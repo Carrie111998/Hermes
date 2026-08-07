@@ -334,6 +334,29 @@ class TestSkillView:
         assert by_name["success"] is True
         assert "Step 1" in by_name["content"]
 
+    def test_registered_view_tracks_use_with_task_and_session(self, tmp_path):
+        from tools.skills_tool import _skill_view_with_bump
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skill_usage.bump_view") as bump_view,
+            patch("tools.skill_usage.bump_use") as bump_use,
+        ):
+            _make_skill(tmp_path, "my-skill")
+            raw = _skill_view_with_bump(
+                {"name": "my-skill"},
+                task_id="task-view",
+                session_id="session-view",
+            )
+
+        assert json.loads(raw)["success"] is True
+        bump_view.assert_called_once_with("my-skill")
+        bump_use.assert_called_once_with(
+            "my-skill",
+            task_id="task-view",
+            session_id="session-view",
+        )
+
 
     def test_view_reference_files(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -612,10 +635,81 @@ class TestSkillViewPrerequisites:
         ]
 
 
-    def test_remote_backend_becomes_available_after_local_secret_capture(
+    def test_remote_backend_treats_persisted_env_as_available(
         self, tmp_path, monkeypatch
     ):
-        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "remote-ready",
+                frontmatter_extra="prerequisites:\n  env_vars: [PERSISTED_REMOTE_KEY]\n",
+            )
+            from hermes_cli.config import save_env_value
+
+            save_env_value("PERSISTED_REMOTE_KEY", "persisted-value")
+            monkeypatch.delenv("PERSISTED_REMOTE_KEY", raising=False)
+            raw = skill_view("remote-ready")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is False
+        assert result["missing_required_environment_variables"] == []
+        assert result["readiness_status"] == "available"
+
+    def test_no_setup_metadata_when_no_required_envs(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "plain-skill")
+            raw = skill_view("plain-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is False
+        assert result["required_environment_variables"] == []
+
+    def test_skill_view_treats_backend_only_env_as_setup_needed(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "backend-ready",
+                frontmatter_extra="prerequisites:\n  env_vars: [BACKEND_ONLY_KEY]\n",
+            )
+            raw = skill_view("backend-ready")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is True
+        assert result["missing_required_environment_variables"] == ["BACKEND_ONLY_KEY"]
+
+    def test_local_env_missing_keeps_setup_needed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.delenv("SHELL_ONLY_KEY", raising=False)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "shell-ready",
+                frontmatter_extra="prerequisites:\n  env_vars: [SHELL_ONLY_KEY]\n",
+            )
+            raw = skill_view("shell-ready")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is True
+        assert result["missing_required_environment_variables"] == ["SHELL_ONLY_KEY"]
+        assert result["readiness_status"] == "setup_needed"
+
+    @pytest.mark.parametrize(
+        "backend",
+        ["ssh", "daytona", "docker", "singularity", "modal", "vercel_sandbox"],
+    )
+    def test_remote_backend_becomes_available_after_local_secret_capture(
+        self, tmp_path, monkeypatch, backend
+    ):
+        monkeypatch.setenv("TERMINAL_ENV", backend)
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
         calls = []
 

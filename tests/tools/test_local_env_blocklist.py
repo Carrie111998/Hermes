@@ -210,6 +210,10 @@ class TestProviderEnvBlocklist:
             "MODAL_TOKEN_ID": "modal-id",
             "MODAL_TOKEN_SECRET": "modal-secret",
             "DAYTONA_API_KEY": "daytona-key",
+            "VERCEL_OIDC_TOKEN": "vercel-oidc-token",
+            "VERCEL_TOKEN": "vercel-token",
+            "VERCEL_PROJECT_ID": "vercel-project",
+            "VERCEL_TEAM_ID": "vercel-team",
         }
         result_env = _run_with_env(extra_os_env=leaked_vars)
 
@@ -307,6 +311,48 @@ class TestActiveVenvMarkerStripping:
         from tools.environments.local import _ACTIVE_VENV_MARKER_VARS
         assert "VIRTUAL_ENV" in _ACTIVE_VENV_MARKER_VARS
         assert "CONDA_PREFIX" in _ACTIVE_VENV_MARKER_VARS
+
+
+class TestProfileScopedPassthrough:
+    def test_make_run_env_uses_active_profile_for_passthrough(self, monkeypatch):
+        """Allowlisted values must come from the routed profile, not os.environ."""
+        from agent import secret_scope as ss
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        clear_env_passthrough()
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"SERVICE_TOKEN": "token-for-routed-profile"})
+        try:
+            result = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+            clear_env_passthrough()
+
+        assert result["SERVICE_TOKEN"] == "token-for-routed-profile"
+
+    def test_make_run_env_omits_missing_scoped_passthrough(self, monkeypatch):
+        """A missing routed secret must not fall back to the default profile."""
+        from agent import secret_scope as ss
+        from tools.env_passthrough import clear_env_passthrough, register_env_passthrough
+        from tools.environments.local import _make_run_env
+
+        clear_env_passthrough()
+        register_env_passthrough(["SERVICE_TOKEN"])
+        monkeypatch.setenv("SERVICE_TOKEN", "token-for-default")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            result = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+            clear_env_passthrough()
+
+        assert "SERVICE_TOKEN" not in result
 
 
 class TestBlocklistCoverage:
@@ -459,6 +505,10 @@ class TestBlocklistCoverage:
             "MODAL_TOKEN_ID",
             "MODAL_TOKEN_SECRET",
             "DAYTONA_API_KEY",
+            "VERCEL_OIDC_TOKEN",
+            "VERCEL_TOKEN",
+            "VERCEL_PROJECT_ID",
+            "VERCEL_TEAM_ID",
         }
         assert extras.issubset(_HERMES_PROVIDER_ENV_BLOCKLIST)
 
