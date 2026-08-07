@@ -4345,9 +4345,12 @@ class BasePlatformAdapter(ABC):
         return validate_media_delivery_path(path)
 
     @staticmethod
-    def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
-        """Drop unsafe MEDIA paths and normalize accepted paths."""
+    def partition_media_delivery_paths(
+        media_files,
+    ) -> Tuple[List[Tuple[str, bool]], List[Tuple[str, bool]]]:
+        """Partition MEDIA paths into normalized accepted and rejected pairs."""
         safe_media: List[Tuple[str, bool]] = []
+        rejected_media: List[Tuple[str, bool]] = []
         for media_path, is_voice in media_files or []:
             raw = str(media_path)
             safe_path = validate_media_delivery_path(raw)
@@ -4355,6 +4358,13 @@ class BasePlatformAdapter(ABC):
                 safe_media.append((safe_path, bool(is_voice)))
             else:
                 logger.warning("Skipping unsafe MEDIA directive path: %s", _log_safe_path(raw))
+                rejected_media.append((raw, bool(is_voice)))
+        return safe_media, rejected_media
+
+    @staticmethod
+    def filter_media_delivery_paths(media_files) -> List[Tuple[str, bool]]:
+        """Drop unsafe MEDIA paths and normalize accepted paths."""
+        safe_media, _ = BasePlatformAdapter.partition_media_delivery_paths(media_files)
         return safe_media
 
     @staticmethod
@@ -5289,6 +5299,21 @@ class BasePlatformAdapter(ABC):
         existing_pending = self._pending_messages.get(session_key)
         if (
             existing_pending is not None
+            and (getattr(existing_pending, "metadata", None) or {}).get(
+                "media_delivery_feedback"
+            )
+        ):
+            state = store.pop(session_key, None)
+            if state is None:
+                return False
+            runner = getattr(self, "gateway_runner", None)
+            queue_pending = getattr(runner, "_queue_or_replace_pending_event", None)
+            if callable(queue_pending):
+                queue_pending(session_key, state.event)
+                return True
+            return False
+        if (
+            existing_pending is not None
             and not self._can_merge_text_debounce_events(existing_pending, state.event)
         ):
             return False
@@ -5478,6 +5503,16 @@ class BasePlatformAdapter(ABC):
         """
         await self._flush_text_debounce_now(session_key)
         pending_event = self._pending_messages.pop(session_key, None)
+        if pending_event is not None and (
+            getattr(pending_event, "metadata", None) or {}
+        ).get("media_delivery_feedback"):
+            runner = getattr(self, "gateway_runner", None)
+            promote = getattr(runner, "_promote_queued_event", None)
+            pending_event = (
+                promote(session_key, self, None)
+                if callable(promote)
+                else None
+            )
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -5724,6 +5759,19 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
+            pending_feedback = self._pending_messages.get(session_key)
+            if (
+                pending_feedback is not None
+                and (getattr(pending_feedback, "metadata", None) or {}).get(
+                    "media_delivery_feedback"
+                )
+            ):
+                runner = getattr(self, "gateway_runner", None)
+                queue_pending = getattr(runner, "_queue_or_replace_pending_event", None)
+                if callable(queue_pending):
+                    queue_pending(session_key, event)
+                    return
+
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.
@@ -5890,7 +5938,22 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
-                media_files = self.filter_media_delivery_paths(media_files)
+                media_files, rejected_media = self.partition_media_delivery_paths(media_files)
+                runner = getattr(self, "gateway_runner", None)
+                if rejected_media and runner is not None and not event.internal:
+                    try:
+                        runner._queue_media_delivery_feedback(
+                            event,
+                            session_key,
+                            self,
+                            rejected_media,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Could not queue MEDIA delivery feedback",
+                            self.name,
+                            exc_info=True,
+                        )
 
                 # Do NOT deduplicate MEDIA tags against prior turns here.
                 # The auto-append path in GatewayRunner._run_agent_inner already

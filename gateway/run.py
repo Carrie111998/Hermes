@@ -7813,6 +7813,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    def _queue_media_delivery_feedback(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+        adapter: Any,
+        rejected_media: List[Tuple[str, bool]],
+    ) -> None:
+        """Queue one bounded same-session turn for rejected MEDIA paths."""
+        if not rejected_media or event.metadata.get("media_delivery_feedback"):
+            return
+
+        paths = []
+        seen = set()
+        for media_path, _is_voice in rejected_media:
+            raw_path = str(media_path)
+            if raw_path in seen:
+                continue
+            seen.add(raw_path)
+            paths.append(json.dumps(raw_path, ensure_ascii=True))
+
+        feedback_text = (
+            "The gateway rejected the following MEDIA path(s) before upload, "
+            "so the listed attachment(s) were not sent:\n"
+            + "\n".join(f"- {path}" for path in paths)
+            + "\nMove, copy, translate, or regenerate the file at a host-visible "
+            "path under an allowed root, then retry with a new MEDIA directive. "
+            "If no valid path exists, report the delivery failure plainly."
+        )
+        feedback_metadata = dict(event.metadata or {})
+        feedback_metadata["media_delivery_feedback"] = True
+        feedback_event = MessageEvent(
+            text=feedback_text,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            message_id=None,
+            auto_skill=event.auto_skill,
+            channel_prompt=event.channel_prompt,
+            channel_context=event.channel_context,
+            internal=True,
+            metadata=feedback_metadata,
+        )
+        self._enqueue_fifo(session_key, feedback_event, adapter)
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -8788,6 +8831,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if existing is not None and (
+            getattr(existing, "metadata", None) or {}
+        ).get("media_delivery_feedback"):
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return
+            self._enqueue_fifo(session_key, event, adapter)
+            return
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -18479,7 +18534,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response, event, _media_adapter, session_key=session_key,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -19671,6 +19726,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        session_key: Optional[str] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -19701,7 +19757,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            media_files, rejected_media = BasePlatformAdapter.partition_media_delivery_paths(media_files)
+            runner = getattr(adapter, "gateway_runner", None)
+            if rejected_media and runner is not None and not event.internal:
+                try:
+                    runner._queue_media_delivery_feedback(
+                        event,
+                        session_key or self._session_key_for_source(event.source),
+                        adapter,
+                        rejected_media,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] Could not queue streamed MEDIA delivery feedback",
+                        adapter.name,
+                        exc_info=True,
+                    )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
             # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
             # a MEDIA: directive in the final streamed reply is the model
