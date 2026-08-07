@@ -182,6 +182,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -206,6 +207,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -266,6 +268,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -326,6 +329,7 @@ class InProcessCronScheduler(CronScheduler):
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
+                                    profile_adapters=profile_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

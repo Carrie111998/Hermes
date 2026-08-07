@@ -25541,6 +25541,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
     cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    # Pass profile-specific adapters so multiplexed profile crons deliver
+    # through the right bot (#cross-profile-cron-delivery).
+    profile_adapters = getattr(runner, "_profile_adapters", None)
+    if profile_adapters:
+        cron_start_kwargs["profile_adapters"] = profile_adapters
 
     # Multiplex profiles: tell the built-in ticker which profile homes to
     # tick so secondary-profile cron jobs actually fire (#69377).
