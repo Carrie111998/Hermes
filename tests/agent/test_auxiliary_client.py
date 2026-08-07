@@ -11,6 +11,7 @@ import pytest
 
 from agent.auxiliary_client import (
     _NOUS_MODEL,
+    AnthropicAuxiliaryClient,
     CodexAuxiliaryClient,
     get_text_auxiliary_client,
     get_available_vision_backends,
@@ -36,7 +37,14 @@ from agent.auxiliary_client import (
     _resolve_task_provider_model,
     _resolve_xai_oauth_for_aux,
     _CodexCompletionsAdapter,
+    _AnthropicCompletionsAdapter,
     _pool_runtime_base_url,
+)
+from agent.llm_execution import (
+    LlmExecutionAudit,
+    LlmExecutionMode,
+    StrictExecutionRouteMismatch,
+    StrictExecutionUnsupported,
 )
 
 
@@ -4426,3 +4434,452 @@ class TestAsynchronousFallbackCachePlans:
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
         assert "cache_control" in wire_tools[-1]
         assert "cache_control" not in tools[-1]
+
+
+class _StrictSyncCompletions:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = 0
+        self.last_kwargs = {}
+
+    def create(self, **kwargs):
+        self.calls += 1
+        self.last_kwargs = kwargs
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+class _StrictAsyncCompletions:
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.calls = 0
+
+    async def create(self, **_kwargs):
+        self.calls += 1
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+class _StrictFakeClient:
+    _hermes_strict_single_attempt_supported = True
+
+    def __init__(self, completions):
+        self.base_url = "https://strict.invalid/v1"
+        self.chat = SimpleNamespace(completions=completions)
+
+
+def _strict_response(model="test-model", provider=None):
+    return SimpleNamespace(
+        model=model,
+        provider=provider,
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+        usage=None,
+    )
+
+
+def _install_strict_client(monkeypatch, client):
+    monkeypatch.setattr(
+        "agent.auxiliary_client._resolve_custom_runtime",
+        lambda: (
+            "https://strict.invalid/v1",
+            "test-only-placeholder",
+            "chat_completions",
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client._get_cached_client",
+        lambda *_args, **_kwargs: (client, "test-model"),
+    )
+    for name in (
+        "_try_configured_fallback_chain",
+        "_try_main_fallback_chain",
+        "_try_payment_fallback",
+        "_try_main_agent_model_fallback",
+    ):
+        monkeypatch.setattr(
+            f"agent.auxiliary_client.{name}",
+            lambda *_args, _name=name, **_kwargs: pytest.fail(
+                f"strict execution entered fallback {_name}"
+            ),
+        )
+    monkeypatch.setattr(
+        "agent.auxiliary_client._recover_provider_pool",
+        lambda *_args, **_kwargs: pytest.fail(
+            "strict execution entered credential rotation"
+        ),
+    )
+
+
+class TestStrictSingleAttemptExecution:
+    def test_anthropic_adapter_disables_stream_fallback_in_strict_mode(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.build_anthropic_kwargs",
+            lambda **kwargs: kwargs,
+        )
+
+        def fake_create(_client, _kwargs, **options):
+            captured.update(options)
+            return SimpleNamespace(usage=None)
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.create_anthropic_message",
+            fake_create,
+        )
+        monkeypatch.setattr(
+            "agent.transports.get_transport",
+            lambda _name: SimpleNamespace(
+                normalize_response=lambda _response, **_kwargs: SimpleNamespace(
+                    content="ok",
+                    tool_calls=[],
+                    reasoning=None,
+                    finish_reason="stop",
+                )
+            ),
+        )
+        adapter = _AnthropicCompletionsAdapter(
+            SimpleNamespace(),
+            "test-model",
+        )
+
+        response = adapter.create(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            _strict_single_attempt=True,
+        )
+
+        assert response.choices[0].message.content == "ok"
+        assert captured["prefer_stream"] is False
+
+    @pytest.mark.parametrize(
+        ("provider", "client_type"),
+        [
+            ("anthropic", AnthropicAuxiliaryClient),
+            ("openai-codex", CodexAuxiliaryClient),
+        ],
+    )
+    def test_native_adapter_strict_support_is_one_call(
+        self, monkeypatch, provider, client_type
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        client = object.__new__(client_type)
+        client.chat = SimpleNamespace(completions=completions)
+        client.base_url = "https://strict.invalid/v1"
+        client._real_client = SimpleNamespace(max_retries=0)
+        _install_strict_client(monkeypatch, client)
+
+        response = call_llm(
+            provider=provider,
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+        )
+
+        assert response.model == "test-model"
+        assert completions.calls == 1
+        if provider == "anthropic":
+            assert completions.last_kwargs["_strict_single_attempt"] is True
+
+    def test_strict_success_is_one_outbound_call(self, monkeypatch):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        response = call_llm(
+            provider="test-provider",
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode=LlmExecutionMode.STRICT_SINGLE_ATTEMPT,
+            execution_audit=audit,
+        )
+
+        assert response.model == "test-model"
+        assert completions.calls == 1
+        assert audit.attempt_count == 1
+        assert audit.response_provider == ""
+        assert audit.response_model == "test-model"
+        assert audit.strict_contract_satisfied is True
+
+    def test_strict_response_route_mismatch_is_not_reported_as_satisfied(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(
+            _strict_response(model="other-model", provider="other-provider")
+        )
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        call_llm(
+            provider="test-provider",
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+            execution_audit=audit,
+        )
+
+        assert completions.calls == 1
+        assert audit.response_provider == "other-provider"
+        assert audit.response_model == "other-model"
+        assert audit.route_changed is True
+        assert audit.strict_contract_satisfied is False
+
+    @pytest.mark.parametrize(
+        ("requested_provider", "canonical_provider"),
+        [("codex", "openai-codex"), ("github", "copilot")],
+    )
+    def test_strict_alias_records_canonical_dispatch_without_route_change(
+        self, monkeypatch, requested_provider, canonical_provider
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        call_llm(
+            provider=requested_provider,
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+            execution_audit=audit,
+        )
+
+        assert completions.calls == 1
+        assert audit.requested_provider == requested_provider
+        assert audit.dispatched_provider == canonical_provider
+        assert audit.route_changed is False
+        assert audit.strict_contract_satisfied is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("402 insufficient credit"),
+            RuntimeError("429 rate limit"),
+            RuntimeError("500 server error"),
+            RuntimeError("unsupported temperature parameter"),
+            RuntimeError("response_format is unsupported"),
+            RuntimeError("401 invalid credential"),
+        ],
+    )
+    def test_strict_failures_do_not_retry_rotate_or_fallback(
+        self, monkeypatch, error
+    ):
+        completions = _StrictSyncCompletions(error)
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        with pytest.raises(RuntimeError, match=str(error)):
+            call_llm(
+                provider="test-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                temperature=0.2,
+                extra_body={"response_format": {"type": "json_object"}},
+                execution_mode="strict_single_attempt",
+                execution_audit=audit,
+            )
+
+        assert completions.calls == 1
+        assert audit.attempt_count == 1
+        assert audit.fallback_used is False
+        assert audit.credential_rotation_used is False
+        assert audit.strict_contract_satisfied is True
+
+    @pytest.mark.parametrize(
+        "error",
+        [TimeoutError("request timed out"), RuntimeError("connection reset")],
+    )
+    def test_strict_transport_failure_is_delivery_ambiguous(
+        self, monkeypatch, error
+    ):
+        completions = _StrictSyncCompletions(error)
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        with pytest.raises(type(error)):
+            call_llm(
+                provider="test-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+                execution_audit=audit,
+            )
+
+        assert completions.calls == 1
+        assert audit.delivery_ambiguous is True
+
+    @pytest.mark.parametrize(
+        "provider", ["openai", "custom", "qwen-oauth", "xai-oauth"]
+    )
+    def test_strict_openai_compatible_and_oauth_routes_use_one_call(
+        self, monkeypatch, provider
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+
+        response = call_llm(
+            provider=provider,
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            execution_mode="strict_single_attempt",
+        )
+
+        assert response.model == "test-model"
+        assert completions.calls == 1
+
+    def test_unproven_transport_is_rejected_before_outbound(self, monkeypatch):
+        completions = _StrictSyncCompletions(_strict_response())
+
+        class ExternalProcessClient:
+            def __init__(self):
+                self.base_url = "external-process://provider"
+                self.chat = SimpleNamespace(completions=completions)
+
+        client = ExternalProcessClient()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_cached_client",
+            lambda *_args, **_kwargs: (client, "test-model"),
+        )
+
+        with pytest.raises(StrictExecutionUnsupported, match="ExternalProcessClient"):
+            call_llm(
+                provider="external-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+        assert completions.calls == 0
+
+    @pytest.mark.parametrize("api_mode", ["anthropic_messages", "codex_responses"])
+    def test_strict_transport_downgrade_is_rejected_before_outbound(
+        self, monkeypatch, api_mode
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="test-provider",
+                model="test-model",
+                api_mode=api_mode,
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+                execution_audit=audit,
+            )
+
+        assert completions.calls == 0
+        assert audit.attempt_count == 0
+
+    def test_named_custom_transport_downgrade_is_rejected_before_outbound(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda name: (
+                {"name": name, "api_mode": "anthropic_messages"}
+                if name == "named-provider"
+                else None
+            ),
+        )
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="named-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
+        assert completions.calls == 0
+
+    def test_resolver_api_mode_downgrade_is_rejected_before_outbound(
+        self, monkeypatch
+    ):
+        completions = _StrictSyncCompletions(_strict_response())
+        client = _StrictFakeClient(completions)
+        client._hermes_resolved_api_mode = "anthropic_messages"
+        _install_strict_client(monkeypatch, client)
+
+        with pytest.raises(StrictExecutionUnsupported, match="configured API mode"):
+            call_llm(
+                provider="nous",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
+        assert completions.calls == 0
+
+    def test_custom_prefix_cannot_hide_early_builtin_route(self, monkeypatch):
+        completions = _StrictSyncCompletions(_strict_response())
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda name: (
+                {
+                    "name": "openrouter",
+                    "base_url": "https://named.invalid/v1",
+                    "api_mode": "chat_completions",
+                }
+                if name in {"custom:openrouter", "openrouter"}
+                else None
+            ),
+        )
+
+        with pytest.raises(StrictExecutionRouteMismatch, match="route resolution"):
+            call_llm(
+                provider="custom:openrouter",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+            )
+
+        assert completions.calls == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            _strict_response(),
+            RuntimeError("402 insufficient credit"),
+            RuntimeError("429 rate limit"),
+            RuntimeError("500 server error"),
+            TimeoutError("request timed out"),
+        ],
+    )
+    async def test_async_strict_never_exceeds_one_call(
+        self, monkeypatch, outcome
+    ):
+        completions = _StrictAsyncCompletions(outcome)
+        _install_strict_client(monkeypatch, _StrictFakeClient(completions))
+        audit = LlmExecutionAudit()
+
+        if isinstance(outcome, BaseException):
+            with pytest.raises(type(outcome)):
+                await async_call_llm(
+                    provider="test-provider",
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                    execution_mode="strict_single_attempt",
+                    execution_audit=audit,
+                )
+        else:
+            response = await async_call_llm(
+                provider="test-provider",
+                model="test-model",
+                messages=[{"role": "user", "content": "hi"}],
+                execution_mode="strict_single_attempt",
+                execution_audit=audit,
+            )
+            assert response.model == "test-model"
+
+        assert completions.calls == 1
+        assert audit.attempt_count == 1
+        if isinstance(outcome, TimeoutError):
+            assert audit.delivery_ambiguous is True
