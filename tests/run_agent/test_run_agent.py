@@ -92,6 +92,42 @@ def agent():
         return a
 
 
+def test_agent_tool_search_policy_is_the_assembly_snapshot(monkeypatch):
+    """The conversation must retain the exact policy used to build its tools."""
+    from tools.tool_search import ToolSearchConfig
+
+    snapshot = ToolSearchConfig.from_raw({
+        "enabled": "on",
+        "builtins": {
+            "enabled": True,
+            "defer": ["browser"],
+            "min_schema_tokens": 0,
+        },
+    })
+    assembled_with = []
+
+    def get_defs(**kwargs):
+        assembled_with.append(kwargs.get("tool_search_config"))
+        return _make_tool_defs("tool_search", "tool_describe", "tool_call")
+
+    with (
+        patch("tools.tool_search.load_config", return_value=snapshot),
+        patch("run_agent.get_tool_definitions", side_effect=get_defs),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        constructed = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert constructed._tool_search_config is snapshot
+    assert assembled_with == [snapshot]
+
+
 def test_persist_user_message_override_rewrites_text_turns(agent):
     messages = [{"role": "user", "content": "API-only synthetic prefix\nhello"}]
     agent._persist_user_message_idx = 0
@@ -1505,6 +1541,7 @@ class TestExecuteToolCalls:
             args, kwargs = mock_hfc.call_args
             assert args[:3] == ("web_search", {"q": "test"}, "task-1")
             assert set(kwargs.get("enabled_tools", [])) == agent.valid_tool_names
+            assert kwargs["tool_search_config"] is agent._tool_search_config
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
@@ -1535,10 +1572,18 @@ class TestExecuteToolCalls:
                 "min_schema_tokens": 0,
             },
         })
-        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        agent._tool_search_config = cfg
+        monkeypatch.setattr(
+            tool_search,
+            "load_config",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("active conversation must not reload tool-search config")
+            ),
+        )
+        policies = []
         monkeypatch.setattr(
             "agent.tool_executor.tool_search_scoped_names",
-            lambda _agent, config=None: frozenset({"browser_back"}),
+            lambda _agent, config=None: policies.append(config) or frozenset({"browser_back"}),
         )
         tc = _mock_tool_call(
             name="tool_call",
@@ -1555,6 +1600,7 @@ class TestExecuteToolCalls:
             )
 
         assert dispatch.call_args.args[:3] == ("browser_back", {}, "task-1")
+        assert policies == [cfg]
         assert messages[-1]["name"] == "browser_back"
 
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
@@ -1900,7 +1946,7 @@ class TestConcurrentToolExecution:
                 "min_schema_tokens": 0,
             },
         })
-        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        agent._tool_search_config = cfg
         monkeypatch.setattr(
             "agent.tool_executor.tool_search_scoped_names",
             lambda _agent, config=None: frozenset({"browser_back", "browser_press"}),
@@ -2035,6 +2081,7 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                tool_search_config=agent._tool_search_config,
                 tool_request_middleware_trace=[],
             )
             assert result == "result"

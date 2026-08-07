@@ -307,6 +307,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_search_config: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -322,6 +323,9 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        tool_search_config: Optional immutable ToolSearchConfig snapshot. Agent
+            conversations pass the same snapshot for every assembly and bridge
+            dispatch so the model-visible tool surface cannot drift mid-session.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -352,6 +356,7 @@ def get_tool_definitions(
                 cfg_fp,
                 bool(os.environ.get("HERMES_KANBAN_TASK")),
                 bool(skip_tool_search_assembly),
+                tool_search_config,
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
@@ -366,8 +371,13 @@ def get_tool_definitions(
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result = _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+        tool_search_config=tool_search_config,
+    )
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -393,6 +403,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    tool_search_config: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -584,7 +595,7 @@ def _compute_tool_definitions(
     # case some caller invokes get_tool_definitions twice.
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-        ts_cfg = _load_ts_config()
+        ts_cfg = tool_search_config or _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
@@ -1135,6 +1146,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    tool_search_config: Optional[Any] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1156,6 +1168,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        tool_search_config: Optional immutable policy snapshot used to build
+                       the caller's model-visible tool list. Direct callers
+                       that have no agent may omit it and use current config.
 
     Returns:
         Function result as a JSON string.
@@ -1195,7 +1210,7 @@ def handle_function_call(
         _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
-        _ts_config = _ts_mod.load_config()
+        _ts_config = tool_search_config or _ts_mod.load_config()
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
             # not the already-collapsed bridge-only list (the bridge would
@@ -1213,7 +1228,9 @@ def handle_function_call(
             current_defs = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
-                quiet_mode=True, skip_tool_search_assembly=True,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+                tool_search_config=_ts_config,
             ) or []
         except Exception:
             current_defs = []
@@ -1283,6 +1300,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                tool_search_config=_ts_config,
             )
 
     _tool_original_args = dict(function_args)

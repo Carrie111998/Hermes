@@ -346,6 +346,10 @@ def tool_search_scoped_names(agent, config=None) -> frozenset:
         return frozenset()
 
     if config is None:
+        config = getattr(agent, "_tool_search_config", None)
+    if config is None:
+        # Compatibility for lightweight test/embedding agents created without
+        # agent_init; real AIAgent conversations always own a frozen snapshot.
         config = _ts.load_config()
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
@@ -364,6 +368,7 @@ def tool_search_scoped_names(agent, config=None) -> frozenset:
             disabled_toolsets=disabled,
             quiet_mode=True,
             skip_tool_search_assembly=True,
+            tool_search_config=config,
         ) or []
         names = _ts.scoped_deferrable_names(scoped_defs, config=config)
     except Exception:
@@ -383,7 +388,9 @@ def _unwrap_tool_search_call(agent, function_name: str, function_args: dict):
 
         if function_name != _ts.TOOL_CALL_NAME:
             return function_name, function_args, scope_block
-        config = _ts.load_config()
+        config = getattr(agent, "_tool_search_config", None)
+        if config is None:
+            config = _ts.load_config()
         underlying, underlying_args, error = _ts.resolve_underlying_call(
             function_args,
             builtin_policy=config.builtins,
@@ -2015,6 +2022,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_search_config=getattr(agent, "_tool_search_config", None),
                     )
 
                 (
@@ -2094,6 +2102,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         tool_request_middleware_trace=list(middleware_trace),
                         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_search_config=getattr(agent, "_tool_search_config", None),
                     )
 
                 (

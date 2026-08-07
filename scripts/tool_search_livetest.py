@@ -470,6 +470,41 @@ def _prepare_fixtures() -> None:
     ))
 
 
+def _install_effective_tool_observer(
+    plugin_manager,
+    tool_call_log: List[Dict[str, Any]],
+):
+    """Observe executed tools after bridge unwrapping without replacing hooks."""
+    bridge_names = {"tool_search", "tool_describe", "tool_call"}
+
+    def observe_effective_tool(**event):
+        name = str(event.get("tool_name") or "")
+        if not name or name in bridge_names:
+            return
+        if event.get("status") in {"blocked", "cancelled"}:
+            return
+        tool_call_log.append({
+            "name": _redact_secrets(name),
+            "args": _trim_args(event.get("args") or {}),
+            "status": event.get("status"),
+            "error_type": event.get("error_type"),
+            "error_message": _redact_secrets(
+                str(event.get("error_message") or "")
+            ) or None,
+        })
+
+    callbacks = plugin_manager._hooks.setdefault("post_tool_call", [])
+    callbacks.append(observe_effective_tool)
+
+    def detach() -> None:
+        try:
+            callbacks.remove(observe_effective_tool)
+        except ValueError:
+            pass
+
+    return detach
+
+
 def run_one_scenario(
     scenario: Dict[str, Any],
     out_dir: Path,
@@ -493,26 +528,18 @@ def run_one_scenario(
 
     n_registered = register_fake_tools() if suite == "mcp" else 0
 
-    # Capture tool calls via a hook on the registry dispatch path. We use the
-    # registry hook (rather than the run_agent.handle_function_call binding,
-    # which is already cached by tool_executor) because the dispatch call is
-    # the one place every underlying tool call lands. Bridge calls are
-    # extracted from the message transcript after the run.
+    # Capture effective post-tool events after bridge unwrapping. This single
+    # observer sees both registry-backed tools and agent-runtime tools such as
+    # todo, session_search, and delegate_task. Bridge calls themselves are
+    # extracted separately from the message transcript.
     tool_call_log: List[Dict[str, Any]] = []
-
-    from tools.registry import registry
-    original_dispatch = registry.dispatch
-
-    def logging_dispatch(name, args, **kw):
-        tool_call_log.append({"name": name, "args": _trim_args(args)})
-        return original_dispatch(name, args, **kw)
-    registry.dispatch = logging_dispatch
 
     # Build agent and run
     started = time.time()
     error = None
     final_response = ""
     messages_out = []
+    detach_observer = None
     try:
         from run_agent import AIAgent
         agent = AIAgent(
@@ -525,6 +552,14 @@ def run_one_scenario(
             skip_memory=True,
             platform="cli",
             max_iterations=15,
+        )
+        # Plugin discovery during AIAgent construction may reset the hook
+        # registry, so install the observer only after the agent exists.
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        discover_plugins()
+        detach_observer = _install_effective_tool_observer(
+            get_plugin_manager(),
+            tool_call_log,
         )
         result = agent.run_conversation(
             user_message=scenario["prompt"],
@@ -541,7 +576,8 @@ def run_one_scenario(
     except Exception as e:
         error = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
     finally:
-        registry.dispatch = original_dispatch
+        if detach_observer is not None:
+            detach_observer()
 
     elapsed = time.time() - started
 
@@ -562,6 +598,7 @@ def run_one_scenario(
         "model": "anthropic/claude-haiku-4.5 (via openrouter)",
         "prompt": scenario["prompt"],
         "expected_underlying_tools": scenario.get("expected_underlying_tools", []),
+        "expected_eager_tools": scenario.get("expected_eager_tools", []),
         "n_fake_tools_registered": n_registered,
         "elapsed_seconds": round(elapsed, 2),
         "bridge_calls": bridge_call_log,
@@ -570,6 +607,9 @@ def run_one_scenario(
         "n_iterations": _count_assistant_turns(messages_out),
         "error": _redact_secrets(error) if error else error,
     }
+    passed, failure_reasons = _evaluate_case(scenario, mode, record)
+    record["passed"] = passed
+    record["failure_reasons"] = failure_reasons
 
     out_path = out_dir / f"{scenario['id']}__{mode}.json"
     out_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
@@ -601,16 +641,30 @@ def _redact_secrets(text: str) -> str:
 
 
 def _trim_args(args: Any, max_chars: int = 300) -> Any:
-    """Trim long string args so the log stays readable."""
-    if not isinstance(args, dict):
-        return args
-    out = {}
-    for k, v in args.items():
-        if isinstance(v, str) and len(v) > max_chars:
-            out[k] = v[:max_chars] + f"...[{len(v)-max_chars} chars trimmed]"
-        else:
-            out[k] = v
-    return out
+    """Recursively redact secrets and trim long strings for stored traces."""
+    if isinstance(args, dict):
+        out = {}
+        for key, value in args.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            sensitive = (
+                normalized in {
+                    "api_key", "authorization", "password", "secret", "token",
+                    "access_token", "refresh_token", "client_secret",
+                }
+                or normalized.endswith(("_api_key", "_password", "_secret", "_token"))
+            )
+            out[key] = "[REDACTED]" if sensitive else _trim_args(value, max_chars)
+        return out
+    if isinstance(args, list):
+        return [_trim_args(value, max_chars) for value in args]
+    if isinstance(args, tuple):
+        return [_trim_args(value, max_chars) for value in args]
+    if isinstance(args, str):
+        value = _redact_secrets(args)
+        if len(value) > max_chars:
+            return value[:max_chars] + f"...[{len(value)-max_chars} chars trimmed]"
+        return value
+    return args
 
 
 def _count_assistant_turns(messages: List[Dict[str, Any]]) -> int:
@@ -638,6 +692,70 @@ def _extract_bridge_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     args = {"_raw": raw_args}
                 out.append({"name": name, "args": _trim_args(args)})
     return out
+
+
+def _evaluate_case(
+    scenario: Dict[str, Any],
+    mode: str,
+    record: Dict[str, Any],
+) -> Tuple[bool, List[str]]:
+    """Evaluate one live record against mode-specific disclosure contracts."""
+    reasons: List[str] = []
+    error = record.get("error")
+    if error:
+        first_line = _redact_secrets(str(error)).splitlines()[0]
+        reasons.append(f"scenario error: {first_line}")
+
+    underlying_names = [
+        str(call.get("name") or "")
+        for call in record.get("underlying_tool_calls", [])
+        if isinstance(call, dict) and call.get("name")
+    ]
+    for call in record.get("underlying_tool_calls", []):
+        if not isinstance(call, dict) or call.get("status") != "error":
+            continue
+        name = str(call.get("name") or "unknown")
+        message = str(call.get("error_message") or "tool returned an error")
+        reasons.append(f"underlying tool failed: {name}: {message}")
+    bridge_calls = [
+        call for call in record.get("bridge_calls", [])
+        if isinstance(call, dict)
+    ]
+    bridge_names = [
+        str(call.get("name") or "") for call in bridge_calls if call.get("name")
+    ]
+    bridged_underlying_names = [
+        str((call.get("args") or {}).get("name") or "")
+        for call in bridge_calls
+        if call.get("name") == "tool_call" and isinstance(call.get("args"), dict)
+    ]
+
+    expected = [str(name) for name in scenario.get("expected_underlying_tools", [])]
+    expected_eager = [str(name) for name in scenario.get("expected_eager_tools", [])]
+    for name in expected:
+        if name not in underlying_names:
+            reasons.append(f"missing expected underlying tool: {name}")
+    for name in expected_eager:
+        if name not in underlying_names:
+            reasons.append(f"missing expected eager tool: {name}")
+        elif name in bridged_underlying_names:
+            reasons.append(f"expected eager tool used tool_call: {name}")
+
+    if not expected:
+        for name in underlying_names:
+            reasons.append(f"tool-free scenario invoked underlying tool: {name}")
+        for name in bridge_names:
+            reasons.append(f"tool-free scenario invoked bridge tool: {name}")
+
+    if mode in {"enabled", "deferred"}:
+        for name in expected:
+            if name not in expected_eager and name not in bridged_underlying_names:
+                reasons.append(f"expected deferred tool did not use tool_call: {name}")
+    elif mode in {"disabled", "direct", "off"}:
+        for name in bridge_names:
+            reasons.append(f"{mode} mode used bridge {name}")
+
+    return not reasons, reasons
 
 
 def build_run_matrix(
@@ -735,6 +853,7 @@ def main(argv: List[str] | None = None) -> int:
     print(f"Writing transcripts to: {out_dir}")
 
     summary = []
+    all_passed = True
     try:
         for case in cases:
             scenario = case["scenario"]
@@ -746,13 +865,19 @@ def main(argv: List[str] | None = None) -> int:
                 suite=case["suite"],
                 mode=mode,
             )
+            passed, failure_reasons = _evaluate_case(scenario, mode, record)
+            record["passed"] = passed
+            record["failure_reasons"] = failure_reasons
+            all_passed = all_passed and passed
             n_bridge = len(record["bridge_calls"])
             n_under = len(record["underlying_tool_calls"])
             err = record["error"]
             print(f"  bridge calls: {n_bridge}, underlying tool calls: {n_under}, "
-                  f"elapsed: {record['elapsed_seconds']}s, error: {bool(err)}")
+                  f"elapsed: {record['elapsed_seconds']}s, passed: {passed}")
             if err:
                 print(f"  ERROR: {err[:300]}")
+            for reason in failure_reasons:
+                print(f"  FAIL: {reason}")
             summary.append({
                 "scenario": scenario["id"],
                 "suite": case["suite"],
@@ -762,6 +887,8 @@ def main(argv: List[str] | None = None) -> int:
                 "n_underlying": n_under,
                 "elapsed": record["elapsed_seconds"],
                 "error": bool(err),
+                "passed": passed,
+                "failure_reasons": failure_reasons,
                 "underlying_tools_called": [c["name"] for c in record["underlying_tool_calls"]],
                 "expected": scenario.get("expected_underlying_tools", []),
             })
@@ -775,7 +902,7 @@ def main(argv: List[str] | None = None) -> int:
             os.environ["HERMES_HOME"] = ORIGINAL_HOME
         else:
             os.environ.pop("HERMES_HOME", None)
-    return 0
+    return 0 if all_passed else 1
 
 
 if __name__ == "__main__":
