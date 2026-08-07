@@ -302,6 +302,14 @@ def _is_interactive() -> bool:
     if _oauth_interactive_forced.get():
         return True
     try:
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
+
+        if get_dashboard_oauth_flow() is not None or get_gateway_oauth_flow() is not None:
+            return True
+    except Exception:
+        pass
+    try:
         return sys.stdin.isatty()
     except (AttributeError, ValueError):
         return False
@@ -429,25 +437,44 @@ def _write_json(path: Path, data: dict) -> None:
 class HermesTokenStorage:
     """Persist OAuth tokens and client registration to JSON files.
 
-    File layout::
+    File layout (shared / default)::
 
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
+
+    File layout when ``user_key`` is set (``mcp.oauth.identity_mode: per_user``)::
+
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.json
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.client.json
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.meta.json
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        user_key: str | None = None,
+    ):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._user_key = _safe_filename(user_key) if user_key else ""
+
+    def _storage_dir(self) -> Path:
+        base = _get_token_dir(self._hermes_home)
+        if self._user_key:
+            return base / "by-user" / self._user_key
+        return base
 
     def _tokens_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
+        return self._storage_dir() / f"{self._server_name}.json"
 
     def _client_info_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.client.json"
+        return self._storage_dir() / f"{self._server_name}.client.json"
 
     def _meta_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+        return self._storage_dir() / f"{self._server_name}.meta.json"
 
     # -- tokens ------------------------------------------------------------
 
@@ -713,10 +740,16 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         as a fallback for headless/SSH/gateway environments.
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
             await dashboard_flow.publish_authorization_url(authorization_url)
+            return
+
+        gateway_flow = get_gateway_oauth_flow()
+        if gateway_flow is not None:
+            await gateway_flow.publish_authorization_url(authorization_url)
             return
 
         # Fail fast at the authorization boundary in non-interactive contexts
@@ -833,10 +866,15 @@ def _make_callback_waiter(port: int):
 
     async def _wait() -> tuple[str, str | None]:
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
             return await dashboard_flow.wait_for_callback()
+
+        gateway_flow = get_gateway_oauth_flow()
+        # When gateway_flow is set we still bind loopback (redirect_uri tunnels)
+        # and race it against chat paste via gateway_flow below.
 
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
@@ -912,6 +950,21 @@ def _make_callback_waiter(port: int):
                 target=_paste_callback_reader, args=(result,), daemon=True
             )
             paste_thread.start()
+
+        # Gateway chat paste: messaging user pastes redirect URL → deliver_callback
+        # fills gateway_flow; mirror that into the shared result dict.
+        if gateway_flow is not None:
+            def _gateway_paste_watch() -> None:
+                if not gateway_flow._callback_ready.wait(timeout=300.0):
+                    return
+                if result["auth_code"] is not None or result["error"] is not None:
+                    return
+                if gateway_flow._callback_error:
+                    result["error"] = gateway_flow._callback_error
+                elif gateway_flow._callback is not None:
+                    result["auth_code"], result["state"] = gateway_flow._callback
+
+            threading.Thread(target=_gateway_paste_watch, daemon=True).start()
 
         timeout = 300.0
         poll_interval = 0.5
@@ -1033,11 +1086,74 @@ def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
+    user_key: str | None = None,
 ) -> None:
-    """Delete stored OAuth tokens and client info for a server."""
-    storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    """Delete stored OAuth tokens and client info for a server identity."""
+    storage = HermesTokenStorage(
+        server_name, hermes_home=hermes_home, user_key=user_key,
+    )
     storage.remove()
-    logger.info("OAuth tokens removed for '%s'", server_name)
+    if user_key:
+        logger.info(
+            "OAuth tokens removed for '%s' (user=%s)", server_name, user_key,
+        )
+    else:
+        logger.info("OAuth tokens removed for '%s'", server_name)
+
+
+def remove_all_oauth_tokens_for_server(
+    server_name: str,
+    *,
+    hermes_home: str | Path | None = None,
+) -> list[str]:
+    """Delete shared + every by-user OAuth state file for ``server_name``.
+
+    Returns the list of identity keys cleared: empty string for the shared
+    path, plus each ``by-user/<key>/`` directory name that had matching files.
+    """
+    safe = _safe_filename(server_name)
+    cleared: list[str] = []
+
+    # Shared profile path
+    shared = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    had_shared = any(
+        p.exists()
+        for p in (shared._tokens_path(), shared._client_info_path(), shared._meta_path())
+    )
+    shared.remove()
+    if had_shared:
+        cleared.append("")
+
+    # Per-user trees: mcp-tokens/by-user/<user_key>/<server>.*
+    by_user_root = _get_token_dir(hermes_home) / "by-user"
+    if by_user_root.is_dir():
+        for user_dir in sorted(by_user_root.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            paths = [
+                user_dir / f"{safe}.json",
+                user_dir / f"{safe}.client.json",
+                user_dir / f"{safe}.meta.json",
+            ]
+            if not any(p.exists() for p in paths):
+                continue
+            for p in paths:
+                p.unlink(missing_ok=True)
+            cleared.append(user_dir.name)
+            # Drop empty user dirs
+            try:
+                next(user_dir.iterdir())
+            except StopIteration:
+                try:
+                    user_dir.rmdir()
+                except OSError:
+                    pass
+
+    logger.info(
+        "OAuth tokens removed for '%s' across %d identity path(s)",
+        server_name, len(cleared),
+    )
+    return cleared
 
 
 # ---------------------------------------------------------------------------

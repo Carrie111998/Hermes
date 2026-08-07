@@ -1836,6 +1836,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_oauth_user_key",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1894,6 +1895,7 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._oauth_user_key: str = ""
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2782,6 +2784,7 @@ class MCPServerTask:
                 from tools.mcp_oauth_manager import get_manager
                 _oauth_auth = get_manager().get_or_build_provider(
                     self.name, url, config.get("oauth"),
+                    user_key=getattr(self, "_oauth_user_key", "") or "",
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
@@ -3037,7 +3040,7 @@ class MCPServerTask:
             return
         if not self._ready.is_set():
             with _lock:
-                if _servers.get(self.name) is not self:
+                if _servers.get(_server_registry_key_for_task(self)) is not self:
                     return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
@@ -3046,7 +3049,7 @@ class MCPServerTask:
         # recovered: drop its stale connect error so status surfaces stop
         # reporting it as failed.
         with _lock:
-            if _servers.get(self.name) is self:
+            if _servers.get(_server_registry_key_for_task(self)) is self:
                 _server_connect_errors.pop(self.name, None)
 
     async def run(self, config: dict):
@@ -3676,8 +3679,7 @@ def _signal_reconnect(server: Any) -> bool:
 
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
-    with _lock:
-        server = _servers.get(server_name)
+    server = _lookup_live_server(server_name)
     if server is None:
         return False
     return _signal_reconnect(server)
@@ -3877,7 +3879,14 @@ def _handle_auth_error_and_retry(
     manager = get_manager()
 
     async def _recover():
-        return await manager.handle_401(server_name, None)
+        user_key = ""
+        try:
+            from tools.mcp_oauth_identity import current_oauth_user_key
+
+            user_key = current_oauth_user_key(require=False)
+        except Exception:
+            user_key = ""
+        return await manager.handle_401(server_name, None, user_key=user_key)
 
     try:
         recovered = _run_on_mcp_loop(_recover, timeout=10)
@@ -3889,8 +3898,7 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
+        srv = _lookup_live_server(server_name)
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -3928,16 +3936,103 @@ def _handle_auth_error_and_retry(
 
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops
-    # retrying the tool.
+    # retrying the tool. In a gateway session, kick off in-chat OAuth so
+    # the user gets an authorize URL (#78169 / #78174).
     _bump_server_error(server_name)
-    return tool_error(
-        f"MCP server '{server_name}' requires re-authentication. "
-        f"Run `hermes mcp login {server_name}` (or delete the tokens "
-        f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
-        f"this tool — ask the user to re-authenticate.",
-        needs_reauth=True,
-        server=server_name,
-    )
+
+    authorization_url = None
+    user_key = ""
+    try:
+        from tools.mcp_oauth_identity import (
+            current_oauth_user_key,
+            is_per_user_oauth_identity,
+        )
+
+        user_key = current_oauth_user_key(require=False)
+    except Exception:
+        user_key = ""
+
+    try:
+        from tools.mcp_gateway_oauth import (
+            gateway_oauth_available,
+            start_gateway_reauth_and_wait_for_url,
+        )
+        from tools.mcp_oauth_manager import get_manager as _get_oauth_mgr
+
+        if gateway_oauth_available():
+            # Clear this identity's tokens so reconnect forces interactive OAuth.
+            _get_oauth_mgr().remove(
+                server_name, user_key=user_key or "", all_identities=False,
+            )
+
+            def _reconnect() -> None:
+                srv = _lookup_live_server(server_name)
+                if srv is not None and hasattr(srv, "_reconnect_event"):
+                    _signal_reconnect_and_wait(
+                        server_name,
+                        srv,
+                        op_description=f"{op_description} gateway OAuth reauth",
+                        timeout=320,
+                    )
+                else:
+                    # Lazy / parked: try on-demand connect under the flow.
+                    _ensure_lazy_server_connected(server_name)
+
+            authorization_url, user_key = start_gateway_reauth_and_wait_for_url(
+                server_name, reconnect_fn=_reconnect,
+            )
+    except Exception as reauth_exc:
+        logger.warning(
+            "MCP OAuth '%s': gateway reauth attempt failed: %s",
+            server_name, reauth_exc,
+        )
+
+    if authorization_url:
+        message = (
+            f"MCP server '{server_name}' requires re-authentication. "
+            f"An authorize link was sent in this chat — open it to "
+            f"continue, then paste the redirect URL back if needed. "
+            f"Do NOT invent alternate login steps. authorization_url is "
+            f"included in this error for restating to the user."
+        )
+    else:
+        try:
+            from tools.mcp_oauth_identity import is_per_user_oauth_identity
+
+            per_user = is_per_user_oauth_identity()
+        except Exception:
+            per_user = False
+        if user_key:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name} --user {user_key}` "
+                f"(or delete tokens under ~/.hermes/mcp-tokens/ and restart). "
+                f"Do NOT retry this tool — ask the user to re-authenticate."
+            )
+        elif per_user:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name} --user <platform:user_id>` "
+                f"(mcp.oauth.identity_mode is per_user). Do NOT retry this "
+                f"tool — ask the user to re-authenticate."
+            )
+        else:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name}` (or delete the tokens "
+                f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
+                f"this tool — ask the user to re-authenticate."
+            )
+
+    extra = {
+        "needs_reauth": True,
+        "server": server_name,
+    }
+    if authorization_url:
+        extra["authorization_url"] = authorization_url
+    if user_key:
+        extra["user_key"] = user_key
+    return tool_error(message, **extra)
 
 
 # Substrings (lower-cased match) that indicate the MCP server rejected
@@ -4074,8 +4169,7 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    with _lock:
-        srv = _servers.get(server_name)
+    srv = _lookup_live_server(server_name)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -4449,6 +4543,27 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
+def _wrap_with_gateway_oauth_flow(coro):
+    """Propagate a gateway OAuth consent flow onto the dedicated MCP loop task."""
+    try:
+        from tools.mcp_gateway_oauth import (
+            gateway_oauth_flow,
+            get_gateway_oauth_flow,
+        )
+
+        flow = get_gateway_oauth_flow()
+    except Exception:
+        return coro
+    if flow is None:
+        return coro
+
+    async def _scoped():
+        with gateway_oauth_flow(flow):
+            return await coro
+
+    return _scoped()
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -4484,6 +4599,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # scopes don't interfere). No-op when no override is active.
     coro = _wrap_with_home_override(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
+    coro = _wrap_with_gateway_oauth_flow(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,
@@ -4692,6 +4808,12 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
+    try:
+        from tools.mcp_oauth_identity import current_oauth_user_key
+
+        server._oauth_user_key = current_oauth_user_key(require=False)
+    except Exception:
+        server._oauth_user_key = ""
     claim = _connect_server_claim.get()
     claim_token = None
     if claim is not None:
@@ -4764,14 +4886,99 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
         return False
 
 
+
+
+def _lookup_live_server(server_name: str) -> Optional["MCPServerTask"]:
+    """Find a live MCPServerTask by logical name (shared or per-user key).
+
+    Prefers the current OAuth registry key, then any connected entry whose
+    ``.name`` matches. Used by reconnect / check paths that only know the
+    logical server name.
+    """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=False)
+    except Exception:
+        registry_key = server_name
+    with _lock:
+        server = _servers.get(registry_key)
+        if server is not None:
+            return server
+        if registry_key != server_name:
+            server = _servers.get(server_name)
+            if server is not None:
+                return server
+        for key, srv in _servers.items():
+            if srv is not None and srv.name == server_name:
+                return srv
+    return None
+
+
+def _server_registry_key_for_task(server: "MCPServerTask") -> str:
+    """Registry key for an already-constructed MCPServerTask."""
+    from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+    return oauth_connection_registry_key(
+        server.name, getattr(server, "_oauth_user_key", "") or "",
+    )
+
+
+def _server_config_is_oauth(server_name: str, config: Optional[dict] = None) -> bool:
+    """True when the named MCP server is configured for OAuth auth."""
+    cfg = config
+    if cfg is None:
+        cfg = _lazy_server_configs.get(server_name)
+    if cfg is None:
+        try:
+            cfg = (_load_mcp_config() or {}).get(server_name)
+        except Exception:
+            cfg = None
+    if not isinstance(cfg, dict):
+        with _lock:
+            for _key, srv in _servers.items():
+                if srv is not None and srv.name == server_name:
+                    return (getattr(srv, "_auth_type", "") or "") == "oauth"
+        return False
+    return (cfg.get("auth") or "").lower().strip() == "oauth"
+
+
+def _resolve_oauth_registry_key(server_name: str, *, require_identity: bool = False) -> str:
+    """Return the ``_servers`` registry key for ``server_name``.
+
+    In shared mode this is ``server_name``. In per-user OAuth mode for OAuth
+    servers it becomes ``server@@user_key`` (#78174).
+    """
+    from tools.mcp_oauth_identity import (
+        current_oauth_user_key,
+        is_per_user_oauth_identity,
+        oauth_connection_registry_key,
+    )
+
+    if not is_per_user_oauth_identity() or not _server_config_is_oauth(server_name):
+        return server_name
+    user_key = current_oauth_user_key(require=require_identity)
+    return oauth_connection_registry_key(server_name, user_key)
+
+
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
 
     Gated per-server by ``mcp_servers.<name>.lazy`` in config (default OFF),
     following the same per-server key pattern as ``idle_timeout_seconds``.
     Design from #56832 (Vansh5632).
+
+    Also forced ON for OAuth servers when ``mcp.oauth.identity_mode`` is
+    ``per_user`` (#78174).
     """
-    return _parse_boolish(config.get("lazy", False), default=False)
+    if _parse_boolish(config.get("lazy", False), default=False):
+        return True
+    try:
+        from tools.mcp_oauth_identity import is_per_user_oauth_identity
+
+        if is_per_user_oauth_identity() and _server_config_is_oauth(name, config):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -4783,8 +4990,19 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     cooldown bookkeeping stays in one place. Returns True when a live
     session is available afterwards.
     """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=True)
+    except Exception as exc:
+        logger.warning(
+            "MCP server '%s': refusing lazy connect without user identity: %s",
+            server_name, exc,
+        )
+        with _lock:
+            _server_connect_errors[server_name] = str(exc)
+        return False
+
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(registry_key)
         if server is not None and server.session is not None:
             return True
         config = _lazy_server_configs.get(server_name)
@@ -4792,24 +5010,79 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             return False
         if _connect_cooldown_active(server_name):
             return False
-        if server_name in _server_connecting:
+        if registry_key in _server_connecting or server_name in _server_connecting:
             return False
+        _server_connecting.add(registry_key)
         _server_connecting.add(server_name)
         _server_connect_errors.pop(server_name, None)
 
-    logger.info("MCP server '%s': lazy start on first use", server_name)
+    logger.info(
+        "MCP server '%s': lazy start on first use (key=%s)",
+        server_name, registry_key,
+    )
     _ensure_mcp_loop()
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
     async def _connect():
         return await _discover_and_register_server(server_name, config)
 
+    from contextlib import ExitStack
+
+    owned_gateway_flow = False
     try:
-        _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
+        with ExitStack() as stack:
+            # Headless messaging: surface the authorize URL in-chat (#78169).
+            try:
+                from tools.mcp_gateway_oauth import (
+                    GatewayOAuthFlow,
+                    gateway_oauth_available,
+                    gateway_oauth_flow,
+                    get_gateway_oauth_flow,
+                )
+                from tools.mcp_oauth import force_interactive_oauth
+                from tools.approval import get_current_session_key
+                from tools.mcp_oauth_identity import current_oauth_user_key
+
+                # Reuse an outer reauth flow when present (nested connect).
+                if get_gateway_oauth_flow() is None and (
+                    gateway_oauth_available()
+                    and _server_config_is_oauth(server_name, config)
+                ):
+                    session_key = get_current_session_key()
+                    if session_key:
+                        flow = GatewayOAuthFlow(
+                            server_name=server_name,
+                            session_key=session_key,
+                            user_key=current_oauth_user_key(require=False),
+                        )
+                        stack.enter_context(gateway_oauth_flow(flow))
+                        stack.enter_context(force_interactive_oauth())
+                        owned_gateway_flow = True
+                elif get_gateway_oauth_flow() is not None:
+                    stack.enter_context(force_interactive_oauth())
+            except Exception as exc:
+                logger.debug(
+                    "MCP gateway OAuth context not entered for '%s': %s",
+                    server_name, exc,
+                )
+            try:
+                _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
+            except BaseException as connect_exc:
+                if owned_gateway_flow:
+                    try:
+                        from tools.mcp_gateway_oauth import (
+                            notify_consent_failure_for_active_flow,
+                        )
+
+                        notify_consent_failure_for_active_flow(exc=connect_exc)
+                    except Exception:
+                        pass
+                raise
     except BaseException as exc:
         message = _format_connect_error(exc)
         with _lock:
             _server_connecting.discard(server_name)
+            _server_connecting.discard(registry_key)
             _server_connect_errors[server_name] = message
             _record_connect_failure(server_name)
         logger.warning(
@@ -4819,11 +5092,16 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
 
     with _lock:
         _server_connecting.discard(server_name)
+        _server_connecting.discard(registry_key)
         _clear_connect_failure(server_name)
-        _lazy_server_configs.pop(server_name, None)
-        stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
-        cached_names = _lazy_server_tool_names.pop(server_name, None) or []
-        server = _servers.get(server_name)
+        if registry_key == server_name:
+            _lazy_server_configs.pop(server_name, None)
+            stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
+            cached_names = _lazy_server_tool_names.pop(server_name, None) or []
+        else:
+            stale_fingerprint = _lazy_server_fingerprints.get(server_name)
+            cached_names = list(_lazy_server_tool_names.get(server_name) or [])
+        server = _servers.get(registry_key)
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
         )
@@ -4852,19 +5130,33 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     Also the single first-use connect point for lazy (schema-cache
     registered) servers, so raw tool calls AND the resource/prompt utility
     handlers all trigger the deferred spawn (#56832).
+
+    Under ``mcp.oauth.identity_mode: per_user``, OAuth servers are looked up
+    by ``server@@user_key`` so concurrent users never share a bearer (#78174).
     """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=True)
+    except Exception as exc:
+        logger.warning(
+            "MCP server '%s': no user identity for OAuth call: %s",
+            server_name, exc,
+        )
+        with _lock:
+            _server_connect_errors[server_name] = str(exc)
+        return None
+
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(registry_key)
         is_lazy = server_name in _lazy_server_configs
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(registry_key)
         return server
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(registry_key)
     return server
 
 
@@ -4883,6 +5175,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Identity is session/ContextVar only — never let tool args pick
+        # which OAuth credentials to use (#78174).
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4909,6 +5207,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         server = _get_connected_server_for_call(server_name)
         if not server:
+            identity_err = _server_connect_errors.get(server_name, "")
+            if "identity_mode is 'per_user'" in identity_err or "no authenticated user" in identity_err.lower():
+                return tool_error(identity_err)
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5094,6 +5395,9 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5150,6 +5454,9 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5211,6 +5518,9 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5272,6 +5582,9 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5337,12 +5650,12 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
+        server = _lookup_live_server(server_name)
+        if server is not None and (
+            server.session is not None or server._is_recycled_stdio()
+        ):
+            return True
         with _lock:
-            server = _servers.get(server_name)
-            if server is not None and (
-                server.session is not None or server._is_recycled_stdio()
-            ):
-                return True
             # Lazy (schema-cache registered) servers are available: the
             # first real call spawns/connects them (#56832).
             return server_name in _lazy_server_configs
@@ -6189,18 +6502,38 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         ):
             # Recoverable park: the run task deliberately stays alive to
             # self-probe, so adopt it into the registry for shutdown/revival.
+            park_key = name
+            try:
+                from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+                park_key = oauth_connection_registry_key(
+                    name, getattr(server, "_oauth_user_key", "") or "",
+                )
+            except Exception:
+                park_key = name
             with _lock:
-                _servers[name] = server
+                _servers[park_key] = server
         elif server is not None:
             await server.shutdown()
         raise
     finally:
         _connect_server_claim.reset(claim_token)
 
+    registry_key = name
+    try:
+        from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+        registry_key = oauth_connection_registry_key(
+            name, getattr(server, "_oauth_user_key", "") or "",
+        )
+    except Exception:
+        registry_key = name
+
     with _lock:
         _server_connecting.discard(name)
+        _server_connecting.discard(registry_key)
         _server_connect_errors.pop(name, None)
-        _servers[name] = server
+        _servers[registry_key] = server
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)

@@ -506,6 +506,13 @@ DEFAULT_CONFIG = {
         # When disabled, the watcher still detects the change and prints
         # guidance to apply it deliberately via /reload-mcp.
         "auto_reload_on_config_change": True,
+        # OAuth identity boundary (#78174). shared = one token set per
+        # profile+server; per_user = key by gateway session user so User A
+        # cannot silently reuse User B's MCP OAuth. Companion consent UX:
+        # #78169.
+        "oauth": {
+            "identity_mode": "shared",
+        },
     },
 
     # Tool-output truncation thresholds. When terminal output or a
