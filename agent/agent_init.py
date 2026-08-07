@@ -445,6 +445,21 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _notify_context_session_start(agent) -> None:
+    """Publish the context-engine session observer, never failing launch."""
+    try:
+        agent.context_compressor.on_session_start(
+            agent.session_id,
+            hermes_home=str(get_hermes_home()),
+            platform=agent.platform or "cli",
+            model=agent.model,
+            context_length=getattr(agent.context_compressor, "context_length", 0),
+            conversation_id=getattr(agent, "_gateway_session_key", None),
+        )
+    except Exception as exc:
+        _ra().logger.debug("Context engine on_session_start: %s", exc)
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -459,6 +474,8 @@ def init_agent(
     max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    skip_tool_search_assembly: bool = False,
+    defer_session_start_observers: bool = False,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -1420,6 +1437,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -2607,19 +2625,12 @@ def init_agent(
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 
-    # Notify context engine of session start
+    # Notify context engine of session start. Exact execution-profile children
+    # defer this observer until their launch contract is verified and executor
+    # submission has succeeded.
     if hasattr(agent, "context_compressor") and agent.context_compressor:
-        try:
-            agent.context_compressor.on_session_start(
-                agent.session_id,
-                hermes_home=str(get_hermes_home()),
-                platform=agent.platform or "cli",
-                model=agent.model,
-                context_length=getattr(agent.context_compressor, "context_length", 0),
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
-        except Exception as _ce_err:
-            _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
+        if not defer_session_start_observers:
+            _notify_context_session_start(agent)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
         working_dir=os.getenv("TERMINAL_CWD") or None,

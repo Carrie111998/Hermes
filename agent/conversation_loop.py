@@ -89,6 +89,30 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+def _strict_profile_surface_frozen(agent: Any) -> bool:
+    """Whether provider recovery must preserve an exact launch surface."""
+    frozen = getattr(agent, "_delegate_frozen_tool_names", None)
+    return isinstance(frozen, (set, frozenset))
+
+
+def _raise_if_strict_profile_recovery(
+    agent: Any,
+    error: BaseException,
+    recovery_name: str,
+) -> None:
+    """Reject recovery that would mutate a strict launch-time authority."""
+    if not _strict_profile_surface_frozen(agent):
+        return
+    logger.warning(
+        "%sStrict execution profile rejected %s recovery because prompt/tool "
+        "state is launch-time pinned",
+        getattr(agent, "log_prefix", ""),
+        recovery_name,
+    )
+    raise error
+
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -3522,6 +3546,11 @@ def run_conversation(
                 # ASCII-only locale sanitization if needed.
                 # -----------------------------------------------------------
                 if isinstance(api_error, UnicodeEncodeError) and getattr(agent, '_unicode_sanitization_passes', 0) < 2:
+                    _raise_if_strict_profile_recovery(
+                        agent,
+                        api_error,
+                        "Unicode",
+                    )
                     _err_str = str(api_error).lower()
                     _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
                     # Detect surrogate errors — utf-8 codec refusing to
@@ -4144,6 +4173,11 @@ def run_conversation(
                     classified.reason == FailoverReason.llama_cpp_grammar_pattern
                     and not _retry.llama_cpp_grammar_retry_attempted
                 ):
+                    _raise_if_strict_profile_recovery(
+                        agent,
+                        api_error,
+                        "llama.cpp schema",
+                    )
                     _retry.llama_cpp_grammar_retry_attempted = True
                     try:
                         from tools.schema_sanitizer import strip_pattern_and_format

@@ -30,7 +30,96 @@ class TestHandleFunctionCall:
         assert "error" in result
         assert "totally_fake_tool_xyz" in result["error"]
 
+    def test_frozen_dispatch_snapshot_bypasses_live_registry(self):
+        snapshot = {"web_search": object()}
+        with (
+            patch(
+                "model_tools.registry.dispatch_snapshot", return_value="frozen"
+            ) as frozen,
+            patch("model_tools.registry.dispatch") as live,
+        ):
+            result = handle_function_call(
+                "web_search",
+                {"q": "test"},
+                task_id="t1",
+                dispatch_snapshot=snapshot,
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
 
+        assert result == "frozen"
+        frozen.assert_called_once()
+        assert frozen.call_args.args[:3] == (snapshot, "web_search", {"q": "test"})
+        live.assert_not_called()
+
+    def test_frozen_dispatch_coercion_uses_launch_schema(self):
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+
+        def handler(args, **_kwargs):
+            return json.dumps({"type": type(args["count"]).__name__})
+
+        launch_schema = {
+            "name": "coercion_probe",
+            "description": "",
+            "parameters": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+            },
+        }
+        reg.register(
+            name="coercion_probe",
+            toolset="test",
+            schema=launch_schema,
+            handler=handler,
+        )
+        snapshot = reg.snapshot_dispatch_entries(
+            {"coercion_probe"},
+            effective_schemas={"coercion_probe": launch_schema},
+        )
+        live_schema = {
+            **launch_schema,
+            "parameters": {
+                "type": "object",
+                "properties": {"count": {"type": "string"}},
+            },
+        }
+
+        with patch("model_tools.registry.get_schema", return_value=live_schema):
+            result = json.loads(
+                handle_function_call(
+                    "coercion_probe",
+                    {"count": "7"},
+                    dispatch_snapshot=snapshot,
+                )
+            )
+
+        assert result == {"type": "int"}
+
+    def test_frozen_dispatch_precedes_tool_search_bridge(self):
+        snapshot = {"tool_search": object()}
+        with (
+            patch(
+                "model_tools.registry.dispatch_snapshot", return_value="frozen"
+            ) as frozen,
+            patch(
+                "tools.tool_search.dispatch_tool_search",
+                side_effect=AssertionError("live bridge must not execute"),
+            ),
+        ):
+            result = handle_function_call(
+                "tool_search",
+                {"query": "terminal"},
+                dispatch_snapshot=snapshot,
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == "frozen"
+        frozen.assert_called_once()
 
     def test_post_tool_call_receives_non_negative_integer_duration_ms(self):
         """Regression: post_tool_call and transform_tool_result hooks must

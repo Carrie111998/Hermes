@@ -557,6 +557,25 @@ class TestSanePathIncludesHomebrew:
         # Original entries keep their leading precedence.
         assert path_entries[:4] == ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
 
+    def test_make_run_env_launchd_path_gains_installed_user_bun(self, tmp_path):
+        """GUI/launchd Hermes must find Bun installed by its standard installer."""
+        from tools.environments.local import _make_run_env
+
+        bun_dir = tmp_path / ".bun" / "bin"
+        bun_dir.mkdir(parents=True)
+        bun = bun_dir / "bun"
+        bun.write_text("#!/bin/sh\n")
+        bun.chmod(0o755)
+        launchd_env = {
+            "HOME": str(tmp_path),
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        }
+
+        with patch.dict(os.environ, launchd_env, clear=True):
+            result = _make_run_env({})
+
+        assert str(bun_dir) in result["PATH"].split(os.pathsep)
+
 
     def test_make_run_env_preserves_windows_mixed_case_path_key(self, monkeypatch):
         from tools.environments import local as local_mod

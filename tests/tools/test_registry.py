@@ -33,6 +33,57 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_dispatch_snapshot_keeps_original_same_toolset_handler(self):
+        reg = ToolRegistry()
+
+        def original(_args, **_kwargs):
+            return json.dumps({"handler": "original"})
+
+        def replacement(_args, **_kwargs):
+            return json.dumps({"handler": "replacement"})
+
+        reg.register(
+            name="pinned",
+            toolset="plugin-profile",
+            schema=_make_schema("pinned"),
+            handler=original,
+        )
+        snapshot = reg.snapshot_dispatch_entries({"pinned"})
+        reg.register(
+            name="pinned",
+            toolset="plugin-profile",
+            schema=_make_schema("pinned"),
+            handler=replacement,
+        )
+
+        assert json.loads(reg.dispatch("pinned", {})) == {"handler": "replacement"}
+        assert json.loads(reg.dispatch_snapshot(snapshot, "pinned", {})) == {
+            "handler": "original"
+        }
+
+    def test_dispatch_snapshot_deep_freezes_effective_schema(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="pinned",
+            toolset="plugin-profile",
+            schema=_make_schema("pinned"),
+            handler=_dummy_handler,
+        )
+        effective_schema = {
+            "name": "pinned",
+            "parameters": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+            },
+        }
+
+        snapshot = reg.snapshot_dispatch_entries(
+            {"pinned"}, effective_schemas={"pinned": effective_schema}
+        )
+        effective_schema["parameters"]["properties"]["count"]["type"] = "string"
+
+        frozen = reg.get_snapshot_schema(snapshot, "pinned")
+        assert frozen["parameters"]["properties"]["count"]["type"] == "integer"
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""

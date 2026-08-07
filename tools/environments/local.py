@@ -1168,7 +1168,23 @@ def _managed_runtime_path_entries() -> list[str]:
         return []
 
 
-def _append_missing_sane_path_entries(existing_path: str) -> str:
+def _installed_user_runtime_path_entries(home: str | None = None) -> list[str]:
+    """Return verified standard user-runtime dirs missing from GUI launch PATHs."""
+    if _IS_WINDOWS:
+        return []
+    user_home = home or os.environ.get("HOME")
+    if not user_home:
+        return []
+    bun_dir = os.path.join(os.path.expanduser(user_home), ".bun", "bin")
+    bun = os.path.join(bun_dir, "bun")
+    if os.path.isfile(bun) and os.access(bun, os.X_OK):
+        return [bun_dir]
+    return []
+
+
+def _append_missing_sane_path_entries(
+    existing_path: str, *, home: str | None = None
+) -> str:
     """Return a normalised POSIX PATH with missing sane entries appended.
 
     On POSIX the caller-supplied PATH is rewritten (not merely appended to):
@@ -1198,9 +1214,14 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     if _IS_WINDOWS:
         return existing_path
 
-    sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
+    sane_entries: list[str] = [entry for entry in _SANE_PATH.split(":") if entry]
     sane_entries.extend(
         entry for entry in _managed_runtime_path_entries() if entry not in sane_entries
+    )
+    sane_entries.extend(
+        entry
+        for entry in _installed_user_runtime_path_entries(home)
+        if entry not in sane_entries
     )
     if not existing_path:
         return ":".join(sane_entries)
@@ -1295,7 +1316,9 @@ def _make_run_env(env: dict) -> dict:
                 run_env[k] = value
     path_key = _path_env_key(run_env)
     if path_key is not None:
-        new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+        new_path = _append_missing_sane_path_entries(
+            run_env.get(path_key, ""), home=run_env.get("HOME")
+        )
         # On Windows, ensure Git Bash's coreutils dirs (…\usr\bin etc.) are on
         # PATH.  A non-login ``bash -c`` fallback (used when ``bash -l`` is
         # broken) never sources /etc/profile, so without this cat/mktemp/mv and

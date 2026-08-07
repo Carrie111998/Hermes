@@ -64,6 +64,11 @@ pattern scanner, not any tool allowlist. Any in-process component
 that screens LLM output is a heuristic operating on an
 attacker-influenced string, and this policy treats it as such.
 
+Host-resolved [subagent execution profiles](docs/security/execution-profiles.md)
+pin in-process protocol, role, and tool policy and produce launch evidence; they
+do not create OS isolation. In particular, macOS process groups are a
+development lifecycle aid, not a production containment boundary.
+
 Hermes Agent supports two OS-level isolation postures. They address
 different threats and an operator should choose deliberately.
 
