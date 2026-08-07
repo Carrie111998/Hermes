@@ -726,6 +726,345 @@ async def test_exact_nonce_history_rejects_content_collision():
 
 
 @pytest.mark.asyncio
+async def test_guild_receipt_contract_reconciles_explicit_approved_private_target(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    default_role = object()
+    bot_user = SimpleNamespace(id=42)
+    guild = SimpleNamespace(id=1, default_role=default_role, me=bot_user)
+    content = "Exact approved-private release summary"
+    nonce = (1 << 63) + 17
+    message = SimpleNamespace(
+        id=1234,
+        nonce=nonce,
+        author=bot_user,
+        content=content,
+    )
+    other_nonce_message = SimpleNamespace(
+        id=1233,
+        nonce=nonce + 1,
+        author=bot_user,
+        content=content,
+    )
+    history_calls = []
+
+    def permissions_for(principal):
+        is_bot = principal is bot_user
+        return SimpleNamespace(
+            view_channel=is_bot,
+            read_message_history=is_bot,
+            send_messages=is_bot,
+        )
+
+    async def history(**kwargs):
+        history_calls.append(kwargs)
+        yield other_nonce_message
+        yield message
+
+    channel = SimpleNamespace(
+        id=555,
+        type=0,
+        guild=guild,
+        permissions_for=permissions_for,
+        history=history,
+        fetch_message=AsyncMock(return_value=message),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    after_utc = datetime.datetime(
+        2026,
+        8,
+        7,
+        20,
+        27,
+        21,
+        tzinfo=datetime.timezone.utc,
+    )
+    digest = hashlib.sha256(content.encode()).hexdigest()
+
+    message_ids = await adapter.find_guild_message_ids_by_exact_nonce(
+        expected_guild_id="1",
+        channel_id="555",
+        nonce=nonce,
+        expected_content_sha256=digest,
+        after_utc=after_utc,
+    )
+    receipt = await adapter.verify_guild_message_receipt(
+        expected_guild_id="1",
+        channel_id="555",
+        message_id="1234",
+        expected_content_sha256=digest,
+    )
+
+    assert message_ids == ("1234",)
+    assert receipt == {
+        "verified": True,
+        "platform": "discord",
+        "guild_id": "1",
+        "channel_id": "555",
+        "message_id": "1234",
+        "content_sha256": digest,
+        "bot_user_id": "42",
+    }
+    assert history_calls == [
+        {"limit": 10_001, "after": after_utc, "oldest_first": True}
+    ]
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guild_receipt_contract_rejects_unapproved_private_target(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "999")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    default_role = object()
+    bot_user = SimpleNamespace(id=42)
+    guild = SimpleNamespace(id=1, default_role=default_role, me=bot_user)
+
+    def permissions_for(principal):
+        is_bot = principal is bot_user
+        return SimpleNamespace(
+            view_channel=is_bot,
+            read_message_history=is_bot,
+            send_messages=is_bot,
+        )
+
+    channel = SimpleNamespace(
+        id=555,
+        type=0,
+        guild=guild,
+        permissions_for=permissions_for,
+        history=MagicMock(),
+        fetch_message=AsyncMock(),
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="approved guild delivery target"):
+        await adapter.find_guild_message_ids_by_exact_nonce(
+            expected_guild_id="1",
+            channel_id="555",
+            nonce=42,
+            expected_content_sha256="a" * 64,
+            after_utc=datetime.datetime.now(datetime.timezone.utc),
+        )
+    with pytest.raises(RuntimeError, match="approved guild delivery target"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256="a" * 64,
+        )
+
+    channel.history.assert_not_called()
+    channel.fetch_message.assert_not_awaited()
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guild_receipt_contract_rejects_dm_private_and_unapproved_thread(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    default_role = object()
+    bot_user = SimpleNamespace(id=42)
+    guild = SimpleNamespace(id=1, default_role=default_role, me=bot_user)
+
+    def permissions_for(principal):
+        is_bot = principal is bot_user
+        return SimpleNamespace(
+            view_channel=is_bot,
+            read_message_history=is_bot,
+            send_messages_in_threads=is_bot,
+        )
+
+    channels = (
+        SimpleNamespace(id=555, type=1, guild=None),
+        SimpleNamespace(
+            id=555,
+            type=SimpleNamespace(value=12, name="private_thread"),
+            guild=guild,
+        ),
+        SimpleNamespace(
+            id=556,
+            parent_id=777,
+            parent=None,
+            type=SimpleNamespace(value=11, name="public_thread"),
+            guild=guild,
+            permissions_for=permissions_for,
+        ),
+    )
+
+    for channel in channels:
+        adapter._client = SimpleNamespace(
+            user=bot_user,
+            get_channel=lambda _channel_id, value=channel: value,
+            fetch_channel=AsyncMock(),
+        )
+        with pytest.raises(RuntimeError, match="approved guild delivery target"):
+            await adapter.find_guild_message_ids_by_exact_nonce(
+                expected_guild_id="1",
+                channel_id=str(channel.id),
+                nonce=42,
+                expected_content_sha256="a" * 64,
+                after_utc=datetime.datetime.now(datetime.timezone.utc),
+            )
+
+
+@pytest.mark.asyncio
+async def test_guild_receipt_contract_fails_when_bot_access_is_revoked(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    default_role = object()
+    bot_user = SimpleNamespace(id=42)
+    guild = SimpleNamespace(id=1, default_role=default_role, me=bot_user)
+    state = {"bot_access": True}
+    message = SimpleNamespace(id=1234, author=bot_user, content="receipt")
+
+    def permissions_for(principal):
+        is_bot = principal is bot_user and state["bot_access"]
+        return SimpleNamespace(
+            view_channel=is_bot,
+            read_message_history=is_bot,
+            send_messages=is_bot,
+        )
+
+    async def fetch_message(_message_id):
+        state["bot_access"] = False
+        return message
+
+    channel = SimpleNamespace(
+        id=555,
+        type=0,
+        guild=guild,
+        permissions_for=permissions_for,
+        fetch_message=AsyncMock(side_effect=fetch_message),
+    )
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="lost approved guild delivery"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"receipt").hexdigest(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_guild_receipt_contract_rejects_wrong_channel_bot_and_content(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555,556")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    default_role = object()
+    bot_user = SimpleNamespace(id=42)
+    other_user = SimpleNamespace(id=43)
+    guild = SimpleNamespace(id=1, default_role=default_role, me=bot_user)
+
+    def permissions_for(principal):
+        is_bot = principal is bot_user
+        return SimpleNamespace(
+            view_channel=is_bot,
+            read_message_history=is_bot,
+            send_messages=is_bot,
+        )
+
+    channel = SimpleNamespace(
+        id=556,
+        type=0,
+        guild=guild,
+        permissions_for=permissions_for,
+        fetch_message=AsyncMock(
+            return_value=SimpleNamespace(
+                id=1234,
+                author=other_user,
+                content="different",
+            )
+        ),
+    )
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="channel identity mismatch"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    channel.id = 555
+    with pytest.raises(RuntimeError, match="guild identity mismatch"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="2",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    channel.fetch_message.return_value = SimpleNamespace(
+        id=1235,
+        author=bot_user,
+        content="expected",
+    )
+    with pytest.raises(RuntimeError, match="message identity mismatch"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    channel.fetch_message.return_value = SimpleNamespace(
+        id=1234,
+        author=other_user,
+        content="different",
+    )
+    with pytest.raises(RuntimeError, match="not authored by this bot"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    channel.fetch_message.return_value = SimpleNamespace(
+        id=1234,
+        author=bot_user,
+        content="different",
+    )
+    with pytest.raises(RuntimeError, match="content hash mismatch"):
+        await adapter.verify_guild_message_receipt(
+            expected_guild_id="1",
+            channel_id="555",
+            message_id="1234",
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_public_thread_visible_to_everyone_allows_send_and_receipt():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     default_role = object()
