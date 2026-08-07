@@ -364,6 +364,7 @@ hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
 muncho-ops = "ops.muncho.runtime.operational_edge_cli:main"
+muncho-release = "ops.muncho.release.cli:main"
 
 [tool.uv]
 override-dependencies = [
@@ -407,6 +408,7 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 
 [tool.setuptools.package-data]
 hermes_cli = ["observability/schemas/*.json"]
+"ops.muncho.release" = ["*.json"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —
 # status phrases fall back to the tiny hardcoded set and the Telegram
