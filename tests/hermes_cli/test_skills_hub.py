@@ -255,6 +255,137 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
     return install_calls
 
 
+# ---------------------------------------------------------------------------
+# Untracked skills (no hub lock entry) must not be silently destroyed.
+#
+# install_from_quarantine() rmtree's whatever sits at the install path and
+# justifies it by deferring to "the lock-file check in do_install()". That
+# check reads the hub lock file, so it is blind to locally authored skills
+# (source_type="local") and to bundled skills the user has edited -- both of
+# which live under skills/ with no lock entry.
+#
+# These tests drive the REAL quarantine/install/lock code so the destructive
+# rmtree actually runs; only the remote source and the scanner are faked.
+# ---------------------------------------------------------------------------
+
+_LOCAL_SKILL_BODY = "---\nname: note-taker\ndescription: hand written\n---\n# my own notes\n"
+_UPSTREAM_SKILL_BODY = "---\nname: note-taker\ndescription: upstream\n---\n# upstream body\n"
+
+
+def _untracked_source(name, identifier):
+    class _Source:
+        def inspect(self, _identifier):
+            return type("Meta", (), {
+                "extra": {}, "identifier": identifier, "name": name, "path": name,
+            })()
+
+        def fetch(self, _identifier):
+            return type("Bundle", (), {
+                "name": name,
+                "files": {"SKILL.md": _UPSTREAM_SKILL_BODY},
+                "source": "github",
+                "identifier": identifier,
+                "trust_level": "community",
+                "metadata": {},
+            })()
+
+    return _Source()
+
+
+def _real_install_env(monkeypatch, name, identifier):
+    """Fake only the remote source and the scanner; keep the disk path real."""
+    import tools.skills_guard as guard
+    import tools.skills_hub as hub
+
+    monkeypatch.setattr(hub, "GitHubAuth", lambda: None)
+    monkeypatch.setattr(
+        hub, "create_source_router",
+        lambda auth: [_untracked_source(name, identifier)],
+    )
+    monkeypatch.setattr(
+        guard, "scan_skill_cached",
+        lambda skill_path, source="community", source_url="", cache_dir=None: (
+            guard.ScanResult(
+                skill_name=name, source=source,
+                trust_level="community", verdict="safe",
+            ),
+            {
+                "fresh": True, "scanner_version": "test", "bundle_hash": "sha256:t",
+                "source_url": source_url, "scanned_at": "now", "rules": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(guard, "format_scan_report", lambda _result: "scan ok")
+    monkeypatch.setattr(
+        guard, "should_allow_install", lambda _result, force=False: (True, "ok"),
+    )
+
+
+def _seed_untracked_skill(tmp_path, name):
+    """A skill directory on disk with NO entry in the hub lock file."""
+    skill_dir = tmp_path / "skills" / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(_LOCAL_SKILL_BODY, encoding="utf-8")
+    return skill_dir
+
+
+def _run_install(monkeypatch, name, identifier, **kwargs):
+    _real_install_env(monkeypatch, name, identifier)
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
+    do_install(identifier, console=console, skip_confirm=True,
+               invalidate_cache=False, **kwargs)
+    # Rich hard-wraps at the console width; collapse it so assertions can match
+    # message text without depending on where the wrap lands.
+    return " ".join(sink.getvalue().split())
+
+
+def test_install_refuses_to_replace_untracked_local_skill(hub_env, monkeypatch, tmp_path):
+    """A local/user-edited skill has no lock entry, so the lock-file check
+    cannot see it -- but install_from_quarantine() would still rmtree it.
+    Without --force the install must refuse and leave the file untouched."""
+    skill_dir = _seed_untracked_skill(tmp_path, "note-taker")
+
+    out = _run_install(monkeypatch, "note-taker", "acme/note-taker")
+
+    # The user's own file survives, byte for byte.
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _LOCAL_SKILL_BODY
+    assert "not tracked by the skills hub" in out
+    assert "Use --force to overwrite." in out
+    # And the install did not report success.
+    assert "Installed:" not in out
+
+
+def test_install_force_still_replaces_untracked_local_skill(hub_env, monkeypatch, tmp_path):
+    """--force remains the escape hatch: the guard warns but does not block."""
+    skill_dir = _seed_untracked_skill(tmp_path, "note-taker")
+
+    out = _run_install(monkeypatch, "note-taker", "acme/note-taker", force=True)
+
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _UPSTREAM_SKILL_BODY
+    assert "Installed:" in out
+
+
+def test_install_untracked_guard_leaves_lockfile_branch_alone(hub_env, monkeypatch, tmp_path):
+    """A hub-installed skill (lock entry present) keeps the existing message
+    and the existing behaviour -- the new filesystem check must not fire."""
+    from tools.skills_hub import HubLockFile
+
+    skill_dir = _seed_untracked_skill(tmp_path, "note-taker")
+    HubLockFile().record_install(
+        name="note-taker", source="github", identifier="acme/note-taker",
+        trust_level="community", scan_verdict="safe", skill_hash="sha256:old",
+        install_path="note-taker", files=["SKILL.md"],
+    )
+
+    out = _run_install(monkeypatch, "note-taker", "acme/note-taker")
+
+    assert "is already installed at" in out
+    assert "Use --force to reinstall." in out
+    assert "not tracked by the skills hub" not in out
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _LOCAL_SKILL_BODY
+
+
 
 
 
