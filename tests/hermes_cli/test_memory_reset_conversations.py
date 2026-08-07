@@ -76,6 +76,9 @@ def _assert_seed_still_present(home):
         assert db.message_count() == 3
         assert db.get_meta("memory-reset-preservation") == "keep"
         assert db.search_messages(_SEARCH_NEEDLE)
+        assert db.is_telegram_topic_mode_enabled(
+            chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID
+        )
         assert (
             db.get_telegram_topic_binding(
                 chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
@@ -133,9 +136,7 @@ def test_memory_reset_parser_invokes_exactly_one_handler(monkeypatch):
     build_memory_parser(subparsers, cmd_memory=legacy_handler)
 
     legacy_args = parser.parse_args(["memory", "reset", "--target", "all"])
-    conversation_args = parser.parse_args(
-        ["memory", "reset", "--target", "conversations", "--yes"]
-    )
+    conversation_args = parser.parse_args(["memory", "reset", "--target", "conversations", "--yes"])
 
     assert legacy_args.func(legacy_args) == 0
     assert legacy_calls == ["all"]
