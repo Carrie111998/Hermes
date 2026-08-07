@@ -8,12 +8,14 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 from typing import Any, Optional
 
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.codex_runtime import make_codex_app_server_event_bridge
 from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
@@ -125,6 +127,123 @@ def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
         client_factory=lambda **kw: client,
         **kwargs,
     )
+
+
+def test_useful_commentary_and_mid_turn_steering_share_one_live_turn():
+    """Completed model commentary stays useful and steering amends, rather
+    than cancels or replaces, the same Codex turn before its single final.
+
+    This crosses the real session notification loop, event bridge, native
+    ``turn/steer`` request, history projector, and final-result boundary.
+    Raw commentary deltas remain intentionally absent from the stream rail.
+    """
+    client = FakeClient()
+    for method, item in [
+        ("item/started", {
+            "type": "agentMessage", "id": "progress-1", "phase": "commentary",
+        }),
+        ("item/agentMessage/delta", {
+            "itemId": "progress-1", "delta": "raw first tokens",
+        }),
+        ("item/completed", {
+            "type": "agentMessage",
+            "id": "progress-1",
+            "phase": "commentary",
+            "text": "I verified the current release; next I am checking Discord.",
+        }),
+        ("item/started", {
+            "type": "agentMessage", "id": "progress-2", "phase": "commentary",
+        }),
+        ("item/completed", {
+            "type": "agentMessage",
+            "id": "progress-2",
+            "phase": "commentary",
+            "text": "Discord delivery is healthy; I am running the final test.",
+        }),
+        ("item/started", {
+            "type": "commandExecution",
+            "id": "verify-1",
+            "command": "pytest -q focused",
+            "cwd": "/tmp",
+        }),
+        ("item/completed", {
+            "type": "commandExecution",
+            "id": "verify-1",
+            "command": "pytest -q focused",
+            "cwd": "/tmp",
+            "status": "completed",
+            "aggregatedOutput": "1 passed",
+            "exitCode": 0,
+        }),
+        ("item/started", {
+            "type": "agentMessage", "id": "final-1", "phase": "final_answer",
+        }),
+        ("item/agentMessage/delta", {
+            "itemId": "final-1", "delta": "Done.",
+        }),
+        ("item/completed", {
+            "type": "agentMessage",
+            "id": "final-1",
+            "phase": "final_answer",
+            "text": "Done.",
+        }),
+    ]:
+        if method == "item/agentMessage/delta":
+            client.queue_notification(method, **item)
+        else:
+            client.queue_notification(method, item=item)
+    client.queue_notification(
+        "turn/completed",
+        threadId="t",
+        turn={"id": "tu1", "status": "completed", "error": None},
+    )
+
+    commentary: list[str] = []
+    streamed: list[str] = []
+    session_ref: dict[str, CodexAppServerSession] = {}
+
+    def emit_interim(text: str) -> None:
+        commentary.append(text)
+        if len(commentary) == 1:
+            assert session_ref["session"].request_steer(
+                "Keep the verified work and also cover the restart path."
+            )
+
+    agent = SimpleNamespace(
+        tool_progress_callback=None,
+        tool_start_callback=None,
+        tool_complete_callback=None,
+        _fire_stream_delta=streamed.append,
+        _fire_reasoning_delta=None,
+        _fire_streamed_codex_commentary=emit_interim,
+        show_commentary=True,
+    )
+    session = make_session(
+        client,
+        on_event=make_codex_app_server_event_bridge(agent),
+    )
+    session_ref["session"] = session
+
+    result = session.run_turn("Ship the release", turn_timeout=1.0)
+
+    assert commentary == [
+        "I verified the current release; next I am checking Discord.",
+        "Discord delivery is healthy; I am running the final test.",
+    ]
+    assert streamed == ["Done."]
+    assert result.final_text == "Done."
+    assert [message["role"] for message in result.projected_messages] == [
+        "assistant", "tool", "assistant"
+    ]
+    assert result.projected_messages[0]["content"] is None
+    assert result.projected_messages[-1] == {
+        "role": "assistant", "content": "Done."
+    }
+    assert result.tool_iterations == 1
+    assert result.interrupted is False
+    assert result.pending_steer is None
+    assert [method for method, _ in client.requests].count("turn/steer") == 1
+    assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
 
 # ---- choice mapping ----
