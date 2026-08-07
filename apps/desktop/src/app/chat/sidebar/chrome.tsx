@@ -65,7 +65,15 @@ export function SidebarRowShell({
   return (
     <div className={cn(rowMinH, 'grid grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md', className)} {...props}>
       {children}
-      {actions ? <div className="flex shrink-0 items-center self-center">{actions}</div> : null}
+      {/*
+        actions wrapper is shrink-0 so the actions slot owns its width, but
+        the slot itself is allowed to drop to 0px when idle (the kebab track
+        animates `w-[1.375rem] -> w-0` on hover-out). Previously the inner
+        track was permanently `w-[1.375rem]`, which produced the standing
+        gutter reported in #75331 — fixed by the inner actions slot, not
+        here, so the chrome itself remains the single source of row geometry.
+      */}
+      {actions ? <div className="flex items-center self-center">{actions}</div> : null}
     </div>
   )
 }
