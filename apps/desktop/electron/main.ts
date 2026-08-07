@@ -2616,6 +2616,7 @@ let isQuittingForHandoff = false
 // (the app.quit() that follows re-enters before-quit and must pass through).
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
+let backendQuitTeardownDone = false
 
 // Resolve the staged updater binary the desktop may hand an update to. On
 // Windows that binary owns ALL repo mutation — running `hermes update` +
@@ -8322,6 +8323,20 @@ function stopAllPoolBackends() {
   }
 }
 
+// Quit-path variant of stopAllPoolBackends(): waits for every pool backend to
+// actually exit (SIGKILL escalation after 5s each, via teardownPoolBackendAndWait)
+// instead of firing SIGTERM and returning immediately. Used only from
+// before-quit, where the fire-and-forget original could let Electron's own
+// process exit before the child did, orphaning it to launchd. The Windows
+// lock-release path (releaseBackendLock) keeps calling the original
+// stopAllPoolBackends() — it already tree-kills aggressively right after, so
+// waiting there would just duplicate work for no benefit.
+async function stopAllPoolBackendsAndWait() {
+  await Promise.all(
+    [...backendPool.keys()].map(profile => teardownPoolBackendAndWait(profile))
+  )
+}
+
 // Returns the profile name whose backend was torn down, or null when the
 // request is not a profile-delete.  The caller uses this to skip ensureBackend
 // for the just-torn-down profile — otherwise ensureBackend respawns a pool
@@ -12021,8 +12036,24 @@ app.on('before-quit', event => {
     disposeTerminalSession(id)
   }
 
-  stopBackendChild(backendConnectionState.getProcess())
-  stopAllPoolBackends()
+  // Wait for the primary + pool backend children to actually exit before
+  // letting the app finish quitting. A bare SIGTERM-and-return (the previous
+  // behavior) could let Electron's own process exit first, orphaning the
+  // `hermes serve` child to launchd (PPID 1) — it stops listening but keeps
+  // ~/.hermes/state.db open indefinitely. teardownPrimaryBackendAndWait /
+  // teardownPoolBackendAndWait already implement the wait+SIGKILL-escalation
+  // (5s) this needs; the outer 6s race is just a hard ceiling so a stuck
+  // backend can never hang the quit entirely.
+  if (!backendQuitTeardownDone) {
+    event.preventDefault()
+
+    const pending = Promise.allSettled([teardownPrimaryBackendAndWait(), stopAllPoolBackendsAndWait()])
+
+    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 6_000))]).then(() => {
+      backendQuitTeardownDone = true
+      app.quit()
+    })
+  }
 })
 
 app.on('window-all-closed', () => {
