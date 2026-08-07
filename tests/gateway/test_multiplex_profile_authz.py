@@ -74,6 +74,39 @@ def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
     assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
+def test_secondary_a2a_source_keeps_upstream_authorization(monkeypatch):
+    """A source built by a secondary A2A adapter uses that adapter's auth verdict."""
+    from gateway.run import GatewayRunner
+    from plugins.platforms.a2a.adapter import A2AAdapter
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner._profile_name_for_source = lambda source: None
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter.gateway_runner = runner
+    runner._profile_adapters = {
+        "coder": {adapter.platform: adapter},
+    }
+
+    source = adapter.build_source(
+        chat_id="a2a-context",
+        user_id="alpha",
+        user_name="alpha",
+    )
+    source.profile = "coder"
+
+    assert runner._adapter_profile_for_source(source) == "coder"
+    assert runner._is_user_authorized(source) is True
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
