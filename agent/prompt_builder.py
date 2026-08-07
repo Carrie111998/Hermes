@@ -87,8 +87,14 @@ def _find_git_root(start: Path) -> Optional[Path]:
     """
     current = start.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
-            return parent
+        try:
+            if (parent / ".git").exists():
+                return parent
+        except OSError:
+            # Unreadable directory (e.g. /root owned by another user) — skip
+            # and keep walking up; prompt construction must never crash on a
+            # permission error.
+            continue
     return None
 
 
@@ -112,8 +118,12 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     for directory in search_dirs:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
-            if candidate.is_file():
-                return candidate
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                # Unreadable directory — keep searching elsewhere.
+                continue
         if stop_at and directory == stop_at:
             break
     return None
