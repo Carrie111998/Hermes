@@ -1860,6 +1860,145 @@ def test_legacy_v3_operational_edges_cannot_borrow_host_owner_gate_key(
         assert config["owner_gate_receipt_public_key_file"] is None
 
 
+def test_generated_runtime_projects_both_public_trust_anchors_create_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = _release((tmp_path / "release").resolve())
+    manifest = package.build_release_artifacts(
+        release,
+        REVISION,
+        unit_inputs=_unit_inputs(),
+    )
+    runtime = _load_artifact(
+        Path(manifest["artifacts"]["production-host-rollback"]["path"]),
+        "production_cross_service_trust_anchor_artifact",
+    )
+
+    def public_pair(name: str) -> tuple[Path, str]:
+        key = Ed25519PrivateKey.generate().public_key()
+        payload = key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        path = (tmp_path / name).resolve()
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        return path, hashlib.sha256(key.public_bytes_raw()).hexdigest()
+
+    writer_source, writer_id = public_pair("writer-source.pem")
+    owner_source, owner_id = public_pair("owner-source.pem")
+    writer_source.chmod(0o440)
+    owner_target_root = tmp_path / "owner-target"
+    operational_target_root = tmp_path / "operational-target"
+    owner_target_root.mkdir(mode=0o755)
+    operational_target_root.mkdir(mode=0o755)
+    writer_target = owner_target_root / "writer.pem"
+    owner_target = operational_target_root / "owner.pem"
+
+    monkeypatch.setattr(runtime, "WRITER_CAPABILITY_PUBLIC_KEY", writer_source)
+    monkeypatch.setattr(runtime, "OWNER_GATE_WRITER_PUBLIC_KEY", writer_target)
+    monkeypatch.setattr(runtime, "OWNER_GATE_RECEIPT_PUBLIC_KEY", owner_source)
+    monkeypatch.setattr(
+        runtime,
+        "OPERATIONAL_EDGE_OWNER_GATE_RECEIPT_PUBLIC_KEY",
+        owner_target,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_identity_foundation",
+        lambda _manifest: {"exact": "identity"},
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_discord_key_foundation",
+        lambda _manifest, _identity: {
+            "writer": {
+                "public_key_id": writer_id,
+                "public_gid": os.getegid(),
+                "public_mode": 0o440,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_operational_edge_bundle",
+        lambda _manifest: {
+            "owner_gate_receipt_public_key_id": owner_id,
+            "receipt_public_key_ids": {"canonical": "f" * 64},
+        },
+    )
+
+    first = runtime._provision_cross_service_trust_anchors(
+        {},
+        writer_public_key_id=writer_id,
+        trust_anchor_uid=os.geteuid(),
+        trust_anchor_gid=os.getegid(),
+    )
+    assert first["anchor_count"] == 2
+    assert [row["created"] for row in first["anchors"]] == [True, True]
+    assert writer_target.read_bytes() == writer_source.read_bytes()
+    assert owner_target.read_bytes() == owner_source.read_bytes()
+    assert stat.S_IMODE(writer_target.stat().st_mode) == 0o444
+    assert stat.S_IMODE(owner_target.stat().st_mode) == 0o444
+
+    second = runtime._provision_cross_service_trust_anchors(
+        {},
+        writer_public_key_id=writer_id,
+        trust_anchor_uid=os.geteuid(),
+        trust_anchor_gid=os.getegid(),
+    )
+    assert [row["created"] for row in second["anchors"]] == [False, False]
+
+    monkeypatch.setattr(
+        runtime,
+        "_operational_edge_bundle",
+        lambda _manifest: {
+            "owner_gate_receipt_public_key_id": None,
+            "receipt_public_key_ids": {"canonical": "f" * 64},
+        },
+    )
+    with pytest.raises(
+        runtime.ArtifactError,
+        match="owner_gate_trust_anchor_unavailable",
+    ):
+        runtime._provision_cross_service_trust_anchors(
+            {},
+            writer_public_key_id=writer_id,
+            trust_anchor_uid=os.geteuid(),
+            trust_anchor_gid=os.getegid(),
+        )
+    legacy_writer_before = writer_target.read_bytes()
+    legacy_owner_before = owner_target.read_bytes()
+    assert runtime._provision_cross_service_trust_anchors_if_required(
+        {},
+        writer_public_key_id=writer_id,
+        trust_anchor_uid=os.geteuid(),
+        trust_anchor_gid=os.getegid(),
+    ) is None
+    assert writer_target.read_bytes() == legacy_writer_before
+    assert owner_target.read_bytes() == legacy_owner_before
+    monkeypatch.setattr(
+        runtime,
+        "_operational_edge_bundle",
+        lambda _manifest: {
+            "owner_gate_receipt_public_key_id": owner_id,
+            "receipt_public_key_ids": {"canonical": "f" * 64},
+        },
+    )
+
+    writer_target.chmod(0o644)
+    writer_target.write_bytes(owner_source.read_bytes())
+    writer_target.chmod(0o444)
+    with pytest.raises(runtime.ArtifactError, match="trust_anchor_conflict"):
+        runtime._provision_cross_service_trust_anchors(
+            {},
+            writer_public_key_id=writer_id,
+            trust_anchor_uid=os.geteuid(),
+            trust_anchor_gid=os.getegid(),
+        )
+
+
 def test_generated_runtime_requires_exact_projector_read_and_gateway_mutation(
     tmp_path,
     monkeypatch,

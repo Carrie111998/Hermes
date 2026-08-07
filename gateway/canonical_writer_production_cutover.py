@@ -6124,7 +6124,7 @@ def _require_operational_edge_readiness(
     return parsed
 
 
-_HOST_APPLY_RECEIPT_FIELDS = frozenset({
+_HOST_APPLY_RECEIPT_FIELDS_V2 = frozenset({
     "schema", "plan_sha256", "artifact_sha256", "gateway_stopped",
     "writer_stopped", "connector_stopped", "phase_b_stopped",
     "routeback_stopped", "mac_ops_stopped", "browser_stopped",
@@ -6153,6 +6153,11 @@ _HOST_APPLY_RECEIPT_FIELDS = frozenset({
     "ok", "secret_material_recorded",
     "secret_digest_recorded", "receipt_sha256",
 })
+_HOST_APPLY_RECEIPT_FIELDS_V3 = frozenset({
+    *_HOST_APPLY_RECEIPT_FIELDS_V2,
+    "cross_service_trust_anchor_receipt_sha256",
+    "cross_service_trust_anchors_ready",
+})
 
 
 def _disabled_target_identity(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -6174,9 +6179,15 @@ def _require_host_apply_receipt(
     only fragment hashes would accept unit-file or drop-in drift.
     """
 
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    fields = (
+        _HOST_APPLY_RECEIPT_FIELDS_V3
+        if schema == "muncho-production-writer-host-apply.v3"
+        else _HOST_APPLY_RECEIPT_FIELDS_V2
+    )
     raw = _hashed(
         value,
-        _HOST_APPLY_RECEIPT_FIELDS,
+        fields,
         "receipt_sha256",
         "production host apply receipt",
     )
@@ -6207,7 +6218,11 @@ def _require_host_apply_receipt(
         runtime=operational_runtime,
     )
     if (
-        raw["schema"] != "muncho-production-writer-host-apply.v2"
+        raw["schema"]
+        not in {
+            "muncho-production-writer-host-apply.v2",
+            "muncho-production-writer-host-apply.v3",
+        }
         or raw["plan_sha256"] != plan.sha256
         or raw["artifact_sha256"]
         != plan.value["artifacts"]["host_activation"]["sha256"]
@@ -6305,6 +6320,14 @@ def _require_host_apply_receipt(
         ]
         or raw["operational_edge_staged_key_copies_retained"] is not True
         or raw["operational_edge_keys_ready"] is not True
+        or raw["schema"] == "muncho-production-writer-host-apply.v3"
+        and (
+            _SHA256.fullmatch(
+                str(raw["cross_service_trust_anchor_receipt_sha256"])
+            )
+            is None
+            or raw["cross_service_trust_anchors_ready"] is not True
+        )
         or _SHA256.fullmatch(
             str(raw["operational_edge_asset_readback_receipt_sha256"])
         ) is None

@@ -57,6 +57,7 @@ REQUIRED_ENTRYPOINTS = (
     "bin/muncho-host-trusted-signer-provision",
     "bin/muncho-passkey-v2-web",
     "bin/muncho-passkey-v2-authority",
+    "bin/muncho-passkey-enrollment",
     "bin/muncho-passkey-v2-executor",
 )
 ROOT_RUNTIME_FILES = (
@@ -109,6 +110,7 @@ REQUIRED_ASSET_FILES = (
     "ops/muncho/owner-gate/bin/muncho-host-observation-attestor",
     "ops/muncho/owner-gate/bin/muncho-host-trusted-signer-provision",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-authority",
+    "ops/muncho/owner-gate/bin/muncho-passkey-enrollment",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-executor",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-web",
     "ops/muncho/owner-gate/README.md",

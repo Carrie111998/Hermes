@@ -506,7 +506,11 @@ def complete_enrollment(
     return credential_from_receipt(receipt)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    root: Path = PRODUCTION_ENROLLMENT_ROOT,
+) -> int:
     """Create one local-only, single-use iPhone enrollment invitation."""
 
     parser = argparse.ArgumentParser(prog="muncho-passkey-enrollment")
@@ -514,10 +518,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner-discord-user-id", required=True)
     parser.add_argument("--user-label", required=True)
     parser.add_argument("--ttl-seconds", type=int, default=3600)
-    parser.add_argument("--root", type=Path, default=PRODUCTION_ENROLLMENT_ROOT)
     args = parser.parse_args(argv)
     invitation, token = create_invitation(
-        root=args.root,
+        root=root,
         owner_discord_user_id=args.owner_discord_user_id,
         user_label=args.user_label,
         ttl_seconds=args.ttl_seconds,

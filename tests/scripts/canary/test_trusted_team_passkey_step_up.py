@@ -836,9 +836,8 @@ def test_installed_enrollment_cli_emits_seed_once_only_to_operator_stdout(
             "Ivs",
             "--ttl-seconds",
             "3600",
-            "--root",
-            str(tmp_path),
-        ]
+        ],
+        root=tmp_path,
     ) == 0
 
     captured = capsys.readouterr()
@@ -854,6 +853,22 @@ def test_installed_enrollment_cli_emits_seed_once_only_to_operator_stdout(
         path.read_text(encoding="ascii")
         for path in tmp_path.rglob("*.json")
     )
+
+    with pytest.raises(SystemExit):
+        enrollment.main(
+            [
+                "create",
+                "--owner-discord-user-id",
+                IVS,
+                "--user-label",
+                "Ivs",
+                "--ttl-seconds",
+                "3600",
+                "--root",
+                str(tmp_path / "forbidden-cli-root"),
+            ],
+            root=tmp_path,
+        )
 
 
 def test_phone_enrollment_web_wire_imports_one_credential_create_only(
