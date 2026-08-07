@@ -3124,6 +3124,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
         provider_tool_in_flight["yes"] = False
+        result["partial_tool_names"] = []
         return attempt_id
 
     def _cancel_current_stream_attempt(reason: str) -> None:
@@ -4105,7 +4106,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # Reset in-memory accumulators so the next
                         # attempt's chunks don't concat onto the dead
                         # stream's partial JSON.
-                        result["partial_tool_names"] = []
                         deltas_were_sent["yes"] = False
                         first_delta_fired["done"] = False
                         agent._emit_stream_drop(
