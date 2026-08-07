@@ -2257,6 +2257,17 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Gateway-native exception supervision. Disabled until an owning
+        # profile selects its command channel; this prevents cross-profile bot
+        # fallback and keeps normal installs silent by default.
+        "proactive_supervisor": {
+            "enabled": False,
+            "platform": "",
+            "chat_id": "",
+            "thread_id": "",
+            "chat_type": "",
+            "recovery_limit": 1,
+        },
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

@@ -34,6 +34,16 @@ def _make_event(
     )
 
 
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
+    """Wait for an async batching condition without a brittle wall-clock race."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            raise AssertionError("timed out waiting for batching condition")
+        await asyncio.sleep(0.01)
+
+
 # =====================================================================
 # Discord text batching
 # =====================================================================
@@ -69,7 +79,7 @@ class TestDiscordTextBatching:
         adapter.handle_message.assert_not_called()
 
         # Wait for flush
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args[0][0]
@@ -86,7 +96,7 @@ class TestDiscordTextBatching:
 
         adapter.handle_message.assert_not_called()
 
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -126,7 +136,7 @@ class TestMatrixTextBatching:
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -140,7 +150,7 @@ class TestMatrixTextBatching:
         adapter._enqueue_text_event(_make_event("second part", Platform.MATRIX))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text
@@ -180,7 +190,7 @@ class TestWeComTextBatching:
         adapter._enqueue_text_event(event)
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         assert adapter.handle_message.call_args[0][0].text == "hello world"
@@ -194,7 +204,7 @@ class TestWeComTextBatching:
         adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
 
         adapter.handle_message.assert_not_called()
-        await asyncio.sleep(0.2)
+        await _wait_until(lambda: getattr(adapter.handle_message, "call_count", 0) == 1)
 
         adapter.handle_message.assert_called_once()
         text = adapter.handle_message.call_args[0][0].text

@@ -243,6 +243,7 @@ class TestReplyToText:
         event = reply_text_adapter.handle_message.await_args.args[0]
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False
 
 
     @pytest.mark.asyncio
@@ -257,6 +258,60 @@ class TestReplyToText:
         event = reply_text_adapter.handle_message.await_args.args[0]
         assert event.reply_to_message_id == "555"
         assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False
+
+    @pytest.mark.asyncio
+    async def test_reference_to_own_message_records_provenance(self, reply_text_adapter):
+        resolved_msg = SimpleNamespace(
+            content="supervisor prompt",
+            author=SimpleNamespace(id=999),
+        )
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+
+        await reply_text_adapter._handle_message(_make_message(reference=ref))
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_text == "supervisor prompt"
+        assert event.reply_to_is_own_message is True
+
+    @pytest.mark.asyncio
+    async def test_reference_to_other_author_is_not_own(self, reply_text_adapter):
+        resolved_msg = SimpleNamespace(
+            content="forged supervisor prompt",
+            author=SimpleNamespace(id=123),
+        )
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+
+        await reply_text_adapter._handle_message(_make_message(reference=ref))
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_is_own_message is False
+
+    @pytest.mark.asyncio
+    async def test_gate_reply_bypasses_batch_without_losing_prior_message(
+        self, reply_text_adapter
+    ):
+        reply_text_adapter._text_batch_delay_seconds = 60
+        gate_prompt = SimpleNamespace(
+            content=(
+                "Decision needed\n"
+                "[kanban-gate:0123456789abcdef0123456789abcdef]"
+            ),
+            author=SimpleNamespace(id=999),
+        )
+        gate_reference = SimpleNamespace(message_id=555, resolved=gate_prompt)
+
+        await reply_text_adapter._handle_message(_make_message(content="preceding text"))
+        await reply_text_adapter._handle_message(
+            _make_message(content="approve deletion", reference=gate_reference)
+        )
+
+        events = [call.args[0] for call in reply_text_adapter.handle_message.await_args_list]
+        assert [event.text for event in events] == ["preceding text", "approve deletion"]
+        assert events[1].reply_to_is_own_message is True
+        assert "[kanban-gate:0123456789abcdef0123456789abcdef]" in (
+            events[1].reply_to_text or ""
+        )
 
 
 class TestYamlConfigLoading:

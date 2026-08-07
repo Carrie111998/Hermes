@@ -14560,6 +14560,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # A reply to a native Kanban gate prompt belongs to that existing task
+        # graph. Attach the answer and resume the blocked card before creating
+        # or mutating a conversational session. Slash commands still follow
+        # the normal control path.
+        if not is_internal and not event.get_command():
+            _gate_reply_candidate = False
+            try:
+                from gateway.kanban_proactive_supervisor import (
+                    consume_supervisor_reply,
+                    is_supervisor_gate_reply,
+                )
+
+                _gate_reply_candidate = is_supervisor_gate_reply(
+                    getattr(event, "reply_to_text", None),
+                    reply_to_is_own_message=bool(
+                        getattr(event, "reply_to_is_own_message", False)
+                    ),
+                )
+                _gate_reply = consume_supervisor_reply(
+                    reply_to_text=getattr(event, "reply_to_text", None),
+                    reply_to_message_id=getattr(event, "reply_to_message_id", None),
+                    answer=event.text or "",
+                    author=source.user_name or source.user_id or "user",
+                    platform=getattr(source.platform, "value", str(source.platform)),
+                    chat_id=source.chat_id,
+                    thread_id=source.thread_id or "",
+                    notifier_profile=(
+                        self._adapter_profile_for_source(source)
+                        or self._active_profile_name()
+                    ),
+                    reply_to_is_own_message=bool(
+                        getattr(event, "reply_to_is_own_message", False)
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Kanban supervisor reply handling failed: %s", exc)
+                if _gate_reply_candidate:
+                    return (
+                        "Could not process that Kanban decision, so no action "
+                        "was taken. Please retry your reply."
+                    )
+                _gate_reply = None
+            if _gate_reply is not None:
+                if _gate_reply.resumed:
+                    return (
+                        f"Resumed Kanban {_gate_reply.task_id} on "
+                        f"{_gate_reply.board} with your decision attached."
+                    )
+                return (
+                    f"Kanban {_gate_reply.task_id} is no longer waiting for "
+                    "that decision."
+                )
+            if _gate_reply_candidate:
+                return (
+                    "That Kanban gate is no longer active or could not be "
+                    "matched. No action was taken."
+                )
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

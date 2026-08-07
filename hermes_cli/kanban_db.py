@@ -134,6 +134,16 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Events that establish a new durable task-state generation for native
+# supervision. Informational events such as comments and heartbeats do not
+# invalidate a still-current block.
+SUPERVISOR_STATE_EVENT_KINDS = (
+    "created", "promoted", "claimed", "reclaimed", "completed", "archived",
+    "scheduled", "dependency_wait", "blocked", "gave_up",
+    "block_loop_detected", "status", "unblocked", "specified",
+    "supervisor_recovery", "supervisor_answered",
+)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -5964,6 +5974,176 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def supervisor_recover_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source_event_id: int,
+    source_kind: str,
+    reason: str,
+    recovery_limit: int,
+) -> tuple[bool, str]:
+    """Schedule one bounded, durable recovery for an agent-owned exception.
+
+    The recovery marker and status transition share one transaction. Replaying
+    the same supervisor tick after a crash therefore cannot spend the budget
+    twice or create an unblock loop. The budget is per task and survives
+    gateway restarts because it is counted from ``supervisor_recovery`` events.
+    """
+    limit = max(0, int(recovery_limit))
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False, "missing"
+
+        # The source event is a generation token, not just audit context. A
+        # dashboard move, manual unblock, later block, or successful recovery
+        # permanently invalidates an older blocking event.
+        state_placeholders = ",".join("?" for _ in SUPERVISOR_STATE_EVENT_KINDS)
+        current = conn.execute(
+            f"SELECT id, kind FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({state_placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *SUPERVISOR_STATE_EVENT_KINDS),
+        ).fetchone()
+        if (
+            current is None
+            or int(current["id"]) != int(source_event_id)
+            or str(current["kind"]) != str(source_kind)
+        ):
+            return False, "stale_event"
+        if task["status"] not in {"blocked", "triage"}:
+            return False, "not_blocked"
+
+        prior_rows = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'supervisor_recovery'",
+            (task_id,),
+        ).fetchall()
+        prior_source_ids: set[int] = set()
+        for row in prior_rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+                prior_source_ids.add(int(payload.get("source_event_id", -1)))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if int(source_event_id) in prior_source_ids:
+            return False, "already_recovered"
+        if len(prior_rows) >= limit:
+            return False, "budget_exhausted"
+
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'triage')",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, "status_changed"
+        comment = (
+            "Native Kanban supervisor scheduled a bounded recovery after "
+            f"{source_kind}: {reason[:500]}"
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'kanban-supervisor', ?, ?)",
+            (task_id, comment, now),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "supervisor_recovery",
+            {
+                "source_event_id": int(source_event_id),
+                "source_kind": source_kind,
+                "status": new_status,
+                "attempt": len(prior_rows) + 1,
+                "limit": limit,
+            },
+        )
+        return True, new_status
+
+
+def resume_supervisor_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_event_id: int,
+    answer: str,
+    author: str,
+) -> tuple[bool, str]:
+    """Attach a human gate answer and resume that same task graph atomically."""
+    if not answer or not answer.strip():
+        raise ValueError("answer is required")
+    if not author or not author.strip():
+        raise ValueError("author is required")
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False, "missing"
+        if task["status"] not in {"blocked", "triage"}:
+            return False, "not_waiting"
+        state_placeholders = ",".join("?" for _ in SUPERVISOR_STATE_EVENT_KINDS)
+        current = conn.execute(
+            f"SELECT id, kind FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({state_placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *SUPERVISOR_STATE_EVENT_KINDS),
+        ).fetchone()
+        if (
+            current is None
+            or int(current["id"]) != int(expected_event_id)
+            or str(current["kind"]) not in {
+                "blocked", "gave_up", "block_loop_detected"
+            }
+        ):
+            return False, "stale_gate"
+        undone_parent = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        new_status = "todo" if undone_parent else "ready"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, author.strip(), answer.strip(), now),
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'triage')",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, "status_changed"
+        _append_event(
+            conn,
+            task_id,
+            "supervisor_answered",
+            {
+                "author": author.strip(),
+                "status": new_status,
+                "source_event_id": int(expected_event_id),
+            },
+        )
+        return True, new_status
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7871,7 +8051,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'transient' "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (failures, error[:500], task_id),
                 )
@@ -7881,7 +8062,8 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = 'transient' "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
@@ -7900,6 +8082,7 @@ def _record_task_failure(
                     },
                 )
             payload = {
+                "kind": "transient",
                 "failures": failures,
                 "effective_limit": effective_limit,
                 "limit_source": limit_source,
@@ -9623,13 +9806,17 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
+    start_event_id: Optional[int] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
     for ``task_id``. Idempotent on (task, platform, chat, thread).
 
     New subscriptions start "caught up": ``last_event_id`` snaps to the
-    task's current ``MAX(task_events.id)`` at creation instead of the
-    schema default 0. A cursor of 0 on an already-active task made the
+    task's current ``MAX(task_events.id)`` at creation unless
+    ``start_event_id`` explicitly selects an earlier cursor. The latter is
+    reserved for native discovery of an already-written blocking event.
+    The normal snapshot replaces the schema default 0. A cursor of 0 on an
+    already-active task made the
     gateway notifier replay every historical terminal event on its next
     tick — and with many stale subs, a single boot-time burst of 100+
     messages (issue #29905). Subscribers only want events that occur
@@ -9645,7 +9832,10 @@ def add_notify_sub(
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
                  notifier_profile, delivery_metadata, created_at, last_event_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+                    CASE WHEN ? IS NULL
+                         THEN COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0)
+                         ELSE MAX(0, ?)
+                    END)
             """,
             (
                 task_id,
@@ -9657,7 +9847,9 @@ def add_notify_sub(
                 notifier_profile,
                 metadata_json,
                 now,
+                start_event_id,
                 task_id,
+                start_event_id,
             ),
         )
         if chat_type:

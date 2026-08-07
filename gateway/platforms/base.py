@@ -5661,6 +5661,55 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
+            # Authenticated replies to native Kanban supervisor prompts are
+            # control-plane answers, not follow-up agent turns. Preserve the
+            # quoted gate marker/provenance and dispatch them directly while
+            # the original worker remains active. Queueing or merging them
+            # would erase the capability binding and can deadlock the graph.
+            if not cmd:
+                from gateway.kanban_proactive_supervisor import (
+                    is_supervisor_gate_reply,
+                )
+
+                _is_supervisor_gate = is_supervisor_gate_reply(
+                    event.reply_to_text,
+                    reply_to_is_own_message=event.reply_to_is_own_message,
+                )
+
+                if _is_supervisor_gate:
+                    logger.debug(
+                        "[%s] Routing authenticated supervisor reply for %s",
+                        self.name,
+                        session_key,
+                    )
+                    try:
+                        _thread_meta = _thread_metadata_for_source(
+                            event.source, _reply_anchor_for_event(event)
+                        )
+                        response = await self._message_handler(event)
+                        _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        if _text:
+                            _r = await self._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=_text,
+                                reply_to=_reply_anchor_for_event(event),
+                                metadata=_mark_notify_metadata(_thread_meta),
+                            )
+                            if _eph_ttl > 0 and _r.success and _r.message_id:
+                                self._schedule_ephemeral_delete(
+                                    chat_id=event.source.chat_id,
+                                    message_id=_r.message_id,
+                                    ttl_seconds=_eph_ttl,
+                                )
+                    except Exception as e:
+                        logger.error(
+                            "[%s] Supervisor reply dispatch failed: %s",
+                            self.name,
+                            e,
+                            exc_info=True,
+                        )
+                    return
+
             # Clarify reply bypass: if the agent is blocked on a
             # clarify_tool call, the next non-command message in this
             # session MUST reach the runner so typed numeric choices,
