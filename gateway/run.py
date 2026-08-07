@@ -25727,6 +25727,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pending_event = None
                 pending = None
 
+            # Tracks (chat_id, session_key) tuples for which the queued-follow-up
+            # fallback path already delivered ``first_response`` via
+            # ``adapter.send()`` (#81052). The normal completion pipeline checks
+            # this set before re-sending the same text, so a slow turn whose
+            # stream consumer didn't confirm final delivery cannot duplicate the
+            # message. The set is scoped to this single pending-message handling
+            # block; ``session_key`` is constant within it, ``chat_id`` matches
+            # the inbound source, and at most one fallback send runs per chat.
+            _delivered_in_fallback = set()
+
             if pending_event or pending:
                 logger.debug("Processing pending message: '%s...'", pending[:40])
 
@@ -25807,6 +25817,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 first_response,
                                 metadata=_status_thread_metadata,
                             )
+                            # Mark this chat as having received the turn-final
+                            # response via the queued-follow-up fallback send
+                            # so the subsequent normal completion pipeline does
+                            # not re-send the same ``first_response`` (#81052).
+                            # ``_delivered_in_fallback`` lives in this turn's
+                            # pending-message scope; the set is bounded by the
+                            # inbound chat and the request lifetime.
+                            _delivered_in_fallback.add((source.chat_id, session_key))
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -26074,13 +26092,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered or (source.chat_id, session_key) in _delivered_in_fallback):
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s fallback=%s).",
                     session_key or "?",
                     _streamed,
                     _previewed,
                     _content_delivered,
+                    (source.chat_id, session_key) in _delivered_in_fallback,
                 )
                 response["already_sent"] = True
             elif not _is_empty_sentinel and not _transformed and _stale_finalized and _sc is not None:
