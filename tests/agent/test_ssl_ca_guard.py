@@ -19,6 +19,26 @@ def test_healthy_bundle_passes(monkeypatch):
     verify_ca_bundle()
 
 
+def test_truststore_backend_without_cert_enumeration_passes(monkeypatch):
+    """A truststore SSLContext may load CAs but not support enumeration."""
+    for key in (
+        "HERMES_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    class NonEnumerableContext:
+        def get_ca_certs(self):
+            raise NotImplementedError
+
+    monkeypatch.setattr(
+        "agent.ssl_guard.ssl.create_default_context",
+        lambda **_kwargs: NonEnumerableContext(),
+    )
+
+    verify_ca_bundle()
 
 
 def test_empty_certifi_bundle_raises_ssl_error(monkeypatch, tmp_path):
