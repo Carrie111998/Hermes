@@ -154,13 +154,27 @@ def _wait_ready(
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        # The official image starts a temporary postmaster while initdb and
+        # entrypoint setup run.  pg_isready can briefly accept that server
+        # immediately before it shuts down, so it is not sufficient evidence
+        # that the container reached its final exec'd postgres process.
+        pid_one = subprocess.run(
+            ["docker", "exec", name, "cat", "/proc/1/comm"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         probe = subprocess.run(
             ["docker", "exec", name, "pg_isready", "-U", user],
             capture_output=True,
             text=True,
             check=False,
         )
-        if probe.returncode == 0:
+        if (
+            pid_one.returncode == 0
+            and pid_one.stdout.strip() == "postgres"
+            and probe.returncode == 0
+        ):
             return
         time.sleep(0.5)
     raise RuntimeError("ephemeral PostgreSQL did not become ready")
