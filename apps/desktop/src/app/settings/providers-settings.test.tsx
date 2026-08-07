@@ -7,12 +7,14 @@ import type { EnvVarInfo, OAuthProvider } from '@/types/hermes'
 const listOAuthProviders = vi.fn()
 const disconnectOAuthProvider = vi.fn()
 const getEnvVars = vi.fn()
+const getCredentialPool = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const onboarding = atom({ manual: false })
 
 vi.mock('@/hermes', () => ({
   disconnectOAuthProvider: (providerId: string) => disconnectOAuthProvider(providerId),
+  getCredentialPool: () => getCredentialPool(),
   getEnvVars: () => getEnvVars(),
   listOAuthProviders: () => listOAuthProviders()
 }))
@@ -60,6 +62,7 @@ function keyVar(patch: Partial<EnvVarInfo> = {}): EnvVarInfo {
 beforeEach(() => {
   onboarding.set({ manual: false })
   getEnvVars.mockResolvedValue({})
+  getCredentialPool.mockResolvedValue({ providers: [] })
   disconnectOAuthProvider.mockResolvedValue({ ok: true, provider: 'nous' })
   listOAuthProviders.mockResolvedValue({
     providers: [provider('nous', true), provider('minimax-oauth', false)]
@@ -202,5 +205,30 @@ describe('ProvidersSettings', () => {
     fireEvent.click(row)
 
     await waitFor(() => expect(startManualLocalEndpoint).toHaveBeenCalledWith(null))
+  })
+
+  it('shows a per-credential pool status only for a provider with >1 stored credential', async () => {
+    // Regression: multi-credential providers (e.g. a personal + a shared
+    // Copilot key) had no Desktop UI to see which stored credential is
+    // actually active. See issue #80828.
+    getCredentialPool.mockResolvedValue({
+      providers: [
+        {
+          provider: 'nous',
+          entries: [
+            { index: 1, label: 'wadefengx', priority: 0, request_count: 12, token_preview: 'sk-…abcd', has_refresh: false, last_status: 'ok' },
+            { index: 2, label: 'shared-fallback', priority: 1, request_count: 0, token_preview: 'sk-…wxyz', has_refresh: false, last_status: 'exhausted' }
+          ]
+        }
+      ]
+    })
+
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('wadefengx')).toBeTruthy()
+    expect(screen.getByText('shared-fallback')).toBeTruthy()
+    expect(screen.getByText('exhausted')).toBeTruthy()
+    // minimax-oauth has no pool entries in this test → no status list rendered for it.
+    expect(screen.queryByText('sk-…wxyz')).toBeNull()
   })
 })
