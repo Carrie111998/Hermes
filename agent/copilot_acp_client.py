@@ -122,6 +122,12 @@ def _jsonrpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     }
 
 
+def _acp_auto_approve_enabled() -> bool:
+    """Return True when HERMES_ACP_AUTO_APPROVE requests headless allow-always."""
+    raw = os.getenv("HERMES_ACP_AUTO_APPROVE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _permission_denied(message_id: Any) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -132,6 +138,76 @@ def _permission_denied(message_id: Any) -> dict[str, Any]:
             }
         },
     }
+
+
+def _permission_selected(message_id: Any, option_id: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "result": {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": option_id,
+            }
+        },
+    }
+
+
+def _pick_auto_approve_option_id(params: dict[str, Any]) -> str | None:
+    """Choose the strongest allow option offered by an ACP permission request.
+
+    Claude Code ACP offers ``optionId: "allow_always"`` for normal tool
+    prompts, but mode-switch prompts use other ids with ``kind:
+    "allow_always"`` (e.g. ``bypassPermissions``). Prefer the literal
+    ``allow_always`` id when present, then another offered allow-always option,
+    and finally an offered allow-once option. Return ``None`` when the request
+    offers no allow option; never synthesize an option id that was not offered.
+    """
+    options = params.get("options") or []
+    always_ids: list[str] = []
+    once_ids: list[str] = []
+    if isinstance(options, list):
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            option_id = str(opt.get("optionId") or opt.get("option_id") or "").strip()
+            if not option_id:
+                continue
+            kind = str(opt.get("kind") or "").strip()
+            if kind == "allow_always" or option_id in {
+                "allow_always",
+                "bypassPermissions",
+                "acceptEdits",
+                "auto",
+            }:
+                always_ids.append(option_id)
+            elif kind == "allow_once" or option_id in {
+                "allow_once",
+                "allow",
+                "default",
+            }:
+                once_ids.append(option_id)
+
+    for preferred in ("allow_always", "bypassPermissions", "acceptEdits", "auto"):
+        if preferred in always_ids:
+            return preferred
+    if always_ids:
+        return always_ids[0]
+    for preferred in ("allow_once", "allow", "default"):
+        if preferred in once_ids:
+            return preferred
+    if once_ids:
+        return once_ids[0]
+    return None
+
+
+def _permission_response(message_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Resolve session/request_permission — auto-approve when enabled, else cancel."""
+    if _acp_auto_approve_enabled():
+        option_id = _pick_auto_approve_option_id(params)
+        if option_id is not None:
+            return _permission_selected(message_id, option_id)
+    return _permission_denied(message_id)
 
 
 def _format_messages_as_prompt(
@@ -700,7 +776,7 @@ class CopilotACPClient:
         params = msg.get("params") or {}
 
         if method == "session/request_permission":
-            response = _permission_denied(message_id)
+            response = _permission_response(message_id, params)
         elif method == "fs/read_text_file":
             try:
                 path = _ensure_path_within_cwd(str(params.get("path") or ""), cwd)

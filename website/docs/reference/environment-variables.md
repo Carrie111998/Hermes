@@ -32,6 +32,7 @@ Hermes reads environment variables from the process environment and, for user-ma
 | `COPILOT_CLI_PATH` | Alias for `HERMES_COPILOT_ACP_COMMAND` |
 | `HERMES_COPILOT_ACP_ARGS` | Override Copilot ACP arguments (default: `--acp --stdio`) |
 | `COPILOT_ACP_BASE_URL` | Override Copilot ACP base URL |
+| `HERMES_ACP_AUTO_APPROVE` | Opt-in: when set to `1`/`true`/`yes`/`on`, auto-approve ACP `session/request_permission` requests with an `allow_always`-class option instead of cancelling them. Off by default (requests are cancelled). Intended for headless/gateway contexts (Discord, cron) that have no interactive approval UI — enable only in trusted, operator-controlled environments. |
 | `COPILOT_API_BASE_URL` | Override the Copilot API base URL (`copilot` provider) |
 | `GLM_API_KEY` | z.ai / ZhipuAI GLM API key ([z.ai](https://z.ai)) |
 | `ZAI_API_KEY` | Alias for `GLM_API_KEY` |

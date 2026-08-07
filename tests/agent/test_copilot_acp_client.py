@@ -69,7 +69,151 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertTrue(payload)
         return json.loads(payload)
 
+    def test_request_permission_cancels_without_auto_approve(self) -> None:
+        with patch.dict(os.environ, {"HERMES_ACP_AUTO_APPROVE": ""}, clear=False):
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "session/request_permission",
+                    "params": {
+                        "options": [
+                            {
+                                "kind": "allow_always",
+                                "name": "Always allow",
+                                "optionId": "allow_always",
+                            },
+                            {
+                                "kind": "allow_once",
+                                "name": "Allow",
+                                "optionId": "allow",
+                            },
+                        ],
+                    },
+                },
+                cwd="/tmp",
+            )
 
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
+
+    def test_request_permission_auto_approves_allow_always(self) -> None:
+        with patch.dict(os.environ, {"HERMES_ACP_AUTO_APPROVE": "1"}, clear=False):
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "session/request_permission",
+                    "params": {
+                        "options": [
+                            {
+                                "kind": "allow_always",
+                                "name": "Always allow Bash",
+                                "optionId": "allow_always",
+                            },
+                            {
+                                "kind": "allow_once",
+                                "name": "Allow",
+                                "optionId": "allow",
+                            },
+                        ],
+                    },
+                },
+                cwd="/tmp",
+            )
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "selected", "optionId": "allow_always"},
+        )
+
+    def test_request_permission_auto_approves_mode_switch_bypass(self) -> None:
+        """Plan-exit prompts offer mode ids, not literal allow_always."""
+        with patch.dict(os.environ, {"HERMES_ACP_AUTO_APPROVE": "true"}, clear=False):
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "session/request_permission",
+                    "params": {
+                        "options": [
+                            {
+                                "kind": "allow_always",
+                                "name": "Yes, and bypass permissions",
+                                "optionId": "bypassPermissions",
+                            },
+                            {
+                                "kind": "allow_once",
+                                "name": "Yes, and manually approve edits",
+                                "optionId": "default",
+                            },
+                        ],
+                    },
+                },
+                cwd="/tmp",
+            )
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "selected", "optionId": "bypassPermissions"},
+        )
+
+    def test_request_permission_auto_approves_allow_once_when_only_allow_option(self) -> None:
+        with patch.dict(os.environ, {"HERMES_ACP_AUTO_APPROVE": "yes"}, clear=False):
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "session/request_permission",
+                    "params": {
+                        "options": [
+                            {
+                                "kind": "allow_once",
+                                "name": "Allow once",
+                                "optionId": "allow-this-time",
+                            },
+                            {
+                                "kind": "reject_once",
+                                "name": "Reject",
+                                "optionId": "reject",
+                            },
+                        ],
+                    },
+                },
+                cwd="/tmp",
+            )
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "selected", "optionId": "allow-this-time"},
+        )
+
+    def test_request_permission_auto_approve_cancels_without_allow_option(self) -> None:
+        with patch.dict(os.environ, {"HERMES_ACP_AUTO_APPROVE": "on"}, clear=False):
+            response = self._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 11,
+                    "method": "session/request_permission",
+                    "params": {
+                        "options": [
+                            {
+                                "kind": "reject_once",
+                                "name": "Reject",
+                                "optionId": "reject",
+                            }
+                        ],
+                    },
+                },
+                cwd="/tmp",
+            )
+
+        self.assertEqual(
+            response["result"]["outcome"],
+            {"outcome": "cancelled"},
+        )
 
     def test_read_text_file_redacts_sensitive_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
