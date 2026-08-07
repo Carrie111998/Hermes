@@ -69,6 +69,11 @@ def hash_monitor_output(output: str) -> str:
     return hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _hash_monitor_bytes(output: bytes) -> str:
+    """Hash exact source bytes before lossy decoding for prompt display."""
+    return hashlib.sha256(output).hexdigest()
+
+
 def build_monitor_diff(old: str, new: str) -> str:
     """Unified diff of old vs new monitor output, capped at MAX_DIFF_CHARS."""
     diff = "\n".join(
@@ -118,8 +123,8 @@ def clear_monitor_snapshot(job_id: str) -> None:
         logger.warning("Monitor: failed to clear last output for %r: %s", job_id, exc)
 
 
-def _fetch_monitor_url(url: str) -> tuple[bool, str]:
-    """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
+def _fetch_monitor_url_bytes(url: str) -> tuple[bool, bytes | str]:
+    """Bounded GET of a monitor URL. Success returns exact body bytes."""
     from tools.url_safety import create_ssrf_safe_client, is_safe_url
 
     current_url = str(url)
@@ -154,30 +159,57 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
                                 f"monitor_url response exceeds {MAX_URL_BYTES} bytes"
                             )
                         chunks.append(chunk)
-                    body = b"".join(chunks)
-                    return True, body.decode("utf-8", errors="replace")
+                    return True, b"".join(chunks)
         return False, f"monitor_url exceeded {MAX_URL_REDIRECTS} redirects"
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 
 
-def _run_monitor_source(job: dict) -> tuple[bool, str]:
-    """Run the job's monitor source (script or URL). Returns (ok, output)."""
+def _fetch_monitor_url(url: str) -> tuple[bool, str]:
+    """Text compatibility wrapper around the exact-byte URL fetcher."""
+    ok, result = _fetch_monitor_url_bytes(url)
+    if not ok:
+        return False, str(result)
+    return True, bytes(result).decode("utf-8", errors="replace")
+
+
+def _redact_monitor_output(raw_output: bytes) -> str:
+    """Decode source bytes for prompt/snapshot use without hashing this view."""
+    output = raw_output.decode("utf-8", errors="replace")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(output)
+    except Exception as exc:
+        logger.warning("Monitor: failed to redact source output: %s", exc)
+        return "[REDACTED - redaction failed]"
+
+
+def _run_monitor_source(job: dict) -> tuple[bool, str, bytes]:
+    """Run one monitor source, returning display text plus exact hash bytes."""
     monitor_script = (job.get("monitor_script") or "").strip()
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
         from cron.scheduler import _run_job_script
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(
+        ok, result = _run_job_script(
             monitor_script,
             workdir=workdir,
-            preserve_output=True,
+            raw_output=True,
         )
+        if not ok:
+            return False, str(result), b""
+        raw_output = bytes(result)
+        return True, _redact_monitor_output(raw_output), raw_output
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
-        return _fetch_monitor_url(monitor_url)
-    return False, "monitor job has neither monitor_script nor monitor_url"
+        ok, result = _fetch_monitor_url_bytes(monitor_url)
+        if not ok:
+            return False, str(result), b""
+        raw_output = bytes(result)
+        return True, _redact_monitor_output(raw_output), raw_output
+    return False, "monitor job has neither monitor_script nor monitor_url", b""
 
 
 def job_has_monitor(job: dict) -> bool:
@@ -193,11 +225,11 @@ def check_monitor(job: dict) -> MonitorOutcome:
     On failure nothing is persisted.
     """
     job_id = str(job.get("id") or "")
-    ok, output = _run_monitor_source(job)
+    ok, output, raw_output = _run_monitor_source(job)
     if not ok:
         return MonitorOutcome(ok=False, error=output)
 
-    new_hash = hash_monitor_output(output)
+    new_hash = _hash_monitor_bytes(raw_output)
     raw_state = job.get("monitor_state")
     state = raw_state if isinstance(raw_state, dict) else {}
     last_hash = state.get("last_output_hash")
@@ -228,25 +260,37 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Current output\n\n```\n{shown_output}\n```"
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
+    if _persist_monitor_state(job, new_hash, output) is False:
+        # The source was edited or the job removed while this observation was
+        # in flight. Do not run the agent for obsolete data; the new source
+        # keeps its empty baseline and will run normally on its next tick.
+        return MonitorOutcome(ok=True, changed=False)
     return MonitorOutcome(
         ok=True, changed=True, first_run=first_run, context_block=context_block
     )
 
 
-def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
-    from cron.jobs import _hermes_now, update_job
+def _persist_monitor_state(job: dict, new_hash: str, output: str) -> Optional[bool]:
+    from cron.jobs import _hermes_now, update_monitor_state_if_source_matches
 
+    job_id = job["id"]
     _write_last_output(job_id, output)
     try:
-        update_job(
+        persisted = update_monitor_state_if_source_matches(
             job_id,
-            {
-                "monitor_state": {
-                    "last_output_hash": new_hash,
-                    "last_changed_at": _hermes_now().isoformat(),
-                }
+            expected_monitor_script=job.get("monitor_script"),
+            expected_monitor_url=job.get("monitor_url"),
+            monitor_state={
+                "last_output_hash": new_hash,
+                "last_changed_at": _hermes_now().isoformat(),
             },
         )
+        if not persisted:
+            logger.info(
+                "Monitor: discarded stale state for %r because its source changed",
+                job_id,
+            )
+        return persisted
     except Exception as exc:
         logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
+        return None

@@ -203,6 +203,53 @@ def test_update_job_resets_baseline_when_monitor_source_changes(hermes_env):
     assert not _snapshot_path(job["id"]).exists()
 
 
+def test_stale_monitor_run_cannot_overwrite_new_source_baseline(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _persist_monitor_state
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    update_job(old_job["id"], {"monitor_script": "two.sh"})
+    assert _persist_monitor_state(old_job, "stale-hash", "old output") is False
+
+    current = get_job(old_job["id"])
+    assert current["monitor_script"] == "two.sh"
+    assert current["monitor_state"] is None
+
+
+def test_source_edit_during_check_suppresses_obsolete_agent_run(
+    hermes_env, monkeypatch
+):
+    import cron.monitor as monitor
+    from cron.jobs import create_job, get_job, update_job
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    def run_then_edit(_job):
+        update_job(old_job["id"], {"monitor_script": "two.sh"})
+        return True, "old output", b"old output"
+
+    monkeypatch.setattr(monitor, "_run_monitor_source", run_then_edit)
+
+    outcome = monitor.check_monitor(old_job)
+
+    assert outcome.ok is True
+    assert outcome.changed is False
+    assert get_job(old_job["id"])["monitor_state"] is None
+
+
 # ---------------------------------------------------------------------------
 # cron.monitor: hashing + diff unit behavior
 # ---------------------------------------------------------------------------
@@ -375,6 +422,39 @@ def test_boundary_whitespace_change_runs_agent(hermes_env, monkeypatch):
 
     assert observed["agent_runs"] == 2
     assert "+state A " in observed["prompts"][1]
+
+
+def test_non_utf8_byte_change_runs_agent(hermes_env, monkeypatch):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler import run_job
+
+    _write_script(
+        hermes_env,
+        "raw.py",
+        "import sys\nsys.stdout.buffer.write(b'\\xff')\n",
+    )
+    job = create_job(
+        prompt="Summarize what changed",
+        schedule="every 5m",
+        monitor_script="raw.py",
+        deliver="local",
+        provider="test",
+        model="test-model",
+    )
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    run_job(job)
+    _write_script(
+        hermes_env,
+        "raw.py",
+        "import sys\nsys.stdout.buffer.write(b'\\xfe')\n",
+    )
+    run_job(get_job(job["id"]))
+
+    # Both bytes decode to the same replacement character for display, so only
+    # hashing the exact source bytes can detect this change.
+    assert observed["agent_runs"] == 2
 
 
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):

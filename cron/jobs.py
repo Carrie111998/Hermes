@@ -1923,6 +1923,42 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def update_monitor_state_if_source_matches(
+    job_id: str,
+    *,
+    expected_monitor_script: Optional[str],
+    expected_monitor_url: Optional[str],
+    monitor_state: Dict[str, Any],
+) -> bool:
+    """Persist monitor state only while the observed source is still current.
+
+    Source execution intentionally happens outside the jobs lock. This
+    compare-and-set prevents an old in-flight tick from restoring source A's
+    hash after an operator has changed the job to source B and reset its
+    baseline.
+    """
+    expected_source = (
+        _normalize_job_optional_text(expected_monitor_script),
+        _normalize_job_optional_text(expected_monitor_url),
+    )
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job.get("id") != job_id:
+                continue
+            current_source = (
+                _normalize_job_optional_text(job.get("monitor_script")),
+                _normalize_job_optional_text(job.get("monitor_url")),
+            )
+            if current_source != expected_source:
+                return False
+            job["monitor_state"] = dict(monitor_state)
+            jobs[i] = job
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
