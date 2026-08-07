@@ -7228,3 +7228,45 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Subpackage layout
+# ---------------------------------------------------------------------------
+# tools/mcp_tool/ was created by refactoring the former tools/mcp_tool.py
+# god-module into a package.  The package __init__ (this file) remains the
+# canonical namespace: it owns all module-level state (including the
+# reassignable _mcp_loop/_mcp_thread globals) and all function/class
+# definitions, so the runtime semantics, cross-module `global` rebinding,
+# and monkeypatch compatibility (tests patch attributes on tools.mcp_tool
+# itself) are preserved exactly.
+#
+# The sibling submodules are re-export facades that expose the public surface
+# by concern so that `from tools.mcp_tool.<area> import <name>` also works:
+#
+#   errors.py      - InvalidMcpUrlError / NonMcpEndpointError / failure
+#                    classification + error sanitization
+#   resources.py   - MCP resource image/audio rendering helpers
+#   handlers.py    - SamplingHandler / ElicitationHandler
+#   server_task.py - MCPServerTask
+#   reconnect.py   - reconnect / auth-recovery / session-expiry helpers
+#   loop.py        - background event-loop management
+#   discovery.py   - server discovery / connection / tool-handler factories
+#   registry.py    - tool registration / discovery / status helpers
+#   lifecycle.py   - shutdown / orphan reaping / loop teardown
+#   utils.py       - stdio / transport / env-building helpers
+
+
+# Expose the submodules as package attributes (mirrors the tools.approval
+# refactor convention) so ``tools.mcp_tool.errors`` etc. resolve without an
+# explicit submodule import.
+from tools.mcp_tool import errors  # noqa: E402,F401
+from tools.mcp_tool import resources  # noqa: E402,F401
+from tools.mcp_tool import handlers  # noqa: E402,F401
+from tools.mcp_tool import server_task  # noqa: E402,F401
+from tools.mcp_tool import reconnect  # noqa: E402,F401
+from tools.mcp_tool import loop  # noqa: E402,F401
+from tools.mcp_tool import discovery  # noqa: E402,F401
+from tools.mcp_tool import registry  # noqa: E402,F401
+from tools.mcp_tool import lifecycle  # noqa: E402,F401
+from tools.mcp_tool import utils  # noqa: E402,F401

@@ -22,18 +22,43 @@ logger = logging.getLogger(__name__)
 # Module Registry
 # ═══════════════════════════════════════════════════════════════════
 
-STM_MODULES: Dict[str, Dict[str, Any]] = {}
+class STMRegistry:
+    """Isolated registry of STM transform modules.
+
+    Use the module-level ``_registry`` instance for production.
+    Tests should construct a fresh ``STMRegistry()`` to avoid sharing
+    state with modules registered at import time.
+    """
+
+    def __init__(self) -> None:
+        self._modules: Dict[str, Dict[str, Any]] = {}
+
+    def register(self, name: str, description: str):
+        """Decorator to register an STM module with this registry."""
+        def decorator(fn: Callable[[str], str]):
+            self._modules[name] = {
+                "name": name,
+                "description": description,
+                "transform": fn,
+            }
+            return fn
+        return decorator
+
+    def get(self, name: str) -> Optional[Dict[str, Any]]:
+        return self._modules.get(name)
+
+    def list(self) -> List[Dict[str, str]]:
+        return [{"name": m["name"], "description": m["description"]}
+                for m in self._modules.values()]
+
+
+# Module-level default instance — production code uses this.
+_registry = STMRegistry()
 
 
 def register(name: str, description: str):
-    """Decorator to register an STM module."""
-    def decorator(fn: Callable[[str], str]):
-        STM_MODULES[name] = {
-            "name": name,
-            "description": description,
-            "transform": fn,
-        }
-        return fn
+    """Register a module with the default registry (used by @register decorators)."""
+    return _registry.register(name, description)
     return decorator
 
 
@@ -142,7 +167,7 @@ def apply_stm(text: str, module_names: List[str]) -> str:
     """
     result = text
     for name in module_names:
-        module = STM_MODULES.get(name)
+        module = _registry.get(name)
         if module:
             try:
                 result = module["transform"](result)
@@ -155,10 +180,7 @@ def apply_stm(text: str, module_names: List[str]) -> str:
 
 def list_modules() -> List[Dict[str, str]]:
     """List available STM modules."""
-    return [
-        {"name": m["name"], "description": m["description"]}
-        for m in STM_MODULES.values()
-    ]
+    return _registry.list()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -167,11 +189,11 @@ def list_modules() -> List[Dict[str, str]]:
 
 def is_enabled(cfg: Dict[str, Any]) -> bool:
     """Check if STM is enabled in config."""
-    stm = cfg.get("stm") or {}
-    return bool(stm.get("enabled", False))
+    from agent.local_ext_utils import cfg_section
+    return bool(cfg_section(cfg, "stm").get("enabled", False))
 
 
 def get_modules(cfg: Dict[str, Any]) -> List[str]:
     """Get configured STM module list."""
-    stm = cfg.get("stm") or {}
-    return stm.get("modules") or []
+    from agent.local_ext_utils import cfg_section
+    return cfg_section(cfg, "stm").get("modules") or []

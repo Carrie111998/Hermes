@@ -53,6 +53,22 @@ from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
 )
+from agent.bandit_router import (
+    is_enabled as _bandit_is_enabled,
+    select_model as _bandit_select,
+    get_candidates_from_config as _bandit_get_candidates,
+    get_quality_floor as _bandit_get_quality_floor,
+    record_outcome as _bandit_record_outcome,
+)
+from agent.autotune import (
+    is_enabled as _autotune_is_enabled,
+    compute_params as _autotune_compute_params,
+)
+from agent.stm_transforms import (
+    is_enabled as _stm_is_enabled,
+    apply_stm as _stm_apply,
+    get_modules as _stm_get_modules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3526,14 +3542,8 @@ def run_job(
         _bandit_decision = None
         if not job.get("model"):
             try:
-                from agent.bandit_router import (
-                    is_enabled as bandit_enabled,
-                    select_model as bandit_select,
-                    get_candidates_from_config,
-                    get_quality_floor,
-                )
-                if bandit_enabled(_cfg):
-                    _bandit_candidates = get_candidates_from_config(_cfg)
+                if _bandit_is_enabled(_cfg):
+                    _bandit_candidates = _bandit_get_candidates(_cfg)
                     if _bandit_candidates:
                         _bandit_ctx = {
                             "prompt": job.get("prompt", ""),
@@ -3542,8 +3552,8 @@ def run_job(
                             "has_script": bool(job.get("script")),
                             "no_agent": bool(job.get("no_agent")),
                         }
-                        _bandit_decision = bandit_select(
-                            _bandit_ctx, _bandit_candidates, get_quality_floor(_cfg)
+                        _bandit_decision = _bandit_select(
+                            _bandit_ctx, _bandit_candidates, _bandit_get_quality_floor(_cfg)
                         )
                         model = _bandit_decision.model
                         logger.info(
@@ -3557,9 +3567,8 @@ def run_job(
         # ── AutoTune: compute context-adaptive sampling params ──
         _autotune_params = None
         try:
-            from agent.autotune import is_enabled as autotune_enabled, compute_params
-            if autotune_enabled(_cfg):
-                _autotune_params = compute_params(
+            if _autotune_is_enabled(_cfg):
+                _autotune_params = _autotune_compute_params(
                     message=job.get("prompt", ""),
                     toolsets=job.get("enabled_toolsets"),
                     skills=job.get("skills"),
@@ -3811,13 +3820,12 @@ def run_job(
         # ── STM: post-process response before delivery ──
         if final_response:
             try:
-                from agent.stm_transforms import is_enabled as stm_enabled, apply_stm, get_modules
-                if stm_enabled(_cfg):
-                    _stm_modules = get_modules(_cfg)
+                if _stm_is_enabled(_cfg):
+                    _stm_modules = _stm_get_modules(_cfg)
                     if _stm_modules:
-                        final_response = apply_stm(final_response, _stm_modules)
+                        final_response = _stm_apply(final_response, _stm_modules)
             except Exception:
-                pass
+                logger.warning("Job '%s': STM post-processing failed", job_id, exc_info=True)
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -3842,10 +3850,9 @@ def run_job(
         # ── Bandit Router: record success outcome ──
         if _bandit_decision is not None:
             try:
-                from agent.bandit_router import record_outcome
-                record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=True)
+                _bandit_record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=True)
             except Exception:
-                pass
+                logger.warning("Job '%s': bandit outcome record (success) failed", job_id, exc_info=True)
 
         return True, output, final_response, None
         
@@ -3856,10 +3863,9 @@ def run_job(
         # ── Bandit Router: record failure outcome ──
         if _bandit_decision is not None:
             try:
-                from agent.bandit_router import record_outcome
-                record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=False)
+                _bandit_record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=False)
             except Exception:
-                pass
+                logger.warning("Job '%s': bandit outcome record (failure) failed", job_id, exc_info=True)
         
         output = f"""# Cron Job: {job_name} (FAILED)
 

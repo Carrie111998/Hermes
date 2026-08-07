@@ -25,22 +25,36 @@ Enable via config.yaml:
       quality_floor: 0.6
 """
 
-import json
 import logging
 import random
 import time
+
+# Module-level RNG instance. Production code uses this; tests can pass their
+# own seeded random.Random to select_model() for deterministic replay.
+_rng = random.Random()
 from dataclasses import dataclass, asdict
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+from hermes_constants import get_hermes_home
+from agent.local_ext_utils import JsonStateStore, cfg_section
+
+# ───────────────────────────────────────────────────────────────────
+# State store (process-safe, replaces hardcoded Path + bare I/O)
+# ───────────────────────────────────────────────────────────────────
+def _default_state() -> Dict[str, Any]:
+    return {"version": 1, "priors": {}, "outcomes": [], "updated": None}
+
+_store = JsonStateStore(
+    get_hermes_home() / "bandit_state.json",
+    default_factory=_default_state,
+)
 
 # Complexity buckets
 SIMPLE = "simple"
 MODERATE = "moderate"
 COMPLEX = "complex"
 
-STATE_FILE = Path("~/.hermes/bandit_state.json").expanduser()
 MAX_OUTCOMES_HISTORY = 200
 
 
@@ -139,24 +153,16 @@ def classify_complexity(ctx: Dict[str, Any]) -> str:
 
 def _load_state() -> Dict[str, Any]:
     """Load bandit state from disk. Returns fresh state if missing/corrupt."""
-    try:
-        if STATE_FILE.exists():
-            data = json.loads(STATE_FILE.read_text())
-            if data.get("version") == 1:
-                return data
-    except Exception as e:
-        logger.warning("Bandit state load failed, using fresh state: %s", e)
-    return {"version": 1, "priors": {}, "outcomes": [], "updated": None}
+    data = _store.load()
+    if data.get("version") == 1:
+        return data
+    return _default_state()
 
 
 def _save_state(state: Dict[str, Any]) -> None:
     """Persist bandit state to disk."""
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        STATE_FILE.write_text(json.dumps(state, indent=2))
-    except Exception as e:
-        logger.warning("Bandit state save failed: %s", e)
+    state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _store.save(state)
 
 
 def _get_prior(state: Dict, bucket: str, model: str) -> Dict[str, float]:
@@ -176,6 +182,7 @@ def select_model(
     task_context: Dict[str, Any],
     candidates: List[ModelCandidate],
     quality_floor: float = 0.6,
+    rng: Optional[random.Random] = None,
 ) -> RouteDecision:
     """Thompson sample → pick cheapest viable model.
 
@@ -183,10 +190,13 @@ def select_model(
         task_context: dict with prompt, toolsets, skills, has_script, no_agent
         candidates: list of ModelCandidate (ordered doesn't matter)
         quality_floor: minimum sampled θ to consider viable
+        rng: optional seeded Random instance for deterministic replay;
+             defaults to the module-level ``_rng``
 
     Returns:
         RouteDecision with chosen model, bucket, sample value, and reason
     """
+    _r = rng if rng is not None else _rng
     bucket = classify_complexity(task_context)
     state = _load_state()
 
@@ -194,7 +204,7 @@ def select_model(
     samples: Dict[str, float] = {}
     for c in candidates:
         prior = _get_prior(state, bucket, c.model)
-        theta = random.betavariate(prior["alpha"], prior["beta"])
+        theta = _r.betavariate(prior["alpha"], prior["beta"])
         samples[c.model] = theta
 
     # Cost-optimal: among models with θ >= floor, pick cheapest
@@ -276,8 +286,7 @@ def record_outcome(
 
 def get_candidates_from_config(cfg: Dict[str, Any]) -> List[ModelCandidate]:
     """Parse bandit_router.candidates from Hermes config.yaml."""
-    br = cfg.get("bandit_router") or {}
-    raw = br.get("candidates") or []
+    raw = cfg_section(cfg, "bandit_router").get("candidates") or []
     candidates = []
     for entry in raw:
         if isinstance(entry, dict) and entry.get("model"):
@@ -291,14 +300,12 @@ def get_candidates_from_config(cfg: Dict[str, Any]) -> List[ModelCandidate]:
 
 def is_enabled(cfg: Dict[str, Any]) -> bool:
     """Check if bandit router is enabled in config."""
-    br = cfg.get("bandit_router") or {}
-    return bool(br.get("enabled", False))
+    return bool(cfg_section(cfg, "bandit_router").get("enabled", False))
 
 
 def get_quality_floor(cfg: Dict[str, Any]) -> float:
     """Get quality floor from config (default 0.6)."""
-    br = cfg.get("bandit_router") or {}
-    return float(br.get("quality_floor", 0.6))
+    return float(cfg_section(cfg, "bandit_router").get("quality_floor", 0.6))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -337,6 +344,5 @@ def get_status() -> Dict[str, Any]:
 
 def reset_state() -> None:
     """Reset all priors to uniform Beta(1,1). Irreversible."""
-    state = {"version": 1, "priors": {}, "outcomes": [], "updated": None}
-    _save_state(state)
+    _store.reset()
     logger.info("Bandit state reset to uniform priors")

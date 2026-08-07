@@ -11,17 +11,20 @@ Adds security/planning context types relevant to pentesting workflows.
 State is persisted to ~/.hermes/autotune_state.json.
 """
 
-import json
 import logging
 import re
 import time
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
+from dataclasses import dataclass, asdict, replace as dc_replace
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+from hermes_constants import get_hermes_home
+from agent.local_ext_utils import JsonStateStore, cfg_section
 
-STATE_FILE = Path("~/.hermes/autotune_state.json").expanduser()
+_store = JsonStateStore(
+    get_hermes_home() / "autotune_state.json",
+    default_factory=dict,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -198,7 +201,8 @@ def compute_params(
     # Apply learned adjustments
     learned = _get_learned_adjustments(ctx_type)
     if learned:
-        params = _apply_learned(params, learned)
+        adjustments, sample_count = learned
+        params = _apply_learned(params, adjustments, sample_count)
 
     # Conversation length factor (reduce repetition in long conversations)
     hist_len = len(conversation_history) if conversation_history else 0
@@ -284,8 +288,13 @@ def record_feedback(
     _save_feedback_state(state)
 
 
-def _get_learned_adjustments(context_type: str) -> Optional[Dict[str, float]]:
-    """Get learned param adjustments for a context type."""
+def _get_learned_adjustments(context_type: str) -> Optional[Tuple[Dict[str, float], int]]:
+    """Get learned param adjustments and sample count for a context type.
+
+    Returns ``(adjustments, sample_count)`` so the caller can scale influence
+    weight by how much data we actually have, or ``None`` when there is not
+    enough data yet.
+    """
     state = _load_feedback_state()
     profile = state.get(context_type)
     if not profile or profile.get("sample_count", 0) < MIN_SAMPLES:
@@ -306,24 +315,33 @@ def _get_learned_adjustments(context_type: str) -> Optional[Dict[str, float]]:
         if abs(delta) > 0.01:
             adjustments[key] = delta
 
-    return adjustments if adjustments else None
+    sample_count: int = profile.get("sample_count", MIN_SAMPLES)
+    return (adjustments, sample_count) if adjustments else None
 
 
-def _apply_learned(params: SamplingParams, adjustments: Dict[str, float]) -> SamplingParams:
-    """Blend learned adjustments into params."""
-    # Weight based on sample count (placeholder — real impl reads state)
-    weight = MAX_LEARNED_WEIGHT  # simplified; full impl scales with sample count
+def _apply_learned(
+    params: SamplingParams,
+    adjustments: Dict[str, float],
+    sample_count: int,
+) -> SamplingParams:
+    """Return a *new* SamplingParams with learned adjustments blended in.
 
-    if "temperature" in adjustments:
-        params.temperature += adjustments["temperature"] * weight
-    if "top_p" in adjustments:
-        params.top_p += adjustments["top_p"] * weight
-    if "frequency_penalty" in adjustments:
-        params.frequency_penalty += adjustments["frequency_penalty"] * weight
-    if "presence_penalty" in adjustments:
-        params.presence_penalty += adjustments["presence_penalty"] * weight
-
-    return params
+    Weight ramps linearly from 0 → MAX_LEARNED_WEIGHT as sample_count goes
+    from MIN_SAMPLES → SAMPLES_FOR_MAX, then caps.  This prevents early
+    observations from having disproportionate influence.
+    """
+    ramp = min(
+        (sample_count - MIN_SAMPLES) / max(SAMPLES_FOR_MAX - MIN_SAMPLES, 1),
+        1.0,
+    )
+    weight = ramp * MAX_LEARNED_WEIGHT
+    return dc_replace(
+        params,
+        temperature=params.temperature + adjustments.get("temperature", 0.0) * weight,
+        top_p=params.top_p + adjustments.get("top_p", 0.0) * weight,
+        frequency_penalty=params.frequency_penalty + adjustments.get("frequency_penalty", 0.0) * weight,
+        presence_penalty=params.presence_penalty + adjustments.get("presence_penalty", 0.0) * weight,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -332,21 +350,12 @@ def _apply_learned(params: SamplingParams, adjustments: Dict[str, float]) -> Sam
 
 def _load_feedback_state() -> Dict[str, Any]:
     """Load AutoTune feedback state."""
-    try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text())
-    except Exception as e:
-        logger.warning("AutoTune state load failed: %s", e)
-    return {}
+    return _store.load()
 
 
 def _save_feedback_state(state: Dict[str, Any]) -> None:
     """Persist AutoTune feedback state."""
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, indent=2))
-    except Exception as e:
-        logger.warning("AutoTune state save failed: %s", e)
+    _store.save(state)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -355,8 +364,7 @@ def _save_feedback_state(state: Dict[str, Any]) -> None:
 
 def is_enabled(cfg: Dict[str, Any]) -> bool:
     """Check if AutoTune is enabled in config."""
-    at = cfg.get("autotune") or {}
-    return bool(at.get("enabled", False))
+    return bool(cfg_section(cfg, "autotune").get("enabled", False))
 
 
 def get_status() -> Dict[str, Any]:
