@@ -1387,9 +1387,9 @@ class TestExtractPricing:
             "cache_read_price_per_million": 0.02,
         })
         assert result == {
-            "prompt": "1e-06",
-            "completion": "2e-06",
-            "cache_read": "2e-08",
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "cache_read": "2E-8",
         }
 
     def test_nested_pricing_with_per_1m_unit(self):
@@ -1405,10 +1405,52 @@ class TestExtractPricing:
             },
         })
         assert result == {
-            "prompt": "1e-06",
-            "completion": "2e-06",
-            "cache_read": "2e-08",
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "cache_read": "2E-8",
         }
+
+    def test_nested_pricing_with_per_1k_unit(self):
+        """per_1k_tokens divides by 1000, not 1M."""
+        result = self._extract({
+            "id": "m",
+            "pricing": {"unit": "per_1k_tokens", "prompt": 1, "completion": 2},
+        })
+        assert result == {
+            "prompt": "0.001",
+            "completion": "0.002",
+        }
+
+    def test_nested_pricing_with_per_10k_unit(self):
+        """Compound units like per_10k_tokens parse correctly."""
+        result = self._extract({
+            "id": "m",
+            "pricing": {"unit": "per_10k_tokens", "prompt": 5, "completion": 10},
+        })
+        assert result == {
+            "prompt": "0.0005",
+            "completion": "0.001",
+        }
+
+    def test_nested_pricing_with_per_token_unit(self):
+        """per_token unit leaves values untouched (already per-token)."""
+        result = self._extract({
+            "id": "m",
+            "pricing": {
+                "unit": "per_token",
+                "prompt": 0.000001,
+                "completion": 0.000002,
+            },
+        })
+        assert result == {"prompt": 0.000001, "completion": 0.000002}
+
+    def test_unknown_unit_falls_through_to_alias_map(self):
+        """An unrecognized unit does not crash and keeps historical behavior."""
+        result = self._extract({
+            "id": "m",
+            "pricing": {"unit": "per_bazillion_tokens", "prompt": 1},
+        })
+        assert result == {"prompt": 1}
 
     def test_top_level_fields_take_precedence_over_nested(self):
         """Explicit top-level fields win when a nested block also exists."""
@@ -1422,7 +1464,7 @@ class TestExtractPricing:
                 "completion": 999,
             },
         })
-        assert result == {"prompt": "1e-06", "completion": "2e-06"}
+        assert result == {"prompt": "0.000001", "completion": "0.000002"}
 
     def test_per_token_pricing_untouched(self):
         """Per-token pricing (OpenRouter style) still flows to the alias map."""

@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse
@@ -1091,6 +1092,31 @@ def _extract_max_completion_tokens(payload: Dict[str, Any]) -> Optional[int]:
     return _extract_first_int(payload, _MAX_COMPLETION_KEYS)
 
 
+def _pricing_unit_divisor(unit: str) -> Optional[Decimal]:
+    """Parse a pricing unit string into a per-token conversion divisor.
+
+    Handles OpenAI-compatible unit spellings such as ``per_1m_tokens``,
+    ``per_1k_tokens``, ``per_10k_tokens``, and ``per_token``. Returns the
+    divisor that converts the reported price to per-token, or ``None`` when
+    the unit is absent/unknown (callers then assume per-token values, the
+    historical default).
+    """
+    if not unit:
+        return None
+    match = re.match(r"^per_?(\d*\.?\d*)([km]?)_?tokens?$", unit.strip().lower())
+    if not match:
+        return None
+    count_str, suffix = match.group(1), match.group(2)
+    if not count_str and not suffix:
+        return None  # per_token — already per-token
+    count = Decimal(count_str) if count_str else Decimal("1")
+    if suffix == "k":
+        count *= Decimal("1000")
+    elif suffix == "m":
+        count *= Decimal("1000000")
+    return count
+
+
 def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
     novita_input = payload.get("input_token_price_per_m")
     novita_output = payload.get("output_token_price_per_m")
@@ -1121,28 +1147,39 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     # OpenAI-compatible endpoints (and aggregators following their schema)
-    # ship per-1M-token prices — either top-level ``input_price_per_million`` /
-    # ``output_price_per_million`` fields or a nested ``pricing`` block with
-    # ``unit: "per_1m_tokens"``. Normalize to per-token like the branches
-    # above; without this the generic cost machinery multiplies by 1M a
-    # second time and reports absurd prices (e.g. $1M/M).
+    # ship prices in explicit per-N-token units — either top-level
+    # ``input_price_per_million`` / ``output_price_per_million`` fields or a
+    # nested ``pricing`` block with a ``unit`` such as ``per_1m_tokens``.
+    # Normalize to per-token at the extraction point (matching the Novita and
+    # DeepInfra branches above); without this the generic cost machinery
+    # multiplies by 1M a second time and reports absurd prices (e.g. $1M/M).
     per_million_fields = (
         ("prompt", payload.get("input_price_per_million")),
         ("completion", payload.get("output_price_per_million")),
         ("cache_read", payload.get("cache_read_price_per_million")),
     )
+    top_level_values = [value for _, value in per_million_fields if value is not None]
     nested_pricing = payload.get("pricing") if isinstance(payload.get("pricing"), dict) else None
-    if any(value is not None for _, value in per_million_fields) or (
-        nested_pricing is not None and nested_pricing.get("unit") == "per_1m_tokens"
-    ):
+    unit_divisor = _pricing_unit_divisor(
+        str(nested_pricing.get("unit", "")) if nested_pricing else ""
+    )
+
+    if top_level_values:
+        # ``*_price_per_million`` fields are semantically fixed at per-1M.
         result: Dict[str, Any] = {}
         for target, value in per_million_fields:
-            if value is None and nested_pricing is not None:
-                value = nested_pricing.get(target)
             if value is not None:
-                result[target] = str(float(value) / 1_000_000)
-        if result:
-            return result
+                result[target] = str(Decimal(str(value)) / Decimal("1000000"))
+        return result
+    if unit_divisor is not None:
+        # Nested ``pricing`` block declares an explicit per-N-token unit.
+        assert nested_pricing is not None  # unit_divisor implies a pricing block
+        result: Dict[str, Any] = {}
+        for target in ("prompt", "completion", "cache_read"):
+            value = nested_pricing.get(target)
+            if value is not None:
+                result[target] = str(Decimal(str(value)) / unit_divisor)
+        return result
 
     alias_map = {
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
