@@ -1,0 +1,199 @@
+name: '[newci] Install & Update E2E'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production install-e2e.yml, running on the GKE self-hosted
+# (ARC) runners so the migration can be observed without touching the workflows
+# that gate merges. Production CI in this branch is byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - artifact names are newci-prefixed, so production artifacts stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - the E2E step is continue-on-error, so a failing leg never reddens a check
+#
+# To retire: delete .github/workflows/newci-*.yml.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# This workflow CANNOT fail the production Install & Update E2E
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Two independent reasons, both deliberate:
+#
+#   1. It is a separate workflow with its own triggers. GitHub reports it as
+#      its own check run; production install-e2e.yml never calls it and never
+#      reads its result. Nothing about this file can turn that one red.
+#   2. Belt and braces: inside newci-install-e2e-run.yml the E2E step carries
+#      `continue-on-error: true`, so a failing leg is recorded as an outcome
+#      and surfaced in the summary rather than failing its job. Even this
+#      shadow's own check stays green — a migration probe should produce
+#      information, not a red X someone has to triage.
+#
+# NOTE on (2): job-level `continue-on-error` is NOT valid on a job that calls
+# a reusable workflow (GitHub allows only name/uses/with/secrets/strategy/
+# needs/if/concurrency/permissions there), which is why the tolerance lives on
+# the step inside the reusable workflow instead. Do not "fix" this by adding
+# continue-on-error to the matrix jobs below — it will not parse.
+#
+# Read the results in the run summary, not in the check status.
+#
+# Triggers mirror production install-e2e.yml so the shadow fires whenever the
+# real one does: every 12 hours, on release tags, and manually. The cron is
+# offset by 5 minutes so the two runs do not contend for the same runner pool
+# at the same instant.
+#
+# NOTE: `schedule` only fires from the default branch. Until this branch is
+# merged, the scheduled leg will not run on its own — use workflow_dispatch
+# (pick this branch in the Run workflow dropdown) to exercise it meanwhile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      route:
+        description: 'Which update route to exercise.'
+        required: false
+        type: choice
+        default: both
+        options: [both, update, installer]
+      tag-count:
+        description: 'How many release tags to sample (newest, oldest, and a spread between).'
+        required: false
+        type: string
+        default: '5'
+      runner:
+        description: 'Runner label to shadow on. Needs a privileged runner container for bubblewrap.'
+        required: false
+        type: string
+        default: arc-runner-set
+  schedule:
+    # Production runs at :20; offset so the shadow does not contend with it.
+    - cron: '25 7,19 * * *'
+  push:
+    tags:
+      # Release tags only: the repo also carries backup/* and one-off tags.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newci-install-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Which released versions do we test updating FROM? Resolved once and shared
+  # by both route matrices, so the two routes cover the same set.
+  pick-releases:
+    name: Pick release tags
+    # Small runner: reads tag names and runs one script.
+    runs-on: arc-runner-small
+    timeout-minutes: 5
+    outputs:
+      tags: ${{ steps.pick.outputs.tags }}
+    steps:
+      # This job only reads tag names and runs one script, so take the cheap
+      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
+      # -- they are the whole input, and the default shallow checkout has none.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: blob:none
+          fetch-tags: true
+          sparse-checkout: scripts/sandbox/pick-release-tags.sh
+          sparse-checkout-cone-mode: false
+      - id: pick
+        run: |
+          set -euo pipefail
+          tags="$(scripts/sandbox/pick-release-tags.sh --count '${{ inputs.tag-count || 5 }}')"
+          echo "Testing updates from: $tags"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  # `hermes update` -- the route most users take.
+  update:
+    if: github.event_name != 'workflow_dispatch' || inputs.route != 'installer'
+    needs: pick-releases
+    strategy:
+      # One release breaking is worth knowing about even if another already
+      # failed, so let every leg report.
+      fail-fast: false
+      matrix:
+        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+    uses: ./.github/workflows/newci-install-e2e-run.yml
+    with:
+      route: update
+      install-ref: ${{ matrix.install-ref }}
+      runner: ${{ inputs.runner || 'arc-runner-set' }}
+
+  # Re-running the curl one-liner over an existing checkout: autostash + pull
+  # rather than the updater's own git handling.
+  installer:
+    if: github.event_name != 'workflow_dispatch' || inputs.route != 'update'
+    needs: pick-releases
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        install-ref: ${{ fromJSON(needs.pick-releases.outputs.tags) }}
+    uses: ./.github/workflows/newci-install-e2e-run.yml
+    with:
+      route: installer
+      install-ref: ${{ matrix.install-ref }}
+      runner: ${{ inputs.runner || 'arc-runner-set' }}
+
+  # Report what the shadow saw WITHOUT ever failing. This is the job to read;
+  # it converts leg results into a summary table instead of a red X. It has no
+  # `exit 1` path on purpose — see the header.
+  shadow-summary:
+    name: '[newci] Shadow result (informational — never fails)'
+    needs: [pick-releases, update, installer]
+    if: always()
+    # Small runner: one script step, no checkout.
+    runs-on: arc-runner-small
+    timeout-minutes: 10
+    steps:
+      - name: Summarize
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        shell: python
+        run: |
+          import json, os
+
+          needs = json.loads(os.environ["NEEDS"])
+          icons = {
+              "success": "✅",
+              "skipped": "⏭️",
+              "cancelled": "⚪",
+              "failure": "❌",
+          }
+
+          lines = [
+              "## [newci] Install & Update E2E — shadow result",
+              "",
+              "Observation only. This never fails, and it cannot affect the",
+              "production `Install & Update E2E` check.",
+              "",
+              "| Job | Result |",
+              "|---|---|",
+          ]
+          for name, info in sorted(needs.items()):
+              result = info.get("result", "unknown")
+              lines.append(f"| {name} | {icons.get(result, '❓')} {result} |")
+
+          failed = sorted(n for n, i in needs.items() if i.get("result") == "failure")
+          lines.append("")
+          if failed:
+              lines += [
+                  f"⚠️ {len(failed)} shadow job(s) failed: {', '.join(failed)}",
+                  "",
+                  "If the legs were skipped instead, the runner lacks bubblewrap",
+                  "support — see the preflight summary in",
+                  "`newci-install-e2e-run.yml` for the capability matrix.",
+              ]
+          else:
+              lines.append("No shadow failures.")
+
+          body = "\n".join(lines)
+          print(body)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(body + "\n")

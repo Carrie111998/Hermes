@@ -1,0 +1,112 @@
+name: '[newci] Contributor Attribution Check'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production contributor-check.yml, running on the GKE self-hosted
+# (ARC) runners so the migration can be observed for a few days without
+# touching the workflows that gate merges. Production CI in this branch is
+# byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - cache keys are newci-prefixed, so production caches stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - the PR review comment runs --dry-run (prints, never posts)
+#   - the gate job is renamed; it does NOT gate merges
+#
+# To retire: delete .github/workflows/newci-*.yml.
+
+on:
+  workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review status objects"
+        value: ${{ jobs.check-attribution.outputs.review_status }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-attribution:
+    runs-on: arc-runner-set
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.check-emails.outputs.review_status }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # Full history needed for git log
+
+      - name: Check for unmapped contributor emails
+        id: check-emails
+        run: |
+          # Commits this PR adds on top of main. `origin/main..HEAD` already
+          # means "reachable from HEAD, not from main", which is exactly what
+          # resolving the merge base and using `<mb>..HEAD` computes — the two
+          # are equivalent (verified, including when the branch has merged main
+          # into itself). Dropping the extra git call also drops an unquoted
+          # expansion of the resulting SHA.
+          NEW_EMAILS=$(git log origin/main..HEAD --format='%ae' --no-merges | sort -u)
+
+          if [ -z "$NEW_EMAILS" ]; then
+            echo "No new commits to check."
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # An email is mapped if it has a file in contributors/emails/
+          # (one file per email — conflict-free) or an entry in the frozen
+          # legacy AUTHOR_MAP in scripts/release.py.
+          MISSING=""
+          while IFS= read -r email; do
+            # Skip teknium and bot emails
+            case "$email" in
+              *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+                continue ;;
+            esac
+
+            if echo "$email" | grep -qP '\+.*@users\.noreply\.github\.com'; then
+              continue  # GitHub id+login noreply emails auto-resolve
+            fi
+
+            if [ -f "contributors/emails/${email}" ]; then
+              continue  # mapped via the contributors directory
+            fi
+
+            if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
+              AUTHOR=$(git log --author="$email" --format='%an' -1)
+              MISSING="${MISSING}\n  ${email} (${AUTHOR})"
+            fi
+          done <<< "$NEW_EMAILS"
+
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "⚠️  New contributor email(s) without a mapping:"
+            echo -e "$MISSING"
+            echo ""
+            echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
+            echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+            echo "or manually:"
+            echo -e "$MISSING" | while read -r line; do
+              email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
+              [ -z "$email" ] && continue
+              echo "    python3 scripts/add_contributor.py ${email} <github-username>"
+            done
+            echo ""
+            echo "To find the GitHub username for an email:"
+            echo "  gh api 'search/users?q=EMAIL+in:email' --jq '.items[0].login'"
+
+            # Emit review_status for unmapped emails
+            DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
+            HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+            REVIEW_STATUS=$(jq -nc \
+              --arg detail "$DETAIL" \
+              --arg how_to_fix "$HOW_TO_FIX" \
+              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
+            echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+
+            exit 1
+          else
+            echo "✅ All contributor emails are mapped."
+          fi

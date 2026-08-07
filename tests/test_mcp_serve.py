@@ -167,6 +167,23 @@ def _create_test_db(db_path, session_id, messages):
     conn.close()
 
 
+def _bump_mtime(path):
+    """Advance a file's mtime by a full second, deterministically.
+
+    EventBridge._poll_once gates all work on ``state.db``'s mtime differing
+    from the cached value, so a test that wants the gate to open must make the
+    mtime *observably* larger. ``os.utime(path, None)`` ("set to now") is not
+    enough: it only differs from the previous value if the wall clock advanced
+    past the filesystem's timestamp granularity in between, and container
+    overlayfs frequently stores mtimes at 1-second granularity. There the
+    rewritten mtime reads back identical, the poll gate stays shut, and the
+    test fails having seen zero events. Adding a whole second is larger than
+    any granularity we run on, so the bump survives truncation.
+    """
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
 @pytest.fixture
 def mock_session_db(tmp_path, populated_sessions_dir):
     """Create a real SQLite DB with test messages and wire it up."""
@@ -1220,7 +1237,7 @@ class TestEventBridgePollE2E:
         conn.commit()
         conn.close()
         # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
-        os.utime(db_path, None)
+        _bump_mtime(db_path)
 
         # Update sessions.json updated_at to trigger re-check
         sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
@@ -1335,7 +1352,7 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        _bump_mtime(db_path)  # bump mtime so the poll gate opens
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1373,7 +1390,7 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        _bump_mtime(db_path)
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

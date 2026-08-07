@@ -1175,6 +1175,19 @@ class TestTranscribeCredentialReadGuard:
 class TestRunCommandSttIdleTimeout:
     """_run_command_stt uses a progress-based idle timeout (mirrors TTS runner)."""
 
+    # The runner's idle deadline starts at Popen, so the FIRST window has to
+    # cover interpreter startup of the helper script — that is wall-clock the
+    # test does not control. Under a parallel test runner a cold `python -u`
+    # can take several hundred ms, and a sub-second window kills the child
+    # before it prints anything ('Terminated' with empty stderr). Keep this
+    # window comfortably above worst-case startup; these tests trade ~1s of
+    # wall time for not being load-sensitive.
+    IDLE_TIMEOUT = 2.0
+    # Gap between progress ticks: well inside IDLE_TIMEOUT so each tick resets
+    # the deadline, while total runtime (TICKS * TICK_SLEEP) exceeds it.
+    TICK_SLEEP = 0.25
+    TICKS = 12
+
     @staticmethod
     def _shell_command(*args):
         import shlex
@@ -1187,13 +1200,18 @@ class TestRunCommandSttIdleTimeout:
         idle timeout shorter than its total runtime."""
         from tools.transcription_tools import _run_command_stt
 
+        assert self.TICKS * self.TICK_SLEEP > self.IDLE_TIMEOUT, (
+            "test setup: total runtime must exceed the idle window, otherwise "
+            "the test passes without exercising the deadline reset"
+        )
+
         script = tmp_path / "progress_then_exit.py"
         script.write_text(
             "\n".join([
                 "import sys, time",
-                "for idx in range(4):",
+                f"for idx in range({self.TICKS}):",
                 "    print(f'tick {idx}', file=sys.stderr, flush=True)",
-                "    time.sleep(0.04)",
+                f"    time.sleep({self.TICK_SLEEP})",
                 "print('done', flush=True)",
             ]),
             encoding="utf-8",
@@ -1201,11 +1219,11 @@ class TestRunCommandSttIdleTimeout:
 
         result = _run_command_stt(
             self._shell_command(sys.executable, "-u", str(script)),
-            timeout=0.1,
+            timeout=self.IDLE_TIMEOUT,
         )
 
         assert result.returncode == 0
-        assert "tick 3" in result.stderr
+        assert f"tick {self.TICKS - 1}" in result.stderr
         assert "done" in result.stdout
 
     def test_silent_stall_still_times_out(self, tmp_path):
@@ -1218,7 +1236,7 @@ class TestRunCommandSttIdleTimeout:
             "\n".join([
                 "import sys, time",
                 "print('starting pass 1', file=sys.stderr, flush=True)",
-                "time.sleep(30)",
+                "time.sleep(300)",
             ]),
             encoding="utf-8",
         )
@@ -1226,7 +1244,7 @@ class TestRunCommandSttIdleTimeout:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
+                timeout=self.IDLE_TIMEOUT,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")

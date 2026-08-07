@@ -1,0 +1,86 @@
+name: '[newci] Docs Site Checks'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production docs-site-checks.yml, running on the GKE self-hosted
+# (ARC) runners so the migration can be observed for a few days without
+# touching the workflows that gate merges. Production CI in this branch is
+# byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - cache keys are newci-prefixed, so production caches stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - the PR review comment runs --dry-run (prints, never posts)
+#   - the gate job is renamed; it does NOT gate merges
+#
+# To retire: delete .github/workflows/newci-*.yml.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-site-checks:
+    runs-on: arc-runner-set
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: npm-cache
+        with:
+          path: website/node_modules
+          # node26: native builds + engine checks are node-major-specific;
+          # keep in sync with NODE_MAJOR in the runner image (see
+          # hermes-agent-ci-infra runner/Dockerfile).
+          key: newci-node-modules-cache-node26-${{ hashFiles('website/package-lock.json') }}
+
+      - name: Install website dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: npm ci
+          working-directory: website
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+
+      - name: Install ascii-guard
+        # Production uses setup-python + `python -m pip install`, which leaves
+        # the interpreter AND the ascii-guard console script on PATH. The ARC
+        # image has no such ambient env: `uv pip install` with no venv errors
+        # out ("No virtual environment found"), so create one explicitly.
+        #
+        # Deliberately NOT `uv run`: this repo has a pyproject.toml, so `uv run`
+        # is a *project* run — it would sync hermes-agent's full locked
+        # dependency set into .venv and prune ascii-guard/pyyaml back out as
+        # extraneous. This job only needs those two packages.
+        uses: ./.github/actions/retry
+        with:
+          command: |
+            uv venv --python 3.11 .venv
+            uv pip install --python .venv ascii-guard==2.3.0 pyyaml==6.0.3
+
+      - name: Put the docs venv on PATH
+        # `npm run lint:diagrams` shells out to the `ascii-guard` binary, and
+        # the extract/generate scripts need `yaml` importable — both come from
+        # the venv, so it has to lead PATH for the rest of the job.
+        run: echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Extract skill metadata for dashboard
+        run: python3 website/scripts/extract-skills.py
+
+      - name: Regenerate per-skill docs pages + catalogs
+        run: python3 website/scripts/generate-skill-docs.py
+
+      - name: Lint docs diagrams
+        run: npm run lint:diagrams
+        working-directory: website
+
+      - name: Build Docusaurus
+        uses: ./.github/actions/profile
+        with:
+          label: docs-site-build
+          working-directory: website
+          command: npm run build

@@ -1,0 +1,246 @@
+name: '[newci] Install & Update E2E (reusable)'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production install-e2e-run.yml, running on the GKE
+# self-hosted (ARC) runners so the migration can be observed without touching
+# the workflows that gate merges. Production CI in this branch is
+# byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - artifact names are newci-prefixed, so production artifacts stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - this workflow is never called by production install-e2e.yml, so its
+#     result cannot fail the production job
+#
+# To retire: delete .github/workflows/newci-*.yml.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Why this shadow is expected to SKIP its legs today
+# ─────────────────────────────────────────────────────────────────────────
+#
+# tests/install/install-update-e2e.sh runs inside scripts/dev-sandbox.sh,
+# which is built on bubblewrap. bwrap needs to remount / as slave and mount
+# a fresh /proc, and in a stock ARC pod both are denied. Measured in-cluster
+# on nousresearch/nous-gke-runner (2026-08-04), installing the same deps the
+# production job apt-installs:
+#
+#   pod securityContext                       bwrap result
+#   ----------------------------------------  ----------------------------
+#   default (what arc-runner-set gives you)   Failed to make / slave: EPERM
+#   capabilities.add: [SYS_ADMIN]             Can't mount proc: EPERM
+#   SYS_ADMIN + apparmor/seccomp Unconfined   Can't mount proc: EPERM
+#   privileged: true                          OK (all probes pass)
+#
+# So this needs a scale set whose *runner* container is privileged.
+# arc-runner-docker does NOT qualify — only its dind sidecar is privileged,
+# the runner container is not. Until such a set exists, the preflight job
+# below detects the missing capability and skips the legs with a warning
+# rather than burning ~11 minutes per leg to fail at the same place.
+#
+# When infra adds the set: pass its label as `runner` from the caller and
+# the legs start running with no other change here.
+
+on:
+  workflow_call:
+    inputs:
+      route:
+        description: 'Update path to exercise: update (hermes update) or installer (re-run install.sh).'
+        required: true
+        type: string
+      install-ref:
+        description: 'What to install before updating: a branch, a tag (v2026.7.7), or a SHA reachable from main.'
+        required: false
+        type: string
+        default: refs/heads/main
+      runner:
+        description: 'Runner label. Needs a privileged runner container for bubblewrap — see the header.'
+        required: false
+        type: string
+        default: arc-runner-set
+      timeout-minutes:
+        description: 'Job timeout. A cold run installs real toolchains twice.'
+        required: false
+        type: number
+        default: 45
+
+permissions:
+  contents: read
+
+jobs:
+  # Probe bwrap before paying for a full install. This is the whole point of
+  # the shadow: it answers "can ARC run the install E2E yet?" in ~30 seconds
+  # instead of ~11 minutes, and says exactly what is missing when it cannot.
+  preflight:
+    name: Probe sandbox capability
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    outputs:
+      supported: ${{ steps.probe.outputs.supported }}
+    steps:
+      - name: Probe bubblewrap
+        id: probe
+        run: |
+          set -uo pipefail
+
+          # The production job apt-installs these on ubuntu-latest; do the same
+          # here so the probe measures the sandbox, not a missing package.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap slirp4netns uidmap util-linux
+
+          supported=true
+          note=""
+
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all true 2>/tmp/bwrap-err; then
+            supported=false
+            note="$(cat /tmp/bwrap-err)"
+          fi
+
+          echo "supported=$supported" >> "$GITHUB_OUTPUT"
+
+          if [ "$supported" = true ]; then
+            echo "✅ bubblewrap works on this runner — running the real legs."
+            {
+              echo "## Sandbox preflight: supported ✅"
+              echo ""
+              echo "\`bwrap\` can create its namespaces on \`${{ inputs.runner }}\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::warning::bubblewrap cannot run on ${{ inputs.runner }}; skipping the install E2E legs. ${note}"
+          {
+            echo "## Sandbox preflight: unsupported ⚠️"
+            echo ""
+            echo "\`bwrap\` failed on \`${{ inputs.runner }}\`:"
+            echo ""
+            echo '```'
+            echo "${note}"
+            echo '```'
+            echo ""
+            echo "The install E2E runs inside \`scripts/dev-sandbox.sh\` (bubblewrap),"
+            echo "which needs to remount \`/\` as slave and mount a fresh \`/proc\`."
+            echo "A stock ARC pod denies both."
+            echo ""
+            echo "| pod securityContext | bwrap |"
+            echo "|---|---|"
+            echo "| default | \`Failed to make / slave: EPERM\` |"
+            echo "| \`capabilities.add: [SYS_ADMIN]\` | \`Can't mount proc: EPERM\` |"
+            echo "| SYS_ADMIN + apparmor/seccomp Unconfined | \`Can't mount proc: EPERM\` |"
+            echo "| \`privileged: true\` | works |"
+            echo ""
+            echo "This needs a scale set whose **runner** container is privileged."
+            echo "\`arc-runner-docker\` does not qualify — only its dind sidecar is."
+            echo ""
+            echo "**This is a skip, not a regression.** Production \`install-e2e.yml\`"
+            echo "on GitHub-hosted runners is unaffected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  e2e:
+    name: ${{ inputs.route }} from ${{ inputs.install-ref }}
+    needs: preflight
+    if: needs.preflight.outputs.supported == 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    steps:
+      # Full history: the sandbox fetches the starting commit and the test
+      # compares against this commit, so a shallow clone is not enough.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      # bubblewrap + slirp4netns are what the sandbox is built on; util-linux
+      # supplies the `unshare` that builds the multi-uid userns for the
+      # user-level (non-root) install.
+      - name: Install sandbox dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap slirp4netns uidmap util-linux
+
+      # The production job flips kernel.apparmor_restrict_unprivileged_userns
+      # on its Ubuntu 24.04 VM. In an ARC pod that sysctl is not present in
+      # /proc at all (verified in-cluster), and a pod cannot set node-level
+      # sysctls anyway — so report the state and move on rather than failing
+      # on a `sysctl -w` that was never going to apply here.
+      - name: Report user-namespace state
+        run: |
+          set -euo pipefail
+          echo "--- kernel userns settings"
+          sysctl kernel.unprivileged_userns_clone 2>/dev/null || echo "  (sysctl absent — expected in a pod)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "  (sysctl absent — expected in a pod)"
+          echo "--- subuid/subgid for $(id -un)"
+          grep "^$(id -un):" /etc/subuid /etc/subgid || echo "  (none — sandbox will say so)"
+
+      - name: Run install + update E2E
+        id: run
+        # Step-level continue-on-error IS supported (job-level is not, for jobs
+        # that call a reusable workflow). This is what makes the shadow
+        # non-blocking: the script's exit code is captured as an outcome and
+        # reported below, but never fails the job — so the shadow workflow's
+        # own check stays green and nobody has to triage a red X that only
+        # means "the migration isn't ready yet".
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          tests/install/install-update-e2e.sh \
+            --route '${{ inputs.route }}' \
+            --install-ref '${{ inputs.install-ref }}'
+        env:
+          # Outside the workspace on purpose: the script creates this directory
+          # up front, and an untracked dir inside the repo makes the worktree
+          # dirty -- which dev-sandbox reacts to by snapshotting the working
+          # copy into a fresh fake-main commit on every invocation, moving the
+          # update target mid-run.
+          HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
+
+      - name: Report leg outcome
+        if: always()
+        run: |
+          set -uo pipefail
+          outcome='${{ steps.run.outcome }}'
+          if [ "$outcome" = "success" ]; then
+            icon="✅"
+          else
+            icon="❌"
+            echo "::warning::[newci shadow] ${{ inputs.route }} from ${{ inputs.install-ref }} failed ($outcome). Not blocking — production install-e2e.yml is unaffected."
+          fi
+          {
+            echo "## ${icon} ${{ inputs.route }} from ${{ inputs.install-ref }} — ${outcome}"
+            echo ""
+            echo "Runner: \`${{ inputs.runner }}\`"
+            echo ""
+            echo "Shadow leg. A failure here is migration data, not a broken build;"
+            echo "production \`Install & Update E2E\` on GitHub-hosted runners is"
+            echo "unaffected by this result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      # Artifact names cannot contain '/', and install-ref may be a full ref
+      # like refs/heads/main. GitHub Actions expressions have no string-replace
+      # function, so build the safe name here. Runs even on failure -- that is
+      # exactly when the logs are wanted.
+      - name: Build artifact name
+        if: always()
+        id: artifact
+        run: |
+          set -euo pipefail
+          safe_ref='${{ inputs.install-ref }}'
+          safe_ref="${safe_ref//\//-}"
+          echo "name=newci-install-e2e-${{ inputs.route }}-${safe_ref}" >> "$GITHUB_OUTPUT"
+
+      # The installer's own transcripts say far more than the assertion that
+      # tripped when a real install breaks.
+      - name: Upload installer logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Unique per leg: a matrix over releases runs this workflow several
+          # times per route, and same-named artifacts collide.
+          name: ${{ steps.artifact.outputs.name }}-${{ github.sha }}
+          path: ${{ runner.temp }}/e2e-logs
+          retention-days: 14
+          if-no-files-found: ignore

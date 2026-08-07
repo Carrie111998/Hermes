@@ -1,0 +1,78 @@
+name: '[newci] Docker / shell lint'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production docker-lint.yml, running on the GKE self-hosted
+# (ARC) runners so the migration can be observed for a few days without
+# touching the workflows that gate merges. Production CI in this branch is
+# byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - cache keys are newci-prefixed, so production caches stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - the PR review comment runs --dry-run (prints, never posts)
+#   - the gate job is renamed; it does NOT gate merges
+#
+# To retire: delete .github/workflows/newci-*.yml.
+
+# Lints the container build inputs: Dockerfile (via hadolint) and any shell
+# scripts under docker/ (via shellcheck). These catch the class of regression
+# the behavioral docker smoke test can't — unquoted variable
+# expansions, silently-failing RUN commands, etc.
+#
+# Rules and ignores are documented in .hadolint.yaml at the repo root.
+# shellcheck severity is pinned to `error` so SC1091-style "can't follow
+# sourced script" info-level warnings don't fail the job — the .venv
+# activate script doesn't exist at lint time.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: newci-docker-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hadolint:
+    name: Lint Dockerfile (hadolint)
+    # arc-runner-docker, NOT arc-runner-small: hadolint-action declares
+    # `runs: using: docker`, so the runner builds and runs it as a container
+    # and needs a real daemon — even though no step here shells out to
+    # docker. Grepping job bodies for docker commands misses this; check
+    # each action's `runs.using` before routing a job to a dind-less set.
+    runs-on: arc-runner-docker
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+          failure-threshold: warning
+
+  shellcheck:
+    name: Lint docker/ shell scripts (shellcheck)
+    # Short gate job: small runner, no dind (see hermes-agent-ci-infra).
+    runs-on: arc-runner-small
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38 # v2.0.0
+        env:
+          # Severity = error: SC1091 (can't follow sourced script) is info-
+          # level and would otherwise fail when the venv activate script
+          # doesn't exist at lint time.
+          SHELLCHECK_OPTS: --severity=error
+        with:
+          scandir: ./docker

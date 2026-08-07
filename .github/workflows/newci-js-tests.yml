@@ -1,0 +1,126 @@
+# .github/workflows/js-tests.yml
+name: '[newci] JS Tests'
+
+# ⚠️  SHADOW WORKFLOW — temporary, for the ARC runner migration.
+#
+# A duplicate of the production js-tests.yml, running on the GKE self-hosted
+# (ARC) runners so the migration can be observed for a few days without
+# touching the workflows that gate merges. Production CI in this branch is
+# byte-identical to main.
+#
+# Safety properties (keep these when editing):
+#   - concurrency groups are newci-prefixed, so a shadow run can never
+#     cancel the production run it shadows
+#   - cache keys are newci-prefixed, so production caches stay clean
+#   - reusable-workflow calls point only at other newci-* workflows
+#   - the PR review comment runs --dry-run (prints, never posts)
+#   - the gate job is renamed; it does NOT gate merges
+#
+# To retire: delete .github/workflows/newci-*.yml.
+
+on:
+  workflow_call:
+
+jobs:
+  workspaces:
+    name: List npm workspaces
+    # Small runner: checkout plus an npm workspace query.
+    runs-on: arc-runner-small
+    timeout-minutes: 20
+    outputs:
+      checks: ${{ steps.set-matrix.outputs.checks }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: set-matrix
+        run: |
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+
+          const rootPkg = JSON.parse(fs.readFileSync("package.json", "utf-8"));
+          const patterns = rootPkg.workspaces || [];
+
+          // minimal glob support: exact dirs ("packages/foo") and single-level wildcards ("packages/*")
+          function expandPattern(pattern) {
+            if (!pattern.includes("*")) {
+              return fs.existsSync(pattern) ? [pattern] : [];
+            }
+            const [base] = pattern.split("*");
+            const parentDir = base.replace(/\/$/, "");
+            if (!fs.existsSync(parentDir)) return [];
+            return fs.readdirSync(parentDir, { withFileTypes: true })
+              .filter(d => d.isDirectory())
+              .map(d => path.join(parentDir, d.name));
+          }
+
+          const dirs = [...new Set(patterns.flatMap(expandPattern))];
+
+          const pkgs = dirs
+            .map(dir => {
+              const pkgPath = path.join(dir, "package.json");
+              if (!fs.existsSync(pkgPath)) return null;
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+              return { location: dir, name: pkg.name, scripts: pkg.scripts || {} };
+            })
+            .filter(Boolean);
+
+          if (pkgs.length === 0) {
+            console.error("::error::Workspace discovery produced an empty package list — refusing to emit a zero-length matrix (would skip all JS/TS checks silently).");
+            process.exit(1);
+          }
+
+          const checks = [];
+          for (const pkg of pkgs) {
+            const subs = Object.keys(pkg.scripts).filter(s => /^check:.+$/.test(s));
+            if (subs.length > 0) {
+              for (const script of subs) {
+                checks.push({ package: pkg.location, script });
+              }
+            } else if (pkg.scripts.check) {
+              checks.push({ package: pkg.location, script: "check" });
+            }
+          }
+
+          if (checks.length === 0) {
+            console.error("::error::No check scripts found in any workspace package.");
+            process.exit(1);
+          }
+
+          process.stdout.write("checks=" + JSON.stringify(checks) + "\n");
+          ' >> "$GITHUB_OUTPUT"
+
+  check:
+    name: ${{ matrix.package }} / ${{ matrix.script }}
+    needs: workspaces
+    runs-on: arc-runner-set
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.workspaces.outputs.checks) }}
+      fail-fast: false # report all failures, not just the first one
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: npm-cache
+        with:
+          path: |
+            node_modules
+            apps/*/node_modules
+            ui-tui/node_modules
+            ui-tui/packages/*/node_modules
+            web/node_modules
+            tests-js/node_modules
+          # node26 in the key: node-pty/electron native artifacts are
+          # node-major-specific; sync with NODE_MAJOR in the runner image
+          # (hermes-agent-ci-infra runner/Dockerfile).
+          key: newci-node-modules-full-node26-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+
+      - uses: ./.github/actions/retry
+        with:
+          command: npm ci
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+
+      - uses: ./.github/actions/profile
+        with:
+          label: js-${{ matrix.package }}-${{ matrix.script }}
+          command: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}

@@ -170,6 +170,56 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
+def _discover_files_from_git(roots: List[Path], repo_root: Path) -> List[Path]:
+    """Like :func:`_discover_files`, but list paths from the git index.
+
+    ``_discover_files`` walks the filesystem, which requires a full
+    working tree. The CI ``--generate-slices`` job only needs test file
+    *names* (it never opens them), so it checks out sparsely — a blobless,
+    sparse clone is ~3MB against ~212MB for the full tree. Under a sparse
+    checkout ``rglob`` finds nothing, because the files aren't on disk.
+
+    The git *index* still carries every path (sparse checkout only clears
+    the worktree, marking entries skip-worktree), so ``git ls-files``
+    enumerates the same set the filesystem walk would have. Skip-part
+    filtering and root-override semantics match ``_discover_files``
+    exactly, so both discovery paths produce identical slicing input.
+    """
+    seen: set[Path] = set()
+    out: List[Path] = []
+    for root in roots:
+        rel = root.relative_to(repo_root) if root.is_absolute() else root
+        # Same opt-in rule as _discover_files: naming a skipped dir as a
+        # root overrides the skip for that subtree.
+        root_skip_overrides = {part for part in rel.parts if part in _SKIP_PARTS}
+        effective_skips = _SKIP_PARTS - root_skip_overrides
+        try:
+            listed = subprocess.run(
+                ["git", "ls-files", "-z", "--", str(rel)],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            print(f"error: git ls-files failed for {rel}: {e}", file=sys.stderr)
+            raise SystemExit(2) from e
+        for entry in listed.split("\0"):
+            if not entry:
+                continue
+            path = Path(entry)
+            if not path.name.startswith("test_") or path.suffix != ".py":
+                continue
+            if any(part in effective_skips for part in path.parts):
+                continue
+            abs_path = repo_root / path
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            out.append(abs_path)
+    return sorted(out)
+
+
 def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
@@ -673,6 +723,35 @@ def _make_stdio_glyph_safe() -> None:
                 pass
 
 
+def _effective_cpu_count() -> int:
+    """CPU count respecting cgroup quotas (containers/K8s pods).
+
+    ``os.cpu_count()`` reports the HOST core count. Inside a CPU-limited
+    cgroup (e.g. an ARC runner pod with a 8-CPU limit on a 22-core node)
+    that oversubscribes the pod ~3x and per-file test subprocesses hit
+    their timeouts from CPU starvation. Read the cgroup v2 ``cpu.max``
+    (or v1 quota/period) when present.
+    """
+    host = os.cpu_count() or 4
+    try:
+        with open("/sys/fs/cgroup/cpu.max", encoding="ascii") as f:
+            quota_s, period_s = f.read().split()
+        if quota_s != "max":
+            return max(1, min(host, int(int(quota_s) / int(period_s))))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="ascii") as f:
+            quota = int(f.read())
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="ascii") as f:
+            period = int(f.read())
+        if quota > 0:
+            return max(1, min(host, quota // period))
+    except (OSError, ValueError):
+        pass
+    return host
+
+
 def main() -> int:
     _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
@@ -683,8 +762,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or _effective_cpu_count() * 2),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cgroup-aware cpu_count*2)",
     )
     parser.add_argument(
         "--paths",
@@ -745,6 +824,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--discover-from-git",
+        action="store_true",
+        help=(
+            "List test files from the git index (git ls-files) instead of "
+            "walking the filesystem. Lets --generate-slices run against a "
+            "blobless sparse checkout, where the test files aren't on disk."
+        ),
+    )
+    parser.add_argument(
         "--files",
         metavar="LIST",
         help=(
@@ -782,6 +870,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--discover-from-git",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -900,7 +989,11 @@ def main() -> int:
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
             _SKIP_PARTS = set()
 
-        files = _discover_files(roots)
+        files = (
+            _discover_files_from_git(roots, repo_root)
+            if args.discover_from_git
+            else _discover_files(roots)
+        )
 
     if not files:
         print("No test files to run", file=sys.stderr)

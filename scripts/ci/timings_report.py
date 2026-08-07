@@ -19,8 +19,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
+import glob
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -195,6 +198,125 @@ def _normalize_job(raw: dict) -> dict:
         "duration_s": dur_s(raw.get("started_at"), raw.get("completed_at")),
         "html_url": raw.get("html_url", ""),
         "steps": steps,
+    }
+
+
+# Step categories. "Overhead" is everything a job pays before and after its
+# actual work: runner setup, checkout, dependency restore/install, teardown.
+# Naming is GitHub's, not ours — a `uses:` step is reported as
+# "Run <owner>/<action>@<sha>" and its cleanup as "Post Run <...>", while a
+# `run:` step keeps whatever `name:` the workflow gave it. So the setup
+# patterns match action refs and the well-known implicit steps, and anything
+# unmatched is treated as work (better to under-report overhead than to
+# silently classify a real test step as setup).
+STEP_SETUP = "setup"
+STEP_WORK = "work"
+STEP_TEARDOWN = "teardown"
+
+_SETUP_PATTERNS = (
+    "set up job",
+    "set up python",
+    "set up node",
+    "checkout",
+    "actions/checkout",
+    "actions/setup-",
+    "actions/cache",
+    "restore ",          # "Restore uv cache", "Restore baseline cache", ...
+    "install ",          # "Install dependencies", "Install ruff + ty", ...
+    "minimize uv cache",
+    "uv-cache",
+    "set up docker buildx",
+    "log in to",
+    "authenticate to",
+    "mint read-only cache token",
+    "pull ghcr.io/",
+    "get-app-token",
+    "determine base ref",
+)
+
+_TEARDOWN_PATTERNS = (
+    "complete job",
+    "stop containers",
+    "upload",
+    "export results",
+)
+
+
+def classify_step(name: str) -> str:
+    """Bucket a step into setup / work / teardown.
+
+    Any ``Post ...`` step is teardown regardless of what it post-processes —
+    that's GitHub's own cleanup phase for a ``uses:`` step.
+    """
+    low = (name or "").strip().lower()
+    if low.startswith("post "):
+        return STEP_TEARDOWN
+    for pat in _TEARDOWN_PATTERNS:
+        if pat in low:
+            return STEP_TEARDOWN
+    for pat in _SETUP_PATTERNS:
+        if pat in low:
+            return STEP_SETUP
+    return STEP_WORK
+
+
+def display_step_name(name: str) -> str:
+    """Strip the pinned SHA from an action ref for display.
+
+    GitHub names a ``uses:`` step after the full pinned ref, e.g.
+    ``Run actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd``. The
+    40-char SHA crowds out the part a reader cares about and makes the
+    overhead table unreadable, so drop it. Only the DISPLAY changes — the
+    raw name stays the key for baseline comparison and aggregation, since
+    two different pins are genuinely two different steps.
+    """
+    if not name:
+        return ""
+    return re.sub(r"@[0-9a-f]{7,40}\b", "", name)
+
+
+def compute_overhead(timings: dict) -> dict:
+    """Aggregate setup/work/teardown seconds across every non-skipped job.
+
+    Returns totals plus the worst individual setup steps, so the report can
+    answer "how much of CI is spent getting ready to work" with a number
+    instead of an impression.
+    """
+    totals = {STEP_SETUP: 0.0, STEP_WORK: 0.0, STEP_TEARDOWN: 0.0}
+    by_step: dict[str, dict] = {}
+    jobs_with_steps = 0
+
+    for j in timings.get("jobs", []):
+        if is_skipped(j) or not j.get("steps"):
+            continue
+        jobs_with_steps += 1
+        for s in j["steps"]:
+            dur = s.get("duration_s")
+            if dur is None or dur < 0:
+                continue
+            cat = classify_step(s.get("name", ""))
+            totals[cat] += dur
+            if cat != STEP_WORK:
+                agg = by_step.setdefault(
+                    s.get("name", ""), {"name": s.get("name", ""),
+                                        "total_s": 0.0, "count": 0, "category": cat}
+                )
+                agg["total_s"] += dur
+                agg["count"] += 1
+
+    accounted = sum(totals.values())
+    overhead = totals[STEP_SETUP] + totals[STEP_TEARDOWN]
+    return {
+        "setup_s": totals[STEP_SETUP],
+        "work_s": totals[STEP_WORK],
+        "teardown_s": totals[STEP_TEARDOWN],
+        "overhead_s": overhead,
+        "accounted_s": accounted,
+        "overhead_pct": (overhead / accounted * 100) if accounted > 0 else 0.0,
+        "jobs_with_steps": jobs_with_steps,
+        "top_overhead_steps": sorted(
+            by_step.values(), key=lambda x: -x["total_s"]
+        )[:8],
     }
 
 
@@ -418,6 +540,344 @@ def compute_stats(timings: dict, baseline: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Resource profile loading + bottleneck analysis
+# ---------------------------------------------------------------------------
+
+def load_resource_profiles(directory: str) -> dict[str, dict]:
+    """Load all resource-profile-*/resource-profile.json artifacts.
+
+    Returns {label: profile_dict}. Labels are derived from the artifact
+    directory name (resource-profile-<label> → <label>).
+    """
+    profiles: dict[str, dict] = {}
+    if not directory or not os.path.isdir(directory):
+        return profiles
+
+    for path in glob.glob(os.path.join(directory, "**", "resource-profile.json"), recursive=True):
+        try:
+            with open(path, encoding="utf-8") as f:
+                profile = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        label = profile.get("label") or os.path.basename(os.path.dirname(path))
+        profiles[label] = profile
+
+    return profiles
+
+
+def _match_tokens(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens, for fuzzy label/job-name matching."""
+    return [t for t in re.sub(r"[^a-z0-9]+", " ", text.lower()).split() if t]
+
+
+def _match_score(label: str, job_name: str) -> float:
+    """Score how well a profile label matches a job name (0.0-1.0).
+
+    Profile labels are hand-written in the workflow (``tests-slice-3``)
+    while job names come from GitHub (``Python tests / Run tests slice
+    3/8``), so there is no exact key to join on. Three signals, blended:
+
+      * containment — what fraction of the label's tokens the job has.
+        The primary signal, since the label is the shorter string.
+      * Jaccard     — penalises a job name that matches by being huge.
+      * sequence    — orders otherwise-tied candidates by surface shape.
+
+    Digits are a hard gate rather than a weighted term: ``tests-slice-3``
+    and ``tests-slice-8`` differ in exactly one token, and without the
+    gate they score within noise of each other. Any digit token in the
+    label must appear in the job name or the pair scores 0.
+    """
+    lt, jt = _match_tokens(label), _match_tokens(job_name)
+    if not lt or not jt:
+        return 0.0
+    ls, jss = set(lt), set(jt)
+
+    label_digits = {t for t in ls if t.isdigit()}
+    if label_digits and not label_digits <= jss:
+        return 0.0
+
+    containment = len(ls & jss) / len(ls)
+    jaccard = len(ls & jss) / len(ls | jss)
+    seq = difflib.SequenceMatcher(None, " ".join(lt), " ".join(jt)).ratio()
+    return 0.45 * containment + 0.35 * jaccard + 0.20 * seq
+
+
+# Below this score a "best match" is more likely coincidence than a real
+# pairing, so the profile is left unattached rather than overlaid onto an
+# unrelated job's bar. Calibrated against a real run: true pairs scored
+# 0.44-0.90, the best false pair 0.31.
+_MATCH_THRESHOLD = 0.40
+
+
+def match_profiles_to_jobs(timings: dict, profiles: dict[str, dict]) -> dict[str, dict]:
+    """Return {job_name: profile} for profiles confidently matched to a job.
+
+    Greedy best-first over all (profile, job) pairs: the highest-scoring
+    pair is committed, then both sides are removed from contention. This
+    keeps one profile per job and one job per profile even when several
+    labels look alike (the eight ``tests-slice-N`` profiles against the
+    eight ``Run tests slice N/8`` jobs), which a per-profile argmax does
+    not guarantee.
+    """
+    jobs = [j for j in timings.get("jobs", []) if not is_skipped(j)]
+    if not jobs or not profiles:
+        return {}
+
+    scored = []
+    for label, profile in profiles.items():
+        for job in jobs:
+            score = _match_score(label, job.get("name", ""))
+            if score >= _MATCH_THRESHOLD:
+                scored.append((score, label, job.get("name", ""), profile))
+
+    # Sort by score desc; ties broken on names so the result is stable
+    # regardless of dict iteration order.
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+
+    matched: dict[str, dict] = {}
+    used_labels: set[str] = set()
+    for _score, label, job_name, profile in scored:
+        if label in used_labels or job_name in matched:
+            continue
+        used_labels.add(label)
+        matched[job_name] = profile
+    return matched
+
+
+def _sparkline_svg(series: list[int], color: str, klass: str) -> str:
+    """Render a 0-100 series as a filled+stroked SVG sparkline that stretches.
+
+    ``preserveAspectRatio="none"`` plus a viewBox in series-index space
+    lets one SVG scale to any bar width without recomputing points, so
+    the same markup serves both the 3px-tall collapsed strip and the
+    full-height expanded overlay.
+
+    The fill alone is too faint to read once three translucent layers are
+    stacked, so each series also gets a 1px stroked polyline on top. The
+    stroke carries ``vector-effect="non-scaling-stroke"``: without it the
+    non-uniform viewBox scaling (a ~200x180px box showing a 180x100
+    viewBox) stretches the stroke into an unreadable smear.
+    """
+    if not series:
+        return ""
+    n = len(series)
+    width = max(n - 1, 1)
+    # y is inverted: SVG's origin is top-left, but 100% should draw at the top.
+    pts = " ".join(f"{i},{100 - v}" for i, v in enumerate(series))
+    # Close the polygon along the bottom edge so it reads as an area chart.
+    poly = f"0,100 {pts} {width},100"
+    return (
+        f'<svg class="res-spark {klass}" viewBox="0 0 {width} 100" '
+        f'preserveAspectRatio="none" aria-hidden="true">'
+        f'<polygon points="{poly}" fill="{color}"/>'
+        f'<polyline points="{pts}" fill="none" stroke="{color}" '
+        f'stroke-width="1" vector-effect="non-scaling-stroke"/>'
+        f'</svg>'
+    )
+
+
+# Overlay series: (profile series key, color, css class).
+_RES_SERIES = (
+    ("cpu_pct", "#3fb950", "cpu"),    # green
+    ("mem_pct", "#d29922", "mem"),    # amber
+    ("disk_pct", "#f85149", "disk"),  # red
+)
+
+
+def _resource_overlay(profile: dict | None, expanded: bool) -> str:
+    """Render one job's CPU/RAM/disk overlay, or "" if there is no series.
+
+    Callers pass an unmatched job's ``None`` straight through, so this is
+    also the guard for "this job was never profiled". Old artifacts
+    predating the ``series`` field degrade the same way: table only, no
+    overlay. ``expanded`` selects which CSS state the layer renders in.
+    """
+    if not profile:
+        return ""
+    series = profile.get("series") or {}
+    layers = []
+    for key, color, name in _RES_SERIES:
+        values = series.get(key) or []
+        if values:
+            layers.append(_sparkline_svg(values, color, name))
+    if not layers:
+        return ""
+
+    cpu = profile.get("cpu", {})
+    mem = profile.get("memory", {})
+    disk = profile.get("disk", {})
+    tip = (
+        f'CPU avg {cpu.get("avg_usage_pct", 0):.0f}% / peak {cpu.get("peak_usage_pct", 0):.0f}% · '
+        f'RAM peak {mem.get("peak_mb", 0):.0f} MB · '
+        f'disk util avg {disk.get("avg_util_pct", 0):.0f}%'
+    )
+    klass = "res-overlay expanded" if expanded else "res-overlay collapsed"
+    return f'<div class="{klass}" title="{escape(tip)}">{"".join(layers)}</div>'
+
+
+def _profile_window_frac(profile: dict | None, job_start, job_end) -> tuple[float, float]:
+    """Return (start, width) of the profiled window as fractions of the job bar.
+
+    ``(0.0, 1.0)`` means "the whole bar" and is the fallback for every case
+    we cannot place confidently — that is exactly the old behaviour, so a
+    miss degrades to stretching rather than to a missing overlay.
+
+    Fractions rather than percentages because the two overlay states live in
+    different coordinate spaces: the collapsed strip is a child of the bar,
+    the expanded layer sits in the track. Each scales this once, instead of
+    one of them undoing the other's scaling.
+
+    Placement matters because the profiler wraps ONE step
+    (``.github/actions/profile``): on a job whose other steps dominate —
+    checkout, uv sync, post-job cleanup — the samples describe a slice in
+    the middle, and stretching them across the bar puts a CPU spike under a
+    step that never ran.
+    """
+    if not profile or job_start is None or job_end is None:
+        return 0.0, 1.0
+
+    p_s = parse_ts(profile.get("started_at"))
+    p_e = parse_ts(profile.get("completed_at"))
+    if p_s is None or p_e is None:
+        return 0.0, 1.0  # artifact predates the timestamps
+
+    span = (job_end - job_start).total_seconds()
+    if span <= 0:
+        return 0.0, 1.0
+
+    # Clamped into the bar: a profiler signalled just after its step ends can
+    # outrun the job's completed_at by a second or two.
+    start = max(0.0, (p_s - job_start).total_seconds() / span)
+    end = min(1.0, (p_e - job_start).total_seconds() / span)
+    if end <= start:
+        return 0.0, 1.0  # clock skew put the window outside the job
+
+    # Floor keeps a hairline visible for a very short profile on a long job.
+    return start, max(end - start, 0.005)
+
+
+def classify_bottleneck(timings: dict, profiles: dict[str, dict]) -> str:
+    """Return a one-line bottleneck classification.
+
+    Examines wall time, compute time, wait time, and resource profiles
+    to identify the dominant constraint.
+
+    Possible verdicts:
+      - "CPU-bound: <job> at <pct>% CPU for <dur>"
+      - "Memory-bound: <job> peaked at <mb> MB"
+      - "Disk IO-bound: <job> at <ops>/s for <dur>"
+      - "Wait-bound: <wait>s idle waiting for dependencies"
+      - "Evenly distributed: no single bottleneck"
+      - "Insufficient data: <reason>"
+    """
+    stats = compute_stats(timings, None)
+    jobs = [j for j in timings.get("jobs", []) if not is_skipped(j)]
+
+    if not jobs:
+        return "Insufficient data: no jobs in timings"
+
+    # --- Wait-bound: if total wait > 50% of wall time ---
+    wall = stats["wall"]
+    total_wait = stats["total_wait"]
+    if wall > 0 and total_wait > 0:
+        wait_pct = total_wait / wall * 100
+        if wait_pct > 50:
+            return (f"Wait-bound: {fmt_dur(total_wait)} idle "
+                    f"({wait_pct:.0f}% of {fmt_dur(wall)} wall) waiting for dependencies")
+
+    # --- Resource-bound: check profiles for CPU/mem/disk extremes ---
+    if profiles:
+        cpu_hotspot = None
+        mem_hotspot = None
+        disk_hotspot = None
+        max_cpu = 0.0
+        max_mem_frac = 0.0
+        max_disk_ops = 0.0
+
+        for label, p in profiles.items():
+            cpu_info = p.get("cpu", {})
+            mem_info = p.get("memory", {})
+            disk_info = p.get("disk", {})
+
+            cpu_avg = cpu_info.get("avg_usage_pct", 0)
+            cpu_peak = cpu_info.get("peak_usage_pct", 0)
+            if cpu_avg > max_cpu:
+                max_cpu = cpu_avg
+                cpu_hotspot = (label, cpu_avg, cpu_peak, p.get("duration_s", 0))
+
+            # Memory is USED MB. Compare against the machine's total when the
+            # profile carries it; otherwise fall back to an absolute floor.
+            mem_peak = mem_info.get("peak_mb", 0)
+            mem_total = mem_info.get("total_mb", 0)
+            mem_frac = (mem_peak / mem_total) if mem_total > 0 else (mem_peak / 16000.0)
+            if mem_frac > max_mem_frac:
+                max_mem_frac = mem_frac
+                mem_hotspot = (label, mem_peak, mem_total)
+
+            disk_ops = disk_info.get("avg_ops_per_s", 0)
+            disk_mb = disk_info.get("total_mb", 0)
+            if disk_ops > max_disk_ops:
+                max_disk_ops = disk_ops
+                disk_hotspot = (label, disk_ops, disk_mb, p.get("duration_s", 0))
+
+        # Classify: pick the most extreme dimension.
+        # Each candidate's sort key is normalized to roughly 0-100 so the
+        # dimensions are comparable:
+        #   CPU   — avg usage pct (bound when > 80)
+        #   Disk  — avg completed IOs/s / 10 (bound when > 500 ops/s)
+        #   Mem   — peak used as pct of total (bound when > 85%)
+
+        candidates = []
+        if cpu_hotspot and cpu_hotspot[1] > 80:
+            candidates.append((
+                cpu_hotspot[1],  # sort key
+                f"CPU-bound: {cpu_hotspot[0]} at {cpu_hotspot[1]:.0f}% avg CPU "
+                f"(peak {cpu_hotspot[2]:.0f}%) for {fmt_dur(cpu_hotspot[3])}"
+            ))
+        if disk_hotspot and disk_hotspot[1] > 500:
+            candidates.append((
+                disk_hotspot[1] / 10,
+                f"Disk IO-bound: {disk_hotspot[0]} at {disk_hotspot[1]:.0f} ops/s "
+                f"({disk_hotspot[2]:.0f} MB total) for {fmt_dur(disk_hotspot[3])}"
+            ))
+        if mem_hotspot and max_mem_frac > 0.85:
+            total_note = f" of {mem_hotspot[2]:.0f} MB" if mem_hotspot[2] else ""
+            candidates.append((
+                max_mem_frac * 100,
+                f"Memory-bound: {mem_hotspot[0]} peaked at "
+                f"{mem_hotspot[1]:.0f} MB used{total_note}"
+            ))
+
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][1]
+
+    # --- No resource profiles, but check wall vs compute ---
+    compute = stats["compute"]
+    if wall > 0 and compute > 0:
+        parallelism = compute / wall
+        if parallelism < 1.2 and len(jobs) > 2:
+            # Low parallelism ratio means jobs are serial
+            slowest = max(jobs, key=lambda j: j.get("duration_s") or 0)
+            slow_dur = slowest.get("duration_s") or 0
+            slow_pct = slow_dur / wall * 100 if wall > 0 else 0
+            if slow_pct > 40:
+                return (f"Serial bottleneck: {slowest['name']} takes "
+                        f"{fmt_dur(slow_dur)} ({slow_pct:.0f}% of wall)")
+
+    # --- Fallback: the single slowest job ---
+    slowest = max(jobs, key=lambda j: j.get("duration_s") or 0)
+    slow_dur = slowest.get("duration_s") or 0
+    if slow_dur > 0 and wall > 0:
+        slow_pct = slow_dur / wall * 100
+        if slow_pct > 40 and len(jobs) > 1:
+            return (f"Dominated by {slowest['name']}: "
+                    f"{fmt_dur(slow_dur)} ({slow_pct:.0f}% of wall)")
+
+    return "Evenly distributed: no single bottleneck"
+
+
+# ---------------------------------------------------------------------------
 # HTML generation
 # ---------------------------------------------------------------------------
 
@@ -470,11 +930,109 @@ h2 { font-size: 18px; margin: 32px 0 12px; }
 .gantt-bar.baseline {
   background: transparent; border: 1px dashed #8b949e; top: 2px; height: 24px; z-index: 1;
 }
+
+/* Step segmentation inside the job bar. Segments are children of
+   .gantt-bar.current, so their percentages are relative to the bar. The
+   right border is the divider between consecutive steps. */
+.gantt-seg {
+  position: absolute; top: 0; height: 100%;
+  border-right: 1px solid rgba(1,4,9,0.85);
+  box-sizing: border-box;
+}
+.gantt-seg:last-child { border-right: none; }
+.gantt-seg.setup { background: #d29922; }
+.gantt-seg.work { background: #1f6feb; }
+.gantt-seg.teardown { background: #8957e5; }
+.gantt-seg:hover { filter: brightness(1.45); }
+
+/* Expandable job rows */
+.gantt-row.job.expandable { cursor: pointer; }
+.gantt-row.job.expandable:hover .gantt-label { color: #58a6ff; }
+.caret {
+  display: inline-block; margin-right: 4px; font-size: 9px; color: #8b949e;
+  transition: transform 0.15s;
+}
+.gantt-group.open .caret { transform: rotate(90deg); }
+.gantt-steps { display: none; }
+.gantt-group.open .gantt-steps { display: block; min-height: 26px; }
+
+/* Resource overlay (CPU / RAM / disk sparklines over a job bar), in two
+   states of the same series:
+     .collapsed — a 3px strip inside .gantt-bar.current, clipped to the job's
+                  extent and adding no row height. Enough to spot a saturated
+                  job while scanning.
+     .expanded  — the same curves over the full height of the open group, so
+                  they read against the step rows that caused them.
+   .gantt-steps is the positioning context for the expanded layer, with a
+   min-height so a profiled job with no step detail still shows one.
+   pointer-events:none keeps step tooltips and click-to-expand working
+   through the overlay. */
+.gantt-steps { position: relative; }
+.res-layer {
+  position: absolute; inset: 0; display: flex;
+  pointer-events: none; z-index: 0;
+}
+.res-layer .gantt-label { height: 100%; }
+.res-layer .gantt-track { height: 100%; border-left: none; }
+.res-overlay { position: absolute; left: 0; width: 100%; pointer-events: none; }
+.res-overlay.collapsed { bottom: 0; height: 3px; }
+.res-overlay.expanded { top: 0; height: 100%; }
+/* Positions the collapsed strip over the profiled window within the bar.
+   The strip itself is 100%-wide of THIS box, not of the job bar, so a job
+   whose profiled step is a slice in the middle shows the sparkline only
+   under that slice. */
+.res-clip { position: absolute; bottom: 0; height: 3px; pointer-events: none; }
+.res-spark { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* Area fills so all three read stacked; the stroke on top is what actually
+   makes each curve legible. At 3px the fill needs near-full opacity to
+   register and the stroke would just be noise. */
+.res-spark polygon { fill-opacity: 0.3; }
+.res-spark polyline { opacity: 0.95; }
+.res-overlay.collapsed .res-spark polygon { fill-opacity: 0.9; }
+.res-overlay.collapsed .res-spark polyline { display: none; }
+.res-holder {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(1,4,9,0.55);
+  border-left: 1px solid #21262d; border-right: 1px solid #21262d;
+  overflow: hidden;
+}
+/* Step bars must stay above the overlay. */
+.gantt-row.step { position: relative; z-index: 1; height: 18px; }
+.gantt-label.step {
+  font-size: 11px; color: #8b949e; padding-left: 18px;
+  text-align: right; direction: rtl;
+}
+.gantt-bar.step { height: 10px; top: 4px; opacity: 0.85; z-index: 2; }
+.gantt-bar.step.setup { background: #d29922; }
+.gantt-bar.step.work { background: #1f6feb; }
+.gantt-bar.step.teardown { background: #8957e5; }
+
+/* Overhead breakdown bar */
+.overhead-bar {
+  display: flex; height: 26px; border-radius: 4px; overflow: hidden;
+  margin: 8px 0 6px; border: 1px solid #30363d;
+}
+.overhead-seg {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; color: #010409; white-space: nowrap;
+  overflow: hidden;
+}
+.overhead-seg.setup { background: #d29922; }
+.overhead-seg.work { background: #1f6feb; color: #fff; }
+.overhead-seg.teardown { background: #8957e5; color: #fff; }
+.gantt-hint { font-size: 12px; color: #8b949e; margin-bottom: 8px; }
+.gantt-hint button {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  border-radius: 5px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+  font-family: inherit; margin-left: 4px;
+}
+.gantt-hint button:hover { background: #30363d; border-color: #8b949e; }
 .gantt-axis { display: flex; height: 20px; position: relative; border-top: 1px solid #30363d; margin-top: 4px; }
 .gantt-tick { position: absolute; font-size: 10px; color: #8b949e; transform: translateX(-50%); top: 4px; }
 .gantt-tick::before { content: ''; position: absolute; top: -4px; left: 50%; width: 1px; height: 4px; background: #30363d; }
 .legend { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; color: #8b949e; }
 .legend-swatch { display: inline-block; width: 16px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+.legend-sep { color: #30363d; }
 
 /* Tables */
 table { border-collapse: collapse; width: 100%; font-size: 13px; margin-bottom: 16px; }
@@ -503,16 +1061,22 @@ details td, details th { font-size: 12px; }
 """
 
 
-def _gantt_bars(timings: dict, baseline: dict | None) -> str:
+def _gantt_bars(timings: dict, baseline: dict | None,
+                profiles: dict[str, dict] | None = None) -> str:
     """Render the gantt chart HTML.
 
     Both current and baseline timelines are normalized to start at t=0
     (relative to each run's earliest job start). The axis scale spans
     0..max_end across both runs so bars are directly comparable.
+
+    When resource profiles are supplied, each matched job also carries a
+    CPU/RAM/disk overlay: a thin strip inside the collapsed bar, and a
+    full-height readable version once the job is expanded.
     """
     jobs = [j for j in timings.get("jobs", [])
             if j.get("started_at") and j.get("completed_at") and not is_skipped(j)]
     bl_map = {j["name"]: j for j in (baseline or {}).get("jobs", [])}
+    job_profiles = match_profiles_to_jobs(timings, profiles or {})
 
     # Current run: relative offsets from earliest start
     cur_starts = [s for s in (parse_ts(j.get("started_at")) for j in jobs) if s is not None]
@@ -587,16 +1151,104 @@ def _gantt_bars(timings: dict, baseline: dict | None) -> str:
                 f'title="{escape(j["name"])} — waited: {fmt_dur(wait_s)}"></div>'
             )
 
+        # Segment the job bar by step, so the composition of a job is visible
+        # without expanding it. Segments are nested INSIDE the job bar, so
+        # their offsets are percentages of the bar's own width (not of the
+        # whole track) — hence job_span, not total_s, as the denominator.
+        # The expanded step rows sit in the track instead, so those use the
+        # track scale.
+        #
+        # GitHub reports step timestamps at second granularity, so a
+        # sub-second step has started_at == completed_at and would render
+        # zero-width. Every segment gets a small minimum width; the tooltip
+        # carries the true duration. Short steps stay hoverable at the cost
+        # of segments summing to slightly over 100% on very short jobs.
+        job_span = (e - s).total_seconds() or 1.0
+        segments = []
+        step_rows = []
+        for st in (j.get("steps") or []):
+            st_s = parse_ts(st.get("started_at"))
+            st_e = parse_ts(st.get("completed_at"))
+            if st_s is None or st_e is None:
+                continue
+            cat = classify_step(st.get("name", ""))
+            st_dur = st.get("duration_s") or 0
+            st_name = escape(display_step_name(st.get("name", "")))
+            tip = f'{st_name} — {fmt_dur(st_dur)} [{cat}]'
+
+            # Within-bar coordinates (percent of the job bar).
+            in_left = max((st_s - s).total_seconds() / job_span * 100, 0)
+            in_width = max((st_e - st_s).total_seconds() / job_span * 100, 0.4)
+            segments.append(
+                f'<div class="gantt-seg {cat}" '
+                f'style="left:{in_left:.3f}%;width:{in_width:.3f}%" '
+                f'title="{tip}"></div>'
+            )
+
+            # Track coordinates (percent of the whole timeline) for the
+            # expanded rows.
+            tr_left = (st_s - cur_t0).total_seconds() / total_s * 100
+            tr_width = max((st_e - st_s).total_seconds() / total_s * 100, 0.15)
+            step_rows.append(
+                f'<div class="gantt-row step">'
+                f'<div class="gantt-label step" title="{st_name}">{st_name}</div>'
+                f'<div class="gantt-track">'
+                f'<div class="gantt-bar step {cat}" '
+                f'style="left:{tr_left:.3f}%;width:{tr_width:.3f}%" '
+                f'title="{tip}"></div>'
+                f'</div></div>'
+            )
+
+        seg_html = "".join(segments)
+
+        # Resource overlay, drawn over the PROFILED WINDOW rather than the
+        # whole job — see _profile_window_frac. The collapsed strip is a
+        # child of the bar (clipped to it, adds no row height) so it scales
+        # the fraction against the bar; the expanded layer is its own track
+        # row, so it scales against the track.
+        profile = job_profiles.get(j["name"])
+        f_left, f_width = _profile_window_frac(profile, s, e)
+
+        collapsed_overlay = _resource_overlay(profile, expanded=False)
+        if collapsed_overlay:
+            collapsed_overlay = (
+                f'<div class="res-clip" '
+                f'style="left:{f_left * 100:.2f}%;width:{f_width * 100:.2f}%">'
+                f'{collapsed_overlay}</div>'
+            )
+
+        expanded_overlay = ""
+        inner = _resource_overlay(profile, expanded=True)
+        if inner:
+            expanded_overlay = (
+                f'<div class="res-layer">'
+                f'<div class="gantt-label"></div>'
+                f'<div class="gantt-track">'
+                f'<div class="res-holder" '
+                f'style="left:{left + f_left * width:.2f}%;'
+                f'width:{f_width * width:.2f}%">{inner}</div>'
+                f'</div></div>'
+            )
+
+        # Only offer expansion when there is detail to show.
+        has_detail = bool(step_rows or expanded_overlay)
+        expandable = " expandable" if has_detail else ""
+        caret = '<span class="caret">▸</span>' if has_detail else ""
+
         rows.append(
-            f'<div class="gantt-row">'
-            f'<div class="gantt-label" title="{escape(j["name"])}">{name_display}</div>'
+            f'<div class="gantt-group">'
+            f'<div class="gantt-row job{expandable}">'
+            f'<div class="gantt-label" title="{escape(j["name"])}">{caret}{name_display}</div>'
             f'<div class="gantt-track">'
             f'{bl_bar}'
             f'{wait_bar}'
             f'<div class="gantt-bar current" '
             f'style="left:{left:.2f}%;width:{width:.2f}%" '
-            f'title="{escape(j["name"])}: {fmt_dur(dur)}{delta_info}"></div>'
+            f'title="{escape(j["name"])}: {fmt_dur(dur)}{delta_info}">'
+            f'{seg_html}{collapsed_overlay}</div>'
             f'</div></div>'
+            f'<div class="gantt-steps">{expanded_overlay}{"".join(step_rows)}</div>'
+            f'</div>'
         )
 
     # Axis
@@ -605,18 +1257,148 @@ def _gantt_bars(timings: dict, baseline: dict | None) -> str:
         f'<span class="gantt-tick" style="left:{(t / total_s * 100):.1f}%">{fmt_tick(t)}</span>'
         for t in ticks
     )
-    axis = f'<div class="gantt-axis"><div class="gantt-track">{tick_html}</div></div>'
+    # Empty label spacer keeps the axis track aligned with the bar tracks
+    # (each gantt-row is [label][track]; without the spacer the axis spans
+    # the label column too and every tick lands left of its true position).
+    axis = (
+        f'<div class="gantt-axis">'
+        f'<div class="gantt-label"></div>'
+        f'<div class="gantt-track">{tick_html}</div>'
+        f'</div>'
+    )
 
     legend = (
         '<div class="legend">'
-        '<span><span class="legend-swatch" style="background:#1f6feb"></span>Current</span>'
+        '<span><span class="legend-swatch" style="background:#d29922"></span>Setup</span>'
+        '<span><span class="legend-swatch" style="background:#1f6feb"></span>Work</span>'
+        '<span><span class="legend-swatch" style="background:#8957e5"></span>Teardown</span>'
         '<span><span class="legend-swatch" style="background:repeating-linear-gradient(45deg,#30363d,#30363d 3px,transparent 3px,transparent 6px);opacity:0.6"></span>Wait</span>'
     )
     if baseline:
         legend += '<span><span class="legend-swatch" style="border:1px dashed #8b949e"></span>Baseline (main)</span>'
+    if job_profiles:
+        legend += (
+            '<span class="legend-sep">|</span>'
+            '<span><span class="legend-swatch" style="background:#3fb950"></span>CPU %</span>'
+            '<span><span class="legend-swatch" style="background:#d29922"></span>RAM %</span>'
+            '<span><span class="legend-swatch" style="background:#f85149"></span>Disk %</span>'
+        )
     legend += '</div>'
 
-    return f'<div class="gantt-wrap"><div class="gantt">{"".join(rows)}{axis}</div></div>{legend}'
+    hint_extra = ""
+    if job_profiles:
+        hint_extra = (
+            'The thin strip along the bottom of a bar is node CPU / RAM / disk '
+            f'utilisation over that job ({len(job_profiles)} profiled); expand for a readable version. '
+        )
+    hint = (
+        '<div class="gantt-hint">'
+        'Bars are segmented by step — hover a segment for its name and duration. '
+        f'{hint_extra}'
+        'Click a job to expand its steps. '
+        '<button type="button" id="gantt-toggle-all">Expand all</button>'
+        '</div>'
+    )
+
+    # Vanilla JS, no deps: the report is a single self-contained HTML file
+    # served from an artifact URL.
+    script = """
+<script>
+(function () {
+  var groups = Array.prototype.slice.call(
+    document.querySelectorAll('.gantt-group')
+  );
+  groups.forEach(function (g) {
+    var row = g.querySelector('.gantt-row.job.expandable');
+    if (!row) return;
+    row.addEventListener('click', function () { g.classList.toggle('open'); });
+  });
+  var btn = document.getElementById('gantt-toggle-all');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    var expandable = groups.filter(function (g) {
+      return g.querySelector('.gantt-row.job.expandable');
+    });
+    var anyClosed = expandable.some(function (g) {
+      return !g.classList.contains('open');
+    });
+    expandable.forEach(function (g) { g.classList.toggle('open', anyClosed); });
+    btn.textContent = anyClosed ? 'Collapse all' : 'Expand all';
+  });
+})();
+</script>
+"""
+
+    return (
+        f'{hint}<div class="gantt-wrap"><div class="gantt">{"".join(rows)}{axis}</div></div>'
+        f'{legend}{script}'
+    )
+
+
+def _overhead_section(timings: dict) -> str:
+    """Quantify how much CI compute goes to setup/teardown rather than work.
+
+    This is the "is checkout the bottleneck?" answer: a stacked bar over all
+    accounted step time, plus the individual overhead steps that cost the
+    most summed across every job.
+    """
+    ov = compute_overhead(timings)
+    total = ov["accounted_s"]
+    if total <= 0:
+        return ('<p style="color:#8b949e">No per-step timing data available '
+                '(GitHub returns steps only for jobs this token can read).</p>')
+
+    setup_pct = ov["setup_s"] / total * 100
+    work_pct = ov["work_s"] / total * 100
+    teardown_pct = ov["teardown_s"] / total * 100
+
+    def seg(cls, pct, label):
+        if pct < 0.5:
+            return ""
+        # Only label a segment wide enough to hold text.
+        text = label if pct >= 8 else ""
+        return (f'<div class="overhead-seg {cls}" style="width:{pct:.2f}%" '
+                f'title="{label}">{text}</div>')
+
+    bar = (
+        '<div class="overhead-bar">'
+        + seg("setup", setup_pct, f'Setup {fmt_dur(ov["setup_s"])} ({setup_pct:.0f}%)')
+        + seg("work", work_pct, f'Work {fmt_dur(ov["work_s"])} ({work_pct:.0f}%)')
+        + seg("teardown", teardown_pct,
+              f'Teardown {fmt_dur(ov["teardown_s"])} ({teardown_pct:.0f}%)')
+        + '</div>'
+    )
+
+    headline = (
+        f'<p style="margin:4px 0 12px"><strong>{ov["overhead_pct"]:.0f}%</strong> of '
+        f'accounted step time ({fmt_dur(ov["overhead_s"])} of {fmt_dur(total)}) is '
+        f'setup + teardown rather than useful work, across {ov["jobs_with_steps"]} jobs.</p>'
+    )
+
+    rows = []
+    for s in ov["top_overhead_steps"]:
+        pct = s["total_s"] / total * 100
+        rows.append(
+            f'<tr><td class="job-name">{escape(display_step_name(s["name"]))}</td>'
+            f'<td>{s["category"]}</td>'
+            f'<td class="num">{s["count"]}</td>'
+            f'<td class="num">{fmt_dur(s["total_s"])}</td>'
+            f'<td class="num">{pct:.1f}%</td></tr>'
+        )
+    table = (
+        '<table><thead><tr><th>Overhead step</th><th>Kind</th>'
+        '<th class="num">Jobs</th><th class="num">Total</th>'
+        '<th class="num">% of step time</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody></table>'
+    ) if rows else ""
+
+    note = (
+        '<p style="font-size:12px;color:#8b949e">Percentages are of summed '
+        'step time across jobs (not wall time — jobs run in parallel). '
+        'Unrecognized step names count as work, so this under-reports rather '
+        'than inflates overhead.</p>'
+    )
+    return headline + bar + table + note
 
 
 def _stats_cards(stats: dict) -> str:
@@ -737,7 +1519,7 @@ def _step_details(timings: dict, baseline: dict | None) -> str:
 
             step_rows.append(
                 f'<tr>'
-                f'<td>{escape(s["name"])}</td>'
+                f'<td>{escape(display_step_name(s["name"]))}</td>'
                 f'<td class="num">{fmt_dur(s_dur)}</td>'
                 f'<td class="num">{fmt_dur(bl_s_dur)}</td>'
                 f'<td class="num {s_cls}">{s_delta}</td>'
@@ -793,7 +1575,7 @@ def _regressions(timings: dict, baseline: dict | None) -> str:
         rows.append(
             f'<tr>'
             f'<td class="job-name">{escape(job)}</td>'
-            f'<td>{escape(step)}</td>'
+            f'<td>{escape(display_step_name(step))}</td>'
             f'<td class="num">{fmt_dur(cur)}</td>'
             f'<td class="num">{fmt_dur(bl_d)}</td>'
             f'<td>{tag}</td>'
@@ -810,7 +1592,58 @@ def _regressions(timings: dict, baseline: dict | None) -> str:
     )
 
 
-def generate_html(timings: dict, baseline: dict | None = None) -> str:
+def _resource_table(profiles: dict[str, dict]) -> str:
+    """Render per-job resource usage as an HTML table."""
+    if not profiles:
+        return ""
+
+    rows = []
+    for label in sorted(profiles):
+        p = profiles[label]
+        cpu = p.get("cpu", {})
+        mem = p.get("memory", {})
+        disk = p.get("disk", {})
+
+        rows.append(
+            f'<tr>'
+            f'<td class="job-name">{escape(label)}</td>'
+            f'<td class="num">{fmt_dur(p.get("duration_s"))}</td>'
+            f'<td class="num">{cpu.get("avg_usage_pct", 0):.0f}%</td>'
+            f'<td class="num">{cpu.get("peak_usage_pct", 0):.0f}%</td>'
+            f'<td class="num">{mem.get("avg_mb", 0):.0f}</td>'
+            f'<td class="num">{mem.get("peak_mb", 0):.0f}</td>'
+            f'<td class="num">{disk.get("total_mb", 0):.0f}</td>'
+            f'<td class="num">{disk.get("avg_ops_per_s", 0):.0f}</td>'
+            f'<td class="num">{disk.get("avg_util_pct", 0):.0f}%</td>'
+            f'</tr>'
+        )
+
+    return (
+        '<table><thead><tr>'
+        '<th>Job</th><th class="num">Duration</th>'
+        '<th class="num">CPU avg</th><th class="num">CPU peak</th>'
+        '<th class="num">Mem avg (MB)</th><th class="num">Mem peak (MB)</th>'
+        '<th class="num">Disk (MB)</th><th class="num">Disk ops/s</th>'
+        '<th class="num">Disk util</th>'
+        '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+    )
+
+
+def _bottleneck_box(timings: dict, profiles: dict[str, dict]) -> str:
+    """Render the bottleneck analysis as a callout box."""
+    verdict = classify_bottleneck(timings, profiles)
+    return (
+        f'<div style="background:#161b22;border:1px solid #30363d;'
+        f'border-radius:8px;padding:16px;margin-bottom:24px">'
+        f'<div style="font-size:12px;color:#8b949e;text-transform:uppercase;'
+        f'letter-spacing:0.5px;margin-bottom:4px">Bottleneck Analysis</div>'
+        f'<div style="font-size:16px;font-weight:500">{escape(verdict)}</div>'
+        f'</div>'
+    )
+
+
+def generate_html(timings: dict, baseline: dict | None = None,
+                  profiles: dict[str, dict] | None = None) -> str:
     stats = compute_stats(timings, baseline)
 
     sha_short = (timings.get("head_sha") or "")[:7]
@@ -837,12 +1670,21 @@ def generate_html(timings: dict, baseline: dict | None = None) -> str:
     html += '<h2>Global Stats</h2>\n'
     html += _stats_cards(stats)
 
+    html += _bottleneck_box(timings, profiles or {})
+
+    html += '<h2>Setup vs Work</h2>\n'
+    html += _overhead_section(timings)
+
+    if profiles:
+        html += '<h2>Resource Usage</h2>\n'
+        html += _resource_table(profiles)
+
     if baseline:
         html += '<h2>Top Regressions & Improvements</h2>\n'
         html += _regressions(timings, baseline)
 
     html += '<h2>Gantt Chart</h2>\n'
-    html += _gantt_bars(timings, baseline)
+    html += _gantt_bars(timings, baseline, profiles)
 
     html += '<h2>Per-Job Comparison</h2>\n'
     html += _job_table(timings, baseline)
@@ -858,11 +1700,17 @@ def generate_html(timings: dict, baseline: dict | None = None) -> str:
 # Markdown summary for $GITHUB_STEP_SUMMARY
 # ---------------------------------------------------------------------------
 
-def generate_summary(timings: dict, baseline: dict | None = None) -> str:
+def generate_summary(timings: dict, baseline: dict | None = None,
+                     profiles: dict[str, dict] | None = None) -> str:
     stats = compute_stats(timings, baseline)
     bl_map = {j["name"]: j for j in (baseline or {}).get("jobs", [])}
 
     lines = ["## CI Timing Summary\n"]
+
+    # Bottleneck analysis
+    bottleneck = classify_bottleneck(timings, profiles or {})
+    lines.append(f"**Bottleneck:** {bottleneck}")
+    lines.append("")
 
     # Global stats table
     lines.append("| Metric | Current | Baseline | Delta |")
@@ -905,7 +1753,8 @@ _TIMINGS_WARN_PCT = 0.25
 
 
 def generate_review_status(
-    timings: dict, baseline: dict | None, report_url: str | None = None
+    timings: dict, baseline: dict | None, report_url: str | None = None,
+    profiles: dict[str, dict] | None = None
 ) -> list[dict]:
     """Produce a review_status JSON array for the CI timings review section.
 
@@ -916,6 +1765,7 @@ def generate_review_status(
     fragment.
     """
     stats = compute_stats(timings, baseline)
+    bottleneck = classify_bottleneck(timings, profiles or {})
 
     if baseline is None:
         severity = "debug"
@@ -941,6 +1791,8 @@ def generate_review_status(
         if stats["unchanged"]:
             wall_str += f" {stats['unchanged']} unchanged."
         summary = wall_str
+
+    summary += f" Bottleneck: {bottleneck}"
 
     # Per-job delta detail (top 5 by absolute change)
     detail_lines: list[str] = []
@@ -1001,7 +1853,12 @@ def main():
                         help="If set, write a review-status JSON for the unified PR comment.")
     parser.add_argument("--review-status-only", action="store_true",
                         help="Write review status from existing timings without regenerating the report.")
+    parser.add_argument("--profiles-dir", default="",
+                        help="Directory of downloaded resource-profile-* artifacts.")
     args = parser.parse_args()
+
+    # Load resource profiles (available in both API and --from-json modes)
+    profiles = load_resource_profiles(args.profiles_dir) if args.profiles_dir else {}
 
     # Collect or load timings
     if args.from_json:
@@ -1051,20 +1908,20 @@ def main():
         if not args.review_status_out:
             parser.error("--review-status-only requires --review-status-out")
         report_url = os.environ.get("CI_TIMINGS_REPORT_URL", "")
-        statuses = generate_review_status(timings, baseline, report_url)
+        statuses = generate_review_status(timings, baseline, report_url, profiles)
         with open(args.review_status_out, "w", encoding="utf-8") as f:
             f.write(f"review_status={json.dumps(statuses)}\n")
         print(f"Wrote review status to {args.review_status_out}")
         return
 
     # Generate HTML
-    html = generate_html(timings, baseline)
+    html = generate_html(timings, baseline, profiles)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"Generated HTML report: {args.output}")
 
     # Write summary
-    summary = generate_summary(timings, baseline)
+    summary = generate_summary(timings, baseline, profiles)
     with open(args.summary_out, "a", encoding="utf-8") as f:
         f.write(summary)
         print(f"Wrote summary to {args.summary_out}")
@@ -1074,7 +1931,7 @@ def main():
     # format) so the ci-timings job can expose it as a workflow_call output.
     if args.review_status_out:
         report_url = os.environ.get("CI_TIMINGS_REPORT_URL", "")
-        statuses = generate_review_status(timings, baseline, report_url)
+        statuses = generate_review_status(timings, baseline, report_url, profiles)
         json_str = json.dumps(statuses)
         with open(args.review_status_out, "a", encoding="utf-8") as f:
             f.write(f"review_status={json_str}\n")

@@ -1,0 +1,86 @@
+name: Ensure merge base is present
+description: >-
+  Guarantee that the local (shallow) clone contains the merge base of two
+  commits, so `git diff base...head` is meaningful. Three-dot diff is defined
+  as "since the merge base", so having both endpoint commits is NOT enough —
+  git reports "fatal: no merge base" until the histories actually connect.
+  A caller that swallows that error silently diffs nothing, which for a
+  security scanner means reporting clean without having looked at anything.
+
+inputs:
+  base:
+    description: Base commit SHA (e.g. github.event.pull_request.base.sha).
+    required: true
+  head:
+    description: Head commit SHA (e.g. github.event.pull_request.head.sha).
+    required: true
+  fail-on-missing:
+    description: >-
+      Fail the step when no merge base exists. Default true: a caller about to
+      run a three-dot diff must never continue, or it silently diffs nothing.
+      Set false when absence is the thing you are measuring (history-check),
+      and branch on the `found` output instead.
+    default: 'true'
+
+outputs:
+  sha:
+    description: The resolved merge-base commit SHA (empty when none exists).
+    value: ${{ steps.resolve.outputs.sha }}
+  found:
+    description: '"true" when a merge base exists, "false" otherwise.'
+    value: ${{ steps.resolve.outputs.found }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+        FAIL_ON_MISSING: ${{ inputs.fail-on-missing }}
+      run: |
+        set -euo pipefail
+
+        # Make sure both endpoints exist locally before deepening.
+        git cat-file -e "${BASE}^{commit}" 2>/dev/null || git fetch --depth=1 origin "$BASE" -q
+        git cat-file -e "${HEAD}^{commit}" 2>/dev/null || git fetch --depth=1 origin "$HEAD" -q
+
+        # Escalating deepen. A fixed budget is a correctness bug, not just a
+        # slow path: main lands ~270 commits/day, so a flat --deepen=100 stops
+        # connecting histories for any branch more than ~9 hours old.
+        for depth in 200 1000 5000; do
+          if git merge-base "$BASE" "$HEAD" >/dev/null 2>&1; then break; fi
+          git fetch --deepen="$depth" origin "$BASE" -q 2>/dev/null || true
+          git fetch --deepen="$depth" -q 2>/dev/null || true
+        done
+
+        # Full history is the only way to PROVE absence, so a genuinely
+        # unrelated branch always lands here. Rare (that PR is rejected
+        # anyway) and still cheaper than every job unshallowing by default.
+        if ! git merge-base "$BASE" "$HEAD" >/dev/null 2>&1; then
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            echo "::warning::deepen did not connect the histories; unshallowing (slow path)"
+            git fetch --unshallow -q 2>/dev/null || true
+            git fetch --depth=2147483647 origin "$BASE" -q 2>/dev/null || true
+          fi
+        fi
+
+        if MB=$(git merge-base "$BASE" "$HEAD" 2>/dev/null) && [ -n "$MB" ]; then
+          echo "sha=$MB" >> "$GITHUB_OUTPUT"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::merge base: $MB"
+          exit 0
+        fi
+
+        # Never fail open. Callers running a three-dot diff must stop here;
+        # history-check opts out to report the failure in its own words.
+        echo "sha=" >> "$GITHUB_OUTPUT"
+        echo "found=false" >> "$GITHUB_OUTPUT"
+        if [ "$FAIL_ON_MISSING" = "true" ]; then
+          echo "::error::No merge base between $BASE and $HEAD after deepening." \
+               "Refusing to continue: a three-dot diff would silently produce" \
+               "an empty result and report a vacuous pass."
+          exit 1
+        fi
+        echo "::notice::no merge base between $BASE and $HEAD"
