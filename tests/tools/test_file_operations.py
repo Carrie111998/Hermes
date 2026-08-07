@@ -673,3 +673,42 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_cjk_utf8_byte_boundary_not_flagged_binary(self, tmp_path):
+        """Regression: Korean/CJK UTF-8 files must not be misdetected as binary.
+
+        `head -c 1000` samples by *byte* count. Korean chars are 3 bytes each,
+        so 1000 mod 3 = 1 — the cut always orphans a start byte and the terminal
+        decoder injects a spurious U+FFFD.  The patched code must verify the
+        real file via python3 and return False.
+        """
+        # 400 × '가' = 1200 bytes; 1000 mod 3 = 1, so byte 999 is an orphaned
+        # UTF-8 start byte → errors='replace' always yields a trailing U+FFFD.
+        korean_text = "가" * 400
+        md_file = tmp_path / "이미지-매핑.md"
+        md_file.write_text(korean_text, encoding="utf-8")
+
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+
+        # Simulate what Hermes does: `head -c 1000` decoded with errors="replace"
+        import subprocess
+        raw = subprocess.run(
+            ["head", "-c", "1000", str(md_file)], capture_output=True
+        ).stdout
+        lossy_sample = raw.decode("utf-8", errors="replace")
+
+        # Confirm the test precondition: sample really does contain U+FFFD
+        assert "\ufffd" in lossy_sample, "test setup: byte-boundary split should produce U+FFFD"
+        # Must NOT be declared binary — it's valid UTF-8
+        assert ops._is_likely_binary(str(md_file), lossy_sample) is False
+
+    def test_real_latin1_file_still_flagged_binary(self, tmp_path):
+        """Real non-UTF-8 binary file must still be caught after the CJK fix."""
+        latin1_file = tmp_path / "legacy.txt"
+        latin1_file.write_bytes(b"caf\xe9 r\xe9sum\xe9\n" * 20)  # valid latin-1, not UTF-8
+
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        raw = latin1_file.read_bytes()[:1000]
+        lossy_sample = raw.decode("utf-8", errors="replace")
+
+        assert ops._is_likely_binary(str(latin1_file), lossy_sample) is True

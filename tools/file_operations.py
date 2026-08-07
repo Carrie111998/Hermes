@@ -903,7 +903,23 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
+            #
+            # HOWEVER: `head -c 1000` samples by *byte* count, so it can split
+            # a multi-byte CJK/Korean UTF-8 sequence at the boundary, causing
+            # the terminal decoder to inject a spurious U+FFFD. When we see
+            # U+FFFD, verify via python3 before declaring the file binary —
+            # this avoids false positives on files that are entirely valid UTF-8.
             if "\ufffd" in content_sample[:1000]:
+                if path:
+                    validate = self._exec(
+                        f"python3 -c \"open({self._escape_shell_arg(path)},"
+                        f" encoding='utf-8', errors='strict').read(100)\" 2>/dev/null"
+                        f" && echo OK"
+                    )
+                    if validate.stdout.strip() == "OK":
+                        # File is valid UTF-8 — the replacement char was a
+                        # byte-boundary truncation artifact, not real binary data.
+                        return False
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
