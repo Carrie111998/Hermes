@@ -9729,7 +9729,7 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     },
     # ── Anthropic / Claude entries sit at the bottom: the API-key path
     # first, then the subscription OAuth path (which only works with extra
-    # usage credits on top of a Claude Max plan — see disclaimer in name).
+    # usage credits on top of a Claude Max plan — see description).
     {
         "id": "anthropic",
         "name": "Anthropic API Key",
@@ -9740,7 +9740,8 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     },
     {
         "id": "claude-code",
-        "name": "Anthropic OAuth: Required Extra Usage Credits to Use Subscription",
+        "name": "Anthropic OAuth (Claude Code)",
+        "description": "Requires extra usage credits on top of a Claude Max plan.",
         "flow": "external",
         "cli_command": "claude setup-token",
         "docs_url": "https://docs.claude.com/en/docs/claude-code",
@@ -9965,6 +9966,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
             providers.append({
                 "id": p["id"],
                 "name": p["name"],
+                "description": p.get("description"),
                 "flow": p["flow"],
                 "cli_command": p["cli_command"],
                 "docs_url": p["docs_url"],
