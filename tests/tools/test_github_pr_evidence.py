@@ -535,6 +535,8 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
         ],
     }
     head_tree = {**base_tree, "sha": "d" * 40}
+    base_commit = {"sha": BASE_SHA, "tree": {"sha": "c" * 40}}
+    head_commit = {"sha": HEAD_SHA, "tree": {"sha": "d" * 40}}
     pull = {
         "number": 42,
         "base": {"sha": BASE_SHA},
@@ -553,8 +555,9 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
                 github_pr_evidence_tool("read", manifest["cursors"]["changed_files"])
             )
         with patch(
-            "tools.github_pr_evidence._run_gh_json", side_effect=[base_tree, head_tree]
-        ):
+            "tools.github_pr_evidence._run_gh_json",
+            side_effect=[base_tree, head_tree, base_commit, head_commit],
+        ) as run:
             result = json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
             )
@@ -562,6 +565,12 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
     assert result["success"] is True
     assert result["items"]["blob_cursors"] == {"changed": [], "canonical": []}
     assert not any(cursor.kind == "blob" for cursor in scope.cursors.values())
+    assert result["items"]["base_tree_sha"] == "c" * 40
+    assert result["items"]["head_tree_sha"] == "d" * 40
+    assert [call.args[0] for call in run.call_args_list[-2:]] == [
+        [f"repos/org/repo/git/commits/{BASE_SHA}"],
+        [f"repos/org/repo/git/commits/{HEAD_SHA}"],
+    ]
     assert result["coverage"]["complete"] is True
 
 

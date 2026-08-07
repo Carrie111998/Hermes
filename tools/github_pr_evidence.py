@@ -867,12 +867,31 @@ def _is_canonical_gate_path(path: str) -> bool:
 
 
 def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
-    base_sha, base = _tree_map(
+    base_inventory_sha, base = _tree_map(
         _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.base_sha}?recursive=1"])
     )
-    head_sha, head = _tree_map(
+    head_inventory_sha, head = _tree_map(
         _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.head_sha}?recursive=1"])
     )
+    base_sha = base_inventory_sha
+    head_sha = head_inventory_sha
+    if scope.concise_review:
+        commit_trees = []
+        for commit_sha in (scope.base_sha, scope.head_sha):
+            commit = _run_gh_json(
+                [f"repos/{scope.repository}/git/commits/{commit_sha}"]
+            )
+            tree = commit.get("tree") if isinstance(commit, dict) else None
+            tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+            if (
+                not isinstance(commit, dict)
+                or commit.get("sha") != commit_sha
+                or not isinstance(tree_sha, str)
+                or _SHA_RE.fullmatch(tree_sha) is None
+            ):
+                raise RuntimeError("Exact commit tree identity was malformed")
+            commit_trees.append(tree_sha)
+        base_sha, head_sha = commit_trees
     scope.base_tree_sha = base_sha
     scope.head_tree_sha = head_sha
     scope.base_tree = base
