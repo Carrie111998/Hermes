@@ -111,7 +111,3 @@ export function GeneralSettings() {
     </SettingsContent>
   )
 }
-
-/** Back-compat alias while patches settle. */
-export const TraySettings = GeneralSettings
-export const TraySettingsSection = GeneralSettings
