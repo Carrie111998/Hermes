@@ -163,6 +163,10 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+        if memory_char_limit < 0:
+            raise ValueError(f"memory_char_limit must be >= 0, got {memory_char_limit}")
+        if user_char_limit < 0:
+            raise ValueError(f"user_char_limit must be >= 0, got {user_char_limit}")
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
@@ -900,9 +904,19 @@ def load_on_disk_store() -> "MemoryStore":
     except Exception:
         pass  # config optional — fall back to defaults rather than break /memory
 
+    # Clamp negative limits at the config boundary so a misconfigured
+    # (negative) value never reaches the MemoryStore constructor's own
+    # ValueError guard and gets swallowed by a blanket except higher up
+    # the call stack.  A warning is logged so the operator can fix config.
+    if memory_char_limit < 0 or user_char_limit < 0:
+        logger.warning(
+            "Negative memory char limit from config "
+            "(memory_char_limit=%s, user_char_limit=%s) — clamping to 0",
+            memory_char_limit, user_char_limit,
+        )
     store = MemoryStore(
-        memory_char_limit=memory_char_limit,
-        user_char_limit=user_char_limit,
+        memory_char_limit=max(0, memory_char_limit),
+        user_char_limit=max(0, user_char_limit),
     )
     store.load_from_disk()
     return store
