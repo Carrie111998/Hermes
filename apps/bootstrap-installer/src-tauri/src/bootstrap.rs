@@ -520,12 +520,13 @@ async fn run_bootstrap(
         manifest_args_full.push("-IncludeDesktop".to_string());
     }
 
+    let mut manifest_cancel_rx = None;
     let manifest_result = run_install_script(
         &app,
         &script.path,
         &manifest_args_full,
         args.hermes_home.as_deref(),
-        None,
+        &mut manifest_cancel_rx,
         Some("__manifest__".to_string()),
     )
     .await?;
@@ -632,12 +633,12 @@ async fn run_bootstrap(
         let mut attempt = 1;
         let mut local_cancel_rx = cancel_rx_holder.lock().await.take();
         let (stage_result, result_frame) = loop {
-            let result = run_install_script(
+            let mut result = run_install_script(
                 &app,
                 &script.path,
                 &stage_args,
                 args.hermes_home.as_deref(),
-                local_cancel_rx.take(),
+                &mut local_cancel_rx,
                 Some(stage.name.clone()),
             )
             .await?;
@@ -646,6 +647,10 @@ async fn run_bootstrap(
             if should_retry_missing_stage_frame(result.exit_code, result.killed, attempt)
                 && frame.is_none()
             {
+                if retry_backoff_cancelled(local_cancel_rx.as_mut()).await {
+                    result.killed = true;
+                    break (result, frame);
+                }
                 attempt += 1;
                 let line = format!(
                     "[bootstrap] {} stage host exited unexpectedly before its JSON result; retrying ({attempt}/{MAX_STAGE_ATTEMPTS})",
@@ -665,12 +670,12 @@ async fn run_bootstrap(
                         stream: LogStream::Stderr,
                     },
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 continue;
             }
 
             break (result, frame);
         };
+        *cancel_rx_holder.lock().await = local_cancel_rx;
 
         let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -828,6 +833,23 @@ fn should_retry_missing_stage_frame(
     !killed && exit_code == Some(-1) && attempt < MAX_STAGE_ATTEMPTS
 }
 
+async fn retry_backoff_cancelled(cancel_rx: Option<&mut mpsc::Receiver<()>>) -> bool {
+    let backoff = tokio::time::sleep(std::time::Duration::from_millis(500));
+    tokio::pin!(backoff);
+
+    match cancel_rx {
+        Some(rx) => tokio::select! {
+            biased;
+            signal = rx.recv() => signal.is_some(),
+            _ = &mut backoff => false,
+        },
+        None => {
+            backoff.await;
+            false
+        }
+    }
+}
+
 async fn cancellation_signalled(holder: &Arc<Mutex<Option<mpsc::Receiver<()>>>>) -> bool {
     let mut guard = holder.lock().await;
     if let Some(rx) = guard.as_mut() {
@@ -842,7 +864,7 @@ async fn run_install_script(
     script_path: &std::path::Path,
     args: &[String],
     hermes_home_override: Option<&str>,
-    cancel_rx: Option<mpsc::Receiver<()>>,
+    cancel_rx: &mut Option<mpsc::Receiver<()>>,
     stage_name: Option<String>,
 ) -> Result<powershell::ScriptResult> {
     let app_for_stdout = app.clone();
@@ -1177,5 +1199,13 @@ mod tests {
         assert!(!should_retry_missing_stage_frame(Some(0), false, 1));
         assert!(!should_retry_missing_stage_frame(None, false, 1));
         assert!(!should_retry_missing_stage_frame(Some(-1), true, 1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_backoff_stops_the_retry() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+
+        assert!(retry_backoff_cancelled(Some(&mut rx)).await);
     }
 }
