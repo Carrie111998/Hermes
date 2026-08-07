@@ -11,6 +11,7 @@ import type { SessionInfo } from '@/types/hermes'
 import {
   appendLiveSessionProjection,
   applyRuntimeInfo,
+  applyStoredSessionPreviewRuntimeInfo,
   chatMessageArraysEquivalent,
   chatMessagesEquivalent,
   chatPartsEquivalent,
@@ -109,6 +110,41 @@ describe('applyRuntimeInfo foreground scoping', () => {
     expect($currentBranch.get()).toBe('main')
     // ...while the caller still gets everything it needs for its own session.
     expect(patch).toMatchObject({ branch: 'bb/tile', cwd: '/other-worktree' })
+  })
+
+  it('clears the Files/workspace cwd when a foreground detached session reports empty cwd', () => {
+    const patch = applyRuntimeInfo({ cwd: '' })
+
+    expect($currentCwd.get()).toBe('')
+    expect(patch).toMatchObject({ cwd: '' })
+  })
+})
+
+describe('applyStoredSessionPreviewRuntimeInfo workspace paint', () => {
+  beforeEach(() => {
+    setCurrentCwd('/previous-project')
+  })
+
+  afterEach(() => {
+    setCurrentCwd('')
+  })
+
+  it('rebinds $currentCwd from the selected session row before resume settles', () => {
+    applyStoredSessionPreviewRuntimeInfo({ cwd: '/next-project', model: 'gpt' })
+
+    expect($currentCwd.get()).toBe('/next-project')
+  })
+
+  it('clears a stale project tree when the selected session is detached', () => {
+    applyStoredSessionPreviewRuntimeInfo({ cwd: '', model: 'gpt' })
+
+    expect($currentCwd.get()).toBe('')
+  })
+
+  it('falls back to git_repo_root when cwd is missing', () => {
+    applyStoredSessionPreviewRuntimeInfo({ git_repo_root: '/repo-root', model: 'gpt' })
+
+    expect($currentCwd.get()).toBe('/repo-root')
   })
 })
 
