@@ -546,6 +546,134 @@ class TestWeixinContentDedup:
         assert event.text == "hello world"
 
 
+class TestWeixinApproveCommandDedup:
+    """Regression tests for Issue #81026 — the ``/approve`` (and other slash
+    command) text was silently swallowed by the content-fingerprint dedup
+    and/or the text-batch debounce, causing a legitimate second approval
+    from the same sender to be dropped and the command to time out.
+    """
+
+    def test_two_distinct_approve_messages_both_reach_handle_message(self):
+        # Two separate agent turns each prompt the user with "/approve";
+        # WeChat assigns each a different message_id. Content-fingerprint
+        # dedup must not treat these as duplicates — each is a distinct,
+        # legitimate approval request that the user is responding to.
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._text_batch_delay_seconds = 0.05
+        adapter._text_batch_split_delay_seconds = 0.05
+
+        base_msg = {
+            "from_user_id": "wxid_user1",
+            "item_list": [{"type": 1, "text_item": {"text": "/approve"}}],
+        }
+
+        async def _drive():
+            await adapter._process_message({**base_msg, "message_id": "cmd-msg-1"})
+            await asyncio.sleep(0.2)
+            await adapter._process_message({**base_msg, "message_id": "cmd-msg-2"})
+            await asyncio.sleep(0.2)
+
+        asyncio.run(_drive())
+
+        assert adapter.handle_message.await_count == 2
+        for call in adapter.handle_message.await_args_list:
+            assert call[0][0].text == "/approve"
+
+    def test_true_resend_same_message_id_is_still_deduped(self):
+        # A genuine transport-level redelivery (same message_id) of a
+        # command must still be dropped by message_id dedup — this is the
+        # one case where suppressing a repeat "/approve" is correct,
+        # because re-running it would double-approve the same request.
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._text_batch_delay_seconds = 0.05
+        adapter._text_batch_split_delay_seconds = 0.05
+
+        msg = {
+            "from_user_id": "wxid_user1",
+            "message_id": "same-id",
+            "item_list": [{"type": 1, "text_item": {"text": "/approve"}}],
+        }
+
+        async def _drive():
+            await adapter._process_message(msg)
+            await adapter._process_message(msg)
+            await asyncio.sleep(0.2)
+
+        asyncio.run(_drive())
+
+        assert adapter.handle_message.await_count == 1
+
+    def test_plain_text_repeat_is_still_content_deduped(self):
+        # Non-command text must keep the existing content-fingerprint dedup
+        # behavior (Issue #16182) — this guards against regressing that fix
+        # while fixing the command-specific case above.
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._text_batch_delay_seconds = 0.05
+        adapter._text_batch_split_delay_seconds = 0.05
+
+        base_msg = {
+            "from_user_id": "wxid_user1",
+            "item_list": [{"type": 1, "text_item": {"text": "hello world"}}],
+        }
+
+        async def _drive():
+            await adapter._process_message({**base_msg, "message_id": "msg-1"})
+            await adapter._process_message({**base_msg, "message_id": "msg-2"})
+            await asyncio.sleep(0.2)
+
+        asyncio.run(_drive())
+
+        assert adapter.handle_message.await_count == 1
+
+    def test_command_after_plain_text_dispatches_independently_without_merging(self):
+        # A slash command arriving while a plain-text batch is pending must
+        # not be absorbed into that batch, and must not itself sit through
+        # the full debounce delay — it dispatches on its own, promptly.
+        adapter = _make_adapter()
+        adapter._poll_session = object()
+        adapter.handle_message = AsyncMock()
+        # A long delay would make the test slow (and flaky under load) if
+        # the command were forced to wait out the plain-text debounce
+        # window instead of flushing immediately.
+        adapter._text_batch_delay_seconds = 5.0
+        adapter._text_batch_split_delay_seconds = 5.0
+
+        text_msg = {
+            "from_user_id": "wxid_user1",
+            "item_list": [{"type": 1, "text_item": {"text": "hello there"}}],
+        }
+        approve_msg = {
+            "from_user_id": "wxid_user1",
+            "item_list": [{"type": 1, "text_item": {"text": "/approve"}}],
+        }
+
+        async def _drive():
+            await adapter._process_message({**text_msg, "message_id": "t1"})
+            await asyncio.sleep(0.1)
+            await adapter._process_message({**approve_msg, "message_id": "c1"})
+            # The command must have dispatched well before the 5s plain-text
+            # debounce window would otherwise elapse.
+            await asyncio.sleep(0.5)
+            assert adapter.handle_message.await_count == 1
+            first_event = adapter.handle_message.await_args_list[0][0][0]
+            assert first_event.text == "/approve"
+            assert first_event.message_type == MessageType.COMMAND
+            # The still-pending plain text batch flushes later on its own.
+            await asyncio.sleep(5.0)
+
+        asyncio.run(_drive())
+
+        assert adapter.handle_message.await_count == 2
+        second_event = adapter.handle_message.await_args_list[1][0][0]
+        assert second_event.text == "hello there"
+
+
 class TestWeixinTextDebounce:
     """Text-debounce batching for rapid multi-message bursts (issue #35301).
 
