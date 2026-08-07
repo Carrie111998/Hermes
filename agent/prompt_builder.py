@@ -337,6 +337,9 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 #      (fake addresses, fake JSON, fake numbers) instead of reporting
 #      the blocker.  (Observed on DeepSeek v4-flash on the same task:
 #      pushed through PEP-668 wall, then returned fabricated listings.)
+#   3. Ending with a partial-progress summary at a legitimate implementation
+#      boundary without identifying the unfinished scope or asking for the
+#      decision needed to continue.
 #
 # Short on purpose.  This block is shipped to every user, every session,
 # in the cached system prompt — token cost is paid once at install and
@@ -353,7 +356,13 @@ TASK_COMPLETION_GUIDANCE = (
     "approach, ask the user). NEVER substitute plausible-looking fabricated "
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
-    "is always better than inventing a result."
+    "is always better than inventing a result.\n"
+    "If work must pause at a permission, safety, workspace, repository, or "
+    "external-system boundary, do not end with a partial-progress summary alone. "
+    "Give a self-contained handoff stating what you completed and verified, what "
+    "remains, the exact boundary or blocker, whether any live or external state "
+    "changed, and the decision or authorization needed to continue. Ask for that "
+    "decision explicitly."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.

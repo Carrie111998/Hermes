@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
+    TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -53,6 +54,15 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_task_completion_guidance_requires_actionable_boundary_handoff(self):
+        guidance = TASK_COMPLETION_GUIDANCE.lower()
+
+        assert "completed and verified" in guidance
+        assert "what remains" in guidance
+        assert "exact boundary or blocker" in guidance
+        assert "live or external state" in guidance
+        assert "decision or authorization" in guidance
 
 
 # =========================================================================
