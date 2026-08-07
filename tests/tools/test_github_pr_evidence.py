@@ -260,6 +260,34 @@ def test_manifest_exposes_only_opaque_cursors_bound_to_fixed_endpoints():
     assert "path" not in result["next_parameters"]
 
 
+def test_recalled_manifest_recovers_only_current_required_cursors():
+    scope = _scope()
+    with evidence_scope(scope):
+        first = json.loads(github_pr_evidence_tool("manifest"))
+        consumed = first["cursors"]["pull_request"]
+        scope.cursors.pop(consumed)
+        recalled = json.loads(github_pr_evidence_tool("manifest"))
+
+    inventory = recalled["current_required_cursors"]
+    assert inventory["total"] == 10
+    assert inventory["truncated"] is False
+    assert consumed not in {item["cursor"] for item in inventory["items"]}
+    assert {item["cursor"] for item in inventory["items"]} == scope.required_cursors
+
+
+def test_manifest_recovery_inventory_is_bounded_and_reports_truncation():
+    scope = _scope()
+    with evidence_scope(scope), patch(
+        "tools.github_pr_evidence._MAX_RECOVERY_CURSOR_INVENTORY", 2
+    ):
+        manifest = json.loads(github_pr_evidence_tool("manifest"))
+
+    inventory = manifest["current_required_cursors"]
+    assert inventory["total"] == 11
+    assert inventory["truncated"] is True
+    assert len(inventory["items"]) == 2
+
+
 def test_execution_control_plane_cursors_enforce_resolution_then_attestation_order():
     scope = _scope()
     scope.execution_attestation_loader = MagicMock()
@@ -340,6 +368,13 @@ def test_gate_resolution_makes_execution_attestation_mandatory():
         assert json.loads(github_pr_evidence_tool("manifest"))["coverage"][
             "execution_attestation"
         ]["gate_resolution_complete"] is True
+        recovery = json.loads(github_pr_evidence_tool("manifest"))[
+            "current_required_cursors"
+        ]
+        assert recovery["items"][-1] == {
+            "cursor": attestation_token,
+            "kind": "execution_attestation",
+        }
 
 
 def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonical_blobs():
@@ -410,6 +445,34 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
         "a" * 40,
     }
     assert all(cursor.required for cursor in required_blobs)
+
+
+def test_tree_evidence_rejects_gitlink_submodule_entries():
+    scope = _scope()
+    with evidence_scope(scope):
+        manifest = json.loads(github_pr_evidence_tool("manifest"))
+        with patch(
+            "tools.github_pr_evidence._run_gh_json",
+            return_value={
+                "sha": "c" * 40,
+                "truncated": False,
+                "tree": [
+                    {
+                        "path": "vendor/untrusted",
+                        "mode": "160000",
+                        "type": "commit",
+                        "sha": "d" * 40,
+                    }
+                ],
+            },
+        ):
+            result = json.loads(
+                github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
+            )
+
+    assert result["success"] is False
+    assert result["fatal"] is True
+    assert "submodule gitlink" in result["error"]
 
 
 def test_tree_diff_normalizes_rename_with_changed_content_from_github_inventory():

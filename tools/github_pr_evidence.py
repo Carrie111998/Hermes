@@ -54,6 +54,7 @@ _MAX_COMPRESSION_RATIO = 100
 _MAX_RESULT_CHARS = 90_000
 _MAX_INLINE_STRING_CHARS = 20_000
 _MAX_PAGE_CHARS = 60_000
+_MAX_RECOVERY_CURSOR_INVENTORY = 100
 # A pull request can expose up to 3,000 changed files. Exact-head review may
 # materialize both base and head blobs plus the bounded 200-entry artifact
 # inventory, so the old 200-cursor ceiling rejected legitimate large reviews.
@@ -481,11 +482,30 @@ def _manifest(scope: EvidenceScope) -> str:
                 scope, _Cursor("execution_attestation", required=False)
             )
         scope.manifest_created = True
+    with scope.lock:
+        current_required = [
+            {"cursor": token, "kind": cursor.kind}
+            for token, cursor in scope.cursors.items()
+            if cursor.required
+        ]
+    current_required.sort(
+        key=lambda item: (
+            item["kind"] == "execution_attestation",
+            item["kind"],
+            item["cursor"],
+        )
+    )
     return json.dumps(
         {
             "success": True,
             "tuple": scope.tuple_dict,
             "cursors": dict(scope.manifest_cursors),
+            "current_required_cursors": {
+                "total": len(current_required),
+                "truncated": len(current_required)
+                > _MAX_RECOVERY_CURSOR_INVENTORY,
+                "items": current_required[:_MAX_RECOVERY_CURSOR_INVENTORY],
+            },
             "next_parameters": {"operation": "read", "cursor": "opaque cursor"},
             "coverage": _coverage(scope),
         },
@@ -635,6 +655,8 @@ def _tree_map(value: Any) -> tuple[str, dict[str, dict[str, Any]]]:
             or not _SHA_RE.fullmatch(str(sha))
         ):
             raise RuntimeError("Immutable Git tree entry was malformed")
+        if kind == "commit" or mode == "160000":
+            raise RuntimeError("Immutable Git tree contains unsupported submodule gitlink")
         if kind != "tree":
             result[path] = {"path": path, "mode": mode, "type": kind, "sha": sha}
     return str(tree_sha), result
@@ -1799,8 +1821,10 @@ registry.register(
         "name": "github_pr_evidence",
         "description": (
             "Read complete, immutable GitHub pull-request evidence bound to the "
-            "trusted webhook tuple. Call manifest once, consume every required "
-            "cursor, and use optional cursors only for evidence-driven drill-down."
+            "trusted webhook tuple. Consume every required cursor and use optional "
+            "cursors only for evidence-driven drill-down. If context loss removes "
+            "continuation tokens, call manifest again and resume from its bounded "
+            "current_required_cursors inventory."
         ),
         "parameters": {
             "type": "object",
