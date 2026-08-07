@@ -145,3 +145,45 @@ def cron_trigger_log_path() -> Path:
     during postmortems instead of scanning audit.jsonl in full.
     """
     return events_dir() / "cron_triggers.jsonl"
+
+
+def devflow_dir() -> Path:
+    """Canonical home of the DevFlow Delegation Plane control plane (DDP).
+
+    Cross-profile by construction (every agent delegates through ONE plane),
+    so anchored at the canonical root like all other notification state.
+    Added 2026-08-06 (spec: 2026-08-06-devflow-delegation-plane-design.md).
+    """
+    return _root() / "devflow"
+
+
+def delegation_ledger_path() -> Path:
+    """SQLite WAL lifecycle/dedup authority for delegated work requests."""
+    return devflow_dir() / "delegation_ledger.db"
+
+
+def devflow_allowlist_path() -> Path:
+    """Operator-owned target allowlist (repos, path scopes, commands, ceilings)."""
+    return devflow_dir() / "allowlist.json"
+
+
+def devflow_policy_path() -> Path:
+    """Optional per-source policy overrides (thresholds, rate limits, mode).
+
+    Missing file = built-in defaults from devflow_delegation.policy.
+    """
+    return devflow_dir() / "policy.json"
+
+
+def autonomy_sentinel_path() -> Path:
+    """Global autonomy sentinel. Stage 3 gate — Stage 1 code must NEVER
+    create this file; it exists here only so every stage resolves the same
+    canonical path."""
+    return devflow_dir() / ".autonomy_enabled"
+
+
+def devflow_inbox_dir() -> Path:
+    """Durable DEVFLOW_WORK_REQUEST envelope queue (atomic tmp+os.replace
+    writes). Shares the existing devflow mailbox root used by the legacy
+    DEVFLOW_FIX_REQUEST intake."""
+    return mailbox_root() / "devflow" / "inbox"

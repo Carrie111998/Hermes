@@ -7,6 +7,8 @@ from events.paths import (
     quiet_hours_path, quiet_queue_path,
     digest_state_path, notifier_batch_path, whatsapp_flush_state_path,
     mailbox_root, failure_cluster_state_path,
+    devflow_dir, delegation_ledger_path, devflow_allowlist_path,
+    devflow_policy_path, autonomy_sentinel_path, devflow_inbox_dir,
 )
 from hermes_constants import get_default_hermes_root
 
@@ -25,6 +27,12 @@ def test_all_paths_anchored_at_canonical_root(tmp_path):
         assert whatsapp_flush_state_path() == tmp_path / "notifications" / "whatsapp_flush_state.json"
         assert mailbox_root() == tmp_path / "mailbox"
         assert failure_cluster_state_path() == tmp_path / "events" / "failure_cluster_state.json"
+        assert devflow_dir() == tmp_path / "devflow"
+        assert delegation_ledger_path() == tmp_path / "devflow" / "delegation_ledger.db"
+        assert devflow_allowlist_path() == tmp_path / "devflow" / "allowlist.json"
+        assert devflow_policy_path() == tmp_path / "devflow" / "policy.json"
+        assert autonomy_sentinel_path() == tmp_path / "devflow" / ".autonomy_enabled"
+        assert devflow_inbox_dir() == tmp_path / "mailbox" / "devflow" / "inbox"
 
 
 def test_paths_ignore_profile_scoping(tmp_path, monkeypatch):
