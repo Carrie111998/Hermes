@@ -2024,3 +2024,74 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+@pytest.mark.parametrize("with_legacy_list", [True, False])
+def test_iter_custom_providers_seeds_providers_dict_for_legacy_and_modern(
+    tmp_path, monkeypatch, with_legacy_list
+):
+    """Regression for #81126: a ``providers:`` entry must seed a pool entry
+    both when a legacy ``custom_providers:`` list is present and when it is
+    not.  Previously the legacy list shadowed the v12+ dict in
+    ``_iter_custom_providers`` (the compatibility layer was only consulted
+    when the legacy list was absent), so no ``config:`` source landed in
+    auth.json for the new-style provider.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+
+    config_payload = {
+        "model": {"provider": "openai", "default": "some-model"},
+        "providers": {
+            "newstyle-endpoint": {
+                "name": "newstyle-endpoint",
+                "api": "http://127.0.0.1:9002/v1",
+                "api_key": "newstyle-key",
+                "default_model": "newstyle-model",
+                "transport": "chat_completions",
+                "models": ["newstyle-model"],
+            },
+        },
+    }
+    if with_legacy_list:
+        config_payload["custom_providers"] = [
+            {
+                "name": "legacy-endpoint",
+                "base_url": "http://127.0.0.1:9001/v1",
+                "api_key": "legacy-key",
+                "api_mode": "chat_completions",
+                "model": "legacy-model",
+            },
+        ]
+
+    import yaml
+
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config_payload))
+
+    from agent.credential_pool import _iter_custom_providers, load_pool
+
+    from hermes_cli.config import load_config, get_compatible_custom_providers
+
+    cfg = load_config()
+    compat_names = [e.get("name") for e in get_compatible_custom_providers(cfg)]
+    iter_names = [n for n, _ in _iter_custom_providers(cfg)]
+
+    # The compat layer sees both shapes; _iter_custom_providers must match.
+    assert "newstyle-endpoint" in compat_names
+    assert "newstyle-endpoint" in iter_names, (
+        f"_iter_custom_providers dropped the providers: dict entry "
+        f"(with_legacy_list={with_legacy_list}): {iter_names!r}"
+    )
+    if with_legacy_list:
+        assert "legacy-endpoint" in iter_names
+
+    # Pool entry seeded from config: source for the new-style provider.
+    pool = load_pool("custom:newstyle-endpoint")
+    assert pool.has_credentials(), (
+        f"newstyle-endpoint pool has no credentials (with_legacy_list={with_legacy_list})"
+    )
+    sources = [entry.source for entry in pool.entries()]
+    assert "config:newstyle-endpoint" in sources, (
+        f"newstyle-endpoint pool missing config: source (with_legacy_list={with_legacy_list}): {sources!r}"
+    )
