@@ -128,9 +128,10 @@ function expandRemotePath(p) {
 // non-login `ssh host cmd` PATH misses user installs), then known install paths.
 async function locateHermes(ssh, remoteHermesPath) {
   const resolveLauncher = async (candidate: string) => {
-    // Scan all exec arguments and keep the last executable absolute path.
-    // install.sh venv mode generates: exec "$HERMES_BIN" "$HERMES_ENTRYPOINT" "$@"
-    // — taking only words[1] returns the Python interpreter, not the hermes entry.
+    // Canonicalize single-target exec wrappers (exec /path/to/hermes "$@")
+    // but leave multi-arg wrappers like exec "$HERMES_BIN" "$HERMES_ENTRYPOINT" "$@"
+    // untouched — the venv wrapper exists to force the venv interpreter, and
+    // resolving past it to the entrypoint would bypass that via shebang.
     const script =
       'import os,shlex,sys\n' +
       `p=os.path.expanduser(${shq(candidate)})\n` +
@@ -140,9 +141,8 @@ async function locateHermes(ssh, remoteHermesPath) {
       ' for line in data.splitlines():\n' +
       '  words=shlex.split(line)\n' +
       '  if len(words)>1 and words[0]=="exec":\n' +
-      '   for w in words[1:]:\n' +
-      '    t=os.path.expanduser(w)\n' +
-      '    if os.path.isabs(t) and os.access(t,os.X_OK):out=t\n' +
+      '   targets=[os.path.expanduser(w) for w in words[1:] if os.path.isabs(os.path.expanduser(w)) and os.access(os.path.expanduser(w),os.X_OK)]\n' +
+      '   if len(targets)==1:out=targets[0]\n' +
       '   break\n' +
       'except (OSError,ValueError):pass\n' +
       'print(out)'

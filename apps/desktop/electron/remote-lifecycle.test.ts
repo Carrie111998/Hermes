@@ -122,18 +122,18 @@ test('locateHermes canonicalizes an installer wrapper to its executable target',
   assert.equal(await locateHermes(ssh, ''), '/home/u/.hermes/hermes-agent/venv/bin/hermes')
 })
 
-test('locateHermes resolves venv launcher shim with two exec arguments', async () => {
+test('locateHermes preserves multi-arg venv launcher shim instead of resolving past it', async () => {
   // install.sh venv mode generates:  exec "$HERMES_BIN" "$HERMES_ENTRYPOINT" "$@"
-  // The Python interpreter (words[1]) is executable, but the hermes entry
-  // point (words[2]) is the real target.  resolveLauncher must return the
-  // entry point, not the interpreter.
+  // The wrapper forces the venv interpreter; resolving past it to the entrypoint
+  // would bypass the venv via shebang under non-login SSH.  resolveLauncher must
+  // return the wrapper itself when exec has more than one executable argument.
   const ssh = fakeSsh([
     [/command -v hermes/, '/home/u/.local/bin/hermes\n'],
     [/\[ -x .*\.local\/bin\/hermes/, 'OK'],
-    [/python3 -c/, '/home/u/.hermes/hermes-agent/hermes\n']
+    [/python3 -c/, '/home/u/.local/bin/hermes\n']
   ])
 
-  assert.equal(await locateHermes(ssh, ''), '/home/u/.hermes/hermes-agent/hermes')
+  assert.equal(await locateHermes(ssh, ''), '/home/u/.local/bin/hermes')
 })
 
 test('locateHermes falls back to ~/.local/bin/hermes when the login-shell probe misses', async () => {
