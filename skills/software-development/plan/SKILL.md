@@ -4,8 +4,8 @@ name: plan
 # Reason: Route plan execution to copilot_remote by default
 # Upstream: internal-only
 description: Plan mode for Hermes — inspect context, write a markdown plan into the active workspace's `.hermes/plans/` directory, do not execute the work, and hand off software implementation to `/copilot_remote` by default.
-version: 1.0.0
-author: Hermes Agent
+version: 2.0.0
+author: Hermes Agent (writing-craft adapted from obra/superpowers)
 # === ROSENBLATT PATCH END ===
 license: MIT
 platforms: [linux, macos, windows]

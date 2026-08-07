@@ -1,7 +1,6 @@
 """Tests for warn_deprecated_cwd_env_vars() migration warning."""
 
 
-
 class TestDeprecatedCwdWarning:
     """Warn when deprecated CWD env vars are present in the environment."""
 
