@@ -1,6 +1,7 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import logging
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -445,6 +446,112 @@ class TestPrompt:
         )
 
         assert captured.get("child") == resp.session_id
+
+    @pytest.mark.asyncio
+    async def test_prompt_does_not_wedge_when_final_response_send_fails(self, agent, caplog):
+        """A failed final-response delivery must not leave is_running stuck.
+
+        Regression: an exception from the final-response session_update (e.g.
+        the client disconnected mid-turn) escaped prompt() before the idle
+        reset, so every later prompt took the queued branch and the drain
+        loop was never reached — the session silently stopped executing.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "first answer",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "first answer"},
+            ],
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=ConnectionError("client gone"))
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        with caplog.at_level(logging.WARNING, logger="acp_adapter.server"):
+            resp = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        # The turn itself completes normally — the result was already
+        # persisted, so a dead client must not fail the turn...
+        assert resp.stop_reason == "end_turn"
+        # ...the failure is surfaced in the logs, not swallowed silently...
+        assert any(
+            "Failed to deliver final response" in record.getMessage()
+            for record in caplog.records
+        )
+        # ...and the session must be idle again, not wedged.
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+        assert state.queued_prompts == []
+
+        # The next prompt must execute normally (no phantom queue).
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "second answer",
+            "messages": [],
+        })
+        mock_conn.session_update = AsyncMock()
+        resp2 = await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+        assert resp2.stop_reason == "end_turn"
+        state.agent.run_conversation.assert_called_once()
+        assert state.queued_prompts == []
+
+    @pytest.mark.asyncio
+    async def test_prompt_cancelled_final_send_still_resets_running(self, agent):
+        """CancelledError from the final send must still reset is_running.
+
+        The inner guard catches Exception only; cancellation rides the
+        finally. The cancellation must re-propagate (the turn really was
+        cancelled) while leaving the session usable.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(return_value={
+            "final_response": "answer that never lands",
+            "messages": [],
+        })
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=asyncio.CancelledError())
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        with pytest.raises(asyncio.CancelledError):
+            await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+
+    @pytest.mark.asyncio
+    async def test_prompt_cancelled_executor_still_resets_running(self, agent):
+        """CancelledError during the executor await must reset + re-raise.
+
+        The executor error handler catches Exception only; without the
+        dedicated CancelledError branch this escaped with is_running stuck
+        True — the same session-wedge class as the final-send path.
+        """
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        state.agent.run_conversation = MagicMock(
+            side_effect=asyncio.CancelledError()
+        )
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hi")]
+        with pytest.raises(asyncio.CancelledError):
+            await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+
 
 
 

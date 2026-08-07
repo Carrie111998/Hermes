@@ -1955,6 +1955,16 @@ class HermesACPAgent(acp.Agent):
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+        except asyncio.CancelledError:
+            # Client disconnect/router teardown cancels the prompt coroutine
+            # mid-executor. CancelledError is BaseException, so the handler
+            # below misses it — but the idle-reset invariant is the same one
+            # as the finally around the final-response send below: leaving
+            # is_running stuck True here wedges the session just the same.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
+            raise
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             with state.runtime_lock:
@@ -2038,25 +2048,42 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        if (
-            final_response
-            and conn
-            and not suppress_interrupt_response
-            and (not streamed_message or result.get("response_transformed"))
-        ):
-            # Deliver the final response when streaming did not already send it,
-            # or when a plugin hook transformed the response after streaming
-            # finished (e.g. transform_llm_output) — otherwise the appended /
-            # rewritten text never reaches the client.
-            update = acp.update_agent_message_text(final_response)
-            await conn.session_update(session_id, update)
-
-        # Mark this turn idle before draining queued work so recursive prompt()
-        # calls can acquire the session. Queued turns are intentionally run as
-        # normal follow-up user prompts, preserving role alternation and history.
-        with state.runtime_lock:
-            state.is_running = False
-            state.current_prompt_text = ""
+        # The idle reset MUST run on every exit path past this point. An
+        # exception escaping with is_running still True wedges the session:
+        # every later prompt takes the queued branch (:1627) while the drain
+        # loop below is never reached — a dead client that disconnects during
+        # the final-response send used to kill the session silently.
+        try:
+            if (
+                final_response
+                and conn
+                and not suppress_interrupt_response
+                and (not streamed_message or result.get("response_transformed"))
+            ):
+                # Deliver the final response when streaming did not already send
+                # it, or when a plugin hook transformed the response after
+                # streaming finished (e.g. transform_llm_output) — otherwise
+                # the appended / rewritten text never reaches the client.
+                try:
+                    update = acp.update_agent_message_text(final_response)
+                    await conn.session_update(session_id, update)
+                except Exception:
+                    # The turn's result is already durable (save_session ran
+                    # above); a client that disconnected mid-turn must not
+                    # fail the turn or take the session down with it.
+                    logger.warning(
+                        "Failed to deliver final response for ACP session %s",
+                        session_id,
+                        exc_info=True,
+                    )
+        finally:
+            # Mark this turn idle before draining queued work so recursive
+            # prompt() calls can acquire the session. Queued turns are
+            # intentionally run as normal follow-up user prompts, preserving
+            # role alternation and history.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
 
         while True:
             with state.runtime_lock:
