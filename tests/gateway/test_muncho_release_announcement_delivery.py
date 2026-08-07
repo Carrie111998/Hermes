@@ -52,6 +52,7 @@ from ops.muncho.release.metadata import load_release_bundle
 
 
 ROOT = Path(__file__).parents[2]
+CURRENT_VERSION = str(load_release_bundle(ROOT).metadata.version)
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
 RELEASE_SHA = "a" * 40
 GUILD_ID = "123456789012345678"
@@ -80,7 +81,7 @@ def _queued(tmp_path: Path, *, release_sha: str = RELEASE_SHA):
     mapping = reserve_release_mapping(
         state,
         bundle,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=release_sha,
         reserved_at=NOW,
     )
@@ -392,7 +393,7 @@ async def test_verified_gateway_relay_delivery_records_exact_id_and_is_idempoten
 
     assert await dispatch_pending_gateway_discord_deliveries(**kwargs) == ()
     assert len(relay.calls) == 1
-    status = release_status(state, version="2.3.2", release_sha=RELEASE_SHA)
+    status = release_status(state, version=CURRENT_VERSION, release_sha=RELEASE_SHA)
     assert status["discord_summary_published"] is True
     assert status["codex_task_summary_published"] is False
 
@@ -442,7 +443,7 @@ async def test_failure_timeout_and_uncertainty_never_create_delivery_truth(
     assert relay.calls[0][3]["connector_idempotency_key"] == relay.calls[1][3][
         "connector_idempotency_key"
     ]
-    status = release_status(state, version="2.3.2", release_sha=RELEASE_SHA)
+    status = release_status(state, version=CURRENT_VERSION, release_sha=RELEASE_SHA)
     assert status["discord_summary_published"] is False
     assert status["complete"] is False
 
@@ -674,7 +675,7 @@ async def test_stale_or_missing_active_invocation_never_reaches_relay(tmp_path: 
     assert relay.calls == []
     assert release_status(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["discord_summary_published"] is False
 
@@ -962,7 +963,7 @@ async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
             prepare_args = [
                 "coordinator-prepare",
                 "--version",
-                "2.3.2",
+                CURRENT_VERSION,
                 "--release-sha",
                 RELEASE_SHA,
                 "--state-dir",
@@ -978,7 +979,7 @@ async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
             assert release_cli.main([
                 "coordinator-complete",
                 "--version",
-                "2.3.2",
+                CURRENT_VERSION,
                 "--release-sha",
                 RELEASE_SHA,
                 "--state-dir",
@@ -997,7 +998,7 @@ async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
             assert terminal["healthy"] is True
             assert release_health(
                 state,
-                version="2.3.2",
+                version=CURRENT_VERSION,
                 release_sha=RELEASE_SHA,
             )["healthy"] is True
         finally:
