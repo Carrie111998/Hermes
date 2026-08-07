@@ -3379,7 +3379,13 @@ class SessionStore:
             return True
         self._clear_dirty_transcript(session_id)
         try:
-            self._db.replace_messages(session_id, messages)
+            # When the session has soft-archived rows (e.g. in-place compaction
+            # history), restrict the DELETE to active-only rows so the archived
+            # turns survive the rewrite.  Without this guard, /retry (and any
+            # other caller of rewrite_transcript) silently destroys the
+            # durable pre-compaction history (#80216).
+            active_only = self._db.has_archived_messages(session_id)
+            self._db.replace_messages(session_id, messages, active_only=active_only)
             return True
         except Exception as e:
             logger.debug("Failed to rewrite transcript in DB: %s", e)
