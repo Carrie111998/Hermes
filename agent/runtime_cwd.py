@@ -27,7 +27,9 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 # TERMINAL_CWD must never be stat'd from the host process: e.g. a root@ssh
 # profile sets TERMINAL_CWD=/root, and an unprivileged local user cannot even
 # stat /root/.git — prompting a PermissionError that aborts system-prompt
-# construction. Keep this in sync with prompt_builder._REMOTE_TERMINAL_BACKENDS.
+# construction. Single source of truth: prompt_builder and env_probe import
+# this set instead of redefining it, so a backend added here is automatically
+# honored by all three consumers.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
     "vercel_sandbox", "managed_modal",
