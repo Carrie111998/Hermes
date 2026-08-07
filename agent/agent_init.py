@@ -819,6 +819,9 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
+    # Context engines are owned per Python agent.  Cleanup may race between a
+    # cache-eviction worker and hard session teardown, so claim shutdown once.
+    agent._context_engine_shutdown_lock = threading.Lock()
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

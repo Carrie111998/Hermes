@@ -25,6 +25,31 @@ def _make_runner():
     return runner
 
 
+def _context_engine_agent(last_activity: float | None = None):
+    """Minimal real AIAgent carrying an owned context engine mock."""
+    import time
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_id = "cache-context-engine-test"
+    agent._active_children = []
+    agent._active_children_lock = threading.Lock()
+    agent._context_engine_shutdown_lock = threading.Lock()
+    agent.client = None
+    agent._last_activity_ts = last_activity if last_activity is not None else time.time()
+    engine = MagicMock()
+    agent.context_compressor = engine
+    return agent, engine
+
+
+def _wait_for_call(mock, timeout: float = 2.0) -> None:
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and mock.call_count == 0:
+        time.sleep(0.02)
+
+
 class TestAgentConfigSignature:
     """Config signature produces stable, distinct keys."""
 
@@ -228,6 +253,100 @@ class TestAgentCacheLifecycle:
             assert session_key not in runner._agent_cache
 
 
+class TestOwnedContextEngineEviction:
+    """Every cache-removal path releases its Python agent's engine clone."""
+
+    def _bounded_runner(self):
+        from collections import OrderedDict
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = OrderedDict()
+        runner._agent_cache_lock = threading.Lock()
+        runner._running_agents = {}
+        return runner
+
+    def test_explicit_eviction_shuts_down_engine_once(self):
+        runner = _make_runner()
+        agent, engine = _context_engine_agent()
+        runner._agent_cache["session"] = (agent, "sig")
+
+        runner._evict_cached_agent("session")
+        _wait_for_call(engine.shutdown)
+        runner._evict_cached_agent("session")
+
+        engine.shutdown.assert_called_once_with()
+
+    def test_cache_cap_eviction_shuts_down_each_evicted_engine_once(self, monkeypatch):
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
+        runner = self._bounded_runner()
+        old_agent, old_engine = _context_engine_agent()
+        new_agent, new_engine = _context_engine_agent()
+        runner._agent_cache["old"] = (old_agent, "old-sig")
+        runner._agent_cache["new"] = (new_agent, "new-sig")
+
+        with runner._agent_cache_lock:
+            runner._enforce_agent_cache_cap()
+        _wait_for_call(old_engine.shutdown)
+
+        old_engine.shutdown.assert_called_once_with()
+        new_engine.shutdown.assert_not_called()
+
+    def test_idle_eviction_shuts_down_finite_session_engine_once(self, monkeypatch):
+        import time
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._bounded_runner()
+        agent, engine = _context_engine_agent(last_activity=time.time() - 10)
+        agent._memory_manager = None
+        runner.session_store = MagicMock()
+        runner.session_store._entries = {"session": MagicMock()}
+        runner.session_store.is_session_finalizable.return_value = True
+        runner.session_store._is_session_expired.return_value = False
+        runner._agent_cache["session"] = (agent, "sig")
+
+        assert runner._sweep_idle_cached_agents() == 1
+        _wait_for_call(engine.shutdown)
+
+        engine.shutdown.assert_called_once_with()
+
+    def test_explicit_eviction_defers_engine_shutdown_until_turn_boundary_without_poller(
+        self, monkeypatch
+    ):
+        import time
+        from gateway import run as gw_run
+
+        runner = self._bounded_runner()
+        agent, engine = _context_engine_agent()
+        runner._agent_cache["session"] = (agent, "sig")
+        runner._running_agents["session"] = agent
+
+        original_thread = gw_run.threading.Thread
+        started_threads: list[object] = []
+
+        class _UnexpectedThread:
+            def __init__(self, *args, **kwargs):
+                started_threads.append((args, kwargs))
+
+            def start(self):
+                return None
+
+        monkeypatch.setattr(gw_run.threading, "Thread", _UnexpectedThread)
+        runner._evict_cached_agent("session")
+        time.sleep(0.1)
+
+        engine.shutdown.assert_not_called()
+        assert started_threads == [], "active eviction must not create an unbounded poller"
+
+        monkeypatch.setattr(gw_run.threading, "Thread", original_thread)
+        assert runner._release_running_agent_state("session") is True
+        _wait_for_call(engine.shutdown)
+        engine.shutdown.assert_called_once_with()
+
+
 class TestAgentCacheBoundedGrowth:
     """LRU cap and idle-TTL eviction prevent unbounded cache growth."""
 
@@ -336,37 +455,77 @@ class TestAgentCacheBoundedGrowth:
         assert old_agent in release_calls  # still released
 
 
-    def test_idle_sweep_keeps_agent_when_session_not_expired(self, monkeypatch):
-        """Agents past idle TTL are kept if the session hasn't expired yet.
+    def test_idle_sweep_commits_then_evicts_finite_session(self, monkeypatch):
+        """The idle TTL bounds finite-policy agents without losing extraction.
 
-        In daily-reset mode the reset can fire hours after the last
-        user message — evicting the agent early means the
-        session-expiry watcher has nothing to call on_session_end()
-        with, and memory providers miss the live transcript.
+        A finalizable session can remain valid for hours after its agent has
+        been idle for one hour.  Retaining that agent defeats the cache TTL and
+        pins its context-engine resources.  Commit the live transcript before
+        eviction, exactly as the existing LRU-cap path does.
         """
         from gateway import run as gw_run
 
         monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
         runner = self._bounded_runner()
-        runner._cleanup_agent_resources = MagicMock()
+        commit_calls: list = []
+        release_calls: list = []
+        runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
 
         import time as _t
         stale = self._fake_agent(last_activity=_t.time() - 10.0)
+        stale._memory_manager = MagicMock()
+        stale._session_messages = [{"role": "user", "content": "hi"}]
+        stale.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
 
-        # Session store says the session is still alive AND is finalizable
-        # (finite reset policy) — so deferring eviction is correct: the expiry
-        # watcher will find this agent later and fire on_session_end().
         session_entry = MagicMock()
         runner.session_store = MagicMock()
         runner.session_store._entries = {"stale-session": session_entry}
         runner.session_store.is_session_finalizable.return_value = True
         runner.session_store._is_session_expired.return_value = False
-
         runner._agent_cache["stale-session"] = (stale, "sig")
 
         evicted = runner._sweep_idle_cached_agents()
-        assert evicted == 0
-        assert "stale-session" in runner._agent_cache
+        deadline = _t.time() + 2.0
+        while _t.time() < deadline and not release_calls:
+            _t.sleep(0.02)
+
+        assert evicted == 1
+        assert "stale-session" not in runner._agent_cache
+        assert commit_calls == [[{"role": "user", "content": "hi"}]]
+        assert release_calls == [stale]
+
+    def test_idle_sweep_evicts_non_finalizable_without_commit(self, monkeypatch):
+        """Mode=none is TTL-bounded but has no synthetic session-end commit."""
+        from gateway import run as gw_run
+
+        monkeypatch.setattr(gw_run, "_AGENT_CACHE_IDLE_TTL_SECS", 0.01)
+        runner = self._bounded_runner()
+        commit_calls: list = []
+        release_calls: list = []
+        runner._release_evicted_agent_soft = lambda agent: release_calls.append(agent)
+
+        import time as _t
+        stale = self._fake_agent(last_activity=_t.time() - 10.0)
+        stale._memory_manager = MagicMock()
+        stale._session_messages = [{"role": "user", "content": "hi"}]
+        stale.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
+
+        session_entry = MagicMock()
+        runner.session_store = MagicMock()
+        runner.session_store._entries = {"stale-session": session_entry}
+        runner.session_store.is_session_finalizable.return_value = False
+        runner.session_store._is_session_expired.return_value = False
+        runner._agent_cache["stale-session"] = (stale, "sig")
+
+        evicted = runner._sweep_idle_cached_agents()
+        deadline = _t.time() + 2.0
+        while _t.time() < deadline and not release_calls:
+            _t.sleep(0.02)
+
+        assert evicted == 1
+        assert "stale-session" not in runner._agent_cache
+        assert commit_calls == []
+        assert release_calls == [stale]
 
 
     def test_is_session_finalizable_real_predicate(self, tmp_path):

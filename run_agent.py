@@ -4146,6 +4146,42 @@ class AIAgent:
         except Exception:
             pass
 
+    def _shutdown_owned_context_engine(self) -> None:
+        """Claim and shut down this agent's context engine at most once.
+
+        ``context_compressor`` is the compatibility name for every context
+        engine, including LCM clones.  Claiming it under a dedicated lock
+        before calling third-party shutdown code makes repeated and concurrent
+        cleanup paths idempotent.  Built-in/legacy engines without a shutdown
+        hook are simply detached.
+        """
+        lock = getattr(self, "_context_engine_shutdown_lock", None)
+        if lock is None:
+            # Partially constructed legacy/test agents normally retain this
+            # lock, so use it rather than racing a lazily-created lock.
+            lock = getattr(self, "_active_children_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._context_engine_shutdown_lock = lock
+
+        with lock:
+            engine = getattr(self, "context_compressor", None)
+            if engine is None:
+                return
+            self.context_compressor = None
+
+        shutdown = getattr(engine, "shutdown", None)
+        if not callable(shutdown):
+            return
+        try:
+            shutdown()
+        except Exception as exc:
+            logger.warning(
+                "Failed to shut down owned context engine %s: %s",
+                type(engine).__name__,
+                exc,
+            )
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -4160,6 +4196,8 @@ class AIAgent:
           - memory provider (has its own lifecycle; keeps running)
 
         We DO close:
+          - The context engine owned by this Python agent (plugin engines may
+            hold SQLite helpers; a rebuilt agent receives a fresh clone)
           - OpenAI/httpx client pool (big chunk of held memory + sockets;
             the rebuilt agent gets a fresh client anyway)
           - Active child subagents (per-turn artefacts; safe to drop)
@@ -4168,6 +4206,8 @@ class AIAgent:
         hard teardown for actual session boundaries (/new, /reset, session
         expiry).
         """
+        self._shutdown_owned_context_engine()
+
         # Close active child agents (per-turn; no cross-turn persistence).
         try:
             with self._active_children_lock:
@@ -4265,6 +4305,11 @@ class AIAgent:
                     pass
         except Exception:
             pass
+
+        # 5b. Release the context engine owned by this Python agent.  This is
+        # distinct from shared SessionDB ownership; plugin engines such as LCM
+        # close only their own cloned stores/helpers here.
+        self._shutdown_owned_context_engine()
 
         # 6. Close the OpenAI/httpx client
         try:

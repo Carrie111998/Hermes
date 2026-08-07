@@ -6074,6 +6074,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        # Explicit cache eviction may race an active turn. Keep one exact
+        # agent reference here until a turn boundary can release it without a
+        # polling thread. The dict de-duplicates repeated eviction requests.
+        self._pending_evicted_agent_releases: Dict[int, Any] = {}
+        self._pending_evicted_agent_releases_lock = _threading.Lock()
 
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
@@ -22833,6 +22838,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if run_generation is not None and not self._is_session_run_current(
             session_key, run_generation
         ):
+            # A newer generation may already have replaced this turn's exact
+            # agent. Drain any older deferred eviction that is no longer live.
+            self._drain_pending_evicted_agent_releases()
             return False
         state = self._peek_session_state(session_key)
         if state is not None:
@@ -22849,6 +22857,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
+        # Event-driven completion edge for an explicit eviction that removed
+        # the cache entry while this exact agent was still mid-turn.
+        self._drain_pending_evicted_agent_releases()
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
@@ -23418,15 +23429,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         # Don't tear down an agent that's actively mid-turn — its client,
-        # sandbox and child subagents are in use by the running request.
+        # sandbox and child subagents are in use by the running request.  The
+        # cache entry is already gone (a config/boundary caller needs a fresh
+        # agent next turn), so defer ownership release until this exact Python
+        # agent leaves the running slot rather than dropping it unclosed.
         running_ids = {
             id(a)
             for _, a in self._running_agent_items()
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
         if id(agent) in running_ids:
+            self._defer_evicted_agent_release(agent)
             return
 
+        self._schedule_evicted_agent_soft_release(agent, session_key)
+
+    def _schedule_evicted_agent_soft_release(
+        self, agent: Any, session_key: str = ""
+    ) -> None:
+        """Release one inactive evicted agent without blocking the caller."""
         try:
             threading.Thread(
                 target=self._release_evicted_agent_soft,
@@ -23441,6 +23462,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_evicted_agent_soft(agent)
             except Exception:
                 pass
+
+    def _pending_evicted_release_state(self) -> tuple[dict, Any]:
+        """Return the lazy deferred-release registry and its lock."""
+        registry = self.__dict__.get("_pending_evicted_agent_releases")
+        lock = self.__dict__.get("_pending_evicted_agent_releases_lock")
+        if registry is None or lock is None:
+            self.__dict__.setdefault("_pending_evicted_agent_releases", {})
+            self.__dict__.setdefault(
+                "_pending_evicted_agent_releases_lock", threading.Lock()
+            )
+            registry = self.__dict__["_pending_evicted_agent_releases"]
+            lock = self.__dict__["_pending_evicted_agent_releases_lock"]
+        return registry, lock
+
+    def _defer_evicted_agent_release(self, agent: Any) -> None:
+        """Remember an active evicted agent for event-driven turn cleanup."""
+        registry, lock = self._pending_evicted_release_state()
+        with lock:
+            registry[id(agent)] = agent
+
+    def _drain_pending_evicted_agent_releases(self) -> None:
+        """Schedule deferred agents that no longer own a running turn."""
+        registry, lock = self._pending_evicted_release_state()
+        running_ids = {
+            id(agent)
+            for _, agent in self._running_agent_items()
+            if agent is not None and agent is not _AGENT_PENDING_SENTINEL
+        }
+        ready: list[Any] = []
+        with lock:
+            for agent_id, agent in list(registry.items()):
+                if agent_id not in running_ids:
+                    ready.append(registry.pop(agent_id))
+        for agent in ready:
+            self._schedule_evicted_agent_soft_release(agent)
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -23479,10 +23535,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``_session_expiry_watcher`` when the session finally expires.
 
         But the watcher tears down whatever agent it finds in ``_agent_cache``
-        at expiry time.  If cache pressure (the LRU cap) soft-evicts a
+        at expiry time.  If cache pressure or the idle TTL soft-evicts a
         finalizable session's agent BEFORE it expires, the watcher later finds
         no cached agent and ``on_session_end`` is silently skipped — memory
-        providers never see the transcript (#11205, LRU-cap variant).
+        providers never see the transcript (#11205).
 
         We hold the live, fully-scoped agent right now, so commit its
         end-of-session memory extraction here using the agent's own memory
@@ -23520,7 +23576,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.commit_memory_session(messages if isinstance(messages, list) else None)
             logger.debug(
                 "Committed on_session_end extraction before soft-evicting "
-                "finalizable session=%s (cache pressure, pre-expiry)", key,
+                "finalizable session=%s (soft eviction, pre-expiry)", key,
             )
         except Exception as _e:
             logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
@@ -23680,45 +23736,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if last_activity is None:
                     continue
                 if (now - last_activity) > _AGENT_CACHE_IDLE_TTL_SECS:
-                    # Check whether the session has actually expired in the
-                    # session store.  If it hasn't (e.g. daily-reset mode
-                    # where the reset fires hours after the user's last
-                    # message), keep the agent in cache so the session-store
-                    # expiry watcher can still find it and call
-                    # on_session_end() with the live transcript.  Skipping
-                    # eviction here means the agent stays alive until the
-                    # session genuinely expires, at which point the watcher
-                    # (gateway/run.py _session_expiry_watcher) tears it down
-                    # properly.  (#11205 follow-up)
-                    #
-                    # BUT only defer when the watcher will EVER finalize this
-                    # session.  For a mode == "none" session the watcher never
-                    # fires (is_session_finalizable() is False), so deferring
-                    # would pin the agent in cache for the gateway's entire
-                    # lifetime — the exact leak this idle sweep exists to
-                    # relieve.  Those sessions fall through to soft eviction
-                    # WITHOUT on_session_end, and that is correct: a mode=="none"
-                    # session never reaches a session-end boundary, so there is
-                    # no missed on_session_end to compensate for.  (The finite
-                    # case — a session evicted under LRU-cap pressure before it
-                    # expires — is instead covered by _commit_memory_before_soft_
-                    # evict on the cap path, which fires on_session_end via the
-                    # live agent's memory manager before releasing it.)
-                    session_entry = None
-                    _store = getattr(self, "session_store", None)
-                    try:
-                        if _store is not None:
-                            _store._ensure_loaded()
-                            session_entry = _store._entries.get(key)
-                    except Exception:
-                        session_entry = None
-                    if (
-                        session_entry is not None
-                        and _store is not None
-                        and _store.is_session_finalizable(session_entry)
-                        and not _store._is_session_expired(session_entry)
-                    ):
-                        continue  # keep agent — finite session hasn't expired
+                    # The idle TTL is an independent bound on Python-agent and
+                    # context-engine ownership.  A finite session can remain
+                    # valid for hours after the one-hour cache TTL, so retaining
+                    # its agent until expiry would pin cloned engine resources.
+                    # The daemon release path commits memory first for finite,
+                    # not-yet-expired sessions; mode="none" remains a soft
+                    # eviction without a synthetic session-end commit.
                     to_evict.append((key, agent))
             for key, _ in to_evict:
                 _cache.pop(key, None)
@@ -23728,8 +23752,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 key, now - getattr(agent, "_last_activity_ts", now),
             )
             threading.Thread(
-                target=self._release_evicted_agent_soft,
-                args=(agent,),
+                target=self._commit_then_release_soft,
+                args=(agent, key),
                 daemon=True,
                 name=f"agent-cache-idle-{key[:24]}",
             ).start()
