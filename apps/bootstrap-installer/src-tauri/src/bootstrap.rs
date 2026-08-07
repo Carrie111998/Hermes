@@ -26,6 +26,8 @@ use crate::install_script::{self, Pin, ScriptKind, ScriptSource};
 use crate::powershell::{self, StreamSink};
 use crate::AppState;
 
+const MAX_STAGE_ATTEMPTS: usize = 3;
+
 // ---------------------------------------------------------------------------
 // Public Tauri commands
 // ---------------------------------------------------------------------------
@@ -621,19 +623,54 @@ async fn run_bootstrap(
             stage_args.push("-IncludeDesktop".to_string());
         }
 
-        // Each stage gets its own cancel receiver because tokio::select!
-        // in run_script consumes it. Take/return through the Arc<Mutex>.
-        let local_cancel_rx = cancel_rx_holder.lock().await.take();
+        // A Windows PowerShell host can occasionally terminate with raw status
+        // 0xffffffff while a long-running native child (npm / Playwright) is
+        // still active. That bypasses install.ps1's finally block, so there is
+        // no JSON frame to distinguish success from failure. Stage workers are
+        // required to be idempotent; retry only this exact abrupt-host shape,
+        // and keep it bounded so ordinary script failures remain immediate.
+        let mut attempt = 1;
+        let mut local_cancel_rx = cancel_rx_holder.lock().await.take();
+        let (stage_result, result_frame) = loop {
+            let result = run_install_script(
+                &app,
+                &script.path,
+                &stage_args,
+                args.hermes_home.as_deref(),
+                local_cancel_rx.take(),
+                Some(stage.name.clone()),
+            )
+            .await?;
+            let frame = powershell::parse_stage_result(&result.stdout);
 
-        let stage_result = run_install_script(
-            &app,
-            &script.path,
-            &stage_args,
-            args.hermes_home.as_deref(),
-            local_cancel_rx,
-            Some(stage.name.clone()),
-        )
-        .await?;
+            if should_retry_missing_stage_frame(result.exit_code, result.killed, attempt)
+                && frame.is_none()
+            {
+                attempt += 1;
+                let line = format!(
+                    "[bootstrap] {} stage host exited unexpectedly before its JSON result; retrying ({attempt}/{MAX_STAGE_ATTEMPTS})",
+                    stage.name
+                );
+                tracing::warn!(
+                    stage = %stage.name,
+                    exit = ?result.exit_code,
+                    attempt,
+                    "stage host exited without a result frame; retrying"
+                );
+                emit_event(
+                    &app,
+                    BootstrapEvent::Log {
+                        stage: Some(stage.name.clone()),
+                        line,
+                        stream: LogStream::Stderr,
+                    },
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+
+            break (result, frame);
+        };
 
         let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -657,8 +694,6 @@ async fn run_bootstrap(
             );
             return Err(anyhow!("cancelled by user"));
         }
-
-        let result_frame = powershell::parse_stage_result(&stage_result.stdout);
 
         match result_frame {
             None => {
@@ -783,6 +818,14 @@ async fn run_bootstrap(
     );
 
     Ok(install_root.to_string_lossy().into_owned())
+}
+
+fn should_retry_missing_stage_frame(
+    exit_code: Option<i32>,
+    killed: bool,
+    attempt: usize,
+) -> bool {
+    !killed && exit_code == Some(-1) && attempt < MAX_STAGE_ATTEMPTS
 }
 
 async fn cancellation_signalled(holder: &Arc<Mutex<Option<mpsc::Receiver<()>>>>) -> bool {
@@ -1116,5 +1159,23 @@ mod tests {
             "failed write must not leave a temp marker sibling either"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn abrupt_windows_stage_exit_is_retried_but_never_forever() {
+        assert!(should_retry_missing_stage_frame(Some(-1), false, 1));
+        assert!(should_retry_missing_stage_frame(Some(-1), false, 2));
+        assert!(
+            !should_retry_missing_stage_frame(Some(-1), false, MAX_STAGE_ATTEMPTS),
+            "the retry policy must stay bounded"
+        );
+    }
+
+    #[test]
+    fn ordinary_failure_or_cancellation_is_not_retried_without_a_frame() {
+        assert!(!should_retry_missing_stage_frame(Some(1), false, 1));
+        assert!(!should_retry_missing_stage_frame(Some(0), false, 1));
+        assert!(!should_retry_missing_stage_frame(None, false, 1));
+        assert!(!should_retry_missing_stage_frame(Some(-1), true, 1));
     }
 }
