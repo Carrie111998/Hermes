@@ -757,7 +757,8 @@ def reconcile_autostart_launchers() -> list[str]:
     actions: list[str] = []
     try:
         task_registered = is_task_registered()
-    except Exception:
+    except Exception as exc:
+        actions.append(f"⚠ Could not verify Scheduled Task state ({exc}) — reconcile skipped")
         return actions
     if task_registered:
         removed, failed = _remove_startup_entries()
@@ -1083,6 +1084,7 @@ def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -
         # the fallback too would fire the same launcher twice at logon and
         # spawn duplicate gateways (#80569).
         print("⚠ Scheduled Task is still registered — skipped Startup fallback to avoid duplicate autostart entries.")
+        print("  If the task is disabled or broken, run 'hermes gateway uninstall' (or delete the task) and re-run install to use the Startup fallback.")
     else:
         entry = _install_startup_entry(script_path)
         print(f"✓ Installed Windows login item: {entry}")

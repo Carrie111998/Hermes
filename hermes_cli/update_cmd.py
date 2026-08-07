@@ -3338,7 +3338,10 @@ def _refresh_windows_gateway_launchers() -> None:
         # and migrate legacy pre-#45610 .cmd login items (#80569) so the next
         # logon cannot fire the same launcher twice.
         for action in gateway_windows.reconcile_autostart_launchers():
-            print(f"  ✓ {action}")
+            if action.startswith("⚠"):
+                print(f"  {action}")
+            else:
+                print(f"  ✓ {action}")
         print("  ✓ Refreshed Windows gateway launcher scripts")
     except Exception as exc:
         logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)

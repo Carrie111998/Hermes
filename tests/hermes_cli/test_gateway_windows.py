@@ -320,8 +320,8 @@ def test_reconcile_reports_unlink_failure(monkeypatch, tmp_path):
     assert any("Could not remove redundant Windows login item" in a for a in actions)
 
 
-def test_reconcile_noop_when_schtasks_wedges(monkeypatch, tmp_path):
-    """A schtasks query failure must not crash or remove anything."""
+def test_reconcile_warns_when_schtasks_wedges(monkeypatch, tmp_path):
+    """A schtasks query failure must warn, not crash or remove anything."""
     vbs, cmd = _arrange_startup_files(monkeypatch, tmp_path)
 
     def raise_wedge():
@@ -329,7 +329,10 @@ def test_reconcile_noop_when_schtasks_wedges(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gateway_windows, "is_task_registered", raise_wedge)
 
-    assert gateway_windows.reconcile_autostart_launchers() == []
+    actions = gateway_windows.reconcile_autostart_launchers()
+
+    assert len(actions) == 1
+    assert "Could not verify Scheduled Task state" in actions[0]
     assert vbs.exists()
     assert cmd.exists()
 
