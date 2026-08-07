@@ -289,6 +289,8 @@ def test_sealed_owner_runtime_runs_first_canonical_writer_ping(tmp_path):
             socket_gid=2345,
             gateway_uid=os.getuid(),
             owner_discord_user_ids=frozenset(),
+            plan_operator_discord_user_ids=frozenset(),
+            top_trusted_operator_discord_user_ids=frozenset(),
             gateway_unit="hermes-cloud-gateway.service",
             socket_path=Path("/tmp/canonical-writer-sealed-release-test.sock"),
             connection_timeout_seconds=2.0,
