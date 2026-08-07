@@ -11328,6 +11328,14 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     return _open_session_db_at_path(db_path, read_only=read_only)
 
 
+def _sessions_dir_for_profile(profile: Optional[str]) -> Path:
+    """Return the transcript directory for a profile-scoped session."""
+    if not profile:
+        return get_hermes_home() / "sessions"
+    _name, home = _cron_profile_home(profile)
+    return Path(home) / "sessions"
+
+
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
 # profile. Bounds the config.yaml read to at most once per this window per
 # profile; the actual sweep is throttled far more coarsely by state_meta

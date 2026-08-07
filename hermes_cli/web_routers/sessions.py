@@ -44,6 +44,7 @@ _open_session_db_for_profile = late("_open_session_db_for_profile")
 _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
+_sessions_dir_for_profile = late("_sessions_dir_for_profile")
 _strip_session_list_rows = late("_strip_session_list_rows")
 
 
@@ -650,7 +651,7 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(sid, sessions_dir=_sessions_dir_for_profile(profile))
             return {"ok": True}
         finally:
             db.close()
