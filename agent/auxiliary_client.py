@@ -918,15 +918,15 @@ _AI_GATEWAY_HEADERS = {
     "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
 }
 
-# Infersia app attribution headers. Infersia reads OpenRouter's header names —
-# X-OpenRouter-Title, with X-Title accepted as the older spelling — and shows
-# the result in the customer's activity log. Without them Hermes traffic is
-# attributed to the OpenAI SDK, so a user sees "OpenAI/Python" rather than the
-# agent that made the call.
+# Infersia app attribution headers. Infersia accepts either spelling of the
+# title header, so this uses `X-Title` to match what this file already sends to
+# OpenRouter and the AI gateway rather than introducing a third variant.
+# Without attribution Hermes traffic is recorded against the OpenAI SDK, so a
+# user sees "OpenAI/Python" rather than the agent that made the call.
 # Documented at https://infersia.com/docs/app-attribution
 _INFERSIA_HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-OpenRouter-Title": "Hermes Agent",
+    "X-Title": "Hermes Agent",
     "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
 }
 
