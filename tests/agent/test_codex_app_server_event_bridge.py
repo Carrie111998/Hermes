@@ -2,7 +2,7 @@
 
 Pin the translation of codex JSON-RPC notifications into agent callbacks
 (`tool_progress_callback`, `_fire_stream_delta`, `_fire_reasoning_delta`,
-`_emit_interim_assistant_message`) so Discord/Telegram/TUI continue to
+`_fire_streamed_codex_commentary`) so Discord/Telegram/TUI continue to
 surface live tool-progress bubbles and interim assistant commentary when
 the active provider runs on `openai_runtime: codex_app_server` (#33200).
 
@@ -36,6 +36,9 @@ def _make_stub_agent() -> SimpleNamespace:
         tool_progress_callback=MagicMock(name="tool_progress_callback"),
         _fire_stream_delta=MagicMock(name="_fire_stream_delta"),
         _fire_reasoning_delta=MagicMock(name="_fire_reasoning_delta"),
+        _fire_streamed_codex_commentary=MagicMock(
+            name="_fire_streamed_codex_commentary"
+        ),
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
@@ -180,6 +183,32 @@ class TestStreamDeltaDispatch:
         })
         agent._fire_stream_delta.assert_not_called()
 
+    def test_present_unknown_phase_fails_closed_for_delta_and_completion(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage",
+            "id": "analysis-1",
+            "phase": "analysis",
+        }))
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "analysis-1", "delta": "private scratch"},
+        })
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "analysis-1",
+            "phase": "analysis",
+            "text": "private scratch",
+        }))
+        bridge(_item_started({
+            "type": "commandExecution", "id": "cmd-1", "command": "true",
+        }))
+
+        agent._fire_stream_delta.assert_not_called()
+        agent._fire_streamed_codex_commentary.assert_not_called()
+        agent._emit_interim_assistant_message.assert_not_called()
+
 
 
     def test_reasoning_delta_fires_reasoning_callback(self):
@@ -273,9 +302,38 @@ class TestAgentMessageInterimDispatch:
             "phase": "commentary",
             "text": "I'll check the config first.",
         }))
-        agent._emit_interim_assistant_message.assert_called_once_with(
-            {"role": "assistant", "content": "I'll check the config first."}
+        agent._fire_streamed_codex_commentary.assert_called_once_with(
+            "I'll check the config first."
         )
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_completed_commentary_uses_central_secret_redaction(
+        self, monkeypatch
+    ):
+        from run_agent import AIAgent
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        secret = "sk-proj-ABCD1234567890EFGH1234567890"
+        delivered = MagicMock()
+        agent = object.__new__(AIAgent)
+        agent.show_commentary = True
+        agent.interim_assistant_callback = delivered
+        agent._delivered_interim_texts = set()
+        agent._strip_think_blocks = lambda text: text
+
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-secret",
+            "phase": "commentary",
+            "text": f"I found OPENAI_API_KEY={secret}; checking rotation.",
+        }))
+
+        delivered.assert_called_once()
+        visible = delivered.call_args.args[0]
+        assert secret not in visible
+        assert "OPENAI_API_KEY=" in visible
+        assert delivered.call_args.kwargs == {"already_streamed": False}
 
     def test_started_commentary_phase_is_used_when_completion_omits_it(self):
         agent = _make_stub_agent()
@@ -286,8 +344,8 @@ class TestAgentMessageInterimDispatch:
         bridge(_item_completed({
             "type": "agentMessage", "id": "am-2", "text": "Config is valid.",
         }))
-        agent._emit_interim_assistant_message.assert_called_once_with(
-            {"role": "assistant", "content": "Config is valid."}
+        agent._fire_streamed_codex_commentary.assert_called_once_with(
+            "Config is valid."
         )
 
     def test_final_answer_is_not_misreported_as_interim(self):
@@ -299,7 +357,7 @@ class TestAgentMessageInterimDispatch:
             "phase": "final_answer",
             "text": "Done.",
         }))
-        agent._emit_interim_assistant_message.assert_not_called()
+        agent._fire_streamed_codex_commentary.assert_not_called()
 
     def test_unphased_legacy_message_emits_only_when_tool_proves_mid_turn(self):
         agent = _make_stub_agent()
@@ -309,15 +367,15 @@ class TestAgentMessageInterimDispatch:
             "id": "am-legacy",
             "text": "I'll inspect the runtime now.",
         }))
-        agent._emit_interim_assistant_message.assert_not_called()
+        agent._fire_streamed_codex_commentary.assert_not_called()
 
         bridge(_item_started({
             "type": "commandExecution",
             "id": "cmd-after-message",
             "command": "true",
         }))
-        agent._emit_interim_assistant_message.assert_called_once_with(
-            {"role": "assistant", "content": "I'll inspect the runtime now."}
+        agent._fire_streamed_codex_commentary.assert_called_once_with(
+            "I'll inspect the runtime now."
         )
 
     def test_unphased_terminal_message_stays_on_final_delivery_path(self):
@@ -330,7 +388,7 @@ class TestAgentMessageInterimDispatch:
         bridge(_item_started({
             "type": "commandExecution", "id": "next-turn-cmd", "command": "true",
         }))
-        agent._emit_interim_assistant_message.assert_not_called()
+        agent._fire_streamed_codex_commentary.assert_not_called()
 
 
 
@@ -347,7 +405,7 @@ class TestAgentMessageInterimDispatch:
             "phase": "commentary",
             "text": "I'll check config.",
         }))
-        agent._emit_interim_assistant_message.assert_not_called()
+        agent._fire_streamed_codex_commentary.assert_not_called()
         # Tool progress is unaffected by the commentary toggle.
         bridge(_item_started({
             "type": "commandExecution", "id": "cmd-1", "command": "ls",
@@ -369,7 +427,7 @@ class TestBridgeRobustness:
         agent = _make_stub_agent()
         agent.tool_progress_callback.side_effect = RuntimeError("boom")
         agent._fire_stream_delta.side_effect = RuntimeError("boom")
-        agent._emit_interim_assistant_message.side_effect = RuntimeError("boom")
+        agent._fire_streamed_codex_commentary.side_effect = RuntimeError("boom")
         bridge = make_codex_app_server_event_bridge(agent)
         # All three paths must swallow exceptions silently.
         bridge(_item_started({

@@ -161,6 +161,21 @@ def test_useful_commentary_and_mid_turn_steering_share_one_live_turn():
             "text": "Discord delivery is healthy; I am running the final test.",
         }),
         ("item/started", {
+            "type": "commandExecution",
+            "id": "verify-1",
+            "command": "pytest -q focused",
+            "cwd": "/tmp",
+        }),
+        ("item/completed", {
+            "type": "commandExecution",
+            "id": "verify-1",
+            "command": "pytest -q focused",
+            "cwd": "/tmp",
+            "status": "completed",
+            "aggregatedOutput": "1 passed",
+            "exitCode": 0,
+        }),
+        ("item/started", {
             "type": "agentMessage", "id": "final-1", "phase": "final_answer",
         }),
         ("item/agentMessage/delta", {
@@ -187,8 +202,8 @@ def test_useful_commentary_and_mid_turn_steering_share_one_live_turn():
     streamed: list[str] = []
     session_ref: dict[str, CodexAppServerSession] = {}
 
-    def emit_interim(message: dict) -> None:
-        commentary.append(message["content"])
+    def emit_interim(text: str) -> None:
+        commentary.append(text)
         if len(commentary) == 1:
             assert session_ref["session"].request_steer(
                 "Keep the verified work and also cover the restart path."
@@ -200,7 +215,7 @@ def test_useful_commentary_and_mid_turn_steering_share_one_live_turn():
         tool_complete_callback=None,
         _fire_stream_delta=streamed.append,
         _fire_reasoning_delta=None,
-        _emit_interim_assistant_message=emit_interim,
+        _fire_streamed_codex_commentary=emit_interim,
         show_commentary=True,
     )
     session = make_session(
@@ -217,6 +232,14 @@ def test_useful_commentary_and_mid_turn_steering_share_one_live_turn():
     ]
     assert streamed == ["Done."]
     assert result.final_text == "Done."
+    assert [message["role"] for message in result.projected_messages] == [
+        "assistant", "tool", "assistant"
+    ]
+    assert result.projected_messages[0]["content"] is None
+    assert result.projected_messages[-1] == {
+        "role": "assistant", "content": "Done."
+    }
+    assert result.tool_iterations == 1
     assert result.interrupted is False
     assert result.pending_steer is None
     assert [method for method, _ in client.requests].count("turn/steer") == 1

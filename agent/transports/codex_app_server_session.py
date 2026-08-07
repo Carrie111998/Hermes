@@ -835,6 +835,23 @@ class CodexAppServerSession:
                                 f"turn ended status={turn_status}", err_msg
                             )
 
+        # Older app-server builds can complete a phase-less final assistant
+        # item and then omit turn/completed. The projector deliberately held
+        # that text out of history until a terminal boundary; the quiet
+        # deadline is the last safe recovery boundary when no later item
+        # proved it mid-turn.
+        if (
+            not turn_complete
+            and not result.interrupted
+            and not result.final_text
+            and result.error is None
+        ):
+            pending_final = projector.finalize_pending_agent_message()
+            if pending_final.messages:
+                result.projected_messages.extend(pending_final.messages)
+            if pending_final.final_text is not None:
+                result.final_text = pending_final.final_text
+
         if (
             not turn_complete
             and not result.interrupted
