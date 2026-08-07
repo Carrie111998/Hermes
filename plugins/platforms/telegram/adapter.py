@@ -244,6 +244,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
         ContextTypes,
         filters,
     )
@@ -821,6 +822,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # error_callback ever fires and the gateway silently stops receiving
         # messages with the process still alive (#55769).
         self._polling_not_running_count: int = 0
+        # Consecutive heartbeat probes that saw updates sitting in PTB's
+        # in-process ``app.update_queue`` with no dispatch progress between
+        # probes. The two probes above are blind to this variant: the updater
+        # is RUNNING and FETCHING — updates are confirmed to Telegram on
+        # fetch, so ``pending_update_count`` stays 0 — while the Application's
+        # update-processing task is dead, so fetched updates pile up in
+        # ``update_queue`` and never reach handlers. Every existing signal is
+        # green (get_me() healthy, fetch progress advancing, updater.running
+        # True, Bot API queue empty) and the gateway is silently deaf.
+        # Field-observed on a long-lived gateway that had gone through the
+        # in-process reconnect ladder, which restarts only the updater and
+        # never verifies the processing half (see _start_polling_once).
+        self._polling_dispatch_stuck_count: int = 0
+        # Stamped by a group -100 TypeHandler on every update PTB dispatches:
+        # the discriminator between a queue that is busy-but-draining (stamp
+        # advances) and one filling against a dead consumer (stamp frozen).
+        self._last_dispatch_monotonic: float = 0.0
+        self._dispatch_stamp_at_last_probe: float = -1.0
         # A polling generation stays degraded until the dedicated getUpdates
         # request makes successful progress. start_polling() return and getMe()
         # success on the general request path are not polling-health signals.
@@ -2805,6 +2824,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
                 pass
 
+    async def _note_dispatch_progress(self, update: object, context: object) -> None:
+        """Group -100 observer: proof PTB's update processor is alive.
+
+        Runs for every update the Application dispatches, before any routing
+        handler. The heartbeat's dispatch-liveness probe compares this stamp
+        across probes; see _probe_pending_updates.
+        """
+        self._last_dispatch_monotonic = time.monotonic()
+
     async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
         """Detect a wedged getUpdates consumer via pending_update_count.
 
@@ -2878,6 +2906,48 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return
         self._polling_not_running_count = 0
+        # Dispatch-liveness: everything below this comment and the pending
+        # probe after it verify different halves of the pipeline. The pending
+        # probe verifies the FETCH half (Bot API queue vs a live consumer);
+        # this block verifies the PROCESSING half. PTB confirms updates to
+        # Telegram on fetch, so when the Application's update-processing task
+        # is dead behind a running updater the Bot API queue stays EMPTY while
+        # ``app.update_queue`` fills — ``pending_update_count`` is blind to it
+        # by construction. An update sitting in ``update_queue`` while the
+        # dispatch stamp has not moved since the previous probe can only mean
+        # a dead consumer: a live one drains a queued update in milliseconds,
+        # not 90 seconds. Two consecutive stuck probes escalate to the
+        # retryable-fatal rebuild — deliberately NOT the reconnect ladder,
+        # which restarts only the updater and would leave the dead processing
+        # task exactly where it was.
+        queue = getattr(self._app, "update_queue", None) if self._app else None
+        qsize = queue.qsize() if queue is not None and callable(getattr(queue, "qsize", None)) else 0
+        stamp = self._last_dispatch_monotonic
+        dispatch_stalled = qsize > 0 and stamp == self._dispatch_stamp_at_last_probe
+        self._dispatch_stamp_at_last_probe = stamp
+        if dispatch_stalled:
+            self._polling_dispatch_stuck_count += 1
+            logger.warning(
+                "[%s] Telegram polling heartbeat: %d update(s) fetched but not "
+                "dispatched, no handler progress since previous probe "
+                "(stuck probe %d/2)",
+                self.name, qsize, self._polling_dispatch_stuck_count,
+            )
+            if self._polling_dispatch_stuck_count >= 2:
+                self._polling_dispatch_stuck_count = 0
+                if getattr(self, "_polling_teardown_started", False):
+                    return
+                self._set_fatal_error(
+                    "telegram_dispatch_stalled",
+                    "Telegram updates are fetched but not dispatched (update "
+                    "processor dead behind a running updater); forcing gateway "
+                    "reconnect.",
+                    retryable=True,
+                )
+                await self._handoff_polling_fatal_error()
+                return
+        else:
+            self._polling_dispatch_stuck_count = 0
         get_webhook_info = getattr(bot, "get_webhook_info", None)
         if not callable(get_webhook_info):
             return
@@ -3889,6 +3959,14 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            # Group -100, block=False: observes every dispatched update
+            # without affecting routing. This stamp is the dispatch-liveness
+            # signal _probe_pending_updates uses to catch a dead
+            # update-processing task hiding behind a healthy updater.
+            self._app.add_handler(
+                TypeHandler(object, self._note_dispatch_progress, block=False),
+                group=-100,
+            )
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -4021,6 +4099,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._app = builder.build()
                         self._bot = self._app.bot
                         # Re-register handlers on the new app
+                        # Same dispatch-liveness observer as the fresh-build
+                        # registration above — a rebuilt app must not lose it.
+                        self._app.add_handler(
+                            TypeHandler(object, self._note_dispatch_progress, block=False),
+                            group=-100,
+                        )
                         self._app.add_handler(TelegramMessageHandler(
                             filters.TEXT & ~filters.COMMAND,
                             self._handle_text_message
