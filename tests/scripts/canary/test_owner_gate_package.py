@@ -69,6 +69,33 @@ def test_target_cloud_observation_signer_is_in_exact_offline_package() -> None:
         "bin/muncho-owner-gate-cloud-observation-signer"
         in package.REQUIRED_ENTRYPOINTS
     )
+
+
+def test_passkey_enrollment_is_in_exact_authority_runtime_package() -> None:
+    assert "bin/muncho-passkey-enrollment" in package.REQUIRED_ENTRYPOINTS
+    assert (
+        "scripts/canary/passkey_v2_enrollment.py"
+        in package.ROOT_RUNTIME_FILES
+    )
+    assert (
+        "ops/muncho/owner-gate/bin/muncho-passkey-enrollment"
+        in package.REQUIRED_ASSET_FILES
+    )
+    sudoers = (
+        ROOT / "ops/muncho/owner-gate/muncho-owner-gate.sudoers"
+    ).read_text(encoding="ascii")
+    exact = (
+        "/opt/muncho-owner-gate/current/venv/bin/python -I -B "
+        "/opt/muncho-owner-gate/current/bin/muncho-passkey-enrollment "
+        "create --owner-discord-user-id * --user-label * "
+        "--ttl-seconds *"
+    )
+    assert sudoers.count(exact) == 1
+    assert (
+        "%google-sudoers ALL=(muncho-passkey-authority) NOPASSWD: "
+        "MUNCHO_PASSKEY_ENROLLMENT"
+    ) in sudoers
+    assert "--root" not in sudoers
     assert (
         "scripts/canary/owner_gate_cloud_observation_signer.py"
         in package.ROOT_RUNTIME_FILES

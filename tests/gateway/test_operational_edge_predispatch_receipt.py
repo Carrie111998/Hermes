@@ -272,6 +272,8 @@ def test_denials_do_not_consume_execution_idempotency_slot(
         idempotency_key=missing.intent.idempotency_key,
         issued_at_unix_ms=now_ms - 1_000,
         expires_at_unix_ms=now_ms + 60_000,
+        subject_discord_user_id="1391703330711142472",
+        case_id="case:predispatch",
     )
     valid = OperationalRequest(
         request_id=str(uuid.uuid4()),
@@ -338,6 +340,8 @@ def test_operator_tier_is_signed_and_enforced_before_dispatch(
             idempotency_key=base.intent.idempotency_key,
             issued_at_unix_ms=now_ms - 1_000,
             expires_at_unix_ms=now_ms + 60_000,
+            subject_discord_user_id="1391703330711142472",
+            case_id="case:predispatch",
             operator_tier=tier,
         )
         return OperationalRequest(

@@ -15751,6 +15751,10 @@ def _render_bitrix_canary_artifacts(
         mutation_peer_uid=full_plan.identities.writer_uid,
         receipt_public_key_id=receipt_public_key_id,
         writer_key_id=writer_public_key_id,
+        # Bitrix does not execute the SkyVision sensitive-report operation.
+        # Select the fail-closed service-config variant explicitly rather
+        # than inheriting a trust anchor from another domain.
+        owner_gate_receipt_public_key_id=None,
     )
     unit = _render_bitrix_service_unit(
         revision=full_plan.revision,
@@ -15765,6 +15769,7 @@ def _render_bitrix_canary_artifacts(
         service_gid=identities["service_gid"],
         socket_group="muncho-edge-bitrix-c",
         socket_gid=identities["socket_client_gid"],
+        owner_gate_receipt_public_key_id=None,
     )
     marker = b"Restart=on-failure\nRestartSec=5s\n"
     replacement = b"Restart=no\nRuntimeMaxSec=900s\n"

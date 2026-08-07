@@ -84,6 +84,10 @@ def test_passkey_v2_suites_run_under_exact_isolated_runtime(
                 / "tests/scripts/canary/"
                 "test_owner_gate_host_observation_isolated_runtime.py"
             ),
+            str(
+                repository
+                / "tests/scripts/canary/test_trusted_team_passkey_step_up.py"
+            ),
             # This suite proves the exact owner-gate dependency closure.  The
             # repository-wide conftest owns unrelated agent/provider autouse
             # fixtures, so loading it would silently widen this runtime every
@@ -107,6 +111,8 @@ def test_passkey_v2_suites_run_under_exact_isolated_runtime(
         repository
         / "tests/scripts/canary/"
         "test_owner_gate_host_observation_isolated_runtime.py",
+        repository
+        / "tests/scripts/canary/test_trusted_team_passkey_step_up.py",
     ):
         relative = suite.relative_to(repository)
         progress = [

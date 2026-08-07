@@ -365,6 +365,7 @@ hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
 muncho-ops = "ops.muncho.runtime.operational_edge_cli:main"
 muncho-release = "ops.muncho.release.cli:main"
+muncho-passkey-enrollment = "scripts.canary.passkey_v2_enrollment:main"
 
 [tool.uv]
 override-dependencies = [

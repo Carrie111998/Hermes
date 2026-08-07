@@ -57,6 +57,7 @@ REQUIRED_ENTRYPOINTS = (
     "bin/muncho-host-trusted-signer-provision",
     "bin/muncho-passkey-v2-web",
     "bin/muncho-passkey-v2-authority",
+    "bin/muncho-passkey-enrollment",
     "bin/muncho-passkey-v2-executor",
 )
 ROOT_RUNTIME_FILES = (
@@ -69,6 +70,9 @@ ROOT_RUNTIME_FILES = (
     "scripts/canary/passkey_v2_protocol.py",
     "scripts/canary/passkey_v2_production_storage_growth.py",
     "scripts/canary/passkey_v2_service.py",
+    "scripts/canary/passkey_v2_enrollment.py",
+    "scripts/canary/passkey_v2_sensitive_report.py",
+    "scripts/canary/passkey_v2_sensitive_report_transport.py",
     "scripts/canary/passkey_v2_storage_growth.py",
     "scripts/canary/passkey_v2_upstream_sync.py",
     "scripts/canary/production_cutover_passkey.py",
@@ -106,6 +110,7 @@ REQUIRED_ASSET_FILES = (
     "ops/muncho/owner-gate/bin/muncho-host-observation-attestor",
     "ops/muncho/owner-gate/bin/muncho-host-trusted-signer-provision",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-authority",
+    "ops/muncho/owner-gate/bin/muncho-passkey-enrollment",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-executor",
     "ops/muncho/owner-gate/bin/muncho-passkey-v2-web",
     "ops/muncho/owner-gate/README.md",

@@ -167,6 +167,7 @@ def _payload(v3_payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
             whole_tree_manifest_sha256="08" * 32,
             candidate_seal_receipt_sha256="09" * 32,
             runtime_dependency_manifest_sha256="0a" * 32,
+            owner_gate_receipt_public_key_id="0b" * 32,
         )
     )
 

@@ -62,6 +62,7 @@ def _rendered_client_config() -> dict:
             for index, domain in enumerate(domains, start=1)
         },
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     return json.loads(bundle.client_config)
 

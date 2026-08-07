@@ -7,5 +7,6 @@
   "schema": "muncho-owner-gate-authority-config.v1",
   "sqlite_journal_mode": "DELETE",
   "sqlite_synchronous": "FULL",
-  "totp_dangerous_actions_enabled": false
+  "totp_dangerous_actions_enabled": false,
+  "writer_capability_public_key_id": "4ba61dad683e02e31f57d6ce6e8eefdd94d08c15b55fde9c624e8cdfee54af6c"
 }

@@ -52,6 +52,7 @@ from gateway.operational_edge_protocol import (
     sign_envelope,
     verify_mutation_capability,
 )
+from scripts.canary import passkey_v2_sensitive_report as sensitive_report
 
 
 CONFIG_SCHEMA = "muncho-operational-edge-service-config.v1"
@@ -100,6 +101,8 @@ class OperationalEdgeServiceConfig:
     writer_key_id: str
     maximum_output_bytes: int
     maximum_connections: int
+    owner_gate_receipt_public_key_file: Path | None = None
+    owner_gate_receipt_public_key_id: str | None = None
 
 
 def linux_peer_credentials(sock: socket.socket) -> OperationalEdgePeer:
@@ -208,6 +211,8 @@ def load_config(
         "mutation_peer_uid", "journal_path", "subprocess_home",
         "receipt_private_key_file", "receipt_key_id", "writer_public_key_file",
         "writer_key_id", "maximum_output_bytes", "maximum_connections",
+        "owner_gate_receipt_public_key_file",
+        "owner_gate_receipt_public_key_id",
         "catalog_sha256",
     }
     if set(value) != fields or value.get("schema") != CONFIG_SCHEMA:
@@ -287,6 +292,20 @@ def load_config(
         or value["socket_gid"] == value["service_gid"]
         or _SHA256.fullmatch(str(value.get("receipt_key_id") or "")) is None
         or _SHA256.fullmatch(str(value.get("writer_key_id") or "")) is None
+        or (
+            domain == "skyvision_db"
+            and _SHA256.fullmatch(
+                str(value.get("owner_gate_receipt_public_key_id") or "")
+            )
+            is None
+        )
+        or (
+            domain != "skyvision_db"
+            and (
+                value.get("owner_gate_receipt_public_key_file") is not None
+                or value.get("owner_gate_receipt_public_key_id") is not None
+            )
+        )
         or not 4096 <= value["maximum_output_bytes"] <= MAX_OUTPUT_BYTES
         or not 1 <= value["maximum_connections"] <= 64
     ):
@@ -323,6 +342,23 @@ def load_config(
             ),
         ),
         writer_key_id=str(value["writer_key_id"]),
+        owner_gate_receipt_public_key_file=(
+            None
+            if value["owner_gate_receipt_public_key_file"] is None
+            else _path(
+                value["owner_gate_receipt_public_key_file"],
+                expected=(
+                    Path("/run/credentials")
+                    / f"muncho-operational-edge-{domain}.service"
+                    / "owner-gate-receipt-public-key"
+                ),
+            )
+        ),
+        owner_gate_receipt_public_key_id=(
+            None
+            if value["owner_gate_receipt_public_key_id"] is None
+            else str(value["owner_gate_receipt_public_key_id"])
+        ),
         maximum_output_bytes=value["maximum_output_bytes"],
         maximum_connections=value["maximum_connections"],
     )
@@ -591,16 +627,88 @@ class OperationalEdgeService:
             config.writer_public_key_file,
             config.service_uid,
         )
+        self.owner_gate_receipt_public_key = (
+            None
+            if config.owner_gate_receipt_public_key_file is None
+            else _load_public(
+                config.owner_gate_receipt_public_key_file,
+                config.service_uid,
+            )
+        )
+        if (config.domain == "skyvision_db") != (
+            self.owner_gate_receipt_public_key is not None
+            and config.owner_gate_receipt_public_key_id is not None
+        ):
+            raise OperationalEdgeServiceError(
+                "owner_gate_receipt_key_configuration_invalid"
+            )
         if (
             _key_id(self.receipt_private_key.public_key())
             != config.receipt_key_id
             or _key_id(self.writer_public_key) != config.writer_key_id
+            or self.owner_gate_receipt_public_key is not None
+            and _key_id(self.owner_gate_receipt_public_key)
+            != config.owner_gate_receipt_public_key_id
         ):
             raise OperationalEdgeServiceError("service_key_identity_invalid")
         self.journal = OperationalEdgeJournal(config.journal_path)
+        self.sensitive_report_journal = (
+            sensitive_report.SensitiveReportAuthorizationJournal(
+                config.journal_path
+            )
+            if config.domain == "skyvision_db"
+            else None
+        )
 
     def close(self) -> None:
+        if self.sensitive_report_journal is not None:
+            self.sensitive_report_journal.close()
         self.journal.close()
+
+    def _authorize_sensitive_report(
+        self,
+        request: OperationalRequest,
+        capability: Any,
+    ) -> None:
+        value = request.step_up_authorization
+        public_key = self.owner_gate_receipt_public_key
+        journal = self.sensitive_report_journal
+        if value is None or public_key is None or journal is None:
+            raise OperationalEdgeServiceError(
+                "sensitive_report_step_up_required"
+            )
+        try:
+            token = base64.b64decode(
+                str(value["retrieval_token_b64"]), validate=True
+            )
+            action = sensitive_report.require_retrieval_token(
+                value["action_envelope"], token
+            )
+            receipt = sensitive_report.validate_authorization_receipt(
+                receipt=value["authorization_receipt"],
+                envelope=action,
+                grant=value["grant_record"],
+                challenge=value["challenge_record"],
+                receipt_public_key=public_key,
+                intent=request.intent,
+                capability=capability,
+                now_unix=int(time.time()),
+            )
+            if (
+                action["executor_release_sha"] != self.config.release_revision
+                or action["executor_plan_sha256"]
+                != sensitive_report.operational_command_sha256(request.intent)
+            ):
+                raise ValueError
+            journal.consume_once(
+                receipt_sha256=receipt["receipt_sha256"],
+                intent=request.intent,
+                now_unix=int(time.time()),
+            )
+        except Exception as exc:
+            raise OperationalEdgeServiceError(
+                "sensitive_report_step_up_invalid"
+            ) from exc
 
     def _asset(self, asset_id: str) -> tuple[Path, str]:
         row = self.assets.get(asset_id)
@@ -668,6 +776,7 @@ class OperationalEdgeService:
         intent_sha256 = hashlib.sha256(
             canonical_json_bytes(request.intent.to_mapping())
         ).hexdigest()
+        capability = None
         if operation.access is OperationalAccess.MUTATION:
             if peer.uid != self.config.mutation_peer_uid:
                 raise OperationalEdgeServiceError("mutation_peer_unauthorized")
@@ -751,8 +860,19 @@ class OperationalEdgeService:
                     response,
                 )
                 return response
+            if request.intent.operation_id == sensitive_report.OPERATION_ID:
+                assert capability is not None
+                self._authorize_sensitive_report(request, capability)
+            elif request.step_up_authorization is not None:
+                raise OperationalEdgeServiceError(
+                    "step_up_authorization_not_accepted"
+                )
         elif request.capability is not None:
             raise OperationalEdgeServiceError("read_capability_not_accepted")
+        elif request.step_up_authorization is not None:
+            raise OperationalEdgeServiceError(
+                "step_up_authorization_not_accepted"
+            )
         replay = self.journal.read(
             request.intent.idempotency_key, intent_sha256
         )

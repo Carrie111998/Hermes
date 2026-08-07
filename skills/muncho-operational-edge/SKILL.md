@@ -88,6 +88,14 @@ Use this release-pinned command:
      --idempotency-key '<stable-key-for-this-exact-action>'
    ```
 
+   For `skyvision.db.query_sensitive`, copy the exact authenticated source
+   event identifiers into `discord_guild_id`, `discord_channel_id`,
+   `discord_thread_id`, and `discord_message_id`. Never invent or substitute
+   them. They become part of the signed capability and stable passkey lease.
+   The CLI sends the protected phone link and the bounded result through the
+   privileged Canonical route-back edge to that same guild thread; sensitive
+   report rows are never returned through terminal stdout.
+
 For reads and fixed mechanical jobs, continue without owner approval. Use the
 returned evidence to reason, try the next viable approach, and advance the
 approved task plan until its success criteria are met.
