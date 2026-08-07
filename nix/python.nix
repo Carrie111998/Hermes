@@ -17,7 +17,7 @@ let
   hacks = callPackage pyproject-nix.build.hacks { };
 
   overlay = workspace.mkPyprojectOverlay {
-    sourcePreference = "sdist";
+    sourcePreference = "wheel";
   };
 
   isAarch64Darwin = stdenv.hostPlatform.system == "aarch64-darwin";
@@ -140,7 +140,7 @@ let
       (final: prev: {
         hermes-agent = prev.hermes-agent.overrideAttrs (old: {
           # point straight at the real source instead of the filtered nix store copy
-          src = lib.cleanSource workspaceRoot;
+          src = workspaceRoot;
           nativeBuildInputs =
             (old.nativeBuildInputs or [ ])
             ++ final.resolveBuildSystem {
