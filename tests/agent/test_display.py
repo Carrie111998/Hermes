@@ -264,6 +264,70 @@ class TestBuildToolLabel:
         assert label.startswith("Reading ")
         assert "example.com/page" in label
 
+    def test_mcp_tool_humanized(self):
+        from agent.display import build_tool_label
+        label = build_tool_label(
+            "mcp__jigo_masterhub__get_daily_briefing",
+            {},
+        )
+        assert label == "Getting daily briefing"
+
+    def test_tool_describe_humanized(self):
+        from agent.display import build_tool_label
+        label = build_tool_label(
+            "tool_describe",
+            {"name": "mcp__jigo_masterhub__get_daily_briefing"},
+        )
+        assert label == "Loading details for daily briefing"
+
+    def test_tool_search_humanized(self):
+        from agent.display import build_tool_label
+        label = build_tool_label("tool_search", {"query": "daily briefing"})
+        assert label == "Searching tools for daily briefing"
+
+    def test_non_mcp_underscore_tool_keeps_preview_only(self):
+        from agent.display import build_tool_label
+        label = build_tool_label(
+            "send_message",
+            {"target": "alice", "message": "hello"},
+        )
+        assert label == 'to alice: "hello"'
+
+    def test_friendly_disabled_falls_back_to_raw_name(self):
+        from agent.display import (
+            build_tool_label,
+            fallback_tool_progress_name,
+            set_friendly_tool_labels,
+        )
+        set_friendly_tool_labels(False)
+        assert build_tool_label("mcp__srv__get_daily_briefing", {}) is None
+        assert fallback_tool_progress_name("mcp__srv__get_daily_briefing") == (
+            "mcp__srv__get_daily_briefing"
+        )
+        set_friendly_tool_labels(True)
+
+    def test_progress_label_applies_format_preview_for_urls(self):
+        from agent.display import ToolPreview, build_tool_progress_label
+
+        url = "https://hermes-agent.nousresearch.com/docs/gateway/discord/tool-progress"
+        visible = url[:37] + "..."
+
+        def _format_preview(preview: ToolPreview) -> str:
+            assert preview.url == url
+            return f"[{preview.text}](<{preview.url}>)"
+
+        label = build_tool_progress_label(
+            "web_extract",
+            {"urls": [url]},
+            preview=url,
+            max_len=40,
+            format_preview=_format_preview,
+        )
+        assert label is not None
+        assert label.startswith("Reading [")
+        assert visible.removeprefix("https://") in label
+        assert f"](<{url}>)" in label
+
 
 
 

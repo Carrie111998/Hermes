@@ -3748,20 +3748,45 @@ class TurnRunner:
                 ctx.progress_queue.put(_code_block_full)
                 return
             ctx.last_was_terminal_block[0] = False
+            from agent.display import (
+                build_tool_progress_label,
+                fallback_tool_progress_name,
+                get_tool_preview_max_len,
+                redact_tool_args_for_display,
+            )
+            display_args = (
+                redact_tool_args_for_display(tool_name, args)
+                if isinstance(args, dict)
+                else {}
+            ) or (args if isinstance(args, dict) else {})
+            _format_preview = (
+                _progress_adapter.format_tool_preview
+                if _progress_adapter is not None
+                else None
+            )
+            header = (
+                build_tool_progress_label(
+                    tool_name,
+                    display_args,
+                    preview=preview,
+                    max_len=None,
+                    format_preview=_format_preview,
+                )
+                or fallback_tool_progress_name(tool_name)
+            )
             if args:
-                from agent.display import get_tool_preview_max_len
                 _pl = get_tool_preview_max_len()
-                args_str = json.dumps(args, ensure_ascii=False, default=str)
+                args_str = json.dumps(display_args, ensure_ascii=False, default=str)
                 # When tool_preview_length is 0 (default), don't truncate
                 # in verbose mode — the user explicitly asked for full
                 # detail.  Platform message-length limits handle the rest.
                 if _pl > 0 and len(args_str) > _pl:
                     args_str = args_str[:_pl - 3] + "..."
-                msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                msg = f"{emoji} {header}({list(display_args.keys())})\n{args_str}"
             elif preview:
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                msg = f"{emoji} {header}"
             else:
-                msg = f"{emoji} {tool_name}..."
+                msg = f"{emoji} {header}..."
             ctx.progress_queue.put(msg)
             return
 
@@ -3773,42 +3798,57 @@ class TurnRunner:
         if _code_block_short is not None:
             msg = _code_block_short
             ctx.last_was_terminal_block[0] = True
-        elif preview:
+        elif preview or (isinstance(args, dict) and args):
             from agent.display import (
+                build_tool_progress_label,
+                fallback_tool_progress_name,
                 get_tool_preview_max_len,
-                get_tool_verb,
-                prepare_tool_preview,
-                tool_verb_connector,
-                verb_drops_preview,
+                redact_tool_args_for_display,
             )
             _pl = get_tool_preview_max_len()
             _cap = _pl if _pl > 0 else 40
-            _prepared_preview = prepare_tool_preview(
-                tool_name,
-                args,
-                fallback=preview,
-                max_len=_cap,
+            display_args = (
+                redact_tool_args_for_display(tool_name, args)
+                if isinstance(args, dict)
+                else {}
+            ) or (args if isinstance(args, dict) else {})
+            _format_preview = (
+                _progress_adapter.format_tool_preview
+                if _progress_adapter is not None
+                else None
             )
-            if _progress_adapter is not None:
-                preview = _progress_adapter.format_tool_preview(_prepared_preview)
-            else:
-                preview = _prepared_preview.text
-            # Friendly labels: render a human-phrased line for built-in
-            # tools ("🔍 Searching the web for ...") by prefixing the verb
-            # onto the preview the callback already computed (so the
-            # command/url/query is preserved).  Custom/plugin/MCP tools
-            # have no verb and fall back to the raw "tool_name: ..." form.
-            _verb = get_tool_verb(tool_name)
-            if _verb:
-                if verb_drops_preview(tool_name):
-                    msg = f"{emoji} {_verb}"
-                else:
-                    msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
-            else:
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+            label = build_tool_progress_label(
+                tool_name,
+                display_args,
+                preview=preview,
+                max_len=_cap,
+                format_preview=_format_preview,
+            )
+            msg = (
+                f"{emoji} {label}"
+                if label
+                else f"{emoji} {fallback_tool_progress_name(tool_name)}..."
+            )
             ctx.last_was_terminal_block[0] = False
         else:
-            msg = f"{emoji} {tool_name}..."
+            from agent.display import (
+                build_tool_progress_label,
+                fallback_tool_progress_name,
+            )
+            _format_preview = (
+                _progress_adapter.format_tool_preview
+                if _progress_adapter is not None
+                else None
+            )
+            label = build_tool_progress_label(
+                tool_name,
+                args or {},
+                preview=preview,
+                max_len=None,
+                format_preview=_format_preview,
+            )
+            fallback = label or fallback_tool_progress_name(tool_name)
+            msg = f"{emoji} {fallback}..."
             ctx.last_was_terminal_block[0] = False
 
         # Dedup: collapse consecutive identical progress messages.

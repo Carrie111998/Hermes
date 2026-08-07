@@ -3080,36 +3080,46 @@ class BasePlatformAdapter(ABC):
         if not isinstance(event, ToolCallChunk):
             return None
 
-        from agent.display import get_tool_emoji
+        from agent.display import (
+            build_tool_progress_label,
+            fallback_tool_progress_name,
+            get_tool_emoji,
+            redact_tool_args_for_display,
+        )
         emoji = get_tool_emoji(event.tool_name, default="⚙️")
+        display_args = (
+            redact_tool_args_for_display(event.tool_name, event.args)
+            or event.args
+            or {}
+        )
+        cap = preview_max_len if preview_max_len > 0 else 40
+
+        def _label(*, verbose: bool) -> str | None:
+            return build_tool_progress_label(
+                event.tool_name,
+                display_args,
+                preview=event.preview,
+                max_len=None if verbose else cap,
+                format_preview=self.format_tool_preview,
+            )
 
         if mode == "verbose":
-            if event.args:
+            if display_args:
                 import json
-                args_str = json.dumps(event.args, ensure_ascii=False, default=str)
+                args_str = json.dumps(display_args, ensure_ascii=False, default=str)
                 if preview_max_len > 0 and len(args_str) > preview_max_len:
                     args_str = args_str[:preview_max_len - 3] + "..."
-                return f"{emoji} {event.tool_name}({list(event.args.keys())})\n{args_str}"
-            if event.preview:
-                return f"{emoji} {event.tool_name}: \"{event.preview}\""
-            return f"{emoji} {event.tool_name}..."
+                header = _label(verbose=True) or fallback_tool_progress_name(event.tool_name)
+                return f"{emoji} {header}({list(display_args.keys())})\n{args_str}"
+            label = _label(verbose=True)
+            if label:
+                return f"{emoji} {label}"
+            return f"{emoji} {fallback_tool_progress_name(event.tool_name)}..."
 
-        # "all" / "new": short preview, capped (default 40 to keep gateway
-        # progress bubbles compact — they persist as permanent messages).
-        preview = event.preview
-        if preview:
-            from agent.display import prepare_tool_preview
-
-            cap = preview_max_len if preview_max_len > 0 else 40
-            prepared = prepare_tool_preview(
-                event.tool_name,
-                event.args,
-                fallback=preview,
-                max_len=cap,
-            )
-            rendered = self.format_tool_preview(prepared)
-            return f"{emoji} {event.tool_name}: \"{rendered}\""
-        return f"{emoji} {event.tool_name}..."
+        label = _label(verbose=False)
+        if label:
+            return f"{emoji} {label}"
+        return f"{emoji} {fallback_tool_progress_name(event.tool_name)}..."
 
     def format_tool_preview(self, preview: "ToolPreview") -> str:
         """Apply platform-native formatting to a compact tool preview.

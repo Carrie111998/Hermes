@@ -492,6 +492,25 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         else:
             return f"planning {len(todos_arg)} task(s)"
 
+    if tool_name == "tool_describe":
+        ref = args.get("name")
+        if isinstance(ref, str) and ref.strip():
+            return humanize_deferred_tool_reference(ref)
+        return None
+
+    if tool_name == "tool_search":
+        query = args.get("query")
+        if query is not None:
+            preview = _oneline(str(query))
+            return _truncate_preview(preview, max_len) if preview else None
+        return None
+
+    if tool_name == "tool_call":
+        ref = args.get("name")
+        if isinstance(ref, str) and ref.strip():
+            return humanize_deferred_tool_reference(ref)
+        return None
+
     if tool_name in {"terminal", "execute_code"}:
         key = "code" if tool_name == "execute_code" else "command"
         command = args.get(key)
@@ -596,12 +615,168 @@ def prepare_tool_preview(
 
 
 # =========================================================================
+# Tool-name humanization (MCP, bridge, plugin tools)
+#
+# Wire names like ``mcp__jigo_masterhub__get_daily_briefing`` are opaque in
+# chat progress bubbles.  These helpers derive short present-tense phrases
+# ("Getting daily briefing") from snake_case identifiers.
+# =========================================================================
+
+_ACTION_PREFIX_VERBS: dict[str, str] = {
+    "get": "Getting",
+    "fetch": "Fetching",
+    "search": "Searching",
+    "find": "Finding",
+    "list": "Listing",
+    "create": "Creating",
+    "update": "Updating",
+    "delete": "Deleting",
+    "remove": "Removing",
+    "emit": "Showing",
+    "show": "Showing",
+    "send": "Sending",
+    "run": "Running",
+    "sync": "Syncing",
+    "load": "Loading",
+    "save": "Saving",
+    "check": "Checking",
+    "validate": "Validating",
+    "approve": "Approving",
+    "reject": "Rejecting",
+    "link": "Linking",
+    "unlink": "Unlinking",
+    "describe": "Describing",
+    "resolve": "Resolving",
+    "confirm": "Confirming",
+}
+
+
+def humanize_snake_identifier(name: str) -> str:
+    """Convert ``get_daily_briefing`` to ``daily briefing`` (words, lowercase)."""
+    return " ".join(name.replace("-", "_").split("_")).strip()
+
+
+def _parse_mcp_prefixed_name(tool_name: str) -> tuple[str, str] | None:
+    """Return ``(server, tool)`` for ``mcp__<server>__<tool>`` names."""
+    if not tool_name.startswith("mcp__"):
+        return None
+    parts = tool_name.split("__")
+    if len(parts) < 3 or parts[0] != "mcp":
+        return None
+    server = parts[1]
+    tool_id = "__".join(parts[2:])
+    if not server or not tool_id:
+        return None
+    return server, tool_id
+
+
+def _tool_identifier_from_name(tool_name: str) -> str:
+    """Strip MCP prefix when present; otherwise return the raw tool name."""
+    parsed = _parse_mcp_prefixed_name(tool_name)
+    if parsed:
+        return parsed[1]
+    return tool_name
+
+
+def noun_phrase_from_tool_identifier(tool_id: str) -> str:
+    """Object phrase for describe-style labels: ``get_daily_briefing`` → ``daily briefing``."""
+    words = [w for w in tool_id.replace("-", "_").split("_") if w]
+    if not words:
+        return "tool"
+    first = words[0].lower()
+    if first in _ACTION_PREFIX_VERBS and len(words) > 1:
+        return " ".join(words[1:])
+    return humanize_snake_identifier(tool_id)
+
+
+def phrase_from_tool_identifier(tool_id: str) -> str:
+    """Present-tense phrase: ``get_daily_briefing`` → ``Getting daily briefing``."""
+    words = [w for w in tool_id.replace("-", "_").split("_") if w]
+    if not words:
+        return "Running tool"
+    first = words[0].lower()
+    rest = " ".join(words[1:])
+    verb = _ACTION_PREFIX_VERBS.get(first)
+    if verb and rest:
+        return f"{verb} {rest}"
+    if verb:
+        return verb
+    text = humanize_snake_identifier(tool_id)
+    return text[0].upper() + text[1:] if text else "Running tool"
+
+
+def phrase_for_tool_name(tool_name: str) -> str | None:
+    """Human phrase for MCP wire names, or None when not MCP-prefixed."""
+    if not tool_name or not tool_name.startswith("mcp__"):
+        return None
+    tool_id = _tool_identifier_from_name(tool_name)
+    return phrase_from_tool_identifier(tool_id)
+
+
+def fallback_tool_progress_name(tool_name: str) -> str:
+    """Wire-name fallback when no preview/label is available."""
+    if _friendly_tool_labels:
+        phrase = phrase_for_tool_name(tool_name)
+        if phrase:
+            return phrase
+    return tool_name
+
+
+def build_tool_progress_label(
+    tool_name: str,
+    args: dict | None,
+    *,
+    preview: str | None = None,
+    max_len: int | None = 40,
+    format_preview=None,
+) -> str | None:
+    """Build one tool-progress label for gateway/stream surfaces.
+
+    Centralizes friendly labels, MCP humanization, secret redaction, and
+    optional platform-specific preview formatting (e.g. clickable truncated
+    URLs on Discord).  ``format_preview`` receives a :class:`ToolPreview`
+    and should return display text — pass ``adapter.format_tool_preview`` when
+    available.
+    """
+    display_args = redact_tool_args_for_display(tool_name, args) or args or {}
+    fallback_preview = preview or ""
+
+    if fallback_preview and format_preview is not None:
+        cap = max_len if max_len and max_len > 0 else 40
+        prepared = prepare_tool_preview(
+            tool_name,
+            display_args,
+            fallback=fallback_preview,
+            max_len=0 if max_len is None else cap,
+        )
+        if prepared.url:
+            linked = format_preview(prepared)
+            verb = get_tool_verb(tool_name)
+            if verb:
+                if verb_drops_preview(tool_name):
+                    return verb
+                return f"{verb}{tool_verb_connector(tool_name)}{linked}"
+
+    label = build_tool_label(tool_name, display_args, max_len=max_len)
+    if label:
+        return label
+    if fallback_preview and _friendly_tool_labels:
+        return _truncate_preview(fallback_preview, max_len) if max_len else fallback_preview
+    return None
+
+
+def humanize_deferred_tool_reference(name: str) -> str:
+    """Humanize a tool name referenced by tool-search bridge tools."""
+    tool_id = _tool_identifier_from_name(name.strip())
+    return noun_phrase_from_tool_identifier(tool_id)
+
+
+# =========================================================================
 # Friendly tool labels (human-phrased verbs for built-in tools)
 #
 # Turns "web_search <query>" into "Searching the web for <query>" — the
-# ChatGPT-style "Searching…/Reading…" surface.  Curated and built-in only:
-# we know each core tool's semantics, so the verb is fixed, not computed.
-# Custom/plugin/MCP tools have no entry and fall back to the raw preview.
+# ChatGPT-style "Searching…/Reading…" surface.  Built-in tools use curated
+# verbs; MCP/plugin tools derive a phrase from the identifier.
 # =========================================================================
 
 # Each entry maps a built-in tool name to its present-participle verb phrase.
@@ -632,6 +807,9 @@ _TOOL_VERBS: dict[str, str] = {
     "clarify": "Asking",
     "memory": "Updating memory",
     "todo": "Updating tasks",
+    "tool_describe": "Loading details for",
+    "tool_search": "Searching tools for",
+    "tool_call": "Running",
 }
 
 # Verbs that read better without the raw argument preview appended.
@@ -711,8 +889,8 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
     if verb:
         head = f"is {verb[0].lower()}{verb[1:]}"
     else:
-        # Custom / plugin / MCP tools: generic but still informative.
-        head = f"is using {tool_name}"
+        phrase = phrase_for_tool_name(tool_name)
+        head = f"is {phrase[0].lower()}{phrase[1:]}" if phrase else f"is using {tool_name}"
 
     phrase = head
     if args and verb and tool_name not in _TOOL_VERBS_NO_PREVIEW:
@@ -735,26 +913,33 @@ def build_tool_label(tool_name: str, args: dict, max_len: int | None = None) -> 
 
     For built-in tools with a known verb (``web_search`` -> "Searching the
     web for ..."), returns the verb optionally followed by the argument
-    preview.  For everything else (custom/plugin/MCP tools, or when friendly
-    labels are disabled) returns the raw preview, so callers can use this as a
-    drop-in replacement for :func:`build_tool_preview`.
+    preview.  MCP and plugin tools derive a present-tense phrase from the
+    tool identifier (``mcp__srv__get_daily_briefing`` -> "Getting daily
+    briefing").  When friendly labels are disabled, returns the raw preview.
     """
     if not _friendly_tool_labels:
         return build_tool_preview(tool_name, args, max_len=max_len)
 
     verb = _TOOL_VERBS.get(tool_name)
-    if not verb:
-        return build_tool_preview(tool_name, args, max_len=max_len)
+    if verb:
+        if tool_name in _TOOL_VERBS_NO_PREVIEW:
+            return verb
 
-    if tool_name in _TOOL_VERBS_NO_PREVIEW:
-        return verb
+        preview = build_tool_preview(tool_name, args, max_len=max_len)
+        if not preview:
+            return verb
+        connector = tool_verb_connector(tool_name)
+        return f"{verb}{connector}{preview}"
 
-    preview = build_tool_preview(tool_name, args, max_len=max_len)
-    if not preview:
-        return verb
-    if tool_name in _TOOL_VERBS_FOR_CONNECTOR:
-        return f"{verb} for {preview}"
-    return f"{verb} {preview}"
+    phrase = phrase_for_tool_name(tool_name)
+    if phrase:
+        preview = build_tool_preview(tool_name, args, max_len=max_len)
+        if preview and preview != phrase:
+            combined = f"{phrase} — {preview}"
+            return _truncate_preview(combined, max_len)
+        return _truncate_preview(phrase, max_len)
+
+    return build_tool_preview(tool_name, args, max_len=max_len)
 
 
 # =========================================================================
