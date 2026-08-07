@@ -207,6 +207,115 @@ class TestControlCharSplitTokens:
         assert "HOME=/home/user" in result
 
 
+class TestCSISplitTokens:
+    """CSI/SGR escape sequences must not defeat prefix masking (#81012).
+
+    A vendor-prefix token (e.g. ``sk-…``) wrapped in ANSI color codes leaks
+    entirely when the ESC byte alone is stripped before the prefix regex
+    runs: the trailing ``[32m`` chars survive, and the literal ``m`` defeats
+    ``_PREFIX_RE``'s ``(?<![A-Za-z0-9_-])`` lookbehind on the prefix that
+    follows. The fix strips complete CSI sequences as a unit before the
+    control-char pass so the token boundary is preserved.
+    """
+
+    def test_csi_prefix_glued_to_token_masks(self):
+        # No space between [32m and sk- — the leak shape from the issue.
+        text = "\x1b[32msk-abcdefghijklmnopqrst\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        # The prefix chars (sk-) are kept for debuggability; the body is
+        # masked. What MUST be absent is the full token body.
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_with_space_prefix_masks(self):
+        # With a space the basic prefix regex already matches; the CSI fix
+        # must not regress this path.
+        text = "\x1b[32m sk-abcdefghijklmnopqrst \x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_inside_token_after_prefix_masks(self):
+        # CSI sequence immediately after the prefix: ``sk-\x1b[32mbody\x1b[0m``
+        text = "sk-\x1b[32mabcdefghijklmnopqrst\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_with_semicolon_param_masks(self):
+        # Bold + red SGR (``\x1b[1;31m``) — the param leg is multi-byte.
+        text = "\x1b[1;31msk-abcdefghijklmnopqrst\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_256_color_prefix_masks(self):
+        # 256-color SGR (``\x1b[38;5;196m``) — even more param bytes.
+        text = "\x1b[38;5;196msk-abcdefghijklmnopqrst\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_truecolor_prefix_masks(self):
+        # True-color SGR (``\x1b[38;2;255;0;0m``) — boundary on the 5/6 char leg.
+        text = "\x1b[38;2;255;0;0msk-abcdefghijklmnopqrst\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_private_mode_prefix_masks(self):
+        # DEC private-mode CSI (``\x1b[?25h``) — the ``?`` param byte is
+        # part of the param leg (0x30-0x3f).
+        text = "\x1b[?25hsk-abcdefghijklmnopqrst"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_github_prefix_wrapped_in_csi_masks(self):
+        # Same leak class but on a different prefix — ghp_ — to confirm the
+        # fix is not sk-specific.
+        text = "\x1b[35mghp_abcdef1234567890ABCDEF1234567890abcdef\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "1234567890ABCDEF1234567890abcdef" not in result
+
+    def test_osc_hyperlink_wrapping_token_masks(self):
+        # OSC hyperlink (``\x1b]8;;url\x1b\\``) followed by token, then
+        # closing OSC. The CSI leg is the post-OSC opener; the prior OSC
+        # sequence itself is not caught by _CSI_SEQUENCE_RE but the OSC
+        # bytes contain an ESC + non-CSI opener so the control-char strip
+        # still removes enough glue to leave the contiguous prefix intact.
+        token = "sk-abcdefghijklmnopqrst"
+        text = "\x1b]8;;https://example.com\x1b\\" + token + "\x1b]8;;\x1b\\"
+        result = redact_sensitive_text(text, force=True)
+        assert "abcdefghijklmnopqrst" not in result
+
+    def test_csi_wrap_preserves_surrounding_prose(self):
+        # The CSI sequence itself must survive (it's display formatting);
+        # only the token body must be masked. The surrounding prose before
+        # and after the CSI wrap must also survive.
+        text = "preamble \x1b[32msk-abcdefghijklmnopqrst\x1b[0m postamble"
+        result = redact_sensitive_text(text, force=True)
+        assert "preamble" in result
+        assert "postamble" in result
+        assert "abcdefghijklmnopqrst" not in result
+        assert "\x1b[32m" in result
+        assert "\x1b[0m" in result
+
+    def test_prose_with_csi_color_codes_only_unchanged(self):
+        # A colored prose line with no secret token must pass through
+        # untouched — the CSI strip must not corrupt benign terminal output.
+        text = "\x1b[1;31mERROR:\x1b[0m gateway failed to start"
+        result = redact_sensitive_text(text, force=True)
+        assert result == text
+
+    def test_existing_control_split_still_masks(self):
+        # Regression: the bare-ESC / newline / ZWSP split cases from
+        # TestControlCharSplitTokens must continue to mask.
+        tok = "ghp_" + "F" * 29
+        cases = [
+            tok[:10] + "\n" + tok[10:],
+            tok[:10] + "\x1b" + tok[10:],
+            tok[:10] + "" + tok[10:],
+        ]
+        for text in cases:
+            result = redact_sensitive_text(text, force=True)
+            longest = max(tok[10:], tok[:10], key=len)
+            assert longest not in result, f"regression on {text!r}"
+
+
 class TestEnvLookupPreserved:
     """Programmatic env var lookups must not be corrupted (issue #2852)."""
 

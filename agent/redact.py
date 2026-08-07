@@ -471,6 +471,18 @@ _CONTROL_CHARS_RE = re.compile(
     r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\ufeff]"
 )
 
+# Complete CSI sequences (ESC [ ... final-byte) must be stripped as a unit
+# before the control-char pass so the trailing ``m`` of ``\x1b[32m`` doesn't
+# glue to a following prefix token and defeat _PREFIX_RE's
+# ``(?<![A-Za-z0-9_-])`` lookbehind (issue #81012). Covers parameter
+# (0x30-0x3f), intermediate (0x20-0x2f), and final (0x40-0x7e) byte ranges
+# per ECMA-48, including the ``?`` private-mode prefix (``\x1b[?25h``
+# etc.). Reuses the CSI leg of tools/ansi_strip.py so the two scrubbers
+# cannot drift.
+_CSI_SEQUENCE_RE = re.compile(
+    r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]"
+)
+
 # Union of every _PREFIX_PATTERNS body class — a control-stripped match may
 # only span original chars that are token-body or control chars (see
 # _mask_control_split_tokens). ``=`` is deliberately excluded: a KEY=value
@@ -496,11 +508,38 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     corresponding span in the *original* — but only when the original span
     contains solely token-body and control chars (a match that crosses into a
     different line's unrelated text, e.g. ``EXA_API_KEY=*** is rejected).
+
+    Issue #81012: a bare control-char strip leaves complete CSI sequences
+    (``\\x1b[32m``) partially intact — only the ESC byte is removed, but the
+    trailing ``[32m`` chars remain and the literal ``m`` defeats
+    _PREFIX_RE's ``(?<![A-Za-z0-9_-])`` lookbehind on a prefix token that
+    follows immediately after the sequence. Strip complete CSI sequences
+    first as a unit so the token boundary is preserved.
     """
-    stripped = _CONTROL_CHARS_RE.sub("", text)
-    if stripped == text:
+    # Issue #81012: strip complete CSI sequences (\\x1b[ … final-byte) BEFORE
+    # the control-char pass. Otherwise the trailing ``[32m`` of ``\\x1b[32m``
+    # stays in the stripped copy and the ``m`` chars glue to the following
+    # prefix token, defeating the lookbehind.
+    csi_stripped = _CSI_SEQUENCE_RE.sub("", text)
+    stripped = _CONTROL_CHARS_RE.sub("", csi_stripped)
+    if stripped == csi_stripped and csi_stripped == text:
+        # Neither CSI nor other controls were present — nothing to do.
         return text
-    orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
+    # CSI bytes (ESC + the parameter/intermediate/final bytes that follow)
+    # are removed as a unit and map to a single stripped offset, the same
+    # way other control chars do. Build orig_idx by collecting the text
+    # indices that survive both passes.
+    csi_spans = [m.span() for m in _CSI_SEQUENCE_RE.finditer(text)]
+
+    def _is_collapsed(idx):
+        if _CONTROL_CHARS_RE.match(text[idx]):
+            return True
+        for start, end in csi_spans:
+            if start <= idx < end:
+                return True
+        return False
+
+    orig_idx = [i for i in range(len(text)) if not _is_collapsed(i)]
     out = list(text)
     matches = []
     for m in _PREFIX_RE.finditer(stripped):
@@ -528,8 +567,22 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         # token body, so the regex matched across unrelated lines). Also
         # reject when the match runs into a ``KEY=`` name: a real token value
         # is followed by a newline/space/end, not ``=``.
-        if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c)
-                for c in span)
+        # Issue #81012: CSI bytes (the parameter/intermediate/final chars of
+        # ``\x1b[…`` that survive the prefix-only control strip) are also
+        # accepted as span-internal — they were part of a stripped CSI
+        # sequence and their presence is expected, not an unrelated char.
+        span_csi_spans = [(s, e) for s, e in csi_spans
+                          if not (end_orig <= s or start_orig >= e)]
+        def _span_char_is_collapsible(c, idx):
+            if c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c):
+                return True
+            for s, e in span_csi_spans:
+                if s <= idx < e:
+                    return True
+            return False
+
+        if (all(_span_char_is_collapsible(c, start_orig + i)
+                for i, c in enumerate(span))
                 and (end_orig >= len(text) or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
