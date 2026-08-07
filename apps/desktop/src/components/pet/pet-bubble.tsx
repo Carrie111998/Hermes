@@ -124,6 +124,26 @@ export function PetBubble() {
     })
   }
 
+  // A new or cleared approval resets any in-flight submit state, so a follow-up
+  // request never inherits a stale disabled button.
+  useEffect(() => {
+    setSubmitting(null)
+  }, [approval])
+
+  // The store only clears the approval after the gateway confirms success and
+  // deliberately keeps the prompt on failure. Release the buttons again after a
+  // short window so a failed respond leaves the overlay actionable instead of
+  // permanently disabled.
+  useEffect(() => {
+    if (!submitting) {
+      return
+    }
+
+    const id = window.setTimeout(() => setSubmitting(null), 5000)
+
+    return () => window.clearTimeout(id)
+  }, [submitting])
+
   if (approval) {
     return (
       <div

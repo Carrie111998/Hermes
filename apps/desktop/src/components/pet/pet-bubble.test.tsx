@@ -62,4 +62,34 @@ describe('PetBubble approval actions', () => {
       sessionId: 'sess-1'
     })
   })
+
+  it('re-enables the buttons when the respond never confirms (failure path)', () => {
+    vi.useFakeTimers()
+    const control = vi.fn()
+
+    desktopWindow.hermesDesktop = {
+      petOverlay: { control }
+    } as unknown as Window['hermesDesktop']
+    $petOverlayApproval.set({ command: 'rm -rf dist', description: 'dangerous', sessionId: 'sess-2' })
+
+    render(
+      <I18nProvider configClient={null}>
+        <PetBubble />
+      </I18nProvider>
+    )
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: /Approve once/i }))
+    })
+
+    // In flight: both buttons disabled while the response is pending.
+    expect(screen.getAllByRole<HTMLButtonElement>('button').every(button => button.disabled)).toBe(true)
+    // Failure path keeps the prompt parked for in-app resolution.
+    expect($petOverlayApproval.get()).not.toBeNull()
+
+    act(() => {
+      vi.advanceTimersByTime(5000)
+    })
+    expect(screen.getAllByRole<HTMLButtonElement>('button').every(button => !button.disabled)).toBe(true)
+    vi.useRealTimers()
+  })
 })
