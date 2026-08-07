@@ -19190,9 +19190,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
-            self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
+            # Preserve a previously-saved mode ("voice_only", "all", "off")
+            # so /voice join doesn't silently clobber an operator's deliberate
+            # setting — channels with no saved mode default to "all" to keep
+            # today's documented join behavior (#81041).
+            voice_key = self._voice_key(event.source.platform, event.source.chat_id)
+            effective_mode = self._voice_mode.setdefault(voice_key, "all")
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            if effective_mode == "voice_only":
+                return (
+                    f"Joined voice channel **{voice_channel.name}**.\n"
+                    f"I'll listen, and reply in text unless you speak. "
+                    f"Use /voice tts to speak all replies."
+                )
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
