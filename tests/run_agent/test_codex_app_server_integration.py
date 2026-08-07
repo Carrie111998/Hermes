@@ -86,6 +86,45 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_progress_guidance_is_bound_once_to_codex_thread(self, fake_session):
+        from agent.prompt_builder import MODEL_AUTHORED_PROGRESS_GUIDANCE
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"agent": {"model_authored_progress": True}},
+        ):
+            agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("do the multi-step task")
+
+        assert agent._codex_session._developer_instructions == (
+            MODEL_AUTHORED_PROGRESS_GUIDANCE
+        )
+
+    def test_unconsumed_native_steer_is_returned_for_gateway_handoff(
+        self, monkeypatch
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-steer-1",
+                thread_id="thread-steer-1",
+                pending_steer="continue with the new constraint",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-steer-1",
+        )
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("start")
+
+        assert result["pending_steer"] == "continue with the new constraint"
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

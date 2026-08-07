@@ -49,6 +49,32 @@ class TestSteerAcceptance:
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
 
+    def test_codex_active_turn_uses_native_steer(self):
+        agent = _bare_agent()
+        calls = []
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: calls.append(text) or True},
+        )()
+
+        assert agent.steer("keep the completed work and add tests") is True
+        assert calls == ["keep the completed work and add tests"]
+        assert agent._pending_steer is None
+
+    def test_codex_startup_race_retains_steer_locally(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_app_server"
+        agent._codex_session = type(
+            "_CodexSession",
+            (),
+            {"request_steer": lambda self, text: False},
+        )()
+
+        assert agent.steer("also cover the Discord path") is True
+        assert agent._pending_steer == "also cover the Discord path"
+
 
 
 

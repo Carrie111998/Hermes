@@ -104,6 +104,11 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Ask the acting model to publish concise, useful progress commentary
+        # during multi-step work. The model decides the semantic boundaries;
+        # Hermes does not classify tasks or synthesize status text. Default is
+        # False to preserve existing transcript volume.
+        "model_authored_progress": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

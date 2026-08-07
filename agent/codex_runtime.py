@@ -27,6 +27,11 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+def _combine_pending_steer(*parts: Any) -> str | None:
+    cleaned = [str(part).strip() for part in parts if str(part or "").strip()]
+    return "\n".join(cleaned) or None
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -694,6 +699,17 @@ def run_codex_app_server_turn(
             on_event=make_codex_app_server_event_bridge(agent),
         )
 
+    # Bind on every turn because tests and recovery paths may replace the
+    # session object. The provider atomically transfers startup-race guidance
+    # into the native turn once Codex has returned its turn id.
+    agent._codex_session.bind_pending_steer_provider(agent._drain_pending_steer)
+    if getattr(agent, "_model_authored_progress", False):
+        from agent.prompt_builder import MODEL_AUTHORED_PROGRESS_GUIDANCE
+
+        agent._codex_session.set_developer_instructions(
+            MODEL_AUTHORED_PROGRESS_GUIDANCE
+        )
+
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
@@ -707,6 +723,17 @@ def run_codex_app_server_turn(
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
+        # Close the native steering window before retiring the crashed session,
+        # then preserve both native-retained and startup-race guidance for the
+        # gateway's normal next-turn handoff.
+        try:
+            _native_pending_steer = agent._codex_session._finish_turn_steering()
+        except Exception:
+            _native_pending_steer = None
+        _crash_pending_steer = _combine_pending_steer(
+            _native_pending_steer,
+            agent._drain_pending_steer(),
+        )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -743,6 +770,11 @@ def run_codex_app_server_turn(
             "error": str(exc),
             "turn_id": _hermes_turn_id,
             "delivery_outcome": None,
+            **(
+                {"pending_steer": _crash_pending_steer}
+                if _crash_pending_steer
+                else {}
+            ),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -756,6 +788,11 @@ def run_codex_app_server_turn(
     )
     if _user_interrupted:
         agent.clear_interrupt()
+
+    _pending_steer = _combine_pending_steer(
+        getattr(turn, "pending_steer", None),
+        agent._drain_pending_steer(),
+    )
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -904,6 +941,7 @@ def run_codex_app_server_turn(
         "agent_persisted": True,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        **({"pending_steer": _pending_steer} if _pending_steer else {}),
         **usage_result,
     }
 

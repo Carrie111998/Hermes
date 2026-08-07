@@ -118,6 +118,7 @@ def test_plan_is_read_only_and_binds_exact_target(tmp_path, monkeypatch):
     assert "agent.verify_on_stop=false" in plan["mutations"]
     assert "agent.verification_ledger_enabled=false" in plan["mutations"]
     assert "agent.gateway_notify_interval=180" in plan["mutations"]
+    assert "agent.model_authored_progress=true" in plan["mutations"]
     assert "agent.reasoning_effort=medium" in plan["mutations"]
     assert "display.busy_input_mode=steer" in plan["mutations"]
     assert "display.show_commentary=true" in plan["mutations"]
@@ -154,6 +155,7 @@ def test_apply_requires_plan_and_writes_exact_backup(tmp_path, monkeypatch):
         "max_effort": "max",
     }
     assert effective["agent"]["background_review_enabled"] is False
+    assert effective["agent"]["model_authored_progress"] is True
     assert effective["agent"]["tool_use_enforcement"] is True
     assert effective["agent"]["verify_on_stop"] is False
     assert effective["agent"]["verification_ledger_enabled"] is False

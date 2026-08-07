@@ -83,6 +83,10 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    # User guidance accepted during the turn but not consumed by Codex (for
+    # example because the turn completed during turn/steer). The gateway
+    # delivers it as the next real user turn instead of losing it.
+    pending_steer: Optional[str] = None
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -265,10 +269,9 @@ class _ServerRequestRouting:
 class CodexAppServerSession:
     """One Codex thread per Hermes session, lifetime owned by AIAgent.
 
-    Not thread-safe — one caller drives it at a time, matching how AIAgent's
-    run_conversation() loop is structured today. The codex client itself can
-    handle interleaved reads/writes via its own threads, but the adapter's
-    state (projector, thread_id, turn counter) is owned by the caller thread.
+    One caller drives the turn loop, matching how AIAgent's
+    run_conversation() is structured. ``request_steer`` and turn teardown are
+    explicitly synchronized because gateway input arrives on another thread.
     """
 
     def __init__(
@@ -302,6 +305,10 @@ class CodexAppServerSession:
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
+        self._steer_delivery_lock = threading.Lock()
+        self._retained_steers: list[str] = []
+        self._pending_steer_provider: Optional[Callable[[], Optional[str]]] = None
+        self._developer_instructions: Optional[str] = None
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
         # bridge when codex sends item/fileChange/requestApproval. The
@@ -343,6 +350,9 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        developer_instructions = getattr(self, "_developer_instructions", None)
+        if developer_instructions:
+            params["developerInstructions"] = developer_instructions
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -376,8 +386,9 @@ class CodexAppServerSession:
         if self._closed:
             return
         self._closed = True
-        with self._active_turn_lock:
-            self._active_turn_id = None
+        with self._steer_delivery_lock:
+            with self._active_turn_lock:
+                self._active_turn_id = None
         if self._client is not None:
             try:
                 self._client.close()
@@ -385,6 +396,22 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+
+    def set_developer_instructions(self, text: Optional[str]) -> None:
+        """Set byte-stable instructions before the Codex thread starts."""
+        cleaned = str(text or "").strip() or None
+        current = getattr(self, "_developer_instructions", None)
+        if getattr(self, "_thread_id", None) is not None and cleaned != current:
+            raise RuntimeError(
+                "developer instructions cannot change after thread/start"
+            )
+        self._developer_instructions = cleaned
+
+    def bind_pending_steer_provider(
+        self, provider: Optional[Callable[[], Optional[str]]]
+    ) -> None:
+        """Bind the owning agent's atomic local-steer drain."""
+        self._pending_steer_provider = provider
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -404,27 +431,74 @@ class CodexAppServerSession:
         cleaned = str(text or "").strip()
         if not cleaned:
             return False
-        with self._active_turn_lock:
-            turn_id = self._active_turn_id
-            thread_id = self._thread_id
-            client = self._client
-        if not turn_id or not thread_id or client is None:
-            return False
-        try:
-            response = client.request(
-                "turn/steer",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": cleaned}],
-                    "expectedTurnId": turn_id,
-                },
-                timeout=10,
+        # Serialize against turn teardown so an accepted message can never
+        # fall between the final notification and _active_turn_id cleanup.
+        with self._steer_delivery_lock:
+            with self._active_turn_lock:
+                turn_id = self._active_turn_id
+                thread_id = self._thread_id
+                client = self._client
+            if not turn_id or not thread_id or client is None:
+                return False
+            try:
+                response = client.request(
+                    "turn/steer",
+                    {
+                        "threadId": thread_id,
+                        "input": [{"type": "text", "text": cleaned}],
+                        "expectedTurnId": turn_id,
+                    },
+                    timeout=10,
+                )
+            except (CodexAppServerError, TimeoutError):
+                # We accepted the message while a turn was active. Retain it
+                # for the gateway's next-turn handoff instead of making the
+                # caller guess whether Codex consumed it.
+                self._retained_steers.append(cleaned)
+                logger.debug(
+                    "turn/steer rejected; retaining guidance for next turn",
+                    exc_info=True,
+                )
+                return True
+            accepted_turn_id = (
+                response.get("turnId") if isinstance(response, dict) else None
             )
-        except (CodexAppServerError, TimeoutError):
-            logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
-            return False
-        accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
-        return accepted_turn_id in {None, turn_id}
+            if accepted_turn_id not in {None, turn_id}:
+                self._retained_steers.append(cleaned)
+            return True
+
+    def _adopt_agent_pending_steer(self) -> None:
+        provider = getattr(self, "_pending_steer_provider", None)
+        if not callable(provider):
+            return
+        try:
+            pending = provider()
+        except Exception:
+            logger.debug("pending steer provider raised", exc_info=True)
+            return
+        if pending:
+            try:
+                accepted = self.request_steer(pending)
+            except Exception:
+                accepted = False
+                logger.debug(
+                    "startup-race turn/steer failed; retaining guidance",
+                    exc_info=True,
+                )
+            if not accepted:
+                with self._steer_delivery_lock:
+                    self._retained_steers.append(str(pending).strip())
+
+    def _finish_turn_steering(self) -> Optional[str]:
+        """Atomically close native steering and return undelivered guidance."""
+        with self._steer_delivery_lock:
+            with self._active_turn_lock:
+                self._active_turn_id = None
+            if not self._retained_steers:
+                return None
+            text = "\n".join(self._retained_steers)
+            self._retained_steers.clear()
+            return text
 
     # ---------- diagnostics ----------
 
@@ -559,6 +633,10 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
+        # A steer can arrive while the app-server is starting, before there is
+        # a native turn id. AIAgent retains it atomically; adopt it now, before
+        # consuming any completion notification for this turn.
+        self._adopt_agent_pending_steer()
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
@@ -783,8 +861,7 @@ class CodexAppServerSession:
                 )
             result.should_retire = True
 
-        with self._active_turn_lock:
-            self._active_turn_id = None
+        result.pending_steer = self._finish_turn_steering()
         self._interrupt_event.clear()
         return result
 
