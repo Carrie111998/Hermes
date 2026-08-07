@@ -1748,6 +1748,10 @@ export interface Translations {
     wakeWordPausedVoice: (phrase: string) => string
     contextRemaining: (tokens: string) => string
     contextRemainingDetail: (remaining: string, total: string) => string
+    contextWindow: string
+    contextWindowFull: (percent: number) => string
+    contextWindowUnavailable: string
+    contextWindowUsage: (used: string, total: string) => string
     lookupLoading: string
     lookupNoMatches: string
     lookupTry: string

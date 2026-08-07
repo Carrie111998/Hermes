@@ -12,7 +12,7 @@ import {
   setCurrentUsage
 } from '@/store/session'
 
-import { contextTokensRemaining, ModelPill } from './model-pill'
+import { contextTokensRemaining, contextWindowUsage, ModelPill } from './model-pill'
 
 const modelState = (over: Partial<ChatBarState['model']> = {}): ChatBarState['model'] => ({
   canSwitch: true,
@@ -120,32 +120,37 @@ describe('ModelPill per-surface model label', () => {
 
     expect(screen.getByText('Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
-    expect(screen.getByTestId('context-remaining').textContent).toBe('150k left')
+    expect(screen.getByTestId('context-window').getAttribute('aria-label')).toBe(
+      'Context window. 25% full. 50k / 200k tokens used.'
+    )
   })
 })
 
-describe('ModelPill context remaining', () => {
-  it('shows the reported remaining context beside the model picker', () => {
+describe('ModelPill context window', () => {
+  it('shows a context ring immediately before the model picker', () => {
     setCurrentUsage({ calls: 0, context_max: 200_000, context_used: 50_000, input: 0, output: 0, total: 0 })
 
     render(<ModelPill disabled={false} model={modelState()} />)
 
-    const counter = screen.getByTestId('context-remaining')
+    const counter = screen.getByTestId('context-window')
 
-    expect(counter.textContent).toBe('150k left')
-    expect(counter.getAttribute('aria-label')).toBe('150k tokens remaining of 200k')
+    expect(counter.getAttribute('aria-label')).toBe('Context window. 25% full. 50k / 200k tokens used.')
+    expect(counter.nextElementSibling?.getAttribute('aria-label')).toBe('Open model picker')
   })
 
-  it('derives remaining context from the reported percentage when exact usage is unavailable', () => {
+  it('derives the ring usage from the reported percentage when exact usage is unavailable', () => {
     expect(
       contextTokensRemaining({ calls: 0, context_max: 128_000, context_percent: 25, input: 0, output: 0, total: 0 })
     ).toBe(96_000)
+    expect(
+      contextWindowUsage({ calls: 0, context_max: 128_000, context_percent: 25, input: 0, output: 0, total: 0 })
+    ).toMatchObject({ max: 128_000, percent: 25, used: 32_000 })
   })
 
-  it('stays hidden until the selected session reports a context window', () => {
+  it('keeps an empty ring visible until the selected session reports its context window', () => {
     render(<ModelPill disabled={false} model={modelState()} />)
 
-    expect(screen.queryByTestId('context-remaining')).toBeNull()
+    expect(screen.getByTestId('context-window').getAttribute('aria-label')).toBe('Context window data is not available yet.')
   })
 
   it('stays out of the compact composer controls', () => {
@@ -153,6 +158,6 @@ describe('ModelPill context remaining', () => {
 
     render(<ModelPill compact disabled={false} model={modelState()} />)
 
-    expect(screen.queryByTestId('context-remaining')).toBeNull()
+    expect(screen.queryByTestId('context-window')).toBeNull()
   })
 })

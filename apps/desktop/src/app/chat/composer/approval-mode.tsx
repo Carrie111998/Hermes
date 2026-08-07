@@ -38,7 +38,8 @@ export function ComposerApprovalMode({
             className={cn(
               'h-7 gap-1 rounded-[var(--radius-sm)] px-1.5 py-0 text-[0.6875rem] font-medium text-(--ui-text-secondary)',
               'hover:bg-(--chrome-action-hover) hover:text-foreground data-[state=open]:bg-(--chrome-action-hover) data-[state=open]:text-foreground',
-              fullAccess && 'bg-amber-500/10 hover:bg-amber-500/15 data-[state=open]:bg-amber-500/15'
+              fullAccess &&
+                'rounded-full bg-amber-500/10 px-2 text-amber-600 hover:bg-amber-500/15 hover:text-amber-600 data-[state=open]:bg-amber-500/15 data-[state=open]:text-amber-600 dark:text-amber-400 dark:hover:text-amber-400 dark:data-[state=open]:text-amber-400'
             )}
             data-approval-mode={menu.mode}
             disabled={disabled}
@@ -49,7 +50,7 @@ export function ComposerApprovalMode({
           >
             <ApprovalModeGlyph className="size-3" mode={menu.mode} />
             <span className={cn('max-w-24 truncate', approvalModeToneClass[menu.mode])}>{menu.labels[menu.mode]}</span>
-            <ChevronDown className="size-3 text-(--ui-text-tertiary)" />
+            {!fullAccess && <ChevronDown className="size-3 text-(--ui-text-tertiary)" />}
           </Button>
         </DropdownMenuTrigger>
       </Tip>
