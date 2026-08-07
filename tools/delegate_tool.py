@@ -1578,9 +1578,9 @@ def _build_child_agent(
     child_fallback = None
     _child_fb_mode = "inherit"  # default
     try:
+        # _load_config() already returns the delegation sub-dict directly.
         _del_cfg = _load_config()
-        _del_cfg_root = _del_cfg.get("delegation", {}) if isinstance(_del_cfg, dict) else {}
-        _del_fb_raw = _del_cfg_root.get("fallback_providers") if isinstance(_del_cfg_root, dict) else None
+        _del_fb_raw = _del_cfg.get("fallback_providers") if isinstance(_del_cfg, dict) else None
         if _del_fb_raw is not None:
             if isinstance(_del_fb_raw, str) and _del_fb_raw.strip().lower() in ("inherit", "parent"):
                 _child_fb_mode = "inherit"

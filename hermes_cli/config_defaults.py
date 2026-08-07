@@ -1681,7 +1681,9 @@ DEFAULT_CONFIG = {
         #   []                   → no fallback (child fails on primary error)
         #   [{provider, model}]  → custom per-child chain
         # Same entry shape as the top-level fallback_providers key.
-        "fallback_providers": [],  # e.g. [{"provider":"zai","model":"glm-5.2"}]
+        # IMPORTANT: do NOT default to [] — that would disable fallback for
+        # all children. Leave unset so the inherit path is the default.
+        # "fallback_providers": [],  # uncomment to disable child fallback
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
