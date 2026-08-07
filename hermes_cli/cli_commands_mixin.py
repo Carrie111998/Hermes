@@ -438,12 +438,30 @@ class CLICommandsMixin:
         print(f"  Use it: hermes -p {imported}")
 
     def _handle_stop_command(self):
-        """Handle /stop — kill all running background processes and
-        background (async) delegations.
+        """Handle /stop — interrupt the active agent turn and clean up
+        background processes / async delegations.
 
         Inspired by OpenAI Codex's separation of interrupt (stop current turn)
         from /stop (clean up background processes). See openai/codex#14602.
+
+        Order matters: the foreground agent interrupt must fire *before* the
+        background-process kill so the in-flight tool loop observes the stop
+        signal and unwinds cleanly. Previously this handler only cleaned up
+        background work, so a busy turn kept firing tool calls and the TUI
+        stayed in the busy/running state until Ctrl+C (#80745).
         """
+        # 1. Interrupt the in-flight agent turn (if any). Same seam Ctrl+C
+        # uses — ``hard_cancel=True`` so compression honors the stop even
+        # when ordinary interrupts are masked.
+        if getattr(self, "agent", None) is not None:
+            try:
+                self.agent.interrupt(hard_cancel=True)
+            except Exception:
+                # Interrupt failures must not block the background-process
+                # cleanup below — that path is the user's last-resort
+                # escape hatch when the agent is truly wedged.
+                pass
+
         from tools.process_registry import process_registry
 
         processes = process_registry.list_sessions()
