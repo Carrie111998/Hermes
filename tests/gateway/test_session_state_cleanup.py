@@ -3,9 +3,9 @@
 Before this change, running-agent state lived in three dicts that drifted
 out of sync:
 
-  self._running_agents       — AIAgent instance per session key
-  self._running_agents_ts    — start timestamp per session key
-  self._busy_ack_ts          — last busy-ack timestamp per session key
+  self._running_agents       - AIAgent instance per session key
+  self._running_agents_ts    - start timestamp per session key
+  self._busy_ack_ts          - last busy-ack timestamp per session key
 
 Six cleanup sites did ``del self._running_agents[key]`` without touching
 the other two; one site only popped ``_running_agents`` and
@@ -19,6 +19,7 @@ leaving WAL locks in place until Python actually exited.
 import threading
 from unittest.mock import MagicMock
 
+import pytest
 
 def _make_runner():
     """Bare GatewayRunner wired with just the state the helper touches."""
@@ -62,7 +63,9 @@ class TestNoMoreBareDeleteSites:
         from pathlib import Path
         import re
 
-        gateway_run = (Path(__file__).parent.parent.parent / "gateway" / "run.py").read_text()
+        gateway_run = (
+            Path(__file__).parent.parent.parent / "gateway" / "run.py"
+        ).read_text(encoding="utf-8")
         # Match `del self._running_agents[...]` that is NOT inside a
         # triple-quoted docstring.  We scan non-docstring lines only.
         lines = gateway_run.splitlines()
@@ -131,11 +134,17 @@ class TestSessionDbCloseOnShutdown:
 
 
 class TestSessionResetZombieRace:
-    """Regression for #28686 — a session_reset racing the in-flight run's
-    guarded release must not leave a dead agent locking the slot forever.
+    """Regression for #28686 / #11016 ownership around _running_agents.
+
+    session_reset (/new, /cc) and /stop bump the run generation and clear the
+    slot at interrupt/reset time so a dead in-flight agent cannot lock the
+    session forever. The outer dispatch finally must then release with the
+    SAME generation guard as _run_agent - otherwise a stale unwind pops a
+    follow-up turn that already reclaimed the slot.
     """
 
-    def test_generation_guard_blocks_then_unconditional_release_evicts(self):
+    def test_reset_time_eviction_clears_zombie_before_stale_guarded_release(self):
+        """Production path: bump + clear at reset; stale guarded release is a no-op."""
         runner = _make_runner()
         runner._session_run_generation = {}
         key = "agent:main:telegram:private:1"
@@ -146,17 +155,221 @@ class TestSessionResetZombieRace:
         runner._running_agents_ts[key] = 1.0
         runner._busy_ack_ts[key] = 1.0
 
-        # session_reset bumps the generation while gen-N is still in flight.
+        # session_reset bumps the generation and clears the slot immediately
+        # (_interrupt_and_clear_session / _handle_reset_command).
         runner._invalidate_session_run_generation(key, reason="session_reset")
-
-        # gen-N's own guarded release is correctly blocked — slot would be a
-        # zombie if nothing else cleared it (the pre-fix behaviour).
-        assert runner._release_running_agent_state(key, run_generation=gen_n) is False
-        assert runner._running_agents.get(key) is dead_agent
-
-        # The fix: unconditional release (no run_generation) always clears it.
         assert runner._release_running_agent_state(key) is True
+        assert key not in runner._running_agents
+
+        # gen-N's guarded release (inner _run_agent + outer dispatch finally)
+        # must not resurrect or error - slot stays empty.
+        assert runner._release_running_agent_state(key, run_generation=gen_n) is False
         assert key not in runner._running_agents
         assert key not in runner._running_agents_ts
         assert key not in runner._busy_ack_ts
+
+    def test_stale_outer_finally_does_not_clobber_newer_turn(self):
+        """After /stop clears the slot, a follow-up turn claims it; the stopped
+        turn's outer finally must not pop the newer entry.
+        """
+        runner = _make_runner()
+        runner._session_run_generation = {}
+        key = "agent:main:telegram:private:3"
+
+        gen_a = runner._begin_session_run_generation(key)
+        runner._running_agents[key] = MagicMock(name="turn_a")
+        runner._running_agents_ts[key] = 1.0
+        runner._busy_ack_ts[key] = 1.0
+
+        # /stop: bump generation and clear the busy slot.
+        runner._invalidate_session_run_generation(key, reason="stop")
+        assert runner._release_running_agent_state(key) is True
+
+        # Turn B claims the slot while Turn A is still unwinding.
+        gen_b = runner._begin_session_run_generation(key)
+        fresh = MagicMock(name="turn_b")
+        runner._running_agents[key] = fresh
+        runner._running_agents_ts[key] = 2.0
+        runner._busy_ack_ts[key] = 2.0
+
+        # Turn A's outer finally - generation-scoped, same as _run_agent.
+        released = runner._release_running_agent_state(
+            key, run_generation=gen_a
+        )
+        assert released is False
+        assert runner._running_agents[key] is fresh
+        assert runner._running_agents_ts[key] == 2.0
+        assert runner._busy_ack_ts[key] == 2.0
+
+        # Turn B's own release still clears when it finishes.
+        assert runner._release_running_agent_state(key, run_generation=gen_b) is True
+        assert key not in runner._running_agents
+
+    def test_normal_completion_outer_release_is_idempotent(self):
+        """Guarded inner release clears; outer finally with the same generation
+        is a harmless no-op on an already-empty slot.
+        """
+        runner = _make_runner()
+        runner._session_run_generation = {}
+        key = "agent:main:telegram:private:2"
+
+        gen = runner._begin_session_run_generation(key)
+        runner._running_agents[key] = MagicMock()
+        runner._running_agents_ts[key] = 1.0
+        runner._busy_ack_ts[key] = 1.0
+
+        assert runner._release_running_agent_state(key, run_generation=gen) is True
+        assert key not in runner._running_agents
+        # Outer finally passes the same run_generation - empty slot, still True
+        # (no ownership block; pops are idempotent).
+        assert runner._release_running_agent_state(key, run_generation=gen) is True
+        assert key not in runner._running_agents_ts
+        assert key not in runner._busy_ack_ts
+
+    @pytest.mark.asyncio
+    async def test_interrupt_clears_slot_before_adapter_await_fails(self):
+        """invalidate+release must run before adapter interrupt; a mid-path
+        adapter failure must not leave a generation-bumped zombie slot.
+        """
+        import threading
+
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner, _INTERRUPT_REASON_STOP
+        from gateway.session import SessionSource
+
+        class _RecordingAgent:
+            def __init__(self):
+                self.interrupt_reasons = []
+
+            def interrupt(self, reason=None):
+                self.interrupt_reasons.append(reason)
+
+        key = "agent:main:telegram:private:4"
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="4", chat_type="private"
+        )
+        agent = _RecordingAgent()
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._running_agents = {key: agent}
+        runner._running_agents_ts = {key: 1.0}
+        runner._busy_ack_ts = {key: 1.0}
+        runner._session_run_generation = {}
+        runner._agent_cache = {key: (agent, "sig")}
+        runner._agent_cache_lock = threading.Lock()
+        runner.adapters = {}
+        runner._pending_messages = {key: "queued"}
+
+        gen_n = runner._begin_session_run_generation(key)
+
+        class _ExplodingAdapter:
+            def __init__(self):
+                self.interrupt_calls = 0
+
+            async def interrupt_session_activity(self, session_key, chat_id, metadata=None):
+                self.interrupt_calls += 1
+                raise RuntimeError("adapter down")
+
+            def get_pending_message(self, session_key):
+                # Mirror adapter consume-and-discard against the runner map
+                # used by this unit fixture.
+                return runner._pending_messages.pop(session_key, None)
+
+        exploding = _ExplodingAdapter()
+        runner._adapter_for_source = MagicMock(return_value=exploding)
+        runner._thread_metadata_for_source = MagicMock(return_value=None)
+
+        await runner._interrupt_and_clear_session(
+            key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_STOP,
+            invalidation_reason="stop_command",
+        )
+
+        assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
+        assert key not in runner._running_agents
+        assert key not in runner._agent_cache
+        # Stale outer finally must remain a no-op after the bump.
+        assert runner._release_running_agent_state(key, run_generation=gen_n) is False
+        assert exploding.interrupt_calls == 1
+        assert key not in runner._pending_messages
+
+    def test_stale_moa_restore_does_not_clobber_newer_turn_override(self):
+        """After /stop, Turn A's MoA finally restore must not overwrite Turn B's
+        model_override or evict Turn B's agent cache.
+        """
+        import threading
+        from types import SimpleNamespace
+
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = {}
+        runner._agent_cache_lock = threading.Lock()
+        for name in (
+            "_sessions_map",
+            "_session_state",
+            "_peek_session_state",
+            "_begin_session_run_generation",
+            "_invalidate_session_run_generation",
+            "_release_running_agent_state",
+            "_is_session_run_current",
+            "_evict_cached_agent",
+            "_restore_moa_one_shot",
+            "_restore_pending_one_turn_model_override",
+            "_restore_session_model_override",
+            "_snapshot_session_model_override",
+        ):
+            setattr(
+                runner,
+                name,
+                getattr(GatewayRunner, name).__get__(runner, GatewayRunner),
+            )
+
+        key = "agent:main:telegram:private:5"
+        gen_a = runner._begin_session_run_generation(key)
+        prior = {"provider": "openai", "model": "gpt-old"}
+        state = runner._session_state(key)
+        state.conversation.model_override = {
+            "provider": "moa",
+            "model": "default",
+            "base_url": "moa://local",
+            "api_key": "moa-virtual-provider",
+            "api_mode": "chat_completions",
+        }
+        state.conversation.one_turn_restore = {
+            "had_override": True,
+            "override": dict(prior),
+        }
+        event_a = SimpleNamespace(
+            _moa_disable_after_turn=True,
+            _moa_restore_override=prior,
+        )
+        state.turn.agent = object()
+        runner._agent_cache[key] = (object(), "sig-a")
+
+        # /stop: bump, clear slot, restore one-shot, evict
+        runner._invalidate_session_run_generation(key, reason="stop")
+        assert runner._release_running_agent_state(key) is True
+        runner._restore_pending_one_turn_model_override(key)
+        runner._evict_cached_agent(key)
+        assert state.conversation.model_override == prior
+
+        # Turn B claims slot + sets a new override
+        gen_b = runner._begin_session_run_generation(key)
+        assert gen_b != gen_a
+        turn_b_override = {"provider": "anthropic", "model": "claude-new"}
+        state.conversation.model_override = turn_b_override
+        cached_b = object()
+        runner._agent_cache[key] = (cached_b, "sig-b")
+        state.turn.agent = object()
+
+        # Stale Turn A finally: generation-guarded restores are no-ops
+        assert runner._is_session_run_current(key, gen_a) is False
+        if runner._is_session_run_current(key, gen_a):
+            runner._restore_moa_one_shot(event_a, key)
+            runner._restore_pending_one_turn_model_override(key)
+
+        assert state.conversation.model_override == turn_b_override
+        assert runner._agent_cache[key][0] is cached_b
 
