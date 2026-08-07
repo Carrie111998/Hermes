@@ -613,6 +613,14 @@ def _stage_replacement(src: str, dst: str) -> str:
     """
     staging = f"{dst}.hermes-update-staging"
     backup = f"{dst}.hermes-update-old"
+    # A previous run may have died between "move dst aside" and "move staging
+    # in" — leaving dst missing and the backup as the ONLY copy of that entry.
+    # Restore it before clearing leftovers: deleting the backup first and then
+    # failing to stage (disk exhaustion is likely right after writing a full
+    # staging copy) would leave a hole in the install with nothing to roll
+    # back to. The restore is a same-filesystem rename — instant and safe.
+    if not os.path.exists(dst) and os.path.exists(backup):
+        os.rename(backup, dst)
     for leftover in (staging, backup):
         if os.path.isdir(leftover):
             shutil.rmtree(leftover, ignore_errors=True)
@@ -657,9 +665,10 @@ def _commit_staged_replacements(staged) -> None:
     This covers plain files as well as directories: the repo root holds 20
     first-party modules (``run_agent.py``, ``cli.py``, ``hermes_constants.py``
     …), so a files-only failure reproduces exactly the bug class we are
-    closing. ``os.replace`` is atomic on POSIX and maps to
-    ``MoveFileEx(REPLACE_EXISTING)`` on Windows, so a file swap can never
-    leave a half-written module the way ``copy2`` onto a live path can.
+    closing. Every swap is an ``os.rename`` onto a path that was just moved
+    aside — a same-filesystem rename is atomic on POSIX and NTFS alike, so a
+    file swap can never leave a half-written module the way ``copy2`` onto a
+    live path can.
 
     Splitting stage-all-then-swap-all shrinks the failure window from "the
     duration of a full tree copy" to "the duration of N renames", and makes
@@ -701,6 +710,16 @@ def _commit_staged_replacements(staged) -> None:
                 os.remove(backup)
             except OSError:
                 pass
+
+
+def _print_update_completion(message: str) -> None:
+    """Print an update outcome plus, when the dashboard launched this run
+    with an action id, a terminal receipt line the Desktop can match after
+    the dashboard restarts (see #47359 / #58764)."""
+    print(message)
+    action_id = os.environ.get("HERMES_ACTION_ID", "")
+    if len(action_id) == 32 and all(char in "0123456789abcdef" for char in action_id):
+        print(f"=== hermes-update completed {action_id} ===")
 
 
 def _update_via_zip(args):
@@ -831,7 +850,20 @@ def _update_via_zip(args):
             _discard_staged(staged)
             raise
 
-        _commit_staged_replacements(staged)
+        try:
+            _commit_staged_replacements(staged)
+        except Exception:
+            # The rollback already restored every swapped entry, but staging
+            # copies for the not-yet-swapped entries (potentially most of a
+            # full tree) are still on disk. Drop them, or the retry's
+            # up-front free-space check — which runs BEFORE the lazy
+            # per-entry leftover cleanup — fails on litter this attempt
+            # left behind: the exact "retry fails harder" failure mode
+            # _discard_staged exists to prevent. Safe post-rollback: swapped
+            # entries' staging paths were renamed away, and _discard_staged
+            # skips paths that no longer exist.
+            _discard_staged(staged)
+            raise
         update_count = len(staged)
 
         print(f"✓ Updated {update_count} items from ZIP")
@@ -1037,7 +1069,7 @@ def _update_via_zip(args):
         print("  Code and Python deps are updated, but the dashboard/TUI may")
         print("  be in a mixed state until the Node deps are rebuilt.")
     else:
-        print("✓ Update complete!")
+        _print_update_completion("✓ Update complete!")
     try:
         _print_curator_first_run_notice()
     except Exception as e:
@@ -2067,7 +2099,7 @@ def _update_node_dependencies() -> list[str]:
         print("    deps). Fix npm and re-run `hermes update`.")
         return list(labels)
 
-    extra_args = ["--no-fund", "--no-audit", "--progress=false"]
+    extra_args = ["--no-fund", "--no-audit", "--prefer-offline", "--progress=false"]
 
     from hermes_constants import with_hermes_node_path
 
@@ -3452,8 +3484,36 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
+    def _real_dirty():
+        # Files with a *content* change once CRLF differences are ignored.
+        # NOTE: ``diff --name-only --ignore-cr-at-eol`` still LISTS CR-only
+        # files (the name list is computed from blob/stat differences before
+        # the CR filter is applied), so it cannot be used to isolate real
+        # edits. ``--numstat`` does honor the filter: a CR-only file produces
+        # no numstat record, while a genuinely-edited file does. Parse the
+        # paths out of numstat instead.
+        out = subprocess.run(
+            probe + ["-c", "core.quotepath=false",
+                     "diff", "--numstat", "--ignore-cr-at-eol"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if out.returncode != 0:
+            return None
+        paths = set()
+        for line in out.stdout.splitlines():
+            if not line.strip():
+                continue
+            # Format: "<added>\t<deleted>\t<path>". Rename detection is off in
+            # plain diff, so there is exactly one path field per record.
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[2]:
+                paths.add(parts[2])
+        return paths
+
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
+        all_dirty, real_dirty = _dirty(), _real_dirty()
         if all_dirty is None or real_dirty is None:
             return None
         return all_dirty - real_dirty
@@ -3866,11 +3926,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
                     print("✓ Dependencies repaired!")
+                    _print_update_completion("✓ Update complete!")
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
-                print("✓ Already up to date!")
+                _print_update_completion("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -4541,7 +4602,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("  Code and Python deps are updated, but the dashboard/TUI may")
             print("  be in a mixed state until the Node deps are rebuilt.")
         else:
-            print("✓ Update complete!")
+            _print_update_completion("✓ Update complete!")
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -4813,37 +4874,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _manage_cmd_cache[scope_] = cmd
                 return cmd
 
-            # Drain budget for graceful SIGUSR1 restarts.  The gateway drains
-            # for up to ``agent.restart_drain_timeout`` (default 60s) before
-            # exiting with code 75; we wait slightly longer so the drain
-            # completes before we fall back to a hard restart.  On older
-            # systemd units without SIGUSR1 wiring this wait just times out
-            # and we fall back to ``systemctl restart`` (the old behaviour).
+            # Wait budget for graceful SIGUSR1 restarts.  In-band restart
+            # may defer stop() until active turns finish
+            # (``restart_after_turn_timeout``, #77184) and then spend up to
+            # ``restart_drain_timeout`` inside stop(). Cover both phases so
+            # we don't fall back to a hard kill while the gateway is still
+            # patiently waiting for the requesting turn. On older systemd
+            # units without SIGUSR1 wiring this wait just times out and we
+            # fall back to ``systemctl restart`` (the old behaviour).
             try:
-                from hermes_constants import (
-                    DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT as _DEFAULT_DRAIN,
-                )
-            except Exception:
-                _DEFAULT_DRAIN = 60.0
-            _cfg_drain = None
-            try:
-                from hermes_cli.config import load_config
+                from hermes_cli.gateway import _get_restart_exit_wait_budget
 
-                _cfg_agent = load_config().get("agent") or {}
-                _cfg_drain = _cfg_agent.get("restart_drain_timeout")
+                _drain_budget = max(float(_get_restart_exit_wait_budget()), 45.0)
             except Exception:
-                pass
-            try:
-                _drain_budget = (
-                    float(_cfg_drain)
-                    if _cfg_drain is not None
-                    else float(_DEFAULT_DRAIN)
-                )
-            except (TypeError, ValueError):
-                _drain_budget = float(_DEFAULT_DRAIN)
-            # Add a 15s margin so the drain loop + final exit finish before
-            # we escalate to ``systemctl restart`` / SIGTERM.
-            _drain_budget = max(_drain_budget, 30.0) + 15.0
+                _drain_budget = 45.0
 
             restarted_services = []
             failed_or_stale_units = []
