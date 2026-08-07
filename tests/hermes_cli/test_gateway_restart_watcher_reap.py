@@ -82,7 +82,14 @@ def _reaped_pid() -> int:
     return finished.pid
 
 
-def _wait_for(path: Path, message: str, timeout: float = 60.0) -> None:
+def _wait_for(path: Path, message: str, timeout: float = 20.0) -> None:
+    """Block until ``path`` appears.
+
+    The watcher breaks out of its poll loop as soon as it sees the (already
+    reaped) old PID is gone, so the replacement appears in well under a
+    second; 20s is a large margin for a loaded runner while still surfacing a
+    genuine regression quickly.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
