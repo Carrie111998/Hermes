@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -144,6 +145,71 @@ def test_warm_roots_probes_in_parallel_and_fills_the_cache(monkeypatch):
     before = live["calls"]
     assert git_probe.repo_root("/repo0") == "/repo0"
     assert live["calls"] == before
+
+
+def test_resolve_normalizes_both_roots(monkeypatch):
+    # `resolve()` must normpath both roots so the two probe sources agree on
+    # one spelling. On Windows `--show-toplevel` prints forward slashes while
+    # common_repo_root() (via realpath) returns backslashes; unnormalized, the
+    # downstream main-checkout comparison always fails and every main checkout
+    # is misclassified as a linked worktree (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/repo/sub/..")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/repo/./")
+
+    # Build the expected spelling through normpath so this holds on Windows too,
+    # where os.path.normpath renders "/repo" as "\\repo" (issue #71837 target).
+    expected = os.path.normpath("/repo")
+    assert git_probe.resolve("/repo/x") == {"repo_root": expected, "worktree_root": expected}
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression (issue #71837)")
+def test_resolve_folds_forward_slash_toplevel_into_backslash_common_root(monkeypatch):
+    # The exact defect from issue #71837: git prints `C:/Users/x/repo`,
+    # realpath spells the common root `C:\Users\x\repo`. After normalization
+    # both fields must agree so the main checkout classifies as main.
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "C:/Users/x/repo")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "C:\\Users\\x\\repo")
+
+    info = git_probe.resolve("C:\\Users\\x\\repo")
+
+    assert info["repo_root"] == info["worktree_root"] == "C:\\Users\\x\\repo"
+
+
+def test_resolve_preserves_distinct_worktree_root(monkeypatch):
+    # A genuine linked worktree is a *distinct* location; normalization must
+    # collapse only redundant segments, never fold a real worktree into the
+    # main checkout — otherwise it would wrongly classify as main (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "/home/u/repo/../repo-wt")
+    monkeypatch.setattr(git_probe, "common_repo_root", lambda cwd: "/home/u/repo")
+
+    # Construct expected paths via normpath so they match on Windows too, where
+    # the separator flips and "/home/u/..." becomes "\\home\\u\\...".
+    expected_repo = os.path.normpath("/home/u/repo")
+    expected_wt = os.path.normpath("/home/u/repo-wt")
+    info = git_probe.resolve("/home/u/repo-wt")
+
+    assert info == {"repo_root": expected_repo, "worktree_root": expected_wt}
+    assert info["worktree_root"] != info["repo_root"]
+
+
+def test_resolve_returns_none_when_not_a_repo(monkeypatch):
+    # When git cannot resolve a repo root the resolver must short-circuit to
+    # None rather than building a bogus lane for a non-repo cwd (issue #71837).
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    monkeypatch.setattr(git_probe, "repo_root", lambda cwd: "")
+
+    assert git_probe.resolve("/tmp/not-a-repo") is None
 
 
 def test_create_list_roundtrip(tmp_path):

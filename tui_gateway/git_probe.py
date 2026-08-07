@@ -162,11 +162,21 @@ def resolve(cwd: str) -> dict | None:
     Returns ``{"repo_root": <common root>, "worktree_root": <this checkout>}``
     or ``None`` when ``cwd`` is not in a git repo. ``build_tree`` treats
     ``worktree_root == repo_root`` as the main checkout.
+
+    Both roots are separator-normalized (``os.path.normpath``): on Windows,
+    ``git rev-parse --show-toplevel`` prints forward slashes (``C:/Users/x/repo``)
+    while :func:`common_repo_root` goes through ``os.path.realpath`` and returns
+    backslashes (``C:\\Users\\x\\repo``). Left unnormalized, the main-checkout
+    equality check downstream always fails, so every repo's main checkout is
+    misclassified as a linked worktree and gets a path-keyed lane the desktop's
+    live overlay can't match (issue #71837).
     """
     worktree_root = repo_root(cwd)
     if not worktree_root:
         return None
-    return {"repo_root": common_repo_root(cwd) or worktree_root, "worktree_root": worktree_root}
+    worktree_root = os.path.normpath(worktree_root)
+    repo = os.path.normpath(common_repo_root(cwd) or worktree_root)
+    return {"repo_root": repo, "worktree_root": worktree_root}
 
 
 def warm_roots(cwds: Iterable[str], max_workers: int = _WARM_WORKERS) -> None:
