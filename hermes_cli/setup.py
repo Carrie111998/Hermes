@@ -576,6 +576,20 @@ def _print_setup_summary(config: dict, hermes_home):
         get_env_value("VOICE_TOOLS_OPENAI_KEY") or get_env_value("OPENAI_API_KEY")
     ):
         tool_status.append(("Speech-to-Text (OpenAI)", True, None))
+    elif stt_provider == "openai-codex":
+        try:
+            from hermes_cli.auth import has_codex_runtime_credentials
+
+            codex_ready = has_codex_runtime_credentials()
+        except Exception:
+            codex_ready = False
+        tool_status.append(
+            (
+                "Speech-to-Text (OpenAI Codex OAuth)",
+                codex_ready,
+                None if codex_ready else "run 'hermes auth add openai-codex'",
+            )
+        )
     elif stt_provider == "groq" and get_env_value("GROQ_API_KEY"):
         tool_status.append(("Speech-to-Text (Groq Whisper)", True, None))
     elif stt_provider == "elevenlabs" and get_env_value("ELEVENLABS_API_KEY"):

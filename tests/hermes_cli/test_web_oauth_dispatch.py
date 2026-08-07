@@ -23,7 +23,8 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import httpx
 import pytest
@@ -171,6 +172,352 @@ def test_oauth_start_stores_profile_for_background_completion(tmp_path, monkeypa
         ws._oauth_sessions.pop(session_id, None)
 
 
+def test_oauth_poll_and_cancel_reject_cross_profile_session_access(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session(
+        "openai-codex", "device_code", profile="coder"
+    )
+    try:
+        wrong_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}?profile=other",
+            headers=HEADERS,
+        )
+        wrong_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}?profile=other",
+            headers=HEADERS,
+        )
+        omitted_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}",
+            headers=HEADERS,
+        )
+        omitted_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}",
+            headers=HEADERS,
+        )
+
+        assert wrong_poll.status_code == 409
+        assert wrong_cancel.status_code == 409
+        assert omitted_poll.status_code == 409
+        assert omitted_cancel.status_code == 409
+        assert session_id in ws._oauth_sessions
+
+        right_poll = client.get(
+            f"/api/providers/oauth/openai-codex/poll/{session_id}?profile=coder",
+            headers=HEADERS,
+        )
+        right_cancel = client.delete(
+            f"/api/providers/oauth/sessions/{session_id}?profile=coder",
+            headers=HEADERS,
+        )
+
+        assert right_poll.status_code == 200
+        assert right_cancel.status_code == 200
+        assert session_id not in ws._oauth_sessions
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_oauth_session_profile_preserves_explicit_default_owner(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session("anthropic", "pkce", profile=None)
+    try:
+        assert ws._oauth_session_profile(session_id, "coder") is None
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_pkce_submit_rejects_omitted_profile_for_named_session(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    monkeypatch.setattr(ws, "_oauth_profile_name", lambda profile: profile)
+    session_id, _ = ws._new_oauth_session("anthropic", "pkce", profile="coder")
+    try:
+        with pytest.raises(ws.HTTPException) as exc_info:
+            ws._submit_anthropic_pkce(session_id, "code#state", profile=None)
+
+        assert exc_info.value.status_code == 409
+    finally:
+        ws._oauth_sessions.pop(session_id, None)
+
+
+def test_codex_dashboard_worker_credential_only_preserves_active_provider(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import web_server as ws
+    from hermes_cli.auth import get_active_provider
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    access_token = "h.eyJleH...OTl9.s"
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            return _Resp(200, {
+                "access_token": access_token,
+                "refresh_token": "codex-refresh",
+            })
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "anthropic",
+                "providers": {"anthropic": {"api_key": "anthropic-key"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model:\n  provider: anthropic\n", encoding="utf-8")
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+
+    sid, sess = ws._new_oauth_session("openai-codex", "device_code")
+    sess["activate_provider"] = False
+    try:
+        ws._codex_full_login_worker(sid)
+
+        assert ws._oauth_sessions[sid]["status"] == "approved"
+        assert get_active_provider() == "anthropic"
+        assert config_path.read_text(encoding="utf-8") == "model:\n  provider: anthropic\n"
+
+        runtime = resolve_runtime_provider(requested="openai-codex")
+        assert runtime["provider"] == "openai-codex"
+        assert runtime["api_key"] == access_token
+        assert runtime["api_mode"] == "codex_responses"
+    finally:
+        ws._oauth_sessions.pop(sid, None)
+
+
+def test_codex_dashboard_worker_does_not_save_after_session_cancelled(monkeypatch):
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+
+    session = {}
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(
+                    200,
+                    {
+                        "device_auth_id": "device-auth-id",
+                        "interval": 3,
+                        "user_code": "CODEX-1234",
+                    },
+                )
+            if url.endswith("/deviceauth/token"):
+                return _Resp(
+                    200,
+                    {
+                        "authorization_code": "authorization-code",
+                        "code_verifier": "code-verifier",
+                    },
+                )
+            with ws._oauth_sessions_lock:
+                ws._oauth_sessions.pop(session["id"], None)
+            return _Resp(
+                200,
+                {
+                    "access_token": "codex-access",
+                    "refresh_token": "codex-refresh",
+                },
+            )
+
+    save_tokens = Mock()
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        auth_mod, "_save_codex_device_login_tokens", save_tokens
+    )
+
+    sid, _ = ws._new_oauth_session("openai-codex", "device_code")
+    session["id"] = sid
+    ws._codex_full_login_worker(sid)
+
+    assert sid not in ws._oauth_sessions
+    save_tokens.assert_not_called()
+
+
+def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkeypatch):
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+    from hermes_constants import get_hermes_home
+
+    profile_home = _make_profile_home(tmp_path, monkeypatch)
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            if url.endswith("/deviceauth/usercode"):
+                return _Resp(200, {
+                    "device_auth_id": "device-auth-id",
+                    "interval": 3,
+                    "user_code": "CODEX-1234",
+                })
+            if url.endswith("/deviceauth/token"):
+                return _Resp(200, {
+                    "authorization_code": "authorization-code",
+                    "code_verifier": "code-verifier",
+                })
+            return _Resp(200, {
+                "access_token": "codex-access",
+                "refresh_token": "codex-refresh",
+            })
+
+    saved_homes = []
+    monkeypatch.setattr(httpx, "Client", _Client)
+    monkeypatch.setattr(ws.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        auth_mod,
+        "_save_codex_device_login_tokens",
+        lambda tokens, *args, **kwargs: saved_homes.append(get_hermes_home()),
+    )
+
+    sid, _ = ws._new_oauth_session(
+        "openai-codex",
+        "device_code",
+        profile="coder",
+    )
+    try:
+        ws._codex_full_login_worker(sid)
+
+        assert ws._oauth_sessions[sid]["status"] == "approved"
+        assert saved_homes == [profile_home]
+    finally:
+        ws._oauth_sessions.pop(sid, None)
+
+
+def test_codex_dashboard_start_forwards_credential_only_intent(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    captured = {}
+
+    async def fake_start(provider_id, profile=None, *, activate_provider=True):
+        captured.update(
+            provider_id=provider_id,
+            profile=profile,
+            activate_provider=activate_provider,
+        )
+        return {"session_id": "sid", "flow": "device_code"}
+
+    monkeypatch.setattr(ws, "_start_device_code_flow", fake_start)
+    resp = client.post(
+        "/api/providers/oauth/openai-codex/start?activate_provider=false",
+        headers=HEADERS,
+    )
+
+    assert resp.status_code == 200
+    assert captured == {
+        "provider_id": "openai-codex",
+        "profile": None,
+        "activate_provider": False,
+    }
+
+
+def test_codex_dashboard_start_waits_through_shared_retry_window(monkeypatch):
+    from hermes_cli import web_server as ws
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    clock = iter((0.0, 11.0, 11.0))
+
+    async def fake_sleep(_seconds):
+        with ws._oauth_sessions_lock:
+            session = next(
+                value
+                for value in ws._oauth_sessions.values()
+                if value.get("provider") == "openai-codex"
+            )
+            session.update(
+                user_code="LATE-429",
+                verification_url="https://auth.openai.com/codex/device",
+                expires_in=900,
+                interval=5,
+            )
+
+    monkeypatch.setattr(ws.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        ws,
+        "time",
+        SimpleNamespace(time=time.time, monotonic=lambda: next(clock)),
+    )
+    monkeypatch.setattr(ws.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(ws._start_device_code_flow("openai-codex"))
+    try:
+        assert result["user_code"] == "LATE-429"
+    finally:
+        ws._oauth_sessions.pop(result["session_id"], None)
 
 
 def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
@@ -273,14 +620,18 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
     saved = []
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(httpx, "Client", _Client)
-    monkeypatch.setattr(auth_mod, "_save_codex_tokens", lambda tokens: saved.append(tokens))
+    monkeypatch.setattr(
+        auth_mod,
+        "_save_codex_tokens",
+        lambda tokens, last_refresh=None, **kwargs: saved.append(tokens),
+    )
 
     sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
 
     def fake_sleep(_interval):
         # Simulate a real concurrent DELETE /api/providers/oauth/sessions/{sid}
         # firing while the worker is asleep between polls.
-        resp = client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        resp = client.delete(f"/api/providers/oauth/sessions/{sid}?profile=coder", headers=HEADERS)
         assert resp.status_code == 200, resp.text
 
     monkeypatch.setattr(ws.time, "sleep", fake_sleep)
@@ -354,7 +705,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     delete_started = threading.Event()
     delete_finished = threading.Event()
 
-    def fake_save(tokens):
+    def fake_save(tokens, last_refresh=None, **kwargs):
         # We are inside the worker's critical section right now (holding
         # _oauth_sessions_lock). Fire a real DELETE from another thread and
         # prove it cannot complete until this section releases the lock.
@@ -369,7 +720,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
 
     def _fire_delete():
         delete_started.set()
-        client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
+        client.delete(f"/api/providers/oauth/sessions/{sid}?profile=coder", headers=HEADERS)
         delete_finished.set()
 
     monkeypatch.setattr(auth_mod, "_save_codex_tokens", fake_save)
@@ -418,7 +769,7 @@ def test_cancel_oauth_session_marks_dict_cancelled_before_popping():
     worker_ref = ws._oauth_sessions[session_id]
 
     resp = client.delete(
-        f"/api/providers/oauth/sessions/{session_id}",
+        f"/api/providers/oauth/sessions/{session_id}?profile=coder",
         headers=HEADERS,
     )
 

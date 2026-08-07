@@ -1,15 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { setApiRequestProfile } from '@/hermes'
 import * as notifications from '@/store/notifications'
-import type { OAuthProvider } from '@/types/hermes'
+import type { OAuthPollResponse, OAuthProvider, OAuthStartResponse } from '@/types/hermes'
 
 import {
   $desktopOnboarding,
+  cancelOnboardingFlow,
+  closeManualOnboarding,
   type DesktopOnboardingState,
   type OnboardingContext,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
+  startProviderOAuth,
   submitOnboardingCode
 } from './onboarding'
 
@@ -91,13 +95,308 @@ function fallbackTimeoutGateway(): OnboardingContext['requestGateway'] {
 describe('refreshOnboarding', () => {
   beforeEach(() => {
     window.localStorage.clear()
+    setApiRequestProfile(null)
     $desktopOnboarding.set(baseState())
   })
 
   afterEach(() => {
     window.localStorage.clear()
+    setApiRequestProfile(null)
     $desktopOnboarding.set(baseState())
     vi.restoreAllMocks()
+  })
+
+  it('cancels a stale OAuth start that resolves after onboarding is dismissed', async () => {
+    let resolveStart: ((value: OAuthStartResponse) => void) | undefined
+
+    const startPromise = new Promise<OAuthStartResponse>(resolve => {
+      resolveStart = resolve
+    })
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return startPromise
+      }
+
+      if (path.includes('/sessions/stale-onboarding-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    installApiMock(api)
+    const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+    expect($desktopOnboarding.get().flow.status).toBe('starting')
+    cancelOnboardingFlow()
+    resolveStart?.({
+      flow: 'device_code',
+      session_id: 'stale-onboarding-session',
+      user_code: 'STALE-1234',
+      verification_url: 'https://auth.openai.com/device',
+      expires_in: 900,
+      poll_interval: 5
+    })
+    await operation
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/providers/oauth/sessions/stale-onboarding-session',
+        method: 'DELETE'
+      })
+    )
+    expect(openSpy).not.toHaveBeenCalled()
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+  })
+
+  it('cancels and isolates the previous session when OAuth is replaced', async () => {
+    let startCount = 0
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        startCount += 1
+
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: `replacement-session-${startCount}`,
+          user_code: `REPLACE-${startCount}`,
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      notifications.clearNotifications()
+      installApiMock(api)
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+      const staleRecovery = notifications.$notifications.get().find(item => item.title === 'Sign-in window was blocked')
+
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/replacement-session-1',
+          method: 'DELETE'
+        })
+      )
+      expect($desktopOnboarding.get().flow.status).toBe('polling')
+
+      staleRecovery?.action?.onClick()
+
+      expect(openSpy).toHaveBeenCalledTimes(2)
+      expect(notifications.$notifications.get().some(item => item.title === 'Sign-in window was blocked')).toBe(true)
+    } finally {
+      cancelOnboardingFlow()
+      notifications.clearNotifications()
+      openSpy.mockRestore()
+    }
+  })
+
+  it('clears a failed OAuth start after its initiating profile changes', async () => {
+    let rejectStart: ((reason?: unknown) => void) | undefined
+
+    const api = vi.fn(
+      ({ path }: { path: string }) =>
+        new Promise<unknown>((_resolve, reject) => {
+          if (!path.includes('/start')) {
+            throw new Error(`unexpected api path: ${path}`)
+          }
+
+          rejectStart = reject
+        })
+    )
+
+    installApiMock(api)
+    setApiRequestProfile('coder')
+    const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+    await vi.waitFor(() => expect($desktopOnboarding.get().flow.status).toBe('starting'))
+
+    setApiRequestProfile('other')
+    rejectStart?.(new Error('old profile failed'))
+    await operation
+
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+  })
+
+  it('does not open a browser fallback when bridge failure resolves after cancellation', async () => {
+    let rejectOpen: ((reason?: unknown) => void) | undefined
+
+    const openExternal = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectOpen = reject
+        })
+    )
+
+    const originalDesktop = Object.getOwnPropertyDescriptor(window, 'hermesDesktop')
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'bridge-race-session',
+          user_code: 'BRIDGE-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/bridge-race-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      installApiMock(api)
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { ...window.hermesDesktop, openExternal }
+      })
+      const operation = startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      await vi.waitFor(() => expect(openExternal).toHaveBeenCalled())
+      cancelOnboardingFlow()
+      rejectOpen?.(new Error('bridge unavailable'))
+      await operation
+
+      expect(openSpy).not.toHaveBeenCalled()
+      expect($desktopOnboarding.get().flow.status).toBe('idle')
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/bridge-race-session',
+          method: 'DELETE'
+        })
+      )
+    } finally {
+      openSpy.mockRestore()
+
+      if (originalDesktop) {
+        Object.defineProperty(window, 'hermesDesktop', originalDesktop)
+      } else {
+        Reflect.deleteProperty(window, 'hermesDesktop')
+      }
+    }
+  })
+
+  it('dismisses popup recovery and prevents its stale action after cancellation', async () => {
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'popup-recovery-session',
+          user_code: 'POPUP-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/sessions/popup-recovery-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    try {
+      notifications.clearNotifications()
+      installApiMock(api)
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(emptyOpenRouterGateway()))
+
+      const recovery = notifications.$notifications.get().find(item => item.title === 'Sign-in window was blocked')
+
+      expect(recovery?.action).toBeTruthy()
+      cancelOnboardingFlow()
+      recovery?.action?.onClick()
+
+      expect(openSpy).toHaveBeenCalledTimes(1)
+      expect(notifications.$notifications.get().some(item => item.id === recovery?.id)).toBe(false)
+    } finally {
+      openSpy.mockRestore()
+      notifications.clearNotifications()
+    }
+  })
+
+  it('ignores an in-flight poll that approves after manual onboarding closes', async () => {
+    vi.useFakeTimers()
+    let resolvePoll: ((value: OAuthPollResponse) => void) | undefined
+
+    const pollPromise = new Promise<OAuthPollResponse>(resolve => {
+      resolvePoll = resolve
+    })
+
+    const api = vi.fn(({ path }: { path: string }) => {
+      if (path.includes('/start')) {
+        return Promise.resolve({
+          flow: 'device_code',
+          session_id: 'manual-poll-session',
+          user_code: 'MANUAL-1234',
+          verification_url: 'https://auth.openai.com/device',
+          expires_in: 900,
+          poll_interval: 5
+        })
+      }
+
+      if (path.includes('/poll/manual-poll-session')) {
+        return pollPromise
+      }
+
+      if (path.includes('/sessions/manual-poll-session')) {
+        return Promise.resolve({ ok: true })
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway = vi.fn()
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+
+    try {
+      installApiMock(api)
+      $desktopOnboarding.set(baseState({ manual: true, requested: true }))
+      await startProviderOAuth(provider('openai-codex'), onboardingContext(requestGateway))
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({ path: '/api/providers/oauth/openai-codex/poll/manual-poll-session' })
+      )
+
+      closeManualOnboarding()
+      resolvePoll?.({ status: 'approved', session_id: 'manual-poll-session' })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect($desktopOnboarding.get().flow.status).toBe('idle')
+      expect(requestGateway).not.toHaveBeenCalled()
+      expect(api).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: '/api/providers/oauth/sessions/manual-poll-session',
+          method: 'DELETE'
+        })
+      )
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
   })
 
   it('refreshes OAuth providers again when onboarding was explicitly requested', async () => {

@@ -95,6 +95,7 @@ Add to `~/.hermes/.env`:
 ```bash
 # Speech-to-Text — local provider needs NO key at all
 # pip install faster-whisper          # Free, runs locally, recommended
+# OpenAI Codex OAuth also needs no API key; it uses an existing Hermes Codex login
 GROQ_API_KEY=your-key                 # Groq Whisper — fast, free tier (cloud)
 VOICE_TOOLS_OPENAI_KEY=your-key       # OpenAI Whisper — paid (cloud)
 
@@ -106,6 +107,31 @@ ELEVENLABS_API_KEY=***           # ElevenLabs — premium quality
 :::tip
 If `faster-whisper` is installed, voice mode works with **zero API keys** for STT. The model (~150 MB for `base`) downloads automatically on first use.
 :::
+
+To use transcription included with a ChatGPT/Codex subscription, select
+**OpenAI Codex OAuth** under Speech-to-Text in `hermes tools`. The picker runs a
+credential-only login and does not change the model provider used for chat. You
+can also authenticate separately before opening the picker:
+
+```bash
+hermes auth add openai-codex
+```
+
+For manual configuration, use:
+
+```yaml
+stt:
+  enabled: true
+  provider: openai-codex
+  openai_codex:
+    language: "" # automatic detection; use "tr", "en", etc. to force
+    timeout: 120
+```
+
+This uses Codex's subscription-backed dictation endpoint rather than the
+separately billed OpenAI Platform audio API. The endpoint is private and may
+change upstream; Hermes refreshes expired OAuth tokens once and returns a clear
+error if ChatGPT blocks or removes the route.
 
 ---
 

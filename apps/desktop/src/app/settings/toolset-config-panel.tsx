@@ -5,8 +5,10 @@ import { SETTINGS_ROUTE } from '@/app/routes'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
+  cancelOAuthSession,
   deleteEnvVar,
   getActionStatus,
+  getApiRequestProfile,
   getToolsetConfig,
   getToolsetModels,
   pollOAuthSession,
@@ -21,7 +23,7 @@ import { useI18n } from '@/i18n'
 import { Check, Loader2, Save, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
-import { notify, notifyError } from '@/store/notifications'
+import { dismissNotification, notify, notifyError } from '@/store/notifications'
 import type {
   ActionStatusResponse,
   ToolEnvVar,
@@ -500,8 +502,18 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // Default-provider selection and a user click race just after config arrives:
   // a stale initialization effect must never replace an explicit choice.
   const providerChoiceClaimedRef = useRef(false)
-  // Guard the Nous Portal sign-in poll loop against unmount/state updates.
+  // Guard the OAuth sign-in poll loop against unmount/state updates.
   const mountedRef = useRef(true)
+  const oauthOperationGenerationRef = useRef(0)
+
+  const activeOAuthSessionRef = useRef<{
+    generation: number
+    profile: null | string
+    sessionId: string
+  } | null>(null)
+
+  const popupRecoveryNotificationRef = useRef<{ generation: number; id: string } | null>(null)
+  const authorizationCodeNotificationRef = useRef<{ generation: number; id: string } | null>(null)
 
   // eslint-disable-next-line no-restricted-syntax -- mount flag guarding an async poll loop, not an atom mirror
   useEffect(() => {
@@ -509,6 +521,23 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
     return () => {
       mountedRef.current = false
+      oauthOperationGenerationRef.current += 1
+      const session = activeOAuthSessionRef.current
+      const notifications = [popupRecoveryNotificationRef.current, authorizationCodeNotificationRef.current]
+
+      activeOAuthSessionRef.current = null
+      popupRecoveryNotificationRef.current = null
+      authorizationCodeNotificationRef.current = null
+
+      for (const notification of notifications) {
+        if (notification) {
+          dismissNotification(notification.id)
+        }
+      }
+
+      if (session) {
+        void cancelOAuthSession(session.sessionId, session.profile)
+      }
     }
   }, [])
 
@@ -574,6 +603,18 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
     setSelecting(provider.name)
 
     try {
+      if (provider.auth_provider && providerStatus(provider, envState) === 'needs_auth') {
+        const authenticated = await signInToOAuthProvider(provider.auth_provider)
+
+        if (!authenticated) {
+          return
+        }
+      }
+
+      if (!mountedRef.current) {
+        return
+      }
+
       const result = await selectToolsetProvider(toolset, provider.name)
       // Mirror the backend write locally so dependent UI (model catalog
       // enablement) tracks the new active backend without a refetch.
@@ -596,7 +637,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
           kind: 'warning',
           title: copy.nousAuthNeededTitle,
           message: copy.nousAuthNeededMessage(provider.name),
-          action: { label: copy.nousAuthSignIn, onClick: () => void signInToNousPortal() }
+          action: { label: copy.nousAuthSignIn, onClick: () => void signInToOAuthProvider('nous') }
         })
 
         return
@@ -614,57 +655,229 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   // Drive the existing Nous Portal OAuth device-code flow (the same session
   // machinery onboarding uses: start → open verification URL → poll), then
   // refetch the toolset config so is_active / status flip once entitled.
-  async function signInToNousPortal() {
+  async function signInToOAuthProvider(providerId: string): Promise<boolean> {
+    const generation = ++oauthOperationGenerationRef.current
+    const profile = getApiRequestProfile()
+    const previousSession = activeOAuthSessionRef.current
+
+    activeOAuthSessionRef.current = null
+
+    if (previousSession) {
+      void cancelOAuthSession(previousSession.sessionId, previousSession.profile).catch(() => undefined)
+    }
+
+    for (const ref of [popupRecoveryNotificationRef, authorizationCodeNotificationRef]) {
+      const notification = ref.current
+
+      ref.current = null
+
+      if (notification) {
+        dismissNotification(notification.id)
+      }
+    }
+
+    let sessionId: string | null = null
+
+    const operationIsCurrent = () =>
+      mountedRef.current && oauthOperationGenerationRef.current === generation && getApiRequestProfile() === profile
+
+    const sessionIsCurrent = () => {
+      const active = activeOAuthSessionRef.current
+
+      return (
+        operationIsCurrent() &&
+        active?.generation === generation &&
+        active.sessionId === sessionId &&
+        active.profile === profile
+      )
+    }
+
+    const dismissOperationNotifications = () => {
+      for (const ref of [popupRecoveryNotificationRef, authorizationCodeNotificationRef]) {
+        const notification = ref.current
+
+        if (notification?.generation === generation) {
+          ref.current = null
+          dismissNotification(notification.id)
+        }
+      }
+    }
+
+    const releaseSession = () => {
+      const active = activeOAuthSessionRef.current
+
+      if (active?.generation === generation && active.sessionId === sessionId && active.profile === profile) {
+        activeOAuthSessionRef.current = null
+      }
+
+      dismissOperationNotifications()
+    }
+
     try {
-      const start = await startOAuthLogin('nous')
+      const start = await startOAuthLogin(providerId, providerId !== 'openai-codex', profile)
+
+      sessionId = start.session_id
+
+      if (!operationIsCurrent()) {
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
+        return false
+      }
 
       if (start.flow !== 'device_code') {
-        notifyError(new Error(`unexpected flow: ${start.flow}`), copy.nousAuthFailed)
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+        notifyError(new Error(`unexpected flow: ${start.flow}`), copy.failedSelect(providerId))
 
-        return
+        return false
+      }
+
+      activeOAuthSessionRef.current = { generation, profile, sessionId: start.session_id }
+
+      if (providerId === 'openai-codex' && start.user_code) {
+        const authorizationCode = start.user_code
+        let notificationId = ''
+
+        notificationId = notify({
+          kind: 'warning',
+          title: 'OpenAI Codex authorization code',
+          message: authorizationCode,
+          action: {
+            label: 'Copy code',
+            onClick: () => {
+              if (sessionIsCurrent()) {
+                void navigator.clipboard?.writeText(authorizationCode)
+              }
+
+              const current = authorizationCodeNotificationRef.current
+
+              if (current?.generation === generation && current.id === notificationId) {
+                authorizationCodeNotificationRef.current = null
+              }
+
+              dismissNotification(notificationId)
+            }
+          }
+        })
+        authorizationCodeNotificationRef.current = { generation, id: notificationId }
       }
 
       const url = start.verification_url
+      let opened = false
 
       if (window.hermesDesktop?.openExternal) {
         try {
           await window.hermesDesktop.openExternal(url)
+          opened = true
         } catch {
-          window.open(url, '_blank', 'noopener,noreferrer')
+          if (sessionIsCurrent()) {
+            opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
+          }
         }
-      } else {
-        window.open(url, '_blank', 'noopener,noreferrer')
+      } else if (sessionIsCurrent()) {
+        opened = window.open(url, '_blank', 'noopener,noreferrer') !== null
       }
 
-      // Poll until the device-code session resolves (~5s cadence, bounded).
-      for (let attempt = 0; attempt < 120 && mountedRef.current; attempt += 1) {
-        await new Promise(resolve => window.setTimeout(resolve, 5000))
+      if (!sessionIsCurrent()) {
+        releaseSession()
+        await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
 
-        if (!mountedRef.current) {
-          return
+        return false
+      }
+
+      if (!opened) {
+        let notificationId = ''
+
+        notificationId = notify({
+          kind: 'warning',
+          title: 'Sign-in window was blocked',
+          message: 'Allow pop-ups, then open the authorization page to continue.',
+          action: {
+            label: 'Open sign-in page',
+            onClick: () => {
+              if (sessionIsCurrent()) {
+                window.open(url, '_blank', 'noopener,noreferrer')
+              }
+
+              const current = popupRecoveryNotificationRef.current
+
+              if (current?.generation === generation && current.id === notificationId) {
+                popupRecoveryNotificationRef.current = null
+              }
+
+              dismissNotification(notificationId)
+            }
+          }
+        })
+        popupRecoveryNotificationRef.current = { generation, id: notificationId }
+      }
+
+      const pollIntervalMs = Math.max(1000, start.poll_interval * 1000)
+      const deadline = Date.now() + start.expires_in * 1000
+
+      while (sessionIsCurrent() && Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, pollIntervalMs))
+
+        if (!sessionIsCurrent()) {
+          releaseSession()
+          await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
+          return false
         }
 
-        const polled = await pollOAuthSession('nous', start.session_id)
+        const polled = await pollOAuthSession(providerId, start.session_id, profile)
+
+        if (!sessionIsCurrent()) {
+          releaseSession()
+          await cancelOAuthSession(start.session_id, profile).catch(() => undefined)
+
+          return false
+        }
 
         if (polled.status === 'approved') {
-          notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
+          releaseSession()
+
+          if (providerId === 'nous') {
+            notify({ kind: 'success', title: copy.nousAuthDoneTitle, message: copy.nousAuthDoneMessage })
+          }
+
           await refresh()
+
+          if (!operationIsCurrent()) {
+            return false
+          }
+
           onConfiguredChange?.()
 
-          return
+          return true
         }
 
         if (polled.status !== 'pending') {
-          notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.nousAuthFailed)
+          releaseSession()
+          notifyError(new Error(polled.error_message || `Sign-in ${polled.status}`), copy.failedSelect(providerId))
 
-          return
+          return false
         }
       }
+
+      if (sessionIsCurrent()) {
+        releaseSession()
+        await cancelOAuthSession(start.session_id, profile)
+      }
     } catch (err) {
-      if (mountedRef.current) {
-        notifyError(err, copy.nousAuthFailed)
+      const shouldNotify = operationIsCurrent()
+
+      releaseSession()
+
+      if (sessionId) {
+        await cancelOAuthSession(sessionId, profile).catch(() => undefined)
+      }
+
+      if (shouldNotify) {
+        notifyError(err, copy.failedSelect(providerId))
       }
     }
+
+    return false
   }
 
   function patchEnv(key: string, isSet: boolean) {
