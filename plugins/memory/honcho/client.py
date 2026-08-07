@@ -489,23 +489,31 @@ class HonchoClientConfig:
         cls,
         host: str | None = None,
         config_path: Path | None = None,
+        raw_config: dict[str, Any] | None = None,
     ) -> HonchoClientConfig:
         """Create config from the resolved Honcho config path.
 
         Resolution: $HERMES_HOME/honcho.json -> ~/.honcho/config.json -> env vars.
         When host is None, derives it from the active Hermes profile.
+
+        ``raw_config`` lets callers parse an already-read file snapshot. This
+        keeps content-addressed cache keys bound to the exact bytes whose
+        values are cached instead of rereading a concurrently changing file.
         """
         resolved_host = host or resolve_active_host()
         path = config_path or resolve_config_path()
-        if not path.exists():
-            logger.debug("No global Honcho config at %s, falling back to env", path)
-            return cls.from_env(host=resolved_host)
+        if raw_config is None:
+            if not path.exists():
+                logger.debug("No global Honcho config at %s, falling back to env", path)
+                return cls.from_env(host=resolved_host)
 
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to read %s: %s, falling back to env", path, e)
-            return cls.from_env(host=resolved_host)
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning("Failed to read %s: %s, falling back to env", path, e)
+                return cls.from_env(host=resolved_host)
+        else:
+            raw = raw_config
 
         host_block = _host_block(raw, resolved_host)
         # A hosts.hermes block or explicit enabled flag means the user

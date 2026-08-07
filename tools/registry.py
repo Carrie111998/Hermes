@@ -220,8 +220,14 @@ _CHECK_FN_TTL_SECONDS = 30.0
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
 _CHECK_FN_CACHE_MAX = 512
 _check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
-# Monotonic timestamp of the most recent True result per check_fn.
+# Monotonic timestamp of the most recent True result per check_fn. Entries are
+# retained past the transient-failure grace window until a persistent False is
+# observed, so the available -> unavailable transition can be logged once.
 _check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
+# Keys whose persistent unavailable transition has already been reported.
+# Keep this separate from the TTL result cache so repeated failed probes do
+# not emit a warning every TTL after the transition is known.
+_check_fn_unavailable_warned: set[tuple[Callable, Optional[str]]] = set()
 _check_fn_cache_lock = threading.Lock()
 CHECK_FN_CACHE_BYPASS = ""
 
@@ -234,13 +240,12 @@ def _prune_check_fn_caches(now: float) -> None:
     for key, (timestamp, _) in list(_check_fn_cache.items()):
         if now - timestamp >= _CHECK_FN_TTL_SECONDS:
             _check_fn_cache.pop(key, None)
-    for key, timestamp in list(_check_fn_last_good.items()):
-        if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
-            _check_fn_last_good.pop(key, None)
     while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
         _check_fn_cache.pop(next(iter(_check_fn_cache)))
     while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
         _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
+    while len(_check_fn_unavailable_warned) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_unavailable_warned.pop()
 
 
 def check_fn_cache_scope() -> Optional[str]:
@@ -310,6 +315,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         _prune_check_fn_caches(now)
         if value:
             _check_fn_last_good[cache_key] = now
+            _check_fn_unavailable_warned.discard(cache_key)
             _check_fn_cache[cache_key] = (now, True)
             return True
 
@@ -327,13 +333,36 @@ def _check_fn_cached(fn: Callable) -> bool:
             )
             return True
 
-        # No recent success (or grace expired) — honor the failure. Log it so
-        # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
-            "check_fn %s %s; dependent tools will be unavailable this turn",
-            getattr(fn, "__qualname__", fn),
-            "raised" if raised else "returned False",
-        )
+        # No recent success (or grace expired) — honor the failure. Initial
+        # ``False`` means an optional capability is simply unavailable and is
+        # DEBUG-level. A capability that was previously available has made a
+        # real state transition, so report that transition once at WARNING and
+        # then clear last-good to avoid warning on every subsequent TTL probe.
+        already_warned = cache_key in _check_fn_unavailable_warned
+        if raised and not already_warned:
+            logger.warning(
+                "check_fn %s raised; dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+            _check_fn_unavailable_warned.add(cache_key)
+        elif raised:
+            logger.debug(
+                "check_fn %s still raises; dependent tools remain unavailable",
+                getattr(fn, "__qualname__", fn),
+            )
+        elif last_good is not None and not already_warned:
+            logger.warning(
+                "check_fn %s returned False after previous success; "
+                "dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+            _check_fn_unavailable_warned.add(cache_key)
+        else:
+            logger.debug(
+                "check_fn %s returned False; dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+        _check_fn_last_good.pop(cache_key, None)
         _check_fn_cache[cache_key] = (now, False)
         return False
 
@@ -344,6 +373,7 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+        _check_fn_unavailable_warned.clear()
 
 
 def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
