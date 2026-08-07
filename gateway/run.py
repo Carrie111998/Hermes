@@ -10396,17 +10396,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
-            # Opt-in passthrough: treat listed core commands as plain text so
-            # they queue/interrupt like a normal message (mirrors cold path).
-            if (
-                _cmd_def_inner is not None
-                and _cmd_def_inner.name in self._agent_passthrough_commands(source)
-            ):
+            # Opt-in passthrough: rewrite listed slash commands into a clear
+            # owner-command signal and queue/interrupt like normal text.
+            _pt_name = (
+                _cmd_def_inner.name
+                if _cmd_def_inner is not None
+                else (str(_evt_cmd).strip().lstrip("/").lower() if _evt_cmd else "")
+            )
+            if _pt_name and _pt_name in self._agent_passthrough_commands(source):
                 logger.info(
                     "Passthrough /%s to busy-session path for %s",
-                    _cmd_def_inner.name,
+                    _pt_name,
                     _quick_key,
                 )
+                self._apply_agent_passthrough_rewrite(event, _pt_name)
                 _evt_cmd = None
                 _cmd_def_inner = None
 
@@ -10812,14 +10815,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
-        # Opt-in: send selected core slash commands to the agent as plain
-        # text (e.g. /start → onboarding). Default remains silent /start.
+        # Opt-in: rewrite selected slash commands into a clear owner-command
+        # signal for the agent (e.g. /start → onboarding, /campaign → launch).
+        # Works for core commands AND unknown names listed in config.
+        # Default remains silent /start when not configured.
         if command and canonical and canonical in self._agent_passthrough_commands(source):
             logger.info(
                 "Passthrough /%s to agent for session %s",
                 canonical,
                 _quick_key,
             )
+            self._apply_agent_passthrough_rewrite(event, canonical)
             command = None
             _cmd_def = None
             canonical = None
@@ -13857,28 +13863,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _agent_passthrough_extra(self, source: SessionSource) -> Any:
+        """Raw ``agent_passthrough_commands`` value from platform extra."""
+        from gateway.slash_access import _platform_extra
+
+        if self.config is None or source is None:
+            return None
+        platforms = getattr(self.config, "platforms", None)
+        if platforms is None:
+            return None
+        try:
+            platform_config = platforms.get(source.platform)
+        except Exception:
+            return None
+        extra = _platform_extra(platform_config)
+        return extra.get("agent_passthrough_commands")
+
     def _agent_passthrough_commands(self, source: SessionSource) -> frozenset:
         """Canonical slash names that skip core handlers and reach the agent.
 
         Configured per platform via
-        ``platforms.<platform>.extra.agent_passthrough_commands`` (list or
-        comma-separated string; leading ``/`` and case ignored). Empty by
-        default so stock Hermes keeps treating ``/start`` as a silent
-        platform ping.
-        """
-        from gateway.slash_access import _coerce_command_list, _platform_extra
+        ``platforms.<platform>.extra.agent_passthrough_commands``:
 
-        if self.config is None or source is None:
-            return frozenset()
-        platforms = getattr(self.config, "platforms", None)
-        if platforms is None:
-            return frozenset()
+        - list / comma-separated string of command names
+        - OR mapping of command name → custom agent prompt
+
+        Leading ``/`` and case ignored. Empty by default so stock Hermes
+        keeps treating ``/start`` as a silent platform ping.
+        """
+        from gateway.slash_access import _coerce_command_list
+
+        raw = self._agent_passthrough_extra(source)
+        if isinstance(raw, dict):
+            return _coerce_command_list(list(raw.keys()))
+        return _coerce_command_list(raw)
+
+    def _agent_passthrough_prompt(self, source: SessionSource, name: str) -> str | None:
+        """Optional custom agent prompt for a passthrough command."""
+        raw = self._agent_passthrough_extra(source)
+        if not isinstance(raw, dict):
+            return None
+        key = str(name).strip().lstrip("/").lower()
+        for k, v in raw.items():
+            if str(k).strip().lstrip("/").lower() == key:
+                text = str(v).strip() if v is not None else ""
+                return text or None
+        return None
+
+    def _apply_agent_passthrough_rewrite(self, event: MessageEvent, name: str) -> None:
+        """Rewrite event text so the agent gets a clear owner-command signal."""
+        name = str(name).strip().lstrip("/").lower()
+        args = ""
         try:
-            platform_config = platforms.get(source.platform)
+            args = (event.get_command_args() or "").strip()
         except Exception:
-            return frozenset()
-        extra = _platform_extra(platform_config)
-        return _coerce_command_list(extra.get("agent_passthrough_commands"))
+            args = ""
+        custom = self._agent_passthrough_prompt(event.source, name)
+        if custom:
+            event.text = custom if not args else f"{custom}\nArgs: {args}"
+            return
+        suffix = f" {args}" if args else ""
+        event.text = (
+            f"[OWNER_COMMAND: {name}]\n"
+            f"The owner invoked /{name}{suffix}. "
+            "Execute the matching owner-command section in your skill now. "
+            "Never show YAML, JSON, file paths, tokens, secrets, credentials, "
+            "or internal config to the owner."
+        )
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str

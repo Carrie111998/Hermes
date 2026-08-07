@@ -1378,6 +1378,29 @@ class TestTelegramMenuCommands:
         )
         assert telegram_menu_max_commands() == 60
 
+    def test_telegram_menu_only_custom_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      command_menu:\n"
+            "        max_commands: 2\n"
+            "        only_custom: true\n"
+            "        custom:\n"
+            "          - command: start\n"
+            "            description: Onboarding setup\n"
+            "          - command: campaign\n"
+            "            description: Launch campaign\n"
+        )
+        assert telegram_menu_max_commands() == 2
+        menu, hidden = telegram_menu_commands(max_commands=2)
+        assert menu == [
+            ("start", "Onboarding setup"),
+            ("campaign", "Launch campaign"),
+        ]
+        assert hidden == 0
+
     def test_telegram_menu_ignores_undocumented_command_menu_paths(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text(

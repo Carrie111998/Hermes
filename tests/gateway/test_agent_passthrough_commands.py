@@ -144,15 +144,35 @@ async def test_start_passthrough_reaches_agent():
 
     async def fake_agent(event, source, key, generation):
         captured["text"] = event.text
-        captured["command"] = event.get_command()
         return "onboarding-q1"
 
     runner._handle_message_with_agent = fake_agent
     result = await runner._handle_message(_make_event("/start"))
     assert result == "onboarding-q1"
-    assert captured["text"] == "/start"
-    # get_command still parses the slash form; agent sees raw text.
-    assert captured["command"] == "start"
+    assert captured["text"].startswith("[OWNER_COMMAND: start]")
+    assert "Never show YAML" in captured["text"]
+
+
+@pytest.mark.asyncio
+async def test_passthrough_custom_prompt_and_unknown_command():
+    runner, _ = _make_runner(
+        platform_extra={
+            "agent_passthrough_commands": {
+                "campaign": "[OWNER_COMMAND: campaign]\nLaunch campaign flow now."
+            }
+        }
+    )
+    captured = {}
+
+    async def fake_agent(event, source, key, generation):
+        captured["text"] = event.text
+        return "campaign-q1"
+
+    runner._handle_message_with_agent = fake_agent
+    result = await runner._handle_message(_make_event("/campaign"))
+    assert result == "campaign-q1"
+    assert captured["text"].startswith("[OWNER_COMMAND: campaign]")
+    assert "Launch campaign flow" in captured["text"]
 
 
 @pytest.mark.asyncio
@@ -206,3 +226,25 @@ def test_agent_passthrough_helper_reads_platform_extra():
     )
     cmds = runner._agent_passthrough_commands(_make_source())
     assert cmds == frozenset({"start", "status"})
+
+
+def test_agent_passthrough_helper_reads_dict_keys():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                extra={
+                    "agent_passthrough_commands": {
+                        "/Start": "custom start",
+                        "campaign": "custom campaign",
+                    }
+                },
+            )
+        }
+    )
+    cmds = runner._agent_passthrough_commands(_make_source())
+    assert cmds == frozenset({"start", "campaign"})
+    assert runner._agent_passthrough_prompt(_make_source(), "start") == "custom start"

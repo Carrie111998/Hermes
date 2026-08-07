@@ -636,10 +636,25 @@ def _telegram_command_menu_config() -> dict[str, Any]:
     else:
         priority = []
 
+    raw_custom = menu_cfg.get("custom")
+    custom: list[tuple[str, str]] = []
+    if isinstance(raw_custom, list):
+        for item in raw_custom:
+            if not isinstance(item, Mapping):
+                continue
+            cmd = _sanitize_telegram_name(str(item.get("command") or item.get("name") or ""))
+            desc = str(item.get("description") or item.get("desc") or "").strip()
+            if cmd and desc:
+                custom.append((cmd, desc[:40]))
+
+    only_custom = bool(menu_cfg.get("only_custom"))
+
     return {
         "max_commands": max_commands,
         "priority_mode": priority_mode,
         "priority": priority,
+        "custom": custom,
+        "only_custom": only_custom,
     }
 
 
@@ -901,9 +916,14 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """Return Telegram menu commands capped to the Bot API limit.
 
     Priority order (higher priority = never bumped by overflow):
-      1. Core CommandDef commands (always included)
-      2. Plugin slash commands (take precedence over skills)
-      3. Built-in skill commands (fill remaining slots, alphabetical)
+      1. Optional ``command_menu.custom`` entries (operator-defined)
+      2. Core CommandDef commands (always included unless only_custom)
+      3. Plugin slash commands (take precedence over skills)
+      4. Built-in skill commands (fill remaining slots, alphabetical)
+
+    When ``command_menu.only_custom`` is true, the menu is exactly the
+    custom list (capped) — used by customer-facing bots that only expose
+    a few owner commands like /start and /campaign.
 
     Skills are the only tier that gets trimmed when the cap is hit.
     User-installed hub skills are excluded — accessible via /skills.
@@ -914,9 +934,17 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         (menu_commands, hidden_count) where hidden_count is the number of
         commands omitted due to the cap.
     """
+    menu_cfg = _telegram_command_menu_config()
+    custom_commands = list(menu_cfg.get("custom") or [])
+    if menu_cfg.get("only_custom"):
+        return custom_commands[:max_commands], max(0, len(custom_commands) - max_commands)
+
     core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
-    reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
+    # Custom first; drop core/plugin/skill dups of the same name.
+    reserved_names = {n for n, _ in custom_commands}
+    core_commands = [(n, d) for n, d in core_commands if n not in reserved_names]
+    reserved_names.update(n for n, _ in core_commands)
+    all_commands = list(custom_commands) + list(core_commands)
     hidden_core_count = max(0, len(all_commands) - max_commands)
 
     remaining_slots = max(0, max_commands - len(all_commands))
