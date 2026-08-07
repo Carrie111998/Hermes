@@ -3,7 +3,6 @@ import json
 import pytest
 
 from devflow_delegation.allowlist import (
-    Allowlist,
     AllowlistError,
     load_allowlist,
     path_allowed,
@@ -59,6 +58,18 @@ def test_missing_file_fails_closed(tmp_path):
 def test_malformed_file_fails_closed(tmp_path):
     p = tmp_path / "allowlist.json"
     p.write_text("{not json", encoding="utf-8")
+    with pytest.raises(AllowlistError):
+        load_allowlist(p)
+
+
+def test_non_int_timeout_fails_closed(tmp_path):
+    # A non-numeric command_timeout_seconds must fail closed as AllowlistError,
+    # not leak a bare ValueError. The emitter catches AllowlistError to decline
+    # (target_unresolved); a raw ValueError would bypass that fail-closed path.
+    bad = json.loads(json.dumps(SAMPLE))
+    bad["targets"]["hermes"]["command_timeout_seconds"] = "30m"
+    p = tmp_path / "allowlist.json"
+    p.write_text(json.dumps(bad), encoding="utf-8")
     with pytest.raises(AllowlistError):
         load_allowlist(p)
 

@@ -74,6 +74,15 @@ def load_allowlist(path: Path) -> Allowlist:
     for name, raw in data["targets"].items():
         if not isinstance(raw, dict) or not raw.get("repo") or not raw.get("checkout_path"):
             raise AllowlistError(f"allowlist target '{name}' malformed: repo+checkout_path required")
+        # int() is the only raising coercion; guard it so a malformed timeout
+        # fails closed as AllowlistError rather than leaking a bare ValueError
+        # (the emitter's `except AllowlistError` would not catch the latter).
+        try:
+            command_timeout_seconds = int(raw.get("command_timeout_seconds", 1800))
+        except (TypeError, ValueError) as exc:
+            raise AllowlistError(
+                f"allowlist target '{name}' malformed: command_timeout_seconds must be int ({exc})"
+            ) from exc
         targets[str(name)] = TargetConfig(
             repo=str(raw["repo"]),
             checkout_path=str(raw["checkout_path"]),
@@ -86,7 +95,7 @@ def load_allowlist(path: Path) -> Allowlist:
             lint_commands=_tuple(raw.get("lint_commands")),
             typecheck_commands=_tuple(raw.get("typecheck_commands")),
             build_commands=_tuple(raw.get("build_commands")),
-            command_timeout_seconds=int(raw.get("command_timeout_seconds", 1800)),
+            command_timeout_seconds=command_timeout_seconds,
             required_checks=_tuple(raw.get("required_checks")),
             risk_ceiling=str(raw.get("risk_ceiling", "medium")),
             max_autonomous_action=str(raw.get("max_autonomous_action", "none")),
@@ -109,9 +118,9 @@ def resolve_target(allowlist: Allowlist, repo: str) -> Optional[TargetConfig]:
 def path_allowed(target: TargetConfig, rel_path: str) -> bool:
     """True iff rel_path matches >=1 allowed glob and NO denied glob.
 
-    POSIX-style relative paths; fnmatch treats '**' as '*' per segment, which
-    is sufficient for the Stage 1 allow/deny shapes (all entries are either
-    single-file paths or '<dir>/**' / '**/<name>' patterns).
+    POSIX-style relative paths; fnmatch's '*' matches across path separators,
+    so '<dir>/**' and '**/<name>' shapes match nested paths as intended (the
+    only allow/deny shapes used in Stage 1, plus single-file paths).
     """
     rel = rel_path.replace("\\", "/").strip("/")
     allowed = any(fnmatch.fnmatch(rel, g) for g in target.allowed_globs)
