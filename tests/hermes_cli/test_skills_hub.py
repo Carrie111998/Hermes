@@ -329,10 +329,10 @@ def _seed_untracked_skill(tmp_path, name):
     return skill_dir
 
 
-def _run_install(monkeypatch, name, identifier, **kwargs):
+def _run_install(monkeypatch, name, identifier, console_width=200, **kwargs):
     _real_install_env(monkeypatch, name, identifier)
     sink = StringIO()
-    console = Console(file=sink, force_terminal=False, color_system=None, width=200)
+    console = Console(file=sink, force_terminal=False, color_system=None, width=console_width)
     do_install(identifier, console=console, skip_confirm=True,
                invalidate_cache=False, **kwargs)
     # Rich hard-wraps at the console width; collapse it so assertions can match
@@ -364,6 +364,42 @@ def test_install_force_still_replaces_untracked_local_skill(hub_env, monkeypatch
 
     assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _UPSTREAM_SKILL_BODY
     assert "Installed:" in out
+
+
+def test_untracked_warning_names_the_resolved_deletion_target(hub_env, monkeypatch, tmp_path):
+    """The refusal message must name the directory that would actually be
+    rmtree'd.
+
+    The install target is resolved through _validate_install_parent_path(),
+    which drops empty and "." segments (and rewrites "\\" to "/"), so a message
+    rebuilt from the raw category can name a path that does not even exist
+    while a *different* directory is the one at risk. The whole purpose of
+    this prompt is to name the deletion target, so the two must agree.
+    """
+    from hermes_cli.skills_hub import _untracked_skill_dir
+    from hermes_constants import display_hermes_home
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    raw_category = "personal//./notes"
+    skill_dir = _seed_untracked_skill(tmp_path, "personal/notes/note-taker")
+
+    # Sanity: this really is the directory install_from_quarantine() would
+    # delete, and the raw category does not spell it.
+    target = _untracked_skill_dir("note-taker", raw_category)
+    assert target == skill_dir.resolve()
+
+    out = _run_install(
+        monkeypatch, "note-taker", "acme/note-taker",
+        category=raw_category, console_width=400,
+    )
+
+    expected = (
+        f"{display_hermes_home()}/"
+        f"{target.relative_to(tmp_path.resolve()).as_posix()}"
+    )
+    assert f"already exists at {expected} " in out
+    assert raw_category not in out
+    assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == _LOCAL_SKILL_BODY
 
 
 def test_install_untracked_guard_leaves_lockfile_branch_alone(hub_env, monkeypatch, tmp_path):

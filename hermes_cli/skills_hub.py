@@ -22,7 +22,7 @@ from rich.table import Table
 
 # Lazy imports to avoid circular dependencies and slow startup.
 # tools.skills_hub and tools.skills_guard are imported inside functions.
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 
 _console = Console()
 
@@ -677,10 +677,19 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     if not existing and not force:
         untracked = _untracked_skill_dir(bundle.name, category)
         if untracked is not None:
-            shown = (
-                f"{display_hermes_home()}/skills/"
-                f"{category + '/' if category else ''}{bundle.name}"
-            )
+            # Name the directory that would actually be rmtree'd. Rebuilding
+            # the path from the raw ``category`` would drift from it: the
+            # resolution in _untracked_skill_dir() runs the category through
+            # _validate_install_parent_path(), which strips empty and "."
+            # segments and rewrites "\" to "/". A consent prompt whose whole
+            # job is to name a deletion target must not name a different one.
+            try:
+                relative = untracked.relative_to(get_hermes_home().resolve())
+                shown = f"{display_hermes_home()}/{relative.as_posix()}"
+            except ValueError:
+                # SKILLS_DIR overridden outside HERMES_HOME -- no ~-shorthand
+                # to apply, so show the resolved path as-is.
+                shown = str(untracked)
             c.print(
                 f"[yellow]Warning:[/] '{bundle.name}' already exists at {shown} "
                 "and is not tracked by the skills hub (a local or user-edited skill)."
