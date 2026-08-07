@@ -33,6 +33,15 @@ function renderApprovalMode(requestGateway = vi.fn(async (_method, params) => ({
 }
 
 describe('ComposerApprovalMode', () => {
+  it("uses the status bar's shared approval state without issuing another config read", async () => {
+    const requestGateway = vi.fn(async (_method, params) => ({ value: params?.value ?? 'smart' }))
+    renderApprovalMode(requestGateway)
+
+    await Promise.resolve()
+
+    expect(requestGateway).not.toHaveBeenCalledWith('config.get', { key: 'approvals.mode' })
+  })
+
   it('renders the active approval mode beside the composer and exposes every choice upward', async () => {
     renderApprovalMode()
 

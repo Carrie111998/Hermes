@@ -27,9 +27,30 @@ import {
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
+import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
+
+/**
+ * Stored session rows retain cumulative input/output totals, but not the live
+ * context-window snapshot. Carrying that snapshot forward makes the next
+ * session temporarily advertise the previous model's remaining context.
+ */
+export function hydrateStoredSessionUsage(
+  current: UsageStats,
+  stored: { input_tokens?: null | number; output_tokens?: null | number }
+): UsageStats {
+  const next = { ...current }
+
+  delete next.context_max
+  delete next.context_percent
+  delete next.context_used
+
+  const input = stored.input_tokens ?? 0
+  const output = stored.output_tokens ?? 0
+
+  return { ...next, input, output, total: input + output }
+}
 
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false

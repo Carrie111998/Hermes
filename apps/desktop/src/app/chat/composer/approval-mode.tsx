@@ -23,7 +23,10 @@ export function ComposerApprovalMode({
   profile: string
   requestGateway: ApprovalModeRequester
 }) {
-  const menu = useApprovalModeMenu(profile, requestGateway)
+  // The persistent status-bar control owns the one profile sync. Every
+  // ChatBar (including split-session tiles) renders this control, so syncing
+  // here would fan one config read out across every open pane.
+  const menu = useApprovalModeMenu(profile, requestGateway, { sync: false })
   const fullAccess = menu.mode === 'off'
 
   return (

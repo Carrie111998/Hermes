@@ -62,7 +62,11 @@ export function ApprovalModeGlyph({ className, mode }: { className?: string; mod
 /** Shared approval-mode state and copy for any menu trigger. Keeping it here
  * means the compact composer control and the status-bar control cannot drift
  * in their labels, selected state, or profile-scoped gateway writes. */
-export function useApprovalModeMenu(profile: string, requestGateway: ApprovalModeRequester): ApprovalModeMenuState {
+export function useApprovalModeMenu(
+  profile: string,
+  requestGateway: ApprovalModeRequester,
+  { sync = true }: { sync?: boolean } = {}
+): ApprovalModeMenuState {
   const { t } = useI18n()
   const copy = t.shell.approvalMode
   const modes = useStore($approvalModes)
@@ -90,8 +94,12 @@ export function useApprovalModeMenu(profile: string, requestGateway: ApprovalMod
   )
 
   useEffect(() => {
+    if (!sync) {
+      return
+    }
+
     void syncApprovalModeForProfile(requestGateway, profile).catch(() => undefined)
-  }, [profile, requestGateway])
+  }, [profile, requestGateway, sync])
 
   return {
     ariaLabel: copy.ariaLabel(labels[mode]),
