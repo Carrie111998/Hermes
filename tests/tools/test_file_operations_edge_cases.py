@@ -51,6 +51,44 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    def test_truncated_multibyte_utf8_not_flagged(self, ops):
+        """A U+FFFD produced by head -c cutting mid-CJK-char is a sampling
+        artifact, not binary content.
+
+        Regression: read_file samples with ``head -c 1000``; when byte 1000
+        lands inside a multi-byte UTF-8 sequence, the errors="replace" decode
+        emits one trailing U+FFFD. The old code flagged any sample containing
+        U+FFFD as binary, so valid CJK source files became unreadable.
+        """
+        # Simulate: CJK text whose last visible char was cut in half → one
+        # trailing U+FFFD, everything else is clean UTF-8.
+        sample = "会话级运行状态（chat-filename）" * 30 + "会"
+        sample = sample[:999] + "\ufffd"
+        assert ops._is_likely_binary("store.ts", content_sample=sample) is False
+
+    def test_trailing_fffd_from_real_cjk_file(self, ops):
+        """Reconstruct the exact failure: bytes from a real CJK store.ts,
+        sliced at 1000 bytes and decoded with errors='replace'."""
+        # "会" = E4 BC 9A; take 999 clean chars then the orphaned first byte
+        # of a 3-byte char (decoder emits U+FFFD at the cut).
+        sample = "a" * 999 + "\ufffd"
+        assert ops._is_likely_binary("chat/store.ts", content_sample=sample) is False
+
+    def test_internal_replacement_chars_still_binary(self, ops):
+        """Real non-UTF-8 content has U+FFFD throughout, not just at the
+        tail — those files must still be flagged binary."""
+        sample = "caf\ufffd r\ufffdsum\ufffd\nplain line\n" * 50
+        assert ops._is_likely_binary("notes.txt", content_sample=sample) is True
+
+    def test_only_trailing_replacement_char_stripped(self, ops):
+        """Stripping must remove exactly the trailing artifact, not mask a
+        file whose only corruption is elsewhere (still binary)."""
+        # One U+FFFD in the middle + a clean tail → still binary.
+        sample = "abc\ufffddef\n" + "x" * 500
+        assert ops._is_likely_binary("file.txt", content_sample=sample) is True
+        # Single trailing U+FFFD is the truncation signature → text.
+        assert ops._is_likely_binary("file.txt", content_sample="abc\n" + "\ufffd") is False
+
 
 # =========================================================================
 # _check_lint edge cases

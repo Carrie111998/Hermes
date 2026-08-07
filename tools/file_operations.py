@@ -894,6 +894,7 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            sample = content_sample[:1000]
             # Undecodable bytes: the terminal env decodes stdout with
             # errors="replace", so any non-UTF-8 byte arrives here already
             # turned into U+FFFD. That char is "printable" (ord 65533), so the
@@ -903,9 +904,21 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # But head -c 1000 (the sampling command) can cut a multi-byte
+            # UTF-8 character in half.  The decoder emits exactly one U+FFFD
+            # at the tail for the truncated sequence — that is a sampling
+            # artifact of a perfectly valid UTF-8 file (e.g. CJK source
+            # comments), not binary content.  Strip a single trailing U+FFFD
+            # before judging so valid text truncated mid-character isn't
+            # misclassified.  A real non-UTF-8 file has replacement chars
+            # throughout the sample (not just at the tail), so it is still
+            # caught.
+            if sample.endswith("\ufffd"):
+                sample = sample[:-1]
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
