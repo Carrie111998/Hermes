@@ -4,6 +4,7 @@ import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/te
 import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
+import { applyDesktopStatusbarFromConfig, migrateLegacyDesktopStatusbarPreference } from '@/store/desktop-statusbar'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -56,11 +57,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
 
   const refreshHermesConfig = useCallback(
     async (force = false) => {
-      if (force) {
-        profileRefreshEpochRef.current += 1
-      }
-
-      const profileRefreshEpoch = profileRefreshEpochRef.current
+      const profileRefreshEpoch = ++profileRefreshEpochRef.current
       const selectionGeneration = getComposerSelectionGeneration()
 
       try {
@@ -110,6 +107,8 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
         setSttEnabled(config.stt?.enabled !== false)
         setTerminalFontFamilyFromConfig(config.terminal?.font_family)
+        applyDesktopStatusbarFromConfig(config)
+        void migrateLegacyDesktopStatusbarPreference(config).catch(() => undefined)
         applyAutoSpeakFromConfig(config)
         applyVoiceStopPhraseFromConfig(config)
         applyThinkingSoundFromConfig(config)

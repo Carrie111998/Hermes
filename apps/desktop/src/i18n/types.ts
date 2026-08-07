@@ -353,6 +353,13 @@ export interface Translations {
       terminalFontPlaceholder: string
       terminalFontPreview: string
       terminalFontReset: string
+      statusbarTitle: string
+      statusbarDesc: string
+      statusbarOn: string
+      statusbarOff: string
+      statusbarAutoHide: string
+      statusbarReveal: string
+      statusbarSaveFailed: string
       translucencyTitle: string
       translucencyDesc: string
       backdropTitle: string

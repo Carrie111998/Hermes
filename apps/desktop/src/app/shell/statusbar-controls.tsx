@@ -16,6 +16,7 @@ import { Tip, TipKeybindLabel, Tooltip, TooltipContent, TooltipProvider, Tooltip
 import { useI18n } from '@/i18n'
 import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
 import { cn } from '@/lib/utils'
+import type { DesktopStatusbarMode } from '@/store/desktop-statusbar'
 import { $statusbarHiddenIds, setStatusbarItemVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
 
 // Shared chrome styling for interactive statusbar items (button / link / menu
@@ -80,21 +81,39 @@ export type SetStatusbarItemGroup = (id: string, items: readonly StatusbarItem[]
 interface StatusbarControlsProps extends ComponentProps<'footer'> {
   leftItems?: readonly StatusbarItem[]
   items?: readonly StatusbarItem[]
+  mode?: DesktopStatusbarMode
 }
 
-export function StatusbarControls({ className, leftItems = [], items = [], ...props }: StatusbarControlsProps) {
+export function StatusbarControls({
+  className,
+  leftItems = [],
+  items = [],
+  mode = 'on',
+  ...props
+}: StatusbarControlsProps) {
+  const { t } = useI18n()
   const navigate = useNavigate()
   const hiddenIds = useStore($statusbarHiddenIds)
 
   const visible = (item: StatusbarItem) =>
     !item.hidden && (item.lockedVisible || !item.toggleLabel || !hiddenIds.includes(item.id))
 
-  return (
+  if (mode === 'off') {
+    return null
+  }
+
+  // Radix portals menu content under document.body. Dropdown triggers keep
+  // data-state="open" inside the footer, while the ContextMenu trigger puts
+  // that state on the footer itself. Preserve both markers so moving focus or
+  // the pointer into either portal does not retract an auto-hidden bar.
+  const statusbar = (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <footer
           className={cn(
             'flex h-5 shrink-0 items-stretch justify-between gap-2 bg-(--ui-sidebar-surface-background) px-1 py-0 text-(--ui-text-tertiary) [-webkit-app-region:no-drag]',
+            mode === 'auto-hide' &&
+              'absolute inset-x-0 bottom-0 translate-y-full opacity-0 shadow-[0_-2px_8px_color-mix(in_srgb,var(--ui-bg-primary)_35%,transparent)] transition-[transform,opacity] duration-150 group-hover/statusbar:translate-y-0 group-hover/statusbar:opacity-100 group-focus-within/statusbar:translate-y-0 group-focus-within/statusbar:opacity-100 has-data-[state=open]:translate-y-0 has-data-[state=open]:opacity-100 data-[state=open]:translate-y-0 data-[state=open]:opacity-100',
             className
           )}
           data-slot="statusbar"
@@ -119,6 +138,21 @@ export function StatusbarControls({ className, leftItems = [], items = [], ...pr
       <StatusbarVisibilityMenu hiddenIds={hiddenIds} items={items} leftItems={leftItems} />
     </ContextMenu>
   )
+
+  if (mode === 'auto-hide') {
+    return (
+      <div
+        aria-label={t.settings.appearance.statusbarReveal}
+        className="group/statusbar absolute inset-x-0 bottom-0 z-30 h-2 outline-none [-webkit-app-region:no-drag]"
+        data-slot="statusbar-reveal-zone"
+        tabIndex={0}
+      >
+        {statusbar}
+      </div>
+    )
+  }
+
+  return statusbar
 }
 
 /** Right-click the bar to choose what it shows. Lists every item that named

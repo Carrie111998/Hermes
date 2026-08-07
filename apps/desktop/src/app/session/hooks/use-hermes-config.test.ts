@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { $terminalFontFamily, setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/terminal-font'
 import { getHermesConfig } from '@/hermes'
 import { persistString } from '@/lib/storage'
+import { $desktopStatusbarMode, applyDesktopStatusbarFromConfig } from '@/store/desktop-statusbar'
 import {
   $currentCwd,
   $currentFastMode,
@@ -21,10 +22,14 @@ import {
 import { useHermesConfig } from './use-hermes-config'
 
 vi.mock('@/hermes', () => ({
+  getApiRequestProfile: vi.fn(() => null),
   getHermesConfig: vi.fn(),
-  getHermesConfigDefaults: vi.fn().mockResolvedValue({})
+  getHermesConfigDefaults: vi.fn().mockResolvedValue({}),
+  getHermesConfigRecord: vi.fn().mockResolvedValue({}),
+  saveHermesConfig: vi.fn().mockResolvedValue({ ok: true })
 }))
 
+const LEGACY_STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
 const WORKSPACE_CWD_KEY = 'hermes.desktop.workspace-cwd'
 
 function deferred<T>() {
@@ -49,6 +54,8 @@ describe('useHermesConfig refreshHermesConfig', () => {
     setCurrentReasoningEffort('')
     setDefaultReasoningEffort('')
     setTerminalFontFamilyFromConfig('')
+    persistString(LEGACY_STATUSBAR_VISIBLE_STORAGE_KEY, null)
+    applyDesktopStatusbarFromConfig({ display: { desktop_statusbar: 'off' } })
     persistString(WORKSPACE_CWD_KEY, null)
   })
 
@@ -142,17 +149,50 @@ describe('useHermesConfig refreshHermesConfig', () => {
       refreshC = result.current.refreshHermesConfig(true)
     })
 
-    profileC.resolve({ agent: { reasoning_effort: 'low', service_tier: 'normal' } })
+    profileC.resolve({
+      agent: { reasoning_effort: 'low', service_tier: 'normal' },
+      display: { desktop_statusbar: 'auto-hide' }
+    })
     await act(async () => {
       await refreshC
     })
-    profileB.resolve({ agent: { reasoning_effort: 'high', service_tier: 'priority' } })
+    profileB.resolve({
+      agent: { reasoning_effort: 'high', service_tier: 'priority' },
+      display: { desktop_statusbar: 'on' }
+    })
     await act(async () => {
       await refreshB
     })
 
     expect($currentReasoningEffort.get()).toBe('low')
     expect($currentFastMode.get()).toBe(false)
+    expect($desktopStatusbarMode.get()).toBe('auto-hide')
+  })
+
+  it('does not let an older ordinary refresh overwrite a newer status bar value', async () => {
+    const older = deferred<Awaited<ReturnType<typeof getHermesConfig>>>()
+    const newer = deferred<Awaited<ReturnType<typeof getHermesConfig>>>()
+    vi.mocked(getHermesConfig).mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise)
+
+    const { result } = renderHook(() => useHermesConfig({ activeSessionIdRef: { current: null } }))
+
+    let olderRefresh!: Promise<void>
+    let newerRefresh!: Promise<void>
+    act(() => {
+      olderRefresh = result.current.refreshHermesConfig()
+      newerRefresh = result.current.refreshHermesConfig()
+    })
+
+    newer.resolve({ display: { desktop_statusbar: 'auto-hide' } })
+    await act(async () => {
+      await newerRefresh
+    })
+    older.resolve({ display: { desktop_statusbar: 'on' } })
+    await act(async () => {
+      await olderRefresh
+    })
+
+    expect($desktopStatusbarMode.get()).toBe('auto-hide')
   })
 
   it('loads the profile terminal font for already-mounted terminal surfaces', async () => {

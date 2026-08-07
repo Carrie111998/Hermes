@@ -13,6 +13,7 @@ import { Navigate, Route, Routes, useParams } from 'react-router'
 
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+import { $desktopStatusbarMode } from '@/store/desktop-statusbar'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
 
@@ -76,6 +77,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
   chatOpen: boolean
   commandCenterOpen: boolean
 }) {
+  const desktopStatusbarMode = useStore($desktopStatusbarMode)
   const gatewayState = useStore($gatewayState)
   const freshDraftReady = useStore($freshDraftReady)
   const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
@@ -98,7 +100,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
     toggleCommandCenter: actions.toggleCommandCenter
   })
 
-  return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} />
+  return <StatusbarControls items={statusbarItems} leftItems={leftStatusbarItems} mode={desktopStatusbarMode} />
 })
 
 /** The workspace pane: the real route table (chat + full-page views + plugin
