@@ -1453,6 +1453,85 @@ def build_resume_recovery_note(
     )
 
 
+def _build_discord_resume_recovery_note(
+    reason: Optional[str],
+    *,
+    has_real_user_message: bool,
+    workspace_status: str,
+) -> str:
+    """Build Discord's model-first restart guidance.
+
+    Discord has a durable Canonical Task Workspace recovery path in addition
+    to transcript replay.  The workspace status is structural host evidence;
+    the host does not classify the user's words or choose their task.  When no
+    exact workspace exists, the model remains responsible for recovering the
+    unfinished objective from the existing conversation history.
+    """
+    reason_phrase = (
+        "a gateway restart"
+        if reason == "restart_timeout"
+        else "a gateway shutdown"
+        if reason == "shutdown_timeout"
+        else "a gateway interruption"
+    )
+    if has_real_user_message:
+        resume_guidance = (
+            "Address the user's NEW message below FIRST and focus on what the "
+            "user is asking now. Review the existing conversation history and "
+            "any exact Canonical Task Workspace below, then decide whether the "
+            "new message changes, supersedes, or continues the unfinished work."
+        )
+    elif workspace_status == "exact":
+        resume_guidance = (
+            "An exact active Canonical Task Workspace was recovered. Continue "
+            "it from the next unverified step through its explicit completion "
+            "or blocker contract."
+        )
+    elif workspace_status == "blocked":
+        resume_guidance = (
+            "An exact blocked Canonical Task Workspace was recovered. Do not "
+            "assume its blocker cleared. Inspect its exact blocker contract and "
+            "current evidence; decide whether to author a new active revision "
+            "and continue or report the still-current missing input or authority."
+        )
+    elif workspace_status in {"ambiguous", "incomplete"}:
+        resume_guidance = (
+            "Canonical Task Workspace recovery did not establish one complete, "
+            "unambiguous active plan. Inspect the structured state, retry exact "
+            "reads when appropriate, report a concrete blocker, or ask one "
+            "focused clarification only if ambiguity genuinely remains."
+        )
+    else:
+        resume_guidance = (
+            "No exact Canonical Task Workspace was found. Review the existing "
+            "conversation history, infer the user's active unfinished objective, "
+            "and continue it autonomously from the first unverified step through "
+            "completion. Do not ask a generic 'what next?' question or present a "
+            "menu of possible tasks. Ask one focused clarification only if the "
+            "history genuinely cannot establish the user's intent."
+        )
+
+    if workspace_status in {"exact", "blocked", "ambiguous", "incomplete"}:
+        history_guidance = (
+            "Do NOT blindly replay old tool calls. Use the durable structured "
+            "workspace below, re-check live external state where needed, and "
+            "continue only the remaining explicit work."
+        )
+    else:
+        history_guidance = (
+            "Do NOT blindly replay old tool calls. Treat recorded results as "
+            "evidence, re-check live state where needed, and resume from the "
+            "first step whose result is not established."
+        )
+
+    return (
+        f"[System note: The previous turn was interrupted by {reason_phrase}; "
+        f"the gateway is now back online. Any restart/shutdown command in the "
+        f"history has already run — do NOT re-execute or verify it. "
+        f"{resume_guidance} {history_guidance}]"
+    )
+
+
 # Assistant-message fields that must survive transcript replay so multi-turn
 # reasoning context, prefix-cache hits, and provider-specific echo
 # requirements all behave the same on the gateway as they do in the CLI.
@@ -6929,69 +7008,10 @@ class TurnRunner:
                 )
 
             if getattr(ctx.source, "platform", None) == Platform.DISCORD:
-                _reason_phrase = (
-                    "a gateway restart"
-                    if _reason == "restart_timeout"
-                    else "a gateway shutdown"
-                    if _reason == "shutdown_timeout"
-                    else "a gateway interruption"
-                )
-                if _has_real_user_message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now. If an exact Canonical "
-                        "Task Workspace follows, GPT decides whether the new "
-                        "message changes, supersedes, or continues that plan."
-                    )
-                elif _workspace_status == "exact":
-                    _resume_guidance = (
-                        "An exact active Canonical Task Workspace was recovered. "
-                        "Continue it from the next unverified step through its "
-                        "explicit completion or blocker contract."
-                    )
-                elif _workspace_status == "blocked":
-                    _resume_guidance = (
-                        "An exact blocked Canonical Task Workspace was recovered. "
-                        "Do not assume its blocker cleared. Inspect its exact "
-                        "blocker contract and current evidence; GPT decides "
-                        "whether to author a new active revision and continue "
-                        "or report the still-current missing input or authority."
-                    )
-                elif _workspace_status in {"ambiguous", "incomplete"}:
-                    _resume_guidance = (
-                        "Canonical Task Workspace recovery did not establish "
-                        "one complete, unambiguous active plan. GPT must inspect "
-                        "the structured state, retry exact reads when appropriate, "
-                        "report a concrete blocker, or ask a focused clarification "
-                        "only if ambiguity remains."
-                    )
-                else:
-                    _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
-                    )
-                if _workspace_status in {
-                    "exact",
-                    "blocked",
-                    "ambiguous",
-                    "incomplete",
-                }:
-                    _history_guidance = (
-                        "Do NOT blindly replay old tool calls. Use the durable "
-                        "structured workspace below, re-check live external state "
-                        "where needed, and continue only the remaining explicit work."
-                    )
-                else:
-                    _history_guidance = (
-                        "Do NOT re-execute old tool calls — skip any unfinished "
-                        "work from the conversation history."
-                    )
-                _auto_continue_note = (
-                    f"[System note: The previous turn was interrupted by "
-                    f"{_reason_phrase}; the gateway is now back online. "
-                    f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"{_history_guidance}]"
+                _auto_continue_note = _build_discord_resume_recovery_note(
+                    _reason,
+                    has_real_user_message=_has_real_user_message,
+                    workspace_status=_workspace_status,
                 )
             else:
                 # Event adapters may not have a user present to answer a
@@ -7182,13 +7202,20 @@ class TurnRunner:
                 getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
             )
             _sn_adapter = self._runner._adapter_for_source(ctx.source)
-            _auto_continue_note = build_resume_recovery_note(
-                _sn_reason,
-                "",
-                interactive=bool(
-                    getattr(_sn_adapter, "interactive_resume", True)
-                ),
-            )
+            if getattr(ctx.source, "platform", None) == Platform.DISCORD:
+                _auto_continue_note = _build_discord_resume_recovery_note(
+                    _sn_reason,
+                    has_real_user_message=False,
+                    workspace_status="none",
+                )
+            else:
+                _auto_continue_note = build_resume_recovery_note(
+                    _sn_reason,
+                    "",
+                    interactive=bool(
+                        getattr(_sn_adapter, "interactive_resume", True)
+                    ),
+                )
             ctx.message = _auto_continue_note
             from agent.message_provenance import (
                 GATEWAY_AUTO_CONTINUE_NOTE_KIND,

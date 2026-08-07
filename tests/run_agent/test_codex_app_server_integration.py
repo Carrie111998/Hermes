@@ -100,6 +100,10 @@ class TestRunConversationCodexPath:
         assert agent._codex_session._developer_instructions == (
             MODEL_AUTHORED_PROGRESS_GUIDANCE
         )
+        assert (
+            "returning control to yourself between observations"
+            in agent._codex_session._developer_instructions
+        )
 
     def test_unconsumed_native_steer_is_returned_for_gateway_handoff(
         self, monkeypatch
