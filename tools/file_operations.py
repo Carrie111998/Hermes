@@ -903,7 +903,20 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # Exception \u2014 the sample's own tail. Callers build it with
+            # `head -c N`, which cuts on a BYTE boundary, so the last
+            # character is routinely a multibyte one (CJK, emoji) sliced in
+            # half; errors="replace" renders any such truncated sequence as
+            # exactly one trailing U+FFFD. That is an artifact of how we
+            # sample, not evidence about the file \u2014 without this exception
+            # roughly a third of ordinary Chinese text files read as binary.
+            # A genuinely non-UTF-8 file carries U+FFFD inside the sample
+            # too, which still trips the check.
+            probe = content_sample[:1000].rstrip()
+            if probe.endswith("\ufffd"):
+                probe = probe[:-1]
+            if "\ufffd" in probe:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
