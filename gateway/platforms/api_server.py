@@ -2520,6 +2520,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # responses routes that do not have a public /v1/runs run_id. Shutdown
         # interrupts this exact adapter-owned set before subprocess cleanup.
         self._shutdown_interruptible_agents: Dict[int, Any] = {}
+        # Shutdown can re-signal after its settle window so an agent that was
+        # admitted but materialized late is not missed.  Remember identities
+        # already signalled during this adapter lifetime: the re-signal must
+        # reach only newly materialized agents, not interrupt the same turn a
+        # second time while it is cooperatively unwinding.
+        self._shutdown_interrupted_agent_ids: set[int] = set()
         # Keep one agent per exact API conversation so consecutive turns retain
         # the byte-stable cached prompt prefix.
         self._api_agent_cache: "OrderedDict[APIRequestScope, Dict[str, Any]]" = (
@@ -3629,8 +3635,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         interrupted = 0
         for agent in agents.values():
+            agent_id = id(agent)
+            if agent_id in self._shutdown_interrupted_agent_ids:
+                continue
             try:
                 if request_hard_interrupt(agent, reason):
+                    self._shutdown_interrupted_agent_ids.add(agent_id)
                     interrupted += 1
             except Exception as exc:
                 logger.debug("[api_server] failed interrupting active agent: %s", exc)

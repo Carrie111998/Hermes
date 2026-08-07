@@ -11945,15 +11945,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
+        interrupted_agent_ids = getattr(
+            self,
+            "_shutdown_interrupted_agent_ids",
+            None,
+        )
+        if interrupted_agent_ids is None:
+            interrupted_agent_ids = set()
+            self._shutdown_interrupted_agent_ids = interrupted_agent_ids
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
+            agent_id = id(agent)
+            if agent_id in interrupted_agent_ids:
+                continue
             try:
-                request_hard_interrupt(agent, reason)
-                logger.debug(
-                    "Interrupted running agent for session %s during shutdown",
-                    session_key,
-                )
+                if request_hard_interrupt(agent, reason):
+                    interrupted_agent_ids.add(agent_id)
+                    logger.debug(
+                        "Interrupted running agent for session %s during shutdown",
+                        session_key,
+                    )
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
         # API-server / desk turns are adapter-owned and never enter

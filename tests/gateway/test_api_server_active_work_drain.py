@@ -417,6 +417,19 @@ class TestInterruptActiveRuns:
         assert adapter.interrupt_active_runs("gateway shutdown") == 1
         healthy.interrupt.assert_called_once_with("gateway shutdown")
 
+    def test_resignal_interrupts_only_agents_materialized_after_first_signal(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        existing = MagicMock()
+        late = MagicMock()
+        adapter._shutdown_interruptible_agents = {id(existing): existing}
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+        adapter._shutdown_interruptible_agents[id(late)] = late
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+
+        existing.interrupt.assert_called_once_with("gateway shutdown")
+        late.interrupt.assert_called_once_with("gateway shutdown")
+
 
 class TestShutdownInterruptReachesEveryApiTurn:
     @pytest.mark.asyncio
