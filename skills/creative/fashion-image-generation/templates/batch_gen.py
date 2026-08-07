@@ -78,7 +78,19 @@ def data_url(path):
     ext = "png" if path.lower().endswith(".png") else "jpeg"
     return f"data:image/{ext};base64," + base64.b64encode(b).decode()
 
-def gen(prompt, refs, out, aspect="2:3", quality="high", retries=3):
+def _resize_to(path, size):
+    """Downsample the image at `path` to exactly `size` (W,H) px, in place, as PNG."""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    # resize keeping aspect, then centre-crop to exact size (source is already 4:5)
+    im = im.resize(size, Image.LANCZOS)
+    im.save(path, "PNG")
+
+# Final output must be exactly 800x1000 px (4:5). The API generates at aspect 4:5
+# (e.g. ~1024x1280); we then downsample to the exact target so every file is pixel-identical.
+OUTPUT_SIZE = (800, 1000)
+
+def gen(prompt, refs, out, aspect="4:5", quality="high", retries=3):
     payload = {"model": MODEL, "prompt": prompt, "n": 1, "quality": quality,
                "aspect_ratio": aspect,
                "input_references": [{"type": "image_url", "image_url": {"url": r}} for r in refs]}
@@ -93,7 +105,8 @@ def gen(prompt, refs, out, aspect="2:3", quality="high", retries=3):
             img = base64.b64decode(data["data"][0]["b64_json"])
             with open(out, "wb") as f:
                 f.write(img)
-            return len(img), data.get("usage", {}).get("cost")
+            _resize_to(out, OUTPUT_SIZE)
+            return os.path.getsize(out), data.get("usage", {}).get("cost")
         except Exception as e:
             last = e
             print(f"    [retry {attempt}] {e}", flush=True)
