@@ -47,6 +47,7 @@ from scripts.canary import passkey_v2_upstream_sync as upstream_sync
 from scripts.canary import passkey_v2_production_storage_growth as production_storage
 from scripts.canary import passkey_v2_sensitive_report as sensitive_report
 from scripts.canary import passkey_v2_sensitive_report_transport as sensitive_transport
+from scripts.canary import passkey_v2_enrollment as enrollment
 from scripts.canary import production_cutover_passkey as production_cutover
 from scripts.canary import owner_gate_firewall_readiness as firewall
 from scripts.canary import storage_growth_evidence as growth_evidence
@@ -70,6 +71,7 @@ ACTIVATION_SEAL = Path(
 AUTHORITY_SOCKET = Path(storage.AUTHORITY_SOCKET)
 EXECUTOR_SOCKET = Path(storage.EXECUTOR_SOCKET)
 AUTHORITY_DB = Path(storage.AUTHORITY_DB)
+ENROLLMENT_ROOT = AUTHORITY_DB.parent / "enrollment"
 EXECUTOR_DB = Path(storage.EXECUTOR_DB)
 FIREWALL_RULES = Path("/etc/muncho-owner-gate/metadata-firewall.rules")
 FIREWALL_READINESS_RECEIPT = Path(
@@ -104,6 +106,8 @@ SERVICE_OPERATION_RESPONSE_TIMEOUT_SECONDS = {
     "consume": 30.0,
     "sensitive_create": 30.0,
     "sensitive_consume": 30.0,
+    "enrollment_options": 30.0,
+    "enrollment_complete": 30.0,
     "preflight": 30.0,
     "execute": 240.0,
     "terminal": 10.0,
@@ -266,6 +270,13 @@ _VERIFY_PATH = re.compile(
     r"^/approve/([A-Za-z0-9_-]{32,64})/verify$"
 )
 _SENSITIVE_RELAY_PATH = "/internal/sensitive-report"
+_ENROLL_PATH = re.compile(r"^/enroll/([A-Za-z0-9_-]{32})$")
+_ENROLL_OPTIONS_PATH = re.compile(
+    r"^/enroll/([A-Za-z0-9_-]{32})/options$"
+)
+_ENROLL_COMPLETE_PATH = re.compile(
+    r"^/enroll/([A-Za-z0-9_-]{32})/complete$"
+)
 
 _SEAL_FIELDS = frozenset({
     "schema",
@@ -1065,6 +1076,8 @@ def build_service_frame(
         "consume",
         "sensitive_create",
         "sensitive_consume",
+        "enrollment_options",
+        "enrollment_complete",
         "preflight",
         "execute",
         "terminal",
@@ -1543,6 +1556,62 @@ def handle_authority_frame(
                 "challenge_record": state["challenge_record"],
                 "grant_record": state["grant_record"],
             }
+    elif operation in {"enrollment_options", "enrollment_complete"}:
+        if peer_uid != WEB_UID:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_enrollment_peer_forbidden"
+            )
+        expected = (
+            {"invitation_id", "token_b64url"}
+            if operation == "enrollment_options"
+            else {"invitation_id", "token_b64url", "credential"}
+        )
+        if set(document) != expected:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_service_document_invalid"
+            )
+        try:
+            token = enrollment._decode_b64(
+                document["token_b64url"], label="token", maximum=32
+            )
+            if len(token) != 32:
+                raise enrollment.PasskeyV2EnrollmentError(
+                    "passkey_v2_enrollment_token_invalid"
+                )
+            if operation == "enrollment_options":
+                result = enrollment.registration_options(
+                    root=ENROLLMENT_ROOT,
+                    invitation_id=str(document["invitation_id"]),
+                    token=token,
+                    now_unix=now_unix,
+                )
+            else:
+                credential = enrollment.complete_enrollment(
+                    root=ENROLLMENT_ROOT,
+                    invitation_id=str(document["invitation_id"]),
+                    token=token,
+                    credential=document["credential"],
+                    now_unix=now_unix,
+                )
+                authority.import_migrated_credential(credential)
+                result = {
+                    "schema": "muncho-passkey-v2-enrollment-complete.v1",
+                    "invitation_id": str(document["invitation_id"]),
+                    "owner_discord_user_id": credential[
+                        "owner_discord_user_id"
+                    ],
+                    "credential_record_sha256": credential[
+                        "credential_record_sha256"
+                    ],
+                    "state": "enrolled",
+                }
+        except (
+            enrollment.PasskeyV2EnrollmentError,
+            PasskeyV2SqliteDenied,
+        ) as exc:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_enrollment_rejected"
+            ) from exc
     elif operation in {"sensitive_create", "sensitive_consume"}:
         if peer_uid != WEB_UID or writer_public_key is None:
             raise PasskeyV2ServiceError(
@@ -1571,28 +1640,20 @@ def handle_authority_frame(
             )
         )
         token = sensitive_transport.retrieval_token(
-            frame["capability_envelope"]
-        )
-        action = sensitive_report.build_action_envelope(
-            capability=capability,
-            intent=intent,
-            retrieval_token=token,
-            request_id=str(frame["request_id"]),
-            executor_release_sha=release_revision,
-            authority_release_sha=release_revision,
-            authority_manifest_sha256=manifest_sha256,
-            authority_host_receipt_sha256=host_receipt_sha256,
-            source_preflight_sha256=capability["arguments_sha256"],
-            live_projection_sha256=protocol.sha256_json(intent),
-            prior_authoritative_receipt_sha256=(
-                protocol.GENESIS_JOURNAL_HEAD_SHA256
-            ),
-            prior_event_head_sha256=protocol.GENESIS_JOURNAL_HEAD_SHA256,
-            issued_at_unix=capability["issued_at_unix_ms"] // 1000,
+            frame["capability_envelope"], intent
         )
         try:
-            state = authority.read_request_state(action["request_id"])
-            if state["action_envelope"] != action:
+            state = authority.read_request_state(str(frame["request_id"]))
+            action = sensitive_report.require_retrieval_token(
+                state["action_envelope"], token
+            )
+            if (
+                action["action_payload"]["step_up_lease"]
+                != sensitive_report.build_step_up_lease(
+                    capability=capability,
+                    intent=intent,
+                )
+            ):
                 raise PasskeyV2ServiceError(
                     "passkey_v2_sensitive_relay_request_conflict"
                 )
@@ -1601,6 +1662,26 @@ def handle_authority_frame(
                 raise PasskeyV2ServiceError(
                     "passkey_v2_sensitive_relay_request_missing"
                 ) from exc
+            action = sensitive_report.build_action_envelope(
+                capability=capability,
+                intent=intent,
+                retrieval_token=token,
+                request_id=str(frame["request_id"]),
+                executor_release_sha=release_revision,
+                authority_release_sha=release_revision,
+                authority_manifest_sha256=manifest_sha256,
+                authority_host_receipt_sha256=host_receipt_sha256,
+                source_preflight_sha256=capability["arguments_sha256"],
+                live_projection_sha256=protocol.sha256_json(intent),
+                prior_authoritative_receipt_sha256=(
+                    protocol.GENESIS_JOURNAL_HEAD_SHA256
+                ),
+                prior_event_head_sha256=(
+                    protocol.GENESIS_JOURNAL_HEAD_SHA256
+                ),
+                issued_at_unix=now_unix,
+                approval_ttl_seconds=360,
+            )
             authority.create_request(action)
             challenge = protocol.build_challenge_record(
                 envelope=action,
@@ -1616,8 +1697,12 @@ def handle_authority_frame(
             )
             authority.create_challenge(challenge, envelope=action)
             state = authority.read_request_state(action["request_id"])
-        approval_url = (
-            f"{protocol.PRODUCTION_ORIGIN}/approve/{action['request_id']}"
+        action = sensitive_report.validate_action_envelope(
+            state["action_envelope"]
+        )
+        approval_url = sensitive_transport.validate_approval_url(
+            f"{protocol.PRODUCTION_ORIGIN}/approve/{action['request_id']}",
+            action["request_id"],
         )
         if relay_operation == "create" or state["grant_record"] is None:
             result = {
@@ -2641,16 +2726,28 @@ def validate_web_request(
         route, request_id = "readiness", None
     elif method == "GET" and (match := _APPROVAL_PATH.fullmatch(path)):
         route, request_id = "render", match.group(1)
+    elif method == "GET" and (match := _ENROLL_PATH.fullmatch(path)):
+        route, request_id = "enrollment_render", match.group(1)
     elif method == "GET" and (match := _VIEW_PATH.fullmatch(path)):
         route, request_id = "view", match.group(1)
     elif method == "GET" and (match := _OPTIONS_PATH.fullmatch(path)):
         route, request_id = "options", match.group(1)
     elif method == "GET" and path == "/static/approve.js":
         route, request_id = "javascript", None
+    elif method == "GET" and path == "/static/enroll.js":
+        route, request_id = "enrollment_javascript", None
     elif method == "POST" and path == _SENSITIVE_RELAY_PATH:
         route, request_id = "sensitive_relay", None
     elif method == "POST" and (match := _VERIFY_PATH.fullmatch(path)):
         route, request_id = "verify", match.group(1)
+    elif method == "POST" and (
+        match := _ENROLL_OPTIONS_PATH.fullmatch(path)
+    ):
+        route, request_id = "enrollment_options", match.group(1)
+    elif method == "POST" and (
+        match := _ENROLL_COMPLETE_PATH.fullmatch(path)
+    ):
+        route, request_id = "enrollment_complete", match.group(1)
     else:
         raise PasskeyV2ServiceError("passkey_v2_web_route_forbidden")
     if method == "GET":
@@ -2685,7 +2782,25 @@ def validate_web_request(
     ):
         raise PasskeyV2ServiceError("passkey_v2_web_csrf_invalid")
     parsed = decode_strict_json(body, maximum=MAX_HTTP_BODY_BYTES)
-    if set(parsed) != {"schema", "assertion"} or parsed.get("schema") != WEB_VERIFY_SCHEMA:
+    if route == "enrollment_options":
+        if (
+            set(parsed) != {"schema", "token_b64url"}
+            or parsed.get("schema")
+            != "muncho-passkey-v2-web-enrollment-options.v1"
+        ):
+            raise PasskeyV2ServiceError("passkey_v2_web_body_invalid")
+    elif route == "enrollment_complete":
+        if (
+            set(parsed) != {"schema", "token_b64url", "credential"}
+            or parsed.get("schema")
+            != "muncho-passkey-v2-web-enrollment-complete.v1"
+            or not isinstance(parsed.get("credential"), Mapping)
+        ):
+            raise PasskeyV2ServiceError("passkey_v2_web_body_invalid")
+    elif (
+        set(parsed) != {"schema", "assertion"}
+        or parsed.get("schema") != WEB_VERIFY_SCHEMA
+    ):
         raise PasskeyV2ServiceError("passkey_v2_web_body_invalid")
     return route, request_id, parsed
 
@@ -2693,6 +2808,10 @@ def validate_web_request(
 _APPROVAL_HTML = b"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Muncho owner approval</title></head>
 <body><main><h1>Exact owner approval</h1><h2>Mechanical facts</h2><pre id="facts"></pre><h2>Full signed request</h2><pre id="action"></pre><button id="approve" type="button" disabled>Approve with passkey</button><p id="status" role="status">Loading exact request...</p></main><script src="/static/approve.js" defer></script></body></html>"""
+
+_ENROLLMENT_HTML = b"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Muncho passkey enrollment</title></head>
+<body><main><h1>Register your phone passkey</h1><p>This one-time invitation registers your passkey only. It does not approve a report.</p><button id="enroll" type="button">Register passkey</button><p id="status" role="status">Ready.</p></main><script src="/static/enroll.js" defer></script></body></html>"""
 
 _APPROVAL_JS = rb"""'use strict';
 const b64ToBytes = value => Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4-value.length%4)%4)), c => c.charCodeAt(0));
@@ -2703,6 +2822,17 @@ const approve = document.getElementById('approve');
 async function load() { const response=await fetch(base + '/view',{cache:'no-store'}); if(!response.ok) throw new Error('view'); const view=await response.json(); const schemas=new Set(['muncho-passkey-v2-storage-growth-facts.v1','muncho-passkey-v2-production-cutover-facts.v1','muncho-passkey-v2-dual-upstream-sync-facts.v1','muncho-passkey-v2-production-storage-growth-facts.v1','muncho-sensitive-report-passkey-mechanical-facts.v1']); if(!schemas.has(view.mechanical_facts?.schema)||view.values_are_complete_and_untruncated!==true) throw new Error('facts'); document.getElementById('facts').textContent=JSON.stringify(view.mechanical_facts,null,2); document.getElementById('action').textContent=view.exact_action_envelope_canonical_json; document.getElementById('status').textContent='Review all facts before approval.'; approve.disabled=false; }
 approve.addEventListener('click', async () => { if(approve.disabled) return; approve.disabled=true; try { const optionsResponse=await fetch(base + '/options',{cache:'no-store'}); if(!optionsResponse.ok) throw new Error('options'); const options=await optionsResponse.json(); options.publicKey.challenge=b64ToBytes(options.publicKey.challenge); options.publicKey.allowCredentials=options.publicKey.allowCredentials.map(v=>({...v,id:b64ToBytes(v.id)})); const value=await navigator.credentials.get(options); const c=value; const assertion={id:c.id,rawId:bytesToB64(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment,clientExtensionResults:c.getClientExtensionResults(),response:{clientDataJSON:bytesToB64(c.response.clientDataJSON),authenticatorData:bytesToB64(c.response.authenticatorData),signature:bytesToB64(c.response.signature),userHandle:c.response.userHandle===null?null:bytesToB64(c.response.userHandle)}}; const response=await fetch(base+'/verify',{method:'POST',headers:{'Content-Type':'application/json','X-Muncho-CSRF':csrf()},body:JSON.stringify({schema:'muncho-passkey-v2-web-verify.v1',assertion:{schema:'muncho-passkey-v2-assertion.v1',credential:assertion}})}); if(!response.ok) throw new Error('verify'); const result=await response.json(); document.getElementById('status').textContent=result.state==='granted'?'Approved. You may return to Muncho.':'Approval failed.'; } catch (_error) { document.getElementById('status').textContent='Approval failed safely.'; approve.disabled=false; }});
 load().catch(()=>{approve.disabled=true;document.getElementById('status').textContent='Request unavailable.';});
+"""
+
+_ENROLLMENT_JS = rb"""'use strict';
+const b64ToBytes = value => Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4-value.length%4)%4)), c => c.charCodeAt(0));
+const bytesToB64 = value => btoa(String.fromCharCode(...new Uint8Array(value))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const base = location.pathname;
+const token = location.hash.slice(1);
+history.replaceState(null,'',base);
+const csrf = () => document.cookie.split('; ').find(v => v.startsWith('muncho_csrf='))?.split('=')[1];
+const button = document.getElementById('enroll');
+button.addEventListener('click', async () => { button.disabled=true; try { if(!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new Error('token'); const optionsResponse=await fetch(base+'/options',{method:'POST',headers:{'Content-Type':'application/json','X-Muncho-CSRF':csrf()},body:JSON.stringify({schema:'muncho-passkey-v2-web-enrollment-options.v1',token_b64url:token})}); if(!optionsResponse.ok) throw new Error('options'); const options=await optionsResponse.json(); const publicKey=options.publicKey; publicKey.challenge=b64ToBytes(publicKey.challenge); publicKey.user.id=b64ToBytes(publicKey.user.id); publicKey.excludeCredentials=(publicKey.excludeCredentials||[]).map(v=>({...v,id:b64ToBytes(v.id)})); const c=await navigator.credentials.create({publicKey}); const credential={id:c.id,rawId:bytesToB64(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment,clientExtensionResults:c.getClientExtensionResults(),response:{clientDataJSON:bytesToB64(c.response.clientDataJSON),attestationObject:bytesToB64(c.response.attestationObject),transports:typeof c.response.getTransports==='function'?c.response.getTransports():[]}}; const response=await fetch(base+'/complete',{method:'POST',headers:{'Content-Type':'application/json','X-Muncho-CSRF':csrf()},body:JSON.stringify({schema:'muncho-passkey-v2-web-enrollment-complete.v1',token_b64url:token,credential})}); if(!response.ok) throw new Error('complete'); const result=await response.json(); document.getElementById('status').textContent=result.state==='enrolled'?'Passkey registered. Return to Muncho.':'Registration failed.'; } catch(_error) { document.getElementById('status').textContent='Registration failed safely.'; button.disabled=false; }});
 """
 
 
@@ -2796,6 +2926,12 @@ def create_web_app(config: Mapping[str, Any]) -> Any:
                 media_type="application/javascript",
                 headers=headers,
             )
+        if route == "enrollment_javascript":
+            return Response(
+                _ENROLLMENT_JS,
+                media_type="application/javascript",
+                headers=headers,
+            )
         if route == "sensitive_relay":
             assert parsed is not None
             relay_operation = parsed.get("operation")
@@ -2814,6 +2950,34 @@ def create_web_app(config: Mapping[str, Any]) -> Any:
             )
             return JSONResponse(document, headers=headers)
         assert request_id is not None
+        if route == "enrollment_render":
+            token = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode("ascii")
+            response = HTMLResponse(_ENROLLMENT_HTML, headers=headers)
+            response.set_cookie(
+                "muncho_csrf",
+                token,
+                secure=True,
+                httponly=False,
+                samesite="strict",
+                path=f"/enroll/{request_id}",
+                max_age=600,
+            )
+            return response
+        if route in {"enrollment_options", "enrollment_complete"}:
+            assert parsed is not None
+            operation = route
+            document = {
+                "invitation_id": request_id,
+                "token_b64url": parsed["token_b64url"],
+            }
+            if route == "enrollment_complete":
+                document["credential"] = parsed["credential"]
+            result = await run_in_threadpool(
+                client.call,
+                operation,
+                document,
+            )
+            return JSONResponse(result, headers=headers)
         if route == "render":
             await run_in_threadpool(
                 client.call,

@@ -35,6 +35,12 @@ UI_VIEW_SCHEMA = "muncho-dangerous-action-passkey-ui-view.v2"
 
 MINIMUM_TTL_SECONDS = 30
 MAXIMUM_TTL_SECONDS = 300
+# Sensitive-report approval is deliberately a little longer than the generic
+# dangerous-action window.  The request is delivered to a phone and must
+# remain usable while the edge refreshes its short-lived model capability.
+# This exception is scope-bound; every other dangerous scope retains the
+# original five-minute ceiling.
+SENSITIVE_REPORT_MAXIMUM_TTL_SECONDS = 360
 MAXIMUM_JSON_BYTES = 1024 * 1024
 # Only the owner-authorized full-IAM evidence path may consume this larger
 # budget.  Generic protocol decoders deliberately retain the one MiB default.
@@ -566,10 +572,15 @@ def validate_action_envelope(value: Any) -> Mapping[str, Any]:
     issued = _validate_time(value.get("issued_at_unix"), label="issued_at")
     expires = _validate_time(value.get("expires_at_unix"), label="expires_at")
     ttl = value.get("approval_ttl_seconds")
+    maximum_ttl = (
+        SENSITIVE_REPORT_MAXIMUM_TTL_SECONDS
+        if value.get("scope") == SENSITIVE_REPORT_SCOPE
+        else MAXIMUM_TTL_SECONDS
+    )
     if (
         not isinstance(ttl, int)
         or isinstance(ttl, bool)
-        or not MINIMUM_TTL_SECONDS <= ttl <= MAXIMUM_TTL_SECONDS
+        or not MINIMUM_TTL_SECONDS <= ttl <= maximum_ttl
         or expires != issued + ttl
     ):
         raise PasskeyV2ProtocolError("passkey_v2_ttl_invalid")

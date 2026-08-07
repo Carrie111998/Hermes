@@ -115,7 +115,7 @@ def _service_config(
     mutation_peer_uid: int,
     receipt_public_key_id: str,
     writer_key_id: str,
-    owner_gate_receipt_public_key_id: str,
+    owner_gate_receipt_public_key_id: str | None,
 ) -> bytes:
     unit = service_unit(domain)
     value = {
@@ -142,11 +142,13 @@ def _service_config(
         "owner_gate_receipt_public_key_file": (
             f"/run/credentials/{unit}/owner-gate-receipt-public-key"
             if domain == "skyvision_db"
+            and owner_gate_receipt_public_key_id is not None
             else None
         ),
         "owner_gate_receipt_public_key_id": (
             owner_gate_receipt_public_key_id
             if domain == "skyvision_db"
+            and owner_gate_receipt_public_key_id is not None
             else None
         ),
         "maximum_output_bytes": 1024 * 1024,
@@ -214,6 +216,7 @@ def _service_unit(
     service_gid: int,
     socket_group: str,
     socket_gid: int,
+    owner_gate_receipt_public_key_id: str | None,
 ) -> bytes:
     unit = service_unit(domain)
     config = service_config_path(domain)
@@ -222,7 +225,10 @@ def _service_unit(
         f"LoadCredential={item.name}:{item.source_path}"
         for item in CREDENTIALS_BY_DOMAIN[domain]
     ]
-    if domain == "skyvision_db":
+    if (
+        domain == "skyvision_db"
+        and owner_gate_receipt_public_key_id is not None
+    ):
         credential_lines.append(
             "LoadCredential=owner-gate-receipt-public-key:"
             f"{OWNER_GATE_RECEIPT_PUBLIC_KEY}"
@@ -278,6 +284,7 @@ def _service_unit(
         *(
             [f"AssertPathExists={OWNER_GATE_RECEIPT_PUBLIC_KEY}"]
             if domain == "skyvision_db"
+            and owner_gate_receipt_public_key_id is not None
             else []
         ),
         *(f"AssertPathExists={item.source_path}" for item in CREDENTIALS_BY_DOMAIN[domain]),
@@ -379,7 +386,7 @@ def render_operational_edge_units(
     mutation_peer_gid: int,
     receipt_public_key_ids: Mapping[str, str],
     writer_key_id: str,
-    owner_gate_receipt_public_key_id: str,
+    owner_gate_receipt_public_key_id: str | None,
 ) -> OperationalEdgeUnitBundle:
     domains = sorted({item.domain for item in operation_catalog().values()})
     services = (
@@ -447,10 +454,15 @@ def render_operational_edge_units(
         or len(set(receipt_public_key_ids.values())) != len(domains)
         or not isinstance(writer_key_id, str)
         or _SHA256.fullmatch(writer_key_id) is None
-        or not isinstance(owner_gate_receipt_public_key_id, str)
-        or _SHA256.fullmatch(owner_gate_receipt_public_key_id) is None
-        or owner_gate_receipt_public_key_id
-        in set(receipt_public_key_ids.values()) | {writer_key_id}
+        or (
+            owner_gate_receipt_public_key_id is not None
+            and (
+                not isinstance(owner_gate_receipt_public_key_id, str)
+                or _SHA256.fullmatch(owner_gate_receipt_public_key_id) is None
+                or owner_gate_receipt_public_key_id
+                in set(receipt_public_key_ids.values()) | {writer_key_id}
+            )
+        )
     ):
         raise OperationalEdgeUnitError("operational edge identity input invalid")
     release = Path("/opt/adventico-ai-platform/hermes-agent-releases") / f"hermes-agent-{revision[:12]}"
@@ -488,6 +500,9 @@ def render_operational_edge_units(
             service_gid=services[domain]["gid"],
             socket_group=sockets[domain]["group"],
             socket_gid=sockets[domain]["gid"],
+            owner_gate_receipt_public_key_id=(
+                owner_gate_receipt_public_key_id
+            ),
         )
         for domain in domains
     }

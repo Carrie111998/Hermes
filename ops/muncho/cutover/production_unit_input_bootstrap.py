@@ -69,8 +69,7 @@ PAYLOAD_FIELDS = frozenset({
     "operational_edge_identities", "operational_edge_socket_groups",
     "writer_capability_public_key_id", "discord_edge_receipt_public_key_id",
     "operational_edge_key_foundation_sha256", "discord_reconciliation_intent",
-    "operational_edge_receipt_public_key_ids",
-    "owner_gate_receipt_public_key_id", "release_owner_uid",
+    "operational_edge_receipt_public_key_ids", "release_owner_uid",
     "release_owner_gid", "bwrap_sha256",
     "shell_sha256", "secret_material_recorded", "secret_digest_recorded",
 })
@@ -478,17 +477,8 @@ def _payload(value: Any) -> Mapping[str, Any]:
             for key_id in receipt_key_ids.values()
         )
         or len(set(receipt_key_ids.values())) != len(receipt_key_ids)
-        or SHA256.fullmatch(
-            str(value["owner_gate_receipt_public_key_id"])
-        )
-        is None
-        or value["owner_gate_receipt_public_key_id"]
-        in set(receipt_key_ids.values())
         or value["writer_capability_public_key_id"]
-        in (
-            set(receipt_key_ids.values())
-            | {value["owner_gate_receipt_public_key_id"]}
-        )
+        in set(receipt_key_ids.values())
         or value["discord_edge_receipt_public_key_id"]
         in (
             set(receipt_key_ids.values())

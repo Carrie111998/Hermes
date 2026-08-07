@@ -22,6 +22,7 @@ from scripts.canary import passkey_v2_protocol as protocol
 
 
 ACTION_SCHEMA = "muncho-sensitive-report-passkey-action.v1"
+STEP_UP_LEASE_SCHEMA = "muncho-sensitive-report-step-up-lease.v1"
 FACTS_SCHEMA = "muncho-sensitive-report-passkey-mechanical-facts.v1"
 OPERATION_ID = "skyvision.db.query_sensitive"
 SCOPE = protocol.SENSITIVE_REPORT_SCOPE
@@ -32,7 +33,8 @@ _PAYLOAD_FIELDS = frozenset({
     "schema",
     "operation_id",
     "authority_ref",
-    "capability_sha256",
+    "step_up_lease",
+    "step_up_lease_sha256",
     "subject_discord_user_id",
     "scope",
     "case_id",
@@ -144,6 +146,97 @@ def normalized_query_sha256(query: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def build_step_up_lease(*, capability: Any, intent: Any) -> Mapping[str, Any]:
+    """Project one short capability into a stable, exact step-up lease.
+
+    The writer still has to mint a fresh, currently-valid dangerous-operation
+    capability for every create/consume/execution call.  This projection omits
+    only that capability's time window and signature so the same phone action
+    remains addressable while the user completes WebAuthn.
+    """
+
+    capability_value = _capability(capability)
+    intent_value = _intent(intent)
+    arguments = dict(intent_value["arguments"])
+    route = {
+        "guild_id": arguments.get("discord_guild_id"),
+        "parent_channel_id": arguments.get("discord_channel_id"),
+        "thread_id": arguments.get("discord_thread_id"),
+        "source_message_id": arguments.get("discord_message_id"),
+    }
+    if (
+        capability_value["operation_id"] != intent_value["operation_id"]
+        or capability_value["arguments_sha256"]
+        != intent_value["arguments_sha256"]
+        or capability_value["idempotency_key"]
+        != intent_value["idempotency_key"]
+        or arguments.get("requester_id")
+        != capability_value["subject_discord_user_id"]
+        or arguments.get("case_id") != capability_value["case_id"]
+        or any(
+            not isinstance(value, str)
+            or _DISCORD_ID.fullmatch(value) is None
+            for value in route.values()
+        )
+    ):
+        _fail("sensitive_report_step_up_lease_invalid")
+    return validate_step_up_lease({
+        "schema": STEP_UP_LEASE_SCHEMA,
+        "authority_kind": capability_value["authority_kind"],
+        "authority_ref": capability_value["authority_ref"],
+        "operation_id": capability_value["operation_id"],
+        "arguments_sha256": capability_value["arguments_sha256"],
+        "idempotency_key": capability_value["idempotency_key"],
+        "subject_discord_user_id": capability_value[
+            "subject_discord_user_id"
+        ],
+        "case_id": capability_value["case_id"],
+        "operator_tier": capability_value["operator_tier"],
+        "discord_routeback": route,
+    })
+
+
+def validate_step_up_lease(value: Any) -> Mapping[str, Any]:
+    item = _mapping(value, code="sensitive_report_step_up_lease_invalid")
+    fields = {
+        "schema", "authority_kind", "authority_ref", "operation_id",
+        "arguments_sha256", "idempotency_key", "subject_discord_user_id",
+        "case_id", "operator_tier", "discord_routeback",
+    }
+    route = item.get("discord_routeback")
+    if (
+        set(item) != fields
+        or item.get("schema") != STEP_UP_LEASE_SCHEMA
+        or item.get("authority_kind") != "canonical_plan"
+        or not isinstance(item.get("authority_ref"), str)
+        or not item["authority_ref"]
+        or len(item["authority_ref"]) > 240
+        or "\x00" in item["authority_ref"]
+        or item.get("operation_id") != OPERATION_ID
+        or not isinstance(item.get("arguments_sha256"), str)
+        or _SHA256.fullmatch(item["arguments_sha256"]) is None
+        or not isinstance(item.get("idempotency_key"), str)
+        or _IDEMPOTENCY.fullmatch(item["idempotency_key"]) is None
+        or not isinstance(item.get("subject_discord_user_id"), str)
+        or _DISCORD_ID.fullmatch(item["subject_discord_user_id"]) is None
+        or not isinstance(item.get("case_id"), str)
+        or _CASE_ID.fullmatch(item["case_id"]) is None
+        or item.get("operator_tier") not in {"standard", "top", "owner"}
+        or not isinstance(route, Mapping)
+        or set(route) != {
+            "guild_id", "parent_channel_id", "thread_id",
+            "source_message_id",
+        }
+        or any(
+            not isinstance(entry, str)
+            or _DISCORD_ID.fullmatch(entry) is None
+            for entry in route.values()
+        )
+    ):
+        _fail("sensitive_report_step_up_lease_invalid")
+    return item
+
+
 def _payload(
     *,
     capability: Any,
@@ -161,6 +254,10 @@ def _payload(
         or arguments.get("case_id") != capability_value["case_id"]
     ):
         _fail("sensitive_report_identity_binding_invalid")
+    lease = build_step_up_lease(
+        capability=capability_value,
+        intent=intent_value,
+    )
     database = arguments.get("db")
     purpose = arguments.get("purpose")
     max_rows = arguments.get("max_rows", DEFAULT_MAX_ROWS)
@@ -180,7 +277,8 @@ def _payload(
         "schema": ACTION_SCHEMA,
         "operation_id": OPERATION_ID,
         "authority_ref": capability_value["authority_ref"],
-        "capability_sha256": protocol.sha256_json(capability_value),
+        "step_up_lease": lease,
+        "step_up_lease_sha256": protocol.sha256_json(lease),
         "subject_discord_user_id": capability_value["subject_discord_user_id"],
         "scope": SCOPE,
         "case_id": capability_value["case_id"],
@@ -261,7 +359,7 @@ def build_action_envelope(
         authority_host_receipt_sha256=authority_host_receipt_sha256,
         source_preflight_sha256=source_preflight_sha256,
         live_projection_sha256=live_projection_sha256,
-        external_iam_receipt_sha256=payload["capability_sha256"],
+        external_iam_receipt_sha256=payload["step_up_lease_sha256"],
         prior_authoritative_receipt_sha256=prior_authoritative_receipt_sha256,
         prior_event_head_sha256=prior_event_head_sha256,
         issued_at_unix=issued_at_unix,
@@ -278,6 +376,11 @@ def validate_action_envelope(value: Any) -> Mapping[str, Any]:
             "sensitive_report_action_invalid"
         ) from exc
     payload = action.get("action_payload")
+    lease = (
+        validate_step_up_lease(payload.get("step_up_lease"))
+        if isinstance(payload, Mapping)
+        else None
+    )
     if (
         action.get("scope") != SCOPE
         or action.get("stage") != STAGE
@@ -291,14 +394,16 @@ def validate_action_envelope(value: Any) -> Mapping[str, Any]:
         or payload.get("subject_discord_user_id")
         != action.get("requester_discord_user_id")
         or payload.get("case_id") != action.get("case_id")
-        or payload.get("capability_sha256")
+        or payload.get("step_up_lease_sha256")
         != action.get("external_iam_receipt_sha256")
         or action.get("target_system")
         != f"skyvision-db:{payload.get('database')}"
+        or payload.get("step_up_lease_sha256")
+        != protocol.sha256_json(lease)
     ):
         _fail("sensitive_report_action_binding_invalid")
     for name in (
-        "capability_sha256",
+        "step_up_lease_sha256",
         "arguments_sha256",
         "normalized_query_sha256",
         "purpose_sha256",
@@ -366,11 +471,19 @@ def validate_authorization_receipt(
     if (
         expected_payload["arguments_sha256"] != intent_value["arguments_sha256"]
         or expected_payload["idempotency_key"] != intent_value["idempotency_key"]
-        or expected_payload["capability_sha256"]
-        != protocol.sha256_json(capability_value)
+        or expected_payload["step_up_lease"]
+        != build_step_up_lease(
+            capability=capability_value,
+            intent=intent_value,
+        )
+        or expected_payload["step_up_lease_sha256"]
+        != protocol.sha256_json(expected_payload["step_up_lease"])
         or expected_payload["subject_discord_user_id"]
         != capability_value["subject_discord_user_id"]
         or expected_payload["case_id"] != capability_value["case_id"]
+        or not capability_value["issued_at_unix_ms"]
+        <= now_unix * 1000
+        < capability_value["expires_at_unix_ms"]
     ):
         _fail("sensitive_report_authorization_intent_mismatch")
     try:
@@ -489,9 +602,11 @@ __all__ = [
     "SensitiveReportAuthorizationJournal",
     "SensitiveReportPasskeyError",
     "build_action_envelope",
+    "build_step_up_lease",
     "mechanical_approval_facts",
     "normalized_query_sha256",
     "require_retrieval_token",
     "validate_action_envelope",
     "validate_authorization_receipt",
+    "validate_step_up_lease",
 ]

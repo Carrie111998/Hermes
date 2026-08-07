@@ -17,6 +17,7 @@ import json
 import ssl
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -98,18 +99,32 @@ def _capability_and_intent(
     return envelope, capability, intent
 
 
-def retrieval_token(capability_envelope: Any) -> bytes:
+def _stable_lease(capability_envelope: Any, intent: Any) -> Mapping[str, Any]:
     envelope = _envelope(capability_envelope)
+    try:
+        return sensitive.build_step_up_lease(
+            capability=envelope["payload"],
+            intent=intent,
+        )
+    except sensitive.SensitiveReportPasskeyError as exc:
+        raise SensitiveReportTransportError(
+            "sensitive_report_transport_operation_invalid"
+        ) from exc
+
+
+def retrieval_token(capability_envelope: Any, intent: Any) -> bytes:
     return hashlib.sha256(
         b"muncho-sensitive-report-retrieval.v1\x00"
-        + protocol.canonical_json_bytes(envelope)
+        + protocol.canonical_json_bytes(
+            _stable_lease(capability_envelope, intent)
+        )
     ).digest()
 
 
 def deterministic_request_id(
     capability_envelope: Any, intent: Any
 ) -> str:
-    token = retrieval_token(capability_envelope)
+    token = retrieval_token(capability_envelope, intent)
     digest = hashlib.sha256(
         b"muncho-sensitive-report-request.v1\x00"
         + token
@@ -218,6 +233,7 @@ def step_up_bundle(
     *,
     response: Mapping[str, Any],
     capability_envelope: Mapping[str, Any],
+    intent: Any,
 ) -> Mapping[str, Any]:
     required = {
         "schema", "operation", "state", "request_id", "approval_url",
@@ -239,13 +255,33 @@ def step_up_bundle(
     return {
         "schema": "muncho-sensitive-report-operational-step-up.v1",
         "retrieval_token_b64": base64.b64encode(
-            retrieval_token(capability_envelope)
+            retrieval_token(capability_envelope, intent)
         ).decode("ascii"),
         "action_envelope": dict(response["action_envelope"]),
         "challenge_record": dict(response["challenge_record"]),
         "grant_record": dict(response["grant_record"]),
         "authorization_receipt": dict(response["authorization_receipt"]),
     }
+
+
+def validate_approval_url(value: Any, request_id: str) -> str:
+    if not isinstance(value, str) or not isinstance(request_id, str):
+        _fail("sensitive_report_transport_approval_url_invalid")
+    parsed = urlsplit(value)
+    expected_path = f"/approve/{request_id}"
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != PUBLIC_HOST
+        or parsed.hostname != PUBLIC_HOST
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != expected_path
+        or parsed.query
+        or parsed.fragment
+    ):
+        _fail("sensitive_report_transport_approval_url_invalid")
+    return value
 
 
 @dataclass(frozen=True)
@@ -287,7 +323,19 @@ class SensitiveReportOwnerGateClient:
             ) from exc
         if not isinstance(value, Mapping):
             _fail("sensitive_report_transport_response_invalid")
-        return dict(value)
+        result = dict(value)
+        expected_operation = frame.get("operation")
+        expected_request_id = frame.get("request_id")
+        if (
+            result.get("schema") != RESPONSE_SCHEMA
+            or result.get("operation") != expected_operation
+            or result.get("request_id") != expected_request_id
+        ):
+            _fail("sensitive_report_transport_response_invalid")
+        validate_approval_url(
+            result.get("approval_url"), str(expected_request_id)
+        )
+        return result
 
 
 __all__ = [
@@ -302,5 +350,6 @@ __all__ = [
     "deterministic_request_id",
     "retrieval_token",
     "step_up_bundle",
+    "validate_approval_url",
     "validate_frame",
 ]

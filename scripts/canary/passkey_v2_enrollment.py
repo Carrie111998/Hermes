@@ -11,6 +11,7 @@ never authorizes a report and report use never requires a new owner approval.
 from __future__ import annotations
 
 import base64
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -30,6 +31,9 @@ INVITATION_SCHEMA = "muncho-passkey-v2-enrollment-invitation.v1"
 RECEIPT_SCHEMA = "muncho-passkey-v2-enrollment-receipt.v1"
 MIN_TTL_SECONDS = 300
 MAX_TTL_SECONDS = 24 * 60 * 60
+PRODUCTION_ENROLLMENT_ROOT = Path(
+    "/var/lib/muncho-owner-gate/authority/enrollment"
+)
 _DISCORD_ID = re.compile(r"^[1-9][0-9]{16,21}$")
 _INVITATION_ID = re.compile(r"^[A-Za-z0-9_-]{32}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -502,6 +506,31 @@ def complete_enrollment(
     return credential_from_receipt(receipt)
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Create one local-only, single-use iPhone enrollment invitation."""
+
+    parser = argparse.ArgumentParser(prog="muncho-passkey-enrollment")
+    parser.add_argument("create", choices=("create",))
+    parser.add_argument("--owner-discord-user-id", required=True)
+    parser.add_argument("--user-label", required=True)
+    parser.add_argument("--ttl-seconds", type=int, default=3600)
+    parser.add_argument("--root", type=Path, default=PRODUCTION_ENROLLMENT_ROOT)
+    args = parser.parse_args(argv)
+    invitation, token = create_invitation(
+        root=args.root,
+        owner_discord_user_id=args.owner_discord_user_id,
+        user_label=args.user_label,
+        ttl_seconds=args.ttl_seconds,
+    )
+    # The fragment is consumed locally by the phone browser and removed from
+    # history before any request. Never post this output to Discord.
+    print(
+        f"{protocol.PRODUCTION_ORIGIN}/enroll/"
+        f"{invitation['invitation_id']}#{_b64(token)}"
+    )
+    return 0
+
+
 __all__ = [
     "INVITATION_SCHEMA",
     "PasskeyV2EnrollmentError",
@@ -511,3 +540,7 @@ __all__ = [
     "credential_from_receipt",
     "registration_options",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

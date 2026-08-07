@@ -412,7 +412,6 @@ _UNIT_INPUT_PAYLOAD_FIELDS = frozenset(
         "discord_edge_receipt_public_key_id",
         "operational_edge_key_foundation_sha256",
         "operational_edge_receipt_public_key_ids",
-        "owner_gate_receipt_public_key_id",
         "discord_reconciliation_intent",
         "release_owner_uid",
         "release_owner_gid",
@@ -608,18 +607,8 @@ def _unit_input_payload(
             for key_id in receipt_key_ids.values()
         )
         or len(set(receipt_key_ids.values())) != len(receipt_key_ids)
-        or re.fullmatch(
-            r"[0-9a-f]{64}",
-            str(raw["owner_gate_receipt_public_key_id"]),
-        )
-        is None
-        or raw["owner_gate_receipt_public_key_id"]
-        in set(receipt_key_ids.values())
         or raw["writer_capability_public_key_id"]
-        in (
-            set(receipt_key_ids.values())
-            | {raw["owner_gate_receipt_public_key_id"]}
-        )
+        in set(receipt_key_ids.values())
         or raw["discord_edge_receipt_public_key_id"]
         in (
             set(receipt_key_ids.values())
@@ -1987,9 +1976,12 @@ def _sealed_runtime_artifact_request(
                 "operational_edge_receipt_public_key_ids"
             ],
             writer_key_id=inputs["writer_capability_public_key_id"],
-            owner_gate_receipt_public_key_id=inputs[
-                "owner_gate_receipt_public_key_id"
-            ],
+            # The immutable v3 unit-input authority predates the owner-gate
+            # receipt trust anchor.  Keep its byte contract intact and select
+            # the legacy fail-closed unit variant explicitly.  A successor
+            # authority version must carry the exact key id before enabling
+            # sensitive-report execution in the six-artifact cutover.
+            owner_gate_receipt_public_key_id=None,
         )
     except (
         OperationalEdgeAssetError,

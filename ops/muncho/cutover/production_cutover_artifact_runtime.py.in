@@ -7357,12 +7357,17 @@ def _operational_edge_bundle(
         or raw["credential_values_read"] is not False
         or raw["receipt_public_key_ids"]
         != manifest["operational_edge_receipt_public_key_ids"]
-        or SHA256.fullmatch(
-            str(raw["owner_gate_receipt_public_key_id"])
+        or (
+            raw["owner_gate_receipt_public_key_id"] is not None
+            and (
+                SHA256.fullmatch(
+                    str(raw["owner_gate_receipt_public_key_id"])
+                )
+                is None
+                or raw["owner_gate_receipt_public_key_id"]
+                in set(raw["receipt_public_key_ids"].values())
+            )
         )
-        is None
-        or raw["owner_gate_receipt_public_key_id"]
-        in set(raw["receipt_public_key_ids"].values())
         or raw["units"] != expected_units
         or raw["configs"] != expected_configs
         or raw["client_config_path"]

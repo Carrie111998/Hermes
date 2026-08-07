@@ -79,6 +79,7 @@ from gateway.operational_edge_service import (
     load_config,
 )
 from gateway.operational_edge_units import (
+    OWNER_GATE_RECEIPT_PUBLIC_KEY,
     OperationalEdgeUnitError,
     render_operational_edge_units,
     service_identity_name,
@@ -1052,6 +1053,41 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
             for credential in values
         } - {credential.name for credential in credentials}
         assert all(f"LoadCredential={name}:" not in unit for name in foreign)
+
+
+def test_unit_renderer_requires_an_explicit_trust_anchor_choice() -> None:
+    receipt_key_ids = {
+        domain: f"{index:064x}"
+        for index, domain in enumerate(
+            sorted(CREDENTIALS_BY_DOMAIN), start=1
+        )
+    }
+    services, sockets = _edge_identities()
+    legacy = render_operational_edge_units(
+        revision=REVISION,
+        service_identities=services,
+        socket_groups=sockets,
+        release_owner_uid=1006,
+        release_owner_gid=1007,
+        read_peer_uids=(1004,),
+        mutation_peer_uid=1004,
+        mutation_peer_gid=1005,
+        receipt_public_key_ids=receipt_key_ids,
+        writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id=None,
+    )
+    config = json.loads(
+        legacy.configs["/etc/muncho/operational-edge/skyvision_db.json"]
+    )
+    unit = legacy.units[
+        "muncho-operational-edge-skyvision_db.service"
+    ].decode()
+
+    assert legacy.manifest["owner_gate_receipt_public_key_id"] is None
+    assert config["owner_gate_receipt_public_key_file"] is None
+    assert config["owner_gate_receipt_public_key_id"] is None
+    assert "owner-gate-receipt-public-key" not in unit
+    assert str(OWNER_GATE_RECEIPT_PUBLIC_KEY) not in unit
 
 
 def test_every_rendered_service_config_loads_with_gateway_only_peer(
