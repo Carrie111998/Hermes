@@ -681,6 +681,14 @@ _GATEWAY_STRONG_PROVIDER_ERROR_SHAPE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GATEWAY_PROVIDER_ERROR_PREFIX_RE = re.compile(
+    r"^\s*(?:\W+\s*)?(?:"
+    r"the\s+request\s+failed\s*:"
+    r"|(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:Error|Exception)\s*:"
+    r")\s*",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_gateway_provider_error(text: str) -> bool:
     """True when text is infrastructure/provider failure, not normal content.
@@ -698,10 +706,20 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if not text:
         return False
     body = str(text).strip()
+    # Normalization and provider SDKs can prepend a small chain of envelopes,
+    # e.g. ``The request failed: AuthenticationError: Incorrect API key``.
+    # Peel only those anchored prefixes so markers buried in assistant prose
+    # remain ineligible for the provider-error rewrite.
+    strong_candidate = body
+    for _ in range(4):
+        prefix = _GATEWAY_PROVIDER_ERROR_PREFIX_RE.match(strong_candidate)
+        if not prefix:
+            break
+        strong_candidate = strong_candidate[prefix.end():]
     # Strong provider envelopes remain errors even when an SDK appends a long
     # JSON payload, request id, account guidance, or retry diagnostics. The old
     # 400-character ceiling leaked exactly those expanded failures.
-    if _GATEWAY_STRONG_PROVIDER_ERROR_SHAPE_RE.search(body):
+    if _GATEWAY_STRONG_PROVIDER_ERROR_SHAPE_RE.search(strong_candidate):
         return True
     # Bare "HTTP NNN" is ambiguous (an assistant may be explaining HTTP), so
     # retain the conservative short-envelope heuristic for that shape alone.

@@ -8,6 +8,7 @@ from agent.conversation_compression import (
 )
 from gateway.config import Platform
 from gateway.run import (
+    _normalize_empty_agent_response,
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
@@ -319,6 +320,49 @@ def test_long_expanded_provider_failure_is_one_safe_reply(platform):
         "settings/usage",
     ):
         assert forbidden.lower() not in sanitized.lower()
+
+
+def test_discord_normalized_sdk_auth_failure_is_one_safe_reply():
+    """Failed-turn normalization must not hide an SDK provider envelope."""
+    raw = (
+        "AuthenticationError: Incorrect API key provided: "
+        + "sk-"
+        + "test-not-real; account billing status=inactive; HTTP 401; "
+        "request_id=req_internal"
+    )
+    normalized = _normalize_empty_agent_response(
+        {"failed": True, "error": raw}, "", history_len=0
+    )
+
+    assert _sanitize_gateway_final_response("discord", normalized) == (
+        "⚠️ I couldn’t complete that request. Please try again shortly."
+    )
+
+
+def test_prefixed_long_sdk_provider_failure_is_one_safe_reply():
+    """Gateway and SDK prefixes must not expose expanded provider details."""
+    raw = (
+        "The request failed: openai.RateLimitError: Error code: 429 - "
+        "account billing status=inactive; request_id=req_internal; "
+        + "diagnostic-padding-" * 30
+    )
+
+    assert _sanitize_gateway_final_response("discord", raw) == (
+        "⚠️ I couldn’t complete that request. Please try again shortly."
+    )
+
+
+def test_long_http_explanation_after_ordinary_prose_is_preserved():
+    """An HTTP marker buried in normal assistant prose is not an envelope."""
+    answer = (
+        "Here is a detailed explanation for your application. HTTP 401 means "
+        "the request lacks valid authentication credentials; check how your "
+        "client constructs its Authorization header, confirm the token scope, "
+        "and retry only after correcting the credentials. "
+        + "Additional troubleshooting context. " * 20
+    )
+
+    assert _sanitize_gateway_final_response("discord", answer) == answer
 
 
 def test_telegram_final_response_keeps_normal_answers():
