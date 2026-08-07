@@ -50,7 +50,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         return None
 
     def fake_mark(
-        jid, ok, err=None, delivery_error=None, delivery_status=None
+        jid, ok, err=None, delivery_error=None, delivery_status=None, **_kw
     ):
         calls.append(("mark", jid, ok))
 

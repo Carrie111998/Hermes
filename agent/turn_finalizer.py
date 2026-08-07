@@ -818,6 +818,7 @@ def finalize_turn(
         getattr(agent, "_background_review_enabled", True)
         and final_response
         and not interrupted
+        and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         try:

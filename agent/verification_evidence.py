@@ -69,6 +69,21 @@ def record_terminal_result(
     return None
 
 
+def record_verify_run(
+    *,
+    root: str | Path,
+    session_id: str | None = None,
+    ok: bool,
+    command: str = "hermes verify",
+    scope: str = "full",
+    output: str = "",
+) -> Optional[dict[str, Any]]:
+    """Ignore explicit verify results instead of persisting semantic state."""
+
+    del root, session_id, ok, command, scope, output
+    return None
+
+
 def mark_workspace_edited(
     *,
     session_id: str | None,
@@ -96,6 +111,7 @@ __all__ = [
     "VerificationEvidence",
     "classify_verification_command",
     "mark_workspace_edited",
+    "record_verify_run",
     "record_terminal_result",
     "verification_ledger_enabled",
     "verification_status",
