@@ -17,6 +17,7 @@ import { middleClickHandlers } from '@/lib/middle-click'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { sessionTabsEnabled } from '@/store/session-tabs'
 import { $attentionSessionIds } from '@/store/session-states'
 
 import { SessionStatusDot } from '../session-status-dot'
@@ -169,9 +170,18 @@ function SidebarSessionRowImpl({
         )}
         <SidebarRowBody
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
-          // Middle-click = open in a new tab (browser muscle memory).
+          // Middle-click = open in a new tab (browser muscle memory). When
+          // session tabs are disabled, fall through to in-place resume — the
+          // row's navigate path is `onResume`, not a no-op openSession navigate.
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
+
+            if (!sessionTabsEnabled()) {
+              onResume()
+
+              return
+            }
+
             openSession(session.id, () => undefined, 'tab')
           })}
           onClick={event => {
@@ -187,11 +197,19 @@ function SidebarSessionRowImpl({
               return
             }
 
-            // ⌘/⌃-click → open in a new tab (stack into main).
+            // ⌘/⌃-click → open in a new tab (stack into main), or in-place
+            // when the user has disabled session tabs.
             if (mod) {
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
+
+              if (!sessionTabsEnabled()) {
+                onResume()
+
+                return
+              }
+
               openSession(session.id, () => undefined, 'tab')
 
               return

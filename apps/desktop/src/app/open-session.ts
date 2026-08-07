@@ -15,6 +15,7 @@
  *     the bridge has no session-window support.
  */
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { sessionTabsEnabled } from '@/store/session-tabs'
 import {
   focusedSessionNeedsRoute,
   focusOpenSession,
@@ -43,7 +44,9 @@ export function mainChatOccupied(activeSessionId: null | string, selectedStoredS
 
 /** Read modifiers the way session rows do — meta OR ctrl for tab, +shift for
  *  window. `base` is what an unmodified select means for the caller: the
- *  sidebar spends main (`in-place`), a palette-style open doesn't (`stack`). */
+ *  sidebar spends main (`in-place`), a palette-style open doesn't (`stack`).
+ *  When session tabs are disabled, ⌘/⌃ collapses to `base` (in-place load)
+ *  instead of stacking a tab; window hops stay available. */
 export function openSessionIntentFromModifiers(
   event?: null | { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean },
   base: OpenSessionIntent = 'in-place'
@@ -59,7 +62,7 @@ export function openSessionIntentFromModifiers(
   }
 
   if (mod) {
-    return 'tab'
+    return sessionTabsEnabled() ? 'tab' : base
   }
 
   return base
@@ -87,8 +90,14 @@ export function openSession(
       return
     }
 
-    // No pop-out support → treat like a new tab.
-    resolved = 'tab'
+    // No pop-out support → treat like a new tab (or main when tabs are off).
+    resolved = sessionTabsEnabled() ? 'tab' : 'in-place'
+  }
+
+  // Users who disable session tabs never want a stacked chat — force every
+  // tab-or-stack intent into main. Explicit window opens already returned above.
+  if (!sessionTabsEnabled() && (resolved === 'tab' || resolved === 'stack')) {
+    resolved = 'in-place'
   }
 
   // A `stack` open arrives from outside the workspace, so unlike a sidebar

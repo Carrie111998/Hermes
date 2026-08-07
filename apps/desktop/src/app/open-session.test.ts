@@ -26,6 +26,7 @@ vi.mock('./routes', () => ({
 }))
 
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { setSessionTabsEnabled } from '@/store/session-tabs'
 
 import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
 
@@ -76,6 +77,15 @@ describe('openSessionIntentFromModifiers', () => {
     expect(openSessionIntentFromModifiers({ metaKey: true }, 'stack')).toBe('tab')
     expect(openSessionIntentFromModifiers({ metaKey: true, shiftKey: true }, 'stack')).toBe('window')
   })
+
+  it('collapses ⌘/⌃ to base when session tabs are disabled', () => {
+    setSessionTabsEnabled(false)
+    expect(openSessionIntentFromModifiers({ metaKey: true })).toBe('in-place')
+    expect(openSessionIntentFromModifiers({ ctrlKey: true }, 'stack')).toBe('stack')
+    // Window hops stay available.
+    expect(openSessionIntentFromModifiers({ metaKey: true, shiftKey: true })).toBe('window')
+    setSessionTabsEnabled(true)
+  })
 })
 
 describe('openSession', () => {
@@ -91,6 +101,7 @@ describe('openSession', () => {
     reuseBlankDraftTile.mockReset()
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
+    setSessionTabsEnabled(true)
   })
 
   it('in-place focuses an existing tile and does not navigate', () => {
@@ -196,6 +207,33 @@ describe('openSession', () => {
     openSession('s1', navigate, 'window')
     expect(openSessionInNewWindow).not.toHaveBeenCalled()
     expect(openSessionTile).toHaveBeenCalledWith('s1', 'center')
+  })
+
+  it('tab loads into main when session tabs are disabled', () => {
+    setSessionTabsEnabled(false)
+    focusOpenSession.mockReturnValue(null)
+    openSession('s1', navigate, 'tab')
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('stack loads into main even when occupied if session tabs are disabled', () => {
+    setSessionTabsEnabled(false)
+    $selectedStoredSessionId.set('s0')
+    focusOpenSession.mockReturnValue(null)
+    openSession('s1', navigate, 'stack')
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('window falls back to main when pop-out is unavailable and tabs are off', () => {
+    setSessionTabsEnabled(false)
+    canOpenSessionWindow.mockReturnValue(false)
+    focusOpenSession.mockReturnValue(null)
+    openSession('s1', navigate, 'window')
+    expect(openSessionInNewWindow).not.toHaveBeenCalled()
+    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(navigate).toHaveBeenCalledWith('/c/s1')
   })
 
   it('no-ops on an empty id', () => {
