@@ -1,41 +1,82 @@
 #!/usr/bin/env python3
 """Organize generated FW26 images into PRODUCT IMG with SKU-based progressive renaming.
 
-Reads the authoritative SKU map from HELMUR-master-prodotti spreadsheet (tab VARIANTI),
+Reads the authoritative SKU map from the HELMUR-master-prodotti spreadsheet (tab VARIANTI),
 renames local generated outputs (ghost_<C>.png / indossato_<posa>_<C>.png) to
-<SKU-base>_<modello>-<colore>_<NN>_<posa>.png, and uploads them to:
+<SKU>_<modello>-<colore>_<NN>_<posa>.png, and uploads them to:
 
-    PRODUCT IMG (root_id) > DONNA|UOMO > <MODELLO> > <CodColore>-<COLORE>/
+    PRODUCT IMG (root) > DONNA|UOMO > <MODELLO> > <CodColore>-<COLORE>/
 
-Idempotent: skip uploads whose exact target filename already exists in the target folder
-(and trash-all-upload-one is NOT used here — filenames are unique per model+color+pose).
+Idempotent: skips a file whose exact target filename already exists in its target folder.
+
+Drive operations use the Google API python client directly (google_api.build_service),
+NOT shell quoting — this avoids the .split() bug that mangled parent-search queries and
+created duplicate folders.
 
 Usage:
   python organize_output.py                              # all garments
-  python organize_output.py ALASKA MONTANA               # only these models
-  python organize_output.py --local-only ALASKA          # just rename locally, no upload
-  python organize_output.py --start 1                     # progressive index base (default 0)
-
-Requires google_api.py on PATH via $GAPI, and the xlsx via --xlsx (default downloaded fresh).
+  python organize_output.py MONTANA ALASKA               # only these models
+  python organize_output.py --local-only MONTANA         # rename locally, no upload
+  python organize_output.py --start 1                    # progressive index base (default 0)
 """
-import argparse, json, os, re, shutil, subprocess, sys, tempfile
-import openpyxl
+import argparse, os, re, sys
+
+try:
+    sys.path.insert(0, "/root/.hermes/skills/productivity/google-workspace/scripts")
+    import google_api as ga
+    from googleapiclient.http import MediaFileUpload
+except Exception as e:  # pragma: no cover
+    print("ERROR: cannot import google_api:", e)
+    sys.exit(2)
 
 BASE = os.environ.get("FW_OUTPUT_BASE", os.path.dirname(os.path.abspath(__file__)))
-# Drive target root: PRODUCT IMG. Subfolders DONNA/UOMO already exist; model/color created on demand.
-PRODUCT_IMG_ROOT = os.environ.get("PRODUCT_IMG_ROOT", "1vy41E81IYScJOVJYYz076sCc_eBCCblN")
-SEX_FOLDERS = {"Donna": "1YqQ27arr_CvWIFPZe3XK9B-UpuhDw6l8", "Uomo": "1ZhlmWVWFEnmN6VJpTMEog9zWTQMg4Vdi"}  # may re-query by name
+PRODUCT_IMG_ROOT = "1vy41E81IYScJOVJYYz076sCc_eBCCblN"
+SEX_FOLDERS = {"Donna": "1YqQ27arr_CvWIFPZe3XK9B-UpuhDw6l8", "Uomo": "1ZhlmWVWFEnmN6VJpTMEog9zWTQMg4Vdi"}
 XLSX = os.environ.get("HELMUR_XLSX", "/root/analysis/master.xlsx")
-GAPI = os.environ.get("GAPI", "python /root/.hermes/skills/productivity/google-workspace/scripts/google_api.py")
 
-# working color token -> Cod. colore (number). Fill from the manifest / vision mapping.
-# token like "NOCCIOLA-302" -> 302 ; "MASTICE-202" -> 202 ; "CENERE-201" -> 201
+MIME_FOLDER = "application/vnd.google-apps.folder"
+POSA_ORDER = {"ghost": 0, "front": 1, "bust34": 2, "editorial": 3, "back": 4, "detail": 5}
+
+
+def _svc():
+    return ga.build_service("drive", "v3")
+
+
+def list_children(svc, parent):
+    out, token = [], None
+    while True:
+        r = svc.files().list(q=f"'{parent}' in parents and trashed=false",
+                             pageSize=1000, pageToken=token,
+                             fields="nextPageToken, files(id,name,mimeType)").execute()
+        out.extend(r.get("files", []))
+        token = r.get("nextPageToken")
+        if not token:
+            return out
+
+
+def ensure_folder(svc, parent, name):
+    for x in list_children(svc, parent):
+        if x["name"] == name and x["mimeType"] == MIME_FOLDER:
+            return x["id"]
+    f = svc.files().create(body={"name": name, "mimeType": MIME_FOLDER, "parents": [parent]},
+                           fields="id").execute()
+    return f["id"]
+
+
+def has_file(svc, parent, name):
+    for x in list_children(svc, parent):
+        if x["name"] == name:
+            return True
+    return False
+
+
 def parse_code(token):
     m = re.search(r"-(\d+)$", token)
     return m.group(1) if m else token
 
+
 def load_sku_map(xlsx):
-    """Return {modello: {codcol(str): {sku, colore, foto, reparto}}}."""
+    import openpyxl
     wb = openpyxl.load_workbook(xlsx, data_only=True, read_only=True)
     ws = wb["VARIANTI"]
     rows = ws.iter_rows(values_only=True)
@@ -43,35 +84,11 @@ def load_sku_map(xlsx):
     m = {}
     for r in rows:
         sku, mod, rep, cat, codcol, col, *_rest = (list(r) + [None] * 10)[:10]
-        foto = _rest[3] if len(_rest) > 3 else None
         if not mod:
             continue
-        m.setdefault(mod, {})[str(codcol)] = {"sku": sku, "colore": col, "foto": foto, "reparto": rep}
+        m.setdefault(mod, {})[str(codcol)] = {"sku": sku, "colore": col, "reparto": rep}
     return m
 
-def popen_gapi(args):
-    proc = subprocess.run(f"{GAPI} {args}".split(), capture_output=True, text=True)
-    if proc.returncode != 0:
-        return None
-    try:
-        return json.loads(proc.stdout)
-    except Exception:
-        return None
-
-def child_id(parent, name):
-    d = popen_gapi(f"drive search \"'{parent}' in parents and name='{name}' and trashed=false\" --raw-query --max 50")
-    if d:
-        for x in d:
-            if x.get("name") == name and x.get("mimeType") == "application/vnd.google-apps.folder":
-                return x["id"]
-    return None
-
-def ensure_folder(parent, name):
-    e = child_id(parent, name)
-    if e:
-        return e
-    d = popen_gapi(f"drive create-folder \"{name}\" --parent {parent}")
-    return d.get("id") if d else None
 
 def target_name(sku_map, modulo, colore_token, posa_enum, idx, start):
     code = parse_code(colore_token)
@@ -79,8 +96,23 @@ def target_name(sku_map, modulo, colore_token, posa_enum, idx, start):
     nome_col = (info.get("colore") or colore_token.split("-")[0]).lower()
     sku = info.get("sku") or f"{modulo[:4].upper()}-{code}"
     nn = str(start + idx).zfill(2)
-    posa = "ghost" if posa_enum == "ghost" else posa_enum  # front / bust34 / editorial
+    posa = "ghost" if posa_enum == "ghost" else posa_enum
     return f"{sku}_{modulo.lower()}-{nome_col}_{nn}_{posa}.png", info
+
+
+def classify_posa(fname):
+    if fname.startswith("ghost_"):
+        return "ghost"
+    if "bust34" in fname:
+        return "bust34"
+    if "editorial" in fname:
+        return "editorial"
+    if "back" in fname:
+        return "back"
+    if "detail" in fname:
+        return "detail"
+    return "front"
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -92,59 +124,50 @@ def main():
 
     sku_map = load_sku_map(a.xlsx) if os.path.exists(a.xlsx) else {}
     want = set(a.modelli) or None
+    svc = _svc() if not a.local_only else None
 
-    # local generated outputs live under BASE/<MODELLO>/
-    for capo in os.listdir(BASE):
+    for capo in sorted(os.listdir(BASE)):
         capodir = os.path.join(BASE, capo)
         if not os.path.isdir(capodir) or capo.startswith("."):
             continue
         if want and capo not in want:
             continue
-        # group generated files by color token
-        files = sorted(f for f in os.listdir(capodir) if re.match(r"(ghost|indossato)_", f))
+        files = sorted(f for f in os.listdir(capodir)
+                       if re.match(r"(ghost|indossato)_", f) and f.endswith(".png"))
         bycolour = {}
         for f in files:
-            # ghost_NOCCIOLA-302.png | indossato_front_NOCCIOLA-302.png | indossato_editorial_...
             m = re.match(r"(ghost|indossato)_(?:([a-z0-9]+)_)?(.+)\.png$", f)
             if not m:
                 continue
-            kind, posa, colore = m.group(1), m.group(2) or "front", m.group(3)
-            posa_enum = "ghost" if kind == "ghost" else posa
+            colore = m.group(3)
             bycolour.setdefault(colore, []).append(f)
         for colore, flist in sorted(bycolour.items()):
-            # sorted poses: ghost, front, bust34, editorial
-            order = {"ghost": 0, "front": 1, "bust34": 2, "editorial": 3}
-            flist.sort(key=lambda f: order.get(("ghost" if f.startswith("ghost") else
-                     ("bust34" if "bust34" in f else ("editorial" if "editorial" in f else "front"))), 9))
-            info, _it = {}, {}
+            flist.sort(key=lambda f: POSA_ORDER.get(classify_posa(f), 9))
+            sep = min((i for i, f in enumerate(flist) if i > 0), default=len(flist))
+            prev_name, info = None, {}
             for idx, f in enumerate(flist):
-                posa_enum = "ghost" if f.startswith("ghost") else \
-                    ("bust34" if "bust34" in f else ("editorial" if "editorial" in f else "front"))
+                posa_enum = classify_posa(f)
                 newname, info = target_name(sku_map, capo, colore, posa_enum, idx, a.start)
                 src = os.path.join(capodir, f)
-                dst = os.path.join(capodir, newname)
-                if os.path.abspath(src) != os.path.abspath(dst):
-                    shutil.copy2(src, dst)
+                dst = os.path.join(capodir, f)
                 if a.local_only:
                     print(f"  [local] {capo}/{colore}: {f} -> {newname}", flush=True)
                     continue
-                # upload to PRODUCT IMG / DOC | UOMO / modello / colore
-                reparto = info.get("reparto") or ("Uomo" if capo in ("OXFORD","PORTLAND","LEMANS") else "Donna")
-                sex = sex_folder_name(reparto)
-                sexid = SEX_FOLDERS.get(sex)
-                if not sexid:
-                    sexid = ensure_folder(PRODUCT_IMG_ROOT, sex) or ensure_folder(PRODUCT_IMG_ROOT, "Uomo")
-                model_id = ensure_folder(sexid, capo)
+                reparto = info.get("reparto") or ("Uomo" if capo in ("OXFORD", "PORTLAND", "LEMANS") else "Donna")
+                sex = "Donna" if str(reparto).strip().lower() in ("donna", "femmina", "f") else "Uomo"
+                sexid = SEX_FOLDERS.get(sex) or ensure_folder(svc, PRODUCT_IMG_ROOT, sex)
+                model_id = ensure_folder(svc, sexid, capo)
                 col_name = f"{parse_code(colore)}-{info.get('colore') or colore}"
-                col_id = ensure_folder(model_id, col_name)
-                if child_id(col_id, newname):
+                col_id = ensure_folder(svc, model_id, col_name)
+                if has_file(svc, col_id, newname):
                     print(f"  [skip] {capo}/{colore}: {newname} già presente", flush=True)
                     continue
-                popen_gapi(f"drive upload {dst} --name \"{newname}\" --parent {col_id}")
+                mime = "image/png" if newname.endswith(".png") else "image/jpeg"
+                media = MediaFileUpload(src, mimetype=mime)
+                svc.files().create(body={"name": newname, "parents": [col_id]},
+                                   media_body=media, fields="id,name").execute()
                 print(f"  [ok] {capo}/{colore}: {newname} -> PRODUCT IMG/{sex}/{capo}/{col_name}/", flush=True)
 
-def sex_folder_name(reparto):
-    return "Donna" if str(reparto).strip().lower() in ("donna", "femmina", "f") else "Uomo"
 
 if __name__ == "__main__":
     main()
