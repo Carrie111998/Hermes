@@ -1064,7 +1064,7 @@ class CLICommandsMixin:
         # events and ancestor rows render correctly (matching the startup
         # --resume path in _preload_resumed_session).
         model_history, display_history = self._session_db.get_resume_conversations(
-            target_id
+            target_id, limit=getattr(self, "_recent_limit", None)
         )
         restored = [m for m in (model_history or []) if m.get("role") != "session_meta"]
         self.conversation_history = restored
