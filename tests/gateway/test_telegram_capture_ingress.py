@@ -534,3 +534,98 @@ async def test_queue_sentinel_passes_through(temp_capture_db):
     await queue.put(sentinel)
     assert not queue.empty()
     assert queue.get_nowait() is sentinel
+
+
+# --- Task 12: PTB Application wiring ---
+
+def test_put_normalizes_ptb_update_objects(temp_capture_db):
+    """PTB puts Update objects, not dicts — the queue must still capture them."""
+    class _FakeUpdate:
+        def __init__(self, d):
+            self._d = d
+
+        def to_dict(self):
+            return self._d
+
+    raw = make_text_update(4242, -1001111222, "captured")
+    queue = CaptureIngressQueue(
+        inner_queue=asyncio.Queue(),
+        db_connection=temp_capture_db,
+        profile="default",
+        account_id=555,
+        route_map={(-1001111222, 0): {"mode": "capture_only", "sink": "ledger"}},
+    )
+    asyncio.run(queue.put(_FakeUpdate(raw)))
+
+    row = temp_capture_db.execute(
+        "SELECT event_id, route_mode FROM ingress_ledger"
+    ).fetchone()
+    assert row["event_id"] == "telegram:default:555:4242"
+    assert row["route_mode"] == "capture_only"
+    assert queue.qsize() == 0  # capture_only is terminal — never dispatched
+
+
+def test_open_capture_db_creates_schema(tmp_path):
+    """open_capture_db must create both tables so callers need no external DDL."""
+    from plugins.platforms.telegram.capture_ingress import open_capture_db
+
+    conn = open_capture_db(tmp_path / "nested" / "ingress.db")
+    tables = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {"ingress_ledger", "capture_payload"} <= tables
+    conn.close()
+
+
+def _adapter(extra=None):
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    return TelegramAdapter(
+        PlatformConfig(enabled=True, token="123:abc", extra=extra or {}),
+        profile="default",
+    )
+
+
+def test_build_capture_queue_returns_none_without_routes():
+    """No configured capture routes → no queue, no DB file created."""
+    assert _adapter()._build_capture_queue() is None
+
+
+def test_build_capture_queue_reads_routes_from_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _adapter({
+        "bot_id": 777,
+        "capture_routes": [
+            {"chat_id": -1003910549809, "thread_id": 6,
+             "mode": "capture_only", "sink": "ledger"},
+            {"chat_id": -1003910549809, "mode": "agent", "sink": "ledger"},
+        ],
+    })
+    queue = adapter._build_capture_queue()
+    assert isinstance(queue, CaptureIngressQueue)
+    assert queue._account_id == 777
+    assert queue._profile == "default"
+    assert queue._route_map == {
+        (-1003910549809, 6): {"mode": "capture_only", "sink": "ledger"},
+        (-1003910549809, 0): {"mode": "agent", "sink": "ledger"},
+    }
+    queue._db.close()
+
+
+def test_register_handlers_installs_all_handlers():
+    """Both build sites must share one handler-registration helper."""
+    adapter = _adapter()
+
+    class _App:
+        def __init__(self):
+            self.handlers = []
+
+        def add_handler(self, h):
+            self.handlers.append(h)
+
+    app = _App()
+    adapter._register_handlers(app)
+    assert len(app.handlers) == 5

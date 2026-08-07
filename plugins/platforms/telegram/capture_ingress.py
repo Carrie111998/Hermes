@@ -47,6 +47,49 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+CAPTURE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ingress_ledger (
+    event_id TEXT PRIMARY KEY,
+    profile TEXT NOT NULL,
+    account_id INTEGER NOT NULL,
+    update_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    route_mode TEXT NOT NULL,
+    sink TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    message_thread_id INTEGER,
+    media_kind TEXT,
+    command_text TEXT,
+    content_preview TEXT,
+    lifecycle TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS capture_payload (
+    event_id TEXT PRIMARY KEY REFERENCES ingress_ledger(event_id),
+    payload BLOB NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+"""
+
+
+def open_capture_db(path) -> sqlite3.Connection:
+    """Open (creating parents + schema) the capture ledger DB at ``path``."""
+    from pathlib import Path
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(CAPTURE_SCHEMA)
+    conn.commit()
+    return conn
+
+
 def atomic_insert_capture(
     conn: sqlite3.Connection,
     *,
@@ -151,9 +194,14 @@ class CaptureIngressQueue(asyncio.Queue):
         routes are consumed here (terminal deny); agent routes persist THEN
         delegate via super().put().
         """
+        # PTB enqueues telegram.Update objects; tests and replays enqueue the
+        # equivalent dict. Normalize for inspection but delegate the ORIGINAL
+        # object so PTB's dispatcher gets what it expects.
+        raw = update.to_dict() if hasattr(update, "to_dict") else update
+
         effective_msg = (
-            self._get_effective_message(update)
-            if self._is_message_like(update)
+            self._get_effective_message(raw)
+            if self._is_message_like(raw)
             else None
         )
         if effective_msg is None:
@@ -169,7 +217,7 @@ class CaptureIngressQueue(asyncio.Queue):
             return
 
         event_type = self._classify_event_type(effective_msg)
-        update_id = update.get("update_id", 0)
+        update_id = raw.get("update_id", 0)
         message_id = effective_msg.get("message_id", 0)
         sender_id = effective_msg.get("from", {}).get("id", 0)
         event_id = build_event_id(self._profile, self._account_id, update_id)
@@ -188,8 +236,8 @@ class CaptureIngressQueue(asyncio.Queue):
                 event_type=event_type,
                 route_mode=route["mode"],
                 sink=route["sink"],
-                payload=canonicalize_payload(update),
-                payload_hash_str=payload_hash(update),
+                payload=canonicalize_payload(raw),
+                payload_hash_str=payload_hash(raw),
                 message_thread_id=thread_id,
                 command_text=(text if event_type == "command" else None),
                 content_preview=text[:200] or None,

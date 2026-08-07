@@ -709,6 +709,78 @@ class TelegramAdapter(BasePlatformAdapter):
         """Telegram measures message length in UTF-16 code units."""
         return utf16_len
 
+    def _register_handlers(self, app) -> None:
+        """Install the message/callback handlers on a freshly-built Application."""
+        app.add_handler(TelegramMessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.COMMAND,
+            self._handle_command
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
+            self._handle_location_message
+        ))
+        app.add_handler(TelegramMessageHandler(
+            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+            self._handle_media_message
+        ))
+        # Handle inline keyboard button callbacks (update prompts)
+        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
+    def _capture_db_path(self) -> "Path":
+        """Capture ledger DB path. HERMES_HOME is already profile-scoped."""
+        from pathlib import Path
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+        except Exception:
+            home = Path(os.path.expanduser("~/.hermes"))
+        return Path(home) / "cache" / "capture" / "ingress.db"
+
+    def _build_capture_queue(self):
+        """Build the pre-dispatch capture queue, or None when no routes exist.
+
+        Routes come from ``platforms.telegram.extra.capture_routes``, a list of
+        ``{chat_id, thread_id?, mode, sink}`` entries. With none configured the
+        queue would be a pure passthrough, so we skip it (and skip creating the
+        DB file) entirely.
+        """
+        from plugins.platforms.telegram.capture_ingress import (
+            CaptureIngressQueue,
+            open_capture_db,
+        )
+
+        route_map = {}
+        for entry in (self.config.extra or {}).get("capture_routes") or []:
+            try:
+                key = (int(entry["chat_id"]), int(entry.get("thread_id") or 0))
+                route_map[key] = {
+                    "mode": str(entry["mode"]),
+                    "sink": str(entry["sink"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "[%s] Ignoring malformed capture_routes entry: %r",
+                    self.name, entry,
+                )
+        if not route_map:
+            return None
+
+        # ponytail: bot_id comes from config because the queue is needed BEFORE
+        # builder.build() gives us self._bot.id. Set extra.bot_id to keep
+        # event_ids stable; resolve it pre-build if that ever gets fiddly.
+        account_id = int((self.config.extra or {}).get("bot_id") or 0)
+        return CaptureIngressQueue(
+            inner_queue=asyncio.Queue(),
+            db_connection=open_capture_db(self._capture_db_path()),
+            profile=self._profile,
+            account_id=account_id,
+            route_map=route_map,
+        )
+
     @property
     def profile(self) -> str:
         """Receiving-profile name this adapter belongs to (read-only)."""
@@ -3888,28 +3960,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
             get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
+            capture_queue = self._build_capture_queue()
+            if capture_queue is not None:
+                builder = builder.update_queue(capture_queue)
             self._app = builder.build()
             self._bot = self._app.bot
-            
-            # Register handlers
-            self._app.add_handler(TelegramMessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._handle_text_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.COMMAND,
-                self._handle_command
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                self._handle_location_message
-            ))
-            self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
-            ))
-            # Handle inline keyboard button callbacks (update prompts)
-            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            self._register_handlers(self._app)
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -4023,24 +4079,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
-                        # Re-register handlers on the new app
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.TEXT & ~filters.COMMAND,
-                            self._handle_text_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.COMMAND,
-                            self._handle_command
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                            self._handle_location_message
-                        ))
-                        self._app.add_handler(TelegramMessageHandler(
-                            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                            self._handle_media_message
-                        ))
-                        self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+                        self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:
                             await _shutdown_abandoned_app(old_app)
