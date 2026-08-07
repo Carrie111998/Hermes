@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -1977,9 +1978,6 @@ class SessionDB:
                 # Trigram FTS5 path — quote each non-operator token to handle
                 # FTS5 special chars (%, *, etc.) while preserving boolean
                 # operators (AND, OR, NOT) for multi-term queries.
-                # Default to OR for CJK tokens (no explicit operator) so that
-                # multi-term queries like "大别山 项目" match either term rather
-                # than requiring both (implicit AND misses too many results).
                 tokens = raw_query.split()
                 parts = []
                 for tok in tokens:
@@ -1987,12 +1985,15 @@ class SessionDB:
                         parts.append(tok)
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
-                # Join with OR if user didn't supply any explicit boolean op
+                # Gate OR-join on CJK characters so non-CJK queries keep
+                # implicit AND semantics. Without this, a query like
+                # "database migration" would become "database" OR "migration"
+                # and return excessive false positives.
                 has_explicit_op = any(t.upper() in ("AND", "OR", "NOT") for t in tokens)
-                if has_explicit_op:
-                    trigram_query = " ".join(parts)
-                else:
-                    trigram_query = " OR ".join(parts)
+                use_or = not has_explicit_op and any(
+                    unicodedata.category(c).startswith("Lo") for c in raw_query
+                )
+                trigram_query = (" OR " if use_or else " ").join(parts)
                 tri_where = ["messages_fts_trigram MATCH ?"]
                 tri_params: list = [trigram_query]
                 if source_filter is not None:
