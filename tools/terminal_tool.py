@@ -961,7 +961,19 @@ def _rewrite_compound_background(command: str) -> str:
         suffix = result[amp_pos + 1 :]
         # `{` needs a trailing space in bash; the closing `}` needs to be
         # preceded by `;` or `&` — we're providing `&` from the backgrounding.
-        result = prefix + "{ " + middle + "& }" + suffix
+        # When the `&` is mid-command (`A && B & C`), bash backgrounds the
+        # whole `A && B` list and runs `C` in the foreground. The brace group
+        # must then be separated from `C` by `;` — `A && { B & }C` is a
+        # syntax error that would kill the whole command line, including the
+        # backgrounded server the user asked for. A newline (or an existing
+        # `;`/`&`/`#`) already ends the statement, so no separator is added
+        # there — keeping the historical output byte-identical.
+        head = suffix.lstrip()
+        prefix_ws = suffix[: len(suffix) - len(head)]
+        if head and "\n" not in prefix_ws and head[0] not in (";", "&", "#"):
+            result = prefix + "{ " + middle + "& }; " + head
+        else:
+            result = prefix + "{ " + middle + "& }" + suffix
 
     return result
 
