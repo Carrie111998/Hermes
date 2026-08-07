@@ -1421,6 +1421,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 pr_number=int(payload.get("pr_number", 0)),
                 base_sha=str(payload.get("expected_base_sha", "")),
                 head_sha=str(payload.get("expected_head_sha", "")),
+                concise_review=static_route.get("review_evidence_mode") == "concise",
                 execution_attestation_public_key=public_key,
                 baseline_execution_gates=gate_ids,
                 execution_gate_policy_version=policy_version,

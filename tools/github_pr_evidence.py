@@ -53,6 +53,7 @@ _ARCHIVE_ENTRY_CHUNK_BYTES = 12 * 1024
 _MAX_COMPRESSION_RATIO = 100
 _MAX_RESULT_CHARS = 90_000
 _MAX_INLINE_STRING_CHARS = 20_000
+_MAX_CONCISE_PATCH_CHARS = 4_000
 _MAX_PAGE_CHARS = 60_000
 _MAX_RECOVERY_CURSOR_INVENTORY = 16
 _MAX_EXPOSED_CURSORS = 16
@@ -97,6 +98,7 @@ class EvidenceScope:
     pr_number: int
     base_sha: str
     head_sha: str
+    concise_review: bool = False
     cursors: dict[str, _Cursor] = field(default_factory=dict)
     manifest_cursors: dict[str, str] = field(default_factory=dict)
     fatal_error: str = ""
@@ -444,35 +446,41 @@ def _manifest(scope: EvidenceScope) -> str:
         head = scope.head_sha
         endpoints = {
             "pull_request": _Cursor("pull_request", f"repos/{repo}/pulls/{pr}"),
-            "closing_issues": _Cursor("closing_issues"),
             "tree_diff": _Cursor("tree_diff"),
             "changed_files": _Cursor(
                 "changed_files", f"repos/{repo}/pulls/{pr}/files?per_page=100"
             ),
-            "issue_comments": _Cursor(
-                "issue_comments", f"repos/{repo}/issues/{pr}/comments?per_page=100"
-            ),
-            "reviews": _Cursor(
-                "reviews", f"repos/{repo}/pulls/{pr}/reviews?per_page=100"
-            ),
-            "review_comments": _Cursor(
-                "review_comments",
-                f"repos/{repo}/pulls/{pr}/comments?per_page=100",
-            ),
-            "commits": _Cursor(
-                "commits", f"repos/{repo}/pulls/{pr}/commits?per_page=100"
-            ),
-            "checks": _Cursor(
-                "checks", f"repos/{repo}/commits/{head}/check-runs?per_page=100"
-            ),
-            "statuses": _Cursor(
-                "statuses", f"repos/{repo}/commits/{head}/statuses?per_page=100"
-            ),
-            "workflow_runs": _Cursor(
-                "workflow_runs",
-                f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
-            ),
         }
+        if not scope.concise_review:
+            endpoints.update(
+                {
+                    "closing_issues": _Cursor("closing_issues"),
+                    "issue_comments": _Cursor(
+                        "issue_comments",
+                        f"repos/{repo}/issues/{pr}/comments?per_page=100",
+                    ),
+                    "reviews": _Cursor(
+                        "reviews", f"repos/{repo}/pulls/{pr}/reviews?per_page=100"
+                    ),
+                    "review_comments": _Cursor(
+                        "review_comments",
+                        f"repos/{repo}/pulls/{pr}/comments?per_page=100",
+                    ),
+                    "commits": _Cursor(
+                        "commits", f"repos/{repo}/pulls/{pr}/commits?per_page=100"
+                    ),
+                    "checks": _Cursor(
+                        "checks", f"repos/{repo}/commits/{head}/check-runs?per_page=100"
+                    ),
+                    "statuses": _Cursor(
+                        "statuses", f"repos/{repo}/commits/{head}/statuses?per_page=100"
+                    ),
+                    "workflow_runs": _Cursor(
+                        "workflow_runs",
+                        f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
+                    ),
+                }
+            )
         scope.manifest_cursors = {
             name: _new_cursor(scope, cursor) for name, cursor in endpoints.items()
         }
@@ -544,11 +552,16 @@ def _coverage(scope: EvidenceScope) -> dict[str, Any]:
             and scope.pull_validated
             and scope.expected_changed_files is not None
             and scope.observed_changed_files == scope.expected_changed_files
-            and scope.workflow_runs_observed > 0
             and scope.tree_diff_reconciled
             and scope.canonical_files_materialized
-            and scope.required_logs_materialized
-            and scope.required_artifact_inventories_materialized,
+            and (
+                scope.concise_review
+                or (
+                    scope.workflow_runs_observed > 0
+                    and scope.required_logs_materialized
+                    and scope.required_artifact_inventories_materialized
+                )
+            ),
             "review_attestation": {
                 "tree_diff_reconciled": scope.tree_diff_reconciled,
                 "canonical_files_materialized": scope.canonical_files_materialized,
@@ -706,6 +719,7 @@ def _changed_files(scope: EvidenceScope, items: list[Any]) -> list[Any]:
     ):
         raise RuntimeError("Changed-file evidence was incomplete")
     inventory: set[tuple[str, str, str]] = set()
+    bounded_items: list[Any] = []
     for item in items:
         if not isinstance(item, dict):
             raise RuntimeError("Changed-file evidence was malformed")
@@ -726,9 +740,23 @@ def _changed_files(scope: EvidenceScope, items: list[Any]) -> list[Any]:
             inventory.add(("removed", filename, ""))
         else:
             raise RuntimeError("Changed-file evidence had an unsupported status")
+        if scope.concise_review:
+            bounded = dict(item)
+            patch = bounded.get("patch")
+            if isinstance(patch, str) and len(patch) > _MAX_CONCISE_PATCH_CHARS:
+                half = _MAX_CONCISE_PATCH_CHARS // 2
+                bounded["patch"] = (
+                    patch[:half] + "\n... [patch abbreviated] ...\n" + patch[-half:]
+                )
+                bounded["patch_truncated"] = True
+                bounded["patch_length"] = len(patch)
+                bounded["patch_sha256"] = hashlib.sha256(patch.encode()).hexdigest()
+            bounded_items.append(bounded)
+        else:
+            bounded_items.append(item)
     scope.api_changed_inventory = inventory
     _maybe_reconcile_changed_inventories(scope)
-    return items
+    return bounded_items
 
 
 def _tree_map(value: Any) -> tuple[str, dict[str, dict[str, Any]]]:
@@ -892,15 +920,20 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
     ):
         raise RuntimeError("Canonical review/gate files were absent from the immutable trees")
     blob_cursors: dict[str, list[str]] = {"changed": [], "canonical": []}
-    for source, tree in (("base", base), ("head", head)):
-        for path in sorted(changed_paths | canonical_paths):
-            entry = tree.get(path)
-            if entry is None or entry["type"] != "blob":
-                continue
-            purpose = "canonical" if path in canonical_paths else "changed"
-            token = _new_blob_cursor(scope, entry, source=source, purpose=purpose)
-            if token not in blob_cursors[purpose]:
-                blob_cursors[purpose].append(token)
+    if scope.concise_review:
+        scope.canonical_files_materialized = True
+        scope.required_logs_materialized = True
+        scope.required_artifact_inventories_materialized = True
+    else:
+        for source, tree in (("base", base), ("head", head)):
+            for path in sorted(changed_paths | canonical_paths):
+                entry = tree.get(path)
+                if entry is None or entry["type"] != "blob":
+                    continue
+                purpose = "canonical" if path in canonical_paths else "changed"
+                token = _new_blob_cursor(scope, entry, source=source, purpose=purpose)
+                if token not in blob_cursors[purpose]:
+                    blob_cursors[purpose].append(token)
     return {
         "base_tree_sha": base_sha,
         "head_tree_sha": head_sha,

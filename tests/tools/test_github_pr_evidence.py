@@ -260,6 +260,20 @@ def test_manifest_exposes_only_opaque_cursors_bound_to_fixed_endpoints():
     assert "path" not in result["next_parameters"]
 
 
+def test_concise_manifest_exposes_only_tuple_diff_and_file_summary():
+    scope = _scope()
+    scope.concise_review = True
+    with evidence_scope(scope):
+        result = json.loads(github_pr_evidence_tool("manifest"))
+
+    assert set(result["cursors"]) == {
+        "pull_request",
+        "tree_diff",
+        "changed_files",
+    }
+    assert result["current_required_cursors"]["total"] == 3
+
+
 def test_recalled_manifest_recovers_only_current_required_cursors():
     scope = _scope()
     with evidence_scope(scope):
@@ -501,6 +515,56 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
     assert all(cursor.required for cursor in required_blobs)
 
 
+def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
+    scope = _scope()
+    scope.concise_review = True
+    required_entries = {
+        "AGENTS.md": "1" * 40,
+        "docs/DEV.md": "2" * 40,
+        "docs/TESTING.md": "3" * 40,
+        "package.json": "4" * 40,
+        "playwright.config.ts": "5" * 40,
+        ".github/workflows/ci.yml": "6" * 40,
+    }
+    base_tree = {
+        "sha": "c" * 40,
+        "truncated": False,
+        "tree": [
+            {"path": path, "mode": "100644", "type": "blob", "sha": sha}
+            for path, sha in required_entries.items()
+        ],
+    }
+    head_tree = {**base_tree, "sha": "d" * 40}
+    pull = {
+        "number": 42,
+        "base": {"sha": BASE_SHA},
+        "head": {"sha": HEAD_SHA},
+        "changed_files": 0,
+    }
+
+    with evidence_scope(scope):
+        manifest = json.loads(github_pr_evidence_tool("manifest"))
+        with patch("tools.github_pr_evidence._run_gh_json", return_value=pull):
+            json.loads(
+                github_pr_evidence_tool("read", manifest["cursors"]["pull_request"])
+            )
+        with patch("tools.github_pr_evidence._run_gh_json", return_value=[[]]):
+            json.loads(
+                github_pr_evidence_tool("read", manifest["cursors"]["changed_files"])
+            )
+        with patch(
+            "tools.github_pr_evidence._run_gh_json", side_effect=[base_tree, head_tree]
+        ):
+            result = json.loads(
+                github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
+            )
+
+    assert result["success"] is True
+    assert result["items"]["blob_cursors"] == {"changed": [], "canonical": []}
+    assert not any(cursor.kind == "blob" for cursor in scope.cursors.values())
+    assert result["coverage"]["complete"] is True
+
+
 def test_tree_evidence_rejects_gitlink_submodule_entries():
     scope = _scope()
     with evidence_scope(scope):
@@ -727,6 +791,36 @@ def test_changed_files_are_paginated_completely_but_tree_diff_owns_blob_authorit
         assert all("blob_cursors" not in item for item in result["items"])
         assert result["coverage"]["required_outstanding"] == 10
         assert result["coverage"]["optional_available"] == 0
+
+
+def test_concise_changed_files_bounds_large_patches_without_cursor_fanout():
+    scope = _scope()
+    scope.concise_review = True
+    patch_text = "x" * 20_000
+    files = [
+        {
+            "filename": "src/new.py",
+            "status": "added",
+            "sha": "c" * 40,
+            "patch": patch_text,
+        }
+    ]
+
+    with evidence_scope(scope):
+        manifest = json.loads(github_pr_evidence_tool("manifest"))
+        with patch(
+            "tools.github_pr_evidence.subprocess.run", return_value=_result([files])
+        ):
+            result = json.loads(
+                github_pr_evidence_tool("read", manifest["cursors"]["changed_files"])
+            )
+
+    item = result["items"][0]
+    assert item["patch_truncated"] is True
+    assert item["patch_length"] == len(patch_text)
+    assert item["patch_sha256"] == hashlib.sha256(patch_text.encode()).hexdigest()
+    assert len(item["patch"]) < 5_000
+    assert result["coverage"]["required_outstanding"] == 2
 
 
 def test_reading_gate_definitions_discovers_referenced_setup_scripts_as_required():

@@ -282,6 +282,7 @@ class TestGitHubPREvidenceScope:
             {
                 "github-pr": {
                     "evidence": "github_pr",
+                    "review_evidence_mode": "concise",
                     "secret": "secret",
                     "script": "trusted-gate.py",
                     "deliver_extra": {"contract_version": "v2"},
@@ -296,6 +297,7 @@ class TestGitHubPREvidenceScope:
         scope = adapter._evidence_scope_for_route("github-pr", self.payload)
 
         assert scope is not None
+        assert scope.concise_review is True
         assert scope.tuple_dict == {
             "contract_version": "v2",
             "repository": "org/repo",
