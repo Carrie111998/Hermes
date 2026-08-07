@@ -19,6 +19,7 @@ Improvements over v2:
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import re
 import time
@@ -1363,6 +1364,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self.reset_adaptive_threshold()
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -1549,15 +1551,18 @@ class ContextCompressor(ContextEngine):
             # threshold_percent as a side effect) so the percent read below
             # is the floored value regardless of argument evaluation order.
             _ctx = self.context_length
-            # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even
-            # if the percentage would suggest a lower value (#14690 handles
-            # the degenerate small-window case inside the helper).
-            self._threshold_tokens = self._compute_threshold_tokens(
-                _ctx, self.threshold_percent, self.max_tokens,
-            )
-            # Apply absolute token cap (compression.threshold_tokens) —
-            # takes the lower of the ratio-based threshold and the cap.
-            self._apply_threshold_tokens_cap()
+            if getattr(self, "adaptive_context", False):
+                self._threshold_tokens = self.adaptive_threshold_for_working_set(0)
+            else:
+                # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even
+                # if the percentage would suggest a lower value (#14690 handles
+                # the degenerate small-window case inside the helper).
+                self._threshold_tokens = self._compute_threshold_tokens(
+                    _ctx, self.threshold_percent, self.max_tokens,
+                )
+                # Apply absolute token cap (compression.threshold_tokens) —
+                # takes the lower of the ratio-based threshold and the cap.
+                self._apply_threshold_tokens_cap()
         return self._threshold_tokens
 
     @threshold_tokens.setter
@@ -2071,14 +2076,20 @@ class ContextCompressor(ContextEngine):
         # passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        self.threshold_tokens = self._compute_threshold_tokens(
-            context_length, self.threshold_percent, self.max_tokens,
-        )
-        # Re-apply the absolute token cap so it survives model switches
-        # and fallback activations. The cap is a first-class config value
-        # stored on the compressor instance, not a one-time post-construction
-        # patch — this is why update_model() must re-apply it.
-        self._apply_threshold_tokens_cap()
+        # A model/route switch is an adaptive-governor hysteresis boundary.
+        # Recompute from the new effective input window so an allowance raised
+        # under a larger model can never leak into a smaller fallback route.
+        if self.adaptive_context:
+            self.reset_adaptive_threshold()
+        else:
+            self.threshold_tokens = self._compute_threshold_tokens(
+                context_length, self.threshold_percent, self.max_tokens,
+            )
+            # Re-apply the absolute token cap so it survives model switches
+            # and fallback activations. The cap is a first-class config value
+            # stored on the compressor instance, not a one-time post-construction
+            # patch — this is why update_model() must re-apply it.
+            self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
@@ -2144,6 +2155,38 @@ class ContextCompressor(ContextEngine):
     _ANTI_THRASH_RECOVERY_SECONDS = 300.0
 
     @staticmethod
+    def _coerce_positive_int(value: Any, default: int) -> int:
+        """Return a positive integer, rejecting bool/fractional config values."""
+        if isinstance(value, bool):
+            return default
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not number.is_integer() or number <= 0:
+            return default
+        return int(number)
+
+    @staticmethod
+    def _coerce_ratio(
+        value: Any,
+        default: float,
+        *,
+        minimum: float,
+        maximum: float,
+    ) -> float:
+        """Return a finite bounded ratio; malformed values use the default."""
+        if isinstance(value, bool):
+            return default
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(ratio):
+            return default
+        return max(minimum, min(ratio, maximum))
+
+    @staticmethod
     def _coerce_max_tokens(value: Any) -> int | None:
         """Normalize a max_tokens value to a positive int or None.
 
@@ -2189,6 +2232,152 @@ class ContextCompressor(ContextEngine):
             _effective_cap = min(self.threshold_tokens_cap, self.context_length)
             if _effective_cap < self.threshold_tokens:
                 self.threshold_tokens = _effective_cap
+
+    def _adaptive_hard_limit_tokens(self) -> int:
+        """Highest prompt trigger permitted by the route safety policy."""
+        effective_window = self.context_length - (self.max_tokens or 0)
+        if effective_window <= 0:
+            effective_window = self.context_length
+        hard_limit = max(1, int(effective_window * self.adaptive_hard_ratio))
+        if self.threshold_tokens_cap is not None:
+            hard_limit = min(
+                hard_limit,
+                min(self.threshold_tokens_cap, self.context_length),
+            )
+        return max(1, hard_limit)
+
+    def adaptive_threshold_for_working_set(self, working_set_tokens: int) -> int:
+        """Return the adaptive trigger for a protected working-set estimate.
+
+        The efficient base is intentionally not step-rounded.  Growth above the
+        base is rounded up to stable increments so the threshold does not move
+        on every small tool result.  The route hard limit is always final.
+        """
+        if not self.adaptive_context:
+            return self.threshold_tokens
+        hard_limit = self._adaptive_hard_limit_tokens()
+        base = min(self.adaptive_base_tokens, hard_limit)
+        working_set = max(0, int(working_set_tokens or 0))
+        if working_set <= base:
+            return base
+        desired = int(math.ceil(
+            (working_set * (1.0 + self.adaptive_headroom_ratio))
+            / self.adaptive_step_tokens
+        ) * self.adaptive_step_tokens)
+        return min(hard_limit, max(base, desired))
+
+    def estimate_protected_working_set_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        request_tokens: int | None = None,
+    ) -> int:
+        """Estimate system/summary/recent/current-turn tokens that must survive.
+
+        ``request_tokens`` should be the full request estimate when available.
+        The difference between it and the message estimate accounts for tool
+        schemas and any separately supplied system prompt.
+        """
+        if not messages:
+            return max(0, int(request_tokens or 0))
+
+        protected: set[int] = set()
+        message_count = len(messages)
+
+        # Leading system messages plus the compressor's configured head floor.
+        first_non_system = 0
+        while (
+            first_non_system < message_count
+            and messages[first_non_system].get("role") == "system"
+        ):
+            protected.add(first_non_system)
+            first_non_system += 1
+        head_count = self._effective_protect_first_n()
+        protected.update(
+            range(first_non_system, min(message_count, first_non_system + head_count))
+        )
+
+        # The rolling handoff summary remains essential even after head
+        # protection decays following the first compression boundary.
+        for index, message in enumerate(messages):
+            if self._is_context_summary_message(message):
+                protected.add(index)
+
+        # Preserve both the configured recent-message floor and the complete
+        # active user/tool group.  A large tool loop may span more than
+        # protect_last_n messages; starting at the latest real user instruction
+        # keeps that active task visible to the governor.
+        tail_start = max(0, message_count - max(0, self.protect_last_n))
+        actionable_users = [
+            index
+            for index, message in enumerate(messages)
+            if self._is_actionable_user_turn(message)
+        ]
+        if actionable_users:
+            user_floor = max(1, int(self.min_tail_user_messages or 1))
+            anchor = actionable_users[-min(user_floor, len(actionable_users))]
+            tail_start = min(tail_start, anchor)
+        protected.update(range(tail_start, message_count))
+
+        protected_messages = [
+            messages[index] for index in sorted(protected)
+        ]
+        protected_tokens = estimate_messages_tokens_rough(protected_messages)
+        if request_tokens is not None:
+            all_message_tokens = estimate_messages_tokens_rough(messages)
+            protected_tokens += max(0, int(request_tokens) - all_message_tokens)
+        return max(0, int(protected_tokens))
+
+    def refresh_adaptive_threshold(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        request_tokens: int | None = None,
+        protected_working_set_tokens: int | None = None,
+        allow_decrease: bool = False,
+    ) -> int:
+        """Raise the live trigger to fit the protected working set.
+
+        The trigger is hysteretic within a live context: ordinary refreshes can
+        raise it but cannot lower it.  A completed compaction, an idle-resume
+        boundary, or a model switch calls :meth:`reset_adaptive_threshold`.
+        """
+        if not self.adaptive_context:
+            return self.threshold_tokens
+        if protected_working_set_tokens is None:
+            protected_working_set_tokens = self.estimate_protected_working_set_tokens(
+                messages,
+                request_tokens=request_tokens,
+            )
+        working_set = max(0, int(protected_working_set_tokens or 0))
+        desired = self.adaptive_threshold_for_working_set(working_set)
+        current = self.threshold_tokens
+        effective = desired if allow_decrease else max(current, desired)
+        effective = min(effective, self._adaptive_hard_limit_tokens())
+        self._adaptive_working_set_tokens = working_set
+        if effective != current:
+            self._threshold_tokens = effective
+            self._tail_token_budget = None
+            logger.info(
+                "Adaptive context threshold %s: %,d -> %,d tokens "
+                "(protected working set ~%,d, hard limit %,d)",
+                "recalibrated" if allow_decrease and effective < current else "raised",
+                current,
+                effective,
+                working_set,
+                self._adaptive_hard_limit_tokens(),
+            )
+        return self.threshold_tokens
+
+    def reset_adaptive_threshold(self) -> int:
+        """Reset hysteresis at a compaction, idle, or model-switch boundary."""
+        if not getattr(self, "adaptive_context", False):
+            current = getattr(self, "_threshold_tokens", None)
+            return current if isinstance(current, int) else 0
+        self._adaptive_working_set_tokens = 0
+        self._threshold_tokens = None
+        self._tail_token_budget = None
+        return self.threshold_tokens
 
     @staticmethod
     def _effective_threshold_percent(
@@ -2269,6 +2458,11 @@ class ContextCompressor(ContextEngine):
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
+        adaptive_context: bool = False,
+        adaptive_base_tokens: int = 231_200,
+        adaptive_headroom_ratio: float = 0.20,
+        adaptive_step_tokens: int = 65_536,
+        adaptive_hard_ratio: float = 0.85,
         min_tail_user_messages: int = 1,
     ):
         self.model = model
@@ -2296,6 +2490,24 @@ class ContextCompressor(ContextEngine):
         # re-applied in update_model() so it survives model switches/fallbacks.
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(
             threshold_tokens_cap,
+        )
+        # Adaptive context governor (opt-in).  The static compression trigger
+        # remains the default for backward compatibility.  When enabled, the
+        # trigger starts at ``adaptive_base_tokens`` and can grow in fixed
+        # steps to fit the protected active working set, but never beyond the
+        # route's hard input-window safety ratio (or an explicit absolute cap).
+        self.adaptive_context = adaptive_context is True
+        self.adaptive_base_tokens = self._coerce_positive_int(
+            adaptive_base_tokens, 231_200,
+        )
+        self.adaptive_headroom_ratio = self._coerce_ratio(
+            adaptive_headroom_ratio, 0.20, minimum=0.0, maximum=1.0,
+        )
+        self.adaptive_step_tokens = self._coerce_positive_int(
+            adaptive_step_tokens, 65_536,
+        )
+        self.adaptive_hard_ratio = self._coerce_ratio(
+            adaptive_hard_ratio, 0.85, minimum=0.50, maximum=0.95,
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
@@ -2382,6 +2594,7 @@ class ContextCompressor(ContextEngine):
         self._threshold_tokens: int | None = None
         self._tail_token_budget: int | None = None
         self._max_summary_tokens: int | None = None
+        self._adaptive_working_set_tokens: int = 0
         self.compression_count = 0
 
         # The "initialized" log reports resolved token budgets, which would
@@ -6860,6 +7073,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         # future copy site cannot re-leak the marker into the child-session flush.
         _strip_persistence_markers(compressed)
         self._last_compression_made_progress = True
+        # A completed rewrite is a new working-set boundary.  Drop any
+        # allowance raised for the pre-compaction transcript; the next request
+        # will grow it again only when protected material requires the room.
+        self.reset_adaptive_threshold()
 
         # A successful compaction just freed the largest allocation a long
         # session ever drops (the compressed-away message dicts), which makes

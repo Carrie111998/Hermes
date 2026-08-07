@@ -305,6 +305,56 @@ def _should_idle_compact(
     return tokens > floor_tokens
 
 
+def _durable_idle_reference_ts(agent: Any) -> float:
+    """Return the persisted previous-activity timestamp when available.
+
+    Gateway turn setup resets ``_last_activity_ts`` for watchdog semantics, so
+    that volatile clock cannot measure a cross-turn idle gap reliably. The
+    SessionDB heartbeat is authoritative; CLI/test doubles without a usable
+    store retain the historical in-memory fallback.
+    """
+    fallback = getattr(agent, "_last_activity_ts", time.time())
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    getter = getattr(db, "get_session_activity", None)
+    if not session_id or not callable(getter):
+        return fallback
+    try:
+        activity = getter(session_id)
+        durable = activity.get("last_activity_at") if isinstance(activity, dict) else None
+        if isinstance(durable, (int, float)) and not isinstance(durable, bool):
+            return float(durable)
+    except Exception:
+        logger.debug(
+            "Durable idle activity lookup failed for session=%s",
+            session_id,
+            exc_info=True,
+        )
+    return fallback
+
+
+def _refresh_adaptive_context_threshold(
+    compressor: Any,
+    messages: List[Dict[str, Any]],
+    request_tokens: int,
+) -> int:
+    """Refresh the built-in adaptive governor; plugin engines stay untouched."""
+    if getattr(compressor, "adaptive_context", False) is True:
+        refresh = getattr(compressor, "refresh_adaptive_threshold", None)
+        if callable(refresh):
+            try:
+                return int(refresh(messages, request_tokens=request_tokens))
+            except Exception:
+                logger.warning(
+                    "Adaptive context threshold refresh failed; retaining current threshold",
+                    exc_info=True,
+                )
+    threshold = getattr(compressor, "threshold_tokens", 0)
+    if isinstance(threshold, int) and not isinstance(threshold, bool):
+        return threshold
+    return 0
+
+
 @dataclass
 class TurnContext:
     """Values produced by the turn prologue and consumed by the turn loop."""
@@ -663,15 +713,19 @@ def build_turn_context(
     # history up front so the rest of the conversation does not keep re-reading
     # a large stale context on every turn. This fires on elapsed wall-clock time
     # rather than size, so it complements (does not replace) the token-threshold
-    # preflight below. ``_last_activity_ts`` is the last time this turn loop did
-    # work; nothing has touched it yet this turn, so it measures the gap since
-    # the previous turn finished. The cheap gap pre-check gates the (more
-    # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+    # preflight below. SessionDB's durable activity heartbeat measures the gap
+    # across gateway agent-cache resets; the volatile watchdog timestamp is a
+    # fallback only. The cheap gap pre-check gates the token estimate.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if agent.compression_enabled and _idle_after > 0 and messages:
-        _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
+        _idle_gap = max(0.0, time.time() - _durable_idle_reference_ts(agent))
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
+            _reset_adaptive = getattr(_compressor, "reset_adaptive_threshold", None)
+            if getattr(_compressor, "adaptive_context", False) is True and callable(
+                _reset_adaptive
+            ):
+                _reset_adaptive()
             _idle_tokens = estimate_request_tokens_rough(
                 messages,
                 system_prompt=active_system_prompt or "",
@@ -679,8 +733,9 @@ def build_turn_context(
             )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
-            _idle_floor = int(
-                _compressor.threshold_tokens * _compressor.summary_target_ratio
+            _idle_floor = max(
+                int(_compressor.threshold_tokens * _compressor.summary_target_ratio),
+                int(getattr(agent, "compression_idle_compact_min_tokens", 0) or 0),
             )
             _idle_cooldown = getattr(
                 _compressor, "get_active_compression_failure_cooldown", lambda: None
@@ -757,6 +812,9 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        _refresh_adaptive_context_threshold(
+            _compressor, messages, _preflight_tokens
+        )
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
         # engine-preflight tests) and plugin context engines lack this
         # ContextCompressor-only method — absence means no snapshot, and the
@@ -919,6 +977,9 @@ def build_turn_context(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
+                )
+                _refresh_adaptive_context_threshold(
+                    _compressor, messages, _preflight_tokens
                 )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens

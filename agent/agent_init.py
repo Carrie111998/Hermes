@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -1979,6 +1980,47 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+
+    def _parse_bounded_float(raw, default, minimum, maximum):
+        if isinstance(raw, bool):
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        return max(minimum, min(value, maximum))
+
+    # Opt-in adaptive context governor. Existing installs retain the static
+    # ratio trigger until explicitly enabled.
+    compression_adaptive_context = is_truthy_value(
+        _compression_cfg.get("adaptive_context"), default=False
+    )
+    compression_adaptive_base_tokens = max(
+        1,
+        _parse_prune_int(
+            _compression_cfg.get("adaptive_base_tokens", 231_200), 231_200
+        ),
+    )
+    compression_adaptive_headroom_ratio = _parse_bounded_float(
+        _compression_cfg.get("adaptive_headroom_ratio", 0.20),
+        0.20,
+        0.0,
+        1.0,
+    )
+    compression_adaptive_step_tokens = max(
+        1,
+        _parse_prune_int(
+            _compression_cfg.get("adaptive_step_tokens", 65_536), 65_536
+        ),
+    )
+    compression_adaptive_hard_ratio = _parse_bounded_float(
+        _compression_cfg.get("adaptive_hard_ratio", 0.85),
+        0.85,
+        0.50,
+        0.95,
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2066,6 +2108,12 @@ def init_agent(
     # complements the size-based threshold above. Consumed by build_turn_context().
     compression_idle_compact_after_seconds = max(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
+    )
+    compression_idle_compact_min_tokens = max(
+        0,
+        _parse_prune_int(
+            _compression_cfg.get("idle_compact_min_tokens", 0), 0
+        ),
     )
 
     # Read optional explicit context_length override for the auxiliary
@@ -2496,6 +2544,11 @@ def init_agent(
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
+            adaptive_context=compression_adaptive_context,
+            adaptive_base_tokens=compression_adaptive_base_tokens,
+            adaptive_headroom_ratio=compression_adaptive_headroom_ratio,
+            adaptive_step_tokens=compression_adaptive_step_tokens,
+            adaptive_hard_ratio=compression_adaptive_hard_ratio,
             min_tail_user_messages=compression_min_tail_users,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
@@ -2521,6 +2574,7 @@ def init_agent(
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds
     )
+    agent.compression_idle_compact_min_tokens = compression_idle_compact_min_tokens
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

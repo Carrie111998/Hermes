@@ -1333,6 +1333,19 @@ class TestConfigNormalizationDoesNotOverwriteUserValues:
 
 
 
+class TestAdaptiveContextConfig:
+    """Adaptive governor defaults are explicit and behavior-neutral."""
+
+    def test_default_config_is_opt_in(self):
+        compression = DEFAULT_CONFIG["compression"]
+        assert compression["adaptive_context"] is False
+        assert compression["adaptive_base_tokens"] == 231_200
+        assert compression["adaptive_headroom_ratio"] == 0.20
+        assert compression["adaptive_step_tokens"] == 65_536
+        assert compression["adaptive_hard_ratio"] == 0.85
+        assert compression["idle_compact_min_tokens"] == 0
+
+
 class TestCodexAppServerAutoConfig:
     """codex_app_server_auto ships a default and survives migration untouched."""
 

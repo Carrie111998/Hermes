@@ -38,6 +38,7 @@ def _prep_idle_agent(db: SessionDB, session_id: str, *, idle_after: int = 60,
     agent = _build_agent_with_db(db, session_id)
     agent.compression_enabled = True
     agent.compression_idle_compact_after_seconds = idle_after
+    agent.compression_idle_compact_min_tokens = 0
     agent._last_activity_ts = time.time() - idle_gap
     # The idle block reads these from the compressor; give the MagicMock real
     # numbers so the floor computation and the preflight gate behave.
@@ -185,5 +186,79 @@ def test_idle_compaction_respects_anti_thrash_breaker(tmp_path: Path) -> None:
     assert len(ctx.messages) == len(_history()) + 1
 
 
+def test_idle_compaction_uses_durable_activity_after_gateway_clock_reset(
+    tmp_path: Path,
+) -> None:
+    """The gateway watchdog reset must not erase the durable idle gap."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_DURABLE_OLD"
+    db.create_session(sid, source="gateway")
+    db.touch_session_activity(
+        sid,
+        time.time() - 3600,
+        description="previous turn complete",
+    )
+    agent = _prep_idle_agent(db, sid, idle_after=60)
+    agent._last_activity_ts = time.time()  # gateway watchdog reset
 
+    _run_prologue(agent, _history())
+
+    agent.context_compressor.compress.assert_called_once()
+
+
+def test_recent_durable_activity_prevents_false_idle_compaction(
+    tmp_path: Path,
+) -> None:
+    """A recent durable stamp overrides a stale in-memory watchdog clock."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_DURABLE_RECENT"
+    db.create_session(sid, source="gateway")
+    db.touch_session_activity(
+        sid,
+        time.time(),
+        description="recent turn complete",
+    )
+    agent = _prep_idle_agent(db, sid, idle_after=60, idle_gap=3600)
+
+    _run_prologue(agent, _history())
+
+    agent.context_compressor.compress.assert_not_called()
+
+
+def test_idle_min_tokens_avoids_compacting_small_resumed_session(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = "IDLE_MIN_TOKENS"
+    db.create_session(sid, source="gateway")
+    db.touch_session_activity(
+        sid,
+        time.time() - 3600,
+        description="previous turn complete",
+    )
+    agent = _prep_idle_agent(db, sid, idle_after=60)
+    agent._last_activity_ts = time.time()
+    agent.compression_idle_compact_min_tokens = 128_000
+
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+         patch("agent.turn_context._should_run_preflight_estimate", return_value=False), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=100_000):
+        build_turn_context(
+            agent=agent,
+            user_message="hello again",
+            system_message=None,
+            conversation_history=_history(),
+            task_id=None,
+            stream_callback=None,
+            persist_user_message=None,
+            restore_or_build_system_prompt=lambda *a, **k: None,
+            install_safe_stdio=lambda: None,
+            sanitize_surrogates=lambda s: s,
+            summarize_user_message_for_log=lambda s: str(s),
+            set_session_context=lambda _sid: None,
+            set_current_write_origin=lambda _o: None,
+            ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *a, **k: None),
+        )
+
+    agent.context_compressor.compress.assert_not_called()
 

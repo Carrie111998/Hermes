@@ -85,6 +85,34 @@ class TestProactivePruneConfig:
         agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
         assert agent.context_compressor.proactive_prune_tokens == 0
 
+    def test_adaptive_context_defaults_off(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path)
+        cc = agent.context_compressor
+        assert cc.adaptive_context is False
+        assert cc.adaptive_base_tokens == 231_200
+        assert cc.adaptive_headroom_ratio == 0.20
+        assert cc.adaptive_step_tokens == 65_536
+        assert cc.adaptive_hard_ratio == 0.85
+        assert agent.compression_idle_compact_min_tokens == 0
 
-
+    def test_adaptive_context_values_are_wired_from_config(
+        self, monkeypatch, tmp_path
+    ):
+        agent = _make_agent(
+            monkeypatch,
+            tmp_path,
+            adaptive_context=True,
+            adaptive_base_tokens=200_000,
+            adaptive_headroom_ratio=0.25,
+            adaptive_step_tokens=32_768,
+            adaptive_hard_ratio=0.80,
+            idle_compact_min_tokens=128_000,
+        )
+        cc = agent.context_compressor
+        assert cc.adaptive_context is True
+        assert cc.adaptive_base_tokens == 200_000
+        assert cc.adaptive_headroom_ratio == 0.25
+        assert cc.adaptive_step_tokens == 32_768
+        assert cc.adaptive_hard_ratio == 0.80
+        assert agent.compression_idle_compact_min_tokens == 128_000
 

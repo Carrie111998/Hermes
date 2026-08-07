@@ -578,6 +578,11 @@ DEFAULT_CONFIG = {
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
+        "adaptive_context": False,    # opt-in protected-working-set governor
+        "adaptive_base_tokens": 231200,
+        "adaptive_headroom_ratio": 0.20,
+        "adaptive_step_tokens": 65536,
+        "adaptive_hard_ratio": 0.85,
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "min_tail_user_messages": 1,  # REAL (actionable) user messages guaranteed to
@@ -751,6 +756,8 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
+        "idle_compact_min_tokens": 0,  # Optional absolute size floor; 0 keeps
+                                      # threshold × target_ratio behavior.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).

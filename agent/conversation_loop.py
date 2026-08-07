@@ -40,6 +40,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
+    _refresh_adaptive_context_threshold,
     build_turn_context,
     compose_user_api_content,
     reanchor_current_turn_user_idx,
@@ -1938,6 +1939,9 @@ def run_conversation(
         # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
+        _refresh_adaptive_context_threshold(
+            _compressor, api_messages, request_pressure_tokens
+        )
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )

@@ -88,6 +88,12 @@ compression:
   target_ratio: 0.20         # How much of threshold to keep as tail (default: 0.20)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
   min_tail_user_messages: 1  # Real user messages guaranteed in the tail (default: 1)
+  adaptive_context: false    # Opt-in protected-working-set governor
+  adaptive_base_tokens: 231200
+  adaptive_headroom_ratio: 0.20
+  adaptive_step_tokens: 65536
+  adaptive_hard_ratio: 0.85
+  idle_compact_min_tokens: 0 # Optional absolute idle size floor
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
@@ -112,6 +118,12 @@ auxiliary:
 | `min_tail_user_messages` | `1` | ≥1 | Minimum number of REAL (actionable) user messages guaranteed to survive in the uncompressed tail. `1` = the existing single last-user anchor (behavior-preserving default). Raise to e.g. `3` to keep the last 3 real user turns verbatim even when bulky tool outputs fill the tail token budget. Blank platform echoes, compaction handoffs, and synthetic continuation rows never count toward N. The guarantee wins over the tail token budget — the tail may exceed the budget when the anchor pulls the cut back |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
 | `idle_compact_after_seconds` | `0` | ≥0 seconds | Opt-in: compact up front when a session resumes after this many seconds idle (0 = disabled). Skips when context ≤ threshold × target_ratio; honors cooldown/anti-thrash/lock guards |
+| `idle_compact_min_tokens` | `0` | ≥0 tokens | Absolute idle-compaction size floor; effective floor is max(this, threshold × target_ratio) |
+| `adaptive_context` | `false` | bool | Opt-in protected-working-set governor; static behavior is unchanged when false |
+| `adaptive_base_tokens` | `231200` | >0 | Efficient starting trigger for adaptive mode |
+| `adaptive_headroom_ratio` | `0.20` | 0.0-1.0 | Headroom above protected active material |
+| `adaptive_step_tokens` | `65536` | >0 | Increment used when raising the live trigger |
+| `adaptive_hard_ratio` | `0.85` | 0.50-0.95 | Final safety ceiling as a fraction of effective input window |
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
@@ -160,6 +172,19 @@ Plugin context engines can reuse the same resolution logic via
 `from agent.context_compressor import resolve_model_threshold`; engines that
 override `update_model()` own their own compaction policy and may ignore the
 map.
+
+### Adaptive context governor
+
+With `compression.adaptive_context: true`, Hermes starts at
+`adaptive_base_tokens` rather than treating a fixed threshold as a permanent
+ceiling. At each full request-pressure check it estimates the protected working
+set: system and tool-schema overhead, rolling handoff summary, configured head
+and tail, and the complete active user/tool group. The trigger grows to that
+estimate plus `adaptive_headroom_ratio`, rounded up by `adaptive_step_tokens`.
+It is hysteretic within the live context and resets after compaction, a
+qualifying idle resume, or a model/route switch. The final value is always
+bounded by `adaptive_hard_ratio × (context_length - max_tokens)` and by an
+explicit `threshold_tokens` cap when present.
 
 ### Codex gpt-5.5 threshold autoraise
 
@@ -218,9 +243,10 @@ max_summary_tokens   = min(200,000 × 0.05, 12,000) = 10,000
 ```
 
 :::note Threshold is derived from the MAIN model's context window
-`threshold_tokens` is always `threshold × context_length`, where `context_length`
-is the **main agent model's** context window — never the auxiliary/summary
-model's. On a 262,144-token model at the default `0.50`, the threshold is
+In static mode, `threshold_tokens` is `threshold × context_length`; in adaptive
+mode, its hard ceiling is derived from the effective input window. In both
+cases `context_length` is the **main agent model's** window — never the
+auxiliary/summary model's. On a 262,144-token model at the default `0.50`, the threshold is
 `262,144 × 0.50 = 131,072`. That number being close to a common "128K context"
 is a coincidence of the percentage, not a sign that the auxiliary model's window
 is the trigger. The auxiliary model's context window is a separate concern — see

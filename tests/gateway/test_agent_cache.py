@@ -122,6 +122,14 @@ class TestExtractCacheBustingConfig:
                     "codex_gpt55_autoraise": False,
                     "target_ratio": 0.3,
                     "protect_last_n": 25,
+                    "protect_first_n": 0,
+                    "idle_compact_after_seconds": 86400,
+                    "idle_compact_min_tokens": 128000,
+                    "adaptive_context": True,
+                    "adaptive_base_tokens": 231200,
+                    "adaptive_headroom_ratio": 0.20,
+                    "adaptive_step_tokens": 65536,
+                    "adaptive_hard_ratio": 0.85,
                     "codex_app_server_auto": "hermes",
                     "some_other_key": "ignored",
                 }
@@ -132,6 +140,14 @@ class TestExtractCacheBustingConfig:
         assert out["compression.codex_gpt55_autoraise"] is False
         assert out["compression.target_ratio"] == 0.3
         assert out["compression.protect_last_n"] == 25
+        assert out["compression.protect_first_n"] == 0
+        assert out["compression.idle_compact_after_seconds"] == 86400
+        assert out["compression.idle_compact_min_tokens"] == 128000
+        assert out["compression.adaptive_context"] is True
+        assert out["compression.adaptive_base_tokens"] == 231200
+        assert out["compression.adaptive_headroom_ratio"] == 0.20
+        assert out["compression.adaptive_step_tokens"] == 65536
+        assert out["compression.adaptive_hard_ratio"] == 0.85
         assert out["compression.codex_app_server_auto"] == "hermes"
 
 
