@@ -497,12 +497,51 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     contains solely token-body and control chars (a match that crosses into a
     different line's unrelated text, e.g. ``EXA_API_KEY=*** is rejected).
     """
-    stripped = _CONTROL_CHARS_RE.sub("", text)
+    # Full CSI / SGR sequences (``\x1b[...letter``). Stripped from the shadow
+    # copy before the bare control-char strip so a token like
+    # ``\x1b[32msk-AAA…BBB\x1b[0m`` collapses to ``sk-AAA…BBB`` and matches
+    # ``_PREFIX_RE`` — without this, the bare ESC strip leaves ``[32m``
+    # glued to the head and the ``[m`` byte defeats the prefix lookbehind
+    # (#81012). Reuses the shape from ``tools/ansi_strip.py`` (CSI only —
+    # OSC/DCS can carry arbitrary payloads and are not safe to delete from
+    # redaction shadow-copies; the bare-ESC strip below still handles them
+    # as control bytes).
+    _CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+    # First pass: build a single global shadow-copy of the text with every
+    # CSI sequence AND every bare control/zero-width char removed. The
+    # CSI-then-control order matters — stripping the bare ESC byte first
+    # would leave ``[32m`` glued to the head and the ``[m`` byte defeats
+    # the prefix lookbehind (#81012).
+    stripped = _CONTROL_CHARS_RE.sub("", _CSI_RE.sub("", text))
     if stripped == text:
         return text
-    orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
+
+    # The back-map from a position in ``stripped`` to the position in the
+    # original ``text`` is non-trivial because (a) a CSI sequence removes
+    # multiple chars per match and (b) ``_CONTROL_CHARS_RE`` removes one
+    # char per match. Build it iteratively so multi-char CSI deletions
+    # collapse correctly.
+    csi_spans = [m.span() for m in _CSI_RE.finditer(text)]
+    csi_positions = set()
+    for a, b in csi_spans:
+        for i in range(a, b):
+            csi_positions.add(i)
+
+    def _is_collapsible(idx: int) -> bool:
+        if idx in csi_positions:
+            return True
+        if _CONTROL_CHARS_RE.match(text[idx]):
+            return True
+        return False
+
+    orig_idx: list[int] = []
+    for i in range(len(text)):
+        if not _is_collapsible(i):
+            orig_idx.append(i)
+
     out = list(text)
-    matches = []
+    matches: list = []
     for m in _PREFIX_RE.finditer(stripped):
         body = m.group(1)
         start_orig = orig_idx[m.start(1)]
@@ -515,10 +554,10 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         # the self-matching fragment is handled by the ordinary prefix pass
         # (any remainder past the newline is left unmasked — accepted
         # residual to preserve line structure).
-        # For NON-newline controls (ESC, ZWSP, ...) the join proceeds even
-        # when a fragment self-matches: those bytes never legitimately sit
-        # between a token and adjacent prose, and skipping there let the
-        # non-matching remainder of a split token leak
+        # For NON-newline controls (ESC, ZWSP, CSI sequences) the join
+        # proceeds even when a fragment self-matches: those bytes never
+        # legitimately sit between a token and adjacent prose, and skipping
+        # there let the non-matching remainder of a split token leak
         # (``sk-<head>\x1b<tail>`` masked only the head).
         span = text[start_orig:end_orig]
         if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
@@ -528,10 +567,23 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         # token body, so the regex matched across unrelated lines). Also
         # reject when the match runs into a ``KEY=`` name: a real token value
         # is followed by a newline/space/end, not ``=``.
-        if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c)
-                for c in span)
-                and (end_orig >= len(text) or text[end_orig] != "=")):
-            matches.append((start_orig, end_orig, mask_fn(body)))
+        # A position is considered "collapsible" (i.e. safely erased in
+        # the shadow) when the original char is a token-body char, a bare
+        # control char, or part of a CSI sequence. CSI chars are
+        # permitted here even though they aren't in _TOKEN_BODY_CHARS —
+        # the shadow already erased them, and including them keeps the
+        # legacy "all-eraseable" invariant for split-token joins (#81012).
+        if not all(
+            c in _TOKEN_BODY_CHARS
+            or _CONTROL_CHARS_RE.match(c)
+            or (start_orig + i) in csi_positions
+            for i, c in enumerate(span)
+        ):
+            continue
+        if end_orig < len(text) and text[end_orig] == "=":
+            continue
+        matches.append((start_orig, end_orig, mask_fn(body)))
+
     for start_orig, end_orig, replacement in reversed(matches):
         out[start_orig:end_orig] = list(replacement)
     return "".join(out)
