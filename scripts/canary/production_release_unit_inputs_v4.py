@@ -74,6 +74,7 @@ _V3_COMPATIBILITY_FIELDS = frozenset(
         "discord_edge_receipt_public_key_id",
         "operational_edge_key_foundation_sha256",
         "operational_edge_receipt_public_key_ids",
+        "owner_gate_receipt_public_key_id",
         "discord_reconciliation_intent",
         "release_owner_uid",
         "release_owner_gid",

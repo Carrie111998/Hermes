@@ -46,6 +46,7 @@ from scripts.canary import passkey_v2_storage_growth as storage
 from scripts.canary import passkey_v2_upstream_sync as upstream_sync
 from scripts.canary import passkey_v2_production_storage_growth as production_storage
 from scripts.canary import passkey_v2_sensitive_report as sensitive_report
+from scripts.canary import passkey_v2_sensitive_report_transport as sensitive_transport
 from scripts.canary import production_cutover_passkey as production_cutover
 from scripts.canary import owner_gate_firewall_readiness as firewall
 from scripts.canary import storage_growth_evidence as growth_evidence
@@ -101,6 +102,8 @@ SERVICE_OPERATION_RESPONSE_TIMEOUT_SECONDS = {
     "verify": 30.0,
     "create_request": 30.0,
     "consume": 30.0,
+    "sensitive_create": 30.0,
+    "sensitive_consume": 30.0,
     "preflight": 30.0,
     "execute": 240.0,
     "terminal": 10.0,
@@ -262,6 +265,7 @@ _OPTIONS_PATH = re.compile(
 _VERIFY_PATH = re.compile(
     r"^/approve/([A-Za-z0-9_-]{32,64})/verify$"
 )
+_SENSITIVE_RELAY_PATH = "/internal/sensitive-report"
 
 _SEAL_FIELDS = frozenset({
     "schema",
@@ -1059,6 +1063,8 @@ def build_service_frame(
         "verify",
         "create_request",
         "consume",
+        "sensitive_create",
+        "sensitive_consume",
         "preflight",
         "execute",
         "terminal",
@@ -1434,6 +1440,7 @@ def handle_authority_frame(
     signer: ReceiptSigner,
     peer_uid: int,
     now_unix: int,
+    writer_public_key: Ed25519PublicKey | None = None,
 ) -> Mapping[str, Any]:
     frame = validate_service_frame(value)
     operation = frame["operation"]
@@ -1535,6 +1542,119 @@ def handle_authority_frame(
                 "action_envelope": state["action_envelope"],
                 "challenge_record": state["challenge_record"],
                 "grant_record": state["grant_record"],
+            }
+    elif operation in {"sensitive_create", "sensitive_consume"}:
+        if peer_uid != WEB_UID or writer_public_key is None:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_sensitive_relay_peer_forbidden"
+            )
+        relay_operation = (
+            "create" if operation == "sensitive_create" else "consume"
+        )
+        frame, capability, intent = sensitive_transport.validate_frame(
+            document,
+            writer_key_id=protocol.sha256_bytes(
+                writer_public_key.public_bytes_raw()
+            ),
+            writer_public_key=writer_public_key,
+            now_unix=now_unix,
+        )
+        if frame["operation"] != relay_operation:
+            raise PasskeyV2ServiceError(
+                "passkey_v2_sensitive_relay_operation_invalid"
+            )
+        release_revision = _release_revision()
+        (_runtime, manifest_sha256, host_receipt_sha256, _trust) = (
+            _local_cutover_authority_binding(
+                release_revision,
+                protocol.GENESIS_JOURNAL_HEAD_SHA256,
+            )
+        )
+        token = sensitive_transport.retrieval_token(
+            frame["capability_envelope"]
+        )
+        action = sensitive_report.build_action_envelope(
+            capability=capability,
+            intent=intent,
+            retrieval_token=token,
+            request_id=str(frame["request_id"]),
+            executor_release_sha=release_revision,
+            authority_release_sha=release_revision,
+            authority_manifest_sha256=manifest_sha256,
+            authority_host_receipt_sha256=host_receipt_sha256,
+            source_preflight_sha256=capability["arguments_sha256"],
+            live_projection_sha256=protocol.sha256_json(intent),
+            prior_authoritative_receipt_sha256=(
+                protocol.GENESIS_JOURNAL_HEAD_SHA256
+            ),
+            prior_event_head_sha256=protocol.GENESIS_JOURNAL_HEAD_SHA256,
+            issued_at_unix=capability["issued_at_unix_ms"] // 1000,
+        )
+        try:
+            state = authority.read_request_state(action["request_id"])
+            if state["action_envelope"] != action:
+                raise PasskeyV2ServiceError(
+                    "passkey_v2_sensitive_relay_request_conflict"
+                )
+        except PasskeyV2SqliteDenied as exc:
+            if relay_operation != "create":
+                raise PasskeyV2ServiceError(
+                    "passkey_v2_sensitive_relay_request_missing"
+                ) from exc
+            authority.create_request(action)
+            challenge = protocol.build_challenge_record(
+                envelope=action,
+                challenge_id=base64.urlsafe_b64encode(secrets.token_bytes(24))
+                .rstrip(b"=")
+                .decode("ascii"),
+                challenge_b64url=base64.urlsafe_b64encode(secrets.token_bytes(32))
+                .rstrip(b"=")
+                .decode("ascii"),
+                rp_id=protocol.PRODUCTION_RP_ID,
+                origin=protocol.PRODUCTION_ORIGIN,
+                created_at_unix=now_unix,
+            )
+            authority.create_challenge(challenge, envelope=action)
+            state = authority.read_request_state(action["request_id"])
+        approval_url = (
+            f"{protocol.PRODUCTION_ORIGIN}/approve/{action['request_id']}"
+        )
+        if relay_operation == "create" or state["grant_record"] is None:
+            result = {
+                "schema": sensitive_transport.RESPONSE_SCHEMA,
+                "operation": relay_operation,
+                "state": (
+                    "granted" if state["grant_record"] is not None else "pending"
+                ),
+                "request_id": action["request_id"],
+                "approval_url": approval_url,
+                "action_envelope": state["action_envelope"],
+                "challenge_record": state["challenge_record"],
+                "grant_record": state["grant_record"],
+                "authorization_receipt": None,
+            }
+        else:
+            consume_attempt_id = hashlib.sha256(
+                b"muncho-sensitive-report-consume.v1\x00"
+                + protocol.canonical_json_bytes(frame)
+            ).hexdigest()
+            consumed = authority.consume_or_replay(
+                envelope=state["action_envelope"],
+                runtime_binding=frame["runtime_binding"],
+                consume_attempt_id=consume_attempt_id,
+                signer=signer,
+                now_unix=now_unix,
+            )
+            result = {
+                "schema": sensitive_transport.RESPONSE_SCHEMA,
+                "operation": "consume",
+                "state": "authorized",
+                "request_id": action["request_id"],
+                "approval_url": approval_url,
+                "action_envelope": state["action_envelope"],
+                "challenge_record": state["challenge_record"],
+                "grant_record": state["grant_record"],
+                "authorization_receipt": consumed.receipt,
             }
     else:
         raise PasskeyV2ServiceError("passkey_v2_authority_operation_forbidden")
@@ -2527,6 +2647,8 @@ def validate_web_request(
         route, request_id = "options", match.group(1)
     elif method == "GET" and path == "/static/approve.js":
         route, request_id = "javascript", None
+    elif method == "POST" and path == _SENSITIVE_RELAY_PATH:
+        route, request_id = "sensitive_relay", None
     elif method == "POST" and (match := _VERIFY_PATH.fullmatch(path)):
         route, request_id = "verify", match.group(1)
     else:
@@ -2535,6 +2657,19 @@ def validate_web_request(
         if body:
             raise PasskeyV2ServiceError("passkey_v2_web_get_body_forbidden")
         return route, request_id, None
+    if route == "sensitive_relay":
+        if (
+            normalized.get("content-type") != "application/json"
+            or normalized.get("x-muncho-relay") != "sensitive-report-v1"
+            or normalized.get("origin") is not None
+            or len(body) > MAX_HTTP_BODY_BYTES
+        ):
+            raise PasskeyV2ServiceError(
+                "passkey_v2_sensitive_relay_headers_invalid"
+            )
+        return route, None, decode_strict_json(
+            body, maximum=MAX_HTTP_BODY_BYTES
+        )
     if (
         normalized.get("origin") != protocol.PRODUCTION_ORIGIN
         or normalized.get("content-type") != "application/json"
@@ -2661,6 +2796,23 @@ def create_web_app(config: Mapping[str, Any]) -> Any:
                 media_type="application/javascript",
                 headers=headers,
             )
+        if route == "sensitive_relay":
+            assert parsed is not None
+            relay_operation = parsed.get("operation")
+            operation = {
+                "create": "sensitive_create",
+                "consume": "sensitive_consume",
+            }.get(relay_operation)
+            if operation is None:
+                raise PasskeyV2ServiceError(
+                    "passkey_v2_sensitive_relay_operation_invalid"
+                )
+            document = await run_in_threadpool(
+                client.call,
+                operation,
+                parsed,
+            )
+            return JSONResponse(document, headers=headers)
         assert request_id is not None
         if route == "render":
             await run_in_threadpool(
@@ -2719,6 +2871,32 @@ def _load_receipt_signer() -> ReceiptSigner:
     if not isinstance(key, Ed25519PrivateKey):
         raise PasskeyV2ServiceError("passkey_v2_signing_key_invalid")
     return ReceiptSigner(key)
+
+
+def _load_writer_public_key(expected_key_id: str) -> Ed25519PublicKey:
+    root = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not root or not os.path.isabs(root):
+        raise PasskeyV2ServiceError(
+            "passkey_v2_writer_credential_unavailable"
+        )
+    raw, _metadata = _read_regular_file(
+        Path(root) / "writer-public-key", maximum=16 * 1024
+    )
+    try:
+        key = serialization.load_pem_public_key(raw)
+    except (TypeError, ValueError):
+        raise PasskeyV2ServiceError(
+            "passkey_v2_writer_public_key_invalid"
+        ) from None
+    if not isinstance(key, Ed25519PublicKey):
+        raise PasskeyV2ServiceError("passkey_v2_writer_public_key_invalid")
+    if (
+        _SHA256.fullmatch(expected_key_id) is None
+        or hashlib.sha256(key.public_bytes_raw()).hexdigest()
+        != expected_key_id
+    ):
+        raise PasskeyV2ServiceError("passkey_v2_writer_public_key_invalid")
+    return key
 
 
 def _load_executor_public_key(config: Mapping[str, Any]) -> Ed25519PublicKey:
@@ -3121,7 +3299,7 @@ def authority_main(argv: Sequence[str]) -> int:
         exact_path=AUTHORITY_CONFIG,
         schema="muncho-owner-gate-authority-config.v1",
         fields=frozenset({
-            "schema", "database", "executor_socket", "origin", "owner_discord_user_id", "rp_id", "sqlite_journal_mode", "sqlite_synchronous", "totp_dangerous_actions_enabled"
+            "schema", "database", "executor_socket", "origin", "owner_discord_user_id", "rp_id", "sqlite_journal_mode", "sqlite_synchronous", "totp_dangerous_actions_enabled", "writer_capability_public_key_id"
         }),
     )
     if (
@@ -3133,6 +3311,10 @@ def authority_main(argv: Sequence[str]) -> int:
         or config["sqlite_journal_mode"] != "DELETE"
         or config["sqlite_synchronous"] != "FULL"
         or config["totp_dangerous_actions_enabled"] is not False
+        or _SHA256.fullmatch(
+            str(config["writer_capability_public_key_id"])
+        )
+        is None
     ):
         raise PasskeyV2ServiceError("passkey_v2_authority_config_invalid")
     authority = PasskeyV2AuthorityDatabase(
@@ -3141,6 +3323,9 @@ def authority_main(argv: Sequence[str]) -> int:
         authority_gid=AUTHORITY_UID,
     )
     signer = _load_receipt_signer()
+    writer_public_key = _load_writer_public_key(
+        str(config["writer_capability_public_key_id"])
+    )
     return _serve_activated_socket(
         lambda value, peer: handle_authority_frame(
             value,
@@ -3148,6 +3333,7 @@ def authority_main(argv: Sequence[str]) -> int:
             signer=signer,
             peer_uid=peer,
             now_unix=int(time.time()),
+            writer_public_key=writer_public_key,
         ),
         expected_path=AUTHORITY_SOCKET,
         expected_name="passkey-authority",

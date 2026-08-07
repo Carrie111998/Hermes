@@ -29,6 +29,8 @@ from gateway.operational_edge_protocol import (
     operational_command_sha256,
     sha256_json,
 )
+from scripts.canary import passkey_v2_sensitive_report as sensitive_report
+from scripts.canary import passkey_v2_sensitive_report_transport as sensitive_transport
 
 
 DEFAULT_CLIENT_CONFIG = Path("/etc/muncho/operational-edge-client.json")
@@ -187,6 +189,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     capability = None
+    intent = OperationalIntent.from_mapping(
+        {
+            "operation_id": operation.operation_id,
+            "arguments": arguments,
+            "arguments_sha256": sha256_json(arguments),
+            "idempotency_key": args.idempotency_key,
+        }
+    )
     if args.capability_file is not None:
         if operation.access is not OperationalAccess.MUTATION:
             raise SystemExit(
@@ -196,26 +206,74 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.capability_file, maximum=128 * 1024, allowed_modes={0o400, 0o440, 0o444, 0o600, 0o640}
         )
     if operation.access is OperationalAccess.MUTATION and capability is None:
-        intent = OperationalIntent.from_mapping(
-            {
-                "operation_id": operation.operation_id,
-                "arguments": arguments,
-                "arguments_sha256": sha256_json(arguments),
-                "idempotency_key": args.idempotency_key,
-            }
-        )
         capability = _consume_approved_capability(intent)
+    step_up_authorization = None
+    if operation.operation_id == sensitive_report.OPERATION_ID:
+        if not isinstance(capability, Mapping):
+            raise SystemExit("sensitive report capability unavailable")
+        owner_gate = sensitive_transport.SensitiveReportOwnerGateClient()
+        create_frame = sensitive_transport.build_frame(
+            operation="create",
+            capability_envelope=capability,
+            intent=intent,
+        )
+        state = owner_gate.call(create_frame)
+        if (
+            state.get("schema") != sensitive_transport.RESPONSE_SCHEMA
+            or state.get("operation") != "create"
+            or state.get("request_id") != create_frame["request_id"]
+            or state.get("state") not in {"pending", "granted"}
+            or not isinstance(state.get("approval_url"), str)
+            or not isinstance(state.get("action_envelope"), Mapping)
+        ):
+            raise SystemExit("sensitive report owner gate response invalid")
+        if state["state"] == "pending":
+            print(json.dumps({
+                "schema": "muncho-sensitive-report-step-up-required.v1",
+                "outcome": "step_up_required",
+                "approval_url": state["approval_url"],
+                "request_id": state["request_id"],
+                "authenticated_discord_user_id": (
+                    state["action_envelope"]["requester_discord_user_id"]
+                ),
+                "case_id": state["action_envelope"]["case_id"],
+                "secret_material_included": False,
+            }, ensure_ascii=False, sort_keys=True))
+            return 3
+        runtime = sensitive_transport.build_runtime_binding(
+            action_envelope=state["action_envelope"],
+            capability_envelope=capability,
+            intent=intent,
+        )
+        consume_frame = sensitive_transport.build_frame(
+            operation="consume",
+            capability_envelope=capability,
+            intent=intent,
+            runtime_binding=runtime,
+        )
+        consumed = owner_gate.call(consume_frame)
+        if consumed.get("state") != "authorized":
+            raise SystemExit("sensitive report passkey approval pending")
+        step_up_authorization = sensitive_transport.step_up_bundle(
+            response=consumed,
+            capability_envelope=capability,
+        )
     config = _config(args.config, operation.domain)
     provider = AttestedMainPidFileProvider(
         Path("/run/muncho-operational-edge") / operation.domain / "mainpid.json",
         domain=operation.domain,
     )
     client = OperationalEdgeClient(config, main_pid_provider=provider)
+    invoke_options = {
+        "idempotency_key": args.idempotency_key,
+        "capability": capability,
+    }
+    if step_up_authorization is not None:
+        invoke_options["step_up_authorization"] = step_up_authorization
     receipt = client.invoke(
         operation.operation_id,
         arguments,
-        idempotency_key=args.idempotency_key,
-        capability=capability,
+        **invoke_options,
     )
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
     return 0 if receipt.get("outcome") == "succeeded" else 2

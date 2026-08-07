@@ -29,7 +29,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
-PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
+PROTOCOL_SCHEMA = "muncho-operational-edge-request.v2"
+LEGACY_PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
 CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v3"
 RECEIPT_SCHEMA = "muncho-operational-edge-receipt.v2"
 PREDISPATCH_MUTATION_BLOCKERS = frozenset(
@@ -417,6 +418,7 @@ class OperationalRequest:
     deadline_unix_ms: int
     intent: OperationalIntent
     capability: SignedEnvelope | None
+    step_up_authorization: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(
@@ -425,22 +427,18 @@ class OperationalRequest:
         *,
         now_unix_ms: int | None = None,
     ) -> "OperationalRequest":
-        raw = _exact(
-            value,
-            frozenset(
-                {
-                    "schema",
-                    "request_id",
-                    "sequence",
-                    "deadline_unix_ms",
-                    "intent",
-                    "capability",
-                }
-            ),
-            "invalid_request",
-        )
-        if raw["schema"] != PROTOCOL_SCHEMA:
+        if not isinstance(value, Mapping):
+            _fail("invalid_request")
+        schema = value.get("schema")
+        fields = {
+            "schema", "request_id", "sequence", "deadline_unix_ms",
+            "intent", "capability",
+        }
+        if schema == PROTOCOL_SCHEMA:
+            fields.add("step_up_authorization")
+        elif schema != LEGACY_PROTOCOL_SCHEMA:
             _fail("invalid_request_schema")
+        raw = _exact(value, frozenset(fields), "invalid_request")
         sequence = raw["sequence"]
         if type(sequence) is not int or not 0 <= sequence < (1 << 63):
             _fail("invalid_sequence")
@@ -461,6 +459,22 @@ class OperationalRequest:
             deadline_unix_ms=deadline,
             intent=OperationalIntent.from_mapping(raw["intent"]),
             capability=capability,
+            step_up_authorization=(
+                None
+                if schema == LEGACY_PROTOCOL_SCHEMA
+                or raw["step_up_authorization"] is None
+                else dict(
+                    _exact(
+                        raw["step_up_authorization"],
+                        frozenset({
+                            "schema", "retrieval_token_b64", "action_envelope",
+                            "challenge_record", "grant_record",
+                            "authorization_receipt",
+                        }),
+                        "invalid_step_up_authorization",
+                    )
+                )
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -471,6 +485,11 @@ class OperationalRequest:
             "deadline_unix_ms": self.deadline_unix_ms,
             "intent": self.intent.to_mapping(),
             "capability": self.capability.to_mapping() if self.capability else None,
+            "step_up_authorization": (
+                None
+                if self.step_up_authorization is None
+                else dict(self.step_up_authorization)
+            ),
         }
 
 

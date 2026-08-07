@@ -22,14 +22,23 @@ import cbor2
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 
+from gateway import operational_edge_service as edge_service
 from gateway.operational_edge_protocol import (
     OperationalCapability,
     OperationalIntent,
+    OperationalRequest,
+    SignedEnvelope,
     sha256_json,
+    sign_envelope,
+)
+from gateway.operational_edge_service import (
+    OperationalEdgeService,
+    OperationalEdgeServiceError,
 )
 from scripts.canary import passkey_v2_enrollment as enrollment
 from scripts.canary import passkey_v2_protocol as protocol
 from scripts.canary import passkey_v2_sensitive_report as sensitive
+from scripts.canary import passkey_v2_sensitive_report_transport as transport
 from scripts.canary import passkey_v2_service as service
 from scripts.canary import passkey_v2_webauthn as webauthn
 from scripts.canary.passkey_v2_signer import ReceiptSigner
@@ -285,6 +294,193 @@ def test_ivs_passkey_authorizes_only_her_exact_query_and_replays_safely(
             now_unix=NOW + 5,
         )
     journal.close()
+
+
+def test_cloud_relay_to_phone_passkey_to_exact_query_bundle_is_real_and_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the disposable HTTPS payload through the sealed authority."""
+
+    intent = _intent()
+    capability = _capability(intent)
+    writer_private = ed25519.Ed25519PrivateKey.generate()
+    writer_key_id = hashlib.sha256(
+        writer_private.public_key().public_bytes_raw()
+    ).hexdigest()
+    capability_envelope = sign_envelope(
+        capability.to_mapping(),
+        key_id=writer_key_id,
+        private_key=writer_private,
+    ).to_mapping()
+    create_frame = transport.build_frame(
+        operation="create",
+        capability_envelope=capability_envelope,
+        intent=intent,
+    )
+
+    database_path = tmp_path / "authority.sqlite3"
+    bootstrap_authority_database(
+        database_path,
+        authority_uid=os.getuid(),
+        authority_gid=os.getgid(),
+        now_unix=NOW - 1,
+        require_root=False,
+    )
+    authority = PasskeyV2AuthorityDatabase(
+        database_path,
+        authority_uid=os.getuid(),
+        authority_gid=os.getgid(),
+    )
+    receipt_signer = ReceiptSigner(ed25519.Ed25519PrivateKey.generate())
+    monkeypatch.setattr(service, "_release_revision", lambda: "a" * 40)
+    monkeypatch.setattr(
+        service,
+        "_local_cutover_authority_binding",
+        lambda _revision, _plan: ({}, "b" * 64, "c" * 64, {}),
+    )
+
+    create_response = service.validate_service_response(
+        service.handle_authority_frame(
+            service.build_service_frame("sensitive_create", create_frame),
+            authority=authority,
+            signer=receipt_signer,
+            peer_uid=service.WEB_UID,
+            now_unix=NOW,
+            writer_public_key=writer_private.public_key(),
+        ),
+        expected_operation="sensitive_create",
+    )
+    assert create_response["state"] == "pending"
+    assert create_response["approval_url"] == (
+        f"{protocol.PRODUCTION_ORIGIN}/approve/{create_frame['request_id']}"
+    )
+    create_json = json.dumps(create_response, sort_keys=True)
+    assert _b64(transport.retrieval_token(capability_envelope)) not in create_json
+    assert "retrieval_token_b64" not in create_json
+
+    action = create_response["action_envelope"]
+    challenge = create_response["challenge_record"]
+    credential, assertion = _credential_and_assertion(
+        owner=IVS,
+        action=action,
+        challenge=challenge,
+        credential_id=b"ivs-cloud-phone-passkey",
+    )
+    authority.import_migrated_credential(credential)
+    grant = authority.verify_assertion_and_record_grant(
+        assertion=assertion,
+        envelope=action,
+        challenge=challenge,
+        grant_id="G" * 32,
+        now_unix=NOW + 1,
+    )
+    assert grant["approver_discord_user_id"] == IVS
+
+    runtime = transport.build_runtime_binding(
+        action_envelope=action,
+        capability_envelope=capability_envelope,
+        intent=intent,
+    )
+    consume_frame = transport.build_frame(
+        operation="consume",
+        capability_envelope=capability_envelope,
+        intent=intent,
+        runtime_binding=runtime,
+    )
+    consume_response = service.validate_service_response(
+        service.handle_authority_frame(
+            service.build_service_frame("sensitive_consume", consume_frame),
+            authority=authority,
+            signer=receipt_signer,
+            peer_uid=service.WEB_UID,
+            now_unix=NOW + 2,
+            writer_public_key=writer_private.public_key(),
+        ),
+        expected_operation="sensitive_consume",
+    )
+    bundle = transport.step_up_bundle(
+        response=consume_response,
+        capability_envelope=capability_envelope,
+    )
+    receipt = sensitive.validate_authorization_receipt(
+        receipt=bundle["authorization_receipt"],
+        envelope=bundle["action_envelope"],
+        grant=bundle["grant_record"],
+        challenge=bundle["challenge_record"],
+        receipt_public_key=receipt_signer.public_key,
+        intent=intent,
+        capability=capability,
+        now_unix=NOW + 3,
+    )
+    assert receipt["approver_discord_user_id"] == IVS
+    assert sensitive.require_retrieval_token(
+        bundle["action_envelope"],
+        base64.b64decode(bundle["retrieval_token_b64"], validate=True),
+    )["action_payload"]["normalized_query_sha256"] == (
+        sensitive.normalized_query_sha256(intent.arguments["query"])
+    )
+
+    edge = object.__new__(OperationalEdgeService)
+    edge.config = SimpleNamespace(release_revision="a" * 40)
+    edge.owner_gate_receipt_public_key = receipt_signer.public_key
+    edge.sensitive_report_journal = sensitive.SensitiveReportAuthorizationJournal(
+        tmp_path / "edge" / "journal.sqlite3"
+    )
+    operational_request = OperationalRequest(
+        request_id="90ddf0ef-5919-46f4-b39a-c61f28e582cd",
+        sequence=0,
+        deadline_unix_ms=(NOW + 30) * 1000,
+        intent=intent,
+        capability=SignedEnvelope.from_mapping(
+            capability_envelope,
+            code="test_capability_invalid",
+        ),
+        step_up_authorization=bundle,
+    )
+    monkeypatch.setattr(edge_service.time, "time", lambda: NOW + 3)
+    edge._authorize_sensitive_report(operational_request, capability)
+    assert edge.sensitive_report_journal.consume_once(
+        receipt_sha256=receipt["receipt_sha256"],
+        intent=intent,
+        now_unix=NOW + 4,
+    ) == "replayed_same_intent"
+
+    changed_arguments = {**intent.arguments, "query": "SELECT 2"}
+    changed_intent = OperationalIntent(
+        operation_id=intent.operation_id,
+        arguments=changed_arguments,
+        arguments_sha256=sha256_json(changed_arguments),
+        idempotency_key=intent.idempotency_key,
+    )
+    with pytest.raises(
+        transport.SensitiveReportTransportError,
+        match="operation_invalid",
+    ):
+        transport.validate_frame(
+            transport.build_frame(
+                operation="create",
+                capability_envelope=capability_envelope,
+                intent=changed_intent,
+            ),
+            writer_key_id=writer_key_id,
+            writer_public_key=writer_private.public_key(),
+            now_unix=NOW,
+        )
+    changed_request = OperationalRequest(
+        request_id="af8f2ec3-e1e6-40c4-8d37-b8e37f9c2c68",
+        sequence=1,
+        deadline_unix_ms=(NOW + 30) * 1000,
+        intent=changed_intent,
+        capability=operational_request.capability,
+        step_up_authorization=bundle,
+    )
+    with pytest.raises(
+        OperationalEdgeServiceError,
+        match="sensitive_report_step_up_invalid",
+    ):
+        edge._authorize_sensitive_report(changed_request, capability)
+    edge.sensitive_report_journal.close()
 
 
 def test_cross_user_and_query_drift_fail_closed() -> None:

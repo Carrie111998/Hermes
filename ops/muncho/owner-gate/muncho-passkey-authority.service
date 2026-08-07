@@ -10,6 +10,7 @@ Group=muncho-passkey-authority
 ExecStartPre=/usr/bin/sha256sum --check --status /etc/muncho-owner-gate/python3.sha256
 ExecStart=/opt/muncho-owner-gate/current/venv/bin/python -I -B /opt/muncho-owner-gate/current/bin/muncho-passkey-v2-authority serve-authority --config /etc/muncho-owner-gate/authority.json --socket-activation
 LoadCredential=receipt-signing-key:/etc/muncho-owner-gate/keys/receipt-signing-key.pem
+LoadCredential=writer-public-key:/etc/muncho-owner-gate/public/writer-capability-public.pem
 Restart=on-failure
 RestartSec=2s
 UMask=0077

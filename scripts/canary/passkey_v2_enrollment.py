@@ -72,6 +72,15 @@ def _fail(code: str) -> None:
     raise PasskeyV2EnrollmentError(code)
 
 
+def _effective_identity() -> tuple[int, int]:
+    """Return the POSIX owner identity or fail closed on unsupported hosts."""
+    get_euid = getattr(os, "geteuid", None)
+    get_egid = getattr(os, "getegid", None)
+    if not callable(get_euid) or not callable(get_egid):
+        _fail("passkey_v2_enrollment_runtime_unsupported")
+    return int(get_euid()), int(get_egid())
+
+
 def _load_registration_verifier() -> tuple[Any, type[Exception]]:
     _require_selected_runtime()
     try:
@@ -158,6 +167,7 @@ def _validate_invitation(value: Any) -> Mapping[str, Any]:
 
 
 def _write_create_only(path: Path, value: Mapping[str, Any]) -> None:
+    effective_uid, effective_gid = _effective_identity()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
         parent = path.parent.lstat()
@@ -166,8 +176,8 @@ def _write_create_only(path: Path, value: Mapping[str, Any]) -> None:
     if (
         not stat.S_ISDIR(parent.st_mode)
         or stat.S_ISLNK(parent.st_mode)
-        or parent.st_uid != os.geteuid()
-        or parent.st_gid != os.getegid()
+        or parent.st_uid != effective_uid
+        or parent.st_gid != effective_gid
     ):
         _fail("passkey_v2_enrollment_state_invalid")
     os.chmod(path.parent, 0o700, follow_symlinks=False)
@@ -208,6 +218,7 @@ def _write_create_only(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _read(path: Path) -> Mapping[str, Any]:
+    effective_uid, effective_gid = _effective_identity()
     try:
         descriptor = os.open(
             path,
@@ -222,8 +233,8 @@ def _read(path: Path) -> Mapping[str, Any]:
         if (
             not stat.S_ISREG(item.st_mode)
             or item.st_nlink != 1
-            or item.st_uid != os.geteuid()
-            or item.st_gid != os.getegid()
+            or item.st_uid != effective_uid
+            or item.st_gid != effective_gid
             or stat.S_IMODE(item.st_mode) != 0o400
             or item.st_size < 2
             or item.st_size > 64 * 1024

@@ -28,6 +28,9 @@ CLIENT_CONFIG_PATH = Path("/etc/muncho/operational-edge-client.json")
 KEY_ROOT = Path("/etc/muncho/keys")
 TRUST_ROOT = CONFIG_ROOT / "trust"
 WRITER_PUBLIC_KEY = KEY_ROOT / "writer-capability-public.pem"
+OWNER_GATE_RECEIPT_PUBLIC_KEY = (
+    TRUST_ROOT / "owner-gate-authority-receipt-public.pem"
+)
 SOCKET_ROOT = Path("/run/muncho-operational-edge")
 STATE_ROOT = Path("/var/lib/muncho-operational-edge")
 SUBPROCESS_HOME = Path("/opt/adventico-ai-platform")
@@ -112,6 +115,7 @@ def _service_config(
     mutation_peer_uid: int,
     receipt_public_key_id: str,
     writer_key_id: str,
+    owner_gate_receipt_public_key_id: str,
 ) -> bytes:
     unit = service_unit(domain)
     value = {
@@ -135,6 +139,16 @@ def _service_config(
             f"/run/credentials/{unit}/writer-public-key"
         ),
         "writer_key_id": writer_key_id,
+        "owner_gate_receipt_public_key_file": (
+            f"/run/credentials/{unit}/owner-gate-receipt-public-key"
+            if domain == "skyvision_db"
+            else None
+        ),
+        "owner_gate_receipt_public_key_id": (
+            owner_gate_receipt_public_key_id
+            if domain == "skyvision_db"
+            else None
+        ),
         "maximum_output_bytes": 1024 * 1024,
         "maximum_connections": 16,
         "catalog_sha256": _catalog_sha256(),
@@ -208,6 +222,11 @@ def _service_unit(
         f"LoadCredential={item.name}:{item.source_path}"
         for item in CREDENTIALS_BY_DOMAIN[domain]
     ]
+    if domain == "skyvision_db":
+        credential_lines.append(
+            "LoadCredential=owner-gate-receipt-public-key:"
+            f"{OWNER_GATE_RECEIPT_PUBLIC_KEY}"
+        )
     credential_binds = [
         f"BindReadOnlyPaths=/run/credentials/{unit}/{item.name}:{item.target_path}"
         for item in CREDENTIALS_BY_DOMAIN[domain]
@@ -256,6 +275,11 @@ def _service_unit(
         f"AssertPathExists={WRITER_PUBLIC_KEY}",
         f"AssertPathExists={receipt_private_key_path(domain)}",
         f"AssertPathExists={receipt_public_key_path(domain)}",
+        *(
+            [f"AssertPathExists={OWNER_GATE_RECEIPT_PUBLIC_KEY}"]
+            if domain == "skyvision_db"
+            else []
+        ),
         *(f"AssertPathExists={item.source_path}" for item in CREDENTIALS_BY_DOMAIN[domain]),
         "",
         "[Service]",
@@ -355,6 +379,7 @@ def render_operational_edge_units(
     mutation_peer_gid: int,
     receipt_public_key_ids: Mapping[str, str],
     writer_key_id: str,
+    owner_gate_receipt_public_key_id: str,
 ) -> OperationalEdgeUnitBundle:
     domains = sorted({item.domain for item in operation_catalog().values()})
     services = (
@@ -422,6 +447,10 @@ def render_operational_edge_units(
         or len(set(receipt_public_key_ids.values())) != len(domains)
         or not isinstance(writer_key_id, str)
         or _SHA256.fullmatch(writer_key_id) is None
+        or not isinstance(owner_gate_receipt_public_key_id, str)
+        or _SHA256.fullmatch(owner_gate_receipt_public_key_id) is None
+        or owner_gate_receipt_public_key_id
+        in set(receipt_public_key_ids.values()) | {writer_key_id}
     ):
         raise OperationalEdgeUnitError("operational edge identity input invalid")
     release = Path("/opt/adventico-ai-platform/hermes-agent-releases") / f"hermes-agent-{revision[:12]}"
@@ -442,6 +471,9 @@ def render_operational_edge_units(
             mutation_peer_uid=mutation_peer_uid,
             receipt_public_key_id=receipt_public_key_ids[domain],
             writer_key_id=writer_key_id,
+            owner_gate_receipt_public_key_id=(
+                owner_gate_receipt_public_key_id
+            ),
         )
         for domain in domains
     }
@@ -499,6 +531,9 @@ def render_operational_edge_units(
         "receipt_public_key_ids": {
             domain: receipt_public_key_ids[domain] for domain in domains
         },
+        "owner_gate_receipt_public_key_id": (
+            owner_gate_receipt_public_key_id
+        ),
         "identity_contract": {
             "services": {
                 domain: dict(services[domain]) for domain in domains

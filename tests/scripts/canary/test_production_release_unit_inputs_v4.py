@@ -115,6 +115,10 @@ def _v3_payload() -> dict[str, Any]:
         "discord_edge_receipt_public_key_id": "b" * 64,
         "operational_edge_key_foundation_sha256": "c" * 64,
         "operational_edge_receipt_public_key_ids": receipt_keys,
+        "owner_gate_receipt_public_key_id": (
+            "4e974ea56c17e57e8724e458433d0f4a"
+            "148225e2bc464cdf7adf876791fdeb56"
+        ),
         "discord_reconciliation_intent": {
             "schema": v3.DISCORD_RECONCILIATION_INTENT_SCHEMA,
             "purpose": v3.DISCORD_RECONCILIATION_INTENT_PURPOSE,

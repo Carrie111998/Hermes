@@ -204,6 +204,10 @@ def _unit_inputs() -> dict:
         "operational_edge_receipt_public_key_ids": (
             _operational_receipt_key_ids()
         ),
+        "owner_gate_receipt_public_key_id": (
+            "4e974ea56c17e57e8724e458433d0f4a"
+            "148225e2bc464cdf7adf876791fdeb56"
+        ),
         "discord_reconciliation_intent": {
             "schema": package.DISCORD_RECONCILIATION_INTENT_SCHEMA,
             "purpose": package.DISCORD_RECONCILIATION_INTENT_PURPOSE,

@@ -1921,6 +1921,8 @@ def test_unix_client_uses_fixed_long_mutation_deadline() -> None:
         "verify",
         "create_request",
         "consume",
+        "sensitive_create",
+        "sensitive_consume",
         "preflight",
         "execute",
         "terminal",

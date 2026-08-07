@@ -7286,6 +7286,7 @@ def _operational_edge_bundle(
             "domains", "operation_count", "all_operations_implemented",
             "credentials_by_domain", "credential_count",
             "credential_values_read", "receipt_public_key_ids",
+            "owner_gate_receipt_public_key_id",
             "identity_contract", "units", "configs",
             "client_config_path", "client_config_sha256",
             "secret_material_recorded", "secret_digest_recorded",
@@ -7356,6 +7357,12 @@ def _operational_edge_bundle(
         or raw["credential_values_read"] is not False
         or raw["receipt_public_key_ids"]
         != manifest["operational_edge_receipt_public_key_ids"]
+        or SHA256.fullmatch(
+            str(raw["owner_gate_receipt_public_key_id"])
+        )
+        is None
+        or raw["owner_gate_receipt_public_key_id"]
+        in set(raw["receipt_public_key_ids"].values())
         or raw["units"] != expected_units
         or raw["configs"] != expected_configs
         or raw["client_config_path"]

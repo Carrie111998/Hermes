@@ -840,6 +840,7 @@ def test_create_only_key_stager_and_pure_foundation_bind_real_key_ids(
         release_owner_uid=os.geteuid(),
         release_owner_gid=os.getegid(),
         writer_public_key_id=writer_id,
+        owner_gate_receipt_public_key_id="e" * 64,
         key_foundation=pre_owner,
         asset_verification=asset_verification,
         key_root=staged_root,
@@ -947,6 +948,7 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     assert bundle.manifest["operation_count"] == len(operation_catalog())
     assert bundle.manifest["release_owner_uid"] == 1006
@@ -1073,6 +1075,7 @@ def test_every_rendered_service_config_loads_with_gateway_only_peer(
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     for domain in sorted(CREDENTIALS_BY_DOMAIN):
         path = tmp_path / f"{domain}.json"
@@ -1116,6 +1119,7 @@ def test_service_config_accepts_only_exact_production_or_canary_release_root(
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     raw = next(iter(bundle.configs.values()))
     production = json.loads(raw)
@@ -1218,6 +1222,7 @@ def test_unit_renderer_rejects_any_cross_domain_identity_or_socket_alias() -> No
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
     aliased_sockets = {
         domain: dict(row) for domain, row in sockets.items()
@@ -1235,6 +1240,7 @@ def test_unit_renderer_rejects_any_cross_domain_identity_or_socket_alias() -> No
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
 
 
@@ -1271,6 +1277,7 @@ def test_unit_renderer_rejects_malformed_or_unauthorized_reader_sets(
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
 
 
