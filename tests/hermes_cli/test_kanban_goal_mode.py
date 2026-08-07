@@ -94,6 +94,39 @@ def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_goal_mode_spawn_keeps_single_quiet_flag_and_goal_env(
+    kanban_home, monkeypatch,
+):
+    captured = {}
+
+    class FakeProc:
+        pid = 99999
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="goal spawn compatibility",
+            assignee="goal-profile",
+            goal_mode=True,
+            goal_max_turns=7,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        assert kb._default_spawn(task, str(workspace)) == 99999
+
+    assert captured["cmd"].count("-Q") == 1
+    assert captured["env"]["HERMES_KANBAN_GOAL_MODE"] == "1"
+    assert captured["env"]["HERMES_KANBAN_GOAL_MAX_TURNS"] == "7"
+
+
 
 # ---------------------------------------------------------------------------
 # Goal loop logic (callback-injected, no live model)

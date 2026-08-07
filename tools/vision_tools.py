@@ -379,6 +379,46 @@ def _normalize_to_supported_image(
     )
 
 
+def _validate_image_for_embedding(image_path: Path) -> Optional[str]:
+    """Return an actionable error when image bytes are malformed.
+
+    Magic bytes identify a claimed format but do not prove that the complete
+    payload is decodable. Native vision results become immutable conversation
+    history, so embedding a truncated PNG (or equivalent corrupt raster) makes
+    every following provider request fail with a non-retryable HTTP 400. Use
+    Pillow's structural verification and then fully decode every frame. Pillow
+    is a core dependency because native image embedding must fail closed when
+    validation is unavailable.
+    """
+    try:
+        from PIL import Image as _PILImage
+        from PIL import ImageSequence as _PILImageSequence
+    except ImportError as exc:
+        return (
+            "Image validation is unavailable because Pillow could not be "
+            f"imported ({exc}). Repair the Hermes installation before sending "
+            "images to a vision model."
+        )
+
+    try:
+        with _PILImage.open(image_path) as image:
+            image.verify()
+        # ``verify()`` checks container structure but deliberately does not
+        # decode pixels. Reopen after verify() (which invalidates the decoder)
+        # and force every frame through its codec so truncated JPEG entropy or
+        # a corrupt later GIF/WebP frame cannot reach immutable tool history.
+        with _PILImage.open(image_path) as image:
+            for frame in _PILImageSequence.Iterator(image):
+                frame.load()
+    except Exception as exc:
+        return (
+            "Image data is invalid or corrupt and cannot be sent to a vision "
+            f"model ({type(exc).__name__}: {exc}). Recreate or re-download the "
+            "image, then run vision_analyze again."
+        )
+    return None
+
+
 def _is_retryable_download_error(error: Exception) -> bool:
     """Return True only for transient image-download failures worth retrying.
 
@@ -1025,6 +1065,15 @@ async def _vision_analyze_native(
             temp_image_path = normalized_path
             should_cleanup = True
             image_size_bytes = temp_image_path.stat().st_size
+
+        # A supported MIME type is not enough: truncated or mutated image bytes
+        # can still carry a valid PNG/JPEG header. Reject them before they enter
+        # immutable multimodal tool history and wedge every subsequent request.
+        _validation_error = await _run_encode_on_cpu_executor(
+            _validate_image_for_embedding, temp_image_path,
+        )
+        if _validation_error:
+            return tool_error(_validation_error, success=False)
 
         image_data_url = await _run_encode_on_cpu_executor(
             _image_to_base64_data_url,
