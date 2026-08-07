@@ -247,9 +247,10 @@ class EventType(Enum):
     # devflow.build_* / devflow.pr_* members above are REUSED for the
     # BUILDING and PR_OPEN lifecycle states; only genuinely new lifecycle
     # names are added here. work_requested/work_triaged/work_planned surface
-    # new delegated work; duplicate/suppressed/declined are flood-control
-    # outcomes (LOW so they batch quietly); merge/deploy members land in
-    # Stage 2/3 but are registered now so the routing table is total.
+    # new delegated work; duplicate/suppressed are flood-control outcomes
+    # (LOW so they batch quietly), while declined is NORMAL (a real decision
+    # worth surfacing); merge/deploy members land in Stage 2/3 but are
+    # registered now so the routing table is total.
     DEVFLOW_WORK_REQUESTED = ("devflow.work_requested", Priority.NORMAL)
     DEVFLOW_WORK_TRIAGED = ("devflow.work_triaged", Priority.NORMAL)
     DEVFLOW_WORK_PLANNED = ("devflow.work_planned", Priority.NORMAL)
