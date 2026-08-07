@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { startClientWakeCapture } from '@/lib/wake-client-capture'
+
+import { $notifications, clearNotifications } from './notifications'
 import {
   $wakeWord,
   applyWakeStartResult,
@@ -12,6 +15,8 @@ import {
   type WakeRequester
 } from './wake-word'
 
+vi.mock('@/lib/wake-client-capture', () => ({ startClientWakeCapture: vi.fn() }))
+
 const requester = (impl: (method: string, params?: Record<string, unknown>) => unknown) =>
   vi.fn(async (method: string, params: Record<string, unknown> = {}) =>
     impl(method, params)
@@ -19,6 +24,9 @@ const requester = (impl: (method: string, params?: Record<string, unknown>) => u
 
 beforeEach(() => {
   resetWakeWordState()
+  clearNotifications()
+  vi.mocked(startClientWakeCapture).mockReset()
+  vi.mocked(startClientWakeCapture).mockResolvedValue({ active: true, stop: vi.fn() })
 })
 
 describe('applyWakeStatus', () => {
@@ -81,6 +89,54 @@ describe('toggleWakeWord', () => {
     expect($wakeWord.get()).toMatchObject({ listening: true, notice: '', pending: false })
   })
 
+  it('surfaces an explicit client microphone startup failure', async () => {
+    applyWakeStatus({ available: true, listening: false, phrase: 'hey hermes' })
+    vi.mocked(startClientWakeCapture).mockRejectedValueOnce(new Error('Microphone permission denied'))
+
+    await toggleWakeWord(
+      requester(() => ({ capture: 'client', frame_length: 1280, phrase: 'hey hermes', started: true }))
+    )
+
+    expect($wakeWord.get()).toMatchObject({
+      listening: false,
+      notice: 'Microphone permission denied',
+      pending: false
+    })
+    expect($notifications.get()).toEqual([
+      expect.objectContaining({
+        id: 'wake-word-start-failed',
+        kind: 'warning',
+        message: 'Microphone permission denied'
+      })
+    ])
+  })
+
+  it('keeps the toggle pending until explicit client microphone capture is ready', async () => {
+    applyWakeStatus({ available: true, listening: false, phrase: 'hey hermes' })
+
+    let resolveCapture: (value: { active: boolean; stop: () => void }) => void = () => undefined
+
+    vi.mocked(startClientWakeCapture).mockReturnValueOnce(
+      new Promise(resolve => {
+        resolveCapture = resolve
+      })
+    )
+
+    const request = requester(() => ({ capture: 'client', frame_length: 1280, started: true }))
+    const first = toggleWakeWord(request)
+
+    await vi.waitFor(() => expect(startClientWakeCapture).toHaveBeenCalledTimes(1))
+    expect($wakeWord.get().pending).toBe(true)
+
+    await toggleWakeWord(request)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    resolveCapture({ active: true, stop: vi.fn() })
+    await first
+
+    expect($wakeWord.get()).toMatchObject({ listening: true, pending: false })
+  })
+
   it('stops via wake.stop when listening', async () => {
     applyWakeStatus({ available: true, listening: true, phrase: 'hey hermes' })
 
@@ -116,6 +172,13 @@ describe('toggleWakeWord', () => {
     expect(state.available).toBe(false)
     expect(state.listening).toBe(false)
     expect(state.notice).toBe('Set PORCUPINE_ACCESS_KEY')
+    expect($notifications.get()).toEqual([
+      expect.objectContaining({
+        id: 'wake-word-start-failed',
+        kind: 'warning',
+        message: 'Set PORCUPINE_ACCESS_KEY'
+      })
+    ])
   })
 
   it('stays off and keeps the error as the notice when the RPC throws', async () => {
@@ -132,6 +195,13 @@ describe('toggleWakeWord', () => {
       notice: 'Hermes gateway unavailable',
       pending: false
     })
+    expect($notifications.get()).toEqual([
+      expect.objectContaining({
+        id: 'wake-word-start-failed',
+        kind: 'warning',
+        message: 'Hermes gateway unavailable'
+      })
+    ])
   })
 
   it('ignores clicks while a toggle is already in flight', async () => {
