@@ -166,6 +166,20 @@ class TestStreamDeltaDispatch:
         assert agent._fire_stream_delta.call_args_list[0].args == ("hello ",)
         assert agent._fire_stream_delta.call_args_list[1].args == ("world",)
 
+    def test_commentary_delta_waits_for_completed_model_update(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage",
+            "id": "commentary-1",
+            "phase": "commentary",
+        }))
+        bridge({
+            "method": "item/agentMessage/delta",
+            "params": {"itemId": "commentary-1", "delta": "raw token"},
+        })
+        agent._fire_stream_delta.assert_not_called()
+
 
 
     def test_reasoning_delta_fires_reasoning_callback(self):
@@ -250,17 +264,73 @@ class TestToolProgressDispatch:
 
 
 class TestAgentMessageInterimDispatch:
-    def test_completed_agent_message_emits_interim(self):
+    def test_completed_commentary_message_emits_interim(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
             "type": "agentMessage",
             "id": "am-1",
+            "phase": "commentary",
             "text": "I'll check the config first.",
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
+
+    def test_started_commentary_phase_is_used_when_completion_omits_it(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "agentMessage", "id": "am-2", "phase": "commentary",
+        }))
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-2", "text": "Config is valid.",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "Config is valid."}
+        )
+
+    def test_final_answer_is_not_misreported_as_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-3",
+            "phase": "final_answer",
+            "text": "Done.",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+    def test_unphased_legacy_message_emits_only_when_tool_proves_mid_turn(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-legacy",
+            "text": "I'll inspect the runtime now.",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
+        bridge(_item_started({
+            "type": "commandExecution",
+            "id": "cmd-after-message",
+            "command": "true",
+        }))
+        agent._emit_interim_assistant_message.assert_called_once_with(
+            {"role": "assistant", "content": "I'll inspect the runtime now."}
+        )
+
+    def test_unphased_terminal_message_stays_on_final_delivery_path(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-final-legacy", "text": "Done.",
+        }))
+        bridge({"method": "turn/completed", "params": {"turn": {"id": "t1"}}})
+        bridge(_item_started({
+            "type": "commandExecution", "id": "next-turn-cmd", "command": "true",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
 
@@ -272,7 +342,10 @@ class TestAgentMessageInterimDispatch:
         agent.show_commentary = False
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
-            "type": "agentMessage", "id": "am-5", "text": "I'll check config.",
+            "type": "agentMessage",
+            "id": "am-5",
+            "phase": "commentary",
+            "text": "I'll check config.",
         }))
         agent._emit_interim_assistant_message.assert_not_called()
         # Tool progress is unaffected by the commentary toggle.
@@ -305,7 +378,10 @@ class TestBridgeRobustness:
         bridge({"method": "item/agentMessage/delta",
                 "params": {"delta": "x"}})
         bridge(_item_completed({
-            "type": "agentMessage", "id": "am-x", "text": "hi",
+            "type": "agentMessage",
+            "id": "am-x",
+            "phase": "commentary",
+            "text": "hi",
         }))
 
 
