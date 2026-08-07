@@ -1,4 +1,10 @@
 r"""
+DEPRECATED: This script is superseded by the agent-meow voice gateway
+(``python -m agent_meow.hermes_voice_gateway``) as of Plan 005 Task 4.
+It remains as a migration shim for operators who have not yet switched
+to the agent-meow-owned voice gateway. Do not extend or build on this
+script — new voice logic belongs in agent-meow.
+
 Qwen3-TTS Bridge Server for Hermes
 ===================================
 Lightweight HTTP server that wraps Qwen3-TTS-0.6B for Hermes command provider.
