@@ -14862,6 +14862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
                     return ""
+                # The text was not resolved (arbitrary prose for a native
+                # multi-choice clarify).  Cancel the pending clarify so the
+                # agent loop does not block for up to clarify_timeout (default
+                # 1h) waiting for a button click that will never come.  The
+                # user's message falls through to normal dispatch as a new
+                # turn (#74399).
+                _clarify_mod.clear_session(_quick_key)
+                logger.info(
+                    "Gateway cancelled pending clarify after unmatched text "
+                    "reply (session=%s, id=%s)",
+                    _quick_key, _pending_clarify.clarify_id,
+                )
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are

@@ -341,3 +341,62 @@ class TestMultiSelectTextFallback:
         from tools import clarify_gateway as cm
         entry = cm.register("s4", "sk", "Q?", ["A", "B"])
         assert cm._coerce_text_response(entry, "b") == "B"
+
+
+class TestClarifyCancelOnUnmatchedProse:
+    """When the user replies with arbitrary prose that can't resolve a
+    native multi-choice clarify, clear_session must unblock the waiting
+    agent thread immediately instead of leaving it stuck for up to
+    clarify_timeout (default 1h).
+
+    This is the primitive-level contract the gateway fix in run.py relies
+    on (#74399): after resolve_text_response_for_session returns False,
+    the gateway calls clear_session to cancel the pending entry.
+    """
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_clear_session_unblocks_waiter(self):
+        """clear_session sets the event so wait_for_response returns ''."""
+        from tools import clarify_gateway as cm
+        cm.register("c1", "sk", "Q?", ["A", "B", "C"])
+        result_box = {}
+
+        def waiter():
+            result_box["r"] = cm.wait_for_response("c1", timeout=5)
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.05)
+
+        # The text response does not match any choice
+        assert cm.resolve_text_response_for_session("sk", "let's go with A please") is False
+        # The clarify is still pending
+        assert cm.has_pending("sk")
+
+        # Gateway cancels the pending clarify
+        cancelled = cm.clear_session("sk")
+        assert cancelled == 1
+        assert not cm.has_pending("sk")
+
+        t.join(timeout=5)
+        assert result_box["r"] == ""
+
+    def test_clear_session_no_pending_is_noop(self):
+        """clear_session on a session with no pending clarify returns 0."""
+        from tools import clarify_gateway as cm
+        assert cm.clear_session("nonexistent") == 0
+
+    def test_unmatched_prose_does_not_resolve(self):
+        """resolve_text_response_for_session returns False for arbitrary prose."""
+        from tools import clarify_gateway as cm
+        cm.register("c2", "sk", "Q?", ["staging", "prod", "cancel"])
+        # Exact match resolves
+        assert cm.resolve_text_response_for_session("sk", "staging") is True
+        # But after re-registering (the first resolve consumed the entry)
+        cm.register("c3", "sk", "Q?", ["staging", "prod", "cancel"])
+        # Arbitrary prose does not resolve
+        assert cm.resolve_text_response_for_session("sk", "let's go with staging please") is False
+        # The entry is still pending
+        assert cm.has_pending("sk")
