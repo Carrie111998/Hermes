@@ -2348,6 +2348,7 @@ class TestRunJobSessionPersistence:
 
         with (
             patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._cron_preflight_enabled", return_value=False),
             patch("hermes_state.SessionDB", return_value=fake_db),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -2417,6 +2418,7 @@ class TestRunJobSessionPersistence:
 
         with (
             patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._cron_preflight_enabled", return_value=False),
             patch("hermes_state.SessionDB", return_value=fake_db),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -2601,6 +2603,7 @@ class TestRunJobSessionPersistence:
 
         with (
             patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._cron_preflight_enabled", return_value=False),
             patch("hermes_state.SessionDB", return_value=fake_db),
             patch(
                 "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -3508,12 +3511,15 @@ class TestRunJobSkillBacked:
         assert success is True
         assert error is None
         assert final_response == "ok"
-        assert skill_view_mock.call_count == 2
+        # Preflight checks readiness, then prompt assembly loads the exact
+        # same ordered skills for the model.
+        assert skill_view_mock.call_count == 4
         assert [call.args[0] for call in skill_view_mock.call_args_list] == [
             "blogwatcher",
             "maps",
+            "blogwatcher",
+            "maps",
         ]
-
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
         assert prompt_arg.index("blogwatcher") < prompt_arg.index("maps")
         assert "Instructions for blogwatcher." in prompt_arg

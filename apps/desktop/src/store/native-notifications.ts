@@ -228,6 +228,7 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
 
   try {
     const request = sessionApprovalRequest(sessionId).get()
+
     if (!request) {
       return
     }
