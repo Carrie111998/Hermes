@@ -638,13 +638,41 @@ def cmd_mcp_remove(args):
     _remove_mcp_server(name)
     _success(f"Removed '{name}' from config")
 
-    # Clean up OAuth tokens if they exist — route through MCPOAuthManager so
-    # any provider instance cached in the current process (e.g. from an
-    # earlier `hermes mcp test` in the same session) is evicted too.
+    # Always wipe the three on-disk OAuth state files for this server
+    # (`<name>.json`, `<name>.client.json`, `<name>.meta.json`) so a removed
+    # OAuth server can never be revived on the next gateway restart. The
+    # manager path below additionally evicts any cached provider instance
+    # from the current process (e.g. from an earlier `hermes mcp test`).
+    # Without the explicit disk cleanup here, a manager-path failure would
+    # silently leak the `.meta.json` / `.client.json` files (#81050).
+    _purge_oauth_state_files(name)
+    _success("Cleaned up OAuth state")
+
+
+def _purge_oauth_state_files(name: str) -> None:
+    """Delete ``<name>.json`` / ``<name>.client.json`` / ``<name>.meta.json``.
+
+    Failures are logged but never raised so the CLI command can still report
+    success on the config removal — partial cleanup is strictly better than
+    a visible crash on a non-fatal concern, but the user should still see a
+    warning so they can investigate.
+    """
+    try:
+        from tools.mcp_oauth import HermesTokenStorage
+        HermesTokenStorage(name).remove()
+    except Exception as exc:
+        logger.warning(
+            "Failed to purge OAuth state files for MCP server %r: %s",
+            name,
+            exc,
+        )
+
+    # Best-effort: also evict any provider instance cached in this process
+    # via MCPOAuthManager. Errors here are non-fatal because the disk
+    # cleanup above already accomplished the user-visible goal.
     try:
         from tools.mcp_oauth_manager import get_manager
         get_manager().remove(name)
-        _success("Cleaned up OAuth tokens")
     except Exception:
         pass
 

@@ -169,6 +169,56 @@ class TestMcpRemove:
         assert not token_file.exists()
 
 
+    def test_remove_cleans_all_oauth_files(self, tmp_path, capsys, monkeypatch):
+        """Regression for #81050: ``hermes mcp remove`` must delete *all* of
+        ``<name>.json``, ``<name>.client.json`` and ``<name>.meta.json`` so a
+        removed OAuth server cannot be revived on the next gateway restart.
+        Previously the command relied on ``MCPOAuthManager.remove()``, which
+        can fail silently (e.g. manager not initialised, or the lookup raises),
+        leaving the ``.meta.json`` / ``.client.json`` files behind.
+        """
+        _seed_config(tmp_path, {
+            "oauth-srv": {"url": "https://example.com/mcp", "auth": "oauth"},
+        })
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
+        )
+
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir()
+        token_file = token_dir / "oauth-srv.json"
+        client_file = token_dir / "oauth-srv.client.json"
+        meta_file = token_dir / "oauth-srv.meta.json"
+        token_file.write_text("{}")
+        client_file.write_text("{}")
+        meta_file.write_text("{}")
+
+        # Make the OAuth manager raise on the remove path so we exercise the
+        # fallback (the bug surfaces when ``get_manager().remove(name)`` is
+        # not in fact available — e.g. in a fresh profile, or when the
+        # manager module is still importing).
+        from tools import mcp_oauth_manager as mgr_mod
+
+        monkeypatch.setattr(
+            mgr_mod.MCPOAuthManager,
+            "remove",
+            lambda self, name, *, hermes_home=None: (_ for _ in ()).throw(
+                RuntimeError("simulated manager failure for #81050")
+            ),
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_remove
+
+        cmd_mcp_remove(_make_args(name="oauth-srv"))
+
+        # The CLI's own cleanup must guarantee all three files are gone even
+        # when the manager path is unavailable.
+        assert not token_file.exists(), "<name>.json left behind"
+        assert not client_file.exists(), "<name>.client.json left behind"
+        assert not meta_file.exists(), "<name>.meta.json left behind"
+
+
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_add
 # ---------------------------------------------------------------------------
