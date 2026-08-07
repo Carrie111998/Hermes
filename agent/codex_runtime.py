@@ -32,6 +32,12 @@ def _combine_pending_steer(*parts: Any) -> str | None:
     return "\n".join(cleaned) or None
 
 
+def _drain_agent_pending_steer(agent: Any) -> str | None:
+    """Drain guidance when the owning agent exposes the steering contract."""
+    drain = getattr(agent, "_drain_pending_steer", None)
+    return drain() if callable(drain) else None
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -702,13 +708,20 @@ def run_codex_app_server_turn(
     # Bind on every turn because tests and recovery paths may replace the
     # session object. The provider atomically transfers startup-race guidance
     # into the native turn once Codex has returned its turn id.
-    agent._codex_session.bind_pending_steer_provider(agent._drain_pending_steer)
+    _pending_steer_provider = getattr(agent, "_drain_pending_steer", None)
+    _bind_pending_steer_provider = getattr(
+        agent._codex_session, "bind_pending_steer_provider", None
+    )
+    if callable(_pending_steer_provider) and callable(_bind_pending_steer_provider):
+        _bind_pending_steer_provider(_pending_steer_provider)
     if getattr(agent, "_model_authored_progress", False):
         from agent.prompt_builder import MODEL_AUTHORED_PROGRESS_GUIDANCE
 
-        agent._codex_session.set_developer_instructions(
-            MODEL_AUTHORED_PROGRESS_GUIDANCE
+        _set_developer_instructions = getattr(
+            agent._codex_session, "set_developer_instructions", None
         )
+        if callable(_set_developer_instructions):
+            _set_developer_instructions(MODEL_AUTHORED_PROGRESS_GUIDANCE)
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
@@ -732,7 +745,7 @@ def run_codex_app_server_turn(
             _native_pending_steer = None
         _crash_pending_steer = _combine_pending_steer(
             _native_pending_steer,
-            agent._drain_pending_steer(),
+            _drain_agent_pending_steer(agent),
         )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -791,7 +804,7 @@ def run_codex_app_server_turn(
 
     _pending_steer = _combine_pending_steer(
         getattr(turn, "pending_steer", None),
-        agent._drain_pending_steer(),
+        _drain_agent_pending_steer(agent),
     )
 
     # If the turn signalled the underlying client is wedged (deadline
