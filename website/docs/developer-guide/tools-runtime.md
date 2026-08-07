@@ -37,10 +37,29 @@ registry.register(
     is_async=False,                # Whether the handler is an async coroutine
     description="Run commands",    # Human-readable description
     emoji="💻",                    # Emoji for spinner/progress display
+    run_start_event={              # Optional /v1/runs SSE projection
+        "event": "client.intent",
+        "fields": ["text", "speech"],
+    },
 )
 ```
 
 Each call creates a `ToolEntry` stored in the singleton `ToolRegistry._tools` dict keyed by tool name. A registration that would shadow an existing tool from a **different** toolset is rejected (with an error log) unless the caller passes `override=True`; plugin overrides of built-in tools additionally require the operator opt-in `plugins.entries.<plugin_id>.allow_tool_override: true` in `config.yaml`.
+
+`run_start_event` is an optional declarative projection for the
+`GET /v1/runs/{run_id}/events` SSE stream. It must contain exactly a
+non-reserved lowercase namespaced `event` and a non-empty, duplicate-free
+`fields` list or tuple. Reserved lifecycle namespaces are `approval`,
+`message`, `reasoning`, `run`, `subagent`, and `tool`; reserved envelope fields
+are `event`, `run_id`, `sequence`, `timestamp`, and `type`.
+
+At `tool.started`, Hermes copies only the declared string arguments, applies
+forced secret and URL-credential redaction, and truncates each value to 160
+characters. Missing or non-string declared fields suppress the projection.
+For an opted-in tool, the normal `tool.started` and `tool.completed` events are
+suppressed to avoid duplicates. This metadata affects only the `/v1/runs` SSE
+surface and never projects handler output. Plugins pass the same keyword to
+`ctx.register_tool()`; see the [plugin guide](./plugins/#project-a-declarative-run-start-event).
 
 ### Discovery: `discover_builtin_tools()`
 
