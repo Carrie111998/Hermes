@@ -23,10 +23,27 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+    module_names = [
+        mod
+        for mod in sys.modules
+        if mod.startswith("hermes_cli")
+        or mod.startswith("hermes_state")
+        or mod == "hermes_constants"
+    ]
+    saved_modules = {mod: sys.modules[mod] for mod in module_names}
+    for mod in module_names:
+        del sys.modules[mod]
+    try:
+        yield test_home
+    finally:
+        for mod in list(sys.modules):
+            if (
+                mod.startswith("hermes_cli")
+                or mod.startswith("hermes_state")
+                or mod == "hermes_constants"
+            ):
+                del sys.modules[mod]
+        sys.modules.update(saved_modules)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):
@@ -39,6 +56,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     # Configure max_in_progress in the loaded config.
     fake_config = {
         "kanban": {
+            "dispatch_in_gateway": False,
             "max_in_progress": 3,
             "max_spawn": 5,
             "default_assignee": "default",
@@ -77,7 +95,7 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
 
-    fake_config = {"kanban": {"max_spawn": 10}}
+    fake_config = {"kanban": {"dispatch_in_gateway": False, "max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
 
     captured = {}

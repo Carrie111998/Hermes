@@ -635,7 +635,6 @@ export const de: Translations = {
     allProfiles: "Alle Profile",
     showArchived: "Archivierte anzeigen",
     lanesByProfile: "Spuren nach Profil",
-    nudgeDispatcher: "Dispatcher anstoßen",
     refresh: "Aktualisieren",
     selected: "ausgewählt",
     complete: "Abschließen",

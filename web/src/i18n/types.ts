@@ -709,7 +709,6 @@ export interface Translations {
     allProfiles: string;
     showArchived: string;
     lanesByProfile: string;
-    nudgeDispatcher: string;
     refresh: string;
     selected: string;
     complete: string;
