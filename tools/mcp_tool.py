@@ -2384,7 +2384,7 @@ class MCPServerTask:
             )
 
         command = config.get("command")
-        args = config.get("args", [])
+        args = config.get("args") or []
         user_env = config.get("env")
 
         if not command:
