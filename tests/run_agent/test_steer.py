@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._accepting_steer = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
@@ -48,6 +49,48 @@ class TestSteerAcceptance:
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
+
+    def test_final_response_atomically_closes_steer_intake(self):
+        agent = _bare_agent()
+
+        assert agent._drain_pending_steer_or_close() is None
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    def test_final_call_steer_is_drained_without_closing_intake(self):
+        agent = _bare_agent()
+        assert agent.steer("check the migration too") is True
+
+        assert agent._drain_pending_steer_or_close() == "check the migration too"
+        assert agent.steer("and the rollback") is True
+        assert agent._pending_steer == "and the rollback"
+
+    def test_final_call_steer_continues_with_valid_role_alternation(self):
+        from agent.conversation_loop import _append_late_steer_continuation
+
+        agent = _bare_agent()
+        emitted = []
+
+        def emit_interim(assistant_msg):
+            emitted.append(assistant_msg)
+
+        agent._emit_interim_assistant_message = emit_interim  # type: ignore[method-assign]
+        messages = [{"role": "user", "content": "fix it"}]
+        final_msg = {"role": "assistant", "content": "Done."}
+        assert agent.steer("also verify the live path") is True
+
+        drained = _append_late_steer_continuation(agent, messages, final_msg)
+
+        assert drained == "also verify the live path"
+        assert emitted == [final_msg]
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "user",
+        ]
+        assert messages[-1]["content"] == "also verify the live path"
+        assert agent._session_messages is messages
+        assert getattr(agent, "_budget_grace_call", False) is True
 
 
 
