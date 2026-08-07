@@ -233,15 +233,12 @@ class TestConcludeToolDispatch:
         )
 
 
-    def test_sync_turn_strips_leaked_memory_context_before_honcho_ingest(self):
+    def test_sync_turn_strips_leaked_memory_context_before_curated_ingest(self):
         provider = HonchoMemoryProvider()
         provider._session_key = "telegram:123"
         provider._manager = MagicMock()
         provider._cron_skipped = False
         provider._config = SimpleNamespace(message_max_chars=25000)
-
-        session = MagicMock()
-        provider._manager.get_or_create.return_value = session
 
         provider.sync_turn(
             (
@@ -263,8 +260,11 @@ class TestConcludeToolDispatch:
         )
         provider._sync_thread.join(timeout=1.0)
 
-        assert session.add_message.call_args_list[0].args == ("user", "hello")
-        assert session.add_message.call_args_list[1].args == ("assistant", "Visible answer")
+        provider._manager.record_turn.assert_called_once_with(
+            "telegram:123",
+            "hello",
+            "Visible answer",
+        )
 
 
 # ---------------------------------------------------------------------------

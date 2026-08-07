@@ -12,6 +12,13 @@ from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 from plugins.memory.honcho.client import get_honcho_client
+from plugins.memory.honcho.ingestion import (
+    POLICY_VERSION,
+    IngestionDecision,
+    decide_card_fact,
+    decide_conclusion,
+    decide_turn,
+)
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -139,6 +146,21 @@ class HonchoSessionManager:
         self._dialectic_max_input_chars: int = (
             config.dialectic_max_input_chars if config else 10000
         )
+        # Durable-memory write policy.  These values are resolved from the
+        # profile's host block; defaults are intentionally conservative.
+        self._save_messages: bool = bool(
+            getattr(config, "save_messages", True) if config else True
+        )
+        self._ingestion_mode: str = str(
+            getattr(config, "ingestion_mode", "curated") if config else "curated"
+        )
+        self._ingestion_require_signal: bool = bool(
+            getattr(config, "ingestion_require_signal", True) if config else True
+        )
+        self._ingestion_extra_deny_terms: tuple[str, ...] = tuple(
+            getattr(config, "ingestion_extra_deny_terms", ()) if config else ()
+        )
+        self._last_ingestion_decision: IngestionDecision | None = None
 
         # Async write queue — the writer thread starts lazily on first enqueue
         # (see _ensure_async_writer). Constructing a manager must not spawn
@@ -371,8 +393,36 @@ class HonchoSessionManager:
         """
         with self._cache_lock:
             if key in self._cache:
-                logger.debug("Local session cache hit: %s", key)
-                return self._cache[key]
+                cached = self._cache[key]
+                expected_scope = {
+                    "workspace": getattr(self._config, "workspace_id", ""),
+                    "ai_peer": self._sanitize_id(
+                        self._config.ai_peer if self._config else "hermes-assistant"
+                    ),
+                }
+                actual_scope = cached.metadata or {}
+                mismatch = any(
+                    actual_scope.get(field)
+                    and actual_scope.get(field) != value
+                    for field, value in expected_scope.items()
+                )
+                if not mismatch:
+                    cached.metadata.update(
+                        {
+                            "workspace": expected_scope["workspace"],
+                            "ai_peer": expected_scope["ai_peer"],
+                            "user_peer": cached.user_peer_id,
+                        }
+                    )
+                    logger.debug("Local session cache hit: %s", key)
+                    return cached
+                logger.error(
+                    "Discarding cached Honcho session with scope mismatch: key=%s expected_workspace=%s actual_workspace=%s",
+                    key,
+                    expected_scope["workspace"],
+                    actual_scope.get("workspace", ""),
+                )
+                del self._cache[key]
 
         # Determine peer IDs — no lock needed (read-only, no shared state mutation).
         # Gateway sessions normally use the runtime user identity (the
@@ -411,12 +461,147 @@ class HonchoSessionManager:
             assistant_peer_id=assistant_peer_id,
             honcho_session_id=honcho_session_id,
             messages=local_messages,
+            metadata={
+                "workspace": getattr(self._config, "workspace_id", ""),
+                "user_peer": user_peer_id,
+                "ai_peer": assistant_peer_id,
+                "host": getattr(self._config, "host", "hermes"),
+            },
         )
 
         # Write to cache under lock — only one writer wins
         with self._cache_lock:
             self._cache[key] = session
         return session
+
+    def record_turn(
+        self,
+        session_key: str,
+        user_content: str,
+        assistant_content: str,
+    ) -> IngestionDecision:
+        """Apply the durable-memory gate and queue an accepted turn.
+
+        This is the only live-conversation path that adds user/assistant
+        messages to the Honcho session.  Keeping the decision here prevents
+        callers from accidentally bypassing the policy by writing directly to
+        ``HonchoSession.messages``.
+        """
+        if not self._save_messages:
+            decision = IngestionDecision(False, "save_messages_disabled")
+            self._last_ingestion_decision = decision
+            return decision
+
+        decision = decide_turn(
+            user_content,
+            assistant_content,
+            mode=self._ingestion_mode,
+            require_signal=self._ingestion_require_signal,
+            extra_deny_terms=getattr(self, "_ingestion_extra_deny_terms", ()),
+        )
+        self._last_ingestion_decision = decision
+        if not decision.accepted:
+            logger.info(
+                "Honcho memory turn rejected by %s: reason=%s tags=%s",
+                POLICY_VERSION,
+                decision.reason,
+                ",".join(decision.tags) or "none",
+            )
+            return decision
+
+        session = self._cache.get(session_key)
+        if session is None:
+            logger.warning("No local session cached for '%s', skipping accepted turn", session_key)
+            return IngestionDecision(False, "session_not_cached")
+
+        expected_scope = {
+            "workspace": getattr(self._config, "workspace_id", ""),
+            "ai_peer": session.assistant_peer_id,
+        }
+        actual_scope = session.metadata or {}
+        mismatch = any(
+            actual_scope.get(field)
+            and actual_scope.get(field) != value
+            for field, value in expected_scope.items()
+        )
+        if mismatch:
+            decision = IngestionDecision(False, "scope_mismatch", tags=("scope_guard",), hard_denial=True)
+            self._last_ingestion_decision = decision
+            logger.error(
+                "Rejected Honcho turn due to scope mismatch: session=%s expected_workspace=%s actual_workspace=%s",
+                session_key,
+                expected_scope["workspace"],
+                actual_scope.get("workspace", ""),
+            )
+            return decision
+        session.metadata.update(
+            {
+                "workspace": expected_scope["workspace"],
+                "ai_peer": expected_scope["ai_peer"],
+                "user_peer": session.user_peer_id,
+            }
+        )
+
+        metadata = decision.as_metadata()
+        metadata.update(
+            {
+                "source": "hermes",
+                "host": getattr(self._config, "host", "hermes"),
+                "workspace": getattr(self._config, "workspace_id", ""),
+                "user_peer": session.user_peer_id,
+                "ai_peer": session.assistant_peer_id,
+                "session_key": session.key,
+            }
+        )
+        for chunk in self._chunk_storage_message(user_content):
+            session.add_message("user", chunk, metadata=metadata)
+        for chunk in self._chunk_storage_message(assistant_content):
+            session.add_message("assistant", chunk, metadata=metadata)
+        self.save(session)
+        logger.debug(
+            "Honcho memory turn accepted by %s: reason=%s messages=%d workspace=%s user_peer=%s ai_peer=%s",
+            POLICY_VERSION,
+            decision.reason,
+            int(bool(user_content and user_content.strip()))
+            + int(bool(assistant_content and assistant_content.strip())),
+            getattr(self._config, "workspace_id", ""),
+            session.user_peer_id,
+            session.assistant_peer_id,
+        )
+        return decision
+
+    def _chunk_storage_message(self, content: str) -> list[str]:
+        """Split an accepted message without ever splitting before the gate."""
+        text = (content or "").strip()
+        limit = max(1, int(self._message_max_chars or 25000))
+        if not text:
+            return []
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        first = True
+        continuation_prefix = "[continued] "
+        while remaining:
+            effective_limit = limit if first else max(1, limit - len(continuation_prefix))
+            cut = min(len(remaining), effective_limit)
+            if cut < len(remaining):
+                boundary = remaining.rfind("\n\n", 0, cut)
+                if boundary > effective_limit * 0.5:
+                    cut = boundary
+                else:
+                    boundary = remaining.rfind(" ", 0, cut)
+                    if boundary > effective_limit * 0.8:
+                        cut = boundary
+            chunk = remaining[:cut].strip()
+            remaining = remaining[cut:].lstrip()
+            if not first:
+                chunk = continuation_prefix + chunk
+            if chunk:
+                chunks.append(chunk)
+            first = False
+        return chunks
 
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
@@ -439,7 +624,27 @@ class HonchoSessionManager:
         honcho_messages = []
         for msg in new_messages:
             peer = user_peer if msg["role"] == "user" else assistant_peer
-            honcho_messages.append(peer.message(msg["content"]))
+            metadata = msg.get("metadata") or {}
+            created_at = msg.get("timestamp")
+            try:
+                honcho_messages.append(
+                    peer.message(
+                        msg["content"],
+                        metadata=metadata,
+                        created_at=created_at,
+                    )
+                )
+            except TypeError:
+                # Older honcho-ai clients may not expose metadata/created_at
+                # on Peer.message().  Preserve compatibility, but make the
+                # loss of provenance visible rather than silently assuming it
+                # was retained.
+                logger.warning(
+                    "Honcho client does not support message provenance fields; "
+                    "falling back to content-only message for %s",
+                    session.key,
+                )
+                honcho_messages.append(peer.message(msg["content"]))
 
         try:
             honcho_session.add_messages(honcho_messages)
@@ -775,9 +980,11 @@ class HonchoSessionManager:
 
     def migrate_local_history(self, session_key: str, messages: list[dict[str, Any]]) -> bool:
         """
-        Upload local session history to Honcho as a file.
+        Upload only durable turns from local session history to Honcho as a file.
 
-        Used when Honcho activates mid-conversation to preserve prior context.
+        Used when Honcho activates mid-conversation to preserve *useful*
+        context.  Raw transcript migration is intentionally not supported by
+        the default path: it must pass the same curated-v1 gate as live turns.
 
         Args:
             session_key: The session key (e.g., "telegram:123456").
@@ -798,21 +1005,100 @@ class HonchoSessionManager:
 
         user_peer = self._get_or_create_peer(session.user_peer_id)
 
-        content_bytes = self._format_migration_transcript(session_key, messages)
-        first_ts = messages[0].get("timestamp") if messages else None
+        curated_messages = self._curate_history_messages(session, messages)
+        if not curated_messages:
+            logger.info(
+                "Skipped local history migration for %s: no turns passed %s",
+                session_key,
+                POLICY_VERSION,
+            )
+            return False
+
+        content_bytes = self._format_migration_transcript(session_key, curated_messages)
+        first_ts = curated_messages[0].get("timestamp") if curated_messages else None
 
         try:
             honcho_session.upload_file(
                 file=("prior_history.txt", content_bytes, "text/plain"),
                 peer=user_peer,
-                metadata={"source": "local_jsonl", "count": len(messages)},
+                metadata={
+                    "source": "local_jsonl_curated",
+                    "memory_policy": POLICY_VERSION,
+                    "count": len(curated_messages),
+                    "profile_host": getattr(self._config, "host", "hermes"),
+                    "workspace": getattr(self._config, "workspace_id", ""),
+                    "user_peer": session.user_peer_id,
+                },
                 created_at=first_ts,
             )
-            logger.info("Migrated %d local messages to Honcho for %s", len(messages), session_key)
+            logger.info(
+                "Migrated %d curated local messages to Honcho for %s",
+                len(curated_messages),
+                session_key,
+            )
             return True
         except Exception as e:
             logger.error("Failed to upload local history to Honcho for %s: %s", session_key, e)
             return False
+
+    def _curate_history_messages(
+        self,
+        session: HonchoSession,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return only user/assistant pairs that pass the ingestion policy."""
+        curated: list[dict[str, Any]] = []
+        pending_user: dict[str, Any] | None = None
+
+        def flush(user_msg: dict[str, Any] | None, assistant_msg: dict[str, Any] | None) -> None:
+            if user_msg is None and assistant_msg is None:
+                return
+            decision = decide_turn(
+                (user_msg or {}).get("content", ""),
+                (assistant_msg or {}).get("content", ""),
+                mode=self._ingestion_mode,
+                require_signal=self._ingestion_require_signal,
+                extra_deny_terms=getattr(self, "_ingestion_extra_deny_terms", ()),
+            )
+            if not decision.accepted:
+                return
+            metadata = decision.as_metadata()
+            metadata.update(
+                {
+                    "source": "hermes_local_history",
+                    "host": getattr(self._config, "host", "hermes"),
+                    "workspace": getattr(self._config, "workspace_id", ""),
+                    "user_peer": session.user_peer_id,
+                    "ai_peer": session.assistant_peer_id,
+                    "session_key": session.key,
+                }
+            )
+            for item in (user_msg, assistant_msg):
+                if item is None:
+                    continue
+                curated.append(
+                    {
+                        "role": item.get("role", "unknown"),
+                        "content": item.get("content", ""),
+                        "timestamp": item.get("timestamp", ""),
+                        "metadata": metadata,
+                    }
+                )
+
+        for raw in messages or []:
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role", "")).strip().lower()
+            if role == "user":
+                flush(pending_user, None)
+                pending_user = raw
+            elif role == "assistant":
+                if pending_user is not None:
+                    flush(pending_user, raw)
+                    pending_user = None
+
+        flush(pending_user, None)
+        return curated
 
     @staticmethod
     def _format_migration_transcript(session_key: str, messages: list[dict[str, Any]]) -> bytes:
@@ -876,7 +1162,6 @@ class HonchoSessionManager:
             return False
 
         user_peer = self._get_or_create_peer(session.user_peer_id)
-        assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
 
         uploaded = False
         files = [
@@ -893,13 +1178,6 @@ class HonchoSessionManager:
                 "User profile and preferences",
                 user_peer,
                 "user",
-            ),
-            (
-                "SOUL.md",
-                "agent_soul.md",
-                "Agent persona and identity configuration",
-                assistant_peer,
-                "ai",
             ),
         ]
 
@@ -927,9 +1205,13 @@ class HonchoSessionManager:
                     file=(upload_name, wrapped.encode("utf-8"), "text/plain"),
                     peer=target_peer,
                     metadata={
-                        "source": "local_memory",
+                        "source": "local_memory_curated",
+                        "memory_policy": POLICY_VERSION,
                         "original_file": filename,
                         "target_peer": target_kind,
+                        "host": getattr(self._config, "host", "hermes"),
+                        "workspace": getattr(self._config, "workspace_id", ""),
+                        "user_peer": session.user_peer_id,
                     },
                 )
                 logger.info(
@@ -1251,6 +1533,20 @@ class HonchoSessionManager:
         if not content or not content.strip():
             return False
 
+        decision = decide_conclusion(
+            content,
+            extra_deny_terms=getattr(self, "_ingestion_extra_deny_terms", ()),
+        )
+        self._last_ingestion_decision = decision
+        if not decision.accepted:
+            logger.info(
+                "Honcho conclusion rejected by %s: reason=%s tags=%s",
+                POLICY_VERSION,
+                decision.reason,
+                ",".join(decision.tags) or "none",
+            )
+            return False
+
         session = self._cache.get(session_key)
         if not session:
             logger.warning("No session cached for '%s', skipping conclusion", session_key)
@@ -1346,6 +1642,24 @@ class HonchoSessionManager:
         session = self._cache.get(session_key)
         if not session:
             return None
+
+        facts = [str(item).strip() for item in (card or []) if str(item).strip()]
+        decisions = [
+            decide_card_fact(fact, extra_deny_terms=getattr(self, "_ingestion_extra_deny_terms", ()))
+            for fact in facts
+        ]
+        denied = next((decision for decision in decisions if not decision.accepted), None)
+        if denied is not None:
+            self._last_ingestion_decision = denied
+            logger.info(
+                "Honcho peer card rejected by %s: reason=%s",
+                POLICY_VERSION,
+                denied.reason,
+            )
+            return None
+        if not facts:
+            return None
+
         try:
             observer_peer_id, target_peer_id = self._resolve_observer_target(session, peer)
             if observer_peer_id is None:
@@ -1353,15 +1667,15 @@ class HonchoSessionManager:
                 return None
             peer_obj = self._get_or_create_peer(observer_peer_id)
             result = (
-                peer_obj.set_card(card, target=target_peer_id)
+                peer_obj.set_card(facts, target=target_peer_id)
                 if target_peer_id is not None
-                else peer_obj.set_card(card)
+                else peer_obj.set_card(facts)
             )
             logger.info(
                 "Updated peer card observer=%s target=%s (%d facts)",
                 observer_peer_id,
                 target_peer_id or observer_peer_id,
-                len(card),
+                len(facts),
             )
             return result
         except Exception as e:
@@ -1387,6 +1701,27 @@ class HonchoSessionManager:
         if not content or not content.strip():
             return False
 
+        if str(source).strip().lower() in {"export", "transcript", "history", "chat"}:
+            logger.info(
+                "Rejected unfiltered AI identity seed source=%s by %s",
+                source,
+                POLICY_VERSION,
+            )
+            return False
+
+        decision = decide_conclusion(
+            content,
+            extra_deny_terms=getattr(self, "_ingestion_extra_deny_terms", ()),
+        )
+        self._last_ingestion_decision = decision
+        if not decision.accepted:
+            logger.info(
+                "AI identity seed rejected by %s: reason=%s",
+                POLICY_VERSION,
+                decision.reason,
+            )
+            return False
+
         session = self._cache.get(session_key)
         if not session:
             logger.warning("No session cached for '%s', skipping AI seed", session_key)
@@ -1406,7 +1741,22 @@ class HonchoSessionManager:
                 f"{content.strip()}\n"
                 f"</ai_identity_seed>"
             )
-            honcho_session.add_messages([assistant_peer.message(wrapped)])
+            metadata = decision.as_metadata()
+            metadata.update(
+                {
+                    "source": "hermes_ai_identity",
+                    "identity_source": str(source),
+                    "memory_policy": POLICY_VERSION,
+                    "host": getattr(self._config, "host", "hermes"),
+                    "workspace": getattr(self._config, "workspace_id", ""),
+                    "ai_peer": session.assistant_peer_id,
+                }
+            )
+            try:
+                message = assistant_peer.message(wrapped, metadata=metadata)
+            except TypeError:
+                message = assistant_peer.message(wrapped)
+            honcho_session.add_messages([message])
             logger.info("Seeded AI identity from '%s' into %s", source, session_key)
             return True
         except Exception as e:

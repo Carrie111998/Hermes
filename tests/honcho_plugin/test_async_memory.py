@@ -424,7 +424,9 @@ class TestMemoryFileMigrationTargets:
         uploaded = mgr.migrate_memory_files(session.key, str(tmp_path))
 
         assert uploaded is True
-        assert honcho_session.upload_file.call_count == 3
+        # SOUL.md is agent configuration, not durable user/project memory;
+        # automatic migration only uploads curated MEMORY.md and USER.md.
+        assert honcho_session.upload_file.call_count == 2
 
         peer_by_upload_name = {}
         for call_args in honcho_session.upload_file.call_args_list:
@@ -433,7 +435,7 @@ class TestMemoryFileMigrationTargets:
 
         assert peer_by_upload_name["consolidated_memory.md"] is user_peer
         assert peer_by_upload_name["user_profile.md"] is user_peer
-        assert peer_by_upload_name["agent_soul.md"] is ai_peer
+        assert "agent_soul.md" not in peer_by_upload_name
 
 
 # ---------------------------------------------------------------------------
@@ -455,4 +457,65 @@ class TestPrefetchCacheAccessors:
 
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
+
+
+class TestCuratedTurnWrites:
+    def test_record_turn_rejects_chatter_and_preserves_scoped_provenance(self, make_manager):
+        mgr = make_manager(write_frequency="turn")
+        mgr._config.workspace_id = "isolated-workspace"
+        mgr._config.host = "hermes_colin"
+        mgr._config.peer_name = "colin"
+        mgr._config.ai_peer = "colin-agent"
+
+        session = _make_session(
+            key="telegram:curated",
+            user_peer_id="colin",
+            assistant_peer_id="colin-agent",
+            honcho_session_id="telegram-curated",
+        )
+        mgr._cache[session.key] = session
+        user_peer = MagicMock(name="user-peer")
+        ai_peer = MagicMock(name="ai-peer")
+        mgr._peers_cache[session.user_peer_id] = user_peer
+        mgr._peers_cache[session.assistant_peer_id] = ai_peer
+        honcho_session = MagicMock()
+        mgr._sessions_cache[session.honcho_session_id] = honcho_session
+
+        accepted = mgr.record_turn(
+            session.key,
+            "Please remember that Colin prefers concise candidate summaries with the key evidence first.",
+            "Understood; that is a durable communication preference for future candidate work.",
+        )
+        assert accepted.accepted is True
+        assert len(session.messages) == 2
+        assert user_peer.message.call_count == 1
+        metadata = user_peer.message.call_args.kwargs["metadata"]
+        assert metadata["memory_policy"] == "curated-v1"
+        assert metadata["workspace"] == "isolated-workspace"
+        assert metadata["user_peer"] == "colin"
+        assert metadata["ai_peer"] == "colin-agent"
+        assert metadata["session_key"] == "telegram:curated"
+
+        before = len(session.messages)
+        rejected = mgr.record_turn(
+            session.key,
+            "The football match was exciting and Arsenal won.",
+            "Acknowledged.",
+        )
+        assert rejected.accepted is False
+        assert rejected.hard_denial is True
+        assert len(session.messages) == before
+        assert user_peer.message.call_count == 1
+
+        session.metadata["workspace"] = "wrong-workspace"
+        scope_rejected = mgr.record_turn(
+            session.key,
+            "Please remember that this is a durable but correctly scoped project convention.",
+            "The convention should be reused by future implementation work.",
+        )
+        assert scope_rejected.accepted is False
+        assert scope_rejected.reason == "scope_mismatch"
+        assert scope_rejected.hard_denial is True
+        assert len(session.messages) == before
+        assert user_peer.message.call_count == 1
 

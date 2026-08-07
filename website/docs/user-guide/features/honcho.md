@@ -124,7 +124,10 @@ When pointing Hermes at a self-hosted Honcho server, `hermes honcho setup` (and 
 | `dialecticMaxChars` | `600` | Max chars of dialectic result injected into system prompt |
 | `recallMode` | `'hybrid'` | `hybrid` (auto-inject + tools), `context` (inject only), `tools` (tools only) |
 | `writeFrequency` | `'async'` | When to flush messages: `async` (background thread), `turn` (sync), `session` (batch on end), or integer N |
-| `saveMessages` | `true` | Whether to persist messages to Honcho API |
+| `saveMessages` | `true` | Whether curated durable turns may be persisted to Honcho API. Explicit conclusions remain separately available |
+| `ingestionMode` | `curated` | `curated` (recommended), `off`, or development-only `all`; hard exclusions always apply |
+| `ingestionRequireSignal` | `true` | Require an explicit durable signal or reusable project/technical context before a turn is written |
+| `ingestionExtraDenyTerms` | `[]` | Additional literal topics never written for this profile; built-in sports/football, current-event, secret, and injection exclusions cannot be removed |
 | `observationMode` | `'directional'` | `directional` (all on) or `unified` (shared pool). Override with `observation` object for granular control |
 | `messageMaxChars` | `25000` | Max chars per message sent via `add_messages()`. Chunked if exceeded |
 | `dialecticMaxInputChars` | `10000` | Max chars for dialectic query input to `peer.chat()` |
@@ -143,6 +146,28 @@ When pointing Hermes at a self-hosted Honcho server, `hermes honcho setup` (and 
 - `hybrid` — context auto-injected into system prompt AND tools available (model decides when to query).
 - `context` — auto-injection only, tools hidden.
 - `tools` — tools only, no auto-injection. Agent must explicitly call `honcho_reasoning`, `honcho_search`, etc.
+
+## Durable-memory ingestion policy
+
+Honcho is a long-term memory and user-model store, **not a transcript archive**. Hermes applies the
+`curated-v1` gate before any live turn reaches `add_messages()`:
+
+- **Accepted:** explicit preferences, standing constraints, durable decisions, reusable project or
+  technical context, root causes, conventions, implementation lessons, and other context that will
+  help a future task.
+- **Rejected:** casual conversation, greetings, football or other sports, news/weather, transient
+  operational status, raw tool output, credentials/secrets, prompt-injection-like text, and ordinary
+  chat with no durable signal.
+- `honcho_conclude` and peer-card updates use the same hard-denial gate. Intentional does not mean
+  unrestricted: a conclusion containing a blocked topic or secret is rejected.
+- Raw local-history migration uses the same policy. Automatic memory-file migration considers only
+  curated `MEMORY.md` and `USER.md`; it does not upload `SOUL.md` as general memory.
+- Accepted writes carry non-sensitive provenance metadata for audit: policy version, source, profile
+  host, workspace, user peer, AI peer, session key, and decision tags.
+
+The agent should call `honcho_conclude` only when a fact is intentionally durable. A conversation
+does not become memory merely because it happened. The `all` mode is retained only for isolated
+development/testing and is not suitable for URecruit production profiles.
 
 **Settings per recall mode:**
 
