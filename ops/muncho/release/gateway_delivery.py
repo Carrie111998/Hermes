@@ -47,6 +47,7 @@ def _supports_verified_native_discord_delivery(adapter: Any) -> bool:
     return (
         getattr(adapter, "supports_verified_idempotent_public_delivery", False)
         is True
+        and callable(getattr(adapter, "find_public_message_ids_by_exact_nonce", None))
         and callable(getattr(adapter, "verify_public_message_receipt", None))
     )
 
@@ -141,12 +142,40 @@ async def dispatch_pending_gateway_discord_deliveries(
                 "non_conversational": True,
             }
         try:
-            result = await transport.send(
-                Platform.DISCORD,
-                request["channel_id"],
-                request["summary"],
-                metadata=delivery_metadata,
-            )
+            if is_native:
+                queued_at = datetime.fromisoformat(
+                    str(request["queued_at_utc"]).replace("Z", "+00:00")
+                )
+                existing_ids = (
+                    await transport.adapter.find_public_message_ids_by_exact_nonce(
+                        expected_guild_id=request["guild_id"],
+                        channel_id=request["channel_id"],
+                        nonce=native_nonce,
+                        expected_content_sha256=request["summary_sha256"],
+                        after_utc=queued_at,
+                    )
+                )
+                if len(existing_ids) > 1:
+                    raise RuntimeError("native Discord nonce receipt is ambiguous")
+                if existing_ids:
+                    result = {
+                        "success": True,
+                        "message_id": existing_ids[0],
+                    }
+                else:
+                    result = await transport.send(
+                        Platform.DISCORD,
+                        request["channel_id"],
+                        request["summary"],
+                        metadata=delivery_metadata,
+                    )
+            else:
+                result = await transport.send(
+                    Platform.DISCORD,
+                    request["channel_id"],
+                    request["summary"],
+                    metadata=delivery_metadata,
+                )
         except Exception:
             uncertain = {**identity, "state": "dispatch_uncertain"}
             if is_native:

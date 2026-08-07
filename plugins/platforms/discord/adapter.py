@@ -3684,6 +3684,95 @@ class DiscordAdapter(BasePlatformAdapter):
             "bot_user_id": bot_id,
         }
 
+    async def find_public_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id: str,
+        channel_id: str,
+        nonce: int,
+        expected_content_sha256: str,
+        after_utc: dt.datetime,
+    ) -> Tuple[str, ...]:
+        """Reconcile an accepted idempotent message without another mutation.
+
+        Discord's ``enforce_nonce`` protects the send race and short retries.
+        A durable release request can outlive that server-side window, so a
+        restarted gateway first scans the bounded history after the immutable
+        request timestamp.  Only the exact nonce, bot author, and content hash
+        are retained; unrelated message content is not interpreted.
+        """
+
+        if not self._client or not getattr(self._client, "user", None):
+            raise RuntimeError("Discord client is not connected")
+        if (
+            isinstance(nonce, bool)
+            or not isinstance(nonce, int)
+            or not 0 <= nonce < (1 << 64)
+        ):
+            raise RuntimeError("Discord reconciliation nonce is invalid")
+        if (
+            not isinstance(after_utc, dt.datetime)
+            or after_utc.tzinfo is None
+            or after_utc.utcoffset() is None
+        ):
+            raise RuntimeError("Discord reconciliation timestamp is invalid")
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(channel_id))
+        if _discord_public_target_error(channel):
+            raise RuntimeError(
+                "Discord reconciliation target is not a public guild "
+                "channel/thread visible to @everyone/default role"
+            )
+        actual_guild_id = str(
+            getattr(getattr(channel, "guild", None), "id", "") or ""
+        )
+        if actual_guild_id != str(expected_guild_id):
+            raise RuntimeError("Discord reconciliation guild identity mismatch")
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            raise RuntimeError("Discord reconciliation history is unavailable")
+
+        bot_id = str(getattr(self._client.user, "id", "") or "")
+        matches: list[str] = []
+        observed = 0
+        async for message in history(
+            limit=10_001,
+            after=after_utc,
+            oldest_first=True,
+        ):
+            observed += 1
+            if observed > 10_000:
+                raise RuntimeError("Discord reconciliation history bound exceeded")
+            if str(getattr(message, "nonce", "")) != str(nonce):
+                continue
+            author_id = str(
+                getattr(getattr(message, "author", None), "id", "") or ""
+            )
+            if not bot_id or author_id != bot_id:
+                raise RuntimeError(
+                    "Discord reconciliation nonce belongs to another author"
+                )
+            actual_sha256 = hashlib.sha256(
+                str(getattr(message, "content", "") or "").encode("utf-8")
+            ).hexdigest()
+            if actual_sha256 != expected_content_sha256:
+                raise RuntimeError(
+                    "Discord reconciliation nonce content hash mismatch"
+                )
+            message_id = str(getattr(message, "id", "") or "")
+            if not message_id.isdigit() or message_id.startswith("0"):
+                raise RuntimeError("Discord reconciliation message ID is invalid")
+            matches.append(message_id)
+            if len(matches) > 1:
+                raise RuntimeError("Discord reconciliation nonce is ambiguous")
+
+        if _discord_public_target_error(channel):
+            raise RuntimeError(
+                "Discord reconciliation target lost public @everyone visibility"
+            )
+        return tuple(matches)
+
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 

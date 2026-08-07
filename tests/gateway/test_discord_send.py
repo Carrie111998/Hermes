@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import hashlib
 import sys
 from pathlib import Path
@@ -640,6 +641,88 @@ async def test_exact_receipt_send_and_readback_reject_wrong_guild_before_post():
             message_id="1234",
         )
     channel.fetch_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_nonce_history_reconciles_bot_message_without_mutation():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    bot_user = SimpleNamespace(id=42)
+    content = "Already accepted immutable release summary"
+    nonce = (1 << 63) + 17
+    history_calls = []
+
+    async def history(**kwargs):
+        history_calls.append(kwargs)
+        yield SimpleNamespace(
+            id=1234,
+            nonce=nonce,
+            author=bot_user,
+            content=content,
+        )
+
+    channel = _public_channel(
+        id=555,
+        type=0,
+        history=history,
+        send=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    after_utc = datetime.datetime(
+        2026,
+        8,
+        7,
+        12,
+        0,
+        tzinfo=datetime.timezone.utc,
+    )
+
+    message_ids = await adapter.find_public_message_ids_by_exact_nonce(
+        expected_guild_id=str(channel.guild.id),
+        channel_id="555",
+        nonce=nonce,
+        expected_content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+        after_utc=after_utc,
+    )
+
+    assert message_ids == ("1234",)
+    assert history_calls == [
+        {"limit": 10_001, "after": after_utc, "oldest_first": True}
+    ]
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exact_nonce_history_rejects_content_collision():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    bot_user = SimpleNamespace(id=42)
+
+    async def history(**_kwargs):
+        yield SimpleNamespace(
+            id=1234,
+            nonce=42,
+            author=bot_user,
+            content="different content",
+        )
+
+    channel = _public_channel(id=555, type=0, history=history)
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="content hash mismatch"):
+        await adapter.find_public_message_ids_by_exact_nonce(
+            expected_guild_id=str(channel.guild.id),
+            channel_id="555",
+            nonce=42,
+            expected_content_sha256=hashlib.sha256(b"expected").hexdigest(),
+            after_utc=datetime.datetime.now(datetime.timezone.utc),
+        )
 
 
 @pytest.mark.asyncio

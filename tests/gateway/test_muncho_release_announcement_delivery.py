@@ -176,6 +176,26 @@ class _NativeDiscord:
             raise RuntimeError("nonce reused with different exact content")
         return SimpleNamespace(success=True, message_id=accepted[0])
 
+    async def find_public_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id,
+        channel_id,
+        nonce,
+        expected_content_sha256,
+        after_utc,
+    ):
+        assert expected_guild_id == GUILD_ID
+        assert channel_id == CHANNEL_ID
+        assert after_utc.tzinfo is not None
+        accepted = self.accepted_by_nonce.get(nonce)
+        if accepted is None:
+            return ()
+        actual_sha256 = hashlib.sha256(accepted[1].encode("utf-8")).hexdigest()
+        if actual_sha256 != expected_content_sha256:
+            raise RuntimeError("stored nonce content mismatch")
+        return (accepted[0],)
+
     async def verify_public_message_receipt(
         self,
         *,
@@ -716,11 +736,10 @@ async def test_native_crash_after_acceptance_replays_one_mutation(
 
     assert completed[0]["state"] == "delivered"
     assert direct.mutations == 1
-    assert len(direct.calls) == 2
-    assert (
-        direct.calls[0][2]["discord_enforced_nonce"]
-        == direct.calls[1][2]["discord_enforced_nonce"]
-    )
+    assert len(direct.calls) == 1
+    assert completed[0]["discord_enforced_nonce"] == direct.calls[0][2][
+        "discord_enforced_nonce"
+    ]
     assert len(direct.receipt_calls) == 2
 
 
@@ -764,6 +783,7 @@ async def test_native_readback_mismatch_stays_pending_and_replays_without_duplic
         "discord_enforced_nonce"
     ]
     assert direct.mutations == 1
+    assert len(direct.calls) == 1
     assert direct.calls[0][1] == draft["summary"]
 
 
