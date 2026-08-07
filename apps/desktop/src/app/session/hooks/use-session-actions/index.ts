@@ -141,10 +141,30 @@ function reconcileAuthoritativeMessages(
 ): ChatMessage[] {
   const authoritative = toChatMessages(authoritativeMessages)
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
-  const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
+
+  return reconcileProjectedMessages(withLiveProjection, previousMessages)
+}
+
+function reconcileProjectedMessages(projectedMessages: ChatMessage[], previousMessages: ChatMessage[]): ChatMessage[] {
+  const reconciled = reconcileResumeMessages(projectedMessages, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
 
   return preserveLocalAssistantErrors(withPendingTurn, previousMessages)
+}
+
+function liveTurnStateChanged(current: ClientSessionState, snapshot: ClientSessionState): boolean {
+  return (
+    current.messages !== snapshot.messages ||
+    current.busy !== snapshot.busy ||
+    current.awaitingResponse !== snapshot.awaitingResponse ||
+    current.streamId !== snapshot.streamId ||
+    current.sawAssistantPayload !== snapshot.sawAssistantPayload ||
+    current.pendingBranchGroup !== snapshot.pendingBranchGroup ||
+    current.interrupted !== snapshot.interrupted ||
+    current.interimBoundaryPending !== snapshot.interimBoundaryPending ||
+    current.needsInput !== snapshot.needsInput ||
+    current.turnStartedAt !== snapshot.turnStartedAt
+  )
 }
 
 // `session.create` params from the current profile + sticky-UI model/effort/fast,
@@ -800,19 +820,31 @@ export function useSessionActions({
 
               const activatedState = updateSessionState(
                 cachedRuntimeId,
-                state => ({
-                  ...state,
-                  ...(runtimeInfo ?? {}),
-                  messages: activatedMessages,
-                  busy: running,
-                  awaitingResponse: running
-                }),
+                state => {
+                  // session.activate snapshots its turn projection before the
+                  // response is delivered. If submit/stream/complete/interrupt
+                  // changed that projection during the await, the live cache is
+                  // newer and wins as a unit. Otherwise activation remains
+                  // authoritative and may legitimately clear a stale busy cache.
+                  const turnAdvanced = liveTurnStateChanged(state, cachedViewState)
+                  const activatedRunning = Boolean(activated.running ?? state.busy)
+
+                  return {
+                    ...state,
+                    ...(runtimeInfo ?? {}),
+                    messages: turnAdvanced
+                      ? state.messages
+                      : reconcileProjectedMessages(activatedMessages, state.messages),
+                    busy: turnAdvanced ? state.busy : activatedRunning,
+                    awaitingResponse: turnAdvanced ? state.awaitingResponse : activatedRunning
+                  }
+                },
                 storedSessionId
               )
 
-              busyRef.current = running
-              setBusy(running)
-              setAwaitingResponse(running)
+              busyRef.current = activatedState.busy
+              setBusy(activatedState.busy)
+              setAwaitingResponse(activatedState.awaitingResponse)
               syncSessionStateToView(cachedRuntimeId, activatedState)
 
               return
