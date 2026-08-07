@@ -4850,13 +4850,17 @@ def run_one_job(
             delivery_status = "unconfirmed"
 
         if not _consume_interrupted_flag(job["id"]):
+            mark_kwargs: dict[str, Any] = {
+                "delivery_error": delivery_error,
+                "delivery_status": delivery_status,
+            }
+            if blocked_config:
+                mark_kwargs["status"] = "blocked_config"
             mark_job_run(
                 job["id"],
                 success,
                 error,
-                delivery_error=delivery_error,
-                delivery_status=delivery_status,
-                status="blocked_config" if blocked_config else None,
+                **mark_kwargs,
             )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
