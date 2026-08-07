@@ -574,11 +574,10 @@ def _compute_tool_definitions(
         logger.warning("Schema sanitization skipped: %s", e)
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
-    # Conditionally replace MCP + plugin (non-core) tools with three bridge
-    # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
-    # deferred. See tools/tool_search.py for full design notes.
+    # Conditionally replace MCP/plugin tools and explicitly selected built-ins
+    # with three bridge tools (tool_search / tool_describe / tool_call).
+    # _HERMES_CORE_TOOLS still defines availability; its reviewed opt-in
+    # subset controls model visibility only. See tools/tool_search.py.
     #
     # This is deliberately the last step before returning — sanitization
     # has already normalized schemas, and the assembly is idempotent in
@@ -601,7 +600,7 @@ def _compute_tool_definitions(
                           "none": "no listing (search-only)"}
                 print(
                     f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
-                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"tools deferred (~{assembly.deferred_tokens} tokens) behind "
                     f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
@@ -1196,6 +1195,7 @@ def handle_function_call(
         _ts_mod = None
 
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
+        _ts_config = _ts_mod.load_config()
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
             # not the already-collapsed bridge-only list (the bridge would
@@ -1222,6 +1222,7 @@ def handle_function_call(
                 _ts_mod.dispatch_tool_search(
                     function_args or {},
                     current_tool_defs=current_defs,
+                    config=_ts_config,
                 )
             )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
@@ -1229,10 +1230,14 @@ def handle_function_call(
                 _ts_mod.dispatch_tool_describe(
                     function_args or {},
                     current_tool_defs=current_defs,
+                    config=_ts_config,
                 )
             )
         if function_name == _ts_mod.TOOL_CALL_NAME:
-            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
+            underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(
+                function_args or {},
+                builtin_policy=_ts_config.builtins,
+            )
             if err or not underlying_name:
                 return _return_bridge_result(
                     tool_error(err or "tool_call could not be resolved")
@@ -1243,7 +1248,10 @@ def handle_function_call(
             # additionally rejects any tool the session was not granted, so a
             # restricted session can never invoke an out-of-scope tool through
             # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
+            _scoped_deferrable = _ts_mod.scoped_deferrable_names(
+                current_defs,
+                config=_ts_config,
+            )
             if underlying_name not in _scoped_deferrable:
                 return _return_bridge_result(
                     tool_error(

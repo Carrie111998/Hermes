@@ -118,7 +118,7 @@ class TestConfigParsing:
 
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification — core availability is separate from eager visibility.
 # ---------------------------------------------------------------------------
 
 
@@ -418,6 +418,115 @@ class TestBridgeDispatch:
         assert "remain available" in result["hint"]
         assert "before concluding" in result["hint"]
 
+    def test_search_and_describe_include_configured_builtin(self):
+        from tools.tool_search import (
+            ToolSearchConfig,
+            dispatch_tool_describe,
+            dispatch_tool_search,
+        )
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        defs = [_td("browser_navigate", "Navigate to a web page")]
+
+        search = json.loads(dispatch_tool_search(
+            {"query": "navigate browser"},
+            current_tool_defs=defs,
+            config=cfg,
+        ))
+        assert [match["name"] for match in search["matches"]] == [
+            "browser_navigate"
+        ]
+        assert search["matches"][0]["source"] == "builtin"
+
+        described = json.loads(dispatch_tool_describe(
+            {"name": "browser_navigate"},
+            current_tool_defs=defs,
+            config=cfg,
+        ))
+        assert described["name"] == "browser_navigate"
+        assert described["description"] == "Navigate to a web page"
+
+    def test_narrow_builtin_below_threshold_is_not_bridge_reachable(self):
+        from tools.tool_search import ToolSearchConfig, scoped_deferrable_names
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 10_000,
+            },
+        })
+
+        assert scoped_deferrable_names(
+            [_td("browser_navigate", "Small browser schema")],
+            config=cfg,
+        ) == frozenset()
+
+    def test_resolve_underlying_call_accepts_configured_builtin_only(self):
+        from tools.tool_search import ToolSearchConfig, resolve_underlying_call
+
+        enabled = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        disabled = ToolSearchConfig.from_raw(None)
+        args = {"name": "browser_navigate", "arguments": {"url": "https://example.com"}}
+
+        name, parsed, err = resolve_underlying_call(
+            args,
+            builtin_policy=enabled.builtins,
+        )
+        assert err is None
+        assert name == "browser_navigate"
+        assert parsed == {"url": "https://example.com"}
+
+        _, _, err = resolve_underlying_call(
+            args,
+            builtin_policy=disabled.builtins,
+        )
+        assert "not a deferrable" in err
+
+    def test_deferred_execute_code_describes_current_dynamic_schema(self):
+        import model_tools
+        from tools.tool_search import (
+            ToolSearchConfig,
+            dispatch_tool_describe,
+        )
+
+        raw_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["code_execution", "file"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["code_execution"],
+                "min_schema_tokens": 0,
+            },
+        })
+
+        described = json.loads(dispatch_tool_describe(
+            {"name": "execute_code"},
+            current_tool_defs=raw_defs,
+            config=cfg,
+        ))
+
+        assert "read_file" in described["description"]
+        assert "web_search" not in described["description"]
+        assert described["parameters"]["required"] == ["code"]
+
 
     def test_resolve_underlying_call_parses_object_args(self):
         from tools.tool_search import resolve_underlying_call
@@ -499,6 +608,56 @@ class TestHandleFunctionCallIntegration:
         assert payload["turn_id"] == "private-turn"
         assert payload["api_request_id"] == "private-request"
         assert payload["tool_call_id"] == "private-call"
+
+    @staticmethod
+    def _builtin_config():
+        from tools.tool_search import ToolSearchConfig
+
+        return ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+
+    def test_builtin_tool_call_dispatches_underlying_tool(self, monkeypatch):
+        import model_tools
+        from tools import tool_search
+        from tools.registry import registry
+
+        cfg = self._builtin_config()
+        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        dispatched = []
+
+        def fake_dispatch(name, args, **kwargs):
+            dispatched.append((name, args))
+            return json.dumps({"ok": True, "tool": name})
+
+        monkeypatch.setattr(registry, "dispatch", fake_dispatch)
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "browser_back", "arguments": {}},
+            enabled_toolsets=["browser"],
+        ))
+
+        assert result == {"ok": True, "tool": "browser_back"}
+        assert dispatched == [("browser_back", {})]
+
+    def test_builtin_tool_call_cannot_escape_session_scope(self, monkeypatch):
+        import model_tools
+        from tools import tool_search
+
+        cfg = self._builtin_config()
+        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        result = json.loads(model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={"name": "browser_back", "arguments": {}},
+            enabled_toolsets=["terminal"],
+        ))
+
+        assert "not available in this session" in result["error"]
 
 
 class TestRegression_OpenClawCron84141:
@@ -620,6 +779,44 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
+
+    def test_executor_scope_cache_fingerprint_includes_builtin_policy(self, monkeypatch):
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools.tool_search import ToolSearchConfig
+
+        class Agent:
+            enabled_toolsets = ["browser", "todo"]
+            disabled_toolsets = None
+
+        agent = Agent()
+        defs = [_td("browser_navigate"), _td("todo")]
+        calls = []
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: calls.append(kwargs) or defs,
+        )
+        browser_cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        todo_cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["todo"],
+                "min_schema_tokens": 0,
+            },
+        })
+
+        assert _tool_search_scoped_names(agent, browser_cfg) == frozenset({
+            "browser_navigate"
+        })
+        assert _tool_search_scoped_names(agent, todo_cfg) == frozenset({"todo"})
+        assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------

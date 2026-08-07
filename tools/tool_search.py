@@ -1,9 +1,10 @@
 """Progressive tool disclosure ("tool search") for Hermes Agent.
 
-When enabled, MCP, non-core plugin, and explicitly selected built-in tools are replaced in the model-visible
-tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Built-in deferral is opt-in and
-allowlist-only; unknown and newly added core tools remain eager.
+When enabled, MCP, non-core plugin, and explicitly selected built-in tools are
+replaced in the model-visible tools array by three bridge tools —
+``tool_search``, ``tool_describe``, ``tool_call`` — and surfaced on demand.
+Built-in deferral is opt-in and allowlist-only; unknown and newly added core
+tools remain eager.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
@@ -349,6 +350,40 @@ def classify_tools(
             deferrable.append(td)
         else:
             visible.append(td)
+    return visible, deferrable
+
+
+def classify_tools_for_config(
+    tool_defs: List[Dict[str, Any]],
+    config: ToolSearchConfig,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Classify one scoped raw tool list using the complete resolved policy.
+
+    This is the single authority for the built-in minimum-schema gate. The
+    assembly and every bridge read/invocation path must agree on whether a
+    selected built-in is actually deferred for this particular session.
+    """
+    if config.enabled == "off":
+        return list(tool_defs), []
+
+    visible, deferrable = classify_tools(
+        tool_defs,
+        builtin_policy=config.builtins,
+    )
+    selected_builtin_defs = [
+        td for td in deferrable
+        if (td.get("function") or {}).get("name")
+        in config.builtins.deferred_names
+        and (td.get("function") or {}).get("name") in _core_tool_names()
+    ]
+    if (
+        selected_builtin_defs
+        and estimate_tokens_from_schemas(selected_builtin_defs)
+        < config.builtins.min_schema_tokens
+    ):
+        # Reclassifying without the built-in policy keeps existing MCP/plugin
+        # tools deferred while returning the below-threshold built-ins eager.
+        return classify_tools(tool_defs)
     return visible, deferrable
 
 
@@ -902,22 +937,7 @@ def assemble_tool_defs(
     if config.enabled == "off":
         return AssemblyResult(tool_defs=incoming, activated=False)
 
-    visible, deferrable = classify_tools(
-        incoming,
-        builtin_policy=config.builtins,
-    )
-
-    # Avoid paying for three bridge schemas in narrow jobs just to hide a
-    # small built-in. The gate considers selected built-in schemas only;
-    # existing MCP/plugin deferral remains exactly as before.
-    selected_builtin_defs = [
-        td for td in deferrable
-        if (td.get("function") or {}).get("name") in config.builtins.deferred_names
-        and (td.get("function") or {}).get("name") in _core_tool_names()
-    ]
-    builtin_tokens = estimate_tokens_from_schemas(selected_builtin_defs)
-    if selected_builtin_defs and builtin_tokens < config.builtins.min_schema_tokens:
-        visible, deferrable = classify_tools(incoming)
+    visible, deferrable = classify_tools_for_config(incoming, config)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -1021,7 +1041,7 @@ def dispatch_tool_search(args: Dict[str, Any],
     else:
         limit = max(1, min(config.max_search_limit, _safe_int(raw_limit, config.search_default_limit)))
 
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools_for_config(current_tool_defs, config)
     catalog = build_catalog(deferrable)
     hits = search_catalog(catalog, query, limit=limit)
     result: Dict[str, Any] = {
@@ -1042,17 +1062,20 @@ def dispatch_tool_search(args: Dict[str, Any],
 
 def dispatch_tool_describe(args: Dict[str, Any],
                            *,
-                           current_tool_defs: List[Dict[str, Any]]) -> str:
+                           current_tool_defs: List[Dict[str, Any]],
+                           config: Optional[ToolSearchConfig] = None) -> str:
     """Execute the ``tool_describe`` bridge tool. Returns a JSON string."""
+    if config is None:
+        config = load_config()
     name = str(args.get("name") or "").strip()
     if not name:
         return tool_error("name is required")
-    if not is_deferrable_tool_name(name):
+    if not is_deferrable_tool_name(name, config.builtins):
         return tool_error(
             f"'{name}' is not a deferrable tool. If you see it in the tools list "
             "already, call it directly; otherwise check the spelling against tool_search."
         )
-    _, deferrable = classify_tools(current_tool_defs)
+    _, deferrable = classify_tools_for_config(current_tool_defs, config)
     for td in deferrable:
         fn = td.get("function") or {}
         if fn.get("name") == name:
@@ -1066,7 +1089,11 @@ def dispatch_tool_describe(args: Dict[str, Any],
     )
 
 
-def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+def scoped_deferrable_names(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    config: Optional[ToolSearchConfig] = None,
+) -> frozenset[str]:
     """Return the set of deferrable tool names present in ``tool_defs``.
 
     ``tool_defs`` is expected to be the *pre-assembly* tool list for the
@@ -1078,12 +1105,14 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     ``tool_executor`` unwrap so a restricted-toolset session can never invoke
     an out-of-scope tool via the bridge.
     """
-    names: set[str] = set()
-    for td in tool_defs:
-        name = (td.get("function") or {}).get("name", "")
-        if name and is_deferrable_tool_name(name):
-            names.add(name)
-    return frozenset(names)
+    if config is None:
+        config = load_config()
+    _, deferrable = classify_tools_for_config(tool_defs, config)
+    return frozenset(
+        (td.get("function") or {}).get("name", "")
+        for td in deferrable
+        if (td.get("function") or {}).get("name")
+    )
 
 
 def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
@@ -1139,7 +1168,11 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
         return None
 
 
-def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
+def resolve_underlying_call(
+    args: Dict[str, Any],
+    *,
+    builtin_policy: Optional[BuiltinDisclosurePolicy] = None,
+) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
     """Parse a ``tool_call`` invocation into (underlying_name, args, error_msg).
 
     Used by:
@@ -1164,7 +1197,7 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    if not is_deferrable_tool_name(name, builtin_policy):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
@@ -1185,6 +1218,7 @@ __all__ = [
     "load_config",
     "is_deferrable_tool_name",
     "classify_tools",
+    "classify_tools_for_config",
     "estimate_tokens_from_schemas",
     "should_activate",
     "build_catalog",

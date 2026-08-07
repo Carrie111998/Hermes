@@ -829,7 +829,12 @@ def _canonicalize_api_tool_calls(api_messages) -> None:
         am["tool_calls"] = new_tcs
 
 
-def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
+def _invalid_tool_name_error_content(
+    name: str,
+    valid_tool_names,
+    *,
+    deferred_tool_names=(),
+) -> str:
     """Error-result content for a tool call whose name isn't a real tool.
 
     A blank/whitespace-only name is not a typo the model can fuzzy-correct
@@ -853,8 +858,24 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
             "tool, use a valid name from your tool list; "
             "otherwise reply in plain text."
         )
+    if name in deferred_tool_names:
+        return (
+            f"Tool '{name}' is available but deferred from the direct tool list. "
+            "Use tool_search if needed, tool_describe to load its parameters, "
+            "then invoke it through tool_call."
+        )
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}"
+
+
+def _deferred_tool_names_for_agent(agent) -> frozenset[str]:
+    """Resolve the current session's bridge-reachable names on error only."""
+    try:
+        from agent.tool_executor import _tool_search_scoped_names
+
+        return _tool_search_scoped_names(agent)
+    except Exception:
+        return frozenset()
 
 
 def _content_policy_blocked_result(
@@ -5983,6 +6004,11 @@ def run_conversation(
                     tc.function.name for tc in assistant_message.tool_calls
                     if tc.function.name not in agent.valid_tool_names
                 ]
+                deferred_tool_names = (
+                    _deferred_tool_names_for_agent(agent)
+                    if invalid_tool_calls
+                    else frozenset()
+                )
                 # Mixed batch: at least one valid call alongside the invalid
                 # one(s). Degrading models (observed with gpt-5.6 at very
                 # large context) emit batches like 6 named calls + 1
@@ -6047,7 +6073,9 @@ def run_conversation(
                             # See _invalid_tool_name_error_content for the
                             # blank-name anti-priming rationale (#47967).
                             content = _invalid_tool_name_error_content(
-                                _tc_name, agent.valid_tool_names
+                                _tc_name,
+                                agent.valid_tool_names,
+                                deferred_tool_names=deferred_tool_names,
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
@@ -6308,7 +6336,9 @@ def run_conversation(
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
                             "content": _invalid_tool_name_error_content(
-                                tc.function.name, agent.valid_tool_names
+                                tc.function.name,
+                                agent.valid_tool_names,
+                                deferred_tool_names=deferred_tool_names,
                             ),
                         })
                     assistant_message.tool_calls = [

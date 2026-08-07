@@ -53,6 +53,20 @@ def test_is_destructive_command_treats_cp_as_mutating():
     assert run_agent._is_destructive_command("cp .env.local .env") is True
 
 
+def test_invalid_deferred_tool_name_returns_bridge_recovery_instruction():
+    from agent.conversation_loop import _invalid_tool_name_error_content
+
+    message = _invalid_tool_name_error_content(
+        "browser_navigate",
+        {"terminal", "tool_search", "tool_describe", "tool_call"},
+        deferred_tool_names={"browser_navigate"},
+    )
+
+    assert "deferred" in message
+    assert "tool_search" in message
+    assert "tool_call" in message
+
+
 
 
 
@@ -1511,6 +1525,38 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
+    def test_sequential_tool_call_unwraps_configured_builtin(self, agent, monkeypatch):
+        from tools import tool_search
+
+        cfg = tool_search.ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.tool_executor._tool_search_scoped_names",
+            lambda _agent, config=None: frozenset({"browser_back"}),
+        )
+        tc = _mock_tool_call(
+            name="tool_call",
+            arguments=json.dumps({"name": "browser_back", "arguments": {}}),
+            call_id="bridge-1",
+        )
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value="ok") as dispatch:
+            agent._execute_tool_calls_sequential(
+                _mock_assistant_msg(content="", tool_calls=[tc]),
+                messages,
+                "task-1",
+            )
+
+        assert dispatch.call_args.args[:3] == ("browser_back", {}, "task-1")
+        assert messages[-1]["name"] == "browser_back"
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
@@ -1843,6 +1889,52 @@ class TestConcurrentToolExecution:
         assert "alpha" in messages[0]["content"]
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
+
+    def test_concurrent_tool_calls_unwrap_configured_builtins(self, agent, monkeypatch):
+        from tools import tool_search
+
+        cfg = tool_search.ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.tool_executor._tool_search_scoped_names",
+            lambda _agent, config=None: frozenset({"browser_back", "browser_press"}),
+        )
+        calls = [
+            _mock_tool_call(
+                name="tool_call",
+                arguments=json.dumps({
+                    "name": name,
+                    "arguments": {"key": "Enter"} if name == "browser_press" else {},
+                }),
+                call_id=f"bridge-{index}",
+            )
+            for index, name in enumerate(("browser_back", "browser_press"), 1)
+        ]
+        dispatched = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            dispatched.append(name)
+            return "ok"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            messages = []
+            agent._execute_tool_calls_concurrent(
+                _mock_assistant_msg(content="", tool_calls=calls),
+                messages,
+                "task-1",
+            )
+
+        assert set(dispatched) == {"browser_back", "browser_press"}
+        assert [message["name"] for message in messages] == [
+            "browser_back",
+            "browser_press",
+        ]
 
     def test_concurrent_none_args_rejected_without_crash(self, agent):
         """Concurrent executor must not crash on arguments=None. Current
