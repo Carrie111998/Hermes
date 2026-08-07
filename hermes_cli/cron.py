@@ -163,6 +163,8 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        if job.get("record_session") is False:
+            print(f"    Record:    {color('no session', Colors.DIM)} (session recording disabled)")
 
         # Execution history
         last_status = job.get("last_status")
@@ -352,6 +354,7 @@ def cron_create(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        record_session=getattr(args, "record_session", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -368,6 +371,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("record_session") is False:
+        print("  Record:  no session (session recording disabled)")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -417,6 +422,7 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        record_session=getattr(args, "record_session", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -436,6 +442,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("record_session") is False:
+        print("  Record:  no session (session recording disabled)")
     return 0
 
 

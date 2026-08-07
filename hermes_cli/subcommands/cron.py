@@ -83,6 +83,23 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--record-session",
+        dest="record_session",
+        action="store_true",
+        default=None,
+        help=(
+            "Record this job's execution as a session in state.db. "
+            "Set --no-record-session to skip session recording for "
+            "high-frequency monitoring jobs. Defaults to True."
+        ),
+    )
+    cron_create.add_argument(
+        "--no-record-session",
+        dest="record_session",
+        action="store_false",
+        help="Skip recording this job's execution as a session in state.db.",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -159,6 +176,19 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--record-session",
+        dest="record_session",
+        action="store_true",
+        default=None,
+        help="Record this job's execution as a session in state.db.",
+    )
+    cron_edit.add_argument(
+        "--no-record-session",
+        dest="record_session",
+        action="store_false",
+        help="Skip recording this job's execution as a session in state.db.",
     )
 
     # lifecycle actions
