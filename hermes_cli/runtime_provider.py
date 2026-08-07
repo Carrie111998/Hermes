@@ -1624,6 +1624,11 @@ def _resolve_explicit_runtime(
                 if provider == "actual":
                     base_url = normalize_actual_base_url(base_url)
 
+        # auth_type="none": the endpoint rejects any Authorization header.
+        # Drop explicit/config keys the same way the credential resolver does.
+        if pconfig.auth_type == "none":
+            api_key = ""
+
         api_mode = "chat_completions"
         if provider == "copilot":
             api_mode = _copilot_runtime_api_mode(

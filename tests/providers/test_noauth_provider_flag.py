@@ -104,11 +104,15 @@ class TestNoAuthProvider:
         creds = resolve_api_key_provider_credentials("noauth-preview")
         assert creds["api_key"] == ""
 
-    def test_resolver_keeps_gate_for_keyed_provider(self, keyed_profile):
+    def test_resolver_keeps_gate_for_keyed_provider(self, keyed_profile, monkeypatch):
         from hermes_cli.auth import resolve_api_key_provider_credentials
 
+        # A keyed provider with its env var set must keep the key — the
+        # no-auth sanitization must not apply to api_key providers.
+        monkeypatch.setenv("KEYED_PREVIEW_KEY", "real-key")
         creds = resolve_api_key_provider_credentials("keyed-preview")
-        assert creds["api_key"] == ""
+        assert creds["api_key"] == "real-key"
+        assert creds["source"] == "KEYED_PREVIEW_KEY"
 
     def test_runtime_resolves_noauth_without_auth_error(self, noauth_profile):
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -117,6 +121,16 @@ class TestNoAuthProvider:
         assert runtime["provider"] == "noauth-preview"
         assert runtime["api_key"] == ""
         assert runtime["base_url"] == "https://preview.example.com/v1"
+
+    def test_runtime_drops_explicit_api_key_for_noauth(self, noauth_profile):
+        """explicit_api_key must be discarded for auth_type=none providers."""
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested="noauth-preview",
+            explicit_api_key="must-not-leak",
+        )
+        assert runtime["api_key"] == ""
 
     def test_runtime_raises_auth_error_for_keyed_provider(self, keyed_profile):
         from hermes_cli.auth import AuthError
@@ -132,6 +146,16 @@ class TestNoAuthProvider:
         assert client is not None
         assert client.api_key == ""
         assert str(client.base_url).startswith("https://preview.example.com")
+
+    def test_auxiliary_client_drops_explicit_api_key_for_noauth(self, noauth_profile):
+        """explicit_api_key must be discarded for auth_type=none providers."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, model = resolve_provider_client(
+            "noauth-preview", "noauth-model", explicit_api_key="must-not-leak"
+        )
+        assert client is not None
+        assert client.api_key == ""
 
     def test_auxiliary_client_returns_none_for_keyed_provider(self, keyed_profile):
         from agent.auxiliary_client import resolve_provider_client

@@ -6218,11 +6218,16 @@ def resolve_provider_client(
 
         creds = resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
+        # auth_type="none": the endpoint rejects any Authorization header.
+        # Drop explicit keys (e.g. from fallback_model entries) — the
+        # credential resolver already forces api_key="".
+        if pconfig.auth_type == "none":
+            api_key = ""
         # Honour an explicit api_key override (e.g. from a fallback_model entry
         # or a custom_providers entry) so callers that pass an explicit
         # credential can authenticate against endpoints where no built-in
         # credential is registered for this provider alias.
-        if explicit_api_key:
+        elif explicit_api_key:
             api_key = explicit_api_key.strip() or api_key
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
         if explicit_base_url:
