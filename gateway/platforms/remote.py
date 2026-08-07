@@ -99,6 +99,13 @@ _CAPABILITIES = {
 _REMOTE_SCOPES = ["read", "approve", "chat", "control", "admin"]
 _MIN_HOST_VERSION = "0.9.0"
 
+# The remote platform's own release (HRA-2026-001 v1.0.0 contract), NOT
+# the hermes-agent core's version. The Android app gates the connection
+# on capabilities.version >= its MIN_HOST_VERSION (1.0.0); the core's
+# 0.20.0 would read as an outdated host and block the WS. The core
+# version is still exposed as "hermesVersion" for diagnosis.
+_REMOTE_PLATFORM_VERSION = "1.0.0"
+
 
 def _platform_version() -> str:
     try:
@@ -456,7 +463,7 @@ class RemoteDeviceAdapter(APIServerAdapter):
         extra = config.extra or {}
         self._state = RemoteState(extra.get("state_dir"))
         self._remote_host = str(extra.get("host") or "0.0.0.0")
-        self._remote_port = int(extra.get("port") or 8643)
+        self._remote_port = int(extra.get("port", 8643))
         self._urls: List[str] = [str(u) for u in (extra.get("urls") or [])]
         self._ttl_seconds = int(extra.get("ttl_seconds") or DEFAULT_TTL_SECONDS)
 
@@ -697,13 +704,15 @@ class RemoteDeviceAdapter(APIServerAdapter):
         return web_json({
             "status": "ok",
             "platform": "hermes-agent",
-            "version": _platform_version(),
+            "version": _REMOTE_PLATFORM_VERSION,
+            "hermesVersion": _platform_version(),
         }, 200)
 
     async def _handle_capabilities(self, request) -> Any:
         return web_json({
             "platform": "hermes-agent",
-            "version": _platform_version(),
+            "version": _REMOTE_PLATFORM_VERSION,
+            "hermesVersion": _platform_version(),
             "capabilities": _CAPABILITIES,
             "minHostVersion": _MIN_HOST_VERSION,
             "remote": {
