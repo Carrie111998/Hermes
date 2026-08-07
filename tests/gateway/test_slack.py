@@ -170,6 +170,42 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
         assert event.source.scope_id == "T123"
 
+    @pytest.mark.asyncio
+    async def test_native_slash_drops_echoed_typed_prefix(self, adapter):
+        """A Slack command payload may echo ``!usage`` as its own argument."""
+        command = {
+            "command": "/usage",
+            "text": "!usage",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/usage"
+        assert event.message_type == MessageType.COMMAND
+        assert event.get_command_args() == ""
+
+    @pytest.mark.asyncio
+    async def test_native_btw_drops_echoed_typed_prefix(self, adapter):
+        """The same Slack echo bug must not turn ``/btw`` into prompt ``!btw``."""
+        command = {
+            "command": "/btw",
+            "text": "!btw",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/btw"
+        assert event.message_type == MessageType.COMMAND
+        assert event.get_command_args() == ""
+
 
 # ---------------------------------------------------------------------------
 # TestAppMentionHandler
@@ -1340,6 +1376,171 @@ class TestBangPrefixCommands:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "!nice work"
         assert msg_event.message_type != MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("input_text", "expected_text"),
+        [
+            ("!usage", "/usage"),
+            ("!btw", "/btw"),
+            ("  !usage", "/usage"),
+            ("\t!btw", "/btw"),
+        ],
+    )
+    async def test_bang_info_command_aliases_and_leading_space(
+        self, adapter, input_text, expected_text
+    ):
+        """Usage/background aliases rewrite despite Slack composer whitespace."""
+        await adapter._handle_slack_message(self._make_event(input_text))
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == expected_text
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_bang_backtick_code_format_not_rewritten(self, adapter):
+        """A bang command wrapped in backticks (Slack code format) must NOT be
+        rewritten as a command: the backtick prefixes the text, so the naive
+        leading-``!`` check misses it and it stays a plain message."""
+        evt = self._make_event("`!model deepseek-v4-flash`", thread_ts="1786070075.411639")
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        # Not recognised as a command → sent to the model.
+        assert msg_event.message_type != MessageType.COMMAND
+        assert msg_event.text == "`!model deepseek-v4-flash`"
+
+    @pytest.mark.asyncio
+    async def test_bang_with_args_inside_thread(self, adapter):
+        """Regression: ``!model deepseek-v4-flash`` typed as a thread reply
+        must rewrite to ``/model deepseek-v4-flash`` with the argument intact
+        and thread_id preserved (mirrors the in-thread command surface the
+        user hits on Slack)."""
+        evt = self._make_event(
+            "!model deepseek-v4-flash", thread_ts="1786070075.411639"
+        )
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model deepseek-v4-flash"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.get_command_args() == "deepseek-v4-flash"
+        assert msg_event.source.thread_id == "1786070075.411639"
+
+    @pytest.mark.asyncio
+    async def test_bang_with_args_and_rich_text_blocks_keeps_argument_clean(
+        self, adapter
+    ):
+        """Slack Block Kit mirrors the typed bang command in ``blocks``.
+
+        The command rewrite must not then append that original ``!model`` text
+        to the rewritten ``/model`` command, otherwise the validator receives
+        two tokens and reports the misleading spaces error.
+        """
+        evt = self._make_event(
+            "!model deepseek-v4-flash", thread_ts="1786070075.411639"
+        )
+        evt["blocks"] = [
+            {
+                "type": "rich_text",
+                "elements": [
+                    {
+                        "type": "rich_text_section",
+                        "elements": [
+                            {"type": "text", "text": "!model deepseek-v4-flash"}
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model deepseek-v4-flash"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.get_command_args() == "deepseek-v4-flash"
+
+    @pytest.mark.asyncio
+    async def test_bang_in_new_thread_skips_context_for_command(
+        self, adapter
+    ):
+        """Regression for the Slack "Model names cannot contain spaces" bug.
+
+        When ``!model deepseek-v4-flash`` is the FIRST reply in a thread (no
+        active session yet), the adapter would prepend the fetched thread
+        context to ``text``, poisoning get_command_args(). The fix skips
+        context prepending for command text, so the argument stays clean and
+        the model switch succeeds.
+        """
+        parent_context = (
+            "[Thread context — prior messages in this thread "
+            "(not yet in conversation history):]\n"
+            "snowkonn: 테스트\n"
+            "[End of thread context]\n\n"
+        )
+
+        async def fake_fetch_thread_context(*a, **k):
+            return parent_context
+
+        # New thread: no active session yet → context would be fetched, but the
+        # fix now skips prepending because this is a command.
+        adapter._has_active_session_for_thread = MagicMock(return_value=False)
+        adapter._mentioned_threads = set()
+        adapter._fetch_thread_context = fake_fetch_thread_context
+
+        evt = self._make_event(
+            "!model deepseek-v4-flash", thread_ts="1786070075.411639"
+        )
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.COMMAND
+        # Context is NOT prepended for commands → args stay clean.
+        assert msg_event.text.startswith("/model deepseek-v4-flash")
+        assert "Thread context" not in msg_event.text
+        assert msg_event.get_command_args() == "deepseek-v4-flash"
+        assert msg_event.source.thread_id == "1786070075.411639"
+
+    @pytest.mark.asyncio
+    async def test_bang_normal_reply_still_gets_context(self, adapter):
+        """The context prepend must still happen for ordinary (non-command)
+        first thread replies — only commands are exempt."""
+        parent_context = (
+            "[Thread context — prior messages in this thread "
+            "(not yet in conversation history):]\n"
+            "snowkonn: 테스트\n"
+            "[End of thread context]\n\n"
+        )
+
+        async def fake_fetch_thread_context(*a, **k):
+            return parent_context
+
+        adapter._has_active_session_for_thread = MagicMock(return_value=False)
+        adapter._mentioned_threads = set()
+        adapter._fetch_thread_context = fake_fetch_thread_context
+
+        evt = self._make_event(
+            "안녕 assistant", thread_ts="1786070075.411639"
+        )
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type != MessageType.COMMAND
+        assert msg_event.text.startswith("[Thread context")
+        assert "안녕 assistant" in msg_event.text
+
+    @pytest.mark.asyncio
+    async def test_bang_model_no_arg_inside_thread(self, adapter):
+        """``!model`` with no argument inside a thread still rewrites and keeps
+        the command discoverable (args empty, not swallowed)."""
+        evt = self._make_event("!model", thread_ts="1786070075.411639")
+        await adapter._handle_slack_message(evt)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model"
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.get_command_args() == ""
 
     @pytest.mark.asyncio
     async def test_bang_with_bot_suffix_resolves(self, adapter):

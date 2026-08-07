@@ -3150,11 +3150,18 @@ class SlackAdapter(BasePlatformAdapter):
         # gateway dispatcher) handles it like a normal slash command.  Only
         # rewrite when the first token resolves to a known gateway command
         # so casual messages like "!nice work" pass through unchanged.
-        if original_text.startswith("!"):
+        _is_rewritten_command = False
+        if original_text.lstrip().startswith("!"):
             try:
                 from hermes_cli.commands import is_gateway_known_command
 
-                first_token = original_text[1:].split(maxsplit=1)[0]
+                # Slack rich-text/composer payloads can preserve a leading
+                # whitespace character before the visible command. Normalize
+                # only after confirming the first non-space token is a known
+                # gateway command; unknown casual messages retain their exact
+                # original text.
+                command_text = original_text.lstrip()
+                first_token = command_text[1:].split(maxsplit=1)[0]
                 # Strip "@suffix" the same way get_command() does, so
                 # forms like ``!stop@hermes`` still resolve.
                 cmd_name = first_token.split("@", 1)[0].lower()
@@ -3163,7 +3170,8 @@ class SlackAdapter(BasePlatformAdapter):
                     and "/" not in cmd_name
                     and is_gateway_known_command(cmd_name)
                 ):
-                    original_text = "/" + original_text[1:]
+                    original_text = "/" + command_text[1:]
+                    _is_rewritten_command = True
             except Exception:  # pragma: no cover - defensive
                 pass
 
@@ -3175,7 +3183,13 @@ class SlackAdapter(BasePlatformAdapter):
         # the plain ``text`` field.  Merge block text so the agent sees the
         # full message content.
         blocks = event.get("blocks")
-        if blocks:
+        # Slack rich-text blocks mirror the original visible text. For a bang
+        # command, the visible text is still ``!model ...`` while
+        # ``original_text`` has already been rewritten to ``/model ...``.
+        # Appending the block text here would therefore produce
+        # ``/model ...\n!model ...`` and poison get_command_args(). Keep command
+        # payloads pristine; blocks remain available for ordinary messages.
+        if blocks and not _is_rewritten_command:
             blocks_text = _extract_text_from_slack_blocks(blocks)
             if blocks_text:
                 # Only append if the blocks contain text not already present
@@ -3198,7 +3212,7 @@ class SlackAdapter(BasePlatformAdapter):
         # fields like title, title_link/from_url, text, footer, and fallback.
         # Without reading these, the agent never sees shared link previews.
         slack_attachments = event.get("attachments") or []
-        if slack_attachments:
+        if slack_attachments and not _is_rewritten_command:
             att_parts: list[str] = []
             for att in slack_attachments:
                 att_title = att.get("title", "")
@@ -3410,7 +3424,14 @@ class SlackAdapter(BasePlatformAdapter):
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
-        if is_thread_reply and not self._has_active_session_for_thread(
+        # Skip context prepending for commands: a leading ``!``/``/`` command
+        # (e.g. ``!model deepseek-v4-flash``) must keep its argument string
+        # intact for downstream parsing (get_command_args). Prepending family
+        # text would make ``text`` no longer start with ``/``, so
+        # get_command_args() returns the whole polluted string and the command
+        # breaks (e.g. "Model names cannot contain spaces.").
+        _is_cmd_text = bool((original_text or "").startswith("/"))
+        if is_thread_reply and not _is_cmd_text and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
             user_id=user_id,
@@ -4549,9 +4570,20 @@ class SlackAdapter(BasePlatformAdapter):
             else:
                 text = "/help"
         else:
-            # Native slash — /<slash_name> [args].  Route directly through the
+            # Native slash — /<slash_name> [args]. Route directly through the
             # gateway command dispatcher by prepending the slash.
-            text = f"/{slash_name} {text}".strip()
+            #
+            # Some Slack clients / command surfaces echo the typed fallback
+            # token back as the slash-command text (e.g. command=/usage,
+            # text=!usage). That is the command name duplicated as its own
+            # argument, not a real /usage subcommand. Treat both typed-prefix
+            # spellings as an empty argument list so the command reaches the
+            # normal display handler.
+            _self_tokens = {f"!{slash_name}", f"/{slash_name}"}
+            if text.casefold() in {token.casefold() for token in _self_tokens}:
+                text = f"/{slash_name}"
+            else:
+                text = f"/{slash_name} {text}".strip()
 
         # Slack slash commands can originate from DMs or shared channels.
         # Preserve DM semantics only for DM channel IDs; shared channels must
