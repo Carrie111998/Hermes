@@ -2516,6 +2516,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._api_cleanup_tasks: set["asyncio.Task"] = set()
         self._api_cleanup_retry_tasks: Dict[str, "asyncio.Task"] = {}
         self._api_active_agents: Dict[int, Any] = {}
+        # Every agent currently inside _run_agent(), including the chat and
+        # responses routes that do not have a public /v1/runs run_id. Shutdown
+        # interrupts this exact adapter-owned set before subprocess cleanup.
+        self._shutdown_interruptible_agents: Dict[int, Any] = {}
+        # Shutdown can re-signal after its settle window so an agent that was
+        # admitted but materialized late is not missed.  Remember identities
+        # already signalled during this adapter lifetime: the re-signal must
+        # reach only newly materialized agents, not interrupt the same turn a
+        # second time while it is cooperatively unwinding.
+        self._shutdown_interrupted_agent_ids: set[int] = set()
         # Keep one agent per exact API conversation so consecutive turns retain
         # the byte-stable cached prompt prefix.
         self._api_agent_cache: "OrderedDict[APIRequestScope, Dict[str, Any]]" = (
@@ -3585,6 +3595,56 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    def interrupt_active_runs(self, reason: str) -> int:
+        """Cooperatively interrupt every adapter-owned agent during shutdown.
+
+        The gateway drain accounts for API-server work through
+        ``active_agent_work_count()``, but those agents are owned by this
+        adapter rather than ``GatewayRunner._running_agents``, so
+        ``GatewayRunner._interrupt_running_agents()`` never reaches them: the
+        turn runs to the drain timeout with no cooperative interrupt and is
+        then amputated by the post-interrupt tool-subprocess kill.
+
+        Cover the same set the drain waits on, so accounting and interrupt
+        agree:
+
+        * ``_active_run_agents`` — the ``/v1/runs`` agents counted through
+          ``_active_run_tasks``.
+        * ``_shutdown_interruptible_agents`` — every ``_run_agent()`` turn
+          counted through ``_inflight_agent_runs``, i.e. both session-chat
+          routes, ``/v1/chat/completions`` and ``/v1/responses`` in their
+          streaming and non-streaming forms.
+
+        ``_pending_agent_requests`` is intentionally not covered: it counts
+        admitted requests that have not constructed an agent yet, so there is
+        no object to interrupt.
+
+        Returns the number of agents that accepted an interrupt.
+        """
+        agents: Dict[int, Any] = {}
+        for agent in list(self._active_run_agents.values()):
+            if agent is not None:
+                agents[id(agent)] = agent
+        for agent in list(self._shutdown_interruptible_agents.values()):
+            if agent is not None:
+                # Dedupe by object identity — the two registries are disjoint
+                # today (/v1/runs runs its own lifecycle, not _run_agent), but
+                # an agent published to both must still be interrupted once.
+                agents[id(agent)] = agent
+
+        interrupted = 0
+        for agent in agents.values():
+            agent_id = id(agent)
+            if agent_id in self._shutdown_interrupted_agent_ids:
+                continue
+            try:
+                if request_hard_interrupt(agent, reason):
+                    self._shutdown_interrupted_agent_ids.add(agent_id)
+                    interrupted += 1
+            except Exception as exc:
+                logger.debug("[api_server] failed interrupting active agent: %s", exc)
+        return interrupted
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -6848,9 +6908,13 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "_lineage_root_id", "pinned", "archived",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
+        # SQLite stores these as 0/1; clients reconcile against a real boolean.
+        for flag in ("pinned", "archived"):
+            if flag in payload:
+                payload[flag] = bool(payload[flag])
         # Avoid exposing full system prompts/model_config through the client API;
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
@@ -7101,13 +7165,19 @@ class APIServerAdapter(BasePlatformAdapter):
             offset=offset,
             include_children=include_children,
             order_by_last_active=True,
+            # A pin means "always reachable", so a pinned conversation that has
+            # aged past the recency window is back-filled rather than dropped.
+            include_pinned=True,
         )
+        # Back-filled pins arrive PAST the limit, so counting them would report
+        # another page that doesn't exist. Only the recency window decides.
+        windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list",
             "data": [self._session_response(s) for s in sessions],
             "limit": limit,
             "offset": offset,
-            "has_more": len(sessions) == limit,
+            "has_more": windowed >= limit,
         })
 
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":
@@ -7275,10 +7345,18 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        # `pinned` and `archived` are durable per-session flags the desktop
+        # sidebar owns (the "keep" flag exempts a chat from the auto-archive
+        # sweep). Rejecting them here was silently 400ing every pin the desktop
+        # made, so pins only ever lived in that one app's localStorage.
+        allowed = {"title", "end_reason", "pinned", "archived"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+
+        for flag in ("pinned", "archived"):
+            if flag in body and not isinstance(body[flag], bool):
+                return web.json_response(_openai_error(f"'{flag}' must be a boolean", code="invalid_session_field"), status=400)
 
         db = await self._ensure_session_db_async()
         if "title" in body:
@@ -7290,6 +7368,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             except ValueError as exc:
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+        if "pinned" in body:
+            await asyncio.to_thread(db.set_session_pinned, session_id, body["pinned"])
+        if "archived" in body:
+            await asyncio.to_thread(db.set_session_archived, session_id, body["archived"])
         if body.get("end_reason"):
             await self._offload_session_db(
                 db.end_session,
@@ -11817,6 +11899,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             agent._api_approval_session_key = bound_session_key
                             with self._api_agent_cache_lock:
                                 self._api_active_agents[id(agent)] = agent
+                            # Shutdown interrupt coverage for every _run_agent
+                            # caller, including routes without a public run_id.
+                            self._shutdown_interruptible_agents[id(agent)] = agent
                             if agent_ref is not None:
                                 agent_ref[0] = agent
                             effective_task_id = request_authority.bind(
@@ -11998,6 +12083,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # left running.
                         if agent is not None:
                             _clear_turn_process_ownership(agent)
+                            self._shutdown_interruptible_agents.pop(id(agent), None)
                             # This runs while the per-conversation execution
                             # lock is still held.  The old callback can no
                             # longer execute, and a queued next turn cannot yet

@@ -5,6 +5,7 @@ identity, resource, session-generation, capability, and explicit profile-mode
 contracts; semantic decisions remain with the model.
 """
 
+import contextlib
 import contextvars
 import datetime as dt
 import functools
@@ -546,6 +547,98 @@ _session_yolo_generations: dict[str, int] = {}
 # grant after the boundary cannot attach it to the successor generation.
 _session_authority_generations: dict[str, int] = {}
 _retired_session_capability_epochs: set[tuple[str, str]] = set()
+
+
+# =========================================================================
+# Human-wait accounting (per session)
+# =========================================================================
+# Concurrent tool batches have a bounded runtime, but time spent verifiably
+# waiting for a person to answer an exact approval prompt is outside that
+# runtime budget.  Track only those prompt windows; arbitrary middleware and
+# command execution remain fully chargeable to the deadline.
+
+
+class _HumanWaitState:
+    __slots__ = ("pending", "window_started", "completed_seconds")
+
+    def __init__(self) -> None:
+        self.pending = 0
+        self.window_started: float | None = None
+        self.completed_seconds = 0.0
+
+
+_human_wait_lock = threading.Lock()
+_human_wait_states: dict[str, _HumanWaitState] = {}
+_HUMAN_WAIT_MAX_SESSIONS = 256
+HUMAN_WAIT_MARGIN_S = 60.0
+
+
+def human_wait_ceiling() -> float:
+    """Return the bounded contribution of one human prompt window."""
+
+    return float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S
+
+
+def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:
+    return min(max(0.0, now - started), ceiling)
+
+
+def _human_wait_state(session_key: str) -> _HumanWaitState:
+    state = _human_wait_states.get(session_key)
+    if state is None:
+        if len(_human_wait_states) >= _HUMAN_WAIT_MAX_SESSIONS:
+            for key in list(_human_wait_states):
+                if len(_human_wait_states) < _HUMAN_WAIT_MAX_SESSIONS:
+                    break
+                if _human_wait_states[key].pending == 0:
+                    del _human_wait_states[key]
+        state = _HumanWaitState()
+        _human_wait_states[session_key] = state
+    return state
+
+
+@contextlib.contextmanager
+def human_wait_window(session_key: str | None = None):
+    """Mark a bounded block that is genuinely waiting on a human answer."""
+
+    key = session_key if session_key is not None else get_current_session_key()
+    now = time.monotonic()
+    with _human_wait_lock:
+        state = _human_wait_state(key)
+        if state.pending == 0:
+            state.window_started = now
+        state.pending += 1
+    try:
+        yield
+    finally:
+        now = time.monotonic()
+        ceiling = human_wait_ceiling()
+        with _human_wait_lock:
+            state = _human_wait_states.get(key)
+            if state is not None:
+                state.pending -= 1
+                if state.pending == 0:
+                    if state.window_started is not None:
+                        state.completed_seconds += _clamped_window_seconds(
+                            state.window_started, now, ceiling
+                        )
+                    state.window_started = None
+
+
+def human_wait_seconds(session_key: str | None = None) -> float:
+    """Return bounded human-prompt wait seconds accrued for one session."""
+
+    key = session_key if session_key is not None else get_current_session_key()
+    now = time.monotonic()
+    ceiling = human_wait_ceiling()
+    with _human_wait_lock:
+        state = _human_wait_states.get(key)
+        if state is None:
+            return 0.0
+        total = state.completed_seconds
+        if state.window_started is not None:
+            total += _clamped_window_seconds(state.window_started, now, ceiling)
+        return total
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2507,11 +2600,12 @@ def prompt_dangerous_approval(command: str, description: str,
                     "approval_id": approval_id,
                     "exact_execution": exact_execution,
                 })
-            return approval_callback(
-                command,
-                description,
-                **callback_kwargs,
-            )
+            with human_wait_window():
+                return approval_callback(
+                    command,
+                    description,
+                    **callback_kwargs,
+                )
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return "deny"
@@ -2587,7 +2681,8 @@ def prompt_dangerous_approval(command: str, description: str,
 
             thread = threading.Thread(target=get_input, daemon=True)
             thread.start()
-            thread.join(timeout=timeout_seconds)
+            with human_wait_window():
+                thread.join(timeout=timeout_seconds)
 
             if thread.is_alive():
                 print("\n" + t("approval.timeout"))
@@ -3270,32 +3365,33 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _deadline = _now + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
-    while True:
-        # Respect interrupt signals (e.g. /stop, /new, or an inactivity
-        # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
-        if is_interrupted():
-            logger.info(
-                "Approval wait interrupted by user signal — "
-                "returning deny for session %s",
-                session_key,
-            )
-            entry.result = "deny"
-            entry.event.set()
-            resolved = True
-            break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
-            resolved = True
-            break
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(_activity_state, "waiting for user approval")
+    with human_wait_window(session_key):
+        while True:
+            # Respect interrupt signals (e.g. /stop, /new, or an inactivity
+            # timeout from the gateway) so a pending approval doesn't keep the
+            # session wedged on threading.Event.wait() until the 5-minute approval
+            # timeout. The wait runs on the agent's execution thread, which is the
+            # exact thread AIAgent.interrupt() flags — so is_interrupted() here
+            # sees the signal. Resolve as "deny" so the agent loop receives a
+            # normal denial and unwinds cleanly (#8697).
+            if is_interrupted():
+                logger.info(
+                    "Approval wait interrupted by user signal — "
+                    "returning deny for session %s",
+                    session_key,
+                )
+                entry.result = "deny"
+                entry.event.set()
+                resolved = True
+                break
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+            if entry.event.wait(timeout=min(1.0, _remaining)):
+                resolved = True
+                break
+            if touch_activity_if_due is not None:
+                touch_activity_if_due(_activity_state, "waiting for user approval")
 
     _drop_entry()
 

@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import argparse
 import sqlite3
 from pathlib import Path
 
@@ -169,6 +170,42 @@ def test_spawn_no_goal_env_for_plain_task(kanban_home, monkeypatch):
     env = captured["env"]
     assert "HERMES_KANBAN_GOAL_MODE" not in env
     assert "HERMES_KANBAN_GOAL_MAX_TURNS" not in env
+
+
+def test_cli_complete_uses_primary_worker_outcome_without_auxiliary_judge(
+    kanban_home,
+    monkeypatch,
+):
+    """The CLI completion path must not resurrect the retired goal judge."""
+    from hermes_cli import kanban
+
+    def _forbidden_auxiliary(*_args, **_kwargs):
+        raise AssertionError("CLI completion must not call an auxiliary judge")
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        _forbidden_auxiliary,
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="primary model completed task",
+            assignee="default",
+            goal_mode=True,
+        )
+
+    rc = kanban._cmd_complete(
+        argparse.Namespace(
+            task_ids=[tid],
+            summary="primary worker recorded completion",
+            metadata=None,
+            result="verified result",
+        )
+    )
+
+    assert rc == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
 
 
 # ---------------------------------------------------------------------------

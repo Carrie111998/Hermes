@@ -103,6 +103,18 @@ _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
 # short enough that one wedged dispatch cannot starve the batch forever.
 _START_ORDER_GATE_TIMEOUT_S = 120.0
+_AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
+
+
+def _authorization_gate_lock_timeout() -> float:
+    """Bound prompt serialization with the same ceiling as human waits."""
+
+    try:
+        from tools.approval import human_wait_ceiling
+
+        return human_wait_ceiling()
+    except Exception:
+        return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S
 
 
 class _BatchAbandoned(BaseException):
@@ -354,6 +366,66 @@ class _ManagedToolResult:
     middleware_trace: list[dict[str, Any]]
     blocked: bool
     dispatched: bool
+
+
+class _ConcurrentToolAuthorizationGate:
+    """Track exact human-approval waits for one concurrent tool batch.
+
+    ``run`` remains available to hosts that need to serialize only their
+    prompt-resolution callback.  Hermes' exact-capability path uses the
+    tracker for deadline accounting without placing ordinary tool execution
+    under a process-global semantic gate.
+    """
+
+    def __init__(
+        self,
+        *,
+        lock_timeout: float | None = None,
+        session_key: str | None = None,
+    ) -> None:
+        self._serialization_lock = threading.Lock()
+        self._lock_timeout = (
+            _authorization_gate_lock_timeout()
+            if lock_timeout is None
+            else lock_timeout
+        )
+        self._session_key = session_key
+        if self._session_key is None:
+            try:
+                from tools.approval import get_current_session_key
+
+                self._session_key = get_current_session_key()
+            except Exception:
+                logger.debug(
+                    "authorization wait tracker could not snapshot session key",
+                    exc_info=True,
+                )
+        self._baseline_wait_seconds = self._human_wait_seconds()
+
+    def _human_wait_seconds(self) -> float:
+        try:
+            from tools.approval import human_wait_seconds
+
+            return human_wait_seconds(self._session_key)
+        except Exception:
+            return 0.0
+
+    def run(self, callback):
+        acquired = self._serialization_lock.acquire(timeout=self._lock_timeout)
+        if not acquired:
+            logger.warning(
+                "authorization prompt lock timed out after %.1fs; "
+                "running the exact prompt callback without serialization",
+                self._lock_timeout,
+            )
+            return callback()
+        try:
+            return callback()
+        finally:
+            self._serialization_lock.release()
+
+    def excluded_seconds(self) -> float:
+        return max(0.0, self._human_wait_seconds() - self._baseline_wait_seconds)
 
 
 def _managed_values(
@@ -850,6 +922,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # its own bound against the batch deadline it must stay under.
     timeout_s = _resolve_concurrent_tool_timeout()
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
+    human_wait_tracker = _ConcurrentToolAuthorizationGate()
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
@@ -1131,7 +1204,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 while True:
                     wait_timeout = 5.0
                     if deadline is not None:
-                        remaining = deadline - time.monotonic()
+                        remaining = (
+                            deadline
+                            + human_wait_tracker.excluded_seconds()
+                            - time.monotonic()
+                        )
                         if remaining <= 0:
                             done, not_done = set(), {
                                 f for f in futures if not f.done()
@@ -1148,7 +1225,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     if not not_done:
                         break
 
-                    if deadline is not None and time.monotonic() >= deadline:
+                    if (
+                        deadline is not None
+                        and time.monotonic()
+                        >= deadline + human_wait_tracker.excluded_seconds()
+                    ):
                         abandon_executor = True
                         timed_out_indices = {
                             future_to_index[f]
