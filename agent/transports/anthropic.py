@@ -52,6 +52,7 @@ class AnthropicTransport(ProviderTransport):
         params (all optional):
             max_tokens: int
             reasoning_config: dict | None
+            temperature: float | None
             tool_choice: str | None
             is_oauth: bool
             preserve_dots: bool
@@ -68,6 +69,7 @@ class AnthropicTransport(ProviderTransport):
             tools=tools,
             max_tokens=params.get("max_tokens", 16384),
             reasoning_config=params.get("reasoning_config"),
+            temperature=params.get("temperature"),
             tool_choice=params.get("tool_choice"),
             is_oauth=params.get("is_oauth", False),
             preserve_dots=params.get("preserve_dots", False),

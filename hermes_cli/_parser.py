@@ -165,6 +165,19 @@ def build_top_level_parser():
         default=None,
         help="Comma-separated toolsets to enable for this invocation. Applies to -z/--oneshot and --tui.",
     )
+    # NOTE: no `-t` short flag for temperature — it belongs to --toolsets.
+    _inherited_flag(
+        parser,
+        "--temperature",
+        type=float,
+        default=None,
+        metavar="TEMP",
+        help=(
+            "Sampling temperature override (0.0-2.0) for this invocation. "
+            "Applies to -z/--oneshot and --tui. Overrides model.temperature "
+            "from config.yaml; provider fixed_temperature contracts still win."
+        ),
+    )
     parser.add_argument(
         "--resume",
         "-r",
@@ -310,6 +323,17 @@ def build_top_level_parser():
         "-t", "--toolsets",
         default=argparse.SUPPRESS,
         help="Comma-separated toolsets to enable",
+    )
+    # NOTE: no `-t` short flag — it belongs to --toolsets. Use --temperature.
+    _inherited_flag(
+        chat_parser,
+        "--temperature",
+        type=float,
+        # SUPPRESS so `hermes --temperature 0.7 chat` (kanban worker spawn)
+        # propagates the top-level value instead of clobbering it with None.
+        default=argparse.SUPPRESS,
+        metavar="TEMP",
+        help="Sampling temperature override (0.0-2.0). Overrides model.temperature from config.yaml.",
     )
     _inherited_flag(
         chat_parser,
