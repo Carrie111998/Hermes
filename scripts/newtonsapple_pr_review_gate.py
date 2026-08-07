@@ -1769,24 +1769,7 @@ def _summary_content(review_tuple: ReviewTuple, pr_url: str, review_body: str) -
         f"head `{review_tuple.head_sha}` (base `{review_tuple.base_sha}`).\n\n"
         f"{review_body}\n\n"
         "**Verification:** verified v2 request provenance, live exact tuple, "
-        "current reviewer request, formal bot review marker, and terminal status verified."
-    )
-
-
-def _post_terminal_status(review_tuple: ReviewTuple, pr_url: str) -> None:
-    gh_json(
-        "api",
-        f"repos/{REPOSITORY}/statuses/{review_tuple.head_sha}",
-        "-X",
-        "POST",
-        "-f",
-        "state=success",
-        "-f",
-        f"context={_status_context(review_tuple)}",
-        "-f",
-        "description=Formal PR review delivered",
-        "-f",
-        f"target_url={pr_url}",
+        "formal bot review marker, and durable completion."
     )
 
 
@@ -2026,7 +2009,6 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             )
             if matching_body is not None:
                 pr_url = str(live_pr.get("html_url", ""))
-                _post_terminal_status(selected, pr_url)
                 store.record_external_completion(
                     selected,
                     now=int(time.time()),
@@ -2166,7 +2148,6 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
     ):
         raise RuntimeError("live pull request tuple changed")
     pr_url = str(live_pr.get("html_url", ""))
-    _post_terminal_status(review_tuple, pr_url)
     store.settle_review(
         review_tuple,
         lease_token=lease_token,

@@ -756,6 +756,45 @@ def test_settlement_control_plane_claims_publication_before_side_effect(monkeypa
         gate._settle(payload, "newtonsapple-bot", store)
 
 
+def test_complete_settlement_records_review_without_commit_status(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    lease_token = store.reserve(review_tuple, now=100, lease_seconds=60)
+    assert isinstance(lease_token, str)
+    live_pr = _live_pr()
+    marker_body = f"verified review\n\n{gate.review_marker(review_tuple)}"
+    monkeypatch.setattr(
+        gate,
+        "_authorized_live_tuple",
+        lambda *args: (live_pr, None, [marker_body]),
+    )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
+    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-summary")
+    monkeypatch.setattr(gate.time, "time", lambda: 120)
+
+    result = gate._settle(
+        {
+            "operation": "complete",
+            "contract_version": "v2",
+            "repository": review_tuple.repository,
+            "pr_number": review_tuple.pr_number,
+            "base_sha": review_tuple.base_sha,
+            "head_sha": review_tuple.head_sha,
+            "lease_token": lease_token,
+        },
+        "newtonsapple-bot",
+        store,
+    )
+
+    assert result == {"settled": "complete", "outbox_delivered": 1}
+    assert store.reserve(review_tuple, now=200, lease_seconds=30) is None
+
+
 def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
@@ -1077,19 +1116,12 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     monkeypatch.setattr(
         gate, "_captured_live_tuple", lambda *args: state, raising=False
     )
-    terminal_statuses = []
-    monkeypatch.setattr(
-        gate,
-        "_post_terminal_status",
-        lambda candidate, url: terminal_statuses.append((candidate, url)),
-    )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
     monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-blocker")
 
     result = gate._reconcile("newtonsapple-bot", store)
 
     assert result["events"] == []
-    assert terminal_statuses == []
 
 
 def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch, tmp_path):
@@ -1108,19 +1140,12 @@ def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch
         "_captured_live_tuple",
         lambda *args: (live_pr, review_tuple, [marker_body]),
     )
-    terminal_statuses = []
-    monkeypatch.setattr(
-        gate,
-        "_post_terminal_status",
-        lambda candidate, url: terminal_statuses.append((candidate, url)),
-    )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
     monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-summary")
 
     result = gate._reconcile("newtonsapple-bot", store)
 
     assert result == {"events": [], "outbox_delivered": 1}
-    assert terminal_statuses == [(review_tuple, live_pr["html_url"])]
     assert store.reserve(review_tuple, now=200, lease_seconds=30) is None
 
 
