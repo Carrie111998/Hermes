@@ -38,6 +38,21 @@ Prompt (ecommerce studio): *"The model from the reference image wearing the garm
 `{POSE}` ∈ front / 3-4 / back / detail. Editorial (campaign) variants swap the studio scene for a cinematic European-winter street scene.
 Output → `indossato_<POSA>_<COLOR>.png`
 
+**Proportions guard (MANDATORY on every STEP B).** The image model has a tendency to
+elongate the figure (legs a little too long, the coat stretched downward), which reads
+as "the model looks too tall". Always append this block to any STEP B prompt (studio or
+editorial) unless the user explicitly overrides it:
+> Keep the model's body proportions anatomically natural and identical to the reference
+> photo: the legs must be a realistic length relative to the torso, with no elongation or
+> vertical stretching of the figure, and the garment must keep its true length relative to
+> the body exactly as in the ghost/reference image — do not lengthen the coat, do not
+> stretch the model's height, keep the head-to-body ratio natural (not an unrealistically
+> small head on a stretched body). Do not slim or stretch the limbs.
+
+Reference for "good proportions" is the user-confirmed example: `indossato_front_MASTICE-202.png`
+(Montana · Mastic) — natural leg length and true coat length. Spot-check every batch against
+it; regenerate any shot that looks elongated.
+
 ## Workflow (end-to-end)
 1. **Enumerate the Drive source** — for each garment folder: identify the ghost mannequin (product photo on flat grey) vs. the color swatches (flat rectangle with a color name+code). Use vision to disambiguate and to map each swatch file → its color code (`NOCCIOLA-302`…). A single `seed` colorway may also come pre-generated.
 2. **Scaffold a manifest** of `{garment: {ghost: path, swatch: {COLOR: path}}}`.

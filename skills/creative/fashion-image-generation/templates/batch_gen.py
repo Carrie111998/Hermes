@@ -34,7 +34,23 @@ STEPB_PROMPT = ("The model from the reference image wearing the garment from the
     "professional ecommerce fashion photography, clean studio lighting. "
     "Preserve all original garment details exactly as shown: stitching, hardware, zippers, buttons "
     "and labels must remain identical to the reference, do not generate any text, logos or writing "
-    "on buttons, zippers or labels, keep all branding elements blank and anonymous.")
+    "on buttons, zippers or labels, keep all branding elements blank and anonymous. "
+    "Keep the model's body proportions anatomically natural and identical to the reference "
+    "photo: the legs must be a realistic length relative to the torso, with no elongation or "
+    "vertical stretching of the figure, and the garment must keep its true length relative to "
+    "the body exactly as in the ghost/reference image, do not lengthen the coat, do not stretch "
+    "the model's height, keep the head-to-body ratio natural, do not slim or stretch the limbs.")
+
+# Poses: each STEP B variant appends its own pose clause to STEPB_PROMPT.
+POSES = {
+    "front":   "standing front pose, arms relaxed at sides",
+    "34":      "three-quarter angle pose, arms relaxed",
+    "back":    "back-facing pose, standing upright",
+    "detail":  "close-up on the garment fabric and construction",
+}
+# Editorial scene replaces the studio background for campaign variants.
+EDITORIAL_SCENE = ("standing on a wet cobblestone street in a European winter city at early morning, "
+    "soft cold overcast light, light snowfall or mist, cinematic mood, desaturated cool tones")
 
 def data_url(path):
     b = open(path, "rb").read()
