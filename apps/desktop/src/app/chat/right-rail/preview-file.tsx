@@ -33,6 +33,7 @@ import {
 import { Check, Pencil, X } from '@/lib/icons'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
+import { findHeadingByHash, rehypeHeadingIds } from '@/lib/markdown-heading-ids'
 import { normalizeFilePreviewMath } from '@/lib/markdown-preprocess'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
@@ -391,7 +392,35 @@ function MarkdownImage({ alt, src, ...rest }: ComponentProps<'img'>) {
   )
 }
 
-function MarkdownLink({ children, className, href, ...rest }: ComponentProps<'a'>) {
+// Custom anchor for the file preview pane (#81055): Streamdown renders links
+// as `<button>` with no `href`, and the default rehype chain strips the `id`
+// we stamp on headings. Fragment links route to the matching heading inside
+// this preview body; every other link keeps the regular external-link
+// treatment. `#preview/...` cross-file references are not handled here (the
+// file preview pane has its own tab switcher that doesn't operate-open
+// another preview from inside markdown).
+function MarkdownAnchor({ children, className, href, ...rest }: ComponentProps<'a'>) {
+  if (href?.startsWith('#')) {
+    return (
+      <a
+        className={cn('text-foreground underline underline-offset-2', className)}
+        href={href}
+        onClick={(event) => {
+          event.preventDefault()
+          // Scope the lookup to this preview body: several previews can be
+          // mounted at once (tabs, tiles) and ids repeat across notes, so a
+          // document-wide match could scroll a different pane.
+          const body = (event.currentTarget as HTMLElement).closest('.preview-markdown') ?? document
+          const heading = findHeadingByHash(body, href)
+          heading?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+        }}
+        {...rest}
+      >
+        {children}
+      </a>
+    )
+  }
+
   const isExternal = /^https?:\/\//i.test(href || '')
 
   return (
@@ -425,11 +454,15 @@ const MARKDOWN_COMPONENTS = {
   td: tagged('td'),
   thead: tagged('thead'),
   img: MarkdownImage,
-  a: MarkdownLink
+  a: MarkdownAnchor
 }
 
 export function MarkdownPreview({ text }: { text: string }) {
   const mathText = useMemo(() => normalizeFilePreviewMath(text), [text])
+  // Heading ids must be stamped AFTER Streamdown's own rehype chain (raw →
+  // sanitize → harden): `id` is not on rehype-sanitize's default allow-list,
+  // so an id added earlier is stripped before it reaches the DOM (#81055).
+  const rehypePlugins = useMemo(() => [rehypeHeadingIds()], [])
 
   return (
     <div className="preview-markdown mx-auto max-w-3xl px-4 py-3 text-sm text-foreground" data-selectable-text="true">
@@ -439,6 +472,7 @@ export function MarkdownPreview({ text }: { text: string }) {
         mode="static"
         parseIncompleteMarkdown={false}
         plugins={{ math: previewMathPlugin }}
+        rehypePlugins={rehypePlugins}
       >
         {mathText}
       </Streamdown>
