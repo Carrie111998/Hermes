@@ -8788,11 +8788,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
+        existing_has_delivery_context = bool(
+            (getattr(existing, "metadata", None) or {}).get("delivery_context")
+        )
+        incoming_has_delivery_context = bool(
+            (getattr(event, "metadata", None) or {}).get("delivery_context")
+        )
+        if (
+            existing is not None
+            and not existing_has_delivery_context
+            and not incoming_has_delivery_context
+            and (
+                getattr(existing, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(existing, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
@@ -8974,6 +8985,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
+
+        # An interaction carries a request-scoped webhook capability and cleanup
+        # responsibility. Never merge or steer it into another turn: doing so can
+        # lose the delivery context, leak it to a neighboring message, or strand
+        # the deferred original response. Preserve the event as its own FIFO turn.
+        if (getattr(event, "metadata", None) or {}).get("delivery_context") is not None:
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
 
         # --- Internal synthetic events must never interrupt/steer ---
         # Async-delegation completions (delegate_task(background=true)) and
@@ -19597,6 +19616,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.extract_images(cleaned)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            _delivery_context = (getattr(event, "metadata", None) or {}).get(
+                "delivery_context"
+            )
+            if _delivery_context is not None:
+                _thread_meta = dict(_thread_meta or {})
+                _thread_meta["delivery_context"] = _delivery_context
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}

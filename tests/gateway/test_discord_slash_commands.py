@@ -115,8 +115,22 @@ def adapter():
 
 
 # ------------------------------------------------------------------
-# /thread slash command registration
+# Conversational and /thread slash command registration
 # ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_registers_ask_as_conversational_slash_command(adapter):
+    adapter._run_conversational_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["ask"]
+    interaction = SimpleNamespace()
+    await command(interaction, prompt="Create a report")
+
+    adapter._run_conversational_slash.assert_awaited_once_with(
+        interaction, "Create a report"
+    )
 
 
 @pytest.mark.asyncio

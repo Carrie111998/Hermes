@@ -26,6 +26,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -92,6 +93,43 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
 })
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
+_DISCORD_INTERACTION_TOKEN_LIFETIME_SECONDS = 15 * 60
+
+
+@dataclass(frozen=True)
+class DiscordInteractionDeliveryContext:
+    """Request-scoped Discord interaction state used for file delivery."""
+
+    interaction: Any
+    attachment_size_limit: Optional[int]
+    channel_id: str
+    created_at: float
+
+
+def _interaction_attachment_size_limit(interaction: Any) -> Optional[int]:
+    """Return Discord's effective per-file interaction limit in bytes.
+
+    discord.py 2.6+ exposes the raw ``attachment_size_limit`` payload field as
+    ``Interaction.filesize_limit``. The second attribute keeps this helper
+    compatible with doubles or libraries that retain Discord's wire name.
+    Missing, boolean, and non-positive values are not trusted.
+    """
+    value = getattr(interaction, "filesize_limit", None)
+    if value is None:
+        value = getattr(interaction, "attachment_size_limit", None)
+    if isinstance(value, bool):
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _format_file_size(size_bytes: int) -> str:
+    return f"{size_bytes / (1024 * 1024):.1f} MiB"
+
+
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -2020,6 +2058,23 @@ class DiscordAdapter(BasePlatformAdapter):
         message = str(exc).lower()
         return code == 10062 or (status == 404 and "unknown interaction" in message)
 
+    @classmethod
+    def _is_discord_interaction_unavailable(cls, exc: BaseException) -> bool:
+        """True when an interaction response/follow-up token is no longer usable."""
+        if cls._is_discord_unknown_interaction(exc):
+            return True
+        code = getattr(exc, "code", None)
+        if code is None:
+            data = getattr(exc, "data", None)
+            if isinstance(data, dict):
+                code = data.get("code")
+        try:
+            code = int(code)
+        except (TypeError, ValueError):
+            code = None
+        message = str(exc).lower()
+        return code == 10015 or "unknown webhook" in message
+
     def _command_sync_mutation_interval_seconds(self) -> float:
         return _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS
 
@@ -2995,6 +3050,16 @@ class DiscordAdapter(BasePlatformAdapter):
             event,
             outcome,
         )
+        if (getattr(event, "metadata", None) or {}).get(
+            "cleanup_original_interaction_response"
+        ):
+            interaction = event.raw_message
+            try:
+                await interaction.delete_original_response()
+            except Exception as e:
+                logger.debug(
+                    "[Discord] Could not clean up /ask working response: %s", e
+                )
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -3560,24 +3625,102 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a local file as a Discord attachment.
-
-        Forum channels (type 15) get a new thread whose starter message
-        carries the file — they reject direct POST /messages.
-
-        Uses a path-based ``discord.File`` (same pattern as
-        ``send_multiple_images``) rather than an open file handle. The
-        handle form can race with Discord's multipart encoder after an
-        earlier image batch on the same channel and produce a successful
-        message with zero attachments — a silent drop for video/document
-        MEDIA tags (#66797).
-        """
+        """Send a local file via its originating interaction or channel."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
-
         if not os.path.isfile(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
+
+        filename = file_name or os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        delivery_context = (metadata or {}).get("delivery_context")
+        fallback_from_interaction = False
+        if isinstance(delivery_context, DiscordInteractionDeliveryContext):
+            interaction = delivery_context.interaction
+            if str(delivery_context.channel_id) != str(chat_id):
+                logger.warning(
+                    "[%s] Ignoring Discord interaction context for channel %s "
+                    "while sending to channel %s",
+                    self.name, delivery_context.channel_id, chat_id,
+                )
+            elif delivery_context.attachment_size_limit is not None:
+                effective_limit = delivery_context.attachment_size_limit
+                logger.info(
+                    "[%s] Discord interaction file preflight: file=%d bytes (%s), "
+                    "effective_limit=%d bytes (%s)",
+                    self.name, file_size, _format_file_size(file_size),
+                    effective_limit, _format_file_size(effective_limit),
+                )
+                if file_size > effective_limit:
+                    error = (
+                        f"File is {_format_file_size(file_size)} ({file_size} bytes), but "
+                        f"this Discord interaction allows {_format_file_size(effective_limit)} "
+                        f"({effective_limit} bytes)."
+                    )
+                    logger.warning("[%s] %s", self.name, error)
+                    return SendResult(success=False, error=error)
+
+                expired = (time.monotonic() - delivery_context.created_at) >= (
+                    _DISCORD_INTERACTION_TOKEN_LIFETIME_SECONDS
+                )
+                is_expired = getattr(interaction, "is_expired", None)
+                if callable(is_expired):
+                    try:
+                        expired = bool(is_expired())
+                    except Exception:
+                        pass
+
+                if not expired:
+                    logger.info(
+                        "[%s] Discord interaction file delivery selected for %s",
+                        self.name, filename,
+                    )
+                    discord_file = discord.File(file_path, filename=filename)
+                    try:
+                        msg = await interaction.followup.send(
+                            content=caption if caption else None,
+                            files=[discord_file],
+                            wait=True,
+                        )
+                    except Exception as e:
+                        if not self._is_discord_interaction_unavailable(e):
+                            raise
+                        fallback_from_interaction = True
+                        logger.warning(
+                            "[%s] Discord interaction unavailable/expired; falling "
+                            "back to channel upload for %s",
+                            self.name, filename,
+                        )
+                    else:
+                        attachments = getattr(msg, "attachments", None) or []
+                        if not attachments:
+                            logger.warning(
+                                "[%s] Discord interaction follow-up returned message %s "
+                                "with no attachments for %s",
+                                self.name, getattr(msg, "id", "?"), filename,
+                            )
+                            return SendResult(
+                                success=False,
+                                error=(
+                                    "Discord accepted the interaction follow-up but "
+                                    f"attached no files ({filename})"
+                                ),
+                                message_id=str(getattr(msg, "id", "") or "") or None,
+                            )
+                        logger.info(
+                            "[%s] Discord interaction file upload succeeded: message_id=%s",
+                            self.name, getattr(msg, "id", "?"),
+                        )
+                        return SendResult(success=True, message_id=str(msg.id))
+                else:
+                    fallback_from_interaction = True
+                    logger.warning(
+                        "[%s] Discord interaction expired before file delivery; "
+                        "falling back to channel upload for %s",
+                        self.name, filename,
+                    )
 
         channel = self._client.get_channel(int(chat_id))
         if not channel:
@@ -3585,7 +3728,30 @@ class DiscordAdapter(BasePlatformAdapter):
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
-        filename = file_name or os.path.basename(file_path)
+        if fallback_from_interaction:
+            guild = getattr(channel, "guild", None)
+            normal_limit = getattr(guild, "filesize_limit", None)
+            if (
+                not isinstance(normal_limit, int)
+                or isinstance(normal_limit, bool)
+                or normal_limit <= 0
+            ):
+                normal_limit = getattr(
+                    discord.utils, "DEFAULT_FILE_SIZE_LIMIT_BYTES", None
+                )
+            if (
+                isinstance(normal_limit, int)
+                and normal_limit > 0
+                and file_size > normal_limit
+            ):
+                error = (
+                    f"File is {_format_file_size(file_size)} ({file_size} bytes), but "
+                    f"the normal Discord channel path allows {_format_file_size(normal_limit)} "
+                    f"({normal_limit} bytes) after the interaction expired."
+                )
+                logger.warning("[%s] %s", self.name, error)
+                return SendResult(success=False, error=error)
+
         logger.info(
             "[%s] Sending file attachment %s (%s) to %s",
             self.name,
@@ -3593,32 +3759,21 @@ class DiscordAdapter(BasePlatformAdapter):
             os.path.splitext(filename)[1].lower() or "no-ext",
             chat_id,
         )
-        # Path-based File: discord.py owns open/close for the upload, matching
-        # the working image-batch path. Prefer ``files=[...]`` over deprecated
-        # singular ``file=`` for the same reason.
+        # Keep the path-based File and plural files kwarg used by #66797.
         discord_file = discord.File(file_path, filename=filename)
         if self._is_forum_parent(channel):
-            result = await self._forum_post_file(
-                channel,
-                content=(caption or "").strip(),
-                files=[discord_file],
+            return await self._forum_post_file(
+                channel, content=(caption or "").strip(), files=[discord_file]
             )
-            return result
         msg = await channel.send(
             content=caption if caption else None,
             files=[discord_file],
         )
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
-            # Discord accepted the message but attached nothing — the failure
-            # mode reported in #66797 (MEDIA video stripped from text, no
-            # attachment, no prior log line). Fail loud so the dispatch loop
-            # surfaces a warning instead of a silent drop.
             logger.warning(
                 "[%s] Discord returned message %s with no attachments for %s",
-                self.name,
-                getattr(msg, "id", "?"),
-                filename,
+                self.name, getattr(msg, "id", "?"), filename,
             )
             return SendResult(
                 success=False,
@@ -3656,17 +3811,34 @@ class DiscordAdapter(BasePlatformAdapter):
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
 
+        interaction_delivery_context = (metadata or {}).get("delivery_context")
+        interaction_delivery_available = (
+            isinstance(
+                interaction_delivery_context,
+                DiscordInteractionDeliveryContext,
+            )
+            and str(interaction_delivery_context.channel_id) == str(chat_id)
+            and interaction_delivery_context.attachment_size_limit is not None
+        )
+
         try:
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
-            if not channel:
+            if not channel and not interaction_delivery_available:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
                 return
         except Exception as e:
-            logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            channel = None
+            if not interaction_delivery_available:
+                logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
+                await super().send_multiple_images(chat_id, images, metadata, human_delay)
+                return
+            logger.debug(
+                "[%s] Channel resolution failed; interaction image delivery remains available: %s",
+                self.name,
+                e,
+            )
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
@@ -3676,6 +3848,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.sleep(human_delay)
 
             files: List[Any] = []
+            file_sizes: List[int] = []
             captions: List[str] = []
             aiohttp_session = None
             try:
@@ -3688,6 +3861,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             logger.warning("[%s] Skipping missing image: %s", self.name, local_path)
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
+                        file_sizes.append(os.path.getsize(local_path))
                     else:
                         if not is_safe_url(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
@@ -3721,6 +3895,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             elif "webp" in ct:
                                 ext = "webp"
                             files.append(_discord_mod.File(_io.BytesIO(data), filename=f"image_{len(files)}.{ext}"))
+                            file_sizes.append(len(data))
                         except Exception as dl_err:
                             logger.warning("[%s] Download failed for %s: %s", self.name, image_url[:80], dl_err)
                             continue
@@ -3734,6 +3909,112 @@ class DiscordAdapter(BasePlatformAdapter):
                     "[%s] Sending %d image(s) as single Discord message (chunk %d/%d)",
                     self.name, len(files), chunk_idx + 1, len(chunks),
                 )
+
+                delivery_context = interaction_delivery_context
+                fallback_from_interaction = False
+                if (
+                    isinstance(delivery_context, DiscordInteractionDeliveryContext)
+                    and str(delivery_context.channel_id) == str(chat_id)
+                    and delivery_context.attachment_size_limit is not None
+                ):
+                    effective_limit = delivery_context.attachment_size_limit
+                    oversized = [size for size in file_sizes if size > effective_limit]
+                    if oversized:
+                        largest = max(oversized)
+                        error = (
+                            f"An image is {_format_file_size(largest)} ({largest} bytes), but "
+                            f"this Discord interaction allows {_format_file_size(effective_limit)} "
+                            f"({effective_limit} bytes) per file."
+                        )
+                        logger.warning("[%s] %s", self.name, error)
+                        for discord_file in files:
+                            close_file = getattr(discord_file, "close", None)
+                            if callable(close_file):
+                                close_file()
+                        await self.send(chat_id=chat_id, content=error, metadata=metadata)
+                        continue
+
+                    interaction = delivery_context.interaction
+                    expired = (time.monotonic() - delivery_context.created_at) >= (
+                        _DISCORD_INTERACTION_TOKEN_LIFETIME_SECONDS
+                    )
+                    is_expired = getattr(interaction, "is_expired", None)
+                    if callable(is_expired):
+                        try:
+                            expired = bool(is_expired())
+                        except Exception:
+                            pass
+                    if not expired:
+                        logger.info(
+                            "[%s] Discord interaction image delivery selected: "
+                            "%d file(s), effective_limit=%d bytes (%s)",
+                            self.name, len(files), effective_limit,
+                            _format_file_size(effective_limit),
+                        )
+                        try:
+                            msg = await interaction.followup.send(
+                                content=content, files=files, wait=True
+                            )
+                        except Exception as e:
+                            if not self._is_discord_interaction_unavailable(e):
+                                logger.warning(
+                                    "[%s] Discord interaction image upload failed: %s",
+                                    self.name, e, exc_info=True,
+                                )
+                                await self.send(
+                                    chat_id=chat_id,
+                                    content="Couldn't deliver the image attachment through the Discord interaction.",
+                                    metadata=metadata,
+                                )
+                                continue
+                            fallback_from_interaction = True
+                            logger.warning(
+                                "[%s] Discord interaction unavailable/expired; "
+                                "falling back to channel image upload", self.name,
+                            )
+                        else:
+                            attachments = getattr(msg, "attachments", None) or []
+                            if len(attachments) < len(files):
+                                logger.warning(
+                                    "[%s] Discord interaction image follow-up returned "
+                                    "%d/%d attachments",
+                                    self.name, len(attachments), len(files),
+                                )
+                                await self.send(
+                                    chat_id=chat_id,
+                                    content="Discord accepted the interaction follow-up but attached fewer images than requested.",
+                                    metadata=metadata,
+                                )
+                            continue
+                    else:
+                        fallback_from_interaction = True
+                        logger.warning(
+                            "[%s] Discord interaction expired before image delivery; "
+                            "falling back to channel upload", self.name,
+                        )
+
+                if fallback_from_interaction:
+                    guild = getattr(channel, "guild", None)
+                    normal_limit = getattr(guild, "filesize_limit", None)
+                    if not isinstance(normal_limit, int) or normal_limit <= 0:
+                        normal_limit = getattr(
+                            discord.utils, "DEFAULT_FILE_SIZE_LIMIT_BYTES", None
+                        )
+                    oversized = (
+                        [size for size in file_sizes if size > normal_limit]
+                        if isinstance(normal_limit, int) and normal_limit > 0
+                        else []
+                    )
+                    if oversized:
+                        largest = max(oversized)
+                        error = (
+                            f"An image is {_format_file_size(largest)} ({largest} bytes), but "
+                            f"the normal Discord channel path allows {_format_file_size(normal_limit)} "
+                            f"({normal_limit} bytes) after the interaction expired."
+                        )
+                        logger.warning("[%s] %s", self.name, error)
+                        await self.send(chat_id=chat_id, content=error, metadata=metadata)
+                        continue
 
                 if self._is_forum_parent(channel):
                     await self._forum_post_file(
@@ -3785,6 +4066,21 @@ class DiscordAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
+        delivery_context = (metadata or {}).get("delivery_context")
+        if (
+            isinstance(delivery_context, DiscordInteractionDeliveryContext)
+            and delivery_context.attachment_size_limit is not None
+        ):
+            # Interaction webhooks do not support Discord's native voice-message
+            # upload handshake. Send the audio as a normal followup attachment so
+            # the exact interaction-provided size limit still applies.
+            return await self._send_file_attachment(
+                chat_id,
+                audio_path,
+                caption,
+                metadata=metadata,
+            )
+
         try:
             import io
 
@@ -4983,7 +5279,9 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file natively as a Discord file attachment."""
         try:
-            return await self._send_file_attachment(chat_id, image_path, caption)
+            return await self._send_file_attachment(
+                chat_id, image_path, caption, metadata=metadata
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5154,7 +5452,9 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local video file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, video_path, caption)
+            return await self._send_file_attachment(
+                chat_id, video_path, caption, metadata=metadata
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5172,7 +5472,13 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(
+                chat_id,
+                file_path,
+                caption,
+                file_name=file_name,
+                metadata=metadata,
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5435,12 +5741,87 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
 
+    async def _run_conversational_slash(
+        self,
+        interaction: discord.Interaction,
+        prompt: str,
+    ) -> None:
+        """Dispatch user text through the normal agent pipeline for ``/ask``."""
+        if not await self._check_slash_authorization(interaction, "/ask"):
+            return
+
+        deferred_response = False
+        interaction_delivery_safe = False
+        try:
+            await interaction.response.defer(ephemeral=False, thinking=True)
+            deferred_response = True
+        except Exception as e:
+            if not self._is_discord_unknown_interaction(e):
+                raise
+            logger.warning(
+                "[Discord] /ask interaction expired before defer; continuing "
+                "through the normal channel response path"
+            )
+
+        if deferred_response:
+            try:
+                # Resolve the deferred callback so later followups cannot edit the
+                # original loading response through Discord's compatibility behavior.
+                await interaction.edit_original_response(content="Working…")
+                interaction_delivery_safe = True
+            except Exception as e:
+                logger.warning(
+                    "[Discord] /ask deferred successfully but the original response "
+                    "could not be resolved; dispatching via the normal channel path: %s",
+                    e,
+                )
+
+        effective_limit = (
+            _interaction_attachment_size_limit(interaction)
+            if interaction_delivery_safe
+            else None
+        )
+        interaction_id = getattr(interaction, "id", "?")
+        guild = getattr(interaction, "guild", None)
+        guild_boost_tier = getattr(guild, "premium_tier", None)
+        if effective_limit is None:
+            logger.info(
+                "[Discord] Interaction upload limit unavailable for request %s; "
+                "normal channel file delivery will be used",
+                interaction_id,
+            )
+        else:
+            logger.info(
+                "[Discord] Interaction upload limit for request %s: %d bytes (%s); "
+                "server_boost_tier=%s",
+                interaction_id,
+                effective_limit,
+                _format_file_size(effective_limit),
+                guild_boost_tier if guild_boost_tier is not None else "n/a",
+            )
+
+        event = self._build_slash_event(interaction, prompt)
+        event.metadata["delivery_context"] = DiscordInteractionDeliveryContext(
+            interaction=interaction,
+            attachment_size_limit=effective_limit,
+            channel_id=str(interaction.channel_id),
+            created_at=time.monotonic(),
+        )
+        if deferred_response:
+            event.metadata["cleanup_original_interaction_response"] = True
+        await self.handle_message(event)
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
             return
 
         tree = self._client.tree
+
+        @tree.command(name="ask", description="Send a prompt to Hermes")
+        @discord.app_commands.describe(prompt="What you want Hermes to do")
+        async def slash_ask(interaction: discord.Interaction, prompt: str):
+            await self._run_conversational_slash(interaction, prompt)
 
         @tree.command(name="new", description="Start a new conversation")
         async def slash_new(interaction: discord.Interaction):

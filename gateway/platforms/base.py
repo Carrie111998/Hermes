@@ -5817,6 +5817,12 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        _delivery_context = (getattr(event, "metadata", None) or {}).get(
+            "delivery_context"
+        )
+        if _delivery_context is not None:
+            _thread_metadata = dict(_thread_metadata or {})
+            _thread_metadata["delivery_context"] = _delivery_context
         typing_task: Optional[asyncio.Task] = None
         if getattr(self.config, "typing_indicator", True):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
