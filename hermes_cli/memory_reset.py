@@ -1,47 +1,18 @@
-"""Safe conversation-history reset helpers for ``hermes memory reset``.
-
-Only the new ``conversations`` and ``everything`` targets are handled here.
-The legacy ``all`` / ``memory`` / ``user`` targets continue through the
-existing ``cmd_memory`` implementation so there is one production path for
-existing behavior.
-"""
+"""Safe conversation-history reset for ``hermes memory reset``."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 # ``SessionDB.delete_sessions`` discovers delegate children with a query that
-# binds each input ID twice. 250 keeps that query, plus the follow-up IN lists,
-# comfortably below SQLite builds that retain the legacy 999-variable limit.
+# binds each input ID twice. 250 stays below SQLite's legacy 999-variable limit.
 _SESSION_DELETE_BATCH = 250
-_CONVERSATION_TARGETS = frozenset({"conversations", "everything"})
 _UNKNOWN_RUNNING_PID = 0
 
 
-def _close_db(db: Any) -> None:
-    if db is None:
-        return
-    try:
-        db.close()
-    except Exception:
-        pass
-
-
 def _get_running_gateway_pid(hermes_home: Path) -> int | None:
-    """Return a gateway PID that may be using the target profile's state.
-
-    Check both the target profile home and the Hermes root. A root gateway can
-    multiplex several isolated profiles while keeping its PID/runtime-status
-    files at the root, so checking only ``<profile>/gateway.pid`` can miss the
-    exact writer this destructive command needs to exclude.
-
-    The repository's full liveness ladder catches launch-service-managed
-    gateways that have runtime status but no usable PID file. A running gateway
-    whose liveness source cannot expose a host PID returns
-    ``_UNKNOWN_RUNNING_PID`` so reset still fails closed.
-    """
+    """Return a live gateway PID that may write to this profile's state."""
     from gateway.status import resolve_gateway_liveness
     from hermes_constants import get_default_hermes_root
 
@@ -52,10 +23,7 @@ def _get_running_gateway_pid(hermes_home: Path) -> int | None:
             homes.append(canonical)
 
     for candidate in homes:
-        liveness = resolve_gateway_liveness(
-            profile_dir=candidate,
-            use_cache=False,
-        )
+        liveness = resolve_gateway_liveness(profile_dir=candidate, use_cache=False)
         if liveness.running:
             return liveness.pid if liveness.pid is not None else _UNKNOWN_RUNNING_PID
         if liveness.probe_error:
@@ -65,105 +33,33 @@ def _get_running_gateway_pid(hermes_home: Path) -> int | None:
     return None
 
 
-def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
-    if target == "conversations":
+def _collect_session_ids(db: Any, expected_count: int) -> list[str]:
+    """Read every session ID once and fail if the snapshot is inconsistent."""
+    if expected_count <= 0:
         return []
-    if target == "everything":
-        return [
-            ("MEMORY.md", "agent notes"),
-            ("USER.md", "user profile"),
-        ]
-    raise ValueError(f"unsupported conversation reset target: {target}")
 
-
-def _preflight_memory_file_deletion(
-    memories_dir: Path,
-    existing_files: list[tuple[str, str]],
-) -> None:
-    """Fail before DB mutation when selected memory files cannot be removed.
-
-    Unlink permission is controlled by the parent directory on POSIX. Windows
-    additionally refuses deletion of common read-only files, so check the file
-    write bit there as a best-effort preflight. The actual unlink remains
-    guarded because permissions can still change after this check.
-    """
-    if not existing_files:
-        return
-    if not os.access(memories_dir, os.W_OK | os.X_OK):
-        raise PermissionError(f"memory directory is not writable: {memories_dir}")
-    if os.name == "nt":
-        for name, _description in existing_files:
-            path = memories_dir / name
-            if not os.access(path, os.W_OK):
-                raise PermissionError(f"memory file is read-only: {path}")
-
-
-def _collect_session_ids(db: Any) -> list[str]:
-    """Take a stable, complete snapshot of session IDs before deletion.
-
-    The reset refuses to continue if paging returns duplicate or malformed rows.
-    This catches a live writer reordering the listing instead of chasing and
-    deleting sessions created while reset is already running.
-    """
-    session_ids: list[str] = []
-    seen: set[str] = set()
-    offset = 0
-
-    while True:
-        rows = db.list_sessions_rich(
-            limit=_SESSION_DELETE_BATCH,
-            offset=offset,
-            include_children=True,
-            project_compression_tips=False,
-            include_archived=True,
-            compact_rows=True,
+    rows = db.list_sessions_rich(
+        limit=expected_count,
+        include_children=True,
+        project_compression_tips=False,
+        include_archived=True,
+        compact_rows=True,
+    )
+    session_ids = [
+        row.get("id")
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    ]
+    if len(session_ids) != expected_count or len(set(session_ids)) != len(session_ids):
+        raise RuntimeError(
+            "session listing changed while reset was preparing; "
+            "stop all Hermes processes and retry"
         )
-        if not rows:
-            break
-
-        page_ids = [
-            row.get("id")
-            for row in rows
-            if isinstance(row, dict) and isinstance(row.get("id"), str)
-        ]
-        if len(page_ids) != len(rows) or len(set(page_ids)) != len(page_ids):
-            raise RuntimeError("session listing returned malformed or duplicate rows")
-        if seen.intersection(page_ids):
-            raise RuntimeError(
-                "session listing changed while reset was preparing; "
-                "stop all Hermes processes and retry"
-            )
-
-        session_ids.extend(page_ids)
-        seen.update(page_ids)
-        offset += len(rows)
-        if len(rows) < _SESSION_DELETE_BATCH:
-            break
-
     return session_ids
 
 
-def _delete_conversations(
-    db: Any,
-    sessions_dir: Path,
-    session_ids: list[str],
-    *,
-    expected_session_count: int,
-) -> int:
-    """Delete the captured sessions through bounded SessionDB transactions.
-
-    ``SessionDB.delete_sessions`` owns the SQL contract: messages and sessions
-    are removed with FTS triggers active, session-model usage cascades, orphaned
-    child references are repaired, unreferenced system prompts are cleaned, and
-    legacy transcript/request-dump files are removed. Unrelated tables are not
-    touched.
-
-    The operation is intentionally batched to stay below SQLite's bind-variable
-    limits. Every batch is atomic; the final zero-row verification refuses to
-    report success after a partial reset. The gateway guard and stable snapshot
-    make a partial result unlikely, but another non-gateway Hermes writer can
-    still race this destructive maintenance command and cause a failure.
-    """
+def _delete_conversations(db: Any, sessions_dir: Path, session_ids: list[str]) -> None:
+    """Delete the captured sessions through the existing SessionDB contract."""
     for start in range(0, len(session_ids), _SESSION_DELETE_BATCH):
         db.delete_sessions(
             session_ids[start : start + _SESSION_DELETE_BATCH],
@@ -177,19 +73,23 @@ def _delete_conversations(
             f"{remaining_sessions} session(s) and {remaining_messages} message(s) "
             "remained; stop all Hermes processes and retry"
         )
-    return expected_session_count
 
 
 def cmd_memory_reset(args: Any) -> int:
-    """Reset persisted conversations, optionally with built-in memory files."""
+    """Clear persisted conversation history while preserving built-in memory."""
     from hermes_constants import display_hermes_home, get_hermes_home
 
     target = getattr(args, "target", None)
-    if target not in _CONVERSATION_TARGETS:
+    if target != "conversations":
         print(f"\n  ✗ Unsupported conversation reset target: {target!r}\n")
         return 2
 
     hermes_home = Path(get_hermes_home())
+    db_path = hermes_home / "state.db"
+    if not db_path.is_file():
+        print("\n  Nothing to reset.\n")
+        return 0
+
     try:
         running_pid = _get_running_gateway_pid(hermes_home)
     except Exception as exc:
@@ -204,64 +104,34 @@ def cmd_memory_reset(args: Any) -> int:
         )
         return 1
 
-    memories_dir = hermes_home / "memories"
-    sessions_dir = hermes_home / "sessions"
-    db_path = hermes_home / "state.db"
-
-    selected_files = _memory_files_for_target(target)
-    existing_files = [
-        (name, description)
-        for name, description in selected_files
-        if (memories_dir / name).is_file()
-    ]
-    try:
-        _preflight_memory_file_deletion(memories_dir, existing_files)
-    except (OSError, PermissionError) as exc:
-        print(f"\n  ✗ Could not prepare memory-file reset: {exc}\n")
-        return 1
+    from hermes_state import SessionDB
 
     db = None
-    session_ids: list[str] = []
-    session_count = 0
-    message_count = 0
-    if db_path.is_file():
-        try:
-            from hermes_state import SessionDB
+    try:
+        db = SessionDB(db_path)
+        session_count = db.session_count(include_archived=True)
+        message_count = db.message_count()
+        session_ids = _collect_session_ids(db, session_count)
+        if message_count and not session_ids:
+            raise RuntimeError(
+                "state.db contains messages without sessions; refusing a partial reset"
+            )
+    except Exception as exc:
+        if db is not None:
+            db.close()
+        print(f"\n  ✗ Could not inspect conversation history: {exc}\n")
+        return 1
 
-            db = SessionDB(db_path)
-            session_count = db.session_count(include_archived=True)
-            message_count = db.message_count()
-            session_ids = _collect_session_ids(db)
-            if len(session_ids) != session_count:
-                raise RuntimeError(
-                    "session count changed while reset was preparing; "
-                    "stop all Hermes processes and retry"
-                )
-            if message_count and not session_ids:
-                raise RuntimeError(
-                    "state.db contains messages without sessions; refusing a partial reset"
-                )
-        except Exception as exc:
-            _close_db(db)
-            print(f"\n  ✗ Could not inspect conversation history: {exc}\n")
-            return 1
-
-    has_conversations = bool(session_count or message_count)
-    if not existing_files and not has_conversations:
-        _close_db(db)
+    if not session_count and not message_count:
+        db.close()
         print("\n  Nothing to reset.\n")
         return 0
 
-    print("\n  This will permanently erase:")
-    for name, description in existing_files:
-        size = (memories_dir / name).stat().st_size
-        print(f"    ◆ {name} ({description}) — {size:,} bytes")
-    if has_conversations:
-        print(
-            "    ◆ conversation history — "
-            f"{session_count:,} sessions, {message_count:,} messages"
-        )
-        print("    Note: stop all other Hermes CLI/TUI/cron processes first.")
+    print(
+        "\n  This will permanently erase conversation history — "
+        f"{session_count:,} sessions, {message_count:,} messages."
+    )
+    print("  Note: stop all other Hermes CLI/TUI/cron processes first.")
 
     if not getattr(args, "yes", False):
         try:
@@ -269,38 +139,21 @@ def cmd_memory_reset(args: Any) -> int:
         except (EOFError, KeyboardInterrupt):
             answer = ""
         if answer != "yes":
-            _close_db(db)
+            db.close()
             print("  Cancelled.\n")
             return 0
 
-    if has_conversations:
-        try:
-            deleted_sessions = _delete_conversations(
-                db,
-                sessions_dir,
-                session_ids,
-                expected_session_count=session_count,
-            )
-        except Exception as exc:
-            print(f"  ✗ Failed to clear conversation history: {exc}")
-            return 1
-        finally:
-            _close_db(db)
-        print(
-            "  ✓ Cleared conversation history "
-            f"({deleted_sessions:,} sessions, {message_count:,} messages)"
-        )
-    else:
-        _close_db(db)
+    try:
+        _delete_conversations(db, hermes_home / "sessions", session_ids)
+    except Exception as exc:
+        print(f"  ✗ Failed to clear conversation history: {exc}")
+        return 1
+    finally:
+        db.close()
 
-    for name, description in existing_files:
-        try:
-            (memories_dir / name).unlink()
-        except OSError as exc:
-            print(f"  ✗ Failed to delete {name}: {exc}")
-            return 1
-        print(f"  ✓ Deleted {name} ({description})")
-
-    print("\n  Memory reset complete.")
+    print(
+        "  ✓ Cleared conversation history "
+        f"({session_count:,} sessions, {message_count:,} messages)"
+    )
     print(f"  Hermes home: {display_hermes_home()}\n")
     return 0
