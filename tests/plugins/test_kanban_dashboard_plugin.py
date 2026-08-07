@@ -388,6 +388,30 @@ def test_dispatch_max_query_overrides_config_max_spawn(client, monkeypatch):
     assert captured.get("max_in_progress") == 3
 
 
+def test_dispatch_max_zero_means_no_spawns(client, monkeypatch):
+    """?max=0 must reach dispatch_once as 0 (block spawns), not None/unlimited."""
+    import sys
+
+    fake_config = {"kanban": {"max_in_progress": 3, "max_spawn": 10}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+
+    captured: dict = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        return kb.DispatchResult()
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    plugin_mod = sys.modules.get("hermes_dashboard_plugin_kanban_test")
+    assert plugin_mod is not None
+    monkeypatch.setattr(plugin_mod.kanban_db, "dispatch_once", fake_dispatch_once)
+
+    r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=0")
+    assert r.status_code == 200
+    assert captured.get("max_spawn") == 0
+    assert captured.get("max_in_progress") == 3
+
+
 # ---------------------------------------------------------------------------
 # Triage column (new v1 status)
 # ---------------------------------------------------------------------------

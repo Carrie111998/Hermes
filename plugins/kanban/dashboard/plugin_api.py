@@ -2238,10 +2238,15 @@ def dispatch(
     """
     board = _resolve_board(board)
     caps = _dispatch_concurrency_from_config()
-    # Explicit ?max= wins over config max_spawn; omit → config / unlimited.
-    max_spawn = (
-        _coerce_positive_int(max_n) if max_n is not None else caps["max_spawn"]
-    )
+    # Explicit ?max= wins over config max_spawn (same as CLI --max). Pass the
+    # integer through — including 0, which means "spawn nothing this tick" —
+    # rather than coercing non-positive values to None (unlimited).
+    if max_n is not None and max_n < 0:
+        raise HTTPException(
+            status_code=http_status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="max must be >= 0",
+        )
+    max_spawn = max_n if max_n is not None else caps["max_spawn"]
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
