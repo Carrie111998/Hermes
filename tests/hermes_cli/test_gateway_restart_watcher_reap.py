@@ -47,7 +47,7 @@ parent_record.write_text(str(os.getppid()), encoding="utf-8")
 """
 
 
-def _generated_watcher_source(old_pid: int, run_argv: list) -> str:
+def _generated_watcher_source(old_pid: int, run_argv: list[str]) -> str:
     """Return the watcher source ``_spawn_gateway_restart_watcher`` builds.
 
     The real function is called (so the source under test is the real one,
