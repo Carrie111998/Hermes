@@ -3573,6 +3573,17 @@ def install_from_quarantine(
     except Exception:
         pass  # index is best-effort; never block install
 
+    try:
+        from tools.skill_usage import record_installed
+
+        record_installed(safe_skill_name)
+    except Exception:
+        logger.debug(
+            "Unable to record skill install lifecycle for %s",
+            safe_skill_name,
+            exc_info=True,
+        )
+
     return install_dir
 
 
