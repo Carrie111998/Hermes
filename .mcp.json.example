@@ -4,6 +4,14 @@
       "type": "stdio",
       "command": "${HOME}/.local/bin/codebase-memory-mcp",
       "args": []
+    },
+    "tolaria": {
+      "type": "stdio",
+      "command": "${HOME}/.local/bin/tolaria-mcp-bridge",
+      "args": [],
+      "env": {
+        "TOLARIA_MCP_URL": "ws://127.0.0.1:9710"
+      }
     }
   }
 }
