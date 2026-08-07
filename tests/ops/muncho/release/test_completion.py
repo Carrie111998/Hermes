@@ -10,7 +10,6 @@ from ops.muncho.release import cli
 from ops.muncho.release.completion import (
     ReleaseCompletionError,
     complete_restart_attestation,
-    deliver_discord_once,
     deliver_discord_via_gateway_once,
     finalize_release_completion,
     pending_gateway_discord_deliveries,
@@ -104,6 +103,33 @@ def _draft(tmp_path: Path, *, release_sha: str = RELEASE_SHA):
         created_at=NOW,
     )
     return state, mapping, smoke, draft
+
+
+def _record_gateway_delivery(
+    state: Path,
+    draft: dict,
+    *,
+    sent: list[tuple[str, str]] | None = None,
+):
+    try:
+        return deliver_discord_via_gateway_once(
+            state,
+            draft,
+            timeout_seconds=0,
+            reserved_at=NOW,
+            queued_at=NOW,
+        )
+    except ReleaseCompletionError as exc:
+        assert str(exc) == "muncho_release_discord_delivery_reconciliation_required"
+    request, = pending_gateway_discord_deliveries(state)
+    if sent is not None:
+        sent.append((request["summary"], request["channel_id"]))
+    return record_gateway_discord_delivery(
+        state,
+        request,
+        message_id="423456789012345678",
+        published_at=NOW,
+    )
 
 
 def test_retrospective_r1_mapping_is_append_only_without_source_metadata(
@@ -211,6 +237,13 @@ def test_restart_cli_records_changed_systemd_invocation_and_replays(
     assert cli.main(complete_args) == 0
     assert json.loads(capsys.readouterr().out) == completed
 
+    stale_replay = list(complete_args)
+    stale_replay[stale_replay.index("--after-invocation-id") + 1] = "3" * 32
+    assert cli.main(stale_replay) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == (
+        "muncho_release_restart_attestation_conflict"
+    )
+
 
 def test_full_completion_requires_same_summary_in_codex_and_discord(
     tmp_path: Path,
@@ -229,20 +262,10 @@ def test_full_completion_requires_same_summary_in_codex_and_discord(
     )
     sent: list[tuple[str, str]] = []
 
-    def sender(message: str, channel_id: str):
-        sent.append((message, channel_id))
-        return {"success": True, "message_id": "423456789012345678"}
-
-    discord = deliver_discord_once(
-        state,
-        draft,
-        sender=sender,
-        reserved_at=NOW,
-        published_at=NOW,
-    )
+    discord = _record_gateway_delivery(state, draft, sent=sent)
     # Retrying the same (version, SHA) returns the receipt and never sends a
     # duplicate Discord announcement.
-    assert deliver_discord_once(state, draft, sender=sender) == discord
+    assert _record_gateway_delivery(state, draft, sent=sent) == discord
     assert sent == [(draft["summary"], CHANNEL_ID)]
 
     codex_attempt, created = reserve_summary_delivery(
@@ -345,6 +368,48 @@ def test_completion_is_not_healthy_after_smoke_but_before_both_summaries(
     assert status["complete"] is False
 
 
+def test_gateway_request_is_mandatory_for_terminal_completion_and_health(
+    tmp_path: Path,
+):
+    state, mapping, smoke, draft = _draft(tmp_path)
+    discord = _record_gateway_delivery(state, draft)
+    codex_attempt, created = reserve_summary_delivery(
+        state,
+        draft,
+        kind="codex_task",
+        destination_ref="019fa801-52ca-7460-954d-30aee7053618",
+        reserved_at=NOW,
+    )
+    assert created is True
+    codex = record_reserved_summary_delivery(
+        state,
+        draft,
+        codex_attempt,
+        message_ref="assistant-release-summary",
+        published_at=NOW,
+    )
+    next(state.glob("gateway-discord-request-*.json")).unlink()
+
+    with pytest.raises(
+        ReleaseCompletionError,
+        match="muncho_release_state_record_missing",
+    ):
+        finalize_release_completion(
+            state,
+            mapping=mapping,
+            smoke=smoke,
+            draft=draft,
+            codex_delivery=codex,
+            discord_delivery=discord,
+        )
+    for projection in (release_status, release_health):
+        with pytest.raises(
+            ReleaseCompletionError,
+            match="muncho_release_status_chain_invalid",
+        ):
+            projection(state, version="2.3.2", release_sha=RELEASE_SHA)
+
+
 def test_status_and_health_reject_wrong_sha_receipt_under_expected_filename(
     tmp_path: Path,
 ):
@@ -369,7 +434,7 @@ def test_status_and_health_reject_wrong_sha_receipt_under_expected_filename(
             )
 
 
-def test_reserved_discord_attempt_never_retries_an_uncertain_send(
+def test_direct_discord_attempt_cannot_create_a_delivery_receipt(
     tmp_path: Path,
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
@@ -383,19 +448,18 @@ def test_reserved_discord_attempt_never_retries_an_uncertain_send(
     assert created is True
     assert attempt["network_send_authorized"] is True
 
-    called = False
-
-    def sender(_message: str, _channel: str):
-        nonlocal called
-        called = True
-        return {"success": True, "message_id": "423456789012345678"}
-
     with pytest.raises(
         ReleaseCompletionError,
-        match="muncho_release_discord_delivery_reconciliation_required",
+        match="muncho_release_state_record_missing",
     ):
-        deliver_discord_once(state, draft, sender=sender)
-    assert called is False
+        record_reserved_summary_delivery(
+            state,
+            draft,
+            attempt,
+            message_ref="423456789012345678",
+            published_at=NOW,
+        )
+    assert not tuple(state.glob("summary-discord-delivery-*.json"))
 
 
 def test_gateway_queue_reconciles_with_exact_message_id_and_no_duplicate(
@@ -466,16 +530,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     tmp_path: Path,
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
-    discord = deliver_discord_once(
-        state,
-        draft,
-        sender=lambda _message, _channel: {
-            "success": True,
-            "message_id": "423456789012345678",
-        },
-        reserved_at=NOW,
-        published_at=NOW,
-    )
+    discord = _record_gateway_delivery(state, draft)
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     prepared, attempt, created = reserve_codex_task_summary(
         state,
@@ -558,14 +613,7 @@ def test_coordinator_crash_after_record_replays_into_one_completion(
     monkeypatch,
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
-    deliver_discord_once(
-        state,
-        draft,
-        sender=lambda _message, _channel: {
-            "success": True,
-            "message_id": "423456789012345678",
-        },
-    )
+    _record_gateway_delivery(state, draft)
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     _prepared, attempt, _created = reserve_codex_task_summary(
         state,
@@ -627,14 +675,7 @@ def test_coordinator_cli_never_claims_delivery_before_explicit_ack(
     capsys,
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
-    deliver_discord_once(
-        state,
-        draft,
-        sender=lambda _message, _channel: {
-            "success": True,
-            "message_id": "423456789012345678",
-        },
-    )
+    _record_gateway_delivery(state, draft)
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     prepare_args = [
         "coordinator-prepare",
@@ -765,12 +806,8 @@ def test_automatic_announcement_cli_requires_exact_identity_and_sends_once(
 
     monkeypatch.setattr(cli, "load_current_production_config", lambda _path: _config())
 
-    def sender(message: str, channel_id: str):
-        sent.append((message, channel_id))
-        return {"success": True, "message_id": "423456789012345678"}
-
     def deliver(state_dir, draft):
-        return deliver_discord_once(state_dir, draft, sender=sender)
+        return _record_gateway_delivery(state_dir, draft, sent=sent)
 
     monkeypatch.setattr(cli, "deliver_discord_via_gateway_once", deliver)
     state = _state(tmp_path)

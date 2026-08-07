@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -37,12 +38,14 @@ from ops.muncho.release.completion import (
     prepare_restart_attestation,
     prepare_summary_draft,
     record_production_smoke,
+    release_health,
     release_status,
     reserve_release_mapping,
 )
 from ops.muncho.release.gateway_delivery import (
     dispatch_pending_gateway_discord_deliveries,
 )
+from ops.muncho.release import cli as release_cli
 from ops.muncho.release.metadata import load_release_bundle
 
 
@@ -52,6 +55,7 @@ RELEASE_SHA = "a" * 40
 GUILD_ID = "123456789012345678"
 CHANNEL_ID = "223456789012345678"
 SERVICE = "hermes-cloud-gateway.service"
+AFTER_INVOCATION_ID = "2" * 32
 
 
 def _production_config() -> dict:
@@ -89,7 +93,7 @@ def _queued(tmp_path: Path, *, release_sha: str = RELEASE_SHA):
         state,
         mapping,
         service_name=SERVICE,
-        after_invocation_id="2" * 32,
+        after_invocation_id=AFTER_INVOCATION_ID,
         attested_at=NOW,
     )
     smoke = record_production_smoke(
@@ -187,6 +191,43 @@ class _DiscordBoundary:
 
 
 @pytest.mark.asyncio
+async def test_gateway_watcher_forwards_its_current_systemd_invocation(
+    monkeypatch,
+):
+    from gateway.run import GatewayRunner
+    import ops.muncho.release.gateway_delivery as edge
+    import ops.muncho.release.metadata as metadata
+
+    runner = SimpleNamespace(
+        _running=True,
+        config=_gateway_config(),
+        adapters={},
+    )
+    observed = {}
+
+    async def dispatch(**kwargs):
+        observed.update(kwargs)
+        runner._running = False
+        return ()
+
+    monkeypatch.setattr(edge, "dispatch_pending_gateway_discord_deliveries", dispatch)
+    monkeypatch.setattr(metadata, "resolve_exact_release_sha", lambda: RELEASE_SHA)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _production_config(),
+    )
+    monkeypatch.setenv("INVOCATION_ID", AFTER_INVOCATION_ID)
+
+    await GatewayRunner._muncho_release_announcement_watcher(  # type: ignore[arg-type]
+        runner,
+        poll_interval=0,
+    )
+
+    assert observed["deployed_release_sha"] == RELEASE_SHA
+    assert observed["active_service_invocation_id"] == AFTER_INVOCATION_ID
+
+
+@pytest.mark.asyncio
 async def test_verified_gateway_relay_delivery_records_exact_id_and_is_idempotent(
     tmp_path: Path,
 ):
@@ -200,6 +241,7 @@ async def test_verified_gateway_relay_delivery_records_exact_id_and_is_idempoten
         "adapters": {Platform.RELAY: relay},
         "production_config": _production_config(),
         "deployed_release_sha": RELEASE_SHA,
+        "active_service_invocation_id": AFTER_INVOCATION_ID,
         "published_at": NOW,
     }
     outcomes = await dispatch_pending_gateway_discord_deliveries(**kwargs)
@@ -255,6 +297,7 @@ async def test_failure_timeout_and_uncertainty_never_create_delivery_truth(
         "adapters": {Platform.RELAY: relay},
         "production_config": _production_config(),
         "deployed_release_sha": RELEASE_SHA,
+        "active_service_invocation_id": AFTER_INVOCATION_ID,
     }
     first = await dispatch_pending_gateway_discord_deliveries(**kwargs)
     second = await dispatch_pending_gateway_discord_deliveries(**kwargs)
@@ -280,6 +323,7 @@ async def test_wrong_deployed_identity_and_direct_adapter_fail_closed(tmp_path: 
         adapters={Platform.RELAY: relay},
         production_config=_production_config(),
         deployed_release_sha="b" * 40,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
     )
     assert identity[0]["state"] == "blocked_identity_mismatch"
     assert relay.calls == []
@@ -294,8 +338,37 @@ async def test_wrong_deployed_identity_and_direct_adapter_fail_closed(tmp_path: 
         adapters={Platform.DISCORD: direct},
         production_config=_production_config(),
         deployed_release_sha=RELEASE_SHA,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
     )
     assert blocked[0]["state"] == "blocked_live_relay_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_stale_or_missing_active_invocation_never_reaches_relay(tmp_path: Path):
+    state, _draft = _queued(tmp_path)
+    relay = _Relay(
+        [SimpleNamespace(success=True, message_id="423456789012345678")]
+    )
+    common = {
+        "state_dir": state,
+        "gateway_config": _gateway_config(),
+        "adapters": {Platform.RELAY: relay},
+        "production_config": _production_config(),
+        "deployed_release_sha": RELEASE_SHA,
+    }
+
+    for invocation_id in (None, "3" * 32):
+        blocked = await dispatch_pending_gateway_discord_deliveries(
+            **common,
+            active_service_invocation_id=invocation_id,
+        )
+        assert blocked[0]["state"] == "blocked_restart_identity_mismatch"
+    assert relay.calls == []
+    assert release_status(
+        state,
+        version="2.3.2",
+        release_sha=RELEASE_SHA,
+    )["discord_summary_published"] is False
 
 
 @pytest.mark.asyncio
@@ -323,6 +396,7 @@ async def test_wrong_sha_smoke_receipt_blocks_before_relay_send(tmp_path: Path):
             adapters={Platform.RELAY: relay},
             production_config=_production_config(),
             deployed_release_sha=RELEASE_SHA,
+            active_service_invocation_id=AFTER_INVOCATION_ID,
         )
 
     assert relay.calls == []
@@ -377,6 +451,7 @@ async def test_crash_after_connector_acceptance_reuses_key_without_second_mutati
         "adapters": {Platform.RELAY: relay},
         "production_config": _production_config(),
         "deployed_release_sha": RELEASE_SHA,
+        "active_service_invocation_id": AFTER_INVOCATION_ID,
     }
     with pytest.raises(RuntimeError, match="crash before local receipt"):
         await dispatch_pending_gateway_discord_deliveries(**kwargs)
@@ -393,6 +468,7 @@ async def test_crash_after_connector_acceptance_reuses_key_without_second_mutati
 async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
     tmp_path: Path,
     monkeypatch,
+    capsys,
 ):
     """E2E through RelayAdapter, Unix protocol, journal, and Discord boundary."""
 
@@ -475,6 +551,7 @@ async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
                 "adapters": {Platform.RELAY: relay},
                 "production_config": _production_config(),
                 "deployed_release_sha": RELEASE_SHA,
+                "active_service_invocation_id": AFTER_INVOCATION_ID,
                 "published_at": NOW,
             }
             with pytest.raises(RuntimeError, match="crash before release receipt"):
@@ -484,6 +561,49 @@ async def test_real_relay_adapter_and_privileged_connector_reconcile_crash_once(
             assert delivered[0]["message_id"] == "423456789012345678"
             assert backend.sends == [draft["summary"]]
             assert await dispatch_pending_gateway_discord_deliveries(**kwargs) == ()
+
+            task_id = "019fa801-52ca-7460-954d-30aee7053618"
+            prepare_args = [
+                "coordinator-prepare",
+                "--version",
+                "2.3.2",
+                "--release-sha",
+                RELEASE_SHA,
+                "--state-dir",
+                str(state),
+                "--task-id",
+                task_id,
+            ]
+            assert release_cli.main(prepare_args) == 0
+            coordinator = json.loads(capsys.readouterr().out)
+            assert coordinator["summary"] == draft["summary"]
+            assert coordinator["summary_sha256"] == draft["summary_sha256"]
+
+            assert release_cli.main([
+                "coordinator-complete",
+                "--version",
+                "2.3.2",
+                "--release-sha",
+                RELEASE_SHA,
+                "--state-dir",
+                str(state),
+                "--task-id",
+                task_id,
+                "--message-ref",
+                "assistant-release-summary",
+                "--summary-sha256",
+                coordinator["summary_sha256"],
+                "--attempt-receipt-sha256",
+                coordinator["attempt_receipt_sha256"],
+            ]) == 0
+            terminal = json.loads(capsys.readouterr().out)
+            assert terminal["release_completion"] == "complete"
+            assert terminal["healthy"] is True
+            assert release_health(
+                state,
+                version="2.3.2",
+                release_sha=RELEASE_SHA,
+            )["healthy"] is True
         finally:
             await relay.disconnect()
             server.shutdown()

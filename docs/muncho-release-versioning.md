@@ -67,20 +67,26 @@ The wrapper calls `restart-prepare` only before its systemd mutation and
 `restart-complete` only after exact identity, marker consumption, service
 health, and smoke checks. An already-active retry may reconcile a pre-existing
 attempt or replay an existing attestation, but it cannot create the missing
-pre-restart evidence. Therefore that fast path cannot announce merely because
-the target happens to be active. The smoke receipt, all later summary receipts,
-status, health, and terminal completion are chained to the restart attestation.
+pre-restart evidence, and replay succeeds only when the supplied current
+systemd `InvocationID` is the attested post-restart invocation. Therefore that
+fast path cannot announce merely because the target happens to be active. The
+smoke receipt, all later summary receipts, status, health, and terminal
+completion are chained to the restart attestation.
 Any embedded version, SHA, idempotency key, or receipt-link mismatch fails
 closed even if a record was placed under an expected filename.
 
 Discord delivery reserves its attempt before network I/O and writes a sealed
-request containing the exact rendered bytes and their digest. The restarted
+request containing the exact rendered bytes, their digest, the restart
+attestation digest, and its post-restart systemd `InvocationID`. The restarted
 gateway watches that private release state only after it has finished the
-restart/startup lifecycle notifications. Once the deploy coordinator has
-confirmed the exact active SHA and production smokes, the gateway sends the
-request only through its live Relay to the privileged Discord connector. A
-native Discord adapter or direct REST fallback is rejected on this production
-path.
+restart/startup lifecycle notifications. It compares the request to its own
+current systemd `INVOCATION_ID`; a missing or later invocation blocks before
+the Relay. Once the deploy coordinator has confirmed the exact active SHA and
+production smokes, the gateway sends the request only through its live Relay
+to the privileged Discord connector. A native Discord adapter or direct REST
+fallback is rejected on this production path. A Discord delivery receipt,
+terminal completion, and healthy status are invalid unless they bind to that
+exact persisted gateway request.
 
 The connector receives a stable idempotency key derived from `(version, exact
 SHA)`. A successful replay returns the existing exact Discord message ID. A

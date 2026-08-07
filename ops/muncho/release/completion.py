@@ -10,12 +10,10 @@ import json
 import os
 import re
 import stat
-import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .metadata import (
     ReleaseBundle,
@@ -496,6 +494,7 @@ def complete_restart_attestation(
         if (
             stored["mapping_receipt_sha256"] != bound["receipt_sha256"]
             or stored["service_name"] != service_name
+            or stored["after_invocation_id"] != after_invocation_id
         ):
             raise ReleaseCompletionError(
                 "muncho_release_restart_attestation_conflict"
@@ -1018,6 +1017,22 @@ def record_reserved_summary_delivery(
         or validate_delivery_attempt(_read(attempt_path)) != reserved
     ):
         raise ReleaseCompletionError("muncho_release_delivery_binding_invalid")
+    if kind == "discord":
+        request = validate_gateway_discord_request(
+            _read(
+                _gateway_discord_request_path(
+                    state,
+                    version=bound["muncho_version"],
+                    release_sha=bound["release_sha"],
+                )
+            )
+        )
+        if (
+            request["attempt_receipt_sha256"] != reserved["receipt_sha256"]
+            or request["draft_receipt_sha256"] != bound["receipt_sha256"]
+            or request["summary_sha256"] != bound["summary_sha256"]
+        ):
+            raise ReleaseCompletionError("muncho_release_delivery_binding_invalid")
     candidate = validate_delivery_receipt(
         _seal(
             DELIVERY_SCHEMA,
@@ -1045,96 +1060,20 @@ def record_reserved_summary_delivery(
     return stored
 
 
-DiscordSender = Callable[[str, str], Mapping[str, Any]]
-
-
-def deliver_discord_once(
-    state_dir: Path,
-    draft: Mapping[str, Any],
-    *,
-    sender: DiscordSender,
-    reserved_at: datetime | None = None,
-    published_at: datetime | None = None,
-) -> dict[str, Any]:
-    bound = validate_summary_draft(draft)
-    channel_id = str(bound["discord_destination"]["channel_id"])
-    attempt, created = reserve_summary_delivery(
-        state_dir,
-        bound,
-        kind="discord",
-        destination_ref=channel_id,
-        reserved_at=reserved_at,
-    )
-    if attempt.get("schema") == DELIVERY_SCHEMA:
-        return validate_delivery_receipt(attempt)
-    if not created:
-        raise ReleaseCompletionError(
-            "muncho_release_discord_delivery_reconciliation_required"
-        )
-    try:
-        result = sender(bound["summary"], channel_id)
-    except Exception as exc:
-        raise ReleaseCompletionError(
-            "muncho_release_discord_delivery_uncertain"
-        ) from exc
-    if not isinstance(result, Mapping) or result.get("success") is not True:
-        raise ReleaseCompletionError("muncho_release_discord_delivery_failed")
-    return record_reserved_summary_delivery(
-        state_dir,
-        bound,
-        attempt,
-        message_ref=str(result.get("message_id", "")),
-        published_at=published_at,
-    )
-
-
-def hermes_send_discord(message: str, channel_id: str) -> Mapping[str, Any]:
-    """Send one already-reserved summary through Hermes's existing sender."""
-
-    if _SNOWFLAKE.fullmatch(channel_id) is None:
-        raise ReleaseCompletionError("muncho_release_destination_invalid")
-    try:
-        completed = subprocess.run(
-            (
-                sys.executable,
-                "-m",
-                "hermes_cli.main",
-                "send",
-                "--to",
-                f"discord:{channel_id}",
-                "--json",
-            ),
-            input=message,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=90,
-        )
-        result = json.loads(completed.stdout or "null")
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        raise ReleaseCompletionError(
-            "muncho_release_discord_delivery_uncertain"
-        ) from exc
-    if completed.returncode != 0 or not isinstance(result, Mapping):
-        raise ReleaseCompletionError("muncho_release_discord_delivery_failed")
-    return {
-        "success": result.get("success") is True or result.get("ok") is True,
-        "message_id": str(result.get("message_id", "")),
-    }
-
-
 _GATEWAY_DISCORD_REQUEST_FIELDS = frozenset({
     "muncho_version",
     "release_sha",
     "release_idempotency_key",
     "attempt_receipt_sha256",
     "draft_receipt_sha256",
+    "restart_attestation_receipt_sha256",
     "smoke_receipt_sha256",
     "summary_sha256",
     "summary",
     "guild_id",
     "channel_id",
     "target_type",
+    "after_invocation_id",
     "queued_at_utc",
 })
 
@@ -1151,6 +1090,7 @@ def validate_gateway_discord_request(value: Any) -> dict[str, Any]:
     for name in (
         "attempt_receipt_sha256",
         "draft_receipt_sha256",
+        "restart_attestation_receipt_sha256",
         "smoke_receipt_sha256",
         "summary_sha256",
     ):
@@ -1170,6 +1110,7 @@ def validate_gateway_discord_request(value: Any) -> dict[str, Any]:
         or raw.get("target_type") != "guild_channel"
     ):
         raise ReleaseCompletionError(code)
+    _require_invocation_id(raw.get("after_invocation_id"), code)
     _require_timestamp(raw.get("queued_at_utc"), code)
     return raw
 
@@ -1204,12 +1145,20 @@ def queue_gateway_discord_delivery(
     reserved = validate_delivery_attempt(attempt)
     attempt_path, _delivery_path = _delivery_paths(state, bound, "discord")
     destination = bound["discord_destination"]
+    suffix = _identity_suffix(bound["muncho_version"], bound["release_sha"])
+    smoke = validate_smoke_receipt(_read(state / f"smoke-{suffix}.json"))
+    restart = validate_restart_attestation(
+        _read(state / f"restart-attestation-{suffix}.json")
+    )
     if (
         reserved["destination_kind"] != "discord"
         or reserved["destination_ref"] != destination["channel_id"]
         or reserved["draft_receipt_sha256"] != bound["receipt_sha256"]
         or reserved["summary_sha256"] != bound["summary_sha256"]
         or validate_delivery_attempt(_read(attempt_path)) != reserved
+        or smoke["receipt_sha256"] != bound["smoke_receipt_sha256"]
+        or smoke["restart_attestation_receipt_sha256"]
+        != restart["receipt_sha256"]
     ):
         raise ReleaseCompletionError(
             "muncho_release_gateway_discord_request_binding_invalid"
@@ -1223,12 +1172,14 @@ def queue_gateway_discord_delivery(
                 "release_idempotency_key": bound["release_idempotency_key"],
                 "attempt_receipt_sha256": reserved["receipt_sha256"],
                 "draft_receipt_sha256": bound["receipt_sha256"],
+                "restart_attestation_receipt_sha256": restart["receipt_sha256"],
                 "smoke_receipt_sha256": bound["smoke_receipt_sha256"],
                 "summary_sha256": bound["summary_sha256"],
                 "summary": bound["summary"],
                 "guild_id": destination["guild_id"],
                 "channel_id": destination["channel_id"],
                 "target_type": destination["target_type"],
+                "after_invocation_id": restart["after_invocation_id"],
                 "queued_at_utc": utc_timestamp(queued_at),
             },
         )
@@ -1422,6 +1373,7 @@ _COMPLETION_FIELDS = frozenset({
     "smoke_receipt_sha256",
     "draft_receipt_sha256",
     "summary_sha256",
+    "gateway_discord_request_receipt_sha256",
     "codex_task_delivery_receipt_sha256",
     "discord_delivery_receipt_sha256",
     "production_smoke_passed",
@@ -1461,6 +1413,12 @@ def finalize_release_completion(
     restart = require_restart_attestation(state, bound_mapping)
     bound_smoke = validate_smoke_receipt(smoke)
     bound_draft = validate_summary_draft(draft)
+    suffix = _identity_suffix(
+        bound_mapping["muncho_version"], bound_mapping["release_sha"]
+    )
+    gateway_request = validate_gateway_discord_request(
+        _read(state / f"gateway-discord-request-{suffix}.json")
+    )
     deliveries = {
         item["destination_kind"]: item
         for item in (
@@ -1473,6 +1431,15 @@ def finalize_release_completion(
         or bound_smoke["restart_attestation_receipt_sha256"]
         != restart["receipt_sha256"]
         or bound_smoke["receipt_sha256"] != bound_draft["smoke_receipt_sha256"]
+        or gateway_request["attempt_receipt_sha256"]
+        != deliveries["discord"]["attempt_receipt_sha256"]
+        or gateway_request["draft_receipt_sha256"]
+        != bound_draft["receipt_sha256"]
+        or gateway_request["restart_attestation_receipt_sha256"]
+        != restart["receipt_sha256"]
+        or gateway_request["smoke_receipt_sha256"]
+        != bound_smoke["receipt_sha256"]
+        or gateway_request["summary_sha256"] != bound_draft["summary_sha256"]
         or any(
             item["draft_receipt_sha256"] != bound_draft["receipt_sha256"]
             or item["summary_sha256"] != bound_draft["summary_sha256"]
@@ -1492,6 +1459,9 @@ def finalize_release_completion(
                 "smoke_receipt_sha256": bound_smoke["receipt_sha256"],
                 "draft_receipt_sha256": bound_draft["receipt_sha256"],
                 "summary_sha256": bound_draft["summary_sha256"],
+                "gateway_discord_request_receipt_sha256": gateway_request[
+                    "receipt_sha256"
+                ],
                 "codex_task_delivery_receipt_sha256": deliveries["codex_task"][
                     "receipt_sha256"
                 ],
@@ -1503,9 +1473,6 @@ def finalize_release_completion(
                 "completed_at_utc": utc_timestamp(completed_at),
             },
         )
-    )
-    suffix = _identity_suffix(
-        bound_mapping["muncho_version"], bound_mapping["release_sha"]
     )
     path = state / f"completion-{suffix}.json"
     created = _create(path, candidate)
@@ -1523,7 +1490,13 @@ def _load_release_completion_chain(
     *,
     version: str,
     release_sha: str,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
     state = _ensure_state_dir(state_dir)
     version = str(SemVer.parse(version))
     release_sha = require_exact_release_sha(release_sha)
@@ -1532,6 +1505,9 @@ def _load_release_completion_chain(
     restart = require_restart_attestation(state, mapping)
     smoke = validate_smoke_receipt(_read(state / f"smoke-{suffix}.json"))
     draft = validate_summary_draft(_read(state / f"summary-draft-{suffix}.json"))
+    gateway_request = validate_gateway_discord_request(
+        _read(state / f"gateway-discord-request-{suffix}.json")
+    )
     discord = validate_delivery_receipt(
         _read(state / f"summary-discord-delivery-{suffix}.json")
     )
@@ -1541,12 +1517,19 @@ def _load_release_completion_chain(
         or smoke["restart_attestation_receipt_sha256"]
         != restart["receipt_sha256"]
         or draft["smoke_receipt_sha256"] != smoke["receipt_sha256"]
+        or gateway_request["attempt_receipt_sha256"]
+        != discord["attempt_receipt_sha256"]
+        or gateway_request["draft_receipt_sha256"] != draft["receipt_sha256"]
+        or gateway_request["restart_attestation_receipt_sha256"]
+        != restart["receipt_sha256"]
+        or gateway_request["smoke_receipt_sha256"] != smoke["receipt_sha256"]
+        or gateway_request["summary_sha256"] != draft["summary_sha256"]
         or discord["destination_kind"] != "discord"
         or discord["draft_receipt_sha256"] != draft["receipt_sha256"]
         or discord["summary_sha256"] != draft["summary_sha256"]
     ):
         raise ReleaseCompletionError("muncho_release_completion_binding_invalid")
-    return mapping, smoke, draft, discord
+    return mapping, smoke, draft, gateway_request, discord
 
 
 def reserve_codex_task_summary(
@@ -1559,10 +1542,12 @@ def reserve_codex_task_summary(
 ) -> tuple[dict[str, Any], dict[str, Any], bool]:
     """Reserve the exact coordinator-task summary without claiming delivery."""
 
-    _mapping, _smoke, draft, _discord = _load_release_completion_chain(
+    _mapping, _smoke, draft, _gateway_request, _discord = (
+        _load_release_completion_chain(
         state_dir,
         version=version,
         release_sha=release_sha,
+        )
     )
     attempt, created = reserve_summary_delivery(
         state_dir,
@@ -1594,10 +1579,12 @@ def record_codex_task_summary_and_finalize(
     summary has actually been posted.
     """
 
-    mapping, smoke, draft, discord = _load_release_completion_chain(
+    mapping, smoke, draft, _gateway_request, discord = (
+        _load_release_completion_chain(
         state_dir,
         version=version,
         release_sha=release_sha,
+        )
     )
     _require_digest(summary_sha256, "muncho_release_codex_ack_invalid")
     _require_digest(attempt_receipt_sha256, "muncho_release_codex_ack_invalid")
@@ -1771,15 +1758,19 @@ def release_status(
             or delivery["draft_receipt_sha256"] != draft["receipt_sha256"]
             or delivery["summary_sha256"] != draft["summary_sha256"]
             or delivery["destination_ref"] != attempt["destination_ref"]
+            or (kind == "discord" and gateway_request is None)
         ):
             raise ReleaseCompletionError("muncho_release_status_chain_invalid")
     if gateway_request is not None and (
         draft is None
+        or restart is None
         or smoke is None
         or discord_attempt is None
         or gateway_request["attempt_receipt_sha256"]
         != discord_attempt["receipt_sha256"]
         or gateway_request["draft_receipt_sha256"] != draft["receipt_sha256"]
+        or gateway_request["restart_attestation_receipt_sha256"]
+        != restart["receipt_sha256"]
         or gateway_request["smoke_receipt_sha256"] != smoke["receipt_sha256"]
         or gateway_request["summary_sha256"] != draft["summary_sha256"]
         or gateway_request["guild_id"]
@@ -1788,6 +1779,8 @@ def release_status(
         != draft["discord_destination"]["channel_id"]
         or gateway_request["target_type"]
         != draft["discord_destination"]["target_type"]
+        or gateway_request["after_invocation_id"]
+        != restart["after_invocation_id"]
     ):
         raise ReleaseCompletionError("muncho_release_status_chain_invalid")
     if completion is not None and (
@@ -1796,6 +1789,7 @@ def release_status(
         or smoke is None
         or draft is None
         or codex is None
+        or gateway_request is None
         or discord is None
         or completion["mapping_receipt_sha256"] != mapping["receipt_sha256"]
         or completion["restart_attestation_receipt_sha256"]
@@ -1803,6 +1797,8 @@ def release_status(
         or completion["smoke_receipt_sha256"] != smoke["receipt_sha256"]
         or completion["draft_receipt_sha256"] != draft["receipt_sha256"]
         or completion["summary_sha256"] != draft["summary_sha256"]
+        or completion["gateway_discord_request_receipt_sha256"]
+        != gateway_request["receipt_sha256"]
         or completion["codex_task_delivery_receipt_sha256"]
         != codex["receipt_sha256"]
         or completion["discord_delivery_receipt_sha256"]
@@ -1868,10 +1864,8 @@ __all__ = [
     "ReleaseCompletionError",
     "build_mapping_receipt",
     "complete_restart_attestation",
-    "deliver_discord_once",
     "deliver_discord_via_gateway_once",
     "finalize_release_completion",
-    "hermes_send_discord",
     "load_current_production_config",
     "pending_gateway_discord_deliveries",
     "prepare_summary_draft",

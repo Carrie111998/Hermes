@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
 
 from ops.muncho.release import cli
+from hermes_cli import __version__
 from ops.muncho.release.metadata import (
     REQUIRED_HISTORY_PREFIX,
     ReleaseMetadataError,
@@ -29,7 +31,7 @@ def _self_hash(value: dict, field: str) -> dict:
 def test_bundled_metadata_keeps_hermes_version_separate_and_history_append_only():
     bundle = load_release_bundle(ROOT)
 
-    assert str(bundle.metadata.version) == "2.3.2"
+    assert bundle.metadata.version > bundle.history.releases[-1].version
     assert REQUIRED_HISTORY_PREFIX == (
         (
             "2.3.0",
@@ -44,10 +46,9 @@ def test_bundled_metadata_keeps_hermes_version_separate_and_history_append_only(
             False,
         ),
     )
-    assert all(
-        entry.metadata_present_at_source is False for entry in bundle.history.releases
-    )
-    assert 'version = "0.20.0"' in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert project["project"]["version"] == __version__
+    assert str(bundle.metadata.version) != __version__
 
 
 def test_upstream_tree_without_any_muncho_metadata_is_a_clean_optional_fallback(

@@ -26,6 +26,7 @@ from .metadata import require_exact_release_sha
 
 
 _SNOWFLAKE = re.compile(r"^[1-9][0-9]{0,24}$")
+_SYSTEMD_INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _result_field(result: Any, name: str, default: Any = None) -> Any:
@@ -41,6 +42,7 @@ async def dispatch_pending_gateway_discord_deliveries(
     adapters: Mapping[Any, Any],
     production_config: Mapping[str, Any],
     deployed_release_sha: str,
+    active_service_invocation_id: str | None,
     published_at: datetime | None = None,
 ) -> tuple[dict[str, Any], ...]:
     """Dispatch pending summaries through the authenticated relay connector.
@@ -56,6 +58,7 @@ async def dispatch_pending_gateway_discord_deliveries(
     requests = pending_gateway_discord_deliveries(state_dir)
     if not requests:
         return ()
+    active_service_invocation_id = str(active_service_invocation_id or "")
     transport = resolve_delivery_transport(
         Platform.DISCORD,
         gateway_config,
@@ -70,6 +73,14 @@ async def dispatch_pending_gateway_discord_deliveries(
         }
         if request["release_sha"] != deployed_release_sha:
             outcomes.append({**identity, "state": "blocked_identity_mismatch"})
+            continue
+        if (
+            _SYSTEMD_INVOCATION_ID.fullmatch(active_service_invocation_id) is None
+            or request["after_invocation_id"] != active_service_invocation_id
+        ):
+            outcomes.append(
+                {**identity, "state": "blocked_restart_identity_mismatch"}
+            )
             continue
         if any(
             request[name] != expected_destination[name]

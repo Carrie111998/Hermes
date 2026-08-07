@@ -26855,6 +26855,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapters=self.adapters,
                         production_config=load_config_readonly() or {},
                         deployed_release_sha=deployed_sha,
+                        active_service_invocation_id=os.environ.get("INVOCATION_ID"),
                     )
                     projection = tuple(
                         (
