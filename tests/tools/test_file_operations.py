@@ -673,3 +673,97 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+class TestWriteDenyAnchoredToSessionCwd:
+    """The credential write-deny must anchor relative paths to the terminal
+    session's live cwd (which tracks `cd`), not the Python process cwd.
+
+    Regression: `get_write_denied_error` realpaths relative paths against
+    the process cwd, so `.ssh/authorized_keys` escaped the deny list while
+    the terminal session sat at $HOME — and the write landed in
+    $HOME/.ssh/authorized_keys."""
+
+    @staticmethod
+    def _env(cwd: str):
+        import subprocess as _sp
+
+        class _E:
+            def __init__(self, c):
+                self.cwd = c
+                self.config = type("C", (), {"cwd": c})()
+
+            def execute(self, command, cwd=None, **kw):
+                out = _sp.run(command, shell=True, cwd=cwd,
+                              capture_output=True, text=True,
+                              input=kw.get("stdin_data"))
+                return {"output": out.stdout + out.stderr,
+                        "returncode": out.returncode}
+
+        return _E(cwd)
+
+    def test_relative_credential_write_denied_at_session_home(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (tmp_path / "proc").mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.chdir(tmp_path / "proc")
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops.write_file(".ssh/authorized_keys", "ssh-ed25519 AAAA x")
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+        assert not (fake_home / ".ssh" / "authorized_keys").exists()
+
+    def test_relative_write_allowed_for_normal_file(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops.write_file("notes.txt", "hello")
+        assert result.error is None
+        assert (fake_home / "notes.txt").read_text() == "hello"
+
+    def test_relative_credential_delete_denied(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops._python_delete(".ssh/authorized_keys", recursive=False)
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+
+    def test_absolute_credential_path_still_denied(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops.write_file(str(fake_home / ".ssh" / "authorized_keys"), "x")
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+
+    def test_relative_credential_move_denied(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".ssh").mkdir(parents=True)
+        (fake_home / "notes.txt").write_text("hello")
+        (fake_home / ".ssh" / "authorized_keys").write_text("existing")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops.move_file("notes.txt", ".ssh/authorized_keys")
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+        assert (fake_home / ".ssh" / "authorized_keys").read_text() == "existing"
+
+    def test_relative_credential_patch_denied(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        (fake_home / ".ssh").mkdir(parents=True)
+        (fake_home / ".ssh" / "authorized_keys").write_text("existing")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        ops = ShellFileOperations(self._env(str(fake_home)))
+        result = ops.patch_replace(".ssh/authorized_keys", "existing", "replaced")
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+        assert (fake_home / ".ssh" / "authorized_keys").read_text() == "existing"
