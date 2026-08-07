@@ -344,6 +344,7 @@ class PluginContext:
 
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
+        self._plugin_id = manifest.key or manifest.name
         self._manager = manager
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
@@ -403,12 +404,11 @@ class PluginContext:
         handle is plugin-owned and tamper-evident. No model tool is added.
         """
         if self._background_tasks is None:
-            from agent.background_tasks import ExternalBackgroundTasksService
+            from agent.background_tasks import _create_external_background_tasks_service
             from agent.host_context import get_active_host_parent
 
-            plugin_id = self.manifest.key or self.manifest.name
-            self._background_tasks = ExternalBackgroundTasksService(
-                plugin_id=plugin_id,
+            self._background_tasks = _create_external_background_tasks_service(
+                plugin_id=self._plugin_id,
                 parent_agent_resolver=get_active_host_parent,
             )
         return self._background_tasks

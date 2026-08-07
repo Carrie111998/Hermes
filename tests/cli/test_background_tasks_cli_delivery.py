@@ -10,7 +10,7 @@ import queue
 from cli import HermesCLI
 from types import SimpleNamespace
 
-from agent.background_tasks import ExternalBackgroundTasksService
+from agent.background_tasks import _create_external_background_tasks_service
 from agent.host_context import bind_host_parent
 from tools.process_registry import process_registry
 from tools.async_delegation import get_durable_delegation
@@ -29,7 +29,7 @@ def _drain_one():
 
 def test_cli_delivery_reaches_bound_parent_once():
     parent = SimpleNamespace(session_id="cli-session-1")
-    svc = ExternalBackgroundTasksService(
+    svc = _create_external_background_tasks_service(
         plugin_id="cli-plugin",
         parent_agent_resolver=lambda: parent,
     )
@@ -66,7 +66,7 @@ def test_cli_delivery_reaches_bound_parent_once():
 def test_cli_delivery_rejects_foreign_session():
     """A different CLI window cannot claim the completion."""
     parent = SimpleNamespace(session_id="cli-session-a")
-    svc = ExternalBackgroundTasksService(
+    svc = _create_external_background_tasks_service(
         plugin_id="cli-plugin",
         parent_agent_resolver=lambda: parent,
     )

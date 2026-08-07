@@ -106,6 +106,21 @@ def _sign(
     return _sign_handle(key, task_id, plugin_id, parent_session_id, created_at)
 
 
+_HOST_SERVICE_CAPABILITY = object()
+
+
+def _create_external_background_tasks_service(
+    *, plugin_id: str, parent_agent_resolver: Callable[[], Any]
+) -> "ExternalBackgroundTasksService":
+    """Host-private constructor used by :class:`PluginContext` and core tests."""
+
+    return ExternalBackgroundTasksService(
+        plugin_id=plugin_id,
+        parent_agent_resolver=parent_agent_resolver,
+        _host_capability=_HOST_SERVICE_CAPABILITY,
+    )
+
+
 class ExternalBackgroundTasksService:
     """Stable public service returned by :attr:`PluginContext.background_tasks`.
 
@@ -118,7 +133,13 @@ class ExternalBackgroundTasksService:
         self,
         plugin_id: str,
         parent_agent_resolver: Callable[[], Any],
+        *,
+        _host_capability: object | None = None,
     ) -> None:
+        if _host_capability is not _HOST_SERVICE_CAPABILITY:
+            raise BackgroundTaskError(
+                "External background-task services are host-owned; use PluginContext.background_tasks."
+            )
         if not isinstance(plugin_id, str) or not plugin_id:
             raise BackgroundTaskError("plugin_id must be a non-empty string.")
         if not callable(parent_agent_resolver):

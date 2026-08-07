@@ -15,9 +15,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import random
 import secrets
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator
 
@@ -101,8 +104,17 @@ def connect() -> sqlite3.Connection:
     try:
         from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(conn, db_label="state.db (background_tasks)")
         conn.execute("PRAGMA busy_timeout=10000")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                apply_wal_with_fallback(conn, db_label="state.db (background_tasks)")
+                break
+            except sqlite3.OperationalError as exc:
+                lock_contention = "locked" in str(exc).lower() or "busy" in str(exc).lower()
+                if not lock_contention or time.monotonic() >= deadline:
+                    raise
+                time.sleep(random.uniform(0.01, 0.05))
         conn.executescript(_SCHEMA)
     except Exception:
         conn.close()

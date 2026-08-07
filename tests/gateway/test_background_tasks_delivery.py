@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent.background_tasks import ExternalBackgroundTasksService
+from agent.background_tasks import _create_external_background_tasks_service
 from agent.host_context import bind_host_parent
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -87,7 +87,7 @@ def _stop_after_sleeps(monkeypatch, runner, count):
 
 def _register_and_complete(*, plugin_id, parent_session_id, label, summary):
     parent = SimpleNamespace(session_id=parent_session_id)
-    svc = ExternalBackgroundTasksService(
+    svc = _create_external_background_tasks_service(
         plugin_id=plugin_id,
         parent_agent_resolver=lambda: parent,
     )

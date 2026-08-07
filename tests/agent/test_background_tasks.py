@@ -22,6 +22,7 @@ import pytest
 from agent.background_tasks import (
     BackgroundTaskError,
     ExternalBackgroundTasksService,
+    _create_external_background_tasks_service,
     ExternalTaskHandle,
     ExternalTaskResult,
     ExternalTaskState,
@@ -47,7 +48,7 @@ def _parent(session_id="parent-1"):
 
 
 def _service(plugin_id="test-plugin", resolver=None):
-    return ExternalBackgroundTasksService(
+    return _create_external_background_tasks_service(
         plugin_id=plugin_id,
         parent_agent_resolver=resolver or get_active_host_parent,
     )
@@ -101,11 +102,30 @@ def test_plugin_context_service_is_per_plugin_identity():
     mgr = MagicMock()
     a = PluginContext(PluginManifest(name="plugin-a", key="plugin-a"), mgr)
     b = PluginContext(PluginManifest(name="plugin-b", key="plugin-b"), mgr)
+
     assert a.background_tasks.plugin_id == "plugin-a"
     assert b.background_tasks.plugin_id == "plugin-b"
 
 
-def test_plugin_identity_is_read_only_after_service_creation():
+def test_plugin_context_snapshots_identity_before_lazy_service_access():
+    from hermes_cli.plugins import PluginContext, PluginManifest
+
+    manifest = PluginManifest(name="plugin-a", key="plugin-a")
+    ctx = PluginContext(manifest, MagicMock())
+    manifest.key = "plugin-b"
+
+    assert ctx.background_tasks.plugin_id == "plugin-a"
+
+
+def test_direct_service_construction_is_host_only():
+    with pytest.raises(BackgroundTaskError, match="host-owned"):
+        ExternalBackgroundTasksService(
+            plugin_id="plugin-b",
+            parent_agent_resolver=get_active_host_parent,
+        )
+
+
+def test_plugin_service_identity_is_read_only():
     service = _service("plugin-a")
 
     with pytest.raises(AttributeError):
@@ -679,10 +699,10 @@ def test_real_restart_restores_undelivered_completion_and_pending_state(tmp_path
     producer = r"""
 import json
 from types import SimpleNamespace
-from agent.background_tasks import ExternalBackgroundTasksService
+from agent.background_tasks import _create_external_background_tasks_service
 from agent.host_context import bind_host_parent
 
-svc = ExternalBackgroundTasksService(
+svc = _create_external_background_tasks_service(
     plugin_id="restart-plugin",
     parent_agent_resolver=lambda: SimpleNamespace(session_id="parent-1"),
 )
@@ -708,10 +728,10 @@ with bind_host_parent(SimpleNamespace(session_id="parent-1")):
 import json
 import sys
 from types import SimpleNamespace
-from agent.background_tasks import ExternalBackgroundTasksService
+from agent.background_tasks import _create_external_background_tasks_service
 from tools.process_registry import process_registry, format_process_notification
 
-svc = ExternalBackgroundTasksService(
+svc = _create_external_background_tasks_service(
     plugin_id="restart-plugin",
     parent_agent_resolver=lambda: SimpleNamespace(session_id="parent-1"),
 )
