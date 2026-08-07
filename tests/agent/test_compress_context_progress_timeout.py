@@ -44,6 +44,26 @@ class TestResolveContextCompressionTimeouts:
         assert idle == 90.0
         assert ceiling == 90.0
 
+    def test_runtime_idle_cannot_undercut_effective_aux_timeout(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "compression": {
+                    "context_timeout_seconds": 120,
+                    "context_total_ceiling_seconds": 600,
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._effective_aux_timeout",
+            lambda task, timeout: 180.0,
+        )
+
+        idle, ceiling = resolve_context_compression_timeouts()
+
+        assert idle == 180.0
+        assert ceiling == 600.0
+
 
 class TestRunCompressContextWithProgressTimeout:
     def test_silent_worker_times_out_and_preserves_messages(self):
@@ -424,6 +444,9 @@ class TestCompressContextForwarderOwnsTimeout:
         assert out_prompt == "sys"
         assert calls["n"] == 1
         agent._emit_warning.assert_called_once()
+        warning = agent._emit_warning.call_args.args[0]
+        assert "without an observable progress signal" in warning
+        assert "no output from the summary model" not in warning
         assert agent.context_compressor._consecutive_timeout_failures == 1
         agent.context_compressor._record_compression_failure_cooldown.assert_called_once()
         cooldown_args = (

@@ -7482,11 +7482,13 @@ class AIAgent:
                 emit = getattr(self, "_emit_warning", None)
                 if callable(emit):
                     emit(
-                        "⚠ Context compression timed out "
-                        f"after {idle:.1f}s with no output from the summary "
-                        "model. No messages were dropped — continuing without "
-                        "compression. Run /compress to retry, /new for a clean "
-                        "session, or check auxiliary.compression."
+                        "⚠ Context compression stopped waiting "
+                        f"after {idle:.1f}s without an observable progress "
+                        "signal. The summary request may have been slow rather "
+                        "than failed; any late result is discarded safely. No "
+                        "messages were dropped — continuing without compression. "
+                        "Run /compress to retry, /new for a clean session, or "
+                        "check auxiliary.compression."
                     )
 
             def _on_commit_overrun(waited, ceiling):

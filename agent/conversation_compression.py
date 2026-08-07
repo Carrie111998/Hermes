@@ -780,11 +780,16 @@ def resolve_context_compression_timeouts(
 
     ``idle_timeout_seconds <= 0`` disables the owned progress-aware wrapper.
     The ceiling is clamped to at least one idle window when the idle budget
-    is positive, matching gateway hygiene semantics.
+    is positive, matching gateway hygiene semantics. Runtime resolution also
+    raises a positive idle budget to the effective auxiliary compression
+    timeout: the host must not abandon a silent-but-still-valid summary call
+    before that call's own deadline. Passing an explicit config mapping keeps
+    this helper deterministic for validation and unit tests.
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
     cfg = compression_cfg
+    align_with_auxiliary_timeout = cfg is None
     if cfg is None:
         try:
             from hermes_cli.config import load_config
@@ -812,6 +817,21 @@ def resolve_context_compression_timeouts(
             except (TypeError, ValueError):
                 pass
     if idle > 0:
+        if align_with_auxiliary_timeout:
+            try:
+                from agent.auxiliary_client import _effective_aux_timeout
+
+                auxiliary_timeout = float(
+                    _effective_aux_timeout("compression", None)
+                )
+                if auxiliary_timeout > 0:
+                    idle = max(idle, auxiliary_timeout)
+            except Exception:
+                logger.debug(
+                    "Failed to align context compression timeout with "
+                    "auxiliary.compression timeout",
+                    exc_info=True,
+                )
         ceiling = max(ceiling, idle)
     return idle, ceiling
 
