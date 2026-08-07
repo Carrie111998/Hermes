@@ -55,6 +55,19 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+# Raw FTS rows are only a discovery-plan input. The final response hydrates
+# its own anchored message window and bookends after lineage deduplication.
+_DISCOVER_SEARCH_FIELDS = (
+    "id",
+    "session_id",
+    "role",
+    "snippet",
+    "source",
+    "model",
+    "session_started",
+)
+
+
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
 
@@ -246,17 +259,21 @@ def _shape_message(
     if max_content_len is not None:
         from agent.context_compressor import _content_text_for_contains
 
-        text_content = _content_text_for_contains(raw_content)
-        if max_content_len and len(text_content) > max_content_len:
-            content = text_content[:max_content_len] + "…"
-            truncated = True
-            original_chars = len(text_content)
-        else:
-            content = text_content
-            truncated = False
-            original_chars = None
+        shaped_content = _content_text_for_contains(raw_content)
     else:
-        content = raw_content
+        shaped_content = raw_content
+    if isinstance(shaped_content, str) and "\x1b" in shaped_content:
+        # Recalled messages can carry ANSI escape sequences (e.g. archived
+        # terminal output). Strip them before returning content to the model.
+        from tools.ansi_strip import strip_ansi
+
+        shaped_content = strip_ansi(shaped_content)
+    if max_content_len and shaped_content and len(shaped_content) > max_content_len:
+        content = shaped_content[:max_content_len] + "…"
+        truncated = True
+        original_chars = len(shaped_content)
+    else:
+        content = shaped_content
         truncated = False
         original_chars = None
     entry = {
@@ -708,6 +725,7 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            fields=_DISCOVER_SEARCH_FIELDS,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
