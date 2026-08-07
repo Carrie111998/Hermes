@@ -1583,3 +1583,86 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_dispatch_spawn_gate_defers_and_spawns(kanban_home, all_assignees_spawnable):
+    """``spawn_gate`` returning {"action": "defer"} leaves the task ready
+    (recorded in ``DispatchResult.deferred_by_gate``) without claiming it;
+    ungated tasks spawn normally. A crashing gate is fail-open."""
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="gated", assignee="w")
+        t2 = kb.create_task(conn, title="free", assignee="w")
+        conn.execute(
+            "UPDATE tasks SET status='ready' WHERE id IN (?, ?)", (t1, t2)
+        )
+        conn.commit()
+
+        spawned: list[str] = []
+
+        def spawn_fn(task, workspace, board=None):
+            spawned.append(getattr(task, "id", None) or task["id"])
+            return None
+
+        def gate(task):
+            if task["id"] == t1:
+                return {"action": "defer", "reason": "budget window closed"}
+            return None
+
+        res = kb._dispatch_once_locked(
+            conn, spawn_fn=spawn_fn, spawn_gate=gate
+        )
+        assert (t1, "budget window closed") in res.deferred_by_gate
+        assert t1 not in spawned and t2 in spawned
+        assert kb.get_task(conn, t1).status == "ready"
+
+        # Fail-open: a gate that raises must not stop the board.
+        def broken_gate(task):
+            raise RuntimeError("boom")
+
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (t1,))
+        conn.commit()
+        res2 = kb._dispatch_once_locked(
+            conn, spawn_fn=spawn_fn, spawn_gate=broken_gate
+        )
+        assert t1 in spawned
+        assert not res2.deferred_by_gate
+
+
+def test_dispatch_spawn_gate_payload_contract(kanban_home, all_assignees_spawnable):
+    """The dict handed to ``spawn_gate`` carries exactly the documented
+    public ``kanban_pre_spawn`` payload: id, title, assignee, priority,
+    status, tenant, created_by, created_at, workspace_kind, workspace_path,
+    branch_name, project_id. Guards the candidate SELECT against silent
+    drift from the contract promised in plugins.VALID_HOOKS and hooks.md."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="payload", assignee="w", priority=7,
+            created_by="tester", tenant="acme",
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+
+        seen: list[dict] = []
+
+        def gate(task):
+            seen.append(task)
+            return {"action": "defer", "reason": "capture only"}
+
+        kb._dispatch_once_locked(
+            conn, spawn_fn=lambda *a, **k: None, spawn_gate=gate
+        )
+        assert len(seen) == 1
+        payload = seen[0]
+        assert set(payload) == {
+            "id", "title", "assignee", "priority", "status", "tenant",
+            "created_by", "created_at", "workspace_kind", "workspace_path",
+            "branch_name", "project_id",
+        }
+        assert payload["id"] == tid
+        assert payload["title"] == "payload"
+        assert payload["assignee"] == "w"
+        assert payload["priority"] == 7
+        assert payload["status"] == "ready"
+        assert payload["tenant"] == "acme"
+        assert payload["created_by"] == "tester"
+        assert payload["workspace_kind"] == "scratch"

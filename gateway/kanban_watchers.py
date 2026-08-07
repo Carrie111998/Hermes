@@ -1244,9 +1244,15 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                # kanban_pre_spawn plugin hook: per-candidate policy veto
+                # (budget windows, maintenance freezes). Shared fail-open
+                # builder — same gate on every dispatcher entry point.
+                from hermes_cli.plugins import make_kanban_spawn_gate
+
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
+                    spawn_gate=make_kanban_spawn_gate(slug),
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,

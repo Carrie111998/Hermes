@@ -2471,10 +2471,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    # Same kanban_pre_spawn policy gate as the gateway-embedded dispatcher:
+    # a manual `hermes kanban dispatch` must not bypass plugin spawn policy.
+    from hermes_cli.plugins import make_kanban_spawn_gate
+    spawn_gate = make_kanban_spawn_gate(getattr(args, "board", None))
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
+            spawn_gate=spawn_gate,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
