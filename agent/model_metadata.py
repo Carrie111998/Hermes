@@ -1120,6 +1120,30 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
             result["cache_read"] = str(float(deepinfra_pricing["cache_read_tokens"]) / 1_000_000)
         return result
 
+    # OpenAI-compatible endpoints (and aggregators following their schema)
+    # ship per-1M-token prices — either top-level ``input_price_per_million`` /
+    # ``output_price_per_million`` fields or a nested ``pricing`` block with
+    # ``unit: "per_1m_tokens"``. Normalize to per-token like the branches
+    # above; without this the generic cost machinery multiplies by 1M a
+    # second time and reports absurd prices (e.g. $1M/M).
+    per_million_fields = (
+        ("prompt", payload.get("input_price_per_million")),
+        ("completion", payload.get("output_price_per_million")),
+        ("cache_read", payload.get("cache_read_price_per_million")),
+    )
+    nested_pricing = payload.get("pricing") if isinstance(payload.get("pricing"), dict) else None
+    if any(value is not None for _, value in per_million_fields) or (
+        nested_pricing is not None and nested_pricing.get("unit") == "per_1m_tokens"
+    ):
+        result: Dict[str, Any] = {}
+        for target, value in per_million_fields:
+            if value is None and nested_pricing is not None:
+                value = nested_pricing.get(target)
+            if value is not None:
+                result[target] = str(float(value) / 1_000_000)
+        if result:
+            return result
+
     alias_map = {
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
         "completion": ("completion", "output", "output_cost_per_token", "completion_token_cost"),
