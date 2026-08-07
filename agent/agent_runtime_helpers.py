@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.message_sanitization import _repair_tool_call_arguments
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -386,6 +387,20 @@ def sanitize_tool_call_arguments(
                 tool_call_id = _ra().AIAgent._get_tool_call_id_static(tool_call) or None
                 function_name = function.get("name", "?")
                 preview = arguments[:80]
+                repaired_arguments = _repair_tool_call_arguments(arguments, function_name)
+                if repaired_arguments != "{}":
+                    function["arguments"] = repaired_arguments
+                    log.warning(
+                        "Corrupted tool_call arguments normalized before request "
+                        "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
+                        session_id or "-",
+                        message_index,
+                        tool_call_id or "-",
+                        function_name,
+                        preview,
+                    )
+                    repaired += 1
+                    continue
                 log.warning(
                     "Corrupted tool_call arguments repaired before request "
                     "(session=%s, message_index=%s, tool_call_id=%s, function=%s, preview=%r)",
