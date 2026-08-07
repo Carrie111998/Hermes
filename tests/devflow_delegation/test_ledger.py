@@ -58,6 +58,17 @@ def test_insert_and_get_roundtrip(ledger):
     assert env["request_id"] == req.request_id
 
 
+def test_close_releases_connection_for_file_deletion(ledger):
+    # A WAL ledger holds a persistent thread-local handle; on Windows that
+    # handle blocks unlink (WinError 32). close() must release it so the db
+    # file can be deleted or handed to a fresh emitter (the reconcile path).
+    ledger.insert_request(make_request())
+    ledger.close()
+    ledger.db_path.unlink()  # would raise WinError 32 if the handle were open
+    assert not ledger.db_path.exists()
+    ledger.close()  # idempotent: no error when already closed
+
+
 def test_duplicate_idempotency_key_rejected(ledger):
     ledger.insert_request(make_request())
     with pytest.raises(sqlite3.IntegrityError):

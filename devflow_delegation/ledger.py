@@ -106,6 +106,17 @@ class DelegationLedger:
         conn.executescript(_SCHEMA)
         conn.commit()
 
+    def close(self) -> None:
+        """Release the calling thread's connection so the db file can be
+        deleted or handed to a fresh reader. WAL keeps an exclusive OS handle
+        on the file while open, which blocks unlink on Windows (WinError 32);
+        the reconcile hand-off (a new emitter re-opening the same path) needs
+        this. Idempotent — a later query lazily reconnects via _conn()."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
     # ------------------------------------------------------------------ write
     def insert_request(self, req: WorkRequest) -> None:
         now = _now_iso()
