@@ -116,14 +116,18 @@ def build_exporter(config: Dict[str, Any]):
 
 
 def _resource_attributes(config: Dict[str, Any]) -> Dict[str, str]:
-    from agent.monitoring.gateway_health import _safe_instance_id
-    from agent.monitoring.policy import ensure_install_id
+    """Span-plane OTLP resource: same shape as the metrics/logs planes.
 
-    return {
-        "service.name": "hermes-gateway",
-        "service.instance.id": _safe_instance_id(ensure_install_id(config)),
-        "telemetry.scope": "gateway_monitoring",
-    }
+    Delegates to the shared helper so configured
+    ``monitoring.gateway_health_export.resource_attributes`` (allowlist-filtered,
+    e.g. ``deployment.environment.name``) are honored on spans exactly as they
+    are on metrics and diagnostic logs. The hardcoded identity keys
+    (``service.name``, sanitized ``service.instance.id``, ``telemetry.scope``)
+    are stamped last and cannot be overridden by config.
+    """
+    from agent.monitoring.gateway_health_export import _runtime_resource_attributes
+
+    return _runtime_resource_attributes(config, telemetry_scope="gateway_monitoring")
 
 
 def _make_provider(config: Dict[str, Any]):

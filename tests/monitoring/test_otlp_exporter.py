@@ -66,6 +66,62 @@ def test_trace_resource_includes_stable_hashed_instance():
     assert attrs["telemetry.scope"] == "gateway_monitoring"
 
 
+def test_trace_resource_honors_configured_resource_attributes():
+    """Configured resource_attributes must reach spans, not just metrics/logs.
+
+    Regression test for the span plane ignoring
+    monitoring.gateway_health_export.resource_attributes (spans landed as
+    env-less, e.g. env:none in Datadog, while metrics/logs carried the env).
+    """
+    config = {
+        "monitoring": {
+            "install_id": "private-install-id",
+            "gateway_health_export": {
+                "resource_attributes": {
+                    "deployment.environment.name": "production",
+                    "service.namespace": "hermes",
+                    "user.email": "user@example.com",  # not allowlisted
+                    "service.name": "attacker-override",  # identity: not overridable
+                },
+            },
+        },
+    }
+    attrs = OE._resource_attributes(config)
+
+    assert attrs["deployment.environment.name"] == "production"
+    assert attrs["service.namespace"] == "hermes"
+    assert "user.email" not in attrs
+    assert attrs["service.name"] == "hermes-gateway"
+    assert attrs["telemetry.scope"] == "gateway_monitoring"
+
+
+def test_trace_resource_matches_metrics_and_logs_resource():
+    """Invariant: all three export planes build the same resource for the same
+    config, differing only in telemetry.scope."""
+    from agent.monitoring.gateway_health_export import _runtime_resource_attributes
+
+    config = {
+        "monitoring": {
+            "install_id": "private-install-id",
+            "gateway_health_export": {
+                "resource_attributes": {
+                    "deployment.environment.name": "staging",
+                    "cloud.provider": "azure",
+                },
+            },
+        },
+    }
+    span_attrs = OE._resource_attributes(config)
+    metric_attrs = _runtime_resource_attributes(config, telemetry_scope="gateway_health")
+    log_attrs = _runtime_resource_attributes(config, telemetry_scope="gateway_diagnostics")
+
+    def _without_scope(attrs):
+        return {k: v for k, v in attrs.items() if k != "telemetry.scope"}
+
+    assert _without_scope(span_attrs) == _without_scope(metric_attrs) == _without_scope(log_attrs)
+    assert span_attrs["telemetry.scope"] == "gateway_monitoring"
+
+
 
 
 def test_streamer_receives_events_and_respects_filter(monkeypatch):
