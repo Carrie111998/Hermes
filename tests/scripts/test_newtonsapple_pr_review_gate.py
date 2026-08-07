@@ -2,9 +2,7 @@
 
 import json
 import base64
-import hashlib
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -14,33 +12,11 @@ from scripts import newtonsapple_pr_review_gate as gate
 from scripts.newtonsapple_pr_review_gate import (
     ReviewStateStore,
     ReviewTuple,
-    TrustedWorkflow,
     _buzz_find,
     _gate_webhook,
-    _workflow_from_environment,
     select_authorized_tuple,
     drain_summary_outbox,
-    parse_status_context,
-    validate_capture_status,
 )
-
-
-def test_capture_workflow_identity_is_code_pinned_not_environment_controlled(
-    monkeypatch,
-):
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_CAPTURE_WORKFLOW_ID", "999")
-    monkeypatch.setenv(
-        "NEWTONSAPPLE_REVIEW_CAPTURE_WORKFLOW_PATH",
-        ".github/workflows/attacker-controlled.yml",
-    )
-
-    workflow = _workflow_from_environment()
-
-    assert workflow == TrustedWorkflow(
-        workflow_id=328661288,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-    )
 
 
 BASE_SHA = "a" * 40
@@ -58,88 +34,6 @@ def _execution_request(operation):
     }
 
 
-def _trusted_ci_fixture():
-    run = {
-        "id": 31035273202,
-        "workflow_id": gate.TRUSTED_EXECUTION_WORKFLOW_ID,
-        "path": gate.TRUSTED_EXECUTION_WORKFLOW_PATH,
-        "event": "workflow_dispatch",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "dev",
-        "head_sha": "c" * 40,
-        "display_title": (
-            "pr-review-execution-v2/dispatch/event-29064129383/pr-185/"
-            f"base-{BASE_SHA}/head-{HEAD_SHA}"
-        ),
-        "actor": {"login": "bas4r"},
-    }
-    jobs = [
-        {
-            "id": index,
-            "name": name,
-            "status": "completed",
-            "conclusion": "success",
-            "started_at": "2026-08-05T18:00:00Z",
-            "completed_at": "2026-08-05T18:01:00Z",
-            "html_url": (
-                "https://github.com/NewtonsAppleAI/newtonsapple-web/"
-                f"actions/runs/31035273202/job/{index}"
-            ),
-            "labels": ["ubuntu-latest"],
-            "steps": [
-                {
-                    "name": f"Attest clean {name if name != 'e2e' else 'E2E'} tree before gate",
-                    "conclusion": "success",
-                },
-                {
-                    "name": {
-                        "quality": "Run the shared quality harness",
-                        "integration": "Replay PostgreSQL and run all integration contracts",
-                        "e2e": "Run all release journeys",
-                    }[name],
-                    "conclusion": "success",
-                },
-                {
-                    "name": f"Attest clean {name if name != 'e2e' else 'E2E'} tree after gate",
-                    "conclusion": "success",
-                },
-            ],
-        }
-        for index, name in enumerate(("quality", "integration", "e2e"), 101)
-    ]
-    return run, jobs
-
-
-def test_gate_contract_rejects_failure_after_a_successful_gate():
-    _, jobs = _trusted_ci_fixture()
-    quality = jobs[0]
-    quality["conclusion"] = "failure"
-
-    with pytest.raises(RuntimeError, match="job conclusion does not match gate"):
-        gate._gate_contract(quality)
-
-
-def _live_execution_pr():
-    return {
-        "number": 185,
-        "state": "open",
-        "draft": False,
-        "base": {"ref": "dev", "sha": BASE_SHA},
-        "head": {"sha": HEAD_SHA},
-        "requested_reviewers": [{"login": "newtonsapple-bot"}],
-    }
-
-
-def _execution_log(gate_name, tree_sha):
-    digest = gate.EXECUTION_GATE_COMMAND_SHA256[gate_name]
-    marker = (
-        f"newtonsapple-review-execution-v2 gate={gate_name} head={HEAD_SHA} "
-        f"tree={tree_sha} command_sha256={digest}"
-    )
-    return f"{marker} phase=before\n{marker} phase=after\n".encode()
-
-
 def _install_attestation_key(monkeypatch):
     private_key = Ed25519PrivateKey.generate()
     raw = private_key.private_bytes(
@@ -154,13 +48,12 @@ def _install_attestation_key(monkeypatch):
     return private_key
 
 
-def test_gate_resolution_is_signed_and_bound_to_exact_trusted_ci(monkeypatch):
+def test_gate_resolution_is_signed_and_local_only(monkeypatch):
     private_key = _install_attestation_key(monkeypatch)
-    run, jobs = _trusted_ci_fixture()
-    with patch.object(gate, "_trusted_ci_evidence", return_value=(run, jobs)):
-        result = gate.resolve_execution_gates(
-            _execution_request("resolve_execution_gates")
-        )
+
+    result = gate.resolve_execution_gates(
+        _execution_request("resolve_execution_gates")
+    )
 
     payload = base64.b64decode(result["gate_resolution_payload"])
     private_key.public_key().verify(
@@ -172,503 +65,43 @@ def test_gate_resolution_is_signed_and_bound_to_exact_trusted_ci(monkeypatch):
     assert manifest["gate_contracts"]["quality"] == {
         "kind": "command",
         "command": ["npm", "run", "check"],
-        "executor": "github_actions",
-        "runner": {"kind": "github_actions", "name": "ubuntu-latest"},
-        "status": "pass",
-        "exit_codes": [0],
+        "executor": "review_worker",
+        "runner": {"kind": "review_worker", "name": "docker-node22"},
+        "statuses": ["pass", "pr-fail", "unavailable"],
+        "exit_codes": list(range(0, 256)),
     }
 
 
-def test_gate_resolution_canonicalizes_unordered_github_job_inventory(monkeypatch):
-    _install_attestation_key(monkeypatch)
-    run, jobs = _trusted_ci_fixture()
-    jobs = [jobs[2], jobs[1], jobs[0]]
-
-    canonical = gate._canonical_ci_jobs(jobs)
-    assert [job["name"] for job in canonical] == ["quality", "integration", "e2e"]
-
-    with patch.object(gate, "_trusted_ci_evidence", return_value=(run, jobs)):
-        result = gate.resolve_execution_gates(
-            _execution_request("resolve_execution_gates")
-        )
-
-    manifest = json.loads(base64.b64decode(result["gate_resolution_payload"]))
-    assert manifest["resolved_gates"] == ["quality", "integration", "e2e"]
-    assert set(manifest["gate_contracts"]) == {"quality", "integration", "e2e"}
-
-
-def test_execution_evidence_hashes_exact_logs_and_omits_unused_worker(monkeypatch):
+def test_execution_evidence_is_signed_from_the_local_worker(monkeypatch):
     private_key = _install_attestation_key(monkeypatch)
-    run, jobs = _trusted_ci_fixture()
-    head_tree_sha = "d" * 40
-    logs = {
-        job["id"]: _execution_log(job["name"], head_tree_sha) for job in jobs
-    }
-    with (
-        patch.object(gate, "_trusted_ci_evidence", return_value=(run, jobs)),
-        patch.object(
-            gate, "_commit_tree_sha", side_effect=["c" * 40, head_tree_sha]
-        ),
-        patch.object(gate, "_job_log", side_effect=lambda job_id: logs[job_id]),
-    ):
-        result = gate.execution_evidence(_execution_request("execution_evidence"))
+    monkeypatch.setattr(
+        gate,
+        "_run_local_execution_worker",
+        lambda review_tuple: {
+            "base_tree_sha": "c" * 40,
+            "head_tree_sha": "d" * 40,
+            "worker": {"required": True, "isolation": "docker"},
+            "gates": [
+                gate._unavailable_local_gate(name, "Docker unavailable")
+                for name in gate.BASELINE_EXECUTION_GATES
+            ],
+        },
+    )
+
+    result = gate.execution_evidence(_execution_request("execution_evidence"))
 
     payload = base64.b64decode(result["attestation_payload"])
     private_key.public_key().verify(
         base64.b64decode(result["attestation_signature"]), payload
     )
     report = json.loads(payload)
-    assert report["worker"] == {"required": False}
+    assert report["worker"] == {"required": True, "isolation": "docker"}
     assert [item["id"] for item in report["gates"]] == [
         "quality",
         "integration",
         "e2e",
     ]
-    assert report["gates"][0]["evidence"]["log_sha256"] == hashlib.sha256(
-        logs[101]
-    ).hexdigest()
-
-
-def test_trusted_execution_rejects_pull_request_merge_ref_run(monkeypatch):
-    run, jobs = _trusted_ci_fixture()
-    run.update(
-        event="pull_request",
-        head_sha=HEAD_SHA,
-        display_title="CI",
-        pull_requests=[
-            {
-                "number": 185,
-                "base": {"sha": BASE_SHA},
-                "head": {"sha": HEAD_SHA},
-            }
-        ],
-    )
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(gate, "gh_json", return_value=_live_execution_pr()),
-        patch.object(gate, "_collection", return_value=[run]),
-    ):
-        with pytest.raises(RuntimeError, match="exact-head execution run"):
-            gate._trusted_ci_evidence(
-                ReviewTuple(
-                    repository=gate.REPOSITORY,
-                    pr_number=185,
-                    base_sha=BASE_SHA,
-                    head_sha=HEAD_SHA,
-                )
-            )
-
-
-def test_trusted_execution_rejects_a_different_base_branch(monkeypatch):
-    live_pr = _live_execution_pr()
-    live_pr["base"]["ref"] = "staging"
-    run, _ = _trusted_ci_fixture()
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(gate, "gh_json", return_value=live_pr),
-        patch.object(gate, "_collection", return_value=[run]),
-    ):
-        with pytest.raises(RuntimeError, match="not eligible"):
-            gate._trusted_ci_evidence(
-                ReviewTuple(
-                    repository=gate.REPOSITORY,
-                    pr_number=185,
-                    base_sha=BASE_SHA,
-                    head_sha=HEAD_SHA,
-                )
-            )
-
-
-def test_trusted_execution_accepts_only_pinned_dispatch_workflow(monkeypatch):
-    run, jobs = _trusted_ci_fixture()
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(
-            gate,
-            "gh_json",
-            side_effect=[_live_execution_pr(), {"jobs": jobs}],
-        ),
-        patch.object(gate, "_collection", return_value=[run]),
-        patch.object(
-            gate,
-            "_trusted_execution_workflow_sha256",
-            return_value=gate.TRUSTED_EXECUTION_WORKFLOW_SHA256,
-        ) as workflow_digest,
-    ):
-        selected_run, selected_jobs = gate._trusted_ci_evidence(
-            ReviewTuple(
-                repository=gate.REPOSITORY,
-                pr_number=185,
-                base_sha=BASE_SHA,
-                head_sha=HEAD_SHA,
-            )
-        )
-
-    assert selected_run == run
-    assert selected_jobs == jobs
-    workflow_digest.assert_called_once_with(run["head_sha"])
-
-
-def test_trusted_execution_accepts_a_completed_pr_gate_failure(monkeypatch):
-    run, jobs = _trusted_ci_fixture()
-    run["conclusion"] = "failure"
-    jobs[0]["conclusion"] = "failure"
-    jobs[0]["steps"][1]["conclusion"] = "failure"
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(
-            gate,
-            "gh_json",
-            side_effect=[_live_execution_pr(), {"jobs": jobs}],
-        ),
-        patch.object(gate, "_collection", return_value=[run]),
-        patch.object(
-            gate,
-            "_trusted_execution_workflow_sha256",
-            return_value=gate.TRUSTED_EXECUTION_WORKFLOW_SHA256,
-        ),
-    ):
-        selected_run, selected_jobs = gate._trusted_ci_evidence(
-            ReviewTuple(
-                repository=gate.REPOSITORY,
-                pr_number=185,
-                base_sha=BASE_SHA,
-                head_sha=HEAD_SHA,
-            )
-        )
-
-    assert selected_run == run
-    assert gate._gate_contract(selected_jobs[0])["status"] == "pr-fail"
-
-
-def test_trusted_execution_accepts_pinned_request_workflow_for_automatic_reviews(
-    monkeypatch,
-):
-    run, jobs = _trusted_ci_fixture()
-    run.update(
-        event="pull_request_target",
-        actor={"login": "contributor"},
-        display_title=(
-            f"pr-review-execution-v2/request/pr-185/base-{BASE_SHA}/head-{HEAD_SHA}"
-        ),
-        pull_requests=[
-            {
-                "number": 185,
-                "base": {"sha": BASE_SHA},
-                "head": {"sha": HEAD_SHA},
-            }
-        ],
-    )
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(
-            gate,
-            "gh_json",
-            side_effect=[_live_execution_pr(), {"jobs": jobs}],
-        ),
-        patch.object(gate, "_collection", return_value=[run]),
-        patch.object(
-            gate,
-            "_trusted_execution_workflow_sha256",
-            return_value=gate.TRUSTED_EXECUTION_WORKFLOW_SHA256,
-        ),
-    ):
-        selected_run, selected_jobs = gate._trusted_ci_evidence(
-            ReviewTuple(
-                repository=gate.REPOSITORY,
-                pr_number=185,
-                base_sha=BASE_SHA,
-                head_sha=HEAD_SHA,
-            )
-        )
-
-    assert selected_run == run
-    assert selected_jobs == jobs
-
-
-def test_trusted_execution_rejects_legacy_unscoped_run_name(monkeypatch):
-    run, _ = _trusted_ci_fixture()
-    run["display_title"] = (
-        f"pr-review-execution-v2/pr-185/base-{BASE_SHA}/head-{HEAD_SHA}"
-    )
-    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
-    with (
-        patch.object(gate, "gh_json", return_value=_live_execution_pr()),
-        patch.object(gate, "_collection", return_value=[run]),
-    ):
-        with pytest.raises(RuntimeError, match="exact-head execution run"):
-            gate._trusted_ci_evidence(
-                ReviewTuple(
-                    repository=gate.REPOSITORY,
-                    pr_number=185,
-                    base_sha=BASE_SHA,
-                    head_sha=HEAD_SHA,
-                )
-            )
-
-
-def test_execution_evidence_requires_recorded_exact_head_before_and_after(monkeypatch):
-    _install_attestation_key(monkeypatch)
-    run, jobs = _trusted_ci_fixture()
-    tree_sha = "d" * 40
-    logs = {job["id"]: _execution_log(job["name"], tree_sha) for job in jobs}
-    with (
-        patch.object(gate, "_trusted_ci_evidence", return_value=(run, jobs)),
-        patch.object(gate, "_commit_tree_sha", side_effect=["c" * 40, tree_sha]),
-        patch.object(gate, "_job_log", side_effect=lambda job_id: logs[job_id]),
-    ):
-        result = gate.execution_evidence(_execution_request("execution_evidence"))
-
-    report = json.loads(base64.b64decode(result["attestation_payload"]))
-    assert report["gates"][0]["command"] == gate.EXECUTION_GATE_COMMANDS["quality"]
-    assert report["gates"][0]["tree_before"] == tree_sha
-    assert report["gates"][0]["tree_after"] == tree_sha
-
-    logs[101] = logs[101].replace(b"phase=after", b"phase=missing", 1)
-    with (
-        patch.object(gate, "_trusted_ci_evidence", return_value=(run, jobs)),
-        patch.object(gate, "_commit_tree_sha", side_effect=["c" * 40, tree_sha]),
-        patch.object(gate, "_job_log", side_effect=lambda job_id: logs[job_id]),
-    ):
-        with pytest.raises(RuntimeError, match="exact-head provenance"):
-            gate.execution_evidence(_execution_request("execution_evidence"))
-
-
-def test_status_context_parses_pr_and_base_while_target_sha_supplies_head():
-    parsed = parse_status_context(
-        f"newtonsapple-bot/review-v2/pr-185/base-{BASE_SHA}",
-        HEAD_SHA,
-    )
-
-    assert parsed == ReviewTuple(
-        repository="NewtonsAppleAI/newtonsapple-web",
-        pr_number=185,
-        base_sha=BASE_SHA,
-        head_sha=HEAD_SHA,
-        contract_version="v2",
-    )
-
-
-@pytest.mark.parametrize(
-    ("context", "head_sha"),
-    [
-        (f"newtonsapple-bot/review-v2/pr-0/base-{BASE_SHA}", HEAD_SHA),
-        (f"newtonsapple-bot/review-v2/pr-0185/base-{BASE_SHA}", HEAD_SHA),
-        (f"newtonsapple-bot/review-v2/pr-185/base-{'A' * 40}", HEAD_SHA),
-        (f"newtonsapple-bot/review-v2/pr-185/base-{BASE_SHA}/extra", HEAD_SHA),
-        (f"newtonsapple-bot/review-v1/pr-185/base-{BASE_SHA}", HEAD_SHA),
-        (f"newtonsapple-bot/review-v2/pr-185/base-{BASE_SHA}", "not-a-sha"),
-    ],
-)
-def test_status_context_rejects_noncanonical_or_incomplete_tuples(context, head_sha):
-    with pytest.raises(ValueError, match="status context"):
-        parse_status_context(context, head_sha)
-
-
-def _pending_status(**overrides):
-    status = {
-        "id": 901,
-        "state": "pending",
-        "context": f"newtonsapple-bot/review-v2/pr-185/base-{BASE_SHA}",
-        "target_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/actions/runs/31035273202",
-        "creator": {"login": "github-actions[bot]"},
-    }
-    status.update(overrides)
-    return status
-
-
-def _capture_run(**overrides):
-    run = {
-        "id": 31035273202,
-        "html_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/actions/runs/31035273202",
-        "workflow_id": 778899,
-        "path": ".github/workflows/pr-review-capture.yml",
-        "display_title": (
-            f"pr-review-capture-v2/request/pr-185/base-{BASE_SHA}/head-{HEAD_SHA}"
-        ),
-        "event": "pull_request_target",
-        "status": "completed",
-        "conclusion": "success",
-        "head_branch": "dev",
-        "head_sha": BASE_SHA,
-        "pull_requests": [
-            {
-                "number": 185,
-                "base": {"sha": BASE_SHA},
-                "head": {"sha": HEAD_SHA},
-            }
-        ],
-    }
-    run.update(overrides)
-    return run
-
-
-def _dispatch_run(**overrides):
-    run = _capture_run(
-        event="workflow_dispatch",
-        head_sha="c" * 40,
-        pull_requests=[],
-        actor={"login": "bas4r"},
-        display_title=(
-            "pr-review-capture-v2/dispatch/event-29064129383/pr-185/"
-            f"base-{BASE_SHA}/head-{HEAD_SHA}"
-        ),
-    )
-    run.update(overrides)
-    return run
-
-
-def test_pending_status_is_authorized_only_by_matching_successful_allowlisted_run():
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-    )
-
-    review_tuple = validate_capture_status(
-        _pending_status(),
-        head_sha=HEAD_SHA,
-        run=_capture_run(),
-        trusted_workflow=trusted,
-    )
-
-    assert review_tuple.pr_number == 185
-    assert review_tuple.base_sha == BASE_SHA
-    assert review_tuple.head_sha == HEAD_SHA
-
-
-def test_capture_run_loader_requires_the_pinned_base_workflow_source(monkeypatch):
-    run = {
-        "id": 123,
-        "head_sha": BASE_SHA,
-        "path": ".github/workflows/pr-review-capture.yml",
-    }
-    monkeypatch.setattr(gate, "gh_json", lambda *args: run)
-    monkeypatch.setattr(
-        gate,
-        "_workflow_source_sha256",
-        lambda commit_sha, path: "0" * 64,
-    )
-
-    assert gate._load_run(123) is None
-
-
-def test_capture_run_loader_accepts_the_pinned_base_workflow_source(monkeypatch):
-    run = {
-        "id": 123,
-        "head_sha": BASE_SHA,
-        "path": ".github/workflows/pr-review-capture.yml",
-    }
-    monkeypatch.setattr(gate, "gh_json", lambda *args: run)
-    monkeypatch.setattr(
-        gate,
-        "_workflow_source_sha256",
-        lambda commit_sha, path: gate.TRUSTED_CAPTURE_WORKFLOW_SHA256,
-    )
-
-    assert gate._load_run(123) == run
-
-
-def test_workflow_source_hash_accepts_github_wrapped_base64(monkeypatch):
-    content = b"name: trusted\non: workflow_dispatch\n"
-    encoded = base64.b64encode(content).decode("ascii")
-    wrapped = "\n".join(encoded[index : index + 12] for index in range(0, len(encoded), 12)) + "\n"
-    monkeypatch.setattr(
-        gate,
-        "gh_json",
-        lambda *args: {"type": "file", "encoding": "base64", "content": wrapped},
-    )
-
-    assert gate._workflow_source_sha256(BASE_SHA, ".github/workflows/review.yml") == hashlib.sha256(content).hexdigest()
-
-
-def test_dispatch_status_requires_canonical_run_name_and_allowlisted_actor():
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-        allowed_dispatchers=("bas4r",),
-    )
-
-    review_tuple = validate_capture_status(
-        _pending_status(),
-        head_sha=HEAD_SHA,
-        run=_dispatch_run(),
-        trusted_workflow=trusted,
-    )
-
-    assert review_tuple.pr_number == 185
-
-
-@pytest.mark.parametrize(
-    "run_overrides",
-    [
-        {"actor": {"login": "attacker"}},
-        {"display_title": "pr-review-capture-v2/dispatch/event-0/pr-185"},
-        {"display_title": (
-            "pr-review-capture-v2/dispatch/event-29064129383/pr-186/"
-            f"base-{BASE_SHA}/head-{HEAD_SHA}"
-        )},
-        {"display_title": (
-            "pr-review-capture-v2/dispatch/event-29064129383/pr-185/"
-            f"base-{'c' * 40}/head-{HEAD_SHA}"
-        )},
-        {"display_title": (
-            "pr-review-capture-v2/dispatch/event-29064129383/pr-185/"
-            f"base-{BASE_SHA}/head-{'c' * 40}"
-        )},
-    ],
-)
-def test_dispatch_status_fails_closed_on_actor_or_run_name_mismatch(run_overrides):
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-        allowed_dispatchers=("bas4r",),
-    )
-
-    with pytest.raises(ValueError, match="capture status"):
-        validate_capture_status(
-            _pending_status(),
-            head_sha=HEAD_SHA,
-            run=_dispatch_run(**run_overrides),
-            trusted_workflow=trusted,
-        )
-
-
-@pytest.mark.parametrize(
-    ("status_overrides", "run_overrides"),
-    [
-        ({"state": "success"}, {}),
-        ({"creator": {"login": "attacker"}}, {}),
-        ({"target_url": "https://example.com/actions/runs/31035273202"}, {}),
-        ({"target_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/actions/runs/7"}, {}),
-        ({}, {"workflow_id": 1}),
-        ({}, {"path": ".github/workflows/other.yml"}),
-        ({}, {"event": "pull_request"}),
-        ({}, {"conclusion": "failure"}),
-        ({}, {"head_branch": "main"}),
-        ({}, {"head_sha": "c" * 40}),
-        ({}, {"pull_requests": []}),
-        ({}, {"pull_requests": [{"number": 185, "base": {"sha": BASE_SHA}, "head": {"sha": "c" * 40}}]}),
-    ],
-)
-def test_capture_status_fails_closed_on_provenance_or_tuple_mismatch(
-    status_overrides, run_overrides
-):
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-    )
-
-    with pytest.raises(ValueError, match="capture status"):
-        validate_capture_status(
-            _pending_status(**status_overrides),
-            head_sha=HEAD_SHA,
-            run=_capture_run(**run_overrides),
-            trusted_workflow=trusted,
-        )
+    assert {item["status"] for item in report["gates"]} == {"unavailable"}
 
 
 def test_review_state_store_uses_wal_and_reclaims_only_expired_leases(tmp_path):
@@ -868,12 +301,66 @@ def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
     assert store.reserve(review_tuple, now=10_000, lease_seconds=30) is None
 
 
+def test_release_settlement_never_publishes_a_github_status(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    monkeypatch.setattr(
+        gate,
+        "gh_json",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("release must not publish a GitHub status")
+        ),
+    )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    delivered = []
+    monkeypatch.setattr(
+        gate,
+        "_buzz_send",
+        lambda content, reply_to=None: delivered.append((content, reply_to))
+        or "buzz-blocker",
+    )
+
+    result = None
+    for attempt in range(gate.MAX_REVIEW_ATTEMPTS):
+        now = 100 + attempt * (gate.RETRY_DELAY_SECONDS + 10)
+        lease_token = store.reserve(review_tuple, now=now, lease_seconds=30)
+        assert isinstance(lease_token, str)
+        monkeypatch.setattr(gate.time, "time", lambda current=now: current)
+        result = gate._settle(
+            {
+                "operation": "release",
+                "contract_version": "v2",
+                "repository": review_tuple.repository,
+                "pr_number": review_tuple.pr_number,
+                "base_sha": review_tuple.base_sha,
+                "head_sha": review_tuple.head_sha,
+                "lease_token": lease_token,
+            },
+            "newtonsapple-bot",
+            store,
+        )
+
+    assert result == {
+        "settled": "release",
+        "attempts": gate.MAX_REVIEW_ATTEMPTS,
+        "dead_lettered": True,
+        "retry_after": None,
+    }
+    assert len(delivered) == 1
+    assert "No GitHub review was published" in delivered[0][0]
+
+
 def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     monkeypatch.setattr(
         "scripts.newtonsapple_pr_review_gate._live_review_state",
-        lambda number, login: (live_pr, [], []),
+        lambda number, login: (live_pr, []),
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
@@ -1208,7 +695,7 @@ def test_operational_blocker_has_distinct_outbox_identity_from_later_summary(tmp
     )
 
     blocker_id = store.enqueue_blocker(
-        review_tuple, marker="blocker-marker", content="missing trusted capture"
+        review_tuple, marker="blocker-marker", content="request provenance unavailable"
     )
     summary_id = store.enqueue_summary(
         review_tuple, marker="summary-marker", content="review completed"
@@ -1216,7 +703,7 @@ def test_operational_blocker_has_distinct_outbox_identity_from_later_summary(tmp
 
     assert blocker_id != summary_id
     assert [item["content"] for item in store.pending_summaries()] == [
-        "missing trusted capture",
+        "request provenance unavailable",
         "review completed",
     ]
 
@@ -1236,20 +723,17 @@ def _live_pr(**overrides):
 
 
 def test_reconciliation_selects_only_live_exact_tuple_with_no_bot_marker():
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-    )
-    run = _capture_run()
-
     selected = select_authorized_tuple(
         _live_pr(),
-        statuses=[_pending_status()],
-        load_run=lambda run_id: run if run_id == run["id"] else None,
-        trusted_workflow=trusted,
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
+        load_timeline=lambda pr_number: [
+            {
+                "id": 1,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            }
+        ],
     )
 
     assert selected == ReviewTuple(
@@ -1272,9 +756,8 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     marker_body = f"legacy review\n\n{gate.review_marker(review_tuple)}"
     state = (live_pr, None, [marker_body])
     monkeypatch.setattr(gate, "_collection", lambda endpoint: [live_pr])
-    monkeypatch.setattr(gate, "_authorized_live_tuple", lambda *args: state)
     monkeypatch.setattr(
-        gate, "_captured_live_tuple", lambda *args: state, raising=False
+        gate, "_recoverable_live_tuple", lambda *args: state
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
@@ -1286,7 +769,7 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     assert result["events"] == []
 
 
-def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch, tmp_path):
+def test_reconcile_settles_existing_marker_for_verified_timeline_request(monkeypatch, tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     review_tuple = ReviewTuple(
@@ -1299,7 +782,7 @@ def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch
     monkeypatch.setattr(gate, "_collection", lambda endpoint: [live_pr])
     monkeypatch.setattr(
         gate,
-        "_captured_live_tuple",
+        "_recoverable_live_tuple",
         lambda *args: (live_pr, review_tuple, [marker_body]),
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
@@ -1330,12 +813,12 @@ def test_reconcile_isolates_a_malformed_candidate_and_continues(monkeypatch, tmp
     )
     monkeypatch.setattr(gate, "_collection", lambda endpoint: [first, second])
 
-    def captured(number, login):
+    def recoverable(number, login):
         if number == 185:
-            raise RuntimeError("malformed status provenance")
+            raise RuntimeError("malformed request provenance")
         return second, second_tuple, []
 
-    monkeypatch.setattr(gate, "_captured_live_tuple", captured)
+    monkeypatch.setattr(gate, "_recoverable_live_tuple", recoverable)
     delivered = []
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
@@ -1353,7 +836,7 @@ def test_reconcile_isolates_a_malformed_candidate_and_continues(monkeypatch, tmp
     assert "could not safely verify current request provenance" in delivered[-1]
 
 
-def test_reconciliation_accepts_latest_current_request_when_capture_status_is_missing():
+def test_reconciliation_accepts_latest_current_timeline_request():
     timeline = [
         {"id": 1, "event": "committed"},
         {
@@ -1365,13 +848,6 @@ def test_reconciliation_accepts_latest_current_request_when_capture_status_is_mi
 
     selected = select_authorized_tuple(
         _live_pr(),
-        statuses=[],
-        load_run=lambda run_id: None,
-        trusted_workflow=TrustedWorkflow(
-            workflow_id=778899,
-            path=".github/workflows/pr-review-capture.yml",
-            branch="dev",
-        ),
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
         load_timeline=lambda pr_number: timeline,
@@ -1401,7 +877,7 @@ def test_reconciliation_accepts_latest_current_request_when_capture_status_is_mi
         {"id": 3, "event": "merged"},
     ],
 )
-def test_reconciliation_without_capture_rejects_events_after_latest_request(later_event):
+def test_reconciliation_rejects_events_after_latest_request(later_event):
     timeline = [
         {
             "id": 2,
@@ -1413,13 +889,6 @@ def test_reconciliation_without_capture_rejects_events_after_latest_request(late
 
     selected = select_authorized_tuple(
         _live_pr(),
-        statuses=[],
-        load_run=lambda run_id: None,
-        trusted_workflow=TrustedWorkflow(
-            workflow_id=778899,
-            path=".github/workflows/pr-review-capture.yml",
-            branch="dev",
-        ),
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
         load_timeline=lambda pr_number: timeline,
@@ -1428,7 +897,7 @@ def test_reconciliation_without_capture_rejects_events_after_latest_request(late
     assert selected is None
 
 
-def test_reconciliation_without_capture_accepts_the_latest_rerequest():
+def test_reconciliation_accepts_the_latest_rerequest():
     timeline = [
         {
             "id": 2,
@@ -1449,13 +918,6 @@ def test_reconciliation_without_capture_accepts_the_latest_rerequest():
 
     selected = select_authorized_tuple(
         _live_pr(),
-        statuses=[],
-        load_run=lambda run_id: None,
-        trusted_workflow=TrustedWorkflow(
-            workflow_id=778899,
-            path=".github/workflows/pr-review-capture.yml",
-            branch="dev",
-        ),
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
         load_timeline=lambda pr_number: timeline,
@@ -1469,13 +931,13 @@ def test_reconciliation_without_capture_accepts_the_latest_rerequest():
     )
 
 
-def test_webhook_accepts_verified_payload_tuple_without_capture_status(monkeypatch, tmp_path):
+def test_webhook_accepts_verified_payload_tuple(monkeypatch, tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     monkeypatch.setattr(
         gate,
         "_live_review_state",
-        lambda number, login: (live_pr, [], []),
+        lambda number, login: (live_pr, []),
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
@@ -1505,7 +967,7 @@ def test_webhook_rejects_head_mutation_between_payload_and_live_state(monkeypatc
     monkeypatch.setattr(
         gate,
         "_live_review_state",
-        lambda number, login: (live_pr, [], []),
+        lambda number, login: (live_pr, []),
     )
 
     with pytest.raises(RuntimeError, match="tuple changed"):
@@ -1654,12 +1116,6 @@ def test_local_execution_reports_unavailable_gates_in_signed_evidence(monkeypatc
             ],
         },
     )
-    monkeypatch.setattr(
-        gate,
-        "_trusted_ci_evidence",
-        lambda review_tuple: (_ for _ in ()).throw(RuntimeError("Actions unavailable")),
-    )
-
     result = gate.execution_evidence(_execution_request("execution_evidence"))
 
     payload = base64.b64decode(result["attestation_payload"])
@@ -1753,15 +1209,8 @@ def test_local_docker_host_rejects_remote_daemon(monkeypatch):
         gate._local_docker_host()
 
 
-def test_gate_resolution_falls_back_to_status_agnostic_local_contracts(monkeypatch):
+def test_gate_resolution_exposes_all_local_gate_outcomes(monkeypatch):
     private_key = _install_attestation_key(monkeypatch)
-    monkeypatch.setattr(
-        gate,
-        "_trusted_ci_evidence",
-        lambda _review_tuple: (_ for _ in ()).throw(
-            RuntimeError("Actions unavailable")
-        ),
-    )
 
     result = gate.resolve_execution_gates(_execution_request("resolve_execution_gates"))
 
@@ -1779,14 +1228,7 @@ def test_gate_resolution_falls_back_to_status_agnostic_local_contracts(monkeypat
     }
 
 
-def test_dispatch_reconciliation_rechecks_request_event_and_later_invalidation():
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-        allowed_dispatchers=("bas4r",),
-    )
-    run = _dispatch_run()
+def test_reconciliation_rechecks_request_event_and_later_invalidation():
     timeline = [
         {
             "id": 29064129383,
@@ -1797,10 +1239,7 @@ def test_dispatch_reconciliation_rechecks_request_event_and_later_invalidation()
 
     selected = select_authorized_tuple(
         _live_pr(),
-        statuses=[_pending_status()],
-        load_run=lambda run_id: run,
         load_timeline=lambda pr_number: timeline,
-        trusted_workflow=trusted,
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
     )
@@ -1809,10 +1248,7 @@ def test_dispatch_reconciliation_rechecks_request_event_and_later_invalidation()
     timeline.append({"id": 29064129384, "event": "committed"})
     rejected = select_authorized_tuple(
         _live_pr(),
-        statuses=[_pending_status()],
-        load_run=lambda run_id: run,
         load_timeline=lambda pr_number: timeline,
-        trusted_workflow=trusted,
         reviewer_login="newtonsapple-bot",
         bot_bodies=[],
     )
@@ -1825,8 +1261,6 @@ def test_dispatch_reconciliation_rechecks_request_event_and_later_invalidation()
         ({"state": "closed"}, []),
         ({"draft": True}, []),
         ({"base": {"ref": "feature", "sha": BASE_SHA}}, []),
-        ({"base": {"ref": "dev", "sha": "c" * 40}}, []),
-        ({"head": {"ref": "chore--review", "sha": "c" * 40}}, []),
         ({"requested_reviewers": []}, []),
         ({}, ["prefix <!-- newtonsapple-pr-review:v2 repo=NewtonsAppleAI/newtonsapple-web "
               f"pr=185 base={BASE_SHA} head={HEAD_SHA} --> suffix"]),
@@ -1835,19 +1269,17 @@ def test_dispatch_reconciliation_rechecks_request_event_and_later_invalidation()
 def test_reconciliation_rejects_stale_ineligible_or_completed_tuple(
     live_overrides, bot_bodies
 ):
-    trusted = TrustedWorkflow(
-        workflow_id=778899,
-        path=".github/workflows/pr-review-capture.yml",
-        branch="dev",
-    )
-
     selected = select_authorized_tuple(
         _live_pr(**live_overrides),
-        statuses=[_pending_status()],
-        load_run=lambda run_id: _capture_run(),
-        trusted_workflow=trusted,
         reviewer_login="newtonsapple-bot",
         bot_bodies=bot_bodies,
+        load_timeline=lambda pr_number: [
+            {
+                "id": 1,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            }
+        ],
     )
 
     assert selected is None

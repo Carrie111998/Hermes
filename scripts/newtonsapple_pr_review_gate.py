@@ -27,39 +27,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 REPOSITORY = "NewtonsAppleAI/newtonsapple-web"
 CONTRACT_VERSION = "v2"
+BASE_BRANCH = "dev"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-STATUS_CONTEXT_PATTERN = re.compile(
-    r"^newtonsapple-bot/review-v2/pr-([1-9][0-9]*)/base-([0-9a-f]{40})$"
-)
-RUN_URL_PATTERN = re.compile(
-    r"^https://github\.com/NewtonsAppleAI/newtonsapple-web/actions/runs/([1-9][0-9]*)$"
-)
-DISPATCH_RUN_NAME_PATTERN = re.compile(
-    r"^pr-review-capture-v2/dispatch/event-([1-9][0-9]*)/"
-    r"pr-([1-9][0-9]*)/base-([0-9a-f]{40})/head-([0-9a-f]{40})$"
-)
-EXECUTION_REQUEST_RUN_NAME_PATTERN = re.compile(
-    r"^pr-review-execution-v2/request/pr-([1-9][0-9]*)/"
-    r"base-([0-9a-f]{40})/head-([0-9a-f]{40})$"
-)
-EXECUTION_DISPATCH_RUN_NAME_PATTERN = re.compile(
-    r"^pr-review-execution-v2/dispatch/event-([1-9][0-9]*)/"
-    r"pr-([1-9][0-9]*)/base-([0-9a-f]{40})/head-([0-9a-f]{40})$"
-)
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 LEASE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 LEASE_SECONDS = 2 * 60 * 60
 RETRY_DELAY_SECONDS = 5 * 60
 MAX_REVIEW_ATTEMPTS = 3
 BUZZ_CHANNEL = "b1cb95c9-6a36-4516-abdd-81d853a9412e"
-TRUSTED_EXECUTION_WORKFLOW_ID = -1  # Pin the assigned GitHub ID after bootstrap merge.
-TRUSTED_CAPTURE_WORKFLOW_SHA256 = (
-    "8b4182103f3b7ea04d473805e7296424a242097f2ccd0fc8ccb7c3c02a581ffd"
-)
-TRUSTED_EXECUTION_WORKFLOW_PATH = ".github/workflows/pr-review-execution.yml"
-TRUSTED_EXECUTION_WORKFLOW_SHA256 = (
-    "4b3277b35071dc0b33055ec579f28d1dbe26a057fd37ef950d82f640d8f1de0f"
-)
 BASELINE_EXECUTION_GATES = ("quality", "integration", "e2e")
 EXECUTION_GATE_COMMANDS = {
     "quality": ["npm", "run", "check"],
@@ -69,36 +44,10 @@ EXECUTION_GATE_COMMANDS = {
 LOCAL_REVIEW_WORKER_IMAGE = (
     "node@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a"
 )
-EXECUTION_GATE_STEP_NAMES = {
-    "quality": (
-        "Attest clean quality tree before gate",
-        "Run the shared quality harness",
-        "Attest clean quality tree after gate",
-    ),
-    "integration": (
-        "Attest clean integration tree before gate",
-        "Replay PostgreSQL and run all integration contracts",
-        "Attest clean integration tree after gate",
-    ),
-    "e2e": (
-        "Attest clean E2E tree before gate",
-        "Run all release journeys",
-        "Attest clean E2E tree after gate",
-    ),
-}
-EXECUTION_GATE_COMMAND_SHA256 = {
-    name: hashlib.sha256(
-        json.dumps(command, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    for name, command in EXECUTION_GATE_COMMANDS.items()
-}
 EXECUTION_GATE_POLICY_VERSION = "newtonsapple-v1"
 _EXECUTION_GATE_POLICY = {
     "version": EXECUTION_GATE_POLICY_VERSION,
     "repository": REPOSITORY,
-    "workflow_id": TRUSTED_EXECUTION_WORKFLOW_ID,
-    "workflow_path": TRUSTED_EXECUTION_WORKFLOW_PATH,
-    "workflow_sha256": TRUSTED_EXECUTION_WORKFLOW_SHA256,
     "baseline_gates": list(BASELINE_EXECUTION_GATES),
     "commands": EXECUTION_GATE_COMMANDS,
     "local_worker": {
@@ -121,21 +70,6 @@ class ReviewTuple:
     base_sha: str
     head_sha: str
     contract_version: str = CONTRACT_VERSION
-
-
-@dataclass(frozen=True)
-class TrustedWorkflow:
-    workflow_id: int
-    path: str
-    branch: str
-    allowed_dispatchers: tuple[str, ...] = ("bas4r",)
-
-
-TRUSTED_CAPTURE_WORKFLOW = TrustedWorkflow(
-    workflow_id=328661288,
-    path=".github/workflows/pr-review-capture.yml",
-    branch="dev",
-)
 
 
 def tuple_key(review_tuple: ReviewTuple) -> str:
@@ -687,155 +621,12 @@ def drain_summary_outbox(
     return processed
 
 
-def parse_status_context(context: str, head_sha: str) -> ReviewTuple:
-    """Parse the canonical status context and bind it to its target commit."""
-    match = STATUS_CONTEXT_PATTERN.fullmatch(context) if isinstance(context, str) else None
-    if match is None or SHA_PATTERN.fullmatch(head_sha or "") is None:
-        raise ValueError("invalid review status context")
-    return ReviewTuple(
-        repository=REPOSITORY,
-        pr_number=int(match.group(1)),
-        base_sha=match.group(2),
-        head_sha=head_sha,
-    )
-
-
-def validate_capture_status(
-    status: dict,
-    *,
-    head_sha: str,
-    run: dict,
-    trusted_workflow: TrustedWorkflow,
-) -> ReviewTuple:
-    """Return the authorized tuple or fail closed on any provenance mismatch."""
-    try:
-        review_tuple = parse_status_context(status["context"], head_sha)
-        run_url_match = RUN_URL_PATTERN.fullmatch(status["target_url"])
-        creator = status["creator"]
-        if (
-            status["state"] != "pending"
-            or not isinstance(creator, dict)
-            or creator.get("login") != "github-actions[bot]"
-            or run_url_match is None
-            or int(run_url_match.group(1)) != run["id"]
-            or run.get("html_url") != status["target_url"]
-            or run.get("workflow_id") != trusted_workflow.workflow_id
-            or run.get("path") != trusted_workflow.path
-            or run.get("status") != "completed"
-            or run.get("conclusion") != "success"
-            or run.get("head_branch") != trusted_workflow.branch
-        ):
-            raise ValueError
-        event = run.get("event")
-        if event == "pull_request_target":
-            pull_requests = run.get("pull_requests")
-            expected_title = (
-                f"pr-review-capture-v2/request/pr-{review_tuple.pr_number}/"
-                f"base-{review_tuple.base_sha}/head-{review_tuple.head_sha}"
-            )
-            if (
-                run.get("display_title") != expected_title
-                or run.get("head_sha") != review_tuple.base_sha
-                or not isinstance(pull_requests, list)
-                or not any(
-                    isinstance(item, dict)
-                    and item.get("number") == review_tuple.pr_number
-                    and isinstance(item.get("base"), dict)
-                    and item["base"].get("sha") == review_tuple.base_sha
-                    and isinstance(item.get("head"), dict)
-                    and item["head"].get("sha") == review_tuple.head_sha
-                    for item in pull_requests
-                )
-            ):
-                raise ValueError
-        elif event == "workflow_dispatch":
-            run_name = run.get("display_title")
-            match = (
-                DISPATCH_RUN_NAME_PATTERN.fullmatch(run_name)
-                if isinstance(run_name, str)
-                else None
-            )
-            actor = run.get("actor")
-            if (
-                match is None
-                or not isinstance(actor, dict)
-                or actor.get("login") not in trusted_workflow.allowed_dispatchers
-                or int(match.group(2)) != review_tuple.pr_number
-                or match.group(3) != review_tuple.base_sha
-                or match.group(4) != review_tuple.head_sha
-            ):
-                raise ValueError
-        else:
-            raise ValueError
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("invalid review capture status") from exc
-    return review_tuple
-
-
 def review_marker(review_tuple: ReviewTuple) -> str:
     return (
         f"<!-- newtonsapple-pr-review:{review_tuple.contract_version} "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
     )
-
-
-def _dispatch_request_is_current(
-    run: dict,
-    *,
-    reviewer_login: str,
-    timeline: list[dict],
-) -> bool:
-    title = run.get("display_title")
-    match = (
-        DISPATCH_RUN_NAME_PATTERN.fullmatch(title)
-        if isinstance(title, str)
-        else None
-    )
-    if match is None:
-        return False
-    request_event_id = match.group(1)
-    request_index = next(
-        (
-            index
-            for index, event in enumerate(timeline)
-            if isinstance(event, dict) and str(event.get("id")) == request_event_id
-        ),
-        None,
-    )
-    if request_index is None:
-        return False
-    request = timeline[request_index]
-    requested_reviewer = request.get("requested_reviewer")
-    if (
-        request.get("event") != "review_requested"
-        or not isinstance(requested_reviewer, dict)
-        or requested_reviewer.get("login") != reviewer_login
-    ):
-        return False
-    invalidating_events = {
-        "base_ref_changed",
-        "base_ref_force_pushed",
-        "closed",
-        "committed",
-        "converted_to_draft",
-        "head_ref_deleted",
-        "head_ref_force_pushed",
-        "merged",
-    }
-    for event in timeline[request_index + 1 :]:
-        if not isinstance(event, dict):
-            return False
-        if event.get("event") in invalidating_events:
-            return False
-        later_reviewer = event.get("requested_reviewer")
-        if (
-            event.get("event") in {"review_request_removed", "review_requested"}
-            and isinstance(later_reviewer, dict)
-            and later_reviewer.get("login") == reviewer_login
-        ):
-            return False
-    return True
 
 
 def _latest_request_is_current(timeline: list[dict], *, reviewer_login: str) -> bool:
@@ -879,14 +670,11 @@ def _latest_request_is_current(timeline: list[dict], *, reviewer_login: str) -> 
 def select_authorized_tuple(
     live_pr: dict,
     *,
-    statuses: list[dict],
-    load_run: Callable[[int], Optional[dict]],
-    trusted_workflow: TrustedWorkflow,
     reviewer_login: str,
     bot_bodies: list[str],
-    load_timeline: Optional[Callable[[int], list[dict]]] = None,
+    load_timeline: Callable[[int], list[dict]],
 ) -> Optional[ReviewTuple]:
-    """Select a current exact tuple from capture evidence or strict timeline proof."""
+    """Select a live exact tuple backed by the latest current review request."""
     try:
         base = live_pr["base"]
         head = live_pr["head"]
@@ -895,7 +683,7 @@ def select_authorized_tuple(
             live_pr.get("state") != "open"
             or live_pr.get("draft") is not False
             or not isinstance(base, dict)
-            or base.get("ref") != trusted_workflow.branch
+            or base.get("ref") != BASE_BRANCH
             or SHA_PATTERN.fullmatch(str(base.get("sha", ""))) is None
             or not isinstance(head, dict)
             or SHA_PATTERN.fullmatch(str(head.get("sha", ""))) is None
@@ -914,46 +702,6 @@ def select_authorized_tuple(
     except (KeyError, TypeError, ValueError):
         return None
 
-    for status in statuses:
-        try:
-            context = status.get("context")
-            if not isinstance(context, str):
-                continue
-            candidate = parse_status_context(context, head["sha"])
-            if (
-                candidate.pr_number != pr_number
-                or candidate.base_sha != base["sha"]
-                or candidate.head_sha != head["sha"]
-            ):
-                continue
-            url_match = RUN_URL_PATTERN.fullmatch(str(status.get("target_url", "")))
-            if url_match is None:
-                continue
-            run = load_run(int(url_match.group(1)))
-            if not isinstance(run, dict):
-                continue
-            candidate = validate_capture_status(
-                status,
-                head_sha=head["sha"],
-                run=run,
-                trusted_workflow=trusted_workflow,
-            )
-            if run.get("event") == "workflow_dispatch":
-                if load_timeline is None:
-                    continue
-                timeline = load_timeline(candidate.pr_number)
-                if not isinstance(timeline, list) or not _dispatch_request_is_current(
-                    run, reviewer_login=reviewer_login, timeline=timeline
-                ):
-                    continue
-        except (TypeError, ValueError):
-            continue
-        marker = review_marker(candidate)
-        if any(marker in body for body in bot_bodies if isinstance(body, str)):
-            return None
-        return candidate
-    if load_timeline is None:
-        return None
     try:
         timeline = load_timeline(pr_number)
     except (RuntimeError, TypeError, ValueError):
@@ -1011,20 +759,6 @@ def gh_json(*args: str) -> object:
         raise RuntimeError("GitHub returned malformed JSON") from exc
 
 
-def gh_bytes(*args: str) -> bytes:
-    result = subprocess.run(
-        ["gh", *args],
-        check=False,
-        capture_output=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise RuntimeError("GitHub control plane unavailable")
-    if len(result.stdout) > 50_000_000:
-        raise RuntimeError("GitHub job log exceeded the fixed limit")
-    return result.stdout
-
-
 def _collection(endpoint: str) -> list[dict]:
     return _flatten_pages(gh_json("api", "--paginate", "--slurp", endpoint))
 
@@ -1071,169 +805,6 @@ def _signed_result(payload: dict, *, payload_key: str, signature_key: str) -> di
     }
 
 
-def _trusted_ci_evidence(review_tuple: ReviewTuple) -> tuple[dict, list[dict]]:
-    live_pr = gh_json("api", f"repos/{REPOSITORY}/pulls/{review_tuple.pr_number}")
-    if not isinstance(live_pr, dict):
-        raise RuntimeError("GitHub returned malformed pull request")
-    base = live_pr.get("base")
-    head = live_pr.get("head")
-    reviewers = live_pr.get("requested_reviewers")
-    if (
-        live_pr.get("state") != "open"
-        or live_pr.get("draft") is not False
-        or not isinstance(base, dict)
-        or base.get("sha") != review_tuple.base_sha
-        or base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
-        or not isinstance(head, dict)
-        or head.get("sha") != review_tuple.head_sha
-        or not isinstance(reviewers, list)
-        or _expected_login()
-        not in {
-            reviewer.get("login")
-            for reviewer in reviewers
-            if isinstance(reviewer, dict)
-        }
-    ):
-        raise RuntimeError("live pull request is not eligible for execution evidence")
-
-    runs = _collection(
-        f"repos/{REPOSITORY}/actions/workflows/"
-        f"{TRUSTED_EXECUTION_WORKFLOW_PATH}/runs?per_page=100"
-    )
-    candidates = []
-    for run in runs:
-        title = run.get("display_title")
-        request_match = (
-            EXECUTION_REQUEST_RUN_NAME_PATTERN.fullmatch(title)
-            if isinstance(title, str)
-            else None
-        )
-        dispatch_match = (
-            EXECUTION_DISPATCH_RUN_NAME_PATTERN.fullmatch(title)
-            if isinstance(title, str)
-            else None
-        )
-        actor = run.get("actor")
-        pull_requests = run.get("pull_requests")
-        request_provenance = bool(
-            run.get("event") == "pull_request_target"
-            and request_match is not None
-            and int(request_match.group(1)) == review_tuple.pr_number
-            and request_match.group(2) == review_tuple.base_sha
-            and request_match.group(3) == review_tuple.head_sha
-            and isinstance(pull_requests, list)
-            and any(
-                isinstance(item, dict)
-                and item.get("number") == review_tuple.pr_number
-                and isinstance(item.get("base"), dict)
-                and item["base"].get("sha") == review_tuple.base_sha
-                and isinstance(item.get("head"), dict)
-                and item["head"].get("sha") == review_tuple.head_sha
-                for item in pull_requests
-            )
-        )
-        dispatch_provenance = bool(
-            run.get("event") == "workflow_dispatch"
-            and dispatch_match is not None
-            and isinstance(actor, dict)
-            and actor.get("login") in TRUSTED_CAPTURE_WORKFLOW.allowed_dispatchers
-            and int(dispatch_match.group(2)) == review_tuple.pr_number
-            and dispatch_match.group(3) == review_tuple.base_sha
-            and dispatch_match.group(4) == review_tuple.head_sha
-        )
-        if (
-            run.get("workflow_id") == TRUSTED_EXECUTION_WORKFLOW_ID
-            and run.get("path") == TRUSTED_EXECUTION_WORKFLOW_PATH
-            and run.get("status") == "completed"
-            and run.get("conclusion") in {"success", "failure"}
-            and run.get("head_branch") == TRUSTED_CAPTURE_WORKFLOW.branch
-            and SHA_PATTERN.fullmatch(str(run.get("head_sha", ""))) is not None
-            and (request_provenance or dispatch_provenance)
-        ):
-            candidates.append(run)
-    if not candidates:
-        raise RuntimeError("trusted exact-head execution run is required")
-    run = max(candidates, key=lambda candidate: int(candidate.get("id", 0)))
-    run_id = run.get("id")
-    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
-        raise RuntimeError("trusted exact-head execution run id is invalid")
-    if _trusted_execution_workflow_sha256(str(run["head_sha"])) != (
-        TRUSTED_EXECUTION_WORKFLOW_SHA256
-    ):
-        raise RuntimeError("trusted exact-head execution workflow content changed")
-    jobs_result = gh_json("api", f"repos/{REPOSITORY}/actions/runs/{run_id}/jobs?per_page=100")
-    if not isinstance(jobs_result, dict) or not isinstance(jobs_result.get("jobs"), list):
-        raise RuntimeError("GitHub returned malformed workflow jobs")
-    jobs = [job for job in jobs_result["jobs"] if isinstance(job, dict)]
-    return run, _canonical_ci_jobs(jobs)
-
-
-def _canonical_ci_jobs(jobs: list[dict]) -> list[dict]:
-    gate_jobs = [job for job in jobs if job.get("name") in BASELINE_EXECUTION_GATES]
-    by_name = {job.get("name"): job for job in gate_jobs}
-    if (
-        len(by_name) != len(gate_jobs)
-        or set(by_name) != set(BASELINE_EXECUTION_GATES)
-    ):
-        raise RuntimeError("trusted CI gate inventory does not match policy")
-    return [by_name[name] for name in BASELINE_EXECUTION_GATES]
-
-
-def _gate_contract(job: dict) -> dict:
-    name = job.get("name")
-    conclusion = job.get("conclusion")
-    labels = job.get("labels")
-    steps = job.get("steps")
-    if (
-        name not in BASELINE_EXECUTION_GATES
-        or job.get("status") != "completed"
-        or conclusion not in {"success", "failure"}
-        or not isinstance(labels, list)
-        or "ubuntu-latest" not in labels
-        or not isinstance(steps, list)
-    ):
-        raise RuntimeError("trusted CI job does not satisfy execution policy")
-    before_name, gate_name, after_name = EXECUTION_GATE_STEP_NAMES[str(name)]
-    relevant_steps = {
-        step.get("name"): step
-        for step in steps
-        if isinstance(step, dict)
-        and step.get("name") in {before_name, gate_name, after_name}
-    }
-    if set(relevant_steps) != {before_name, gate_name, after_name}:
-        raise RuntimeError("trusted CI job omitted execution policy steps")
-    gate_conclusion = relevant_steps[gate_name].get("conclusion")
-    if (
-        relevant_steps[before_name].get("conclusion") != "success"
-        or relevant_steps[after_name].get("conclusion") != "success"
-        or gate_conclusion not in {"success", "failure"}
-    ):
-        raise RuntimeError("trusted CI job did not complete execution policy steps")
-    if conclusion != gate_conclusion:
-        raise RuntimeError("trusted CI job conclusion does not match gate")
-    return {
-        "kind": "command",
-        "command": EXECUTION_GATE_COMMANDS[str(name)],
-        "executor": "github_actions",
-        "runner": {"kind": "github_actions", "name": "ubuntu-latest"},
-        "status": "pass" if gate_conclusion == "success" else "pr-fail",
-        "exit_codes": [0 if gate_conclusion == "success" else 1],
-    }
-
-
-def _gate_resolution_payload(review_tuple: ReviewTuple, jobs: list[dict]) -> dict:
-    jobs = _canonical_ci_jobs(jobs)
-    contracts = {str(job["name"]): _gate_contract(job) for job in jobs}
-    return {
-        **review_tuple.__dict__,
-        "policy_version": EXECUTION_GATE_POLICY_VERSION,
-        "policy_sha256": EXECUTION_GATE_POLICY_SHA256,
-        "baseline_gates": list(BASELINE_EXECUTION_GATES),
-        "resolved_gates": list(BASELINE_EXECUTION_GATES),
-        "gate_contracts": contracts,
-    }
-
-
 def _local_gate_contract(name: str) -> dict:
     return {
         "kind": "command",
@@ -1260,11 +831,7 @@ def _local_gate_resolution_payload(review_tuple: ReviewTuple) -> dict:
 
 def resolve_execution_gates(payload: dict) -> dict:
     review_tuple = _execution_tuple(payload)
-    try:
-        _, jobs = _trusted_ci_evidence(review_tuple)
-        resolution = _gate_resolution_payload(review_tuple, jobs)
-    except RuntimeError:
-        resolution = _local_gate_resolution_payload(review_tuple)
+    resolution = _local_gate_resolution_payload(review_tuple)
     return _signed_result(
         resolution,
         payload_key="gate_resolution_payload",
@@ -1281,66 +848,17 @@ def _commit_tree_sha(commit_sha: str) -> str:
     return tree_sha
 
 
-def _workflow_source_sha256(commit_sha: str, path: str) -> str:
-    value = gh_json(
-        "api",
-        f"repos/{REPOSITORY}/contents/{path}?ref={commit_sha}",
-    )
-    if (
-        not isinstance(value, dict)
-        or value.get("type") != "file"
-        or value.get("encoding") != "base64"
-        or not isinstance(value.get("content"), str)
-    ):
-        raise RuntimeError("GitHub returned malformed workflow content")
-    try:
-        encoded = re.sub(r"[\t\n\r\f\v ]+", "", value["content"])
-        content = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
-        raise RuntimeError("GitHub returned malformed workflow content") from exc
-    return hashlib.sha256(content).hexdigest()
-
-
-def _trusted_execution_workflow_sha256(workflow_sha: str) -> str:
-    return _workflow_source_sha256(workflow_sha, TRUSTED_EXECUTION_WORKFLOW_PATH)
-
-
-def _job_log(job_id: int) -> bytes:
-    return gh_bytes("api", f"repos/{REPOSITORY}/actions/jobs/{job_id}/logs")
-
-
-def _require_exact_head_provenance(
-    log: bytes,
-    *,
-    gate_name: str,
-    head_sha: str,
-    head_tree_sha: str,
-) -> None:
-    if gate_name not in EXECUTION_GATE_COMMAND_SHA256:
-        raise RuntimeError("trusted CI gate is not in the execution policy")
-    text = log.decode("utf-8", errors="replace")
-    prefix = (
-        f"newtonsapple-review-execution-v2 gate={gate_name} head={head_sha} "
-        f"tree={head_tree_sha} "
-        f"command_sha256={EXECUTION_GATE_COMMAND_SHA256[gate_name]}"
-    )
-    if text.count(f"{prefix} phase=before") != 1 or text.count(
-        f"{prefix} phase=after"
-    ) != 1:
-        raise RuntimeError("trusted CI job omitted exact-head provenance")
-
-
 def _duration_ms(started_at: object, completed_at: object) -> int:
     if not isinstance(started_at, str) or not isinstance(completed_at, str):
-        raise RuntimeError("trusted CI job timing is missing")
+        raise RuntimeError("local gate timing is missing")
     try:
         start = datetime.fromisoformat(started_at.removesuffix("Z") + "+00:00")
         end = datetime.fromisoformat(completed_at.removesuffix("Z") + "+00:00")
     except ValueError as exc:
-        raise RuntimeError("trusted CI job timing is invalid") from exc
+        raise RuntimeError("local gate timing is invalid") from exc
     duration = int((end - start).total_seconds() * 1000)
     if duration < 0:
-        raise RuntimeError("trusted CI job timing is invalid")
+        raise RuntimeError("local gate timing is invalid")
     return duration
 
 
@@ -1698,111 +1216,32 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
         "gates": gates,
     }
 
+
 def execution_evidence(payload: dict) -> dict:
     review_tuple = _execution_tuple(payload)
-    try:
-        run, jobs = _trusted_ci_evidence(review_tuple)
-    except RuntimeError:
-        local = _run_local_execution_worker(review_tuple)
-        resolution = _local_gate_resolution_payload(review_tuple)
-        resolution_bytes = json.dumps(
-            resolution, sort_keys=True, separators=(",", ":")
-        ).encode()
-        report = {
-            **review_tuple.__dict__,
-            "base_tree_sha": local["base_tree_sha"],
-            "head_tree_sha": local["head_tree_sha"],
-            "gate_resolution": {
-                "policy_version": EXECUTION_GATE_POLICY_VERSION,
-                "policy_sha256": EXECUTION_GATE_POLICY_SHA256,
-                "manifest_sha256": hashlib.sha256(resolution_bytes).hexdigest(),
-                "resolved_gates": list(BASELINE_EXECUTION_GATES),
-            },
-            "worker": local["worker"],
-            "gates": local["gates"],
-        }
-        return _signed_result(
-            report,
-            payload_key="attestation_payload",
-            signature_key="attestation_signature",
-        )
-    jobs = _canonical_ci_jobs(jobs)
-    resolution = _gate_resolution_payload(review_tuple, jobs)
+    local = _run_local_execution_worker(review_tuple)
+    resolution = _local_gate_resolution_payload(review_tuple)
     resolution_bytes = json.dumps(
         resolution, sort_keys=True, separators=(",", ":")
     ).encode()
-    base_tree_sha = _commit_tree_sha(review_tuple.base_sha)
-    head_tree_sha = _commit_tree_sha(review_tuple.head_sha)
-    run_id = run["id"]
-    gates = []
-    for job in jobs:
-        contract = _gate_contract(job)
-        job_id = job.get("id")
-        url = job.get("html_url")
-        if (
-            isinstance(job_id, bool)
-            or not isinstance(job_id, int)
-            or job_id <= 0
-            or url != f"https://github.com/{REPOSITORY}/actions/runs/{run_id}/job/{job_id}"
-        ):
-            raise RuntimeError("trusted CI job identity is invalid")
-        log = _job_log(job_id)
-        _require_exact_head_provenance(
-            log,
-            gate_name=str(job["name"]),
-            head_sha=review_tuple.head_sha,
-            head_tree_sha=head_tree_sha,
-        )
-        gates.append(
-            {
-                "id": job["name"],
-                "executor": "github_actions",
-                "runner": {
-                    "kind": "github_actions",
-                    "name": "ubuntu-latest",
-                    "job_id": job_id,
-                },
-                "status": contract["status"],
-                "head_sha": review_tuple.head_sha,
-                "attempted": True,
-                "command": contract["command"],
-                "exit_code": contract["exit_codes"][0],
-                "started_at": job["started_at"],
-                "completed_at": job["completed_at"],
-                "duration_ms": _duration_ms(job["started_at"], job["completed_at"]),
-                "tree_before": head_tree_sha,
-                "tree_after": head_tree_sha,
-                "evidence": {
-                    "kind": "github_actions",
-                    "url": url,
-                    "job_id": job_id,
-                    "log_sha256": hashlib.sha256(log).hexdigest(),
-                },
-            }
-        )
     report = {
         **review_tuple.__dict__,
-        "base_tree_sha": base_tree_sha,
-        "head_tree_sha": head_tree_sha,
+        "base_tree_sha": local["base_tree_sha"],
+        "head_tree_sha": local["head_tree_sha"],
         "gate_resolution": {
             "policy_version": EXECUTION_GATE_POLICY_VERSION,
             "policy_sha256": EXECUTION_GATE_POLICY_SHA256,
             "manifest_sha256": hashlib.sha256(resolution_bytes).hexdigest(),
             "resolved_gates": list(BASELINE_EXECUTION_GATES),
         },
-        "worker": {"required": False},
-        "gates": gates,
+        "worker": local["worker"],
+        "gates": local["gates"],
     }
     return _signed_result(
         report,
         payload_key="attestation_payload",
         signature_key="attestation_signature",
     )
-
-
-def _workflow_from_environment() -> TrustedWorkflow:
-    """Return the reviewed capture identity; environment input cannot widen trust."""
-    return TRUSTED_CAPTURE_WORKFLOW
 
 
 def _expected_login() -> str:
@@ -1833,13 +1272,6 @@ def _bot_bodies(items: list[dict], expected_login: str) -> list[str]:
         ):
             bodies.append(body)
     return bodies
-
-
-def _status_context(review_tuple: ReviewTuple) -> str:
-    return (
-        f"newtonsapple-bot/review-v2/pr-{review_tuple.pr_number}/"
-        f"base-{review_tuple.base_sha}"
-    )
 
 
 def _summary_marker(review_tuple: ReviewTuple) -> str:
@@ -1930,23 +1362,6 @@ def _started_content(review_tuple: ReviewTuple, pr_url: str) -> str:
         f"**PR review started:** Hermany is reviewing "
         f"[#{review_tuple.pr_number}]({pr_url}) at head "
         f"`{review_tuple.head_sha[:12]}`."
-    )
-
-
-def _post_error_status(review_tuple: ReviewTuple, pr_url: str) -> None:
-    gh_json(
-        "api",
-        f"repos/{REPOSITORY}/statuses/{review_tuple.head_sha}",
-        "-X",
-        "POST",
-        "-f",
-        "state=error",
-        "-f",
-        f"context={_status_context(review_tuple)}",
-        "-f",
-        "description=Automated review failed after bounded retries",
-        "-f",
-        f"target_url={pr_url}",
     )
 
 
@@ -2087,7 +1502,7 @@ def _ensure_started_message(
     return store.record_started_event(review_tuple, event_id)
 
 
-def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[dict], list[str]]:
+def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[str]]:
     live_pr_result = gh_json("api", f"repos/{REPOSITORY}/pulls/{pr_number}")
     if not isinstance(live_pr_result, dict):
         raise RuntimeError("GitHub returned malformed pull request")
@@ -2095,28 +1510,9 @@ def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[
     head = live_pr.get("head")
     if not isinstance(head, dict) or SHA_PATTERN.fullmatch(str(head.get("sha", ""))) is None:
         raise RuntimeError("GitHub returned malformed pull request head")
-    statuses = _collection(f"repos/{REPOSITORY}/commits/{head['sha']}/statuses?per_page=100")
     comments = _collection(f"repos/{REPOSITORY}/issues/{pr_number}/comments?per_page=100")
     reviews = _collection(f"repos/{REPOSITORY}/pulls/{pr_number}/reviews?per_page=100")
-    return live_pr, statuses, _bot_bodies(comments + reviews, expected_login)
-
-
-def _load_run(run_id: int) -> Optional[dict]:
-    run = gh_json("api", f"repos/{REPOSITORY}/actions/runs/{run_id}")
-    if not isinstance(run, dict):
-        return None
-    head_sha = run.get("head_sha")
-    if not isinstance(head_sha, str) or SHA_PATTERN.fullmatch(head_sha) is None:
-        return None
-    try:
-        workflow_sha256 = _workflow_source_sha256(
-            head_sha, TRUSTED_CAPTURE_WORKFLOW.path
-        )
-    except RuntimeError:
-        return None
-    if workflow_sha256 != TRUSTED_CAPTURE_WORKFLOW_SHA256:
-        return None
-    return run
+    return live_pr, _bot_bodies(comments + reviews, expected_login)
 
 
 def _load_timeline(pr_number: int) -> list[dict]:
@@ -2125,16 +1521,13 @@ def _load_timeline(pr_number: int) -> list[dict]:
     )
 
 
-def _captured_live_tuple(
+def _recoverable_live_tuple(
     pr_number: int, expected_login: str
 ) -> tuple[dict, Optional[ReviewTuple], list[str]]:
-    """Return a tuple backed by capture evidence or strict timeline recovery."""
-    live_pr, statuses, bodies = _live_review_state(pr_number, expected_login)
+    """Return a tuple backed by the latest non-invalidated review request."""
+    live_pr, bodies = _live_review_state(pr_number, expected_login)
     selected = select_authorized_tuple(
         live_pr,
-        statuses=statuses,
-        load_run=_load_run,
-        trusted_workflow=_workflow_from_environment(),
         reviewer_login=expected_login,
         bot_bodies=[],
         load_timeline=_load_timeline,
@@ -2145,7 +1538,7 @@ def _captured_live_tuple(
 def _authorized_live_tuple(
     pr_number: int, expected_login: str
 ) -> tuple[dict, Optional[ReviewTuple], list[str]]:
-    live_pr, selected, bodies = _captured_live_tuple(pr_number, expected_login)
+    live_pr, selected, bodies = _recoverable_live_tuple(pr_number, expected_login)
     if selected is not None:
         marker = review_marker(selected)
         if any(marker in body for body in bodies if isinstance(body, str)):
@@ -2163,7 +1556,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             continue
         try:
-            live_pr, selected, bodies = _captured_live_tuple(
+            live_pr, selected, bodies = _recoverable_live_tuple(
                 number, expected_login
             )
         except (RuntimeError, TypeError, ValueError, sqlite3.Error):
@@ -2173,7 +1566,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             if (
                 isinstance(base, dict)
                 and isinstance(head, dict)
-                and base.get("ref") == TRUSTED_CAPTURE_WORKFLOW.branch
+                and base.get("ref") == BASE_BRANCH
                 and isinstance(base.get("sha"), str)
                 and SHA_PATTERN.fullmatch(base["sha"]) is not None
                 and isinstance(head.get("sha"), str)
@@ -2278,8 +1671,8 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 content=(
                     f"**Operational blocker:** PR #{number} at head "
                     f"`{review_tuple.head_sha}` still requests `{expected_login}`, "
-                    "but neither trusted capture evidence nor a strict current-request "
-                    "timeline proof could be verified. The review was not started."
+                    "but its latest current review request could not be verified from "
+                    "the timeline. The review was not started."
                 ),
             )
     delivered = drain_summary_outbox(
@@ -2335,7 +1728,6 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         )
         return {"settled": "claim_publish"}
     if operation == "release":
-        pr_url = f"https://github.com/{REPOSITORY}/pull/{review_tuple.pr_number}"
         failure = store.record_failure(
             review_tuple,
             lease_token=lease_token,
@@ -2347,12 +1739,11 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
                 "**Operational blocker:** automated review for PR "
                 f"#{review_tuple.pr_number} at head `{review_tuple.head_sha}` "
                 f"failed after {MAX_REVIEW_ATTEMPTS} attempts. The tuple was "
-                "dead-lettered. GitHub error-status publication is attempted "
-                "separately and may still be pending."
+                "dead-lettered. No GitHub review was published; retry the "
+                "review request after resolving this blocker."
             ),
         )
         if failure["dead_lettered"]:
-            _post_error_status(review_tuple, pr_url)
             drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
         return {"settled": "release", **failure}
     if operation != "complete":
@@ -2407,7 +1798,7 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
     payload_pr = payload.get("pull_request")
     if not isinstance(payload_pr, dict):
         raise RuntimeError("webhook pull request tuple is missing")
-    live_pr, _, bodies = _live_review_state(number, expected_login)
+    live_pr, bodies = _live_review_state(number, expected_login)
     payload_base = payload_pr.get("base")
     payload_head = payload_pr.get("head")
     live_base = live_pr.get("base")
@@ -2419,8 +1810,8 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         or not isinstance(payload_head, dict)
         or not isinstance(live_base, dict)
         or not isinstance(live_head, dict)
-        or payload_base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
-        or live_base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
+        or payload_base.get("ref") != BASE_BRANCH
+        or live_base.get("ref") != BASE_BRANCH
         or payload_base.get("sha") != live_base.get("sha")
         or payload_head.get("sha") != live_head.get("sha")
     ):
@@ -2467,13 +1858,12 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         "repository": REPOSITORY,
         "pr_number": number,
         "expected_base_sha": review_tuple.base_sha,
-        "expected_base_ref": TRUSTED_CAPTURE_WORKFLOW.branch,
+        "expected_base_ref": BASE_BRANCH,
         "expected_head_sha": review_tuple.head_sha,
         "action": "review_requested",
         "pr_url": str(live_pr.get("html_url", "")),
         "review_marker": review_marker(review_tuple),
         "publisher_login": expected_login,
-        "capture_context": _status_context(review_tuple),
         "lease_token": lease_token,
     }
 
