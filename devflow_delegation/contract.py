@@ -232,7 +232,7 @@ def parse_v2_fix_request(envelope: Dict[str, Any]) -> Dict[str, Any]:
     evidence: the roadmap row's own text and traces ARE the evidence; the
     derived acceptance criteria restate the row's task + reversibility.
     """
-    if envelope.get("type") != "DEVFLOW_FIX_REQUEST":
+    if envelope.get("type") not in COMPAT_MSG_TYPES:
         raise ContractError(["not_a_v2_fix_request"])
     p = envelope.get("payload") or {}
     issue = _nonempty_str(p.get("issue"))

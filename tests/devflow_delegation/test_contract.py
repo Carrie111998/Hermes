@@ -1,5 +1,3 @@
-import copy
-
 import pytest
 
 from devflow_delegation.contract import (
