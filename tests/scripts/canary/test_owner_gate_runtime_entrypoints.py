@@ -17,6 +17,7 @@ REVISION = "a" * 40
 ENTRYPOINTS = (
     ("muncho-owner-gate-intake", 29102),
     ("muncho-passkey-v2-authority", 29102),
+    ("muncho-passkey-enrollment", 29102),
     ("muncho-passkey-v2-executor", 29103),
     ("muncho-passkey-v2-web", 29101),
     ("muncho-owner-gate-cloud-observation-signer", 29103),

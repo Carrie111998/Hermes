@@ -1,4 +1,6 @@
 Cmnd_Alias MUNCHO_OWNER_GATE_INTAKE = /opt/muncho-owner-gate/current/venv/bin/python -I -B /opt/muncho-owner-gate/current/bin/muncho-owner-gate-intake
 Cmnd_Alias MUNCHO_OWNER_GATE_ACTIVATE_STORAGE = /opt/muncho-owner-gate/current/venv/bin/python -I -B /opt/muncho-owner-gate/current/bin/muncho-owner-gate-activate-storage install
+Cmnd_Alias MUNCHO_PASSKEY_ENROLLMENT = /opt/muncho-owner-gate/current/venv/bin/python -I -B /opt/muncho-owner-gate/current/bin/muncho-passkey-enrollment create --owner-discord-user-id * --user-label * --ttl-seconds *
 %google-sudoers ALL=(muncho-passkey-authority) NOPASSWD: MUNCHO_OWNER_GATE_INTAKE
+%google-sudoers ALL=(muncho-passkey-authority) NOPASSWD: MUNCHO_PASSKEY_ENROLLMENT
 %google-sudoers ALL=(root) NOPASSWD: MUNCHO_OWNER_GATE_ACTIVATE_STORAGE

@@ -4082,6 +4082,36 @@ def test_host_receipts_require_verifier_only_api_and_operational_key_proofs() ->
             validator(drifted, plan=plan)
 
 
+def test_host_apply_receipt_preserves_v2_and_requires_v3_trust_proof() -> None:
+    private = Ed25519PrivateKey.generate()
+    services = Services()
+    plan = _cutover_plan(private, services)
+    legacy = Host(plan, services).apply_stopped(plan)
+    assert legacy["schema"] == "muncho-production-writer-host-apply.v2"
+    assert "cross_service_trust_anchors_ready" not in legacy
+    assert cutover._require_host_apply_receipt(legacy, plan=plan) == legacy
+
+    current = copy.deepcopy(legacy)
+    current["schema"] = "muncho-production-writer-host-apply.v3"
+    current["cross_service_trust_anchor_receipt_sha256"] = "8" * 64
+    current["cross_service_trust_anchors_ready"] = True
+    current["receipt_sha256"] = cutover._sha256_json({
+        key: value
+        for key, value in current.items()
+        if key != "receipt_sha256"
+    })
+    assert cutover._require_host_apply_receipt(current, plan=plan) == current
+
+    current["cross_service_trust_anchors_ready"] = False
+    current["receipt_sha256"] = cutover._sha256_json({
+        key: value
+        for key, value in current.items()
+        if key != "receipt_sha256"
+    })
+    with pytest.raises(cutover.ProductionCutoverError, match="host-apply"):
+        cutover._require_host_apply_receipt(current, plan=plan)
+
+
 def test_resume_target_drift_rolls_back_fail_closed_instead_of_leaving_database_applied() -> None:
     private = Ed25519PrivateKey.generate()
     services = Services()

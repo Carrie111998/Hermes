@@ -7,7 +7,8 @@ OpenAI-shaped `{role, content, tool_calls, tool_call_id}` entries that
 
 Codex emits items with a discriminator field `type`:
   - userMessage         → {role: "user", content}
-  - agentMessage        → {role: "assistant", content}
+  - final agentMessage  → {role: "assistant", content}; commentary/analysis
+                          stays on the live display rail and out of history
   - reasoning           → stashed in the assistant's "reasoning" field
   - commandExecution    → assistant tool_call(name="exec") + tool result
   - fileChange          → assistant tool_call(name="apply_patch") + tool result
@@ -63,7 +64,7 @@ class ProjectionResult:
 
     messages: list[dict] = field(default_factory=list)
     is_tool_iteration: bool = False
-    final_text: Optional[str] = None  # Set when an agentMessage completes
+    final_text: Optional[str] = None  # Set only for a proven final agentMessage
 
 
 class CodexEventProjector:
@@ -74,12 +75,53 @@ class CodexEventProjector:
 
     def __init__(self) -> None:
         self._pending_reasoning: list[str] = []
+        # Delta/completion notifications may omit the phase declared on
+        # item/started, so retain structural protocol state by item id.
+        self._agent_message_phases: dict[str, tuple[bool, Optional[str]]] = {}
+        # Codex versions before MessagePhase did not distinguish mid-turn
+        # narration from the final answer. Hold a phase-less completed message
+        # until turn/completed proves it terminal. Any later item proves it was
+        # commentary and discards it from replayable history.
+        self._pending_unphased_agent_message: Optional[dict] = None
 
     def project(self, notification: dict) -> ProjectionResult:
         """Project a single notification. Idempotent for non-completion events;
         only `item/completed` and `turn/completed` materialize messages."""
         method = notification.get("method", "")
         params = notification.get("params", {}) or {}
+        item = params.get("item") or {}
+
+        # A later item proves a previously completed phase-less agent message
+        # was not terminal. It may already have been shown through the live
+        # commentary rail, but it must never enter prompt-cached history.
+        if (
+            self._pending_unphased_agent_message is not None
+            and method.startswith("item/")
+        ):
+            self._pending_unphased_agent_message = None
+
+        if (
+            method == "item/started"
+            and isinstance(item, dict)
+            and item.get("type") == "agentMessage"
+        ):
+            item_id = str(item.get("id") or "")
+            if item_id and "phase" in item:
+                raw_phase = item.get("phase")
+                normalized = (
+                    str(raw_phase).strip().casefold()
+                    if raw_phase is not None
+                    else ""
+                )
+                self._agent_message_phases[item_id] = (
+                    True,
+                    normalized or None,
+                )
+            return ProjectionResult()
+
+        if method == "turn/completed":
+            self._agent_message_phases.clear()
+            return self.finalize_pending_agent_message()
 
         # We only materialize messages on `item/completed`. Streaming deltas
         # (`item/<type>/outputDelta`, `item/<type>/delta`) are display-only and
@@ -88,7 +130,6 @@ class CodexEventProjector:
         if method != "item/completed":
             return ProjectionResult()
 
-        item = params.get("item") or {}
         item_type = item.get("type") or ""
         item_id = item.get("id") or ""
 
@@ -117,12 +158,51 @@ class CodexEventProjector:
     # ---------- per-type projections ----------
 
     def _project_agent_message(self, item: dict) -> ProjectionResult:
+        item_id = str(item.get("id") or "")
+        if "phase" in item:
+            raw_phase = item.get("phase")
+            normalized = (
+                str(raw_phase).strip().casefold()
+                if raw_phase is not None
+                else ""
+            )
+            phase_present, phase = True, normalized or None
+        else:
+            phase_present, phase = self._agent_message_phases.get(
+                item_id, (False, None)
+            )
+        if item_id:
+            self._agent_message_phases.pop(item_id, None)
+        if not phase_present:
+            self._pending_unphased_agent_message = dict(item)
+            return ProjectionResult()
+        if phase not in {"final_answer", "final"}:
+            # commentary, analysis, null, and future phases are display-only.
+            # Fail closed instead of persisting provider scratch state or
+            # manufacturing a terminal response from an unknown protocol enum.
+            return ProjectionResult()
+        return self._materialize_agent_message(item)
+
+    def _materialize_agent_message(self, item: dict) -> ProjectionResult:
         text = item.get("text") or ""
         msg: dict[str, Any] = {"role": "assistant", "content": text}
         if self._pending_reasoning:
             msg["reasoning"] = "\n".join(self._pending_reasoning)
             self._pending_reasoning = []
         return ProjectionResult(messages=[msg], final_text=text)
+
+    def finalize_pending_agent_message(self) -> ProjectionResult:
+        """Materialize a legacy phase-less message at a proven turn boundary.
+
+        Normal app-server turns call this through ``turn/completed``. The
+        session also calls it after a quiet deadline to preserve the existing
+        recovery behavior for old Codex builds that omit turn/completed.
+        """
+        item = self._pending_unphased_agent_message
+        self._pending_unphased_agent_message = None
+        if item is None:
+            return ProjectionResult()
+        return self._materialize_agent_message(item)
 
     def _project_user_message(self, item: dict) -> ProjectionResult:
         # codex's userMessage content is a list of UserInput variants. For

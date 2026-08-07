@@ -183,6 +183,7 @@ _SEALED_REQUEST_FIELDS = frozenset(
         "capability_bundle",
         "isolated_worker_bundle",
         "operational_edge_bundle",
+        "owner_gate_receipt_public_key_id",
         "operational_asset_verification",
         "secret_material_recorded",
         "secret_digest_recorded",
@@ -700,9 +701,13 @@ def _validate_sealed_request(
     }
     if (
         raw.get("schema")
-        != host_package.SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA
+        != host_package.SEALED_RUNTIME_ARTIFACT_REQUEST_V4_SCHEMA
         or raw.get("release_revision") != release_revision
         or raw.get("target") != unit_inputs["target"]
+        or _SHA256.fullmatch(
+            str(raw.get("owner_gate_receipt_public_key_id") or "")
+        )
+        is None
         or not isinstance(files, Mapping)
         or set(files) != expected_names
         or raw.get("secret_material_recorded") is not False
@@ -875,7 +880,11 @@ def validate_host_artifact_manifest(
         unit_inputs=unit_inputs,
     )
     if (
-        source["sealed_runtime_artifact_request_sha256"]
+        sealed["owner_gate_receipt_public_key_id"]
+        != successor_plan["unit_inputs"][
+            "owner_gate_receipt_public_key_id"
+        ]
+        or source["sealed_runtime_artifact_request_sha256"]
         != sealed["request_sha256"]
     ):
         _fail("release_update_inputs_host_manifest_invalid")

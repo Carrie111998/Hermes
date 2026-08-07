@@ -87,7 +87,7 @@ def _host_manifest(
         for name in sorted(sealed_names)
     }
     sealed_unsigned = {
-        "schema": host_package.SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA,
+        "schema": host_package.SEALED_RUNTIME_ARTIFACT_REQUEST_V4_SCHEMA,
         "release_revision": TARGET,
         "target": unit_inputs["target"],
         "files": sealed_files,
@@ -101,6 +101,9 @@ def _host_manifest(
         "capability_bundle": {"identity": _digest("capability")},
         "isolated_worker_bundle": {"identity": _digest("worker")},
         "operational_edge_bundle": {"identity": _digest("edge")},
+        "owner_gate_receipt_public_key_id": payload[
+            "owner_gate_receipt_public_key_id"
+        ],
         "operational_asset_verification": {
             "identity": _digest("assets")
         },
@@ -510,6 +513,31 @@ def test_host_manifest_unit_inputs_must_be_exact_v4_projection(
         fixture.documents["host_artifact_manifest_sha256"]
     )
     manifest["unit_inputs"][field] = replacement
+    _rehash(manifest, "manifest_sha256")
+    fixture.documents["host_artifact_manifest_sha256"] = manifest
+    fixture.update_publication = _signed_update(
+        fixture,
+        {"host_artifact_manifest_sha256": manifest["manifest_sha256"]},
+    )
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match="release_update_inputs_host_manifest_invalid",
+    ):
+        _validate(fixture)
+
+
+def test_host_manifest_owner_gate_key_must_match_signed_v4_authority() -> None:
+    fixture = _fixture()
+    manifest = deepcopy(
+        fixture.documents["host_artifact_manifest_sha256"]
+    )
+    sealed = manifest["sealed_runtime_artifact_request"]
+    sealed["owner_gate_receipt_public_key_id"] = "f" * 64
+    _rehash(sealed, "request_sha256")
+    manifest["source"]["sealed_runtime_artifact_request_sha256"] = sealed[
+        "request_sha256"
+    ]
     _rehash(manifest, "manifest_sha256")
     fixture.documents["host_artifact_manifest_sha256"] = manifest
     fixture.update_publication = _signed_update(

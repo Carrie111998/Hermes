@@ -443,6 +443,7 @@ class OperationalEdgeClient:
         *,
         idempotency_key: str,
         capability: Mapping[str, Any] | None = None,
+        step_up_authorization: Mapping[str, Any] | None = None,
         timeout_seconds: int = 60,
         _preserve_verified_envelope: bool = False,
     ) -> Mapping[str, Any]:
@@ -475,6 +476,11 @@ class OperationalEdgeClient:
             deadline_unix_ms=int(time.time() * 1000) + timeout_seconds * 1000,
             intent=intent,
             capability=envelope,
+            step_up_authorization=(
+                None
+                if step_up_authorization is None
+                else dict(step_up_authorization)
+            ),
         )
         request_sha256 = hashlib.sha256(
             canonical_json_bytes(request.to_mapping())

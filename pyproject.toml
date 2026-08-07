@@ -364,6 +364,8 @@ hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
 muncho-ops = "ops.muncho.runtime.operational_edge_cli:main"
+muncho-release = "ops.muncho.release.cli:main"
+muncho-passkey-enrollment = "scripts.canary.passkey_v2_enrollment:main"
 
 [tool.uv]
 override-dependencies = [
@@ -407,6 +409,7 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*",
 
 [tool.setuptools.package-data]
 hermes_cli = ["observability/schemas/*.json"]
+"ops.muncho.release" = ["*.json"]
 # gateway/assets/ ships status_phrases.yaml and the Telegram BotFather
 # screenshot. Without this, sealed venvs (uv2nix) silently lose both —
 # status phrases fall back to the tiny hardcoded set and the Telegram
@@ -414,10 +417,12 @@ hermes_cli = ["observability/schemas/*.json"]
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
 # General plugin-wheel distribution remains intentionally unsupported.  The
-# sealed owner runtime has one exact allowlisted observer, however, and its
-# normal PluginManager discovery contract requires this manifest beside the
-# packaged module.  Do not widen this to a wildcard.
-plugins = ["muncho_canary_evidence/plugin.yaml"]
+# sealed owner runtime has two exact allowlisted manifests whose normal
+# PluginManager discovery contracts require them beside the packaged modules:
+# the canary observer and Discord's registered standalone command edge. The
+# production release announcement itself stays on the live privileged Relay.
+# Do not widen this to a wildcard.
+plugins = ["muncho_canary_evidence/plugin.yaml", "platforms/discord/plugin.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -712,6 +712,7 @@ def build_operational_edge_foundation(
     release_owner_uid: int,
     release_owner_gid: int,
     writer_public_key_id: str,
+    owner_gate_receipt_public_key_id: str,
     key_foundation: Mapping[str, Any],
     asset_verification: Mapping[str, Any],
     key_root: Path = KEY_ROOT,
@@ -764,6 +765,9 @@ def build_operational_edge_foundation(
         mutation_peer_gid=gateway_gid,
         receipt_public_key_ids=receipt_ids,
         writer_key_id=writer_public_key_id,
+        owner_gate_receipt_public_key_id=(
+            owner_gate_receipt_public_key_id
+        ),
     )
     artifacts = tuple(
         [
@@ -816,6 +820,9 @@ def build_operational_edge_foundation(
         "release_owner_uid": release_owner_uid,
         "release_owner_gid": release_owner_gid,
         "writer_public_key_id": writer_public_key_id,
+        "owner_gate_receipt_public_key_id": (
+            owner_gate_receipt_public_key_id
+        ),
         "receipt_public_key_ids": receipt_ids,
         "artifacts": artifact_rows,
         "artifact_count": len(artifact_rows),
@@ -848,6 +855,7 @@ def prepare_operational_edge_foundation(
     release_owner_uid: int,
     release_owner_gid: int,
     writer_public_key_id: str,
+    owner_gate_receipt_public_key_id: str,
     writer_public_key_gid: int,
     release_root: Path | None = None,
     writer_public_key_path: Path = KEY_ROOT / "writer-capability-public.pem",
@@ -894,6 +902,9 @@ def prepare_operational_edge_foundation(
         release_owner_uid=release_owner_uid,
         release_owner_gid=release_owner_gid,
         writer_public_key_id=writer_public_key_id,
+        owner_gate_receipt_public_key_id=(
+            owner_gate_receipt_public_key_id
+        ),
         key_foundation=keys,
         asset_verification=verification,
         key_root=key_root,
