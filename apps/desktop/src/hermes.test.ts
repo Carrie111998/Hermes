@@ -12,6 +12,7 @@ import {
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getMessagingPlatforms,
   getProfiles,
   getSessionMessages,
   getStatus,
@@ -21,7 +22,9 @@ import {
   resetSidebarBatchCapability,
   setApiRequestProfile,
   speakText,
-  transcribeAudio
+  testMessagingPlatform,
+  transcribeAudio,
+  updateMessagingPlatform
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 
@@ -36,6 +39,7 @@ describe('Hermes REST helpers', () => {
   let api: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
+    setApiRequestProfile(null)
     resetSidebarBatchCapability()
     api = vi.fn().mockResolvedValue(emptySessionsResponse)
     Object.defineProperty(window, 'hermesDesktop', {
@@ -330,6 +334,45 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
+    })
+  })
+
+  it('routes messaging platform reads through the selected API profile', async () => {
+    api.mockResolvedValue({ platforms: [] })
+    setApiRequestProfile('clean-room')
+
+    await getMessagingPlatforms()
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/messaging/platforms',
+      profile: 'clean-room'
+    })
+  })
+
+  it('routes messaging platform updates through the selected API profile', async () => {
+    api.mockResolvedValue({ ok: true, platform: 'telegram' })
+    setApiRequestProfile('clean-room')
+
+    await updateMessagingPlatform('telegram', { enabled: true })
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/messaging/platforms/telegram',
+      method: 'PUT',
+      body: { enabled: true },
+      profile: 'clean-room'
+    })
+  })
+
+  it('routes messaging platform tests through the selected API profile', async () => {
+    api.mockResolvedValue({ ok: true, message: 'ready' })
+    setApiRequestProfile('clean-room')
+
+    await testMessagingPlatform('telegram')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/messaging/platforms/telegram/test',
+      method: 'POST',
+      profile: 'clean-room'
     })
   })
 
