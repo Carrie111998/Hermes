@@ -13102,7 +13102,9 @@ async def list_hooks():
     for spec in specs:
         entry = None
         try:
-            entry = shell_hooks.allowlist_entry_for(spec.event, spec.command)
+            entry = shell_hooks.allowlist_entry_for(
+                spec.event, spec.command, spec.matcher,
+            )
         except Exception:
             pass
         executable = False
@@ -13172,7 +13174,9 @@ async def create_hook(body: HookCreate):
     approved = False
     if body.approve:
         try:
-            shell_hooks._record_approval(event, command)
+            shell_hooks._record_approval(
+                event, command, matcher=body.matcher,
+            )
             approved = True
         except Exception:
             _log.exception("hook consent record failed")
