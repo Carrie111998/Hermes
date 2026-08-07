@@ -429,6 +429,8 @@ def _install_schema_reconciliation_control(name: str) -> None:
         f"CREATE ROLE {control_login} LOGIN INHERIT NOSUPERUSER CREATEDB "
         "CREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT -1;\n"
         f"GRANT cloudsqlsuperuser TO {control_login} "
+        "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;\n"
+        f"GRANT canonical_brain_migration_owner TO {control_login} "
         "WITH ADMIN FALSE, INHERIT TRUE, SET TRUE;\n",
     )
     _psql_as(
@@ -2109,7 +2111,7 @@ def test_real_postgres_security_definer_omitted_fields_fail_closed(
             "thread_id": seed_runtime.thread_id,
             "message_id": seed_runtime.message_id,
         }),
-    ) == "owner_required"
+    ) == "operator_required"
 
     assert _psql_fields(
         stack.name,

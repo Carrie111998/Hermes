@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from gateway.production_capability_prerequisites import FIRST_WAVE_TOOLSETS
 from gateway.support_ops_team_registry import TEAM_MEMBERS
 
 
@@ -106,6 +105,12 @@ def project_production_agent_access(
     source: Any,
 ) -> ProductionAgentAccess | None:
     """Project a stable owner/team tool surface for a production source."""
+
+    # The privileged writer's sealed preflight imports this module only for
+    # the fixed operator ID sets.  Keep the model-facing tool dependency out
+    # of that owner-runtime import closure and load it only when constructing
+    # an actual gateway agent surface.
+    from gateway.production_capability_prerequisites import FIRST_WAVE_TOOLSETS
 
     role = production_discord_role(source)
     if role is None:
