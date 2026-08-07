@@ -1361,7 +1361,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             "Telegram caption-fallback send failed for missing media: %s",
                             _sanitize_error_text(_cap_err),
                         )
-                        warnings.append(_sanitize_error_text(_cap_err))
+                        warnings.append(
+                            "Telegram caption-fallback send failed for missing media: "
+                            f"{_sanitize_error_text(_cap_err)}"
+                        )
                 continue
 
             ext = os.path.splitext(media_path)[1].lower()
