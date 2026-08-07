@@ -11,7 +11,9 @@ authenticated only at the global root.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -52,9 +54,210 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+@contextmanager
+def _unreadable_global_auth(path: Path, payload: dict):
+    raw = json.dumps(payload, indent=2)
+    path.write_text(raw)
+    path.chmod(0)
+    try:
+        try:
+            path.read_text()
+        except PermissionError:
+            pass
+        else:  # pragma: no cover - Windows does not enforce POSIX mode bits
+            pytest.skip("filesystem does not enforce unreadable mode bits")
+        yield raw
+    finally:
+        path.chmod(0o600)
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
+
+
+def test_profile_pool_shadows_unreadable_global_without_auth_traceback(
+    profile_env,
+    monkeypatch,
+    caplog,
+):
+    """A selected profile account must not probe the optional global store."""
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    profile_access = "profile-account-a-access"
+    profile_refresh = "profile-account-a-refresh"
+    profile_store = _make_auth_store(
+        pool={
+            "openai-codex": [
+                {
+                    "id": "profile-account-b",
+                    "label": "profile account b",
+                    "auth_type": "oauth",
+                    "priority": 7,
+                    "source": "manual:device_code",
+                    "access_token": "profile-account-b-access",
+                    "refresh_token": "profile-account-b-refresh",
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                },
+                {
+                    "id": "profile-account-a",
+                    "label": "profile account a",
+                    "auth_type": "oauth",
+                    "priority": 2,
+                    "source": "device_code",
+                    "access_token": profile_access,
+                    "refresh_token": profile_refresh,
+                    "base_url": "https://chatgpt.com/backend-api/codex",
+                },
+            ],
+        },
+        providers={
+            "openai-codex": {
+                "tokens": {
+                    "access_token": profile_access,
+                    "refresh_token": profile_refresh,
+                },
+                "label": "profile account a",
+                "auth_mode": "chatgpt",
+            },
+        },
+    )
+    profile_store["active_provider"] = "openai-codex"
+    _write(profile_env["profile"] / "auth.json", profile_store)
+    (profile_env["profile"] / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openai-codex\n"
+        "  default: gpt-test\n"
+        "  api_mode: codex_responses\n"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(profile_env["profile"] / "missing-codex"))
+
+    global_secret = "global-secret-must-not-appear"
+    global_payload = _make_auth_store(
+        pool={
+            "openai-codex": [
+                {
+                    "id": "global-account",
+                    "priority": 0,
+                    "source": "device_code",
+                    "access_token": global_secret,
+                },
+            ],
+        },
+    )
+    global_path = profile_env["global"] / "auth.json"
+    caplog.set_level(logging.WARNING)
+
+    with _unreadable_global_auth(global_path, global_payload) as global_raw:
+        resolved = resolve_runtime_provider(requested="openai-codex")
+
+        pool = resolved["credential_pool"]
+        entries = pool.entries()
+        assert [(entry.id, entry.priority) for entry in entries] == [
+            ("profile-account-a", 2),
+            ("profile-account-b", 7),
+        ]
+        assert pool.current().id == "profile-account-a"
+        assert hashlib.sha256(resolved["api_key"].encode()).digest() == hashlib.sha256(
+            profile_access.encode()
+        ).digest()
+        assert resolved["source"] == "device_code"
+        assert "could not read" not in caplog.text
+        assert "PermissionError" not in caplog.text
+        assert global_secret not in caplog.text
+
+    assert hashlib.sha256(global_path.read_bytes()).digest() == hashlib.sha256(
+        global_raw.encode()
+    ).digest()
+
+
+def test_unreadable_required_global_auth_still_fails_closed_without_secret_leak(
+    profile_env,
+    monkeypatch,
+    caplog,
+):
+    """An unreadable fallback cannot turn absent profile auth into success."""
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    empty_profile_store = _make_auth_store(pool={}, providers={})
+    empty_profile_store["active_provider"] = "openai-codex"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(profile_path, empty_profile_store)
+    profile_before = profile_path.read_bytes()
+    (profile_env["profile"] / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openai-codex\n"
+        "  default: gpt-test\n"
+        "  api_mode: codex_responses\n"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(profile_env["profile"] / "missing-codex"))
+
+    global_secret = "unreadable-global-token-must-not-appear"
+    global_path = profile_env["global"] / "auth.json"
+    caplog.set_level(logging.WARNING)
+    with _unreadable_global_auth(
+        global_path,
+        _make_auth_store(
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "global-only-account",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": global_secret,
+                    },
+                ],
+            },
+        ),
+    ):
+        with pytest.raises(AuthError) as exc_info:
+            resolve_runtime_provider(requested="openai-codex")
+
+        assert exc_info.value.provider == "openai-codex"
+        assert exc_info.value.code == "codex_auth_missing"
+        assert global_secret not in caplog.text
+        assert global_secret not in str(exc_info.value)
+
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_missing_profile_pool_still_uses_readable_global_fallback(profile_env):
+    """The early profile return must not weaken the intentional fallback."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(pool={}, providers={}),
+    )
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "global-account-a",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "global-account-a-access",
+                    },
+                    {
+                        "id": "global-account-b",
+                        "priority": 4,
+                        "source": "manual:device_code",
+                        "access_token": "global-account-b-access",
+                    },
+                ],
+            },
+        ),
+    )
+
+    entries = read_credential_pool("openai-codex")
+
+    assert [(entry["id"], entry["priority"]) for entry in entries] == [
+        ("global-account-a", 1),
+        ("global-account-b", 4),
+    ]
 
 
 
