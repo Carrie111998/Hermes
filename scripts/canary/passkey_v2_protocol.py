@@ -55,6 +55,7 @@ EXECUTION_WINDOW_SECONDS = 3600
 PRODUCTION_RP_ID = "lomliev.com"
 PRODUCTION_ORIGIN = "https://auth.lomliev.com"
 
+SENSITIVE_REPORT_SCOPE = "sensitive_report"
 DANGEROUS_SCOPES = frozenset({
     "cloud_secret_change",
     "db_write",
@@ -64,6 +65,7 @@ DANGEROUS_SCOPES = frozenset({
     "production_write",
     "raw_export",
     "runtime_config_mutation",
+    SENSITIVE_REPORT_SCOPE,
 })
 
 UI_SECURITY_HEADERS = {
@@ -492,6 +494,14 @@ def validate_action_envelope(value: Any) -> Mapping[str, Any]:
     )
     if value.get("scope") not in DANGEROUS_SCOPES:
         raise PasskeyV2ProtocolError("passkey_v2_scope_invalid")
+    if (
+        value.get("scope") == SENSITIVE_REPORT_SCOPE
+        and value.get("requester_discord_user_id")
+        != value.get("required_approver_discord_user_id")
+    ):
+        raise PasskeyV2ProtocolError(
+            "passkey_v2_sensitive_report_self_approval_required"
+        )
     if (
         not isinstance(value.get("case_id"), str)
         or _CASE_ID.fullmatch(value["case_id"]) is None

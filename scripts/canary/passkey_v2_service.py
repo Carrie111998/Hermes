@@ -45,6 +45,7 @@ from scripts.canary import passkey_v2_protocol as protocol
 from scripts.canary import passkey_v2_storage_growth as storage
 from scripts.canary import passkey_v2_upstream_sync as upstream_sync
 from scripts.canary import passkey_v2_production_storage_growth as production_storage
+from scripts.canary import passkey_v2_sensitive_report as sensitive_report
 from scripts.canary import production_cutover_passkey as production_cutover
 from scripts.canary import owner_gate_firewall_readiness as firewall
 from scripts.canary import storage_growth_evidence as growth_evidence
@@ -1300,7 +1301,13 @@ def _authority_options(
     challenge = state["challenge_record"]
     if challenge is None or state["grant_record"] is not None:
         raise PasskeyV2ServiceError("passkey_v2_request_not_approvable")
-    credentials = authority.read_active_credentials()
+    action = _validate_authority_action(state["action_envelope"])
+    credentials = tuple(
+        credential
+        for credential in authority.read_active_credentials()
+        if credential["owner_discord_user_id"]
+        == action["required_approver_discord_user_id"]
+    )
     if not credentials:
         raise PasskeyV2ServiceError("passkey_v2_credential_unavailable")
     return {
@@ -1337,11 +1344,14 @@ def _validate_authority_action(value: Any) -> Mapping[str, Any]:
             return upstream_sync.validate_upstream_sync_action_envelope(value)
         if schema == production_storage.ACTION_SCHEMA:
             return production_storage.validate_action_envelope(value)
+        if schema == sensitive_report.ACTION_SCHEMA:
+            return sensitive_report.validate_action_envelope(value)
     except (
         storage.PasskeyV2StorageBoundaryError,
         production_cutover.ProductionCutoverPasskeyError,
         upstream_sync.UpstreamSyncPasskeyError,
         production_storage.ProductionStoragePasskeyError,
+        sensitive_report.SensitiveReportPasskeyError,
     ):
         raise PasskeyV2ServiceError("passkey_v2_action_invalid") from None
     raise PasskeyV2ServiceError("passkey_v2_action_schema_forbidden")
@@ -1359,6 +1369,8 @@ def _mechanical_authority_facts(
         return upstream_sync.mechanical_approval_facts(action)
     if payload["schema"] == production_storage.ACTION_SCHEMA:
         return production_storage.mechanical_approval_facts(action)
+    if payload["schema"] == sensitive_report.ACTION_SCHEMA:
+        return sensitive_report.mechanical_approval_facts(action)
     raise PasskeyV2ServiceError("passkey_v2_action_schema_forbidden")
 
 
@@ -2553,7 +2565,7 @@ const bytesToB64 = value => btoa(String.fromCharCode(...new Uint8Array(value))).
 const base = location.pathname;
 const csrf = () => document.cookie.split('; ').find(v => v.startsWith('muncho_csrf='))?.split('=')[1];
 const approve = document.getElementById('approve');
-async function load() { const response=await fetch(base + '/view',{cache:'no-store'}); if(!response.ok) throw new Error('view'); const view=await response.json(); const schemas=new Set(['muncho-passkey-v2-storage-growth-facts.v1','muncho-passkey-v2-production-cutover-facts.v1','muncho-passkey-v2-dual-upstream-sync-facts.v1','muncho-passkey-v2-production-storage-growth-facts.v1']); if(!schemas.has(view.mechanical_facts?.schema)||view.values_are_complete_and_untruncated!==true) throw new Error('facts'); document.getElementById('facts').textContent=JSON.stringify(view.mechanical_facts,null,2); document.getElementById('action').textContent=view.exact_action_envelope_canonical_json; document.getElementById('status').textContent='Review all facts before approval.'; approve.disabled=false; }
+async function load() { const response=await fetch(base + '/view',{cache:'no-store'}); if(!response.ok) throw new Error('view'); const view=await response.json(); const schemas=new Set(['muncho-passkey-v2-storage-growth-facts.v1','muncho-passkey-v2-production-cutover-facts.v1','muncho-passkey-v2-dual-upstream-sync-facts.v1','muncho-passkey-v2-production-storage-growth-facts.v1','muncho-sensitive-report-passkey-mechanical-facts.v1']); if(!schemas.has(view.mechanical_facts?.schema)||view.values_are_complete_and_untruncated!==true) throw new Error('facts'); document.getElementById('facts').textContent=JSON.stringify(view.mechanical_facts,null,2); document.getElementById('action').textContent=view.exact_action_envelope_canonical_json; document.getElementById('status').textContent='Review all facts before approval.'; approve.disabled=false; }
 approve.addEventListener('click', async () => { if(approve.disabled) return; approve.disabled=true; try { const optionsResponse=await fetch(base + '/options',{cache:'no-store'}); if(!optionsResponse.ok) throw new Error('options'); const options=await optionsResponse.json(); options.publicKey.challenge=b64ToBytes(options.publicKey.challenge); options.publicKey.allowCredentials=options.publicKey.allowCredentials.map(v=>({...v,id:b64ToBytes(v.id)})); const value=await navigator.credentials.get(options); const c=value; const assertion={id:c.id,rawId:bytesToB64(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment,clientExtensionResults:c.getClientExtensionResults(),response:{clientDataJSON:bytesToB64(c.response.clientDataJSON),authenticatorData:bytesToB64(c.response.authenticatorData),signature:bytesToB64(c.response.signature),userHandle:c.response.userHandle===null?null:bytesToB64(c.response.userHandle)}}; const response=await fetch(base+'/verify',{method:'POST',headers:{'Content-Type':'application/json','X-Muncho-CSRF':csrf()},body:JSON.stringify({schema:'muncho-passkey-v2-web-verify.v1',assertion:{schema:'muncho-passkey-v2-assertion.v1',credential:assertion}})}); if(!response.ok) throw new Error('verify'); const result=await response.json(); document.getElementById('status').textContent=result.state==='granted'?'Approved. You may return to Muncho.':'Approval failed.'; } catch (_error) { document.getElementById('status').textContent='Approval failed safely.'; approve.disabled=false; }});
 load().catch(()=>{approve.disabled=true;document.getElementById('status').textContent='Request unavailable.';});
 """

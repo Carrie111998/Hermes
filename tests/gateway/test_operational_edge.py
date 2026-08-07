@@ -316,6 +316,8 @@ def test_mutation_capability_is_exactly_bound_to_writer_plan_intent() -> None:
         idempotency_key=intent.idempotency_key,
         issued_at_unix_ms=1_000,
         expires_at_unix_ms=2_000,
+        subject_discord_user_id="1391703330711142472",
+        case_id="case:case-1",
     )
     envelope = sign_envelope(
         capability.to_mapping(), key_id="canonical-writer-v1", private_key=private_key
@@ -334,6 +336,8 @@ def test_mutation_capability_is_exactly_bound_to_writer_plan_intent() -> None:
         now_unix_ms=1_500,
     )
     assert verified.authority_ref == "plan:case-1:lease-7"
+    assert verified.subject_discord_user_id == "1391703330711142472"
+    assert verified.case_id == "case:case-1"
 
     changed = OperationalRequest(
         request_id=str(uuid.uuid4()),
@@ -374,7 +378,7 @@ def test_existing_writer_consume_issues_edge_capability_from_same_plan_lease() -
         platform="discord",
         session_key_sha256="1" * 64,
         capability_epoch_sha256="2" * 64,
-        user_id="owner-1",
+        user_id="1279454038731264061",
         chat_id="public-channel-1",
         thread_id="public-thread-1",
         message_id="message-1",

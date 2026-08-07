@@ -30,7 +30,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 
 PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
-CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v2"
+CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v3"
 RECEIPT_SCHEMA = "muncho-operational-edge-receipt.v2"
 PREDISPATCH_MUTATION_BLOCKERS = frozenset(
     {
@@ -52,6 +52,8 @@ _OPERATION = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+){1,7}$")
 _IDEMPOTENCY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,239}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_DISCORD_ID = re.compile(r"^[1-9][0-9]{16,21}$")
+_CASE_ID = re.compile(r"^case:[A-Za-z0-9][A-Za-z0-9._:/-]{0,190}$")
 OPERATOR_TIERS = ("standard", "top", "owner")
 
 
@@ -235,6 +237,8 @@ class OperationalCapability:
     idempotency_key: str
     issued_at_unix_ms: int
     expires_at_unix_ms: int
+    subject_discord_user_id: str
+    case_id: str
     operator_tier: str = "standard"
 
     @classmethod
@@ -251,6 +255,8 @@ class OperationalCapability:
                     "idempotency_key",
                     "issued_at_unix_ms",
                     "expires_at_unix_ms",
+                    "subject_discord_user_id",
+                    "case_id",
                     "operator_tier",
                 }
             ),
@@ -275,6 +281,15 @@ class OperationalCapability:
         operator_tier = raw["operator_tier"]
         if operator_tier not in OPERATOR_TIERS:
             _fail("invalid_capability_operator_tier")
+        subject_discord_user_id = raw["subject_discord_user_id"]
+        case_id = raw["case_id"]
+        if (
+            not isinstance(subject_discord_user_id, str)
+            or _DISCORD_ID.fullmatch(subject_discord_user_id) is None
+        ):
+            _fail("invalid_capability_subject")
+        if not isinstance(case_id, str) or _CASE_ID.fullmatch(case_id) is None:
+            _fail("invalid_capability_case")
         return cls(
             authority_kind="canonical_plan",
             authority_ref=authority_ref,
@@ -285,6 +300,8 @@ class OperationalCapability:
             idempotency_key=_idempotency(raw["idempotency_key"]),
             issued_at_unix_ms=issued,
             expires_at_unix_ms=expires,
+            subject_discord_user_id=subject_discord_user_id,
+            case_id=case_id,
             operator_tier=operator_tier,
         )
 
@@ -298,6 +315,8 @@ class OperationalCapability:
             "idempotency_key": self.idempotency_key,
             "issued_at_unix_ms": self.issued_at_unix_ms,
             "expires_at_unix_ms": self.expires_at_unix_ms,
+            "subject_discord_user_id": self.subject_discord_user_id,
+            "case_id": self.case_id,
             "operator_tier": self.operator_tier,
         }
 
