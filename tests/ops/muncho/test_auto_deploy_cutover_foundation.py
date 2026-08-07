@@ -630,6 +630,21 @@ CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
 bootstrap_cutover_unit_inputs_from_target() {{
   [ "$3" = 8 ]
   [ -e /dev/fd/8 ]
+  "$SYSTEM_PYTHON" -c '
+import fcntl
+import os
+import sys
+descriptor = os.open(sys.argv[1], os.O_RDWR)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit("activation lock was released before bootstrap")
+finally:
+    os.close(descriptor)
+' "$CUTOVER_ACTIVATION_LOCK_PATH"
   : > {json.dumps(str(bootstrap_marker))}
   return 0
 }}
