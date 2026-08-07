@@ -15381,6 +15381,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.text = moa_payload
                 _moa_state = self._session_state(_quick_key)
                 event._moa_restore_override = _moa_state.conversation.model_override
+                # Seed session-level restore so /stop can revert MoA without
+                # the per-turn event. Outer finally is generation-scoped and
+                # will skip after invalidate; without this, MoA would leak.
+                if _moa_state.conversation.one_turn_restore is None:
+                    _moa_state.conversation.one_turn_restore = (
+                        self._snapshot_session_model_override(_quick_key)
+                    )
                 _moa_state.conversation.model_override = {
                     "provider": "moa",
                     "model": preset,
@@ -15725,18 +15732,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # out of scope — so if _handle_message_with_agent raises, a restore
             # in the try block would be skipped and the MoA override would leak
             # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            # Putting restores in finally guarantees the revert on success,
+            # exception, and interrupt alike — but only while THIS generation
+            # still owns the session. After /stop clears the slot, a follow-up
+            # turn may already have a new model_override / agent cache entry;
+            # applying our one-shot restore then would clobber it. Interrupt
+            # itself restores pending one-shot state after the generation bump.
+            if self._is_session_run_current(_quick_key, _run_generation):
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
+            # Generation-scoped release on every exit path. A /stop or /new that
+            # bumped the generation while this turn was in flight has already
+            # cleared the slot at interrupt/reset time (#28686); a follow-up turn
+            # may already own _running_agents. Releasing without run_generation
+            # would pop that newer entry and make the session look idle while
+            # the fresh agent is still running — the #11016 ownership invariant.
+            # When this generation is still current, the guarded pop clears our
+            # own sentinel/agent (normal completion / early return).
+            self._release_running_agent_state(
+                _quick_key, run_generation=_run_generation
+            )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
@@ -23109,6 +23124,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name=f"gateway-turn-reaper-{_process_task_id[:12]}",
                 daemon=True,
             ).start()
+        # Clear immediately after the bump. Outer dispatch finally is now
+        # generation-scoped (#11016) and will NOT clear a stale zombie for us
+        # (#28686). Do this before any await so an adapter interrupt failure
+        # cannot leave the slot locked forever.
+        if release_running_state:
+            self._release_running_agent_state(session_key)
+            # Revert /model --once and /moa one-shot overrides now. Outer
+            # finally is generation-scoped and will not restore for this turn
+            # after the bump; skipping here would leak MoA/--once forever
+            # when /stop has no immediate follow-up.
+            self._restore_pending_one_turn_model_override(session_key)
+            # Evict the cached agent: ``_interrupt_requested`` is only
+            # cleared by the turn finalizer, so on a hung or still-draining
+            # run the flag survives the lock release and kills the session's
+            # NEXT message at the top of the tool loop (interrupted=True,
+            # api_calls=0, empty response — silently swallowed, #44212).
+            # Evicting mirrors the /new and /model paths: the next message
+            # rebuilds the agent from session history, while the old agent
+            # object keeps its interrupt flag so a hung drain still dies
+            # when it unblocks.
+            self._evict_cached_agent(session_key)
         adapter = self._adapter_for_source(source)
         interrupt_session_activity = getattr(
             type(adapter), "interrupt_session_activity", None
@@ -23123,28 +23159,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except (TypeError, ValueError):
                 accepts_metadata = False
-            if accepts_metadata:
-                await adapter.interrupt_session_activity(
-                    session_key, source.chat_id, metadata=metadata
+            try:
+                if accepts_metadata:
+                    await adapter.interrupt_session_activity(
+                        session_key, source.chat_id, metadata=metadata
+                    )
+                else:
+                    await adapter.interrupt_session_activity(
+                        session_key, source.chat_id
+                    )
+            except Exception:
+                logger.debug(
+                    "interrupt_session_activity failed for %s",
+                    session_key,
+                    exc_info=True,
                 )
-            else:
-                await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            try:
+                adapter.get_pending_message(session_key)  # consume and discard
+            except Exception:
+                logger.debug(
+                    "get_pending_message failed for %s",
+                    session_key,
+                    exc_info=True,
+                )
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
-        if release_running_state:
-            self._release_running_agent_state(session_key)
-            # Evict the cached agent: ``_interrupt_requested`` is only
-            # cleared by the turn finalizer, so on a hung or still-draining
-            # run the flag survives the lock release and kills the session's
-            # NEXT message at the top of the tool loop (interrupted=True,
-            # api_calls=0, empty response — silently swallowed, #44212).
-            # Evicting mirrors the /new and /model paths: the next message
-            # rebuilds the agent from session history, while the old agent
-            # object keeps its interrupt flag so a hung drain still dies
-            # when it unblocks.
-            self._evict_cached_agent(session_key)
+        # release_running_state + cache eviction already ran above, before any
+        # adapter await, so a mid-path adapter failure cannot leave a zombie.
 
     async def _refresh_agent_cache_message_count(
         self, session_key: str, session_id: Optional[str]
