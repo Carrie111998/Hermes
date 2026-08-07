@@ -220,7 +220,17 @@ def _(rid, params: dict) -> dict:
             # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    # active_only=True: replace only the live (active=1) rows.
+                    # In-place compaction (#38763) keeps the pre-compaction
+                    # transcript as active=0/compacted=1 rows under this same
+                    # session key; a bare replace_messages() would DELETE that
+                    # durable archive on every edit/regenerate — the same bug
+                    # class #80216 fixed for /retry. On an uncompacted session
+                    # all rows are active=1, so this is behaviorally identical
+                    # to the full replace.
+                    db.replace_messages(
+                        session["session_key"], truncated, active_only=True
+                    )
                 except Exception as exc:
                     logger.error(
                         "prompt.submit: replace_messages failed for session %s "
@@ -891,6 +901,14 @@ def _(rid, params: dict) -> dict:
     # allow_expired=True: the read_terminal tool's _block() uses a short 30s
     # timeout, so a slow renderer losing the race is the common case — a late
     # response must not error after the tool already returned empty.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
+@method("preview.read.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string of the active preview tab's serialized contents.
+    # allow_expired=True for the same reason as terminal.read: the tool's
+    # bounded wait can expire while a slow page extraction is still running.
     return _respond(rid, params, "text", allow_expired=True)
 
 
