@@ -4353,7 +4353,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4382,6 +4382,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
                     "session_id": "trunc-sid",
                     "text": "next",
                     "truncate_before_user_ordinal": -1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -4394,17 +4395,82 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
         server._sessions.pop("trunc-sid", None)
 
 
-def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
-    """Stale truncate_before_user_ordinal=0 must not wipe a non-empty transcript.
+def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
+    """An ordinal without confirm_truncate must not drop the session tail.
 
-    Desktop desync can attach ordinal 0 to an ordinary fresh submit. That cuts
-    at the first user message (history[:0] == []) and replace_messages() would
-    DELETE every durable row. Refuse unless confirm_empty_truncate is set.
+    #80763: a desktop client carried a leftover truncate_before_user_ordinal
+    into an ORDINARY submit. The request was indistinguishable from a real
+    rewind — in-range ordinal, non-empty result — so the empty-truncation guard
+    never fired and replace_messages() DELETEd 244 durable rows (296 -> 52).
+    Intent has to be stated: refuse on 4029 and leave memory and DB untouched.
     """
     replaced = []
 
     class _FakeDB:
         def replace_messages(self, key, messages):
+            replaced.append((key, list(messages)))
+
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "third"},
+        {"role": "assistant", "content": "sure"},
+    ]
+    server._sessions["unconfirmed-trunc-sid"] = _session(history=list(history))
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    def _submit(**extra):
+        return server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "unconfirmed-trunc-sid",
+                    "text": "an ordinary typed message",
+                    "truncate_before_user_ordinal": 2,
+                    **extra,
+                },
+            }
+        )
+
+    try:
+        resp = _submit()
+        assert resp["error"]["code"] == 4029
+        assert "confirm_truncate" in resp["error"]["message"]
+        # Explicit falsey values must not satisfy the opt-in either.
+        for falsey in (False, 0, "", "false", "no"):
+            assert _submit(confirm_truncate=falsey)["error"]["code"] == 4029, falsey
+        # confirm_empty_truncate is a different gate — it must not stand in for
+        # rewind intent on a cut that leaves the transcript non-empty.
+        assert _submit(confirm_empty_truncate=True)["error"]["code"] == 4029
+        session = server._sessions["unconfirmed-trunc-sid"]
+        assert session["history"] == history
+        assert session["history_version"] == 0
+        assert session["running"] is False
+        assert replaced == []
+    finally:
+        server._sessions.pop("unconfirmed-trunc-sid", None)
+
+
+def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
+    """A confirmed rewind still must not wipe a non-empty transcript by accident.
+
+    Ordinal 0 cuts at the first user message (history[:0] == []) and
+    replace_messages() would DELETE every durable row. Even a submit that
+    declares rewind intent needs the second opt-in for that edge.
+    """
+    replaced = []
+
+    class _FakeDB:
+        def replace_messages(self, key, messages, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4432,6 +4498,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                     "session_id": "empty-trunc-sid",
                     "text": "fresh typed message",
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -4447,6 +4514,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                         "session_id": "empty-trunc-sid",
                         "text": "fresh typed message",
                         "truncate_before_user_ordinal": 0,
+                        "confirm_truncate": True,
                         "confirm_empty_truncate": falsey,
                     },
                 }
@@ -4489,7 +4557,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4517,6 +4585,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
                     "session_id": "confirm-empty-sid",
                     "text": "first",
                     "truncate_before_user_ordinal": 0,
+                    "confirm_truncate": True,
                     "confirm_empty_truncate": True,
                 },
             }
@@ -8759,6 +8828,66 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
+    """rollback.restore must not truncate from a legacy standalone compaction
+    handoff — a durable role=user row persisted pre-#80622 with NO
+    display_kind. Same bug class as the display_kind marker above, caught
+    only by the is_user_originated_turn predicate.
+    """
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        HISTORICAL_TASK_HEADING,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+
+    class _Mgr:
+        enabled = True
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "abc123"}]
+
+        def restore(self, cwd, target, file_path=None):
+            return {"success": True, "message": "restored"}
+
+    handoff = {
+        "role": "user",
+        "content": (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n"
+            f"User asked: 'old task'\n\n{_SUMMARY_END_MARKER}"
+        ),
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+        # NOTE: no display_kind — the legacy-persistence shape (#80622).
+    }
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+        handoff,
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+        history=list(history),
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "rollback.restore",
+                "params": {"session_id": "sid", "hash": "abc123"},
+            }
+        )
+
+        assert resp["result"]["success"] is True
+        # Truncation lands on "second question", not the handoff row.
+        assert resp["result"]["history_removed"] == 3  # q2 + a2 + handoff
+        remaining = server._sessions["sid"]["history"]
+        assert [m["content"] for m in remaining] == ["first question", "first answer"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ── session.steer ────────────────────────────────────────────────────
 
 
@@ -9054,6 +9183,101 @@ def test_session_undo_allowed_when_idle():
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert resp["result"]["removed"] == 2
         assert server._sessions["sid"]["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_undo_skips_legacy_compaction_handoff_without_display_kind():
+    """Undo removes the real exchange, not a persisted role=user handoff."""
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        HISTORICAL_TASK_HEADING,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+
+    handoff = {
+        "role": "user",
+        "content": (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n"
+            "User asked: 'already completed work'\n\n"
+            f"{_SUMMARY_END_MARKER}"
+        ),
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+        COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: True,
+        # Legacy persisted shape: no display_kind marker.
+    }
+    server._sessions["sid"] = _session(
+        running=False,
+        history=[
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+            handoff,
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["removed"] == 3
+        assert server._sessions["sid"]["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    "scaffolding_kind",
+    [
+        pytest.param("wire-summary", id="metadata-stripped-wire-summary"),
+        pytest.param("hidden-summary", id="modern-hidden-summary"),
+        pytest.param("continuation", id="compression-continuation"),
+    ],
+)
+def test_session_undo_skips_modern_compaction_scaffolding(scaffolding_kind):
+    """Modern reference/continuation rows are not undo turn boundaries."""
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        COMPRESSION_CONTINUATION_USER_CONTENT,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+
+    if scaffolding_kind == "continuation":
+        scaffolding = {
+            "role": "user",
+            "content": COMPRESSION_CONTINUATION_USER_CONTENT,
+        }
+    else:
+        scaffolding = {
+            "role": "user",
+            "content": f"{SUMMARY_PREFIX}\nreference only\n{_SUMMARY_END_MARKER}",
+        }
+        if scaffolding_kind == "hidden-summary":
+            scaffolding[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            scaffolding["display_kind"] = "hidden"
+
+    first_exchange = [
+        {"role": "user", "content": "keep question"},
+        {"role": "assistant", "content": "keep answer"},
+    ]
+    server._sessions["sid"] = _session(
+        running=False,
+        history=first_exchange
+        + [
+            {"role": "user", "content": "undo question"},
+            {"role": "assistant", "content": "undo answer"},
+            scaffolding,
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["removed"] == 3
+        assert server._sessions["sid"]["history"] == first_exchange
     finally:
         server._sessions.pop("sid", None)
 
@@ -9450,8 +9674,8 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
-            self.replaced.append((session_id, list(messages)))
+        def replace_messages(self, session_id, messages, active_only=False):
+            self.replaced.append((session_id, list(messages), active_only))
 
     stub_db = _StubDb()
 
@@ -9470,6 +9694,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                     "session_id": "sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -9483,7 +9708,9 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        assert stub_db.replaced == [("session-key", original_history[:2])]
+        assert stub_db.replaced == [
+            ("session-key", original_history[:2], True)
+        ]
     finally:
         server._sessions.pop("sid", None)
 
@@ -9506,7 +9733,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     server._sessions["trunc-fail-sid"] = sess
 
     class _FailDb:
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, active_only=False):
             raise OSError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
@@ -9526,6 +9753,7 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
                     "session_id": "trunc-fail-sid",
                     "text": "edited second",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
@@ -9597,7 +9825,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, active_only=False):
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -9619,6 +9847,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
                     "session_id": "sid",
                     "text": "edited first",
                     "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
                 },
             }
         )
