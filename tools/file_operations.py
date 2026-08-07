@@ -179,6 +179,10 @@ class WriteResult:
     bytes_written: int = 0
     dirs_created: bool = False
     lint: Optional[Dict[str, Any]] = None
+    # Whether the file changed.
+    applied: Optional[bool] = None
+    # Lint result; None when skipped.
+    validated: Optional[bool] = None
     # Semantic diagnostics from the LSP layer, when applicable.  Kept in
     # its own field (not folded into ``lint``) so the model and any
     # downstream parsers can read syntax errors and semantic errors as
@@ -202,6 +206,10 @@ class PatchResult:
     files_created: List[str] = field(default_factory=list)
     files_deleted: List[str] = field(default_factory=list)
     lint: Optional[Dict[str, Any]] = None
+    # Whether the file changed.
+    applied: Optional[bool] = None
+    # Lint result; None when skipped.
+    validated: Optional[bool] = None
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
@@ -218,6 +226,10 @@ class PatchResult:
             result["files_deleted"] = self.files_deleted
         if self.lint:
             result["lint"] = self.lint
+        if self.applied is not None:
+            result["applied"] = self.applied
+        if self.validated is not None:
+            result["validated"] = self.validated
         if self.lsp_diagnostics:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
@@ -326,6 +338,32 @@ class LintResult:
         if self.message:
             result["message"] = self.message
         return result
+
+
+def _introduced_lint_failure(lint_result: LintResult) -> bool:
+    """Return whether this edit introduced a lint failure.
+
+    Lint is normally advisory.  A syntax/lint error that was already present
+    before the edit is not attributable to this operation, so it remains
+    advisory.  A post-edit error without that pre-existing marker must be
+    treated as an incomplete mutation: the file changed, but the agent must
+    repair it before continuing.
+    """
+    if lint_result.success or lint_result.skipped:
+        return False
+    if "pre-existing lint errors" in (lint_result.message or "").lower():
+        return False
+    return True
+
+
+def _validation_failure_error(path: str, lint_result: LintResult) -> str:
+    """Make a validation failure impossible to mistake for a clean edit."""
+    detail = str(lint_result.output or "Validation failed").strip()
+    return (
+        f"VALIDATION FAILED AFTER EDIT: '{path}' was modified but is not valid. "
+        f"Do not treat this edit as complete; repair the reported error before continuing. "
+        f"{detail}"
+    )
 
 
 @dataclass
@@ -1526,6 +1564,8 @@ class ShellFileOperations(FileOperations):
 
         # Post-write lint with delta refinement.
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
+        introduced_lint_failure = _introduced_lint_failure(lint_result)
+        validated = None if lint_result.skipped else lint_result.success
 
         # Semantic diagnostics from the LSP layer — separate channel.
         # Only fired when the syntax tier reported clean (no point asking
@@ -1545,7 +1585,10 @@ class ShellFileOperations(FileOperations):
             bytes_written=bytes_written,
             dirs_created=dirs_created,
             lint=lint_result.to_dict() if lint_result else None,
+            applied=True,
+            validated=validated,
             lsp_diagnostics=lsp_diagnostics,
+            error=_validation_failure_error(path, lint_result) if introduced_lint_failure else None,
         )
     
     # =========================================================================
@@ -1620,6 +1663,20 @@ class ShellFileOperations(FileOperations):
         # Write back
         write_result = self.write_file(path, new_content)
         if write_result.error:
+            # write_file may have persisted the bytes and then deliberately
+            # failed validation. Preserve that distinct state at the patch
+            # boundary instead of collapsing it into an ordinary write error.
+            if write_result.applied and write_result.validated is False:
+                return PatchResult(
+                    success=False,
+                    diff=self._unified_diff(content, new_content, path),
+                    files_modified=[path],
+                    lint=write_result.lint,
+                    applied=True,
+                    validated=False,
+                    lsp_diagnostics=write_result.lsp_diagnostics,
+                    error=write_result.error,
+                )
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
 
         # Post-write verification — re-read the file and confirm the bytes we
@@ -1661,12 +1718,16 @@ class ShellFileOperations(FileOperations):
         # by this patch, filtering out pre-existing lint failures so the
         # agent isn't distracted by problems that were already there.
         lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
+        introduced_lint_failure = _introduced_lint_failure(lint_result)
+        validated = None if lint_result.skipped else lint_result.success
 
         return PatchResult(
-            success=True,
+            success=not introduced_lint_failure,
             diff=diff,
             files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
+            applied=True,
+            validated=validated,
             # Propagate the LSP diagnostics already captured by the
             # internal ``write_file`` call.  Its baseline was the
             # pre-patch content (taken at the start of write_file via
@@ -1674,6 +1735,7 @@ class ShellFileOperations(FileOperations):
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
+            error=_validation_failure_error(path, lint_result) if introduced_lint_failure else None,
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
