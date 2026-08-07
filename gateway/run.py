@@ -2585,6 +2585,15 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
+# This env var is internal bridge plumbing, not a user-facing configuration
+# source. Initialize it from the canonical config default after dotenv loading
+# so an ambient process/.env value can never control lease safety on its own.
+from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+
+os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
+    _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
+)
+
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / "config.yaml"
@@ -2743,6 +2752,10 @@ if not _REQUIRED_CANONICAL_IMPORT_QUARANTINE and _config_path.exists():
                 os.environ["HERMES_MAX_ITERATIONS"] = str(_agent_cfg["max_turns"])
             if "gateway_timeout" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT"] = str(_agent_cfg["gateway_timeout"])
+            if "gateway_turn_lease_timeout" in _agent_cfg:
+                os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
+                    _agent_cfg["gateway_turn_lease_timeout"]
+                )
             if "gateway_timeout_warning" in _agent_cfg:
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(
                     _agent_cfg["gateway_timeout_warning"]
@@ -2959,7 +2972,11 @@ from gateway.delivery import (
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
 )
-from gateway.turn_lease import SessionTurnLeaseRegistry
+from gateway.turn_lease import (
+    DEFAULT_LEASE_WAIT,
+    SessionTurnLeaseRegistry,
+    TurnLeaseTimeoutError,
+)
 from gateway.session_state import (
     SERVICE_TIER_UNSET as _SERVICE_TIER_UNSET,
     SessionState,
@@ -9758,6 +9775,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # it: the caller sees CancelledError, the handler runs to completion.
         await asyncio.shield(task)
 
+    def _queue_retryable_fatal_platform(self, adapter: BasePlatformAdapter) -> bool:
+        """Queue a retryable fatal adapter for background reconnection.
+
+        Returns True when the platform was newly queued. Idempotent if already
+        queued. Must not await: callers invoke this *before* any disconnect
+        await so a wedged close cannot strand the platform (#80598).
+        """
+        if not adapter.fatal_error_retryable:
+            return False
+        platform_config = self.config.platforms.get(adapter.platform)
+        if not platform_config or adapter.platform in self._failed_platforms:
+            return False
+        self._failed_platforms[adapter.platform] = {
+            "config": platform_config,
+            "attempts": 0,
+            "next_retry": time.monotonic(),
+            "credential_claim": self._adapter_credential_claim(
+                adapter.platform, adapter
+            ),
+            "listener_claim": self._adapter_listener_claim(
+                adapter.platform, adapter
+            ),
+        }
+        logger.info(
+            "%s queued for background reconnection",
+            adapter.platform.value,
+        )
+        # Ensure the reconnect watcher is alive — if it died (e.g. from
+        # exhausting its restart budget), respawn it so queued platforms
+        # are not permanently stranded (#70344).
+        self._ensure_reconnect_watcher_running()
+        return True
+
     async def _handle_adapter_fatal_error_detached(
         self, adapter: BasePlatformAdapter
     ) -> None:
@@ -9766,12 +9816,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         gateway with failure so the service manager restarts it instead of
         leaving a silent partial outage."""
         try:
-            await self._handle_adapter_fatal_error_impl(adapter)
+            # Outer hard deadline (#80598): even with queue-before-disconnect,
+            # a hang anywhere in the impl (status write side effects, detach
+            # races, etc.) must not leave this task wedged forever — the
+            # stranded check in ``finally`` only runs when we return.
+            timeout = self._adapter_disconnect_timeout_secs()
+            if timeout <= 0:
+                await self._handle_adapter_fatal_error_impl(adapter)
+            else:
+                # Disconnect budget plus a small overhead for queue/status
+                # bookkeeping. Keep the additive proportional so tests that
+                # shrink the disconnect timeout still finish promptly.
+                outer = timeout + min(2.0, max(0.05, timeout))
+                completed = await self._await_adapter_cleanup_with_timeout(
+                    self._handle_adapter_fatal_error_impl(adapter),
+                    outer,
+                )
+                if not completed:
+                    logger.error(
+                        "Fatal-error handling for %s timed out after %.1fs; "
+                        "ensuring reconnect queue is populated",
+                        adapter.platform.value,
+                        outer,
+                    )
+                    self._queue_retryable_fatal_platform(adapter)
+        except asyncio.CancelledError:
+            # Best-effort queue before re-raising: a cancelled fatal handler
+            # must not strand a retryable platform (#80598).
+            try:
+                self._queue_retryable_fatal_platform(adapter)
+            except Exception:
+                logger.debug(
+                    "Failed to queue %s after fatal-handler cancellation",
+                    adapter.platform.value,
+                    exc_info=True,
+                )
+            raise
         except Exception:
             logger.exception(
                 "Fatal-error handling for %s raised unexpectedly",
                 adapter.platform.value,
             )
+            # Best-effort queue so an unexpected raise mid-handler cannot
+            # leave a retryable platform permanently deaf (#80598).
+            try:
+                self._queue_retryable_fatal_platform(adapter)
+            except Exception:
+                logger.debug(
+                    "Failed to queue %s after fatal-handler exception",
+                    adapter.platform.value,
+                    exc_info=True,
+                )
         finally:
             platform = adapter.platform
             shutdown_event = getattr(self, "_shutdown_event", None)
@@ -9842,28 +9937,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the same object twice.
             self.adapters.pop(adapter.platform, None)
             self.delivery_router.adapters = self.adapters
+
+        # Queue retryable failures BEFORE any disconnect await (#80598).
+        # A half-dead transport can wedge native close() (or swallow
+        # CancelledError inside it) so the previous "disconnect then queue"
+        # order left platforms permanently deaf inside a live process even
+        # after the network recovered. Populate the queue first so the
+        # reconnect watcher always has work; teardown is best-effort after.
+        self._queue_retryable_fatal_platform(adapter)
+
+        if existing is adapter:
             # A half-closed transport can wedge an adapter's native close()
             # indefinitely. Reuse the shutdown-path timeout so this runtime
-            # fatal handler always reaches the reconnect queue.
+            # fatal handler always returns to the stay-alive / stranded path.
             await self._safe_adapter_disconnect(adapter, adapter.platform)
-
-        # Queue retryable failures for background reconnection
-        if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
-                    "attempts": 0,
-                    "next_retry": time.monotonic(),
-                }
-                logger.info(
-                    "%s queued for background reconnection",
-                    adapter.platform.value,
-                )
-                # Ensure the reconnect watcher is alive — if it died (e.g. from
-                # exhausting its restart budget), respawn it so queued platforms
-                # are not permanently stranded (#70344).
-                self._ensure_reconnect_watcher_running()
 
         if not self.adapters and not self._failed_platforms:
             self._exit_reason = (
@@ -14453,6 +14540,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 finally:
                     _clear_planned_restart_notification()
+
+        # Muncho release announcements are queued only after the external
+        # deploy coordinator has verified the exact active SHA and production
+        # smokes. Start this watcher after restart/startup lifecycle messages
+        # so a verified announcement is the next release lifecycle message.
+        # The watcher uses only the live Relay -> privileged Discord connector
+        # transport; it never loads a bot token or enables direct REST egress.
+        _muncho_release_state = (
+            Path(_hermes_home) / "state" / "private" / "muncho-release"
+        )
+        if _muncho_release_state.is_dir():
+            self._spawn_supervised(
+                self._muncho_release_announcement_watcher,
+                "muncho_release_announcement_watcher",
+            )
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -19229,9 +19331,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(
-                event, source, _quick_key, _run_generation
-            )
+            try:
+                _agent_result = await self._handle_message_with_agent(
+                    event, source, _quick_key, _run_generation
+                )
+            except TurnLeaseTimeoutError as exc:
+                # This is a rejected message, not a completed agent turn. Keep
+                # the resend notice outside the model-authored goal finalization
+                # path, which only runs inside a healthy agent turn boundary.
+                logger.error(
+                    "Rejecting turn for routing key %s on session %s after "
+                    "turn-lease timeout; transcript load was not started and "
+                    "the user must resend",
+                    _quick_key,
+                    exc.session_id,
+                )
+                return (
+                    "⏳ Another turn is still running on this session. To "
+                    "protect the transcript, this message was not processed. "
+                    "Wait for the active turn to finish, then resend it."
+                )
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -20255,19 +20374,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stale history base and interleaving transcript writes. Same-key
         # messages never reach this point mid-turn (adapter + runner guards
         # hold them), so the lock is uncontended outside the alias-key route.
-        # Fail-open: on timeout the token comes back degraded and the turn
-        # proceeds unserialized (never a wedged session). Released in
-        # _handle_message's finally via _release_turn_lease — granted per
-        # (routing key, run generation) so a stale unwind can't release a
-        # newer turn's lease.
+        # Fail-closed on timeout: never enter the transcript region without a
+        # lease. Outer dispatch returns a bounded rejection/resend notice rather
+        # than recreating the exact concurrent-turn corruption this lease exists
+        # to prevent. Released in _handle_message's finally via
+        # _release_turn_lease — granted per (routing key, run generation) so a
+        # stale unwind can't release a newer turn's lease.
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is not None:
-            _lease_token = await _lease_registry.acquire(
-                session_entry.session_id,
-                owner_key=_quick_key,
-                generation=run_generation,
-                timeout=_float_env("HERMES_AGENT_TIMEOUT", 1800),
-            )
+            try:
+                _lease_token = await _lease_registry.acquire(
+                    session_entry.session_id,
+                    owner_key=_quick_key,
+                    generation=run_generation,
+                    timeout=_float_env(
+                        "HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT
+                    ),
+                )
+            except TurnLeaseTimeoutError:
+                # The broad session-context cleanup finally starts later in this
+                # method. Restore the tokens here before propagating the rejection
+                # to outer dispatch, or this early exit leaks task-local identity.
+                self._clear_session_env(_session_env_tokens)
+                raise
             if _lease_token is not None:
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
@@ -26815,6 +26944,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except RuntimeError:
             logger.debug("Skipping update notification watcher: no running event loop")
+
+    async def _muncho_release_announcement_watcher(
+        self,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Deliver strict post-smoke release requests through the live relay."""
+
+        from hermes_cli.config import load_config_readonly
+        from ops.muncho.release.gateway_delivery import (
+            dispatch_pending_gateway_discord_deliveries,
+        )
+        from ops.muncho.release.metadata import resolve_exact_release_sha
+
+        state_dir = Path(_hermes_home) / "state" / "private" / "muncho-release"
+        previous_projection: tuple[tuple[str, str, str], ...] = ()
+        while self._running:
+            try:
+                deployed_sha = resolve_exact_release_sha()
+                if deployed_sha is not None:
+                    outcomes = await dispatch_pending_gateway_discord_deliveries(
+                        state_dir=state_dir,
+                        gateway_config=self.config,
+                        adapters=self.adapters,
+                        production_config=load_config_readonly() or {},
+                        deployed_release_sha=deployed_sha,
+                        active_service_invocation_id=os.environ.get("INVOCATION_ID"),
+                    )
+                    projection = tuple(
+                        (
+                            str(item.get("release_sha", ""))[:8],
+                            str(item.get("summary_sha256", "")),
+                            str(item.get("state", "")),
+                        )
+                        for item in outcomes
+                    )
+                    if projection and projection != previous_projection:
+                        logger.info(
+                            "Muncho release announcement edge: %s",
+                            ", ".join(
+                                f"{short}:{state}"
+                                for short, _digest, state in projection
+                            ),
+                        )
+                    previous_projection = projection
+            except Exception as exc:
+                projection = (("", "", f"error:{type(exc).__name__}"),)
+                if projection != previous_projection:
+                    logger.warning(
+                        "Muncho release announcement edge blocked: %s",
+                        type(exc).__name__,
+                    )
+                previous_projection = projection
+            await asyncio.sleep(poll_interval)
 
     async def _watch_update_progress(
         self,

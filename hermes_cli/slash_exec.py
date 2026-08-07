@@ -67,10 +67,10 @@ class CommandReply:
 # ---------------------------------------------------------------------------
 
 def _exec_version(ctx: CommandContext) -> CommandReply:
-    """Core /version text — the banner version label."""
-    from hermes_cli.banner import format_banner_version_label
+    """Core /version text shared by CLI and messaging gateways."""
+    from hermes_cli.version_info import format_version_command_label
 
-    return CommandReply(format_banner_version_label())
+    return CommandReply(format_version_command_label())
 
 
 def _exec_egress(ctx: CommandContext) -> CommandReply:

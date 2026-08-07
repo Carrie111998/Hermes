@@ -122,7 +122,12 @@ class _Backend:
         return DiscordConnectorAcceptedMessage("500", self.verified)
 
 
-def _send_request(*, content: str = "do the task", key: str = "case:1"):
+def _send_request(
+    *,
+    content: str = "do the task",
+    key: str = "case:1",
+    deadline_offset_ms: int = 5_000,
+):
     return parse_request(
         request_message(
             DiscordConnectorKind.MESSAGE_SEND,
@@ -131,7 +136,7 @@ def _send_request(*, content: str = "do the task", key: str = "case:1"):
                 "target": _target().to_mapping(),
                 "content": content,
                 "reply_to_message_id": None,
-                "deadline_unix_ms": int(time.time() * 1_000) + 5_000,
+                "deadline_unix_ms": int(time.time() * 1_000) + deadline_offset_ms,
             },
         )
     )
@@ -546,9 +551,14 @@ def test_send_is_idempotent_and_changed_payload_never_redispatches(tmp_path) -> 
 
     first = runtime.handle(request)
     replay = runtime.handle(request)
+    fresh_deadline_replay = runtime.handle(
+        _send_request(key="case:1", deadline_offset_ms=10_000)
+    )
     assert first["status"] == "ok"
     assert replay["status"] == "ok"
     assert replay["replayed"] is True
+    assert fresh_deadline_replay["status"] == "ok"
+    assert fresh_deadline_replay["replayed"] is True
     assert backend.sends == 1
 
     with pytest.raises(DiscordConnectorServiceError, match="send_idempotency_conflict"):

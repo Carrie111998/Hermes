@@ -104,13 +104,16 @@ def test_wheel_build_allows_exact_sealed_release_roles(sealed_build, tmp_path):
     assert len(wheels) == 1
     with zipfile.ZipFile(wheels[0]) as archive:
         packaged = set(archive.namelist())
-    observer_manifest = "plugins/muncho_canary_evidence/plugin.yaml"
-    assert observer_manifest in packaged
+    required_manifests = {
+        "plugins/muncho_canary_evidence/plugin.yaml",
+        "plugins/platforms/discord/plugin.yaml",
+    }
+    assert required_manifests <= packaged
     assert {
         name
         for name in packaged
         if name.startswith("plugins/") and name.endswith("/plugin.yaml")
-    } == {observer_manifest}
+    } == required_manifests
 
 
 @pytest.mark.parametrize(

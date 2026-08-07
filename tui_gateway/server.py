@@ -808,13 +808,27 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         pass
 
 
-class _SessionDBHandle:
-    """Idempotent owner for one non-launch SessionDB handle.
+def _transfer_db_to_agent(agent, db) -> bool:
+    """Hand a dedicated profile handle to the agent that actually holds it."""
 
-    A profile agent needs a long-lived handle, but ``AIAgent.close()`` only
-    finalizes the row; it does not close the SQLite connection.  Keeping the
-    close-once token on the registered gateway session makes teardown the
-    single lifecycle owner while remaining safe under build/close races.
+    if agent is None or db is None:
+        return False
+    try:
+        if getattr(agent, "_session_db", None) is not db:
+            return False
+        agent._owns_session_db = True
+        return True
+    except Exception:
+        return False
+
+
+class _SessionDBHandle:
+    """Idempotent pre-transfer owner for one non-launch SessionDB handle.
+
+    Real ``AIAgent`` instances adopt the handle and close it themselves.  The
+    gateway-session fallback remains for compatible test doubles or alternate
+    agents that do not expose the ownership contract.  Either way there is one
+    close owner, and build/close races retain the existing close-once token.
     """
 
     def __init__(self, db):
@@ -833,6 +847,18 @@ class _SessionDBHandle:
             with contextlib.suppress(Exception):
                 db.close()
 
+    def transfer_to_agent(self, agent) -> bool:
+        """Relinquish this token only when ``agent`` holds the same DB."""
+
+        with self._lock:
+            if self._closed or self.db is None:
+                return False
+            if not _transfer_db_to_agent(agent, self.db):
+                return False
+            self._closed = True
+            self.db = None
+            return True
+
 
 def _publish_built_agent(
     sid: str,
@@ -846,7 +872,7 @@ def _publish_built_agent(
         if _sessions.get(sid) is not session:
             return False
         session["agent"] = agent
-        if db_handle is not None:
+        if db_handle is not None and not db_handle.transfer_to_agent(agent):
             session["_owned_session_db"] = db_handle
         return True
 
@@ -862,7 +888,7 @@ def _adopt_registered_agent_db(
         session = _sessions.get(sid)
         if session is None or session.get("agent") is not agent:
             return None
-        if db_handle is not None:
+        if db_handle is not None and not db_handle.transfer_to_agent(agent):
             session["_owned_session_db"] = db_handle
         return session
 
