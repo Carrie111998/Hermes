@@ -426,6 +426,12 @@ def browser_cdp(
     """
     effective_task_id = task_id or "default"
 
+    # --- Validate params before any routing (frame_id path included) ---
+    if params is not None and not isinstance(params, dict):
+        return tool_error(
+            f"'params' must be an object/dict, got {type(params).__name__}"
+        )
+
     # --- Route iframe-scoped calls through the supervisor ---------------
     if frame_id:
         # Same private-page/SSRF boundary as the stateless path below —
