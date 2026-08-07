@@ -3231,6 +3231,19 @@ class GatewayRunner:
             return True
 
         # --- Rate-limit queue case (provider returned 429 for this session) ---
+        # Check the running agent's real-time flag so messages arriving DURING
+        # the 429 backoff sleep (not just after the run completes) get queued.
+        # Previously this flag was only read post-run, meaning messages received
+        # during the active backoff window fell through to the normal busy path.
+        if self._rate_limit_queue_enabled:
+            running_agent_rl = self._running_agents.get(session_key)
+            if (
+                running_agent_rl is not None
+                and running_agent_rl is not _AGENT_PENDING_SENTINEL
+                and getattr(running_agent_rl, "_hit_rate_limit", False)
+                and not self._is_session_rate_limited(session_key)
+            ):
+                self._mark_session_rate_limited(session_key)
         if self._rate_limit_queue_enabled_for_session(session_key):
             adapter = self.adapters.get(event.source.platform)
             if not adapter:
@@ -17766,10 +17779,19 @@ class GatewayRunner:
                     )
                 self._mark_session_rate_limited(session_key)
 
-            # Clear rate-limit flag on successful completion or if fallback
-            # was activated (the fallback provider handled the request).
+            # Clear rate-limit flag on successful completion — but only AFTER
+            # draining any queued rate-limit overflow items so they aren't lost.
+            # Previously, clearing happened before promotion, so a successful
+            # completion could discard pending queued messages.
             if result and result.get("completed") and self._is_session_rate_limited(session_key):
-                self._clear_session_rate_limited(session_key)
+                # Drain rate-limit queue first: promote any overflow into the
+                # pending slot before clearing the flag.
+                _rl_overflow = getattr(self, "_rate_limit_queued_events", {})
+                if _rl_overflow and session_key in _rl_overflow:
+                    # There are queued messages — keep the flag until they're drained
+                    pass
+                else:
+                    self._clear_session_rate_limited(session_key)
 
             adapter = self.adapters.get(source.platform)
             
