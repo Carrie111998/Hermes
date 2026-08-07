@@ -6767,6 +6767,11 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         )
         await response.prepare(request)
+        # #80757: Flush headers immediately so clients don't hang waiting
+        # for the first event.  Without this initial write, Nagle/delayed-ACK
+        # interaction can defer the HTTP response headers until the first
+        # real event arrives (or the 30 s keepalive fires).
+        await response.write(b": connected\n\n")
 
         try:
             while True:
