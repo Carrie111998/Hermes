@@ -73,7 +73,7 @@ test('extreme percentages clamp to the level bounds', () => {
   assert.equal(percentToZoomLevel(1_000_000), 9)
 })
 
-test('installZoomReassertOnWindowEvents wires show, restore, resize, and cross-display moves on macOS and Windows', () => {
+test('installZoomReassertOnWindowEvents wires show, restore, resize, cross-display moves, and focus regain on macOS and Windows', () => {
   const handlers = new Map()
 
   const win = {
@@ -97,7 +97,32 @@ test('installZoomReassertOnWindowEvents wires show, restore, resize, and cross-d
   handlers.get('restore')()
   handlers.get('resized')()
   handlers.get('moved')()
-  assert.equal(calls, 4)
+  handlers.get('focus')()
+  assert.equal(calls, 5)
+})
+
+test('installZoomReassertOnWindowEvents re-asserts on focus regain (alt-tab on high-DPI, #50837)', () => {
+  const handlers = new Map()
+
+  const win = {
+    isDestroyed: () => false,
+    on(event, listener) {
+      handlers.set(event, listener)
+    }
+  }
+
+  let calls = 0
+  installZoomReassertOnWindowEvents(
+    win,
+    () => {
+      calls += 1
+    },
+    'win32'
+  )
+
+  assert.ok(handlers.has('focus'))
+  handlers.get('focus')()
+  assert.equal(calls, 1)
 })
 
 test('installZoomReassertOnWindowEvents debounces Linux resize and move events at the trailing edge', () => {
@@ -133,10 +158,14 @@ test('installZoomReassertOnWindowEvents debounces Linux resize and move events a
     vi.advanceTimersByTime(ZOOM_RESIZE_REASSERT_DELAY_MS / 2)
     assert.equal(calls, 1)
 
+    // `focus` re-asserts directly — it is not part of the debounced pair.
+    handlers.get('focus')()
+    assert.equal(calls, 2)
+
     handlers.get('resize')()
     destroyed = true
     vi.advanceTimersByTime(ZOOM_RESIZE_REASSERT_DELAY_MS)
-    assert.equal(calls, 1)
+    assert.equal(calls, 2)
   } finally {
     vi.useRealTimers()
   }
@@ -159,6 +188,7 @@ test('installZoomReassertOnWindowEvents skips destroyed windows', () => {
   })
   destroyed = true
   handlers.get('show')()
+  handlers.get('focus')()
   assert.equal(calls, 0)
 })
 
