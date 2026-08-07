@@ -26,12 +26,12 @@ box files:get <RETURNED_FILE_ID> --json --fields id,name,type,parent
 
 `content` is Markdown and is limited to 1 MB. Report the returned file ID and its normal Box file link.
 
-## Direct REST with CCG
+## OAuth identity boundary
 
-For normal CCG work, do not mint a Service Account token with `box_subject_type=enterprise`: that bypasses Hermes's dedicated App User permission boundary. Prefer `box request`, which uses the selected `hermes-agent` environment. If the CLI is unavailable, use an SDK client configured with the App User ID as shown in [SDK development](sdk-development.md). Reserve Service Account tokens for approved provisioning actions only. Never echo, log, or commit credentials or tokens.
+`box request` uses the selected OAuth CLI environment. It does not bypass that user's Box permissions. If the CLI is unavailable, use an OAuth-authorized SDK client as described in [SDK development](sdk-development.md). Never echo, log, or commit OAuth tokens or client secrets.
 
 ## Sources
 
 - [Box API reference](https://developer.box.com/reference/)
 - [Box Notes API: create a note from Markdown](https://developer.box.com/guides/box-notes/convert-markdown/)
-- [Client credentials](https://developer.box.com/guides/authentication/client-credentials/)
+- [OAuth 2.0](https://developer.box.com/guides/authentication/oauth2/)

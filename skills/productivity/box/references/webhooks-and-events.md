@@ -1,6 +1,6 @@
 # Webhooks and events
 
-Use webhooks for push notifications about a file or folder. Use Events API polling for catch-up, backfill, or a durable cursor.
+Use webhooks for push notifications about a file or folder. Use Events API polling for catch-up, backfill, or a durable cursor. Webhook management requires a custom OAuth Platform App with the **Manage webhooks** scope; the official Box CLI OAuth app is not sufficient. Use the normal OAuth identity that owns or can access the target, not an administrator identity unless the target operation itself requires it.
 
 ## Create and inspect a webhook
 
@@ -15,7 +15,7 @@ The current actor needs access to the target and the app needs appropriate scope
 
 ## Poll user events with a durable cursor
 
-For App User catch-up and backfill, use the User Events API through the configured App User identity. Do not use the CLI's default `box events` command: it defaults to enterprise admin-log streams. Persist the returned `next_stream_position` after every successful response, then use it on the next poll:
+For user catch-up and backfill, use the User Events API through the selected OAuth identity. Do not use the CLI's default `box events` command: it defaults to enterprise admin-log streams. Persist the returned `next_stream_position` after every successful response, then use it on the next poll:
 
 ```bash
 box request /events --query "stream_type=changes&stream_position=now" --json

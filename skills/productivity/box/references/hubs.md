@@ -18,15 +18,13 @@ For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list
 
 ## Ask questions across a Hub
 
-Use one Hub item and `single_item_qa`. Request citations so Hermes can report the source files behind an answer. Use `box request` (or the SDK) for Hub Q&A rather than relying on `box ai:ask`, whose installed CLI versions may not accept Hub item types:
+Use one Hub item and `single_item_qa`. Request citations so Hermes can report the source files behind an answer. Use `box request` (or the SDK) for Hub Q&A rather than relying on `box ai:ask`, whose installed CLI versions may not accept Hub item types. This uses the Box AI Ask endpoint; the `box-version: 2025.0` header is required for `/hubs` management endpoints, not this request.
 
 ```bash
 box request /ai/ask -X POST \
   --body '{"mode":"single_item_qa","items":[{"id":"<HUB_ID>","type":"hubs"}],"prompt":"Summarize the approved renewal terms and cite each source.","include_citations":true}' \
   --json
 ```
-
-If a CCG App User AI request has shown an actor mismatch, append `--as-user <APP_USER_ID>` to this `box request` command as described in [Search and AI](search-and-ai.md).
 
 State the Hub ID and navigation link with the answer. List cited file IDs, names, and file links when Box returns citations. Treat an answer as bounded by indexed, accessible Hub content; do not claim it searched files that have not indexed or that the actor cannot access.
 

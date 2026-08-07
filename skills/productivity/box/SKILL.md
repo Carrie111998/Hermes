@@ -30,19 +30,21 @@ Use Box as the cloud file system for file operations, collaboration, metadata, a
 When someone is exploring a cloud file system for Hermes, first give a short fit assessment: Box is useful when a team needs cloud file storage, sharing, search, metadata, and document work. Then ask how they want Hermes to connect:
 
 1. **Personal Box access (OAuth):** Hermes acts with the user's existing Box permissions.
-2. **Shared or background agent (CCG):** Hermes runs as a dedicated App User, provisioned through CCG, and sees only content explicitly shared with that App User.
-3. **Box-backed application or integration (SDK):** build with an official Box SDK and the appropriate app authentication.
+2. **Dedicated Box identity (OAuth):** Hermes signs in as a separate Box account or a Managed User created by the user's Box administrator. This lets the owner invite that identity to only the specific files, folders, or Hubs Hermes needs.
+3. **Box-backed application or integration (SDK):** build with an official Box SDK and OAuth user authorization.
 
 Do not run setup, show a command cookbook, propose account plans or folder taxonomies, or load every reference for a broad exploratory question. Wait for the user's answer, then load only the relevant path. When a request already names a concrete outcome, skip this discovery step and handle that outcome directly.
+
+Start normal CLI work with the official Box CLI OAuth app. It covers ordinary content work and Box AI. Use a custom **User Authentication (OAuth 2.0)** Platform App only when the requested operation needs an additional OAuth scope, such as webhook management. This remains an OAuth flow; do not substitute a server-side or impersonation identity.
 
 ## Perform chosen setup interactively
 
 When a user selects an authentication path or asks Hermes to connect Box, perform the setup through `terminal`; do not turn the next response into instructions for the user to copy. Take the next safe action yourself, and pause only for an approval, browser sign-in, administrator action, or secret that Hermes cannot safely supply.
 
 - If `box` is missing, ask for any terminal approval required to install `@box/cli` under the current Hermes home at `tools/box-cli`; then verify it with the shell-appropriate command in [CLI guide](references/cli-guide.md). Do not attempt a global npm install, use `sudo`, change npm's global prefix, or change `PATH`.
-- Before personal OAuth, determine whether the CLI process and the browser the user will authorize in run on the same host. Use the local callback only when they do; otherwise ask the user to confirm remote/headless authentication and read [OAuth setup](references/oauth-setup.md). Do not infer runtime topology from the operating system alone.
-- For CCG, first ask whether the user wants Hermes to use computer control to operate the signed-in browser on this computer, navigate to the Box Developer Console, and create and configure the Platform App. If yes, complete every non-secret Console step and pause only for the user's Box administrator action or for credentials to be stored locally outside the chat. If no, give the linked, step-by-step Console path in [CCG setup](references/ccg-setup.md). Provision, configure, and verify a dedicated App User, then add it to the exact approved file, folder, or Hub.
-- Keep CCG setup interactive. Ask whether to create or open the active Hermes home's `.env` for credential entry, wait for the user to confirm that they added the credentials, then perform the local configuration, App User provisioning, and verification. Do not tell the user to manually run Box CLI commands or create a CCG JSON file.
+- Before OAuth, determine whether the CLI process and the browser the user will authorize in run on the same host. Use the local callback only when they do; otherwise ask the user to confirm remote/headless authentication and read [OAuth setup](references/oauth-setup.md). Do not infer runtime topology from the operating system alone.
+- For a dedicated OAuth identity, ask whether the user already has a separate Box account. If not, explain that they can create a separate Box account or ask their Box administrator to create a Managed User. After the identity exists, run the OAuth flow while the authorization browser is signed in as that identity. Explain that its own Box permissions create a least-privilege boundary: invite it only to the specific files, folders, or Hubs Hermes should access. Do not make that identity an administrator to unlock an exceptional operation.
+- If a custom OAuth Platform App is necessary, use the CLI's interactive Platform App flow. Ask the user to enter its client secret only in the local CLI prompt; never request it in chat, write it to Hermes configuration, or commit it.
 - If an install, browser authorization, environment switch, or permission change needs approval, request that approval and resume the setup after it is granted. Do not replace the action with a command list.
 
 ## Start each task
@@ -55,7 +57,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
    If this succeeds, record the actor and continue. Do not ask about authentication again. Treat `folders:items 0` only as a listing of the actor's root; it is not proof that a shared file, folder, or Hub is inaccessible. For a known file or folder, verify its ID directly; for a Hub, use the Hubs discovery path in [Box Hubs](references/hubs.md).
 2. If authentication is absent, ask which identity the user wants:
    - **Act as me (OAuth):** fastest setup for one person using Hermes as an extension of themselves. Read [OAuth setup](references/oauth-setup.md).
-   - **Act as its own agent (CCG):** provision and use a dedicated App User with only the content explicitly shared with it. Read [CCG setup](references/ccg-setup.md).
+   - **Act as a dedicated Box identity (OAuth):** sign in as a separate Box account or an administrator-created Managed User, then invite that identity only to the required files, folders, or Hubs. Read [OAuth setup](references/oauth-setup.md).
 3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
 
 ## Extend the CLI without pausing
@@ -91,7 +93,7 @@ Use existing Box metadata or metadata queries for deterministic lookups. Otherwi
 
 For Q&A over more than 25 files, first narrow a one-off request with search or metadata. For recurring Q&A over a curated collection, discover and use an existing Box Hub; only propose creating or populating a Hub after the user approves. Do not use a Hub for metadata extraction or text generation. Read [Box Hubs](references/hubs.md).
 
-When the user asks to extract metadata from a Box file, treat it as a request to persist the result. First prove that one existing metadata template represents every requested field; then use structured extraction, attach the returned values to that same file, and read the metadata back. Do this without a separate confirmation only when the schema is fully compatible and the user did not ask for a preview. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields. Read [Search and AI](references/search-and-ai.md) for the required template-selection and writeback workflow.
+When the user asks to extract metadata from a Box file, treat it as a request to persist the result. First prove that one existing metadata template represents every requested field; then use structured extraction, attach the returned values to that same file, and read the metadata back. Do this without a separate confirmation only when the schema is fully compatible and the user did not ask for a preview. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields. Creating or changing an enterprise template additionally requires explicit approval and an Admin or authorized Co-Admin OAuth identity; do not elevate a dedicated Hermes identity for it. Read [Search and AI](references/search-and-ai.md) for the required template-selection and writeback workflow.
 
 Before the first Box AI request, state that Box AI must be enabled, consumes AI units, and remains limited to the current actor's permissions; do not wait for acknowledgement. An AI response returned to Hermes can still contain sensitive information. Confirm only when a material batch's file scope or expected AI-unit use is ambiguous, or when the user has not explicitly requested that scale. See [Search and AI](references/search-and-ai.md).
 
@@ -111,7 +113,7 @@ For every individually reported Box item, include its ID and a clickable navigat
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 - Hub: `https://app.box.com/hubs/<HUB_ID>`
 
-For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to the CCG App User; state that clearly. Include the actor and verification performed in every write summary.
+For large batches, link the source and destination folders plus exceptions instead of listing hundreds of items. A human may not be able to open content that is only visible to a dedicated OAuth identity; state that clearly. Include the actor and verification performed in every write summary.
 
 ## Verify
 

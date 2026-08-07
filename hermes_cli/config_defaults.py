@@ -3771,31 +3771,6 @@ OPTIONAL_ENV_VARS = {
         "category": "skill",
         "advanced": True,
     },
-    "BOX_CLIENT_ID": {
-        "description": "Box CCG Platform App Client ID for the `box` skill App User runtime",
-        "prompt": "Box Client ID",
-        "url": "https://app.box.com/developers/console",
-        "password": False,
-        "category": "skill",
-        "advanced": True,
-    },
-    "BOX_CLIENT_SECRET": {
-        "description": "Box CCG Platform App Client Secret for the `box` skill App User runtime",
-        "prompt": "Box Client Secret",
-        "url": "https://app.box.com/developers/console",
-        "password": True,
-        "category": "skill",
-        "advanced": True,
-    },
-    "BOX_ENTERPRISE_ID": {
-        "description": "Box Enterprise ID for the `box` skill CCG App User runtime",
-        "prompt": "Box Enterprise ID",
-        "url": "https://app.box.com/developers/console",
-        "password": False,
-        "category": "skill",
-        "advanced": True,
-    },
-
     # ── Honcho ──
     "HONCHO_API_KEY": {
         "description": "Honcho API key for AI-native persistent memory",

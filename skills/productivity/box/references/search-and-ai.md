@@ -43,24 +43,16 @@ box ai:text-gen --items=id=<FILE_ID>,type=file \
 
 Do not use a Hub for metadata extraction or text generation. For semantic Q&A across a reusable curated collection, read [Box Hubs](hubs.md). For a one-off request that names more than 25 files, narrow the candidate set before proposing a Hub.
 
-## Diagnose Box AI access for a CCG App User
+## Diagnose Box AI access
 
-A file that succeeds with `files:get` or search can still fail through Box AI when the Platform App lacks AI access. If the App User can preview or download a file but `ai:ask` returns `404 not_found`, do not misdiagnose its collaboration as missing. First verify the current actor and the file permissions:
+A file that succeeds with `files:get` or search can still fail through Box AI when Box AI is unavailable for the current OAuth identity or account. If the user can preview or download a file but `ai:ask` returns `404 not_found`, do not immediately misdiagnose its collaboration as missing. First verify the current actor and the file permissions:
 
 ```bash
 box users:get me --json --fields id,name,login
 box files:get <FILE_ID> --json --fields id,name,permissions
 ```
 
-For a CCG environment with a persistent default App User, retry the failing Box AI request with an explicit `--as-user <APP_USER_ID>` flag. The CLI's AI command path can otherwise issue the request as the underlying Service Account even when ordinary commands inherit the default App User. Apply this fallback to `box ai:*` calls only, not ordinary file, folder, or collaboration operations:
-
-```bash
-box ai:ask --items=id=<FILE_ID>,type=file \
-  --prompt "Summarize the renewal obligations and dates." \
-  --as-user <APP_USER_ID> --json
-```
-
-A successful explicit call proves the App User collaboration and Box AI entitlement are valid. If it still fails, verify **Configuration → Required Access Scopes → Content Actions → Manage AI** (`ai.readwrite`), have an administrator confirm that Box AI API access is enabled for the enterprise, reauthorize the app after changing the scope, obtain a fresh CCG token, and retry one file before a batch.
+If the file permissions and actor are correct, verify that Box AI is enabled and available for the account or enterprise, that the selected OAuth application has the required AI scope when using a custom Platform App, and that AI units are available. Reauthorize the intended OAuth identity after changing application access, then retry one file before a batch. Do not use impersonation as a fallback; if the wrong identity is selected, switch only with approval to the intended OAuth environment and verify it first.
 
 ## Extract and persist file metadata
 
@@ -93,7 +85,7 @@ Treat a request to extract metadata as a structured Box metadata workflow, not a
    box files:metadata:get <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> --json
    ```
 
-The extraction request authorizes matching per-file metadata writes, so do not ask again after finding a fully compatible existing template. Creating or changing a metadata template is an enterprise-wide schema change: require explicit user approval before doing it. If approved, create a dedicated, semantically appropriate template with stable field keys and correct field types, attach it to the target file, and verify every field. Use full ISO timestamps for date values, such as `2025-03-29T00:00:00Z`.
+The extraction request authorizes matching per-file metadata writes, so do not ask again after finding a fully compatible existing template. Creating or changing a metadata template is an enterprise-wide schema change: require explicit user approval before doing it. It also requires an OAuth token for a Box Admin or a Co-Admin authorized to create and edit metadata templates. Do not elevate a dedicated Hermes identity for this purpose. If the approved administrator OAuth session is unavailable, leave structured metadata unchanged and ask the administrator to create the template manually or select another supported outcome. If the approved administrator session is available, create a dedicated, semantically appropriate template with stable field keys and correct field types, attach it to the target file, and verify every field. Use full ISO timestamps for date values, such as `2025-03-29T00:00:00Z`.
 
 ```bash
 box metadata-templates:create --display-name "Invoice extraction" \
@@ -127,3 +119,4 @@ Use `--bulk-file-path` where the command supports it. For hundreds of files, inv
 - [Structured metadata extraction](https://developer.box.com/guides/box-ai/ai-tutorials/extract-metadata-structured/)
 - [Box AI trust](https://www.box.com/ai/trust/)
 - [AI units and plan access](https://support.box.com/hc/en-us/articles/45612941554835-Expanded-AI-API-Access-and-AI-Units-for-Business-Business-Plus-and-Enterprise-Plans)
+- [Metadata template permissions](https://developer.box.com/guides/metadata/templates/create/)

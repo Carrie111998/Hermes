@@ -1,6 +1,6 @@
 # Content workflows
 
-Use IDs, not paths, once an item is resolved. Read [CCG setup](ccg-setup.md) when the acting CCG App User cannot see the target folder.
+Use IDs, not paths, once an item is resolved. If the current OAuth identity cannot see the target, verify the exact item ID and ask the owner to invite that identity to the intended file, folder, or Hub.
 
 ## Browse and create folders
 
@@ -14,7 +14,7 @@ Duplicate names in one parent return `409`. Reuse the existing folder ID instead
 
 ## Verify a shared file or folder
 
-When an App User receives a file or folder invite, use the ID from its Box URL if available and fetch that exact item. Do not use an absence from folder `0` as proof that access failed; it is only the App User's root listing. If only a name is known, use Box search to resolve the ID, then fetch the item:
+When the current OAuth identity receives a file or folder invite, use the ID from its Box URL if available and fetch that exact item. Do not use an absence from folder `0` as proof that access failed; it is only that identity's root listing. If only a name is known, use Box search to resolve the ID, then fetch the item:
 
 ```bash
 box search "Quarterly plan" --json --limit 20 --fields id,name,type,parent
@@ -73,7 +73,7 @@ Report these links for items already known to the caller; they do not create a s
 - File: `https://app.box.com/file/<FILE_ID>`
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 
-Include the item ID with the link. If a human cannot open an App-User-only item, state that rather than creating a link with broader access.
+Include the item ID with the link. If a human cannot open an item visible only to the dedicated OAuth identity, state that rather than creating a link with broader access.
 
 ## Read and write metadata
 

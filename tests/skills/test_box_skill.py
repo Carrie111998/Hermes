@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from urllib.parse import unquote
@@ -12,12 +11,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / "skills" / "productivity" / "box"
 SKILL_MD = SKILL_DIR / "SKILL.md"
-TEMPLATES_DIR = SKILL_DIR / "templates"
-CCG_ENV_VARS = {
-    "BOX_CLIENT_ID": False,
-    "BOX_CLIENT_SECRET": True,
-    "BOX_ENTERPRISE_ID": False,
-}
 
 
 def _parse_frontmatter(content: str) -> dict:
@@ -62,20 +55,10 @@ def test_skill_frontmatter_is_valid_and_discoverable(frontmatter: dict):
     assert {"linux", "macos", "windows"}.issubset(platforms)
 
 
-def test_box_command_is_declared_without_universal_ccg_secret_gate(frontmatter: dict):
+def test_box_command_is_declared_without_universal_credential_gate(frontmatter: dict):
     prerequisites = frontmatter.get("prerequisites") or {}
     assert "box" in prerequisites.get("commands", [])
     assert not prerequisites.get("env_vars")
-
-
-def test_ccg_credentials_remain_optional_setup_entries():
-    from hermes_cli.config import OPTIONAL_ENV_VARS
-
-    for name, is_secret in CCG_ENV_VARS.items():
-        entry = OPTIONAL_ENV_VARS[name]
-        assert entry["category"] == "skill"
-        assert entry["password"] is is_secret
-
 
 def test_all_local_links_resolve_inside_the_skill():
     markdown_files = list(SKILL_DIR.rglob("*.md"))
@@ -91,26 +74,3 @@ def test_every_reference_is_reachable_from_skill_entrypoint():
     entrypoint_targets = _local_markdown_targets(SKILL_MD)
     reference_files = set((SKILL_DIR / "references").glob("*.md"))
     assert reference_files <= entrypoint_targets
-
-
-def test_ccg_template_is_valid_and_matches_registered_credentials():
-    template = TEMPLATES_DIR / "ccg-config.json.example"
-    data = json.loads(template.read_text(encoding="utf-8"))
-    settings = data.get("boxAppSettings") or {}
-    assert settings.get("clientID") == "YOUR_BOX_CLIENT_ID"
-    assert settings.get("clientSecret") == "YOUR_BOX_CLIENT_SECRET"
-    assert data.get("enterpriseID") == "YOUR_BOX_ENTERPRISE_ID"
-
-
-def test_ccg_environment_contract_is_wired_through_all_config_surfaces():
-    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
-    example_keys = set(re.findall(r"^# (BOX_[A-Z_]+)=", env_example, re.MULTILINE))
-    template = json.loads((TEMPLATES_DIR / "ccg-config.json.example").read_text(encoding="utf-8"))
-    template_values = {
-        template["boxAppSettings"]["clientID"],
-        template["boxAppSettings"]["clientSecret"],
-        template["enterpriseID"],
-    }
-
-    assert set(CCG_ENV_VARS) <= example_keys
-    assert template_values == {f"YOUR_{name}" for name in CCG_ENV_VARS}

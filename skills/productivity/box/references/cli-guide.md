@@ -62,10 +62,9 @@ Use `--json` for machine-readable output and `--fields` to return only needed fi
 box configure:environments:list
 box configure:environments:set-current <ENVIRONMENT_NAME>
 box users:get me --json --fields id,name,login
-box folders:items <FOLDER_ID> --as-user <USER_ID> --json --fields id,name,type
 ```
 
-The CLI has one current environment. Confirm before switching it, then verify the actor. Use `--as-user` only when the configured app supports it and the user has asked for that actor.
+The CLI has one current environment. Confirm before switching it, then verify the actor. Perform ordinary Hermes work as the OAuth identity selected for that environment; do not impersonate another user.
 
 ## Pagination and search
 
@@ -88,7 +87,7 @@ box request /files/<FILE_ID> -X PUT --body '{"name":"renamed.pdf"}' --json
 box request /folders -X POST --body '{"name":"New folder","parent":{"id":"0"}}' --json
 ```
 
-Use direct REST only when the CLI is unavailable or application code genuinely needs direct REST.
+Use `box request` as the CLI-based REST fallback. Use an SDK or raw HTTP only when the CLI is unavailable or application code genuinely needs direct REST.
 
 ## Batch inputs and mutations
 

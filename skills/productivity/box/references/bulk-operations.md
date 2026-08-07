@@ -1,6 +1,6 @@
 # Bulk operations
 
-Use this workflow for more than a handful of files. Choose the current actor before inventorying; a CCG App User only sees folders shared with it.
+Use this workflow for more than a handful of files. Choose the current OAuth actor before inventorying; it can only process content that identity can access.
 
 ## Workflow
 

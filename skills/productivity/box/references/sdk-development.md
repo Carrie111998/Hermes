@@ -11,10 +11,8 @@ Inspect the repository for existing Box clients, `BOX_` configuration, token sto
 | Identity | Use when |
 | --- | --- |
 | OAuth | each end user connects their own Box account |
-| CCG | a server-side app needs a dedicated App User runtime identity |
-| `as_user` / managed user | an authorized enterprise app must act as a specified user |
 
-OAuth follows the user's permissions and app scopes. For CCG, use the Service Account to provision a dedicated App User, then run normal application work as that App User. The App User needs folder collaboration unless enterprise capabilities explicitly provide another model.
+OAuth follows the signed-in user's permissions and app scopes. For a shared or background application, authorize a separate Box account or an enterprise Managed User. That dedicated OAuth identity can be invited only to the files, folders, or Hubs the application needs, rather than inheriting a broader user's access.
 
 ## Use an official SDK
 
@@ -22,27 +20,11 @@ OAuth follows the user's permissions and app scopes. For CCG, use the Service Ac
 - [Node SDK](https://github.com/box/box-node-sdk)
 - [Other Box SDKs](https://developer.box.com/guides/tooling/sdks/)
 
-Use the SDK matching the project language. Store credentials in the project's approved secret mechanism, not source control. For CCG, store the provisioned App User ID as non-secret application configuration (for example, `BOX_APP_USER_ID`); do not use the Service Account's enterprise ID for normal application work.
+Use the SDK matching the project language. Store OAuth tokens and any custom Platform App client secret in the project's approved secret mechanism, not source control. When a custom Platform App needs additional scopes, use **User Authentication (OAuth 2.0)** and have the intended Box user grant access; do not add an impersonation path for normal application work. If an exceptional enterprise operation requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the dedicated runtime identity.
 
-## Python CCG client
+## OAuth client
 
-```python
-import os
-
-from box_sdk_gen import BoxCCGAuth, BoxClient, CCGConfig
-
-auth = BoxCCGAuth(
-    CCGConfig(
-        client_id=os.environ["BOX_CLIENT_ID"],
-        client_secret=os.environ["BOX_CLIENT_SECRET"],
-        user_id=os.environ["BOX_APP_USER_ID"],
-    )
-)
-client = BoxClient(auth)
-me = client.users.get_user_me()
-```
-
-Use the generated SDK's file, folder, search, metadata, and webhook APIs rather than rebuilding HTTP and token refresh logic. Follow the installed SDK's current method names when implementing a concrete call.
+Use the generated SDK's OAuth support rather than rebuilding authorization-code exchange or token refresh logic. Follow the installed SDK's current OAuth method names and its language-specific authorization guide when implementing a concrete call. Initialize the OAuth client before calling any SDK method, associate stored tokens with the Box user who granted them, and verify that user before performing work. Do not copy a partial SDK call into an application without its OAuth initialization and token-refresh path.
 
 ## Build document-aware apps with Box AI
 
