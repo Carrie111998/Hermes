@@ -52,6 +52,50 @@ def test_cmd_list_plain_compact_output(monkeypatch, capsys):
     assert "Search" not in out  # plain mode stays compact, no descriptions
 
 
+def test_cmd_list_reports_enabled_plugin_missing_from_disk(monkeypatch, capsys):
+    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: [])
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"vanished-plugin"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+
+    plugins_cmd.cmd_list(_args(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "name": "vanished-plugin",
+            "status": "missing",
+            "version": "",
+            "description": "Configured as enabled but not found",
+            "source": "missing",
+        }
+    ]
+
+
+def test_cmd_disable_clears_missing_enabled_plugin(monkeypatch, capsys):
+    saved = {}
+    monkeypatch.setattr(plugins_cmd, "_resolve_plugin_key", lambda _name: None)
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"vanished-plugin"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=value),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=value),
+    )
+
+    plugins_cmd.cmd_disable("vanished-plugin")
+
+    assert saved == {
+        "enabled": set(),
+        "disabled": {"vanished-plugin"},
+    }
+    assert "vanished-plugin" in capsys.readouterr().out
+
+
 def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path):
     bundled_dir = tmp_path / "bundled"
     user_dir = tmp_path / "user"
@@ -92,5 +136,4 @@ def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path)
             "wiki",
         )
     ]
-
 
