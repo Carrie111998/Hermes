@@ -10,6 +10,7 @@ Covers:
 7. check_email_requirements function
 8. Attachment extraction and caching
 9. Message dispatch and threading
+10. Session-by-subject thread id normalization and routing (#26277)
 """
 
 import os
@@ -905,6 +906,172 @@ class TestSenderAuthentication(unittest.TestCase):
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+
+class TestNormalizeSubjectThreadId(unittest.TestCase):
+    """Subject → session thread id normalization (#26277)."""
+
+    def test_chained_prefixes_strip(self):
+        from plugins.platforms.email.adapter import _normalize_subject_thread_id
+        for subject in (
+            "Re: Fw: Project Status",
+            "Fwd: Re: Project Status",
+            "RE: FW: Project Status",
+        ):
+            self.assertEqual(
+                _normalize_subject_thread_id(subject), "project-status"
+            )
+
+    def test_localized_prefixes_strip(self):
+        from plugins.platforms.email.adapter import _normalize_subject_thread_id
+        # Fullwidth colon, and localized prefixes chained with Latin ones.
+        self.assertEqual(
+            _normalize_subject_thread_id("答复: Re: Project Status"),
+            "project-status",
+        )
+        self.assertEqual(_normalize_subject_thread_id("回复:Hello"), "hello")
+        self.assertEqual(_normalize_subject_thread_id("转发： 转发: Note"), "note")
+
+    def test_slug_rules(self):
+        from plugins.platforms.email.adapter import _normalize_subject_thread_id
+        # Non-alphanumeric runs collapse to one dash; dashes trimmed; lowercase.
+        self.assertEqual(
+            _normalize_subject_thread_id("  Multiple   Spaces — Here  "),
+            "multiple-spaces-here",
+        )
+        self.assertEqual(
+            _normalize_subject_thread_id("Re:Meeting @ 3pm!"), "meeting-3pm"
+        )
+        # Capped at 80 chars.
+        self.assertEqual(_normalize_subject_thread_id("a" * 200), "a" * 80)
+
+    def test_empty_or_prefix_only_returns_none(self):
+        from plugins.platforms.email.adapter import _normalize_subject_thread_id
+        for subject in ("", None, "Re:", "fwd: 答复：", "!!!"):
+            self.assertIsNone(_normalize_subject_thread_id(subject))
+
+
+class TestSessionBySubject(unittest.TestCase):
+    """Opt-in session isolation by normalized subject (#26277)."""
+
+    def setUp(self):
+        # Dispatch fails closed without allow-all (SECURITY.md 2.6); opt in to
+        # exercise the dispatch path, and start with the feature flag unset so
+        # the default-off tests are insulated from the ambient environment.
+        self._prev_allow_all = os.environ.get("EMAIL_ALLOW_ALL_USERS")
+        self._prev_flag = os.environ.get("EMAIL_SESSION_BY_SUBJECT")
+        os.environ["EMAIL_ALLOW_ALL_USERS"] = "true"
+        os.environ.pop("EMAIL_SESSION_BY_SUBJECT", None)
+
+    def tearDown(self):
+        for name, prev in (
+            ("EMAIL_ALLOW_ALL_USERS", self._prev_allow_all),
+            ("EMAIL_SESSION_BY_SUBJECT", self._prev_flag),
+        ):
+            if prev is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prev
+
+    def _make_adapter(self, extra_env=None, config_extra=None):
+        from gateway.config import PlatformConfig
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }
+        env.update(extra_env or {})
+        with patch.dict(os.environ, env):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(
+                PlatformConfig(enabled=True, extra=config_extra or {})
+            )
+        return adapter
+
+    def _dispatch(self, adapter, subject, message_id="<m1@test.com>"):
+        """Dispatch one email from the same sender; return the MessageEvent."""
+        import asyncio
+        captured = []
+
+        async def capture_handle(event):
+            captured.append(event)
+
+        adapter.handle_message = capture_handle
+        asyncio.run(adapter._dispatch_message({
+            "uid": b"1",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": subject,
+            "message_id": message_id,
+            "in_reply_to": "",
+            "body": "Hello",
+            "attachments": [],
+            "date": "",
+        }))
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def test_flag_off_keeps_per_sender_session(self):
+        """Regression guard: flag off → no thread_id → today's session key."""
+        from gateway.session import build_session_key
+        adapter = self._make_adapter()
+        event = self._dispatch(adapter, "Project Status")
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(
+            build_session_key(event.source),
+            "agent:main:email:dm:user@test.com",
+        )
+
+    def test_flag_on_same_normalized_subject_same_session(self):
+        from gateway.session import build_session_key
+        adapter = self._make_adapter(
+            extra_env={"EMAIL_SESSION_BY_SUBJECT": "true"}
+        )
+        first = self._dispatch(adapter, "Project Status", "<m1@test.com>")
+        reply = self._dispatch(adapter, "Re: Fw: Project Status", "<m2@test.com>")
+        self.assertEqual(first.source.thread_id, "project-status")
+        self.assertEqual(reply.source.thread_id, "project-status")
+        self.assertEqual(
+            build_session_key(first.source), build_session_key(reply.source)
+        )
+        self.assertEqual(
+            build_session_key(first.source),
+            "agent:main:email:dm:user@test.com:project-status",
+        )
+
+    def test_flag_on_different_subject_different_session(self):
+        from gateway.session import build_session_key
+        adapter = self._make_adapter(
+            extra_env={"EMAIL_SESSION_BY_SUBJECT": "true"}
+        )
+        first = self._dispatch(adapter, "Project Status", "<m1@test.com>")
+        other = self._dispatch(adapter, "Budget Review", "<m2@test.com>")
+        self.assertNotEqual(
+            build_session_key(first.source), build_session_key(other.source)
+        )
+
+    def test_flag_on_via_config_extra(self):
+        """platforms.email.session_by_subject enables the feature without env."""
+        adapter = self._make_adapter(config_extra={"session_by_subject": True})
+        event = self._dispatch(adapter, "Project Status")
+        self.assertEqual(event.source.thread_id, "project-status")
+
+    def test_missing_or_prefix_only_subject_falls_back_to_per_sender(self):
+        from gateway.session import build_session_key
+        adapter = self._make_adapter(
+            extra_env={"EMAIL_SESSION_BY_SUBJECT": "true"}
+        )
+        # "(no subject)" is the placeholder the fetch layer substitutes for a
+        # missing Subject header; "Re:" normalizes to nothing. Both must keep
+        # the per-sender session.
+        for subject in ("(no subject)", "Re:"):
+            event = self._dispatch(adapter, subject)
+            self.assertIsNone(event.source.thread_id)
+            self.assertEqual(
+                build_session_key(event.source),
+                "agent:main:email:dm:user@test.com",
+            )
 
 
 if __name__ == "__main__":

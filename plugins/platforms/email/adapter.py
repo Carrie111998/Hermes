@@ -13,6 +13,7 @@ Environment variables:
     EMAIL_PASSWORD      — Email password or app-specific password
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+    EMAIL_SESSION_BY_SUBJECT — Isolate sessions by normalized subject (default: off)
 """
 
 import asyncio
@@ -89,6 +90,38 @@ def _esecret_int(name: str, default: int) -> int:
 def _esecret_bool(name: str, default: bool = False) -> bool:
     """Scope-aware boolean read (``env_bool`` variant of ``_get_esecret``)."""
     return is_truthy_value(_get_esecret(name, ""), default=default)
+
+
+# Placeholder subject used when an email has no Subject header.
+_NO_SUBJECT = "(no subject)"
+
+# Leading reply/forward prefixes stripped when normalizing a subject for
+# session-by-subject routing (#26277): Re/Fw/Fwd plus the common Chinese
+# forms, each followed by ":" or the fullwidth "：". Applied repeatedly so
+# chained prefixes ("答复: Re: …") all come off.
+_SUBJECT_PREFIX_RE = re.compile(
+    r"^\s*(?:re|fw|fwd|答复|回复|转发)\s*[:：]\s*", re.IGNORECASE
+)
+
+
+def _normalize_subject_thread_id(subject: Optional[str]) -> Optional[str]:
+    """Normalize an email subject into a session thread id slug.
+
+    Strips leading reply/forward prefixes (repeatedly, so ``Re: Fw: X`` and
+    ``答复: Re: X`` both reduce to ``X``), then slugs the remainder:
+    lowercase, every run of non-alphanumeric characters collapsed to a
+    single dash, dashes trimmed, capped at 80 chars. Returns ``None`` when
+    nothing usable remains (no subject, or only prefixes/punctuation) so
+    the caller falls back to per-sender session routing.
+    """
+    text = (subject or "").strip()
+    while True:
+        stripped = _SUBJECT_PREFIX_RE.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    slug = re.sub(r"[\W_]+", "-", text.lower()).strip("-")
+    return slug[:80] or None
 
 
 # Automated sender patterns — emails from these are silently ignored
@@ -493,6 +526,19 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Isolate sessions by normalized email subject instead of one session
+        # per sender (#26277). Opt-in: default off preserves per-sender
+        # sessions. Configured via config.yaml:
+        #   platforms:
+        #     email:
+        #       session_by_subject: true
+        # or the EMAIL_SESSION_BY_SUBJECT=true env mirror (parity with the
+        # other EMAIL_* vars).
+        if "session_by_subject" in extra:
+            self._session_by_subject = bool(extra["session_by_subject"])
+        else:
+            self._session_by_subject = _esecret_bool("EMAIL_SESSION_BY_SUBJECT", False)
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -746,7 +792,7 @@ class EmailAdapter(BasePlatformAdapter):
                     if "<" in sender_name:
                         sender_name = sender_name.split("<")[0].strip().strip('"')
 
-                    subject = _decode_header_value(msg.get("Subject", "(no subject)"))
+                    subject = _decode_header_value(msg.get("Subject", _NO_SUBJECT))
                     message_id = msg.get("Message-ID", "")
                     in_reply_to = msg.get("In-Reply-To", "")
                     # Skip automated/noreply senders before any processing
@@ -914,12 +960,21 @@ class EmailAdapter(BasePlatformAdapter):
             "message_id": msg_data["message_id"],
         }
 
+        # Opt-in session isolation by normalized subject (#26277): the slugged
+        # subject becomes the DM thread_id, which build_session_key appends to
+        # the session key. A missing (_NO_SUBJECT placeholder) or prefix-only
+        # subject maps to None → per-sender session, unchanged from before.
+        thread_id = None
+        if self._session_by_subject and subject != _NO_SUBJECT:
+            thread_id = _normalize_subject_thread_id(subject)
+
         source = self.build_source(
             chat_id=sender_addr,
             chat_name=msg_data["sender_name"] or sender_addr,
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(

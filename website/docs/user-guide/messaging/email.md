@@ -138,6 +138,20 @@ platforms:
 
 When enabled, attachment and inline parts are skipped before payload decoding. The email body text is still processed normally.
 
+### Sessions by Subject
+
+By default, all emails from the same sender share one Hermes session. To give each email thread its own session — a new subject starts fresh (like `/new`), while `Re:`/`Fw:` replies continue the existing session — opt in via `config.yaml`:
+
+```yaml
+platforms:
+  email:
+    session_by_subject: true
+```
+
+or the `EMAIL_SESSION_BY_SUBJECT=true` environment variable.
+
+The subject is normalized before routing: leading reply/forward prefixes (`Re:`, `Fw:`, `Fwd:`, plus `答复:`, `回复:`, `转发:`) are stripped repeatedly, and the remainder is slugged (lowercase, punctuation runs collapsed to single dashes, 80-character cap). `Re: Fw: Project Status` and `答复: Re: Project Status` both map to `project-status`. Emails with no usable subject keep the per-sender session.
+
 ---
 
 ## Access Control
@@ -196,3 +210,4 @@ Email access is stricter by default than chat-style platforms:
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
+| `EMAIL_SESSION_BY_SUBJECT` | No | `false` | Isolate sessions by normalized email subject |
