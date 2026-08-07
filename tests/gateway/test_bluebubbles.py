@@ -109,6 +109,50 @@ class TestBlueBubblesHelpers:
         adapter = _make_adapter(monkeypatch)
         assert adapter.format_message("[click here](http://example.com)") == "click here"
 
+
+class TestBlueBubblesIMessageSanitization:
+    """format_message strips iMessage-tofu characters (Block Elements, PUAs)
+    while preserving ordinary emoji and leading/trailing whitespace layout."""
+
+    def test_strips_block_elements(self, monkeypatch):
+        """Block Elements (U+2580..U+259F) like the ▉ cursor artifact are removed."""
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.format_message("hello▉ world") == "hello world"
+
+    def test_strips_bmp_pua(self, monkeypatch):
+        """BMP Private Use Area (U+E000..U+F8FF) — Slack custom-emoji chars."""
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.format_message("hi \ue028 there") == "hi  there"
+
+    def test_strips_supplementary_pua(self, monkeypatch):
+        """Supplementary Private Use Areas (U+F0000..U+FFFFD, U+100000..U+10FFFD)."""
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.format_message("a\U000f1234b") == "ab"
+        assert adapter.format_message("a\U0010cdefb") == "ab"
+
+    def test_preserves_ordinary_emoji(self, monkeypatch):
+        """Everyday emoji must survive sanitization untouched."""
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.format_message("hey 😀") == "hey 😀"
+        assert adapter.format_message("love ❤️") == "love ❤️"
+
+    def test_rstrips_trailing_whitespace(self, monkeypatch):
+        """Trailing whitespace left after stripping tofu chars is cleaned up."""
+        adapter = _make_adapter(monkeypatch)
+        # tofu char at the very end leaves trailing whitespace that must be removed
+        assert adapter.format_message("done▉ ") == "done"
+        assert adapter.format_message("done \uE028 ") == "done"
+
+    def test_sanitize_helper_direct(self):
+        """_sanitize_for_imessage strips the tofu ranges and rstrips."""
+        from gateway.platforms.bluebubbles import _sanitize_for_imessage
+
+        assert _sanitize_for_imessage("▉block▉") == "block"
+        assert _sanitize_for_imessage("\ue000pua\uf8ff") == "pua"
+        assert _sanitize_for_imessage("\U000f0000sup\U0010fffd") == "sup"
+        assert _sanitize_for_imessage("ok 😀  ") == "ok 😀"
+        assert _sanitize_for_imessage(None) == ""
+
     def test_init_normalizes_webhook_path(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_path="bluebubbles-webhook")
         assert adapter.webhook_path == "/bluebubbles-webhook"
@@ -418,19 +462,21 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url property normalises local hosts to '127.0.0.1'."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is 0.0.0.0 → normalized to 127.0.0.1
+        assert "127.0.0.1" in adapter._webhook_url
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
-    @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
+    @pytest.mark.parametrize(
+        "host", ["0.0.0.0", "127.0.0.1", "localhost", "::", "::1"]
+    )
     def test_local_hosts_normalized(self, monkeypatch, host):
         adapter = _make_adapter(monkeypatch, webhook_host=host)
-        assert adapter._webhook_url.startswith("http://localhost:")
+        assert adapter._webhook_url.startswith("http://127.0.0.1:")
 
     def test_custom_host_preserved(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")
