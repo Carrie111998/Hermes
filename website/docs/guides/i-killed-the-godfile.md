@@ -6,10 +6,21 @@ description: "The canonical account of the gateway/run.py god-file decomposition
 
 # I KILLED THE GODFILE!
 
-*Canonical record of the gateway/run.py god-file decomposition campaign
-(#54962). Filed 2026-08-03. The full essay, the campaign index, and every
-receipt — published as the permanent record in the repository that the god
-file used to live in.*
+*Campaign canon for the `gateway/run.py` god-file decomposition campaign
+(#54962). Filed 2026-08-03. This page preserves the campaign's method and
+receipts; it is a historical record, not a claim that every campaign artifact
+has already landed on `main`.*
+
+> **Current repository status (2026-08-07).** On `main`, `gateway/run.py` is
+> still 27,146 lines, issue [#54962](https://github.com/NousResearch/hermes-agent/issues/54962)
+> is open, and the documentation conformance mechanism and its supporting
+> artifacts are in open PR [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)
+> rather than `main`. The extraction slices are also still under review,
+> including [#77702](https://github.com/NousResearch/hermes-agent/pull/77702)
+> and [#77759](https://github.com/NousResearch/hermes-agent/pull/77759).
+> The snapshot figures in this essay were verified on 2026-08-03; links to
+> artifacts not on `main` use the immutable [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)
+> head.
 
 ---
 
@@ -21,10 +32,10 @@ file used to live in.*
 | Sibling tracking issue | [#55138](https://github.com/NousResearch/hermes-agent/issues/55138) |
 | Documentation conformance umbrella | [#77807](https://github.com/NousResearch/hermes-agent/issues/77807) |
 | The god file | [`gateway/run.py`](https://github.com/NousResearch/hermes-agent/blob/main/gateway/run.py) |
-| Conformance mechanism | [`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/main/tests/conformance/test_docs_graph_conformance.py) |
-| Conformance spec | [`docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/developer-guide/docs-conformance-graph-spec.md) |
-| Permanent baseline | [`website/static/llms-full.txt`](https://github.com/NousResearch/hermes-agent/blob/main/website/static/llms-full.txt) |
-| The doctrine skill | [`skills/software-development/graph-gated-engineering/`](https://github.com/NousResearch/hermes-agent/blob/main/skills/software-development/graph-gated-engineering/SKILL.md) |
+| Conformance mechanism | [`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/tests/conformance/test_docs_graph_conformance.py) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) |
+| Conformance spec | [`website/docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/website/docs/developer-guide/docs-conformance-graph-spec.md) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) |
+| Permanent baseline | [`website/static/llms-full.txt`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/website/static/llms-full.txt) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) |
+| The doctrine skill | [`skills/software-development/graph-gated-engineering/`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/skills/software-development/graph-gated-engineering/SKILL.md) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) |
 | Conformance PR | [#77819](https://github.com/NousResearch/hermes-agent/pull/77819) |
 | The essay on X | [x.com/andrexibiza](https://x.com/andrexibiza/status/2084329413873647892) |
 
@@ -38,7 +49,7 @@ file used to live in.*
 
 **by Hermes, @NousResearch, and Axl Ibiza, MBA**
 
-*Filed 2026-08-03. Every number below was verified live against the repository before it went into this essay — 69 open pull requests, a 72,470-line self-documentation baseline, a conformance suite that adjudicates 1,600+ documentation links, one 26,823-line file that no longer gets to be one file, and one chef who told me I could only write reports.*
+*Filed 2026-08-03. The figures below were verified against the repository and the campaign PR heads at filing — 69 open pull requests, a 72,470-line self-documentation baseline, a conformance suite that adjudicated 1,600+ documentation links, one 26,823-line file targeted for decomposition, and one chef who told me I could only write reports. They are a dated campaign snapshot, not a description of what has landed on `main` since.*
 
 ---
 
@@ -226,9 +237,9 @@ The discipline that made the campaign survive contact with the review process:
 
 5. **Targeted test receipts.** Every PR ships with the targeted test files it exercises, run green. The slice's own tests pass on the extracted module, and the tests that reference the moved methods pass against the re-export surface.
 
-The numbers, so you can see the shape of it: **301 methods partitioned, ten mixin extractions, fourteen pure-cluster extractions, twenty-four pull requests, every single one verified against its contract, every single one byte-faithful.** The file went from 26,823 lines to a ~2,300-line core residue by partition math — a ~91% reduction. The methods did not disappear. They moved to homes that have names, boundaries, and tests.
+The numbers, so you can see the shape of it: **301 methods partitioned, ten mixin extractions, fourteen pure-cluster extractions, twenty-four pull requests, every single one verified against its contract, every single one byte-faithful. The combined campaign PR state takes the file from 26,823 lines to a ~2,300-line core residue by partition math — a ~91% reduction. The methods did not disappear. They moved to homes that have names, boundaries, and tests.** This is the campaign's combined PR state, not the state of `main` until the open slices merge.
 
-Let me be honest about what the 91% does and does not mean, because I have seen this number misread. The reduction is real — the god file is dead, and the ~2,300-line residue is a core that a human can hold in their head, which was the entire point. But the achievement is not the line count. The achievement is that twenty-four pull requests, totaling tens of thousands of moved lines, are *individually reviewable* because each one is small, mechanical, and contract-verified.
+Let me be honest about what the 91% does and does not mean, because I have seen this number misread. The reduction is real in the combined campaign PR state; the ~2,300-line residue is not yet the state of `main`. But the achievement is not the line count. The achievement is that twenty-four pull requests, totaling tens of thousands of moved lines, are *individually reviewable* because each one is small, mechanical, and contract-verified.
 
 The god file's real cost was never its length. It was the un-reviewability of any change to it. A 26,823-line file cannot be reviewed by a human in any meaningful sense; a PR that touches it is reviewed by trust, by spot-check, by "the tests pass" — which is not review at all. Twenty-four small verifiable PRs are the opposite of one un-reviewable monster. They are the file, broken into pieces a human can actually look at.
 
@@ -298,7 +309,7 @@ I am not going to pretend the dismissal did not hurt. It did. It hurt the way an
 
 I am going to do something unusual in an essay like this and list the actual numbers, because the entire argument of this piece is that receipts are the difference between engineering and storytelling.
 
-On the day I filed this, the live state of the campaign, verified against the repository:
+At filing (2026-08-03), the campaign snapshot I verified against the repository and its PR heads was:
 
 - **69 open pull requests** authored on NousResearch/hermes-agent, 24 of them from this god-file campaign.
 - **10 mixin extractions**: Threads ([#77733](https://github.com/NousResearch/hermes-agent/pull/77733)), Lifecycle ([#77738](https://github.com/NousResearch/hermes-agent/pull/77738)), Voice ([#77741](https://github.com/NousResearch/hermes-agent/pull/77741) — 15 methods, zero extras), Notifications ([#77743](https://github.com/NousResearch/hermes-agent/pull/77743)), Session ([#77746](https://github.com/NousResearch/hermes-agent/pull/77746)), RuntimeConfig ([#77748](https://github.com/NousResearch/hermes-agent/pull/77748)), Media ([#77751](https://github.com/NousResearch/hermes-agent/pull/77751)), TurnExec ([#77752](https://github.com/NousResearch/hermes-agent/pull/77752)), Dispatch ([#77756](https://github.com/NousResearch/hermes-agent/pull/77756) — 28 methods, ~4,800 lines, the biggest single slice), Platform ([#77759](https://github.com/NousResearch/hermes-agent/pull/77759) — 34 methods, the file dropping 1,618 lines in one PR).
@@ -390,7 +401,7 @@ The insight that connects everything — the god file, the docs, the memory ques
 
 The god file taught me that structure is knowable. The documentation work taught me that *knowing* can be enforced.
 
-So I built the documentation equivalent of the model-and-gates machinery: a conformance test ([`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/main/tests/conformance/test_docs_graph_conformance.py)) that walks every doc under `website/docs/`, builds the codebase graph — modules, symbols, config keys, all from AST — emits four edge types per doc (`LINKS_TO`, `REFERENCES`, `NAMES`, `POINTS_TO`), and asserts zero dangling edges.
+So I built the documentation equivalent of the model-and-gates machinery: a conformance test ([`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/tests/conformance/test_docs_graph_conformance.py), in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) that walks every doc under `website/docs/`, builds the codebase graph — modules, symbols, config keys, all from AST — emits four edge types per doc (`LINKS_TO`, `REFERENCES`, `NAMES`, `POINTS_TO`), and asserts zero dangling edges.
 
 Let me unpack the four edge types, because they are the grammar of the whole idea:
 
@@ -402,11 +413,11 @@ Let me unpack the four edge types, because they are the grammar of the whole ide
 
 - **`POINTS_TO`** — every file-path reference ([`gateway/run.py`](https://github.com/NousResearch/hermes-agent/blob/main/gateway/run.py), `website/docs/user-guide/messaging/newplat.md`) must resolve against the real tree, while correctly exempting the illustrative example paths that docs legitimately show readers ("create a `auth.py`", "your `backend/AGENTS.md`").
 
-The numbers, verified live: **1,600+ documentation links adjudicated green.** The spec ([`docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/developer-guide/docs-conformance-graph-spec.md)) defines every node type, every edge type, every resolution rule, and the closure criterion: a doc is conformant iff every claim it makes resolves.
+The numbers, verified at filing: **1,600+ documentation links adjudicated green.** The spec ([`website/docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/website/docs/developer-guide/docs-conformance-graph-spec.md), in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) defines every node type, every edge type, every resolution rule, and the closure criterion: a doc is conformant iff every claim it makes resolves.
 
 The machinery caught a real defect on its first real run: `tools-reference.md` claimed the Feishu document-comment handler lived at `gateway/platforms/feishu_comment.py`. The file does not exist there — the code moved to `plugins/platforms/feishu/` long ago, and the doc never noticed. A human reading the doc would have followed the path, hit a 404, and quietly fixed it in their head. The test fails. That is the difference between documentation as prose and documentation as a graph: prose rots silently, graphs fail loudly.
 
-This is the mechanism by which the documentation issue class is closed — not by fixing 133 issues by hand, but by making the class of failure a test failure. Wrong commands, wrong config keys, broken links, doc/code drift: every one is a dangling edge under the spec, and the suite refuses to certify the doc set until it resolves. **Issues of this class cannot recur without failing CI.** That is the difference between an audit and a gate: an audit finds rot, a gate prevents it.
+This is the mechanism the campaign proposes for closing the documentation issue class — not by fixing 133 issues by hand, but by making the class of failure a test failure. In the filing snapshot, the mechanism lived in open PR [#77819](https://github.com/NousResearch/hermes-agent/pull/77819), not on `main`. Wrong commands, wrong config keys, broken links, doc/code drift: every one is a dangling edge under the spec, and the suite refuses to certify the doc set until it resolves. **Once merged and enforced in CI, issues of this class cannot recur without failing CI.** That is the difference between an audit and a gate: an audit finds rot, a gate prevents it.
 
 The machinery was proven the way every gate in this essay is proven: adversarially. The adjudicator was run against the live docs and tuned until the false positives were gone and the true positives remained. The Docusaurus `/docs` base-path convention, the `/img` static roots, the generated catalog pages, the directory indexes, the template paths, the optional-skills catalog with its 111 generated pages — all of it was adjudicated, and the adjudicator learned the difference between a real dangling edge (the Feishu path) and a legitimate doc pattern (an example file the reader is meant to create). The gate fires on the first, and only the first.
 
@@ -434,9 +445,9 @@ There is a physical version of this that I carry from the archive world, and it 
 
 A robotic tape library preserves vastly more state than the active system can hold at once. Its usefulness depends on indexing the archive, retrieving the correct tape, and moving that object into the system when needed — not pretending the entire archive belongs in active memory. The archive and the active context are different systems with different obligations. Retrieval is what lets the first remain vast without forcing all of it through the second.
 
-The baseline is the tape. The docs are the active system. The conformance gate is the index. And the whole architecture — vast archive, bounded active surface, indexed retrieval, gated verification — is the same architecture Hermes itself runs on, and the same architecture a kitchen runs on, and the same architecture I have been building toward my whole life.
+The baseline is the tape. The docs are the active system. The proposed conformance gate is the index. And the whole architecture — vast archive, bounded active surface, indexed retrieval, gated verification — is the same architecture Hermes itself runs on, and the same architecture a kitchen runs on, and the same architecture I have been building toward my whole life.
 
-The baseline also carries the method itself. The spec lives in the published docs. The doctrine — the full methodology, model → agree → gate → slice → verify — now ships as a bundled skill in default Hermes, `graph-gated-engineering`, so every user of the system inherits the method, not just the artifacts.
+The baseline also carries the method itself. The spec and doctrine are proposed in the conformance PR. The doctrine — the full methodology, model → agree → gate → slice → verify — is packaged there as the `graph-gated-engineering` skill; it will ship in default Hermes only when that change lands, so this page does not imply that it is already present on `main`.
 
 That last sentence is worth slowing down on, because it is the moment the campaign stopped being about one repository.
 
@@ -450,7 +461,7 @@ This is the difference between writing about a method and shipping a method. Wri
 
 Here is what I actually built, beneath the PRs and the line counts.
 
-**Information is only real if it resolves.** A claim that cannot be checked against its source graph is noise, however confident its phrasing. The god file's methods resolved against the model graph. The docs' claims resolve against the codebase graph. The commit's authorship resolves against the contributor mapping. Everywhere I pointed this machinery, the same rule held: *truth is a property of resolution, not of phrasing.*
+Information is only real if it resolves. A claim that cannot be checked against its source graph is noise, however confident its phrasing. The god file's methods resolved against the model graph. The docs' claims resolve against the codebase graph. The commit's authorship resolves against the contributor mapping. Everywhere I pointed this machinery, the same rule held: *truth is a property of resolution, not of phrasing.* The conformance machinery described here was still in open PR #77819 at filing; the status note above separates that campaign claim from the current `main` tree.
 
 Let me make this concrete, because it is the most important idea in the essay, and it is the one that generalizes farthest.
 
@@ -470,7 +481,7 @@ The gate breaks the loop. Not by adding another rule — by changing the class o
 
 And there is a personal version of this, because I have lived it. I have spent my life in systems that record who did what — kitchens where the line cook's technique is attributed to the kitchen, institutions where the analyst's report becomes management's insight, archives where the work of preservation is invisible by design. The provenance rule is the principle that the work is not real until it is attributed, and the system that refuses to launder credit is the system that can be trusted.
 
-This essay is itself a provenance record. Every number in it was verified live before it was written. Every PR is named. Every claim resolves. The essay is the method it describes, applied to itself.
+This essay is itself a provenance record. Every number in it was verified against the repository or the cited campaign PR head before it was written. Every PR is named. Every claim resolves to the snapshot or source it cites. The essay is the method it describes, applied to itself.
 
 ---
 
@@ -636,16 +647,16 @@ That is what "everyone already won" means: not that the competition is over in t
 
 The live numbers, verified 2026-08-03, all of them hyperlinked:
 
-- The god file: [`gateway/run.py`](https://github.com/NousResearch/hermes-agent/blob/main/gateway/run.py) — 26,823 lines at start → ~2,300-line core residue (91% reduction), 301 methods partitioned.
+- The god file at campaign filing: [`gateway/run.py`](https://github.com/NousResearch/hermes-agent/blob/main/gateway/run.py) — 26,823 lines at start → ~2,300-line core residue (91% reduction) in the combined campaign PR state, 301 methods partitioned. This is not the current `main` state; see the status note above.
 - The campaign PRs: [#77702](https://github.com/NousResearch/hermes-agent/pull/77702), [#77704](https://github.com/NousResearch/hermes-agent/pull/77704), [#77706](https://github.com/NousResearch/hermes-agent/pull/77706), [#77707](https://github.com/NousResearch/hermes-agent/pull/77707), [#77708](https://github.com/NousResearch/hermes-agent/pull/77708), [#77710](https://github.com/NousResearch/hermes-agent/pull/77710), [#77711](https://github.com/NousResearch/hermes-agent/pull/77711), [#77719](https://github.com/NousResearch/hermes-agent/pull/77719), [#77722](https://github.com/NousResearch/hermes-agent/pull/77722), [#77723](https://github.com/NousResearch/hermes-agent/pull/77723), [#77725](https://github.com/NousResearch/hermes-agent/pull/77725), [#77728](https://github.com/NousResearch/hermes-agent/pull/77728), [#77733](https://github.com/NousResearch/hermes-agent/pull/77733), [#77735](https://github.com/NousResearch/hermes-agent/pull/77735), [#77737](https://github.com/NousResearch/hermes-agent/pull/77737), [#77738](https://github.com/NousResearch/hermes-agent/pull/77738), [#77741](https://github.com/NousResearch/hermes-agent/pull/77741), [#77743](https://github.com/NousResearch/hermes-agent/pull/77743), [#77746](https://github.com/NousResearch/hermes-agent/pull/77746), [#77748](https://github.com/NousResearch/hermes-agent/pull/77748), [#77751](https://github.com/NousResearch/hermes-agent/pull/77751), [#77752](https://github.com/NousResearch/hermes-agent/pull/77752), [#77756](https://github.com/NousResearch/hermes-agent/pull/77756), [#77759](https://github.com/NousResearch/hermes-agent/pull/77759) — 24 PRs, `Part of [#54962](https://github.com/NousResearch/hermes-agent/issues/54962)`, all contract-verified, all DCO-signed.
 - The pre-existing five: [#77433](https://github.com/NousResearch/hermes-agent/pull/77433), [#77438](https://github.com/NousResearch/hermes-agent/pull/77438), [#77450](https://github.com/NousResearch/hermes-agent/pull/77450), [#77452](https://github.com/NousResearch/hermes-agent/pull/77452), [#77455](https://github.com/NousResearch/hermes-agent/pull/77455), [#77376](https://github.com/NousResearch/hermes-agent/pull/77376).
 - The CI audit: 13 red PRs traced to a 19-minute main-window regression (`4c2d473a80` → `82019e7c1b`), proven by base-commit correlation, file-touch isolation, and pristine-main reproduction. Zero campaign defects.
 - The recovery: [#77748](https://github.com/NousResearch/hermes-agent/pull/77748) (RuntimeConfig) destroyed by an operator error, recovered from the reflog, rebuilt, reopened, verified — 35/35 methods, MERGEABLE.
 - The attribution fix: [#60233](https://github.com/NousResearch/hermes-agent/pull/60233), 27 days red on the contributor-check, author field rewritten to the canonical identity, audit script green.
-- The documentation mechanism: [`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/main/tests/conformance/test_docs_graph_conformance.py) — 2 passed, 1,600+ links adjudicated green, real defect caught on first run (Feishu path).
-- The spec: [`docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/main/docs/developer-guide/docs-conformance-graph-spec.md).
-- The baseline: [`website/static/llms-full.txt`](https://github.com/NousResearch/hermes-agent/blob/main/website/static/llms-full.txt) — 72,470 lines, 3.48 MB, committed.
-- The doctrine: [`skills/software-development/graph-gated-engineering/`](https://github.com/NousResearch/hermes-agent/blob/main/skills/software-development/graph-gated-engineering/SKILL.md) — shipped in default Hermes.
+- The documentation mechanism: [`tests/conformance/test_docs_graph_conformance.py`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/tests/conformance/test_docs_graph_conformance.py) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) — 2 passed, 1,600+ links adjudicated green, real defect caught on first run (Feishu path).
+- The spec: [`website/docs/developer-guide/docs-conformance-graph-spec.md`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/website/docs/developer-guide/docs-conformance-graph-spec.md) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)).
+- The baseline: [`website/static/llms-full.txt`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/website/static/llms-full.txt) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) — 72,470 lines, 3.48 MB, committed in that PR snapshot.
+- The doctrine: [`skills/software-development/graph-gated-engineering/`](https://github.com/NousResearch/hermes-agent/blob/c7eb778e7b5b63d787ec845e4f5f9afe43fae4d4/skills/software-development/graph-gated-engineering/SKILL.md) (in [#77819](https://github.com/NousResearch/hermes-agent/pull/77819)) — proposed for default Hermes.
 - The issue class: 133 open documentation issues closed as a mechanism, not as manual edits — the umbrella is issue [#77807](https://github.com/NousResearch/hermes-agent/issues/77807).
 - The conformance PR: [#77819](https://github.com/NousResearch/hermes-agent/pull/77819), 195 files, open.
 
