@@ -342,6 +342,89 @@ def project_payload_to_v3(value: Any) -> Mapping[str, Any]:
         ) from exc
 
 
+def project_payload_to_cutover_v4(value: Any) -> Mapping[str, Any]:
+    """Project one signed Stage-C payload into the v4 cutover payload.
+
+    Unlike the legacy v3 compatibility projection, this projection preserves
+    the signed owner-gate receipt trust anchor and the root-owned release
+    boundary.  The cutover packager therefore cannot silently downgrade a v4
+    authority to a topology that omits the second public trust anchor.
+    """
+
+    raw = _mapping(
+        value,
+        _PAYLOAD_FIELDS,
+        "release_unit_inputs_v4_payload_invalid",
+    )
+    projected_v3 = dict(project_payload_to_v3(raw))
+    projected = {
+        "schema": v3.UNIT_INPUT_PAYLOAD_SCHEMA_V4,
+        **{
+            name: item
+            for name, item in projected_v3.items()
+            if name not in {"schema", "release_owner_uid", "release_owner_gid"}
+        },
+        "owner_gate_receipt_public_key_id": raw[
+            "owner_gate_receipt_public_key_id"
+        ],
+        "release_owner_uid": raw["release_owner_uid"],
+        "release_owner_gid": raw["release_owner_gid"],
+    }
+    try:
+        return v3._unit_input_payload(projected)  # noqa: SLF001
+    except (v3.PackagingError, KeyError, TypeError, ValueError) as exc:
+        raise ProductionReleaseUnitInputsV4Error(
+            "release_unit_inputs_v4_cutover_projection_invalid"
+        ) from exc
+
+
+def project_fixed_inputs_to_cutover_v4(value: Any) -> Mapping[str, Any]:
+    """Project one immutable Stage-C fixed document for the cutover CLI.
+
+    The fixed document already cross-binds both owner-signed publications.
+    This projection retains the two exact authority receipt digests needed by
+    the historical cutover input envelope and preserves the signed v4 payload
+    without reconstructing it from ambient host state.
+    """
+
+    fixed = _validate_fixed_shape(value)
+    payload = validate_payload(
+        {
+            "schema": PAYLOAD_SCHEMA,
+            **{
+                name: fixed[name]
+                for name in _PAYLOAD_FIELDS
+                if name != "schema"
+            },
+        }
+    )
+    cutover_payload = project_payload_to_cutover_v4(payload)
+    projected = {
+        "schema": v3.UNIT_INPUT_SCHEMA_V4,
+        "release_revision": fixed["release_revision"],
+        "authority_plan_sha256": fixed[
+            "unit_input_authority_plan_sha256"
+        ],
+        "authority_approval_sha256": fixed[
+            "unit_input_authority_approval_sha256"
+        ],
+        **{
+            name: item
+            for name, item in cutover_payload.items()
+            if name != "schema"
+        },
+    }
+    try:
+        return v3._unit_inputs(  # noqa: SLF001
+            projected,
+            revision=fixed["release_revision"],
+        )
+    except (v3.PackagingError, KeyError, TypeError, ValueError) as exc:
+        raise ProductionReleaseUnitInputsV4Error(
+            "release_unit_inputs_v4_cutover_projection_invalid"
+        ) from exc
+
+
 def validate_payload(value: Any) -> Mapping[str, Any]:
     """Validate one strict v4 payload and its complete v3 projection."""
 

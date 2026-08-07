@@ -60,7 +60,6 @@ from gateway.operational_edge_assets import (
 from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from gateway.operational_edge_units import (
     CLIENT_CONFIG_PATH as OPERATIONAL_EDGE_CLIENT_CONFIG,
-    OWNER_GATE_RECEIPT_PUBLIC_KEY,
     OperationalEdgeUnitError,
     render_operational_edge_units,
     service_config_path as operational_edge_config_path,
@@ -109,6 +108,7 @@ SENTINELS = {
     "__MUNCHO_SEALED_RUNTIME_ARTIFACT_REQUEST__",
 }
 UNIT_INPUT_SCHEMA = "muncho-production-cutover-unit-inputs.v3"
+UNIT_INPUT_SCHEMA_V4 = "muncho-production-cutover-unit-inputs.v4"
 SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA = (
     "muncho-production-cutover-sealed-runtime-artifacts.v1"
 )
@@ -130,6 +130,9 @@ _RENAME_NOREPLACE = 1
 _MAX_TEMPORARY_ALIASES = 64
 UNIT_INPUT_STAGING_SCHEMA = "muncho-production-cutover-unit-input-staging.v3"
 UNIT_INPUT_PAYLOAD_SCHEMA = "muncho-production-cutover-unit-input-payload.v3"
+UNIT_INPUT_PAYLOAD_SCHEMA_V4 = (
+    "muncho-production-cutover-unit-input-payload.v4"
+)
 UNIT_INPUT_PLAN_SCHEMA = "muncho-production-cutover-unit-input-plan.v3"
 UNIT_INPUT_APPROVAL_SCHEMA = "muncho-production-cutover-unit-input-approval.v3"
 LEGACY_V3_OPERATIONAL_EDGE_DOMAINS = frozenset(
@@ -144,6 +147,9 @@ LEGACY_V3_OPERATIONAL_EDGE_DOMAINS = frozenset(
         "skyvision_gitlab",
         "skyvision_panel",
     }
+)
+OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY = Path(
+    "/etc/muncho-owner-gate/public/authority-receipt-public.pem"
 )
 DISCORD_RECONCILIATION_INTENT_SCHEMA = (
     "muncho-production-discord-reconciliation-intent.v1"
@@ -427,6 +433,10 @@ _UNIT_INPUT_PAYLOAD_FIELDS = frozenset(
     }
 )
 
+_UNIT_INPUT_PAYLOAD_FIELDS_V4 = _UNIT_INPUT_PAYLOAD_FIELDS | frozenset(
+    {"owner_gate_receipt_public_key_id"}
+)
+
 
 _CLIENT_GROUP_FIELDS = frozenset({"group", "gid"})
 _DISCORD_RECONCILIATION_INTENT_FIELDS = frozenset(
@@ -535,9 +545,15 @@ def _unit_input_payload(
     *,
     operational_edge_domains: Collection[str] | None = None,
 ) -> dict[str, Any]:
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    fields = (
+        _UNIT_INPUT_PAYLOAD_FIELDS_V4
+        if schema == UNIT_INPUT_PAYLOAD_SCHEMA_V4
+        else _UNIT_INPUT_PAYLOAD_FIELDS
+    )
     raw = _exact_mapping(
         value,
-        _UNIT_INPUT_PAYLOAD_FIELDS,
+        fields,
         "cutover_packaging_unit_inputs_invalid",
     )
     identities = {
@@ -572,6 +588,9 @@ def _unit_input_payload(
     domains = set(_v3_operational_edge_domains(operational_edge_domains))
     target = _target_input(raw["target"], database_ip=str(raw["database_ip"]))
     receipt_key_ids = raw["operational_edge_receipt_public_key_ids"]
+    owner_gate_receipt_public_key_id = raw.get(
+        "owner_gate_receipt_public_key_id"
+    )
     expected_identity_names = {
         "gateway": "ai-platform-brain",
         "writer": "muncho-canonical-writer",
@@ -583,7 +602,10 @@ def _unit_input_payload(
         "worker": ISOLATED_WORKER_USER,
     }
     if (
-        raw["schema"] != UNIT_INPUT_PAYLOAD_SCHEMA
+        schema not in {
+            UNIT_INPUT_PAYLOAD_SCHEMA,
+            UNIT_INPUT_PAYLOAD_SCHEMA_V4,
+        }
         or not isinstance(raw["database_ip"], str)
         or not raw["database_ip"]
         or any(
@@ -619,10 +641,40 @@ def _unit_input_payload(
             set(receipt_key_ids.values())
             | {raw["writer_capability_public_key_id"]}
         )
+        or (
+            schema == UNIT_INPUT_PAYLOAD_SCHEMA_V4
+            and (
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(owner_gate_receipt_public_key_id),
+                )
+                is None
+                or owner_gate_receipt_public_key_id
+                in (
+                    set(receipt_key_ids.values())
+                    | {
+                        raw["writer_capability_public_key_id"],
+                        raw["discord_edge_receipt_public_key_id"],
+                    }
+                )
+            )
+        )
         or type(raw["release_owner_uid"]) is not int
         or type(raw["release_owner_gid"]) is not int
-        or raw["release_owner_uid"] != identities["gateway"]["uid"]
-        or raw["release_owner_gid"] != identities["gateway"]["gid"]
+        or (
+            schema == UNIT_INPUT_PAYLOAD_SCHEMA
+            and (
+                raw["release_owner_uid"] != identities["gateway"]["uid"]
+                or raw["release_owner_gid"] != identities["gateway"]["gid"]
+            )
+        )
+        or (
+            schema == UNIT_INPUT_PAYLOAD_SCHEMA_V4
+            and (
+                raw["release_owner_uid"] != 0
+                or raw["release_owner_gid"] != 0
+            )
+        )
         or not isinstance(raw["bwrap_sha256"], str)
         or re.fullmatch(r"[0-9a-f]{64}", raw["bwrap_sha256"]) is None
         or not isinstance(raw["shell_sha256"], str)
@@ -665,6 +717,12 @@ def _unit_inputs(
     revision: str | None = None,
     operational_edge_domains: Collection[str] | None = None,
 ) -> dict[str, Any]:
+    schema = value.get("schema") if isinstance(value, Mapping) else None
+    payload_fields = (
+        _UNIT_INPUT_PAYLOAD_FIELDS_V4
+        if schema == UNIT_INPUT_SCHEMA_V4
+        else _UNIT_INPUT_PAYLOAD_FIELDS
+    )
     raw = _exact_mapping(
         value,
         frozenset(
@@ -673,13 +731,13 @@ def _unit_inputs(
                 "release_revision",
                 "authority_plan_sha256",
                 "authority_approval_sha256",
-                *(_UNIT_INPUT_PAYLOAD_FIELDS - {"schema"}),
+                *(payload_fields - {"schema"}),
             }
         ),
         "cutover_packaging_unit_inputs_invalid",
     )
     if (
-        raw["schema"] != UNIT_INPUT_SCHEMA
+        schema not in {UNIT_INPUT_SCHEMA, UNIT_INPUT_SCHEMA_V4}
         or not isinstance(raw["release_revision"], str)
         or REVISION.fullmatch(raw["release_revision"]) is None
         or (revision is not None and raw["release_revision"] != revision)
@@ -710,7 +768,11 @@ def _unit_inputs(
                     "authority_approval_sha256",
                 }
             },
-            "schema": UNIT_INPUT_PAYLOAD_SCHEMA,
+            "schema": (
+                UNIT_INPUT_PAYLOAD_SCHEMA_V4
+                if schema == UNIT_INPUT_SCHEMA_V4
+                else UNIT_INPUT_PAYLOAD_SCHEMA
+            ),
         },
         operational_edge_domains=operational_edge_domains,
     )
@@ -719,7 +781,7 @@ def _unit_inputs(
     ]:
         raise PackagingError("cutover_packaging_unit_inputs_invalid")
     return {
-        "schema": UNIT_INPUT_SCHEMA,
+        "schema": schema,
         "release_revision": raw["release_revision"],
         "authority_plan_sha256": raw["authority_plan_sha256"],
         "authority_approval_sha256": raw["authority_approval_sha256"],
@@ -812,6 +874,38 @@ def _validated_owner_gate_receipt_public_key_id(
             "cutover_owner_gate_receipt_public_key_invalid"
         )
     return expected_key_id
+
+
+def _owner_gate_receipt_public_key_id_for_inputs(
+    unit_inputs: Mapping[str, Any],
+    explicit_key_id: str | None,
+) -> str | None:
+    """Resolve only the anchor carried by the signed fixed-input schema.
+
+    A v3 input cannot borrow an ambient or caller-supplied key.  A v4 input
+    always carries the key id and any explicit compatibility argument must be
+    byte-identical.  This makes omission and downgrade fail closed while
+    allowing every production caller to consume one normalized input object.
+    """
+
+    schema = unit_inputs.get("schema")
+    bound_key_id = unit_inputs.get("owner_gate_receipt_public_key_id")
+    if schema == UNIT_INPUT_SCHEMA:
+        if explicit_key_id is not None or bound_key_id is not None:
+            raise PackagingError(
+                "cutover_owner_gate_receipt_public_key_authority_invalid"
+            )
+        return None
+    if (
+        schema != UNIT_INPUT_SCHEMA_V4
+        or not isinstance(bound_key_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", bound_key_id) is None
+        or explicit_key_id not in {None, bound_key_id}
+    ):
+        raise PackagingError(
+            "cutover_owner_gate_receipt_public_key_authority_invalid"
+        )
+    return bound_key_id
 
 
 def _file_identity(item: os.stat_result) -> tuple[int, ...]:
@@ -1013,14 +1107,31 @@ def load_fixed_unit_inputs(
             maximum=128 * 1024,
         )
     )
-    return _unit_inputs(
-        _decode_canonical_json(
-            payload,
-            newline=True,
-            code="cutover_unit_inputs_staging_invalid",
-        ),
-        revision=revision,
+    decoded = _decode_canonical_json(
+        payload,
+        newline=True,
+        code="cutover_unit_inputs_staging_invalid",
     )
+    if decoded.get("schema") == "muncho-production-release-unit-inputs.v4":
+        # The release-update rotation stores the complete v4 fixed authority
+        # at the historical fixed path.  Import lazily to avoid the module's
+        # intentional dependency on this legacy packager.
+        from scripts.canary import production_release_unit_inputs_v4
+
+        try:
+            decoded = (
+                production_release_unit_inputs_v4.project_fixed_inputs_to_cutover_v4(
+                    decoded
+                )
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            production_release_unit_inputs_v4.ProductionReleaseUnitInputsV4Error,
+        ) as exc:
+            raise PackagingError("cutover_unit_inputs_staging_invalid") from exc
+    return _unit_inputs(decoded, revision=revision)
 
 
 _UNIT_INPUT_PLAN_FIELDS = frozenset(
@@ -1958,12 +2069,18 @@ def _sealed_runtime_artifact_request(
     operational_asset_verification: Mapping[str, Any],
     owner_gate_receipt_public_key_id: str | None = None,
     owner_gate_receipt_public_key_path: Path = (
-        OWNER_GATE_RECEIPT_PUBLIC_KEY
+        OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY
     ),
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Render and seal the complete no-secret operational host boundary."""
 
     inputs = _unit_inputs(unit_inputs, revision=revision)
+    bound_owner_gate_receipt_public_key_id = (
+        _owner_gate_receipt_public_key_id_for_inputs(
+            inputs,
+            owner_gate_receipt_public_key_id,
+        )
+    )
     runtime = _runtime_browser_kwargs(runtime_dependency)
     gateway = inputs["gateway"]
     projector = inputs["projector"]
@@ -1978,7 +2095,7 @@ def _sealed_runtime_artifact_request(
         )
         verified_owner_gate_receipt_public_key_id = (
             _validated_owner_gate_receipt_public_key_id(
-                owner_gate_receipt_public_key_id,
+                bound_owner_gate_receipt_public_key_id,
                 public_key_path=owner_gate_receipt_public_key_path,
             )
         )
@@ -2206,7 +2323,7 @@ def render_release_sealed_host_payloads(
     unit_inputs: Mapping[str, Any],
     owner_gate_receipt_public_key_id: str | None = None,
     owner_gate_receipt_public_key_path: Path = (
-        OWNER_GATE_RECEIPT_PUBLIC_KEY
+        OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY
     ),
 ) -> tuple[Mapping[str, bytes], Mapping[str, Any], Mapping[str, Any]]:
     """Re-render the release-sealed host bytes without mutating the release.
@@ -2334,7 +2451,7 @@ def build_release_artifacts(
     unit_inputs: Mapping[str, Any],
     owner_gate_receipt_public_key_id: str | None = None,
     owner_gate_receipt_public_key_path: Path = (
-        OWNER_GATE_RECEIPT_PUBLIC_KEY
+        OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY
     ),
 ) -> Mapping[str, Any]:
     if REVISION.fullmatch(revision) is None:
@@ -2467,7 +2584,7 @@ def verify_release_artifacts(
     unit_inputs: Mapping[str, Any],
     owner_gate_receipt_public_key_id: str | None = None,
     owner_gate_receipt_public_key_path: Path = (
-        OWNER_GATE_RECEIPT_PUBLIC_KEY
+        OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY
     ),
 ) -> Mapping[str, Any]:
     try:
@@ -2684,6 +2801,7 @@ def main(argv: list[str] | None = None) -> int:
         with authority_lock.authority_activation_lock(require_root=True):
             unit_inputs = load_fixed_unit_inputs(
                 args.unit_inputs,
+                revision=args.revision,
                 inherited_descriptor=inherited_descriptor,
             )
             result = (
