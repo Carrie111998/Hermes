@@ -61,13 +61,14 @@ class LateState:
 
     Extracted routers can't ``from web_server import _mcp_oauth_flows`` —
     that would freeze the object at import time (breaking tests that mutate
-    or replace it on ``web_server``) and be a circular import besides.  Some
-    of the state is also defined *after* the router's ``include_router``
+    or replace it on ``web_server``) and be a circular import besides.
+    Some of the state is also defined *after* the router's ``include_router``
     point in web_server's body, so even a late module-import wouldn't see it
     yet.  This proxy forwards every operation the extracted handlers actually
     perform — attribute access, item get/set/del, iteration, membership,
-    ``len``/truthiness, ``with``-blocks (locks), and rich comparisons
-    (numeric limits) — to ``web_server.<name>`` resolved at operation time,
+    ``len``/truthiness, ``with``-blocks (locks), int coercion (numeric limits
+    consumed by e.g. ``file.read``), rich comparisons (numeric limits), and
+    hashing — to ``web_server.<name>`` resolved at operation time,
     so mutating or monkeypatching the attribute on ``web_server`` stays
     authoritative.
     """
@@ -103,6 +104,12 @@ class LateState:
 
     def __bool__(self) -> bool:
         return bool(self._target())
+
+    def __int__(self) -> int:
+        return int(self._target())
+
+    def __index__(self) -> int:
+        return int(self._target())
 
     def __enter__(self):
         return self._target().__enter__()
