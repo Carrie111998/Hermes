@@ -38,6 +38,7 @@ from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome,
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
+    _build_discord_resume_recovery_note,
     _canonicalize_agent_result,
     _coerce_gateway_timestamp,
     _canonical_workspace_failure_result,
@@ -54,6 +55,7 @@ from tests.gateway.restart_test_helpers import (
     make_restart_runner,
     make_restart_source,
 )
+from tools.todo_tool import TodoStore
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +324,65 @@ def _simulate_note_injection(
         sn_reason = getattr(resume_entry, "resume_reason", None) or "restart_timeout"
         message = build_resume_recovery_note(sn_reason, "")
     return message
+
+
+def test_discord_resume_without_workspace_continues_transcript_goal(monkeypatch):
+    """No durable plan must not turn an interrupted Discord task into a menu.
+
+    This drives the real Canonical Task Workspace lookup result into the exact
+    helper used by the Discord gateway path.  The host supplies only structural
+    recovery evidence; the model recovers the task semantics from transcript.
+    """
+    from gateway import canonical_brain_task_workspace as workspace
+
+    monkeypatch.setattr(
+        workspace,
+        "_candidate_case_ids",
+        lambda thread_id, *, deadline: ([], False, None),
+    )
+    recovery = workspace.prepare_task_workspace_resume(
+        thread_id="1534519371450290317",
+        session_key="agent:main:discord:channel:1534519371450290317",
+        todo_store=TodoStore(),
+    )
+
+    assert recovery["status"] == "none"
+    note = _build_discord_resume_recovery_note(
+        "restart_timeout",
+        has_real_user_message=False,
+        workspace_status=recovery["status"],
+    )
+    assert "infer the user's active unfinished objective" in note
+    assert "continue it autonomously" in note
+    assert "Do not ask a generic 'what next?'" in note
+    assert "skip any unfinished work" not in note
+
+
+def test_discord_resume_with_new_message_keeps_model_in_charge():
+    note = _build_discord_resume_recovery_note(
+        "shutdown_timeout",
+        has_real_user_message=True,
+        workspace_status="exact",
+    )
+
+    assert "Address the user's NEW message below FIRST" in note
+    assert "Review the existing conversation history" in note
+    assert "continues the unfinished work" in note
+    assert "Do NOT blindly replay old tool calls" in note
+
+
+@pytest.mark.parametrize("workspace_status", ["ambiguous", "incomplete"])
+def test_discord_uncertain_workspace_allows_only_focused_clarification(
+    workspace_status,
+):
+    note = _build_discord_resume_recovery_note(
+        "restart_interrupted",
+        has_real_user_message=False,
+        workspace_status=workspace_status,
+    )
+
+    assert "ask one focused clarification" in note
+    assert "ask what they would like to do next" not in note
 
 
 # ---------------------------------------------------------------------------
