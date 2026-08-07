@@ -8,6 +8,7 @@ plugin registry and its own ``plugins/`` directory was never scanned.
 """
 
 from pathlib import Path
+import sys
 import threading
 import time
 
@@ -40,9 +41,13 @@ def _make_profile(home: Path, plugin_name: str) -> Path:
 @pytest.fixture(autouse=True)
 def _clean_manager_cache():
     """The cache is process-global; do not leak managers between tests."""
+    modules_before = set(sys.modules)
     plugins_mod.reset_plugin_managers()
     yield
     plugins_mod.reset_plugin_managers()
+    for name in set(sys.modules) - modules_before:
+        if name.startswith("hermes_plugins."):
+            sys.modules.pop(name, None)
 
 
 @pytest.fixture
@@ -161,6 +166,144 @@ def test_profile_discovery_is_serialized_across_managers(two_profiles, monkeypat
     assert not errors
     assert all(not thread.is_alive() for thread in threads)
     assert max_active == 1
+
+
+def test_profiles_reuse_an_identical_directory_plugin_module(tmp_path):
+    """Two profile managers may register one source without re-importing it."""
+    from gateway.run import _profile_runtime_scope
+
+    shared = tmp_path / "shared_plugin"
+    shared.mkdir()
+    (shared / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": "shared_relative", "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    (shared / "schemas.py").write_text(
+        "SHARED_VALUE = 'loaded'\n",
+        encoding="utf-8",
+    )
+    (shared / "__init__.py").write_text(
+        "from .schemas import SHARED_VALUE\n"
+        "def register(ctx):\n"
+        "    ctx.register_hook("
+        "'transform_llm_output', lambda **kw: SHARED_VALUE"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    homes = [tmp_path / "profile_a", tmp_path / "profile_b"]
+    managers = []
+    for home in homes:
+        (home / "plugins").mkdir(parents=True)
+        (home / "plugins" / "shared_relative").symlink_to(
+            shared,
+            target_is_directory=True,
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["shared_relative"]}}),
+            encoding="utf-8",
+        )
+        with _profile_runtime_scope(home):
+            plugins_mod.discover_plugins()
+            managers.append(plugins_mod.get_plugin_manager())
+
+    first = managers[0]._plugins["shared_relative"]
+    second = managers[1]._plugins["shared_relative"]
+    assert first.module is second.module
+    assert first.error is None
+    assert second.error is None
+    assert managers[0].invoke_hook("transform_llm_output") == ["loaded"]
+    assert managers[1].invoke_hook("transform_llm_output") == ["loaded"]
+
+
+def test_profiles_reject_same_plugin_key_from_different_sources(tmp_path):
+    from gateway.run import _profile_runtime_scope
+
+    managers = []
+    for index, value in enumerate(("profile-a", "profile-b")):
+        home = tmp_path / f"profile_{index}"
+        plugin = home / "plugins" / "shared_relative"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            yaml.safe_dump({"name": "shared_relative", "version": "0.1.0"}),
+            encoding="utf-8",
+        )
+        (plugin / "schemas.py").write_text(
+            f"SHARED_VALUE = {value!r}\n",
+            encoding="utf-8",
+        )
+        (plugin / "__init__.py").write_text(
+            "from .schemas import SHARED_VALUE\n"
+            "def register(ctx):\n"
+            "    ctx.register_hook("
+            "'transform_llm_output', lambda **kw: SHARED_VALUE"
+            ")\n",
+            encoding="utf-8",
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["shared_relative"]}}),
+            encoding="utf-8",
+        )
+        with _profile_runtime_scope(home):
+            plugins_mod.discover_plugins()
+            managers.append(plugins_mod.get_plugin_manager())
+
+    first = managers[0]._plugins["shared_relative"]
+    second = managers[1]._plugins["shared_relative"]
+    assert first.enabled is True
+    assert first.error is None
+    assert managers[0].invoke_hook("transform_llm_output") == ["profile-a"]
+    assert second.enabled is False
+    assert "different source" in (second.error or "")
+    assert managers[1].invoke_hook("transform_llm_output") == []
+
+
+def test_profiles_do_not_reuse_a_partially_imported_identical_plugin(tmp_path):
+    from gateway.run import _profile_runtime_scope
+
+    shared = tmp_path / "shared_plugin"
+    shared.mkdir()
+    (shared / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": "shared_failed", "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    (shared / "schemas.py").write_text(
+        "SHARED_VALUE = 'partial'\n",
+        encoding="utf-8",
+    )
+    (shared / "__init__.py").write_text(
+        "from .schemas import SHARED_VALUE\n"
+        "def register(ctx):\n"
+        "    ctx.register_hook("
+        "'transform_llm_output', lambda **kw: SHARED_VALUE"
+        ")\n"
+        "raise RuntimeError('import failed')\n",
+        encoding="utf-8",
+    )
+
+    managers = []
+    for name in ("profile_a", "profile_b"):
+        home = tmp_path / name
+        (home / "plugins").mkdir(parents=True)
+        (home / "plugins" / "shared_failed").symlink_to(
+            shared,
+            target_is_directory=True,
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["shared_failed"]}}),
+            encoding="utf-8",
+        )
+        with _profile_runtime_scope(home):
+            plugins_mod.discover_plugins()
+            managers.append(plugins_mod.get_plugin_manager())
+
+    for manager in managers:
+        loaded = manager._plugins["shared_failed"]
+        assert loaded.enabled is False
+        assert "import failed" in (loaded.error or "")
+        assert manager.invoke_hook("transform_llm_output") == []
+    assert "hermes_plugins.shared_failed" not in sys.modules
+    assert "hermes_plugins.shared_failed.schemas" not in sys.modules
 
 
 def test_single_profile_gateway_behaviour_unchanged(tmp_path, monkeypatch):

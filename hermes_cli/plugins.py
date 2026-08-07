@@ -1883,6 +1883,23 @@ class PluginManager:
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
         module_name = f"{_NS_PARENT}.{slug}"
+        cached = sys.modules.get(module_name)
+        if cached is not None:
+            cached_file = getattr(cached, "__file__", None)
+            if cached_file is not None:
+                try:
+                    if Path(cached_file).resolve() == init_file.resolve():
+                        return cached
+                    raise ImportError(
+                        f"Plugin module '{key}' is already loaded from a "
+                        "different source in this process"
+                    )
+                except OSError:
+                    logger.debug(
+                        "Could not resolve cached plugin path for '%s'",
+                        module_name,
+                        exc_info=True,
+                    )
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
@@ -1895,7 +1912,15 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(
+                    f"{module_name}."
+                ):
+                    sys.modules.pop(loaded_name, None)
+            raise
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:
