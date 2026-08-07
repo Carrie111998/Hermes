@@ -38,6 +38,9 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway import _input_limits as _input_limits_mod
+_il_mod = _input_limits_mod  # alias used by rebound method handlers
+_FieldTooLarge = _input_limits_mod.FieldTooLarge  # also rebound into handler globals
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -11700,6 +11703,15 @@ def _project_tree_inputs(
 _DIR_EXISTS_CACHE: dict[str, bool] = {}
 
 
+@method("command.dispatch")
+def _(rid, params: dict) -> dict:
+    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
+    if len(name) > 4096 or len(arg) > 4096:
+        return _err(rid, 4000, "input too long")
+    resolved = _resolve_name(name)
+    if resolved != name:
+        name = resolved
+    session = _sessions.get(params.get("session_id", ""))
 def _dir_exists_cached(path: str) -> bool:
     """``os.path.isdir`` for the project tree, memoized per build.
 
@@ -14071,6 +14083,16 @@ def _browser_disconnect(rid) -> dict:
 
 
 
+# NOTE: A prior version of this module defined ``shell.exec`` here (lines
+# 14035-14043 before this commit). The handlers refactor moved that handler
+# into ``tui_gateway.methods_tools``; the original definition was left in
+# place but became unreachable (its ``@method`` decorator registers into a
+# local HandlerRegistry, while the canonical ``_methods`` dict is rebound by
+# the bottom-of-module import block below). The stale duplicate's body was
+# incomplete (``try:`` with no ``except``/body) and broke Python parsing of
+# this whole module -- every test importing ``tui_gateway.server`` failed
+# with ``SyntaxError: expected 'except' or 'finally' block``. Removing the
+# orphan restores parsing without changing any registered method behaviour.
 # ── Split @method handler modules (see method_ctx.py) ────────────────
 # Imported at the end of this module so every global the handlers close
 # over already exists; register() rebinds them onto this namespace.

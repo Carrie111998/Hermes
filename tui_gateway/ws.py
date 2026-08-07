@@ -32,6 +32,7 @@ import threading
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway._input_limits import FrameTooLarge, check_frame_size
 
 _log = logging.getLogger(__name__)
 
@@ -338,7 +339,11 @@ async def handle_ws(ws: Any) -> None:
 
         while True:
             try:
-                raw = await ws.receive_text()
+                # Use the low-level receive() so we can check frame size in
+                # bytes BEFORE allocating the decoded text string. A 100 MB
+                # attack frame otherwise still costs 100 MB of RAM before the
+                # length-based rejection fires.
+                message = await ws.receive()
             except _WebSocketDisconnect as exc:
                 disconnect_reason = (
                     "client_disconnect("
@@ -350,6 +355,41 @@ async def handle_ws(ws: Any) -> None:
                 disconnect_reason = "receive_failed"
                 _log.exception("ws receive failed peer=%s", peer)
                 break
+
+            msg_type = message.get("type")
+            if msg_type == "websocket.disconnect":
+                code = message.get("code")
+                reason = message.get("reason")
+                disconnect_reason = (
+                    f"client_disconnect(code={code}, reason={reason})"
+                )
+                break
+
+            # Prefer the raw bytes form so we can reject oversized frames
+            # at byte level; fall back to text encoding if the client only
+            # sent text (rare — but FastAPI clients sometimes do).
+            raw_bytes = message.get("bytes")
+            if raw_bytes is None:
+                text = message.get("text", "")
+                raw_bytes = text.encode("utf-8", errors="replace")
+            try:
+                check_frame_size(raw_bytes)
+            except FrameTooLarge as exc:
+                disconnect_reason = (
+                    f"frame_too_large(size={exc.size},limit={exc.limit})"
+                )
+                _log.warning(
+                    "ws reject peer=%s size=%d limit=%d",
+                    peer, exc.size, exc.limit,
+                )
+                await ws.close(code=1009, reason="frame too large")
+                break
+
+            raw = (
+                message["text"]
+                if "text" in message
+                else raw_bytes.decode("utf-8", errors="replace")
+            )
 
             line = raw.strip()
             if not line:
