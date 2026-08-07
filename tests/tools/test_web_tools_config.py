@@ -540,14 +540,14 @@ class TestNonBuiltinProviderAvailability:
 
 
     def test_capability_backend_honors_custom_extract_provider(self):
-        """Per-capability selection (_get_extract_backend) must resolve the
+        """Per-capability selection (_get_extract_backends) must resolve the
         custom provider when configured, instead of dead-ending — issue #32698."""
         with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
              patch("tools.web_tools._peek_nous_access_token", return_value=None), \
              patch("tools.web_tools._load_web_config",
                    return_value={"extract_backend": "fake-plugin-prov"}):
-            from tools.web_tools import _get_extract_backend
-            assert _get_extract_backend() == "fake-plugin-prov"
+            from tools.web_tools import _get_extract_backends
+            assert _get_extract_backends() == ["fake-plugin-prov"]
 
     def test_tool_registry_entries_not_filtered_out(self):
         """web_search and web_extract tool entries must remain in the

@@ -184,7 +184,7 @@ class TestWebExtractSecretExfil:
         web_search_registry._reset_for_tests()
         web_search_registry.register_provider(FakeExtractProvider())
         monkeypatch.setattr(web_tools, "_ensure_web_plugins_loaded", lambda: None)
-        monkeypatch.setattr(web_tools, "_get_extract_backend", lambda: "fake-extract")
+        monkeypatch.setattr(web_tools, "_get_extract_backends", lambda: ["fake-extract"])
         monkeypatch.setattr(web_tools, "async_is_safe_url", allow_url)
 
         try:

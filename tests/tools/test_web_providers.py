@@ -2,7 +2,7 @@
 
 Covers:
 - WebSearchProvider / WebExtractProvider ABC enforcement
-- Per-capability backend selection (_get_search_backend, _get_extract_backend)
+- Per-capability backend selection (_get_search_backend, _get_extract_backends)
 - Backward compatibility (web.backend still works as shared fallback)
 - Config keys merge correctly via DEFAULT_CONFIG
 """
@@ -75,7 +75,7 @@ class TestWebProviderABCs:
 
 
 class TestPerCapabilityBackendSelection:
-    """_get_search_backend and _get_extract_backend read per-capability config."""
+    """_get_search_backend and _get_extract_backends read per-capability config."""
 
     def test_search_backend_overrides_generic(self, monkeypatch):
         from tools import web_tools
@@ -87,7 +87,6 @@ class TestPerCapabilityBackendSelection:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         assert web_tools._get_search_backend() == "tavily"
 
-
     def test_fully_backward_compatible_with_web_backend_only(self, monkeypatch):
         from tools import web_tools
 
@@ -97,7 +96,7 @@ class TestPerCapabilityBackendSelection:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         # No search_backend or extract_backend set — both fall through
         assert web_tools._get_search_backend() == "tavily"
-        assert web_tools._get_extract_backend() == "tavily"
+        assert web_tools._get_extract_backends() == ["tavily"]
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +115,13 @@ class TestDefaultConfig:
         assert "backend" in web
         assert "search_backend" in web
         assert "extract_backend" in web
-        # All empty string by default (no override)
+        assert "extract_backends" in web
+        # All empty by default (no override) — the empty chain must leave
+        # scalar/auto-detect resolution in charge.
         assert web["backend"] == ""
         assert web["search_backend"] == ""
         assert web["extract_backend"] == ""
+        assert web["extract_backends"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +313,13 @@ class TestDispatchersTriggerPluginDiscovery:
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
             )
+            # "firecrawl" is a legacy backend name, so its availability check
+            # bypasses the registry entirely and probes real credentials
+            # (see _is_backend_available) — set one so _get_extract_backends()
+            # deterministically resolves to "firecrawl" per this test's own
+            # premise, rather than falling through to whatever backend
+            # _get_backend()'s auto-detect happens to prefer in this env.
+            monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-test-key")
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 
