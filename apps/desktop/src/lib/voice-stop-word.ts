@@ -76,8 +76,10 @@ function stripAddress(text: string): string {
     if (text === prefix) {
       continue
     }
+
     if (text.startsWith(prefix)) {
       const rest = text.slice(prefix.length).trim()
+
       if (rest) {
         return rest
       }
