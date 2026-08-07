@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
+import { unwrapExpectedNotFound } from './api-expected-404'
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
@@ -104,7 +106,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
   },
-  api: request => ipcRenderer.invoke('hermes:api', request),
+  // The handler resolves an expected 404 with a sentinel instead of rejecting
+  // (Electron logs a stack for every rejected invoke). Turn it back into the
+  // rejection the renderer expects — see electron/api-expected-404.ts.
+  api: request => ipcRenderer.invoke('hermes:api', request).then(unwrapExpectedNotFound),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),
