@@ -150,7 +150,9 @@ describe('ModelPill context window', () => {
   it('keeps an empty ring visible until the selected session reports its context window', () => {
     render(<ModelPill disabled={false} model={modelState()} />)
 
-    expect(screen.getByTestId('context-window').getAttribute('aria-label')).toBe('Context window data is not available yet.')
+    expect(screen.getByTestId('context-window').getAttribute('aria-label')).toBe(
+      'Context window data is not available yet.'
+    )
   })
 
   it('stays out of the compact composer controls', () => {

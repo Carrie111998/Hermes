@@ -207,7 +207,7 @@ export function ModelPill({
 
   const title = pinnedOverride ? `${baseTitle} — ${copy.modelPinned}` : baseTitle
   const requestedContext = requestedUsage?.runtimeId === runtimeId ? contextWindowUsage(requestedUsage.usage) : null
-  const context = compact ? null : reportedContext ?? requestedContext
+  const context = compact ? null : (reportedContext ?? requestedContext)
   const contextPercent = Math.round(context?.percent ?? 0)
 
   const contextDetail = context
@@ -233,42 +233,43 @@ export function ModelPill({
 
   const contextRingOffset = CONTEXT_RING_CIRCUMFERENCE * (1 - contextPercent / 100)
 
-  const contextCounter = !compact && currentModel.trim() ? (
-    <Tip label={contextTooltip} side="top">
-      <span
-        aria-label={contextAriaLabel}
-        className={cn(
-          'inline-flex h-(--composer-control-size) shrink-0 cursor-default items-center justify-center rounded-full text-(--ui-text-tertiary)',
-          context && 'text-(--ui-text-secondary)'
-        )}
-        data-testid="context-window"
-      >
-        <svg aria-hidden="true" className="size-3.5 -rotate-90" fill="none" viewBox="0 0 16 16">
-          <circle
-            className="opacity-25"
-            cx="8"
-            cy="8"
-            r={CONTEXT_RING_RADIUS}
-            stroke="currentColor"
-            strokeWidth="2"
-          />
-          {context && (
+  const contextCounter =
+    !compact && currentModel.trim() ? (
+      <Tip label={contextTooltip} side="top">
+        <span
+          aria-label={contextAriaLabel}
+          className={cn(
+            'inline-flex h-(--composer-control-size) shrink-0 cursor-default items-center justify-center rounded-full text-(--ui-text-tertiary)',
+            context && 'text-(--ui-text-secondary)'
+          )}
+          data-testid="context-window"
+        >
+          <svg aria-hidden="true" className="size-3.5 -rotate-90" fill="none" viewBox="0 0 16 16">
             <circle
+              className="opacity-25"
               cx="8"
               cy="8"
               r={CONTEXT_RING_RADIUS}
               stroke="currentColor"
-              strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
-              strokeDashoffset={contextRingOffset}
-              strokeLinecap="round"
               strokeWidth="2"
-              style={{ transition: 'stroke-dashoffset 300ms ease-out' }}
             />
-          )}
-        </svg>
-      </span>
-    </Tip>
-  ) : null
+            {context && (
+              <circle
+                cx="8"
+                cy="8"
+                r={CONTEXT_RING_RADIUS}
+                stroke="currentColor"
+                strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
+                strokeDashoffset={contextRingOffset}
+                strokeLinecap="round"
+                strokeWidth="2"
+                style={{ transition: 'stroke-dashoffset 300ms ease-out' }}
+              />
+            )}
+          </svg>
+        </span>
+      </Tip>
+    ) : null
 
   if (!model.modelMenuContent) {
     return (
