@@ -195,8 +195,8 @@ def test_chat_gateways_redact_secret_in_provider_error(platform):
     assert "sk-ABCDEF0123456789abcdef0123" not in sanitized
     assert "sk-ABCDEF" not in sanitized
     assert "HTTP 401" not in sanitized
-    # The user gets the safe provider-error category instead of the raw body.
-    assert "provider" in sanitized.lower()
+    # The user gets one provider-agnostic sentence instead of the raw body.
+    assert sanitized == "⚠️ I couldn’t complete that request. Please try again shortly."
 
 
 @pytest.mark.parametrize("platform", ["slack", "matrix"])
@@ -255,8 +255,8 @@ def test_chat_gateways_drop_interrupt_sentinel(platform):
     assert _sanitize_gateway_final_response("local", sentinel) == sentinel
 
 
-def test_telegram_status_sanitizes_raw_provider_security_errors():
-    """Provider policy/security bodies should be replaced before chat delivery."""
+def test_telegram_status_suppresses_raw_provider_security_errors():
+    """Provider retry/status diagnostics must not create a first chat reply."""
     raw = (
         "❌ API failed after 3 retries — HTTP 400: request blocked because "
         "Operation contains cybersecurity risk. request_id=req_123"
@@ -264,11 +264,7 @@ def test_telegram_status_sanitizes_raw_provider_security_errors():
 
     sanitized = _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", raw)
 
-    assert sanitized is not None
-    assert "provider rejected" in sanitized.lower()
-    assert "cybersecurity risk" not in sanitized.lower()
-    assert "HTTP 400" not in sanitized
-    assert "req_123" not in sanitized
+    assert sanitized is None
 
 
 def test_telegram_final_response_sanitizes_raw_provider_errors():
@@ -280,14 +276,14 @@ def test_telegram_final_response_sanitizes_raw_provider_errors():
 
     sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
 
-    assert "provider rejected" in sanitized.lower()
+    assert sanitized == "⚠️ I couldn’t complete that request. Please try again shortly."
     assert "cybersecurity risk" not in sanitized.lower()
     assert "HTTP 400" not in sanitized
     assert "req_abc" not in sanitized
 
 
-def test_telegram_final_response_redacts_auth_secrets():
-    """Authentication errors should be useful without leaking key material."""
+def test_telegram_final_response_hides_auth_and_account_details():
+    """Authentication/account errors use the same provider-agnostic copy."""
     raw = (
         "⚠️ Provider authentication failed: Incorrect API key provided: "
         "sk-live_abcdefghijklmnopqrstuvwxyz1234567890"
@@ -295,9 +291,34 @@ def test_telegram_final_response_redacts_auth_secrets():
 
     sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, raw)
 
-    assert "authentication failed" in sanitized.lower()
-    assert "check the configured credentials" in sanitized.lower()
+    assert sanitized == "⚠️ I couldn’t complete that request. Please try again shortly."
     assert "sk-live" not in sanitized
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_long_expanded_provider_failure_is_one_safe_reply(platform):
+    """Expanded SDK payloads over 400 chars must never bypass sanitization."""
+    raw = (
+        "API call failed after 3 retries. Error code: 400 - "
+        "{'type':'error','error':{'type':'invalid_request_error','message':"
+        "'Third-party apps now draw from your extra usage, not your plan limits. "
+        "Add more at vendor.example/settings/usage and keep going.'},"
+        "'request_id':'req_internal_123'} | provider=vendor model=secret-model "
+        + "diagnostic-padding-" * 20
+    )
+
+    sanitized = _sanitize_gateway_final_response(platform, raw)
+
+    assert sanitized == "⚠️ I couldn’t complete that request. Please try again shortly."
+    for forbidden in (
+        "provider",
+        "model",
+        "usage",
+        "request_id",
+        "HTTP",
+        "settings/usage",
+    ):
+        assert forbidden.lower() not in sanitized.lower()
 
 
 def test_telegram_final_response_keeps_normal_answers():
