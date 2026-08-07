@@ -2665,7 +2665,11 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> Optional[str]:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    extra_prompt: Optional[str] = None,
+) -> Optional[str]:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -2675,8 +2679,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> Optio
             When provided, the script is not re-executed and the cached
             result is added as source-labelled context. When omitted, the
             script (if any) runs inline as before.
+        extra_prompt: Optional per-run context (from ``cronjob(action='run')``,
+            #57331 — salvaged from #57342 by @liuhao1024). Appended to the
+            stored prompt under a ``## Run Context`` header for this single
+            fire only — never persisted to the job definition.
     """
-    prompt = str(job.get("prompt") or "")
+    user_prompt = str(job.get("prompt") or "")
+    if extra_prompt:
+        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
+    prompt = user_prompt
     skills = job.get("skills")
 
     # Run data-collection script if configured, inject output as context.
@@ -2904,7 +2915,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
 ) -> CronJobRunResult:
     """
     Execute a single cron job.
@@ -2918,6 +2930,10 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``extra_prompt``: optional per-run context from ``cronjob(action='run',
+    prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
+    never persisted to the job definition.
 
     Returns:
         A four-value-unpackable result carrying the same-turn structured
@@ -3142,7 +3158,11 @@ def run_job(
                 "operator pre-run gate returned wakeAgent=false",
             )
 
-    prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    prompt = _build_job_prompt(
+        job,
+        prerun_script=prerun_script,
+        extra_prompt=extra_prompt,
+    )
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return _mechanical_cron_suppress_result(
@@ -4093,7 +4113,10 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -4160,9 +4183,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            run_result = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
+            run_job_kwargs: dict[str, Any] = {
+                "defer_agent_teardown": _deferred_agents,
+            }
+            if extra_prompt is not None:
+                run_job_kwargs["extra_prompt"] = extra_prompt
+            run_result = run_job(job, **run_job_kwargs)
             success, output, final_response, error = run_result
             delivery_outcome = getattr(run_result, "delivery_outcome", None)
             delivery_turn_id = str(getattr(run_result, "turn_id", "") or "")

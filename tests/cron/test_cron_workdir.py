@@ -199,18 +199,20 @@ class TestRunJobTerminalCwd:
         )
 
         # Stub scheduler helpers that would otherwise hit the filesystem / config.
-        monkeypatch.setattr(sched, "_build_job_prompt", lambda job, prerun_script=None: "hi")
+        monkeypatch.setattr(sched, "_build_job_prompt", lambda job, prerun_script=None, **kw: "hi")
         monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda job, cfg: None)
         # Unlimited inactivity so the poll loop returns immediately.
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        # run_job calls load_dotenv(~/.hermes/.env, override=True), which will
-        # happily clobber TERMINAL_CWD out from under us if the real user .env
-        # has TERMINAL_CWD set (common on dev boxes).  Stub it out.
-        import dotenv
-        monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
+        # Stub Hermes' public loader so a real profile .env cannot clobber
+        # TERMINAL_CWD. Do not patch python-dotenv before env_loader imports:
+        # that can freeze the stub into the module for later tests.
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv",
+            lambda **_kw: [],
+        )
 
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):

@@ -252,7 +252,7 @@ class TestRunJobKanbanIsolation:
             },
         )
         monkeypatch.setattr(
-            sched, "_build_job_prompt", lambda job, prerun_script=None: "hi"
+            sched, "_build_job_prompt", lambda job, prerun_script=None, **kw: "hi"
         )
         monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
         monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
@@ -261,9 +261,13 @@ class TestRunJobKanbanIsolation:
         )
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        import dotenv
-
-        monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
+        # Patch Hermes' public loader, not python-dotenv itself. Patching the
+        # dependency before hermes_cli.env_loader is imported can otherwise
+        # freeze the stub into that module for every later test in this worker.
+        monkeypatch.setattr(
+            "hermes_cli.env_loader.load_hermes_dotenv",
+            lambda **_kw: [],
+        )
 
     @staticmethod
     def _job(job_id="kanban-iso"):
