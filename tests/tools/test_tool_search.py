@@ -61,6 +61,61 @@ class TestConfigParsing:
         assert cfg.max_search_limit == 50
         assert cfg.search_default_limit <= cfg.max_search_limit
 
+    def test_builtin_disclosure_defaults_off(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw(None)
+        assert not cfg.builtins.enabled
+        assert cfg.builtins.min_schema_tokens == 1500
+        assert cfg.builtins.deferred_names == frozenset()
+
+    def test_builtin_groups_resolve_to_reviewed_exact_names(self):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": [
+                    "browser",
+                    "session_search",
+                    "delegation",
+                    "code_execution",
+                    "todo",
+                    "vision",
+                ],
+                "min_schema_tokens": 2500,
+            },
+        })
+
+        assert cfg.builtins.enabled
+        assert cfg.builtins.min_schema_tokens == 2500
+        assert {
+            "browser_navigate",
+            "session_search",
+            "delegate_task",
+            "execute_code",
+            "todo",
+            "vision_analyze",
+            "image_generate",
+            "bfl_flux3_text_to_video",
+            "bfl_flux3_get_result",
+        } <= cfg.builtins.deferred_names
+        assert "web_search" not in cfg.builtins.deferred_names
+
+    def test_unknown_builtin_entry_warns_and_fails_open(self, caplog):
+        from tools.tool_search import ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser", "future_dangerous_builtin"],
+            },
+        })
+
+        assert "future_dangerous_builtin" not in cfg.builtins.deferred_names
+        assert "browser_navigate" in cfg.builtins.deferred_names
+        assert "future_dangerous_builtin" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Classification — the hard invariant: core tools NEVER defer.
@@ -104,6 +159,45 @@ class TestClassification:
         visible, deferrable = classify_tools(defs)
         names = {(td.get("function") or {}).get("name") for td in visible}
         assert "xx_unknown_tool" in names
+        assert deferrable == []
+
+    def test_reviewed_core_tool_defers_only_with_resolved_policy(self):
+        from tools.tool_search import ToolSearchConfig, classify_tools
+
+        defs = [_td("browser_navigate"), _td("web_search"), _td("terminal")]
+        cfg = ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+
+        visible, deferrable = classify_tools(defs, builtin_policy=cfg.builtins)
+        assert {td["function"]["name"] for td in deferrable} == {"browser_navigate"}
+        assert {td["function"]["name"] for td in visible} == {"web_search", "terminal"}
+
+    def test_new_core_tool_stays_eager_when_not_explicitly_reviewed(self, monkeypatch):
+        from tools import tool_search
+
+        monkeypatch.setattr(
+            tool_search,
+            "_core_tool_names",
+            lambda: frozenset({"future_essential_core"}),
+        )
+        cfg = tool_search.ToolSearchConfig.from_raw({
+            "builtins": {
+                "enabled": True,
+                "defer": ["future_essential_core"],
+                "min_schema_tokens": 0,
+            },
+        })
+        visible, deferrable = tool_search.classify_tools(
+            [_td("future_essential_core")],
+            builtin_policy=cfg.builtins,
+        )
+
+        assert [td["function"]["name"] for td in visible] == ["future_essential_core"]
         assert deferrable == []
 
 
@@ -218,6 +312,73 @@ class TestAssembly:
         # The pre-existing tool_search was stripped (it would be re-injected if
         # activation happened; here it didn't).
         assert "tool_search" not in names
+
+    def test_builtin_threshold_applies_only_to_selected_builtin_schemas(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 10_000,
+            },
+        })
+        defs = [
+            _td("browser_navigate", "Small browser schema"),
+            _td("terminal", "Run shell"),
+        ]
+
+        result = assemble_tool_defs(defs, context_length=200_000, config=cfg)
+        assert not result.activated
+        assert {td["function"]["name"] for td in result.tool_defs} == {
+            "browser_navigate",
+            "terminal",
+        }
+
+    def test_builtin_above_threshold_defers_and_catalog_marks_builtin(self):
+        from tools.tool_search import assemble_tool_defs, build_catalog, ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 1,
+            },
+        })
+        defs = [_td("browser_navigate", "Navigate a browser"), _td("terminal", "Run shell")]
+
+        result = assemble_tool_defs(defs, context_length=200_000, config=cfg)
+        names = {td["function"]["name"] for td in result.tool_defs}
+        assert result.activated
+        assert "browser_navigate" not in names
+        assert "terminal" in names
+        assert {"tool_search", "tool_describe", "tool_call"} <= names
+
+        entries = build_catalog([defs[0]])
+        assert entries[0].source == "builtin"
+        assert entries[0].source_name == "builtin"
+
+    def test_tool_search_off_keeps_selected_builtins_eager(self):
+        from tools.tool_search import assemble_tool_defs, ToolSearchConfig
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "off",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        defs = [_td("browser_navigate"), _td("terminal")]
+
+        result = assemble_tool_defs(defs, context_length=200_000, config=cfg)
+        assert not result.activated
+        assert {td["function"]["name"] for td in result.tool_defs} == {
+            "browser_navigate",
+            "terminal",
+        }
 
 
 # ---------------------------------------------------------------------------

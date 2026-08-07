@@ -1,14 +1,16 @@
 """Progressive tool disclosure ("tool search") for Hermes Agent.
 
-When enabled, MCP and non-core plugin tools are replaced in the model-visible
+When enabled, MCP, non-core plugin, and explicitly selected built-in tools are replaced in the model-visible
 tools array by three bridge tools — ``tool_search``, ``tool_describe``,
-``tool_call`` — and surfaced on demand. Core Hermes tools never defer.
+``tool_call`` — and surfaced on demand. Built-in deferral is opt-in and
+allowlist-only; unknown and newly added core tools remain eager.
 
 Design constraints this module is built around (see ``openclaw-tool-search-report``
 for the full rationale):
 
-* Core tools defined in ``toolsets._HERMES_CORE_TOOLS`` are *never* deferred.
-  Always-load means always-load. No exceptions.
+* ``toolsets._HERMES_CORE_TOOLS`` continues to define availability. A separate,
+  explicit policy may defer reviewed built-ins without removing them from the
+  session's scoped raw tool definitions.
 * Tiered disclosure (July 2026 plan): the moment ANY deferrable (MCP/plugin)
   tools are present, they hide behind the bridge. What scales with catalog
   size is the *listing*, not the activation decision:
@@ -67,9 +69,84 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 CHARS_PER_TOKEN = 4.0
 
 
+# Friendly built-in groups resolve here, independently of platform/toolset
+# membership. Exact-name entries are accepted only when they already appear in
+# this reviewed allowlist. This makes typos and newly introduced core tools
+# fail open (eager) instead of silently hiding capabilities.
+BUILTIN_DEFER_GROUPS: Dict[str, frozenset[str]] = {
+    "browser": frozenset({
+        "browser_navigate", "browser_snapshot", "browser_click",
+        "browser_type", "browser_scroll", "browser_back", "browser_press",
+        "browser_get_images", "browser_vision", "browser_console",
+        "browser_cdp", "browser_dialog",
+    }),
+    "session_search": frozenset({"session_search"}),
+    "delegation": frozenset({"delegate_task"}),
+    "code_execution": frozenset({"execute_code"}),
+    "todo": frozenset({"todo"}),
+    "vision": frozenset({
+        "vision_analyze", "image_generate",
+        "bfl_flux3_text_to_video", "bfl_flux3_image_to_video",
+        "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
+        "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
+    }),
+}
+DEFAULT_BUILTIN_DEFER_GROUPS = (
+    "browser", "session_search", "delegation", "code_execution", "todo", "vision",
+)
+REVIEWED_BUILTIN_DEFER_NAMES = frozenset().union(*BUILTIN_DEFER_GROUPS.values())
+
+
 # ---------------------------------------------------------------------------
 # Configuration plumbing
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BuiltinDisclosurePolicy:
+    """Resolved built-in disclosure policy for one stateless assembly."""
+
+    enabled: bool = False
+    deferred_names: frozenset[str] = frozenset()
+    min_schema_tokens: int = 1500
+
+    @classmethod
+    def from_raw(cls, raw: Any) -> "BuiltinDisclosurePolicy":
+        if not isinstance(raw, dict):
+            return cls()
+
+        enabled = _safe_bool(raw.get("enabled"), False)
+        min_schema_tokens = max(
+            0,
+            min(60_000, _safe_int(raw.get("min_schema_tokens"), 1500)),
+        )
+        if not enabled:
+            return cls(enabled=False, min_schema_tokens=min_schema_tokens)
+
+        requested = raw.get("defer", DEFAULT_BUILTIN_DEFER_GROUPS)
+        if not isinstance(requested, (list, tuple, set, frozenset)):
+            logger.warning(
+                "tools.tool_search.builtins.defer must be a list; keeping built-ins eager"
+            )
+            requested = ()
+
+        resolved: set[str] = set()
+        for raw_entry in requested:
+            entry = str(raw_entry or "").strip()
+            if entry in BUILTIN_DEFER_GROUPS:
+                resolved.update(BUILTIN_DEFER_GROUPS[entry])
+            elif entry in REVIEWED_BUILTIN_DEFER_NAMES:
+                resolved.add(entry)
+            else:
+                logger.warning(
+                    "Unknown built-in tool-search defer entry %r; keeping it eager",
+                    entry,
+                )
+        return cls(
+            enabled=True,
+            deferred_names=frozenset(resolved),
+            min_schema_tokens=min_schema_tokens,
+        )
 
 
 @dataclass(frozen=True)
@@ -96,6 +173,7 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    builtins: BuiltinDisclosurePolicy = field(default_factory=BuiltinDisclosurePolicy)
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -152,6 +230,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            builtins=BuiltinDisclosurePolicy.from_raw(raw.get("builtins")),
         )
 
 
@@ -167,6 +246,18 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _safe_bool(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off"):
+            return False
+    return fallback
 
 
 def load_config() -> ToolSearchConfig:
@@ -201,18 +292,25 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-def is_deferrable_tool_name(name: str) -> bool:
+def is_deferrable_tool_name(
+    name: str,
+    builtin_policy: Optional[BuiltinDisclosurePolicy] = None,
+) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
-    A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    MCP/plugin behavior is unchanged. A core tool is deferrable only when the
+    caller passes an enabled, resolved built-in policy containing its exact
+    reviewed name. Without a policy, core tools retain the legacy eager
+    behavior.
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
     if name in _core_tool_names():
-        return False
+        return bool(
+            builtin_policy
+            and builtin_policy.enabled
+            and name in builtin_policy.deferred_names
+        )
     # Check registry toolset for MCP prefix.
     try:
         from tools.registry import registry
@@ -227,7 +325,11 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
-def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def classify_tools(
+    tool_defs: List[Dict[str, Any]],
+    *,
+    builtin_policy: Optional[BuiltinDisclosurePolicy] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
@@ -243,7 +345,7 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if is_deferrable_tool_name(name, builtin_policy):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -360,6 +462,8 @@ def _entry_search_text(td: Dict[str, Any]) -> str:
 
 def _classify_source(name: str) -> Tuple[str, str]:
     """Return (source_kind, source_name) for a registered tool name."""
+    if name in _core_tool_names():
+        return ("builtin", "builtin")
     try:
         from tools.registry import registry
         entry = registry.get_entry(name)
@@ -794,7 +898,26 @@ def assemble_tool_defs(
     incoming = [td for td in tool_defs
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
-    visible, deferrable = classify_tools(incoming)
+    # Master off is a true rollback: preserve the entire scoped raw array.
+    if config.enabled == "off":
+        return AssemblyResult(tool_defs=incoming, activated=False)
+
+    visible, deferrable = classify_tools(
+        incoming,
+        builtin_policy=config.builtins,
+    )
+
+    # Avoid paying for three bridge schemas in narrow jobs just to hide a
+    # small built-in. The gate considers selected built-in schemas only;
+    # existing MCP/plugin deferral remains exactly as before.
+    selected_builtin_defs = [
+        td for td in deferrable
+        if (td.get("function") or {}).get("name") in config.builtins.deferred_names
+        and (td.get("function") or {}).get("name") in _core_tool_names()
+    ]
+    builtin_tokens = estimate_tokens_from_schemas(selected_builtin_defs)
+    if selected_builtin_defs and builtin_tokens < config.builtins.min_schema_tokens:
+        visible, deferrable = classify_tools(incoming)
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 
@@ -1054,6 +1177,8 @@ __all__ = [
     "TOOL_DESCRIBE_NAME",
     "TOOL_CALL_NAME",
     "BRIDGE_TOOL_NAMES",
+    "BUILTIN_DEFER_GROUPS",
+    "BuiltinDisclosurePolicy",
     "ToolSearchConfig",
     "CatalogEntry",
     "AssemblyResult",

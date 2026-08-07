@@ -2332,8 +2332,8 @@ DEFAULT_CONFIG = {
     # in the model-facing tools array with three bridge tools —
     # tool_search / tool_describe / tool_call — and surfaced on demand.
     #
-    # Core Hermes tools (terminal, read_file, write_file, patch,
-    # search_files, todo, memory, browser_*, etc.) are NEVER deferred.
+    # Core Hermes tools stay eager by default. Selected reviewed built-ins can
+    # be deferred with the opt-in policy below without changing availability.
     # See tools/tool_search.py for full design notes and the
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
@@ -2372,6 +2372,22 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
+            # Opt-in lazy disclosure for reviewed built-in groups. Availability
+            # still comes from _HERMES_CORE_TOOLS and scoped toolset resolution.
+            "builtins": {
+                "enabled": False,
+                "defer": [
+                    "browser",
+                    "session_search",
+                    "delegation",
+                    "code_execution",
+                    "todo",
+                    "vision",
+                ],
+                # In narrow jobs, keep selected built-ins eager unless their
+                # combined schemas meet this threshold. Range 0..60000.
+                "min_schema_tokens": 1500,
+            },
         },
     },
 
