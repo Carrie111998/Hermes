@@ -32,6 +32,18 @@ def test_bundled_metadata_keeps_hermes_version_separate_and_history_append_only(
     bundle = load_release_bundle(ROOT)
 
     assert bundle.metadata.version > bundle.history.releases[-1].version
+    assert str(bundle.metadata.version) == "2.3.3"
+    assert (
+        str(bundle.history.releases[-1].version),
+        bundle.history.releases[-1].release_sha,
+        bundle.history.releases[-1].record_kind,
+        bundle.history.releases[-1].metadata_present_at_source,
+    ) == (
+        "2.3.2",
+        "9c2b9a033df4cb69080c92ee5fa79a1e1bdfe30c",
+        "source_release",
+        True,
+    )
     assert REQUIRED_HISTORY_PREFIX == (
         (
             "2.3.0",

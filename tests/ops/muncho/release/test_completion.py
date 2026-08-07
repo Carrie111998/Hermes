@@ -36,6 +36,7 @@ from ops.muncho.release.metadata import (
 
 
 ROOT = Path(__file__).parents[4]
+CURRENT_VERSION = str(load_release_bundle(ROOT).metadata.version)
 NOW = datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc)
 LATER = datetime(2026, 8, 7, 13, 0, tzinfo=timezone.utc)
 RELEASE_SHA = "a" * 40
@@ -70,7 +71,7 @@ def _draft(tmp_path: Path, *, release_sha: str = RELEASE_SHA):
     mapping = reserve_release_mapping(
         state,
         bundle,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=release_sha,
         reserved_at=NOW,
     )
@@ -169,14 +170,14 @@ def test_reservation_is_idempotent_and_refuses_version_reuse(tmp_path: Path):
     first = reserve_release_mapping(
         state,
         bundle,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         reserved_at=NOW,
     )
     second = reserve_release_mapping(
         state,
         bundle,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         reserved_at=NOW,
     )
@@ -189,7 +190,7 @@ def test_reservation_is_idempotent_and_refuses_version_reuse(tmp_path: Path):
         reserve_release_mapping(
             state,
             bundle,
-            version="2.3.2",
+            version=CURRENT_VERSION,
             release_sha="b" * 40,
             reserved_at=NOW,
         )
@@ -331,24 +332,24 @@ def test_full_completion_requires_same_summary_in_codex_and_discord(
         )
         == completion
     )
-    assert completion["muncho_version"] == "2.3.2"
+    assert completion["muncho_version"] == CURRENT_VERSION
     assert completion["release_sha"] == RELEASE_SHA
     assert completion["required_summaries_published"] is True
 
     status = release_status(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )
     health = release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )
     assert status["phase"] == "complete"
     assert status["release_sha"] == RELEASE_SHA
     assert health["healthy"] is True
-    assert health["muncho_version"] == "2.3.2"
+    assert health["muncho_version"] == CURRENT_VERSION
 
 
 def test_completion_is_not_healthy_after_smoke_but_before_both_summaries(
@@ -373,7 +374,7 @@ def test_completion_is_not_healthy_after_smoke_but_before_both_summaries(
 
     status = release_status(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )
     assert status["production_smoke_passed"] is True
@@ -421,7 +422,7 @@ def test_gateway_request_is_mandatory_for_terminal_completion_and_health(
             ReleaseCompletionError,
             match="muncho_release_status_chain_invalid",
         ):
-            projection(state, version="2.3.2", release_sha=RELEASE_SHA)
+            projection(state, version=CURRENT_VERSION, release_sha=RELEASE_SHA)
 
 
 @pytest.mark.parametrize(
@@ -432,7 +433,7 @@ def test_gateway_request_is_mandatory_for_terminal_completion_and_health(
         {
             "release_sha": "b" * 40,
             "release_idempotency_key": release_idempotency_key(
-                "2.3.2",
+                CURRENT_VERSION,
                 "b" * 40,
             ),
         },
@@ -455,7 +456,7 @@ def test_coordinator_complete_rejects_tampered_gateway_request_chain(
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     _prepared, attempt, created = reserve_codex_task_summary(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         reserved_at=NOW,
@@ -469,7 +470,7 @@ def test_coordinator_complete_rejects_tampered_gateway_request_chain(
     result = cli.main([
         "coordinator-complete",
         "--version",
-        "2.3.2",
+        CURRENT_VERSION,
         "--release-sha",
         RELEASE_SHA,
         "--state-dir",
@@ -510,7 +511,7 @@ def test_status_and_health_reject_wrong_sha_receipt_under_expected_filename(
         ):
             projection(
                 state,
-                version="2.3.2",
+                version=CURRENT_VERSION,
                 release_sha=RELEASE_SHA,
             )
 
@@ -615,7 +616,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     prepared, attempt, created = reserve_codex_task_summary(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         reserved_at=NOW,
@@ -629,7 +630,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     # and cannot create a second attempt on replay.
     replay_draft, replay_attempt, replay_created = reserve_codex_task_summary(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         reserved_at=LATER,
@@ -639,7 +640,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     assert replay_created is False
     assert release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["healthy"] is False
 
@@ -649,7 +650,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     ):
         record_codex_task_summary_and_finalize(
             state,
-            version="2.3.2",
+            version=CURRENT_VERSION,
             release_sha=RELEASE_SHA,
             task_id=task_id,
             message_ref="assistant-release-summary",
@@ -659,7 +660,7 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
 
     codex, completion = record_codex_task_summary_and_finalize(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         message_ref="assistant-release-summary",
@@ -672,13 +673,13 @@ def test_coordinator_supported_workflow_reserves_records_and_finalizes(
     assert completion["required_summaries_published"] is True
     assert release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["healthy"] is True
 
     assert record_codex_task_summary_and_finalize(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         message_ref="assistant-release-summary",
@@ -698,7 +699,7 @@ def test_coordinator_crash_after_record_replays_into_one_completion(
     task_id = "019fa801-52ca-7460-954d-30aee7053618"
     _prepared, attempt, _created = reserve_codex_task_summary(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
     )
@@ -718,14 +719,14 @@ def test_coordinator_crash_after_record_replays_into_one_completion(
     with pytest.raises(RuntimeError, match="crash after Codex receipt"):
         record_codex_task_summary_and_finalize(
             state,
-            version="2.3.2",
+            version=CURRENT_VERSION,
             release_sha=RELEASE_SHA,
             task_id=task_id,
             message_ref="assistant-release-summary",
             summary_sha256=draft["summary_sha256"],
             attempt_receipt_sha256=attempt["receipt_sha256"],
         )
-    status = release_status(state, version="2.3.2", release_sha=RELEASE_SHA)
+    status = release_status(state, version=CURRENT_VERSION, release_sha=RELEASE_SHA)
     assert status["codex_task_summary_published"] is True
     assert status["complete"] is False
 
@@ -736,7 +737,7 @@ def test_coordinator_crash_after_record_replays_into_one_completion(
     )
     _codex, completion = record_codex_task_summary_and_finalize(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
         task_id=task_id,
         message_ref="assistant-release-summary",
@@ -746,7 +747,7 @@ def test_coordinator_crash_after_record_replays_into_one_completion(
     assert completion["required_summaries_published"] is True
     assert release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["healthy"] is True
 
@@ -761,7 +762,7 @@ def test_coordinator_cli_never_claims_delivery_before_explicit_ack(
     prepare_args = [
         "coordinator-prepare",
         "--version",
-        "2.3.2",
+        CURRENT_VERSION,
         "--release-sha",
         RELEASE_SHA,
         "--state-dir",
@@ -776,7 +777,7 @@ def test_coordinator_cli_never_claims_delivery_before_explicit_ack(
     assert prepared["release_completion"] == "codex_task_summary_pending"
     assert release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["healthy"] is False
 
@@ -788,7 +789,7 @@ def test_coordinator_cli_never_claims_delivery_before_explicit_ack(
     complete_args = [
         "coordinator-complete",
         "--version",
-        "2.3.2",
+        CURRENT_VERSION,
         "--release-sha",
         RELEASE_SHA,
         "--state-dir",
@@ -814,7 +815,7 @@ def test_coordinator_cli_rejects_release_records_copied_under_version_alias(
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
     _record_gateway_delivery(state, draft)
-    source_version = "2.3.2"
+    source_version = CURRENT_VERSION
     alias_version = "9.9.9"
     source_suffix = (
         f"v{source_version}-"
@@ -911,7 +912,7 @@ def test_announcement_cli_refuses_release_without_durable_restart_attestation(
     reserve_release_mapping(
         state,
         load_release_bundle(ROOT),
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=release_sha,
     )
     monkeypatch.setattr(cli, "load_current_production_config", lambda _path: _config())
@@ -962,7 +963,7 @@ def test_automatic_announcement_cli_requires_exact_identity_and_sends_once(
     mapping = reserve_release_mapping(
         state,
         bundle,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=release_sha,
     )
     prepare_restart_attestation(
@@ -995,7 +996,7 @@ def test_automatic_announcement_cli_requires_exact_identity_and_sends_once(
 
     assert cli.main(arguments) == 0
     first = json.loads(capsys.readouterr().out)
-    assert first["muncho_version"] == "2.3.2"
+    assert first["muncho_version"] == CURRENT_VERSION
     assert first["release_sha"] == release_sha
     assert first["release_completion"] == "codex_task_summary_pending"
     assert sent == [(first["summary"], CHANNEL_ID)]
