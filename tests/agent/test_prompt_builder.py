@@ -30,6 +30,7 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     MEMORY_GUIDANCE,
+    KANBAN_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
@@ -43,6 +44,11 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_kanban_guidance_does_not_duplicate_explicit_downstream_review(self):
+        assert "explicit downstream audit or reviewer task" in KANBAN_GUIDANCE
+        assert "must call `kanban_complete`" in KANBAN_GUIDANCE
+        assert "negative result" in KANBAN_GUIDANCE
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE

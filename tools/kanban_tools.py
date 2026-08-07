@@ -510,6 +510,7 @@ def _handle_show(args: dict, **kw) -> str:
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
+            delegate_runs = kb.list_delegate_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
@@ -553,6 +554,20 @@ def _handle_show(args: dict, **kw) -> str:
                     for e in events[-50:]   # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
+                "delegate_runs": [
+                    {
+                        "id": r.id, "delegate_id": r.delegate_id,
+                        "goal": r.goal, "role": r.role, "route": r.route,
+                        "model": r.model, "status": r.status,
+                        "attempt": r.attempt, "max_attempts": r.max_attempts,
+                        "summary": r.summary, "artifact_path": r.artifact_path,
+                        "commit_sha": r.commit_sha, "verification": r.verification,
+                        "error": r.error,
+                        "created_at": r.created_at, "started_at": r.started_at,
+                        "ended_at": r.ended_at,
+                    }
+                    for r in delegate_runs
+                ],
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
@@ -1258,6 +1273,7 @@ def _handle_create(args: dict, **kw) -> str:
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
+    _self_tid = os.environ.get("HERMES_KANBAN_TASK")
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -1296,7 +1312,6 @@ def _handle_create(args: dict, **kw) -> str:
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
             if _inherit_project and project_id is None:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.project_id:
@@ -1333,6 +1348,10 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            if not subscribed and _self_tid:
+                subscribed = _inherit_task_subscriptions(
+                    conn, source_task_id=_self_tid, target_task_id=new_tid
+                )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1348,6 +1367,38 @@ def _handle_create(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_create failed")
         return tool_error(f"kanban_create: {e}")
+
+
+def _inherit_task_subscriptions(
+    conn: Any, *, source_task_id: str, target_task_id: str
+) -> bool:
+    """Copy notification lineage to a headless worker-created successor."""
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        copied = 0
+        for sub in _kb.list_notify_subs(conn, source_task_id):
+            _kb.add_notify_sub(
+                conn,
+                task_id=target_task_id,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                chat_type=sub.get("chat_type") or None,
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id") or None,
+                notifier_profile=sub.get("notifier_profile") or None,
+                delivery_metadata=sub.get("delivery_metadata") or None,
+            )
+            copied += 1
+        return copied > 0
+    except Exception as exc:
+        logger.warning(
+            "failed to inherit kanban notification lineage %s -> %s: %r",
+            source_task_id,
+            target_task_id,
+            exc,
+        )
+        return False
 
 
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
@@ -2158,6 +2209,8 @@ registry.register(
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
 )
+
+
 
 registry.register(
     name="kanban_complete",

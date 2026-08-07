@@ -25,6 +25,64 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _kanban_notify_failure_is_transient(exc: Exception) -> bool:
+    """Return True when a transport outage must not drop a subscription."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "connector",
+        "cannot connect",
+        "not connected",
+        "temporary failure",
+        "name resolution",
+        "dns",
+        "network is unreachable",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "server disconnected",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "too many requests",
+    )
+    return any(marker in name or marker in text for marker in transient_markers)
+
+
+def _kanban_completion_handoff(summary: Any, max_chars: int = 1500) -> str:
+    """Format a worker handoff without silently chopping it at 200 chars."""
+    text = str(summary or "").strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return f"\n{text}"
+
+
+def _kanban_origin_wake_handoff(
+    events: Any, task: Any, max_chars: int = 1200
+) -> str:
+    """Return a bounded completion handoff for the creator-session wake."""
+    text = ""
+    for event in reversed(list(events or [])):
+        if getattr(event, "kind", None) != "completed":
+            continue
+        payload = getattr(event, "payload", None)
+        if isinstance(payload, dict):
+            text = str(payload.get("summary") or "").strip()
+        if text:
+            break
+    if not text and task is not None:
+        text = str(getattr(task, "result", None) or "").strip()
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return text
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -420,14 +478,10 @@ class GatewayKanbanWatchersMixin:
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
+                            summary = payload_summary or (
+                                task.result if task and task.result else ""
+                            )
+                            handoff = _kanban_completion_handoff(summary)
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -572,15 +626,22 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            transient = _kanban_notify_failure_is_transient(exc)
                             fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
+                            if transient:
+                                # Connectivity outages are not evidence that
+                                # the destination is permanently dead. Keep
+                                # the event pending until transport recovers.
+                                sub_fail_counts.pop(sub_key, None)
+                            else:
+                                sub_fail_counts[sub_key] = fails
                             logger.warning(
                                 "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
+                                "(attempt %d/%d, transient=%s): %s",
                                 sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                                MAX_SEND_FAILURES, transient, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
+                            if not transient and fails >= MAX_SEND_FAILURES:
                                 logger.warning(
                                     "kanban notifier: dropping subscription "
                                     "%s on %s after %d consecutive send failures",
@@ -645,6 +706,9 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            _handoff = _kanban_origin_wake_handoff(d["events"], task)
+                            if _handoff:
+                                _synth += f"\nArtifact/result handoff: {_handoff}"
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —

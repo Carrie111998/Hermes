@@ -153,6 +153,43 @@ delegation:
 
 If omitted, subagents use the same model as the parent.
 
+## Named Routes
+
+Use named routes when different child tasks need different configured models or providers without exposing arbitrary provider settings through the tool call:
+
+```yaml
+# In ~/.hermes/config.yaml
+delegation:
+  default_route: "fast"
+  routes:
+    fast:
+      provider: "openrouter"
+      model: "google/gemini-3-flash-preview"
+      reasoning_effort: "low"
+      description: "Fast route for bounded mechanical work"
+    review:
+      provider: "openrouter"
+      model: "anthropic/claude-sonnet-4"
+      reasoning_effort: "high"
+      description: "Quality-sensitive review"
+```
+
+The configured names become the allowlist advertised by the `delegate_task` schema:
+
+```python
+delegate_task(goal="Normalize these logs", route="fast")
+
+delegate_task(
+    route="fast",  # batch default
+    tasks=[
+        {"goal": "Normalize the CSV"},
+        {"goal": "Review the parser", "route": "review"},
+    ],
+)
+```
+
+Per-task `route` overrides the top-level batch route, which overrides `delegation.default_route`. A route can override execution fields (`provider`, `model`, `base_url`, `api_key`, `api_mode`, and `reasoning_effort`) but cannot raise concurrency/depth limits or grant tools. Unknown names fail before any child starts. If no route is selected or configured, the existing top-level delegation settings and parent inheritance continue to apply.
+
 ## Inherited Tool Access
 
 `delegate_task` does not accept a model-facing `toolsets` parameter. Each subagent inherits the parent's enabled toolsets so the model cannot grant a child capabilities that the parent does not have. Configure the parent's tools before starting the conversation if delegated work needs additional capabilities.

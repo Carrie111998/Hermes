@@ -1029,9 +1029,10 @@ conversation later through the async-delegation completion queue.
 
 Two shapes:
 
-- **Single:** pass `goal` (+ optional `context`, `toolsets`).
+- **Single:** pass `goal` (+ optional `context`, `route`).
 - **Batch (parallel):** pass `tasks: [...]` — each gets its own subagent
-  running concurrently. Concurrency is capped by
+  running concurrently. A top-level `route` is the batch default and a
+  per-task `route` overrides it. Concurrency is capped by
   `delegation.max_concurrent_children` (default 3).
 
 Roles:
@@ -1046,7 +1047,9 @@ Roles:
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,
-`max_iterations`.
+`max_iterations`, `default_route`, and `routes`. Named routes are allowlisted
+execution profiles; they may override provider/model/endpoint/reasoning fields
+but do not override operational limits or tool access.
 
 Durability rule: background `delegate_task` is detached from the current
 turn but still process-local. For work that must survive process restart, use
