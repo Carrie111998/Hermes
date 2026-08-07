@@ -36,6 +36,7 @@ import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
+import { chooseWindowsHermesHome } from './hermes-home'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   canImportHermesCli,
@@ -569,30 +570,10 @@ function resolveHermesHome() {
     // so directoryExists(localappdata) is always true post-install and the
     // legacy branch is never reached — silently orphaning an existing CLI
     // setup with sessions, config, skills and memories (#40178).
-    //
-    // An established desktop install (state.db present) always wins — never
-    // hijack back to legacy. If only legacy has real data, honour the
-    // CLI-first user's setup. Fresh installs preserve the original
-    // heuristic (legacy dir without LOCALAPPDATA, else LOCALAPPDATA).
-    const localDb = path.join(localappdata, 'state.db')
-    const legacyDb = path.join(legacy, 'state.db')
-    const localHasData = fileExists(localDb)
-    const legacyHasData = fileExists(legacyDb)
-
-    if (localHasData) {
-      return localappdata
-    }
-
-    if (legacyHasData) {
-      return legacy
-    }
-
-    // Neither has real data — fresh install. Preserve original heuristic.
-    if (!directoryExists(localappdata) && directoryExists(legacy)) {
-      return legacy
-    }
-
-    return localappdata
+    return chooseWindowsHermesHome(localappdata, legacy, {
+      fileExists,
+      directoryExists,
+    })
   }
 
   return path.join(app.getPath('home'), '.hermes')

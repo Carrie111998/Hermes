@@ -1,58 +1,21 @@
 /**
- * Unit tests for the Windows Hermes home resolution logic extracted
- * from resolveHermesHome() in main.ts (#40178).
+ * Unit tests for chooseWindowsHermesHome — the Windows Hermes home
+ * resolution helper extracted from resolveHermesHome() in main.ts.
  *
  * These test the pure decision function independently of Electron,
  * so they run on any platform.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import path from 'node:path'
+import { chooseWindowsHermesHome } from './hermes-home'
 
 // ---------------------------------------------------------------------------
-// Pure logic under test (extracted from resolveHermesHome, main.ts)
-// ---------------------------------------------------------------------------
-function chooseWindowsHermesHome(
-  localappdata: string,
-  legacy: string,
-  {
-    fileExists,
-    directoryExists,
-  }: {
-    fileExists: (p: string) => boolean
-    directoryExists: (p: string) => boolean
-  },
-): string {
-  const localDb = path.join(localappdata, 'state.db')
-  const legacyDb = path.join(legacy, 'state.db')
-  const localHasData = fileExists(localDb)
-  const legacyHasData = fileExists(legacyDb)
-
-  // An established desktop install (state.db present) always wins —
-  // never hijack back to legacy.
-  if (localHasData) {
-    return localappdata
-  }
-
-  // Only legacy has real data: honour the CLI-first user's setup.
-  if (legacyHasData) {
-    return legacy
-  }
-
-  // Neither has real data — fresh install.
-  if (!directoryExists(localappdata) && directoryExists(legacy)) {
-    return legacy
-  }
-
-  return localappdata
-}
-
-// ---------------------------------------------------------------------------
-// Test cases
+// Test fixtures
 // ---------------------------------------------------------------------------
 const LOCAL = 'C:\\Users\\test\\AppData\\Local\\hermes'
 const LEGACY = 'C:\\Users\\test\\.hermes'
 
-function makeFs(existingFiles: string[], existingDirs: string[]) {
+function makeProbes(existingFiles: string[], existingDirs: string[]) {
   return {
     fileExists: (p: string) => existingFiles.includes(p),
     directoryExists: (p: string) => existingDirs.includes(p),
@@ -60,65 +23,87 @@ function makeFs(existingFiles: string[], existingDirs: string[]) {
 }
 
 describe('chooseWindowsHermesHome', () => {
-  it('returns LOCALAPPDATA when desktop has an established state.db', () => {
-    const fs = makeFs(
+  // -----------------------------------------------------------------------
+  // Established desktop install — always wins
+  // -----------------------------------------------------------------------
+  it('returns LOCALAPPDATA when both sides have state.db (desktop wins)', () => {
+    const probes = makeProbes(
       [path.join(LOCAL, 'state.db'), path.join(LEGACY, 'state.db')],
       [LOCAL, LEGACY],
     )
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LOCAL)
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LOCAL)
   })
 
   it('returns LOCALAPPDATA when only LOCALAPPDATA has state.db', () => {
-    const fs = makeFs(
+    const probes = makeProbes(
       [path.join(LOCAL, 'state.db')],
       [LOCAL, LEGACY],
     )
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LOCAL)
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LOCAL)
   })
 
-  it('returns legacy when only legacy has state.db (the orphaned-CLI case)', () => {
-    const fs = makeFs(
+  // -----------------------------------------------------------------------
+  // CLI-first user — the #40178 scenario
+  // -----------------------------------------------------------------------
+  it('returns legacy when only legacy has state.db (orphaned CLI data)', () => {
+    // Installer pre-created LOCALAPPDATA dir (empty), legacy has real sessions.
+    const probes = makeProbes(
       [path.join(LEGACY, 'state.db')],
       [LOCAL, LEGACY],
     )
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LEGACY)
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LEGACY)
   })
 
-  it('returns legacy when LOCALAPPDATA is missing and legacy dir exists (fresh install heuristic)', () => {
-    const fs = makeFs([], [LEGACY])
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LEGACY)
+  it('returns legacy when LOCALAPPDATA dir is missing entirely and legacy has state.db', () => {
+    // Test gap noted in #40233 review: LOCALAPPDATA does not exist as a
+    // directory, but legacy has real data. DB check fires before the dir
+    // heuristic, so legacy wins.
+    const probes = makeProbes(
+      [path.join(LEGACY, 'state.db')],
+      [LEGACY],  // LOCALAPPDATA dir does not exist
+    )
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LEGACY)
+  })
+
+  // -----------------------------------------------------------------------
+  // Fresh install — original heuristic preserved
+  // -----------------------------------------------------------------------
+  it('returns legacy when LOCALAPPDATA missing and legacy dir exists (fresh heuristic)', () => {
+    const probes = makeProbes([], [LEGACY])
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LEGACY)
   })
 
   it('returns LOCALAPPDATA for a truly fresh install (no dirs, no dbs)', () => {
-    const fs = makeFs([], [])
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LOCAL)
+    const probes = makeProbes([], [])
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LOCAL)
   })
 
-  it('returns LOCALAPPDATA when installer pre-created the dir but no DB exists on either side', () => {
-    // This is the exact scenario #40178: the installer created
-    // %LOCALAPPDATA%\hermes (empty), legacy ~/.hermes exists but has no
-    // state.db (e.g. a pip install that never ran). Original heuristic
-    // would return LOCALAPPDATA; we keep that for the no-data case.
-    const fs = makeFs([], [LOCAL, LEGACY])
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LOCAL)
+  it('returns LOCALAPPDATA when installer pre-created dir but no DB on either side', () => {
+    // Both dirs exist but neither has state.db — config/.env-only legacy
+    // setup. Original heuristic picks LOCALAPPDATA because it exists.
+    const probes = makeProbes([], [LOCAL, LEGACY])
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LOCAL)
   })
 
+  // -----------------------------------------------------------------------
+  // Edge cases
+  // -----------------------------------------------------------------------
   it('returns LOCALAPPDATA when local DB exists even if legacy also exists', () => {
     // Desktop install established → never silently switch back to CLI data.
-    const fs = makeFs(
+    const probes = makeProbes(
       [path.join(LOCAL, 'state.db'), path.join(LEGACY, 'state.db')],
       [LOCAL, LEGACY],
     )
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LOCAL)
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LOCAL)
   })
 
-  it('returns legacy when LOCALAPPDATA dir exists but empty and legacy has data', () => {
-    // The exact #40178 scenario: installer created the LOCALAPPDATA dir
-    // but it's empty; legacy has real CLI sessions.
-    const fs = makeFs(
+  it('returns legacy when LOCALAPPDATA dir exists but empty, legacy has DB', () => {
+    // Exact #40178: installer created LOCALAPPDATA dir (empty),
+    // legacy has real CLI sessions.
+    const probes = makeProbes(
       [path.join(LEGACY, 'state.db')],
       [LOCAL, LEGACY],
     )
-    expect(chooseWindowsHermesHome(LOCAL, LEGACY, fs)).toBe(LEGACY)
+    expect(chooseWindowsHermesHome(LOCAL, LEGACY, probes)).toBe(LEGACY)
   })
 })
