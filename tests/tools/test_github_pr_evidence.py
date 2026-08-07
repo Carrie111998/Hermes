@@ -272,6 +272,7 @@ def test_recalled_manifest_recovers_only_current_required_cursors():
     assert inventory["total"] == 10
     assert inventory["truncated"] is False
     assert consumed not in {item["cursor"] for item in inventory["items"]}
+    assert consumed not in recalled["cursors"].values()
     assert {item["cursor"] for item in inventory["items"]} == scope.required_cursors
 
 
@@ -286,6 +287,59 @@ def test_manifest_recovery_inventory_is_bounded_and_reports_truncation():
     assert inventory["total"] == 11
     assert inventory["truncated"] is True
     assert len(inventory["items"]) == 2
+
+
+def test_recalled_manifest_exposes_only_one_live_cursor_window():
+    scope = _scope()
+    with evidence_scope(scope):
+        first = json.loads(github_pr_evidence_tool("manifest"))
+        for token in first["cursors"].values():
+            scope.cursors.pop(token)
+        for index in range(100):
+            _new_cursor(scope, _Cursor(kind="data", data={"index": index}))
+
+        recalled = json.loads(github_pr_evidence_tool("manifest"))
+
+    inventory = recalled["current_required_cursors"]
+    assert recalled["cursors"] == {}
+    assert inventory["total"] == 100
+    assert inventory["truncated"] is True
+    assert len(inventory["items"]) == 16
+    assert {item["cursor"] for item in inventory["items"]} == scope.exposed_cursors
+
+
+def test_cursor_exposure_is_a_bounded_rolling_window():
+    scope = _scope()
+    with evidence_scope(scope):
+        children = [
+            _new_cursor(scope, _Cursor(kind="data", data={"index": index}))
+            for index in range(40)
+        ]
+        parent = _new_cursor(
+            scope,
+            _Cursor(kind="data", data={"child_cursors": children}),
+        )
+        first = json.loads(github_pr_evidence_tool("read", parent))
+
+        visible = first["items"]["child_cursors"]
+        assert len(visible) == 16
+        assert first["cursor_exposure"] == {
+            "shown": 16,
+            "hidden": 24,
+            "live_window": 16,
+            "window_limit": 16,
+        }
+        assert first["next_required_cursors"] == []
+        assert len(scope.exposed_cursors) == 16
+
+        consumed = visible[0]
+        second = json.loads(github_pr_evidence_tool("read", consumed))
+
+    assert len(second["next_required_cursors"]) == 1
+    replacement = second["next_required_cursors"][0]["cursor"]
+    assert replacement not in visible
+    assert consumed not in scope.exposed_cursors
+    assert len(scope.exposed_cursors) == 16
 
 
 def test_execution_control_plane_cursors_enforce_resolution_then_attestation_order():
@@ -1030,7 +1084,7 @@ def test_large_archive_entry_creates_only_one_lazy_continuation_cursor():
 
         first_chunk = json.loads(github_pr_evidence_tool("read", entry_cursors[0]))
         assert first_chunk["items"]["part"] == 1
-        assert first_chunk["items"]["parts"] == 3
+        assert first_chunk["items"]["parts"] == 9
         assert first_chunk["items"]["next_cursor"]
         assert first_chunk["coverage"]["optional_available"] == 1
 

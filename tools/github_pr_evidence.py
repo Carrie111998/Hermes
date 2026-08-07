@@ -49,12 +49,13 @@ _MAX_ARCHIVE_BYTES = 50 * 1024 * 1024
 _MAX_ARCHIVE_ENTRIES = 200
 _MAX_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024
 _MAX_ENTRY_BYTES = 2 * 1024 * 1024
-_ARCHIVE_ENTRY_CHUNK_BYTES = 48 * 1024
+_ARCHIVE_ENTRY_CHUNK_BYTES = 12 * 1024
 _MAX_COMPRESSION_RATIO = 100
 _MAX_RESULT_CHARS = 90_000
 _MAX_INLINE_STRING_CHARS = 20_000
 _MAX_PAGE_CHARS = 60_000
-_MAX_RECOVERY_CURSOR_INVENTORY = 100
+_MAX_RECOVERY_CURSOR_INVENTORY = 16
+_MAX_EXPOSED_CURSORS = 16
 # A pull request can expose up to 3,000 changed files. Exact-head review may
 # materialize both base and head blobs plus the bounded 200-entry artifact
 # inventory, so the old 200-cursor ceiling rejected legitimate large reviews.
@@ -138,6 +139,7 @@ class EvidenceScope:
     observed_action_jobs: dict[int, dict[str, Any]] = field(default_factory=dict)
     logs_discovered: bool = False
     artifacts_discovered: bool = False
+    exposed_cursors: set[str] = field(default_factory=set)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
@@ -483,11 +485,22 @@ def _manifest(scope: EvidenceScope) -> str:
             )
         scope.manifest_created = True
     with scope.lock:
+        active_manifest_cursors = {
+            name: token
+            for name, token in scope.manifest_cursors.items()
+            if token in scope.cursors
+        }
+        scope.exposed_cursors.intersection_update(scope.cursors)
+        scope.exposed_cursors.update(active_manifest_cursors.values())
+        _fill_exposed_cursor_window(scope)
         current_required = [
             {"cursor": token, "kind": cursor.kind}
             for token, cursor in scope.cursors.items()
-            if cursor.required
+            if cursor.required and token in scope.exposed_cursors
         ]
+        total_required = sum(
+            1 for cursor in scope.cursors.values() if cursor.required
+        )
     current_required.sort(
         key=lambda item: (
             item["kind"] == "execution_attestation",
@@ -499,11 +512,11 @@ def _manifest(scope: EvidenceScope) -> str:
         {
             "success": True,
             "tuple": scope.tuple_dict,
-            "cursors": dict(scope.manifest_cursors),
+            "cursors": active_manifest_cursors,
             "current_required_cursors": {
-                "total": len(current_required),
-                "truncated": len(current_required)
-                > _MAX_RECOVERY_CURSOR_INVENTORY,
+                "total": total_required,
+                "truncated": total_required
+                > min(len(current_required), _MAX_RECOVERY_CURSOR_INVENTORY),
                 "items": current_required[:_MAX_RECOVERY_CURSOR_INVENTORY],
             },
             "next_parameters": {"operation": "read", "cursor": "opaque cursor"},
@@ -553,6 +566,92 @@ def _coverage(scope: EvidenceScope) -> dict[str, Any]:
                 "required_gates": list(scope.required_execution_gates),
             },
         }
+
+
+_OMIT_CURSOR = object()
+
+
+def _fill_exposed_cursor_window(scope: EvidenceScope) -> list[dict[str, str]]:
+    """Expose a bounded rolling window of live required cursors.
+
+    Callers must hold ``scope.lock``. Previously exposed live cursors retain
+    their place so concurrent tool results cannot collectively fan out beyond
+    the configured window.
+    """
+    scope.exposed_cursors.intersection_update(scope.cursors)
+    available = max(0, _MAX_EXPOSED_CURSORS - len(scope.exposed_cursors))
+    if not available:
+        return []
+    candidates = [
+        (token, cursor)
+        for token, cursor in scope.cursors.items()
+        if cursor.required and token not in scope.exposed_cursors
+    ]
+    candidates.sort(
+        key=lambda item: (
+            item[1].kind == "execution_attestation",
+            item[1].kind,
+            item[0],
+        )
+    )
+    exposed = []
+    for token, cursor in candidates[:available]:
+        scope.exposed_cursors.add(token)
+        exposed.append({"cursor": token, "kind": cursor.kind})
+    return exposed
+
+
+def _bound_cursor_exposure(
+    scope: EvidenceScope, value: Any
+) -> tuple[Any, dict[str, int]]:
+    """Hide surplus live cursor tokens from one result without dropping evidence.
+
+    Hidden cursors remain required inside the scope and are revealed through
+    the rolling window after earlier cursors are consumed. This bounds the
+    aggregate tool output that can enter a single model turn.
+    """
+    shown: set[str] = set()
+    hidden: set[str] = set()
+
+    with scope.lock:
+        scope.exposed_cursors.intersection_update(scope.cursors)
+
+        def walk(candidate: Any) -> Any:
+            if isinstance(candidate, str) and candidate in scope.cursors:
+                if candidate in scope.exposed_cursors:
+                    shown.add(candidate)
+                    return candidate
+                if len(scope.exposed_cursors) < _MAX_EXPOSED_CURSORS:
+                    scope.exposed_cursors.add(candidate)
+                    shown.add(candidate)
+                    return candidate
+                hidden.add(candidate)
+                return _OMIT_CURSOR
+            if isinstance(candidate, list):
+                bounded = []
+                for item in candidate:
+                    result = walk(item)
+                    if result is not _OMIT_CURSOR:
+                        bounded.append(result)
+                return bounded
+            if isinstance(candidate, dict):
+                bounded = {}
+                for key, item in candidate.items():
+                    result = walk(item)
+                    if result is not _OMIT_CURSOR:
+                        bounded[key] = result
+                return bounded
+            return candidate
+
+        bounded_value = walk(value)
+        live_window = len(scope.exposed_cursors)
+
+    return bounded_value, {
+        "shown": len(shown),
+        "hidden": len(hidden),
+        "live_window": live_window,
+        "window_limit": _MAX_EXPOSED_CURSORS,
+    }
 
 
 def _validate_pull_request(scope: EvidenceScope, value: Any) -> None:
@@ -1214,6 +1313,8 @@ def _read(scope: EvidenceScope, token: str) -> str:
                 "Execution attestation prerequisites are incomplete",
             )
         cursor = scope.cursors.pop(token, None)
+        if cursor is not None:
+            scope.exposed_cursors.discard(token)
     if cursor is None:
         return _error(scope, "Unknown or already-consumed evidence cursor")
     try:
@@ -1344,10 +1445,16 @@ def _read(scope: EvidenceScope, token: str) -> str:
             value = _bound_large_strings(scope, value, required=cursor.required)
         if isinstance(value, list):
             value = _paginate_items(scope, value, required=cursor.required)
+        bounded_value, cursor_exposure = _bound_cursor_exposure(scope, value)
+        with scope.lock:
+            next_required_cursors = _fill_exposed_cursor_window(scope)
+            cursor_exposure["live_window"] = len(scope.exposed_cursors)
         response = {
             "success": True,
             "kind": cursor.kind,
-            "items": value,
+            "items": bounded_value,
+            "next_required_cursors": next_required_cursors,
+            "cursor_exposure": cursor_exposure,
             "coverage": _coverage(scope),
         }
         encoded = json.dumps(response, ensure_ascii=False)
@@ -1822,9 +1929,12 @@ registry.register(
         "description": (
             "Read complete, immutable GitHub pull-request evidence bound to the "
             "trusted webhook tuple. Consume every required cursor and use optional "
-            "cursors only for evidence-driven drill-down. If context loss removes "
-            "continuation tokens, call manifest again and resume from its bounded "
-            "current_required_cursors inventory."
+            "cursors only for evidence-driven drill-down. Never issue more than 16 "
+            "github_pr_evidence calls in one assistant turn. Continue with cursors "
+            "from next_required_cursors; if context loss removes continuation "
+            "tokens, call manifest again and resume only from its bounded "
+            "current_required_cursors inventory. A recalled manifest omits consumed "
+            "control-plane cursors."
         ),
         "parameters": {
             "type": "object",
