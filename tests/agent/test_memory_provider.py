@@ -18,10 +18,11 @@ from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 class FakeMemoryProvider(MemoryProvider):
     """Minimal concrete provider for testing."""
 
-    def __init__(self, name="fake", available=True, tools=None):
+    def __init__(self, name="fake", available=True, tools=None, prompt_block=""):
         self._name = name
         self._available = available
         self._tools = tools or []
+        self._prompt_block = prompt_block
         self.initialized = False
         self.synced_turns = []
         self.prefetch_queries = []
@@ -32,7 +33,6 @@ class FakeMemoryProvider(MemoryProvider):
         self.memory_writes = []
         self.shutdown_called = False
         self._prefetch_result = ""
-        self._prompt_block = ""
 
     @property
     def name(self) -> str:
@@ -966,6 +966,90 @@ class TestMemoryToolToolsetGate:
         mgr = self._mgr_with_tools("fact_store", "memory_search", "memory_add")
         tools, names = self._run_memory_injection(None, mgr)
         assert names == {"fact_store", "memory_search", "memory_add"}
+
+
+class TestMemorySystemPromptToolsetGate:
+    """Issue #81014: ``MemoryManager.build_system_prompt`` must honor the same
+    toolset gate as :func:`inject_memory_provider_tools`.
+
+    Without the gate, an operator who disables the memory toolset (e.g.
+    ``agent.disabled_toolsets: [memory]``) still sees the provider's
+    "use mnemosyne_remember …" instructions in the system prompt even
+    though the corresponding tools are absent from the model surface —
+    producing a dangling instruction that confuses smaller models and
+    causes failed / hallucinated tool calls.
+
+    Mirror of :class:`TestMemoryToolToolsetGate` for the prompt path.
+    """
+
+    @staticmethod
+    def _mgr_with_block(block_text):
+        mgr = MemoryManager()
+        mgr.add_provider(FakeMemoryProvider("mnemosyne", prompt_block=block_text))
+        return mgr
+
+    def test_no_gate_args_returns_block_unchanged(self):
+        """Existing call sites that pass no gate args keep today's behavior."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert "mnemosyne_remember" in mgr.build_system_prompt()
+
+    def test_disabled_memory_toolset_suppresses_block(self):
+        """``disabled_toolsets: [memory]`` suppresses the provider's prompt block."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert mgr.build_system_prompt(
+            enabled_toolsets=None,
+            disabled_toolsets=["memory"],
+            memory_tool_present=False,
+        ) == ""
+
+    def test_empty_enabled_toolsets_suppresses_block(self):
+        """``enabled_toolsets: []`` (e.g. ``platform_toolsets.telegram: []``) suppresses the block."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert mgr.build_system_prompt(
+            enabled_toolsets=[],
+            disabled_toolsets=None,
+            memory_tool_present=False,
+        ) == ""
+
+    def test_enabled_toolsets_without_memory_suppresses_block(self):
+        """Toolsets that don't include memory suppress the prompt block."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert mgr.build_system_prompt(
+            enabled_toolsets=["terminal", "web"],
+            disabled_toolsets=None,
+            memory_tool_present=False,
+        ) == ""
+
+    def test_memory_in_enabled_toolsets_keeps_block(self):
+        """An explicit ``memory`` opt-in keeps the block."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert "mnemosyne_remember" in mgr.build_system_prompt(
+            enabled_toolsets=["terminal", "memory"],
+            disabled_toolsets=None,
+            memory_tool_present=False,
+        )
+
+    def test_disabled_memory_wins_over_enabled_memory(self):
+        """An explicit ``disabled_toolsets: [memory]`` overrides enabled include."""
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        assert mgr.build_system_prompt(
+            enabled_toolsets=["memory"],
+            disabled_toolsets=["memory"],
+            memory_tool_present=False,
+        ) == ""
+
+    def test_memory_tool_present_keeps_block(self):
+        """If the built-in ``memory`` tool IS on the surface, the prompt
+        block is kept (matches :func:`memory_provider_tools_enabled`'s
+        ``memory_tool_present`` shortcut for the no-disabled-toolsets path).
+        """
+        mgr = self._mgr_with_block("Use mnemosyne_remember to store facts.")
+        out = mgr.build_system_prompt(
+            enabled_toolsets=["hermes-cli"],  # does NOT include memory
+            disabled_toolsets=None,
+            memory_tool_present=True,
+        )
+        assert "mnemosyne_remember" in out
 
 
 class TestContextEngineToolsetGate:

@@ -523,10 +523,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
+    # External memory provider system prompt block (additive to built-in).
+    # Honors the same toolset gate as inject_memory_provider_tools so the
+    # provider's "use mnemosyne_remember …" instructions aren't injected into
+    # the system prompt when the provider's tools are gated out — see #81014.
     if agent._memory_manager:
         try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
+            _existing_tool_names = {
+                tool.get("function", {}).get("name")
+                for tool in (agent.tools or [])
+                if isinstance(tool, dict)
+            }
+            _ext_mem_block = agent._memory_manager.build_system_prompt(
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                memory_tool_present="memory" in _existing_tool_names,
+            )
             if _ext_mem_block:
                 volatile_parts.append(_ext_mem_block)
         except Exception:

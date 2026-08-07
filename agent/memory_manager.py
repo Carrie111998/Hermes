@@ -483,12 +483,36 @@ class MemoryManager:
 
     # -- System prompt -------------------------------------------------------
 
-    def build_system_prompt(self) -> str:
+    def build_system_prompt(
+        self,
+        *,
+        enabled_toolsets: Optional[List[str]] = None,
+        disabled_toolsets: Optional[List[str]] = None,
+        memory_tool_present: bool = False,
+    ) -> str:
         """Collect system prompt blocks from all providers.
 
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
+
+        Honors the same ``memory_provider_tools_enabled`` gate as
+        :func:`inject_memory_provider_tools` when ``enabled_toolsets`` /
+        ``disabled_toolsets`` are supplied (#81014). Without this gate, an
+        operator who disables the memory toolset (e.g.
+        ``agent.disabled_toolsets: [memory]``) still sees the provider's
+        "use mnemosyne_remember …" instructions in the system prompt even
+        though the corresponding tools are absent from the model surface —
+        producing a dangling instruction that confuses smaller models and
+        causes failed / hallucinated tool calls.
         """
+        if (enabled_toolsets is not None or disabled_toolsets is not None) and not (
+            memory_provider_tools_enabled(
+                enabled_toolsets,
+                disabled_toolsets,
+                memory_tool_present=memory_tool_present,
+            )
+        ):
+            return ""
         blocks = []
         for provider in self._providers:
             try:
