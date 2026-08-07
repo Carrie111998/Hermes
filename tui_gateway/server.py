@@ -8790,6 +8790,62 @@ def _read_spawn_tree_index(session_dir) -> list[dict]:
 
 # ── Methods: prompt ──────────────────────────────────────────────────
 
+# Park async_delegation completions whose owner tab is not live yet.
+# After a backend restart, restore_undelivered_completions re-queues durable
+# pending rows into the shared completion_queue; a non-owner poller used to
+# DROP them (log: "Dropping unowned async_delegation notification"), so the
+# parent never woke even though the DB row stayed pending until the next
+# restart loop. Park instead and let the owning session claim on resume.
+_ORPHAN_NOTIF_LOCK = threading.Lock()
+_ORPHAN_NOTIFS: list = []
+_ORPHAN_NOTIF_MAX = 256
+
+
+def _orphan_notification_key(evt: dict) -> str:
+    did = str(evt.get("delegation_id") or "")
+    if did:
+        return f"deleg:{did}"
+    return (
+        f"misc:{evt.get('type','')}:{evt.get('session_key','')}:"
+        f"{evt.get('origin_ui_session_id','')}:{evt.get('session_id','')}"
+    )
+
+
+def _park_unowned_notification(evt: dict) -> None:
+    """Hold an addressed completion until its owner session is live."""
+    if not isinstance(evt, dict):
+        return
+    key = _orphan_notification_key(evt)
+    with _ORPHAN_NOTIF_LOCK:
+        for existing in _ORPHAN_NOTIFS:
+            if _orphan_notification_key(existing) == key:
+                return
+        _ORPHAN_NOTIFS.append(evt)
+        # Bound memory if many orphans pile up (oldest first).
+        overflow = len(_ORPHAN_NOTIFS) - _ORPHAN_NOTIF_MAX
+        if overflow > 0:
+            del _ORPHAN_NOTIFS[:overflow]
+
+
+def _claim_parked_notifications_for_session(sid: str, session: dict) -> list:
+    """Pop parked events that this live session provably owns."""
+    claimed: list = []
+    with _ORPHAN_NOTIF_LOCK:
+        if not _ORPHAN_NOTIFS:
+            return claimed
+        keep: list = []
+        for evt in _ORPHAN_NOTIFS:
+            try:
+                owns = _session_owns_notification_event(sid, session, evt)
+            except Exception:
+                owns = False
+            if owns:
+                claimed.append(evt)
+            else:
+                keep.append(evt)
+        _ORPHAN_NOTIFS[:] = keep
+    return claimed
+
 
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session.
@@ -9148,6 +9204,13 @@ def _notification_poller_loop(
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        # Deliver parked orphan async_delegation results once this session is
+        # the proven owner (typical after backend restart + tab resume).
+        try:
+            for _parked in _claim_parked_notifications_for_session(sid, session):
+                process_registry.completion_queue.put(_parked)
+        except Exception:
+            pass
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
@@ -9209,19 +9272,26 @@ def _notification_poller_loop(
         # ownerless ordinary notifications retain legacy global delivery.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            log = (
-                logger.warning
-                if evt.get("type") == "async_delegation"
-                else logger.debug
-            )
-            log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
-                evt.get("type", "completion"),
-                str(evt.get("origin_ui_session_id") or ""),
-                str(evt.get("session_key") or ""),
-                sid,
-            )
+            if evt.get("type") == "async_delegation":
+                # Park for the real owner — do not drop. Dropping made parent
+                # chats go silent after backend restarts while children finished.
+                logger.info(
+                    "Parking unowned async_delegation notification for owner "
+                    "(origin=%r key=%r) instead of delivering to session %s",
+                    str(evt.get("origin_ui_session_id") or ""),
+                    str(evt.get("session_key") or ""),
+                    sid,
+                )
+                _park_unowned_notification(evt)
+            else:
+                logger.debug(
+                    "Dropping unowned %s notification (origin=%r key=%r) instead "
+                    "of delivering to session %s",
+                    evt.get("type", "completion"),
+                    str(evt.get("origin_ui_session_id") or ""),
+                    str(evt.get("session_key") or ""),
+                    sid,
+                )
             continue
 
         _evt_sid = evt.get("session_id", "")
