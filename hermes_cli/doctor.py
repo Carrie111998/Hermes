@@ -678,7 +678,7 @@ def _build_apikey_providers_list() -> list:
                 if _pp.base_url else None
             )
             _hc = getattr(_pp, "supports_health_check", True)
-            _static.append((_label, _key_vars, _models_url, _base_var, _hc))
+            _static.append((_label, _key_vars, _models_url, _base_var, _hc, _pp.auth_type))
     except Exception:
         pass
     return _static
@@ -2257,15 +2257,51 @@ def run_doctor(args):
             )
 
     def _probe_apikey_provider(pname, env_vars, default_url, base_env,
-                               supports_health_check) -> _ConnectivityResult:
+                               supports_health_check, noauth=False) -> _ConnectivityResult:
         key = ""
         for ev in env_vars:
             key = os.getenv(ev, "")
             if key:
                 break
+        label = pname.ljust(20)
+        if noauth:
+            # auth_type="none": no credential to check. Report the endpoint
+            # as configured without sending any Authorization header.
+            if not supports_health_check:
+                return _ConnectivityResult(
+                    pname,
+                    [(color("✓", Colors.GREEN), label,
+                      color("(no-auth)", Colors.DIM))],
+                    [],
+                )
+            try:
+                import httpx
+                base = os.getenv(base_env, "") if base_env else ""
+                url = (base.rstrip("/") + "/models") if base else default_url
+                if not url:
+                    return _ConnectivityResult(pname, [], [])
+                r = httpx.get(url, headers={"User-Agent": _HERMES_USER_AGENT}, timeout=10)
+                if r.status_code == 200:
+                    return _ConnectivityResult(
+                        pname,
+                        [(color("✓", Colors.GREEN), label, "")],
+                        [],
+                    )
+                return _ConnectivityResult(
+                    pname,
+                    [(color("⚠", Colors.YELLOW), label,
+                      color(f"(HTTP {r.status_code})", Colors.DIM))],
+                    [],
+                )
+            except Exception as e:
+                return _ConnectivityResult(
+                    pname,
+                    [(color("⚠", Colors.YELLOW), label,
+                      color(f"({e})", Colors.DIM))],
+                    [],
+                )
         if not key:
             return _ConnectivityResult(pname, [], [])
-        label = pname.ljust(20)
         if not supports_health_check:
             return _ConnectivityResult(
                 pname,
@@ -2480,13 +2516,14 @@ def run_doctor(args):
     if _APIKEY_PROVIDERS_CACHE is None:
         _APIKEY_PROVIDERS_CACHE = _build_apikey_providers_list()
     for _entry in _APIKEY_PROVIDERS_CACHE:
-        _pname, _env_vars, _default_url, _base_env, _supports = _entry
+        _pname, _env_vars, _default_url, _base_env, _supports = _entry[:5]
+        _noauth = len(_entry) > 5 and _entry[5] == "none"
         # Capture loop vars by binding default args — without this, all closures
         # would share the final iteration's values and every probe would hit
         # the last provider's URL.
         _probes.append((_pname, lambda p=_pname, e=_env_vars, u=_default_url,
-                                       b=_base_env, s=_supports:
-                                _probe_apikey_provider(p, e, u, b, s)))
+                                       b=_base_env, s=_supports, n=_noauth:
+                                _probe_apikey_provider(p, e, u, b, s, noauth=n)))
 
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))
