@@ -1292,6 +1292,11 @@ class DiscordAdapter(BasePlatformAdapter):
     supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     supports_incomplete_processing_outcome = True
+    # The release-completion edge may use this live adapter only because
+    # ``send`` below accepts a deterministic Discord nonce and the adapter can
+    # read back an exact bot-authored public receipt.  This does not authorize
+    # the standalone/token sender.
+    supports_verified_idempotent_public_delivery = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -3394,6 +3399,31 @@ class DiscordAdapter(BasePlatformAdapter):
         Forum channels (type 15) reject direct messages — a thread post is
         created automatically.
         """
+        enforced_nonce = None
+        enforced_scope_id = None
+        if metadata and "discord_enforced_nonce" in metadata:
+            enforced_nonce = metadata["discord_enforced_nonce"]
+            enforced_scope_id = str(metadata.get("scope_id", "") or "")
+            if (
+                isinstance(enforced_nonce, bool)
+                or not isinstance(enforced_nonce, int)
+                or not 0 <= enforced_nonce < (1 << 64)
+                or metadata.get("require_exact_content") is not True
+                or metadata.get("require_single_public_receipt") is not True
+                or not _metadata_marks_nonconversational(metadata)
+                or reply_to is not None
+                or metadata.get("thread_id") is not None
+                or not enforced_scope_id.isdigit()
+                or enforced_scope_id.startswith("0")
+            ):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "Discord enforced-nonce delivery requires one exact, "
+                        "non-conversational, non-reply public message"
+                    ),
+                )
+
         if not self._client:
             return SendResult(success=False, error="Not connected")
         if not (content or "").strip():
@@ -3443,6 +3473,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            if enforced_nonce is not None and str(
+                getattr(getattr(channel, "guild", None), "id", "") or ""
+            ) != enforced_scope_id:
+                return SendResult(
+                    success=False,
+                    error="Discord exact-content delivery guild mismatch",
+                )
+
             require_single_public_receipt = bool(
                 metadata and metadata.get("require_single_public_receipt")
             )
@@ -3473,6 +3511,18 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
+            if (
+                metadata
+                and metadata.get("require_exact_content") is True
+                and formatted != content
+            ):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "Discord exact-content delivery rejected adapter "
+                        "formatting drift"
+                    ),
+                )
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             if require_single_public_receipt and len(chunks) != 1:
                 return SendResult(
@@ -3500,9 +3550,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
+                    send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if enforced_nonce is not None:
+                        # discord.py serializes an explicitly supplied nonce
+                        # with enforce_nonce=true, so a crash/replay returns the
+                        # accepted message instead of creating a duplicate.
+                        send_kwargs["nonce"] = enforced_nonce
                     msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
+                        **send_kwargs,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3529,10 +3587,10 @@ class DiscordAdapter(BasePlatformAdapter):
                                 error=public_target_error,
                                 raw_response={"message_ids": message_ids},
                             )
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs = {"content": chunk, "reference": None}
+                        if enforced_nonce is not None:
+                            retry_kwargs["nonce"] = enforced_nonce
+                        msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -3575,6 +3633,7 @@ class DiscordAdapter(BasePlatformAdapter):
     async def verify_public_message_receipt(
         self,
         *,
+        expected_guild_id: Optional[str] = None,
         channel_id: str,
         message_id: str,
         expected_content_sha256: Optional[str] = None,
@@ -3595,6 +3654,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 "Discord receipt target is not a public guild channel/thread "
                 "visible to @everyone/default role"
             )
+        actual_guild_id = str(
+            getattr(getattr(channel, "guild", None), "id", "") or ""
+        )
+        if expected_guild_id and actual_guild_id != str(expected_guild_id):
+            raise RuntimeError("Discord receipt guild identity mismatch")
         message = await channel.fetch_message(int(message_id))
         if _discord_public_target_error(channel):
             raise RuntimeError(
@@ -3613,11 +3677,101 @@ class DiscordAdapter(BasePlatformAdapter):
         return {
             "verified": True,
             "platform": "discord",
+            "guild_id": actual_guild_id,
             "channel_id": str(getattr(channel, "id", channel_id)),
             "message_id": str(getattr(message, "id", message_id)),
             "content_sha256": actual_sha256,
             "bot_user_id": bot_id,
         }
+
+    async def find_public_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id: str,
+        channel_id: str,
+        nonce: int,
+        expected_content_sha256: str,
+        after_utc: dt.datetime,
+    ) -> Tuple[str, ...]:
+        """Reconcile an accepted idempotent message without another mutation.
+
+        Discord's ``enforce_nonce`` protects the send race and short retries.
+        A durable release request can outlive that server-side window, so a
+        restarted gateway first scans the bounded history after the immutable
+        request timestamp.  Only the exact nonce, bot author, and content hash
+        are retained; unrelated message content is not interpreted.
+        """
+
+        if not self._client or not getattr(self._client, "user", None):
+            raise RuntimeError("Discord client is not connected")
+        if (
+            isinstance(nonce, bool)
+            or not isinstance(nonce, int)
+            or not 0 <= nonce < (1 << 64)
+        ):
+            raise RuntimeError("Discord reconciliation nonce is invalid")
+        if (
+            not isinstance(after_utc, dt.datetime)
+            or after_utc.tzinfo is None
+            or after_utc.utcoffset() is None
+        ):
+            raise RuntimeError("Discord reconciliation timestamp is invalid")
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(channel_id))
+        if _discord_public_target_error(channel):
+            raise RuntimeError(
+                "Discord reconciliation target is not a public guild "
+                "channel/thread visible to @everyone/default role"
+            )
+        actual_guild_id = str(
+            getattr(getattr(channel, "guild", None), "id", "") or ""
+        )
+        if actual_guild_id != str(expected_guild_id):
+            raise RuntimeError("Discord reconciliation guild identity mismatch")
+        history = getattr(channel, "history", None)
+        if not callable(history):
+            raise RuntimeError("Discord reconciliation history is unavailable")
+
+        bot_id = str(getattr(self._client.user, "id", "") or "")
+        matches: list[str] = []
+        observed = 0
+        async for message in history(
+            limit=10_001,
+            after=after_utc,
+            oldest_first=True,
+        ):
+            observed += 1
+            if observed > 10_000:
+                raise RuntimeError("Discord reconciliation history bound exceeded")
+            if str(getattr(message, "nonce", "")) != str(nonce):
+                continue
+            author_id = str(
+                getattr(getattr(message, "author", None), "id", "") or ""
+            )
+            if not bot_id or author_id != bot_id:
+                raise RuntimeError(
+                    "Discord reconciliation nonce belongs to another author"
+                )
+            actual_sha256 = hashlib.sha256(
+                str(getattr(message, "content", "") or "").encode("utf-8")
+            ).hexdigest()
+            if actual_sha256 != expected_content_sha256:
+                raise RuntimeError(
+                    "Discord reconciliation nonce content hash mismatch"
+                )
+            message_id = str(getattr(message, "id", "") or "")
+            if not message_id.isdigit() or message_id.startswith("0"):
+                raise RuntimeError("Discord reconciliation message ID is invalid")
+            matches.append(message_id)
+            if len(matches) > 1:
+                raise RuntimeError("Discord reconciliation nonce is ambiguous")
+
+        if _discord_public_target_error(channel):
+            raise RuntimeError(
+                "Discord reconciliation target lost public @everyone visibility"
+            )
+        return tuple(matches)
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.

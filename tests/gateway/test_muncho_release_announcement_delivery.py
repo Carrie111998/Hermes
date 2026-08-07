@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import threading
@@ -31,6 +32,7 @@ from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.discord_connector_transport import (
     DiscordConnectorRelayTransport,
 )
+from plugins.platforms.discord.adapter import DiscordAdapter
 from ops.muncho.release.completion import (
     ReleaseCompletionError,
     complete_restart_attestation,
@@ -152,6 +154,78 @@ class _Relay:
         return result
 
 
+class _NativeDiscord:
+    """Live-adapter double with Discord's enforce-nonce replay semantics."""
+
+    supports_verified_idempotent_public_delivery = True
+
+    def __init__(self) -> None:
+        self.calls = []
+        self.receipt_calls = []
+        self.accepted_by_nonce: dict[int, tuple[str, str]] = {}
+        self.mutations = 0
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        assert reply_to is None
+        self.calls.append((chat_id, content, metadata))
+        nonce = metadata["discord_enforced_nonce"]
+        accepted = self.accepted_by_nonce.get(nonce)
+        if accepted is None:
+            self.mutations += 1
+            accepted = ("423456789012345678", content)
+            self.accepted_by_nonce[nonce] = accepted
+        elif accepted[1] != content:
+            raise RuntimeError("nonce reused with different exact content")
+        return SimpleNamespace(success=True, message_id=accepted[0])
+
+    async def find_public_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id,
+        channel_id,
+        nonce,
+        expected_content_sha256,
+        after_utc,
+    ):
+        assert expected_guild_id == GUILD_ID
+        assert channel_id == CHANNEL_ID
+        assert after_utc.tzinfo is not None
+        accepted = self.accepted_by_nonce.get(nonce)
+        if accepted is None:
+            return ()
+        actual_sha256 = hashlib.sha256(accepted[1].encode("utf-8")).hexdigest()
+        if actual_sha256 != expected_content_sha256:
+            raise RuntimeError("stored nonce content mismatch")
+        return (accepted[0],)
+
+    async def verify_public_message_receipt(
+        self,
+        *,
+        expected_guild_id,
+        channel_id,
+        message_id,
+        expected_content_sha256,
+    ):
+        self.receipt_calls.append(
+            (expected_guild_id, channel_id, message_id, expected_content_sha256)
+        )
+        matches = [
+            content
+            for accepted_id, content in self.accepted_by_nonce.values()
+            if accepted_id == message_id
+        ]
+        assert len(matches) == 1
+        actual_sha256 = hashlib.sha256(matches[0].encode("utf-8")).hexdigest()
+        return {
+            "verified": True,
+            "platform": "discord",
+            "guild_id": expected_guild_id,
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "content_sha256": actual_sha256,
+        }
+
+
 class _PidProvider:
     def main_pid(self, _unit_name: str) -> int:
         return os.getpid()
@@ -226,6 +300,68 @@ async def test_gateway_watcher_forwards_its_current_systemd_invocation(
 
     assert observed["deployed_release_sha"] == RELEASE_SHA
     assert observed["active_service_invocation_id"] == AFTER_INVOCATION_ID
+
+
+@pytest.mark.asyncio
+async def test_gateway_watcher_bootstraps_missing_private_state_safely(
+    tmp_path: Path,
+    monkeypatch,
+):
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    import ops.muncho.release.gateway_delivery as edge
+    import ops.muncho.release.metadata as metadata
+
+    state_dir = tmp_path / "state" / "private" / "muncho-release"
+    assert not state_dir.exists()
+    runner = SimpleNamespace(
+        _running=True,
+        config=GatewayConfig(platforms={}),
+        adapters={},
+    )
+    real_dispatch = edge.dispatch_pending_gateway_discord_deliveries
+
+    async def dispatch_once(**kwargs):
+        try:
+            return await real_dispatch(**kwargs)
+        finally:
+            runner._running = False
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(edge, "dispatch_pending_gateway_discord_deliveries", dispatch_once)
+    monkeypatch.setattr(metadata, "resolve_exact_release_sha", lambda: RELEASE_SHA)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        _production_config,
+    )
+
+    await GatewayRunner._muncho_release_announcement_watcher(  # type: ignore[arg-type]
+        runner,
+        poll_interval=0,
+    )
+
+    assert state_dir.is_dir()
+    assert state_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_gateway_arms_release_watcher_without_existing_state_directory(
+    tmp_path: Path,
+):
+    from gateway.run import GatewayRunner
+
+    state_dir = tmp_path / "state" / "private" / "muncho-release"
+    assert not state_dir.exists()
+    calls = []
+    watcher = object()
+    runner = SimpleNamespace(
+        _muncho_release_announcement_watcher=watcher,
+        _spawn_supervised=lambda factory, name: calls.append((factory, name)),
+    )
+
+    GatewayRunner._arm_muncho_release_announcement_watcher(runner)  # type: ignore[arg-type]
+
+    assert calls == [(watcher, "muncho_release_announcement_watcher")]
+    assert not state_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -313,7 +449,9 @@ async def test_failure_timeout_and_uncertainty_never_create_delivery_truth(
 
 
 @pytest.mark.asyncio
-async def test_wrong_deployed_identity_and_direct_adapter_fail_closed(tmp_path: Path):
+async def test_wrong_deployed_identity_and_unsupported_direct_adapter_fail_closed(
+    tmp_path: Path,
+):
     state, _draft = _queued(tmp_path)
     relay = _Relay(
         [SimpleNamespace(success=True, message_id="423456789012345678")]
@@ -341,7 +479,177 @@ async def test_wrong_deployed_identity_and_direct_adapter_fail_closed(tmp_path: 
         deployed_release_sha=RELEASE_SHA,
         active_service_invocation_id=AFTER_INVOCATION_ID,
     )
-    assert blocked[0]["state"] == "blocked_live_relay_unavailable"
+    assert blocked[0]["state"] == "blocked_live_transport_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_verified_native_delivery_reaches_exact_sha_terminal_health(
+    tmp_path: Path,
+    capsys,
+):
+    state, draft = _queued(tmp_path)
+    direct = _NativeDiscord()
+    direct_config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+
+    delivered = await dispatch_pending_gateway_discord_deliveries(
+        state_dir=state,
+        gateway_config=direct_config,
+        adapters={Platform.DISCORD: direct},
+        production_config=_production_config(),
+        deployed_release_sha=RELEASE_SHA,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
+        published_at=NOW,
+    )
+
+    assert delivered[0]["state"] == "delivered"
+    assert delivered[0]["message_id"] == "423456789012345678"
+    nonce = delivered[0]["discord_enforced_nonce"]
+    assert isinstance(nonce, int) and not isinstance(nonce, bool)
+    assert 0 <= nonce < (1 << 64)
+    assert direct.mutations == 1
+    assert direct.calls == [
+        (
+            CHANNEL_ID,
+            draft["summary"],
+            {
+                "scope_id": GUILD_ID,
+                "discord_enforced_nonce": nonce,
+                "non_conversational": True,
+                "require_exact_content": True,
+                "require_single_public_receipt": True,
+            },
+        )
+    ]
+    assert direct.receipt_calls == [
+        (
+            GUILD_ID,
+            CHANNEL_ID,
+            "423456789012345678",
+            draft["summary_sha256"],
+        )
+    ]
+    assert await dispatch_pending_gateway_discord_deliveries(
+        state_dir=state,
+        gateway_config=direct_config,
+        adapters={Platform.DISCORD: direct},
+        production_config=_production_config(),
+        deployed_release_sha=RELEASE_SHA,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
+    ) == ()
+
+    task_id = "019fa801-52ca-7460-954d-30aee7053618"
+    assert release_cli.main([
+        "coordinator-prepare",
+        "--version",
+        CURRENT_VERSION,
+        "--release-sha",
+        RELEASE_SHA,
+        "--state-dir",
+        str(state),
+        "--task-id",
+        task_id,
+    ]) == 0
+    coordinator = json.loads(capsys.readouterr().out)
+    assert coordinator["summary_sha256"] == draft["summary_sha256"]
+    assert release_cli.main([
+        "coordinator-complete",
+        "--version",
+        CURRENT_VERSION,
+        "--release-sha",
+        RELEASE_SHA,
+        "--state-dir",
+        str(state),
+        "--task-id",
+        task_id,
+        "--message-ref",
+        "assistant-release-summary",
+        "--summary-sha256",
+        coordinator["summary_sha256"],
+        "--attempt-receipt-sha256",
+        coordinator["attempt_receipt_sha256"],
+    ]) == 0
+    terminal = json.loads(capsys.readouterr().out)
+    assert terminal["release_completion"] == "complete"
+    assert terminal["healthy"] is True
+    assert release_health(
+        state,
+        version=CURRENT_VERSION,
+        release_sha=RELEASE_SHA,
+    )["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_real_live_discord_adapter_path_sends_and_reads_exact_receipt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    state, draft = _queued(tmp_path)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="unused"))
+    bot_user = SimpleNamespace(id=323456789012345679)
+    default_role = object()
+    guild = SimpleNamespace(id=int(GUILD_ID), default_role=default_role)
+    sent_message = SimpleNamespace(
+        id=423456789012345678,
+        author=bot_user,
+        content=draft["summary"],
+    )
+    sends = []
+
+    async def history(**_kwargs):
+        if False:  # pragma: no cover - preserve async-iterator shape
+            yield None
+
+    async def send(**kwargs):
+        sends.append(kwargs)
+        return sent_message
+
+    channel = SimpleNamespace(
+        id=int(CHANNEL_ID),
+        type=0,
+        guild=guild,
+        permissions_for=lambda role: SimpleNamespace(
+            view_channel=role is default_role
+        ),
+        history=history,
+        send=send,
+        fetch_message=lambda _message_id: None,
+    )
+
+    async def fetch_message(_message_id):
+        return sent_message
+
+    channel.fetch_message = fetch_message
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=None,
+    )
+    direct_config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+
+    outcome = await dispatch_pending_gateway_discord_deliveries(
+        state_dir=state,
+        gateway_config=direct_config,
+        adapters={Platform.DISCORD: adapter},
+        production_config=_production_config(),
+        deployed_release_sha=RELEASE_SHA,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
+        published_at=NOW,
+    )
+
+    assert outcome[0]["state"] == "delivered"
+    assert outcome[0]["message_id"] == str(sent_message.id)
+    assert sends == [
+        {
+            "content": draft["summary"],
+            "reference": None,
+            "nonce": outcome[0]["discord_enforced_nonce"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -463,6 +771,94 @@ async def test_crash_after_connector_acceptance_reuses_key_without_second_mutati
     assert relay.calls[0][3]["connector_idempotency_key"] == relay.calls[1][3][
         "connector_idempotency_key"
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_crash_after_acceptance_replays_one_mutation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state, _draft = _queued(tmp_path)
+    direct = _NativeDiscord()
+    direct_config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+    import ops.muncho.release.gateway_delivery as edge
+
+    real_record = edge.record_gateway_discord_delivery
+    calls = 0
+
+    def crash_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("crash before local native receipt")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(edge, "record_gateway_discord_delivery", crash_once)
+    kwargs = {
+        "state_dir": state,
+        "gateway_config": direct_config,
+        "adapters": {Platform.DISCORD: direct},
+        "production_config": _production_config(),
+        "deployed_release_sha": RELEASE_SHA,
+        "active_service_invocation_id": AFTER_INVOCATION_ID,
+    }
+    with pytest.raises(RuntimeError, match="crash before local native receipt"):
+        await dispatch_pending_gateway_discord_deliveries(**kwargs)
+    completed = await dispatch_pending_gateway_discord_deliveries(**kwargs)
+
+    assert completed[0]["state"] == "delivered"
+    assert direct.mutations == 1
+    assert len(direct.calls) == 1
+    assert completed[0]["discord_enforced_nonce"] == direct.calls[0][2][
+        "discord_enforced_nonce"
+    ]
+    assert len(direct.receipt_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_native_readback_mismatch_stays_pending_and_replays_without_duplicate(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state, draft = _queued(tmp_path)
+    direct = _NativeDiscord()
+    direct_config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+    real_verify = direct.verify_public_message_receipt
+
+    async def mismatched_receipt(**kwargs):
+        receipt = await real_verify(**kwargs)
+        return {**receipt, "content_sha256": "f" * 64}
+
+    monkeypatch.setattr(direct, "verify_public_message_receipt", mismatched_receipt)
+    kwargs = {
+        "state_dir": state,
+        "gateway_config": direct_config,
+        "adapters": {Platform.DISCORD: direct},
+        "production_config": _production_config(),
+        "deployed_release_sha": RELEASE_SHA,
+        "active_service_invocation_id": AFTER_INVOCATION_ID,
+    }
+    uncertain = await dispatch_pending_gateway_discord_deliveries(**kwargs)
+    assert uncertain[0]["state"] == "dispatch_uncertain"
+    assert release_status(
+        state,
+        version=CURRENT_VERSION,
+        release_sha=RELEASE_SHA,
+    )["discord_summary_published"] is False
+
+    monkeypatch.setattr(direct, "verify_public_message_receipt", real_verify)
+    delivered = await dispatch_pending_gateway_discord_deliveries(**kwargs)
+    assert delivered[0]["state"] == "delivered"
+    assert delivered[0]["discord_enforced_nonce"] == uncertain[0][
+        "discord_enforced_nonce"
+    ]
+    assert direct.mutations == 1
+    assert len(direct.calls) == 1
+    assert direct.calls[0][1] == draft["summary"]
 
 
 @pytest.mark.asyncio

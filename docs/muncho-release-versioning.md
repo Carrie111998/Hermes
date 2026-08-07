@@ -78,30 +78,38 @@ closed even if a record was placed under an expected filename.
 Discord delivery reserves its attempt before network I/O and writes a sealed
 request containing the exact rendered bytes, their digest, the restart
 attestation digest, and its post-restart systemd `InvocationID`. The restarted
-gateway watches that private release state only after it has finished the
-restart/startup lifecycle notifications. It compares the request to its own
+gateway always arms the private-state watcher after it has finished the
+restart/startup lifecycle notifications; the state directory may be created
+later without losing the first request. It compares the request to its own
 current systemd `INVOCATION_ID`; a missing or later invocation blocks before
-the Relay. Once the deploy coordinator has confirmed the exact active SHA and
-production smokes, the gateway sends the request only through its live Relay
-to the privileged Discord connector. A native Discord adapter or direct REST
-fallback is rejected on this production path. A Discord delivery receipt,
-terminal completion, and healthy status are invalid unless they bind to that
-exact persisted gateway request.
+any Discord read or mutation.
 
-The connector receives a stable idempotency key derived from `(version, exact
-SHA)`. A successful replay returns the existing exact Discord message ID. A
-timeout or crash after connector acceptance can therefore be reconciled with
-the same key without a second Discord mutation. Missing relay authority,
-identity or destination drift, malformed receipts, and unconfirmed dispatch
-never create delivery truth. No channel ID or user-facing `HERMES_*` setting
-is added.
+Once the deploy coordinator has confirmed the exact active SHA and production
+smokes, the gateway uses one authenticated live transport. The privileged
+Relay connector remains eligible and receives a stable idempotency key derived
+from `(version, exact SHA)`. When production runs the connected native Discord
+adapter instead, the gateway first reconciles the bounded post-request history
+by deterministic 64-bit nonce, bot author, public guild/channel, and exact
+content hash. A missing receipt is sent with the same nonce and Discord
+`enforce_nonce`, closing the history-scan/send race. The accepted message is
+then read back and reverified before the local delivery receipt is recorded.
+A timeout or crash after acceptance therefore resumes from the same message ID
+without a second mutation, including after the short server nonce window.
+
+The standalone Discord sender and bot-token path remain forbidden for release
+announcements. Missing live authority, identity or destination drift,
+ambiguous or over-bound history, malformed receipts, and unconfirmed dispatch
+never create delivery truth. A Discord delivery receipt, terminal completion,
+and healthy status are invalid unless they bind to the exact persisted gateway
+request. No channel ID or user-facing `HERMES_*` setting is added.
 
 Generic upstream `hermes send --to discord:<channel> --json` remains a separate
 edge: the sealed package includes Discord's plugin manifest so PluginManager
 can discover its registered standalone sender. That path uses the existing bot
 configuration for ordinary Hermes installations. Muncho production keeps the
-privileged writer policy intact and does not use this direct sender for release
-announcements.
+privileged writer policy intact and does not use the standalone sender for
+release announcements; native release delivery always occurs inside the
+already-authenticated live gateway adapter.
 
 The legacy production release wrapper reserves the version/SHA mapping before
 activation. It invokes `announce-after-smoke` only after the restarted service

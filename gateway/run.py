@@ -14545,16 +14545,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # deploy coordinator has verified the exact active SHA and production
         # smokes. Start this watcher after restart/startup lifecycle messages
         # so a verified announcement is the next release lifecycle message.
-        # The watcher uses only the live Relay -> privileged Discord connector
-        # transport; it never loads a bot token or enables direct REST egress.
-        _muncho_release_state = (
-            Path(_hermes_home) / "state" / "private" / "muncho-release"
-        )
-        if _muncho_release_state.is_dir():
-            self._spawn_supervised(
-                self._muncho_release_announcement_watcher,
-                "muncho_release_announcement_watcher",
-            )
+        # The watcher uses only an authenticated live transport and never
+        # loads a bot token or enables standalone REST egress. Arm it even when
+        # the private state directory does not exist yet: the coordinator may
+        # create the first request after this gateway boot, and polling an
+        # empty state directory is an inert, local operation.
+        self._arm_muncho_release_announcement_watcher()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -26949,7 +26945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         poll_interval: float = 1.0,
     ) -> None:
-        """Deliver strict post-smoke release requests through the live relay."""
+        """Deliver strict post-smoke release requests through a live transport."""
 
         from hermes_cli.config import load_config_readonly
         from ops.muncho.release.gateway_delivery import (
@@ -26997,6 +26993,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 previous_projection = projection
             await asyncio.sleep(poll_interval)
+
+    def _arm_muncho_release_announcement_watcher(self) -> None:
+        """Arm late request discovery without depending on mutable state paths."""
+
+        self._spawn_supervised(
+            self._muncho_release_announcement_watcher,
+            "muncho_release_announcement_watcher",
+        )
 
     async def _watch_update_progress(
         self,
