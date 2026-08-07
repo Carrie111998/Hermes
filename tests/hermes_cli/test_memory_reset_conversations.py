@@ -136,7 +136,9 @@ def test_memory_reset_parser_invokes_exactly_one_handler(monkeypatch):
     build_memory_parser(subparsers, cmd_memory=legacy_handler)
 
     legacy_args = parser.parse_args(["memory", "reset", "--target", "all"])
-    conversation_args = parser.parse_args(["memory", "reset", "--target", "conversations", "--yes"])
+    conversation_args = parser.parse_args(
+        ["memory", "reset", "--target", "conversations", "--yes"]
+    )
 
     assert legacy_args.func(legacy_args) == 0
     assert legacy_calls == ["all"]
