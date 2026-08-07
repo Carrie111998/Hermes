@@ -78,6 +78,24 @@ def db(tmp_path):
     session_db.close()
 
 
+@pytest.fixture(autouse=True)
+def _no_fts_rebuild_throttle(monkeypatch):
+    """Zero the FTS-rebuild inter-chunk throttle for every test in this file.
+
+    ``optimize_fts_storage`` sleeps ``max(_FTS_REBUILD_MIN_PAUSE,
+    chunk_cost * _FTS_REBUILD_DUTY_FACTOR)`` between chunks so a LIVE
+    gateway/CLI sharing the DB isn't starved of the write lock. Tests run
+    against a private tmp-path DB with no concurrent process — the sleep
+    protects nobody and was pure dead time (measured: 4.1s of a 4.6s
+    migration test was time.sleep; ~20s across the file, whose total was
+    ~52s). The duty-cycle POLICY (sleep >= 4x chunk cost) stays covered by
+    the production constants themselves; no test asserts on wall-clock
+    pacing.
+    """
+    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_MIN_PAUSE", 0.0)
+    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
+
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -1067,6 +1085,99 @@ class TestPruneSessionFilters:
 
 
 
+
+    def test_title_like_underscore_is_literal_not_a_wildcard(self, db):
+        """``_`` is a single-character wildcard in SQL LIKE, so an unescaped
+        filter deletes sessions the operator never selected. The filters are
+        documented (and shown in the CLI confirmation) as substring matches.
+        """
+        self._mk(db, "target", title="user_auth refactor")
+        self._mk(db, "bystander1", title="user-auth review")
+        self._mk(db, "bystander2", title="userXauth notes")
+        self._mk(db, "bystander3", title="user auth meeting")
+
+        rows = db.list_prune_candidates(title_like="user_auth")
+        assert {r["id"] for r in rows} == {"target"}
+
+        pruned = db.prune_sessions(older_than_days=None, title_like="user_auth")
+        assert pruned == 1
+        for survivor in ("bystander1", "bystander2", "bystander3"):
+            assert db.get_session(survivor) is not None
+
+    def test_percent_in_filter_does_not_select_everything(self, db):
+        """``%`` matches any run of characters — a bare one would delete the
+        whole table."""
+        self._mk(db, "a", title="alpha")
+        self._mk(db, "b", title="beta")
+        self._mk(db, "pct", title="100% coverage run")
+
+        # Only the title that really contains a percent sign matches.
+        assert {r["id"] for r in db.list_prune_candidates(title_like="%")} == {"pct"}
+        assert {r["id"] for r in db.list_prune_candidates(title_like="100%")} == {"pct"}
+
+    def test_branch_like_underscore_is_literal(self, db):
+        """Branch names carry underscores routinely."""
+        self._mk_rich(db, "want", git_branch="fix/session_prune")
+        self._mk_rich(db, "other", git_branch="fix/session-prune")
+
+        rows = db.list_prune_candidates(branch_like="session_prune")
+        assert {r["id"] for r in rows} == {"want"}
+
+    def test_model_like_underscore_is_literal(self, db):
+        self._mk_rich(db, "want", model="vendor/model_mini")
+        self._mk_rich(db, "other", model="vendor/model-mini")
+
+        rows = db.list_prune_candidates(model_like="model_mini")
+        assert {r["id"] for r in rows} == {"want"}
+
+    def test_plain_substring_filters_still_match(self, db):
+        """Guard against over-escaping: ordinary filters keep working, and a
+        literal backslash in the needle is matched as itself."""
+        self._mk(db, "smoke", title="Codex Smoke Test")
+        self._mk_rich(db, "winpath", title=r"build C:\tmp artifacts")
+
+        assert {r["id"] for r in db.list_prune_candidates(title_like="smoke")} == {"smoke"}
+        assert {r["id"] for r in db.list_prune_candidates(title_like=r"c:\tmp")} == {"winpath"}
+
+    def test_cwd_prefix_underscore_is_literal_not_a_wildcard(self, db):
+        """``_`` is a LIKE wildcard but an ordinary character in a path, so an
+        unescaped prefix also matched a same-length sibling directory — and
+        prune_sessions deletes what it matches."""
+        self._mk(db, "target", cwd="/home/me/my_project/src")
+        self._mk(db, "sibling", cwd="/home/me/myXproject/src")
+
+        rows = db.list_prune_candidates(cwd_prefix="/home/me/my_project")
+        assert {r["id"] for r in rows} == {"target"}
+
+        pruned = db.prune_sessions(older_than_days=None, cwd_prefix="/home/me/my_project")
+        assert pruned == 1
+        assert db.get_session("sibling") is not None
+
+    def test_cwd_prefix_percent_does_not_select_everything(self, db):
+        self._mk(db, "a", cwd="/home/me/one")
+        self._mk(db, "b", cwd="/home/me/two")
+
+        assert db.list_prune_candidates(cwd_prefix="/home/me/%") == []
+
+    def test_cwd_prefix_still_matches_the_directory_and_its_children(self, db):
+        """Control: the prefix must keep matching itself and anything under it."""
+        self._mk(db, "root", cwd="/home/me/proj")
+        self._mk(db, "child", cwd="/home/me/proj/src")
+        self._mk(db, "outside", cwd="/home/me/other")
+
+        rows = db.list_prune_candidates(cwd_prefix="/home/me/proj")
+        assert {r["id"] for r in rows} == {"root", "child"}
+
+    def test_cwd_prefix_windows_separator_arm(self, db):
+        """The backslash child arm (``{esc}\\\\%`` in the pattern) must keep
+        matching Windows children while ``_`` stays literal — a guard against
+        'simplifying' the quadruple backslash."""
+        self._mk(db, "win_root", cwd=r"C:\Users\me\my_project")
+        self._mk(db, "win_child", cwd=r"C:\Users\me\my_project\src")
+        self._mk(db, "win_sibling", cwd=r"C:\Users\me\myXproject\src")
+
+        rows = db.list_prune_candidates(cwd_prefix=r"C:\Users\me\my_project")
+        assert {r["id"] for r in rows} == {"win_root", "win_child"}
 
     def test_unknown_filter_rejected(self, db):
         import pytest as _pytest
@@ -3471,8 +3582,19 @@ class TestGetMessagesPagination:
 
     def _seed(self, db, n=10):
         db.create_session(session_id="s1", source="cli")
-        for i in range(n):
-            db.append_message("s1", "user" if i % 2 == 0 else "assistant", f"msg-{i}")
+        # One write transaction for the whole seed: per-row append_message
+        # pays a commit (and, off WAL, an fsync) per message, which at
+        # n=3000 was ~10s of pure seeding before the query under test ran.
+        db.append_messages_batch(
+            "s1",
+            [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"msg-{i}",
+                }
+                for i in range(n)
+            ],
+        )
 
     def test_default_returns_all_messages(self, db):
         self._seed(db)
@@ -3835,6 +3957,38 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+
+    def test_ignores_non_integer_performance_values(self, tmp_path, monkeypatch):
+        """Garbage cache_size/mmap_size/temp_store values must be rejected."""
+        import sqlite3
+        from hermes_state import apply_database_pragmas
+
+        conn = sqlite3.connect(str(tmp_path / "pragmas.db"))
+        try:
+            before = {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+            self._patch_cfg(
+                monkeypatch,
+                {
+                    "database": {
+                        "cache_size": "big",
+                        "mmap_size": [256],
+                        "temp_store": "ram please",
+                    }
+                },
+            )
+            apply_database_pragmas(conn, db_label="test.db")
+            after = {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+            assert after == before
+        finally:
+            conn.close()
+
+
 class TestInsightsToolCallIndex:
     """The Insights assistant tool-call scan has a predicate-aligned index.
 
@@ -3894,3 +4048,236 @@ class TestInsightsToolCallIndex:
         assert "WHERE" in sql
         assert "role = 'assistant'" in sql
         assert "tool_calls IS NOT NULL" in sql
+class TestFtsRebuildFinishWithoutTrigram:
+    """An FTS index that the runtime cannot maintain must not wedge the store.
+
+    Two independent failure sites shared one root shape: code that writes to
+    ``messages_fts_trigram`` without first checking the table is actually
+    present. It is legitimately absent whenever the trigram index is
+    unavailable (SQLite build without the tokenizer), and it can also be left
+    absent by an interrupted migration or a partially-applied schema change.
+    """
+
+    @staticmethod
+    def _seed(db_path, n=60):
+        seeded = SessionDB(db_path=db_path)
+        try:
+            seeded.create_session(session_id="s1", source="cli")
+            for i in range(n):
+                seeded.append_message(
+                    "s1",
+                    role=("user" if i % 3 == 0
+                          else "assistant" if i % 3 == 1 else "tool"),
+                    content=f"sentinel payload {i} zebra",
+                )
+            high_water = seeded._conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages"
+            ).fetchone()[0]
+        finally:
+            seeded.close()
+        return high_water
+
+    def test_rebuild_finish_skips_trigram_when_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """optimize_fts_storage() completes when the trigram index is absent.
+
+        ``fts_rebuild_step()`` already guards its backfill INSERT on
+        ``_trigram_available``; ``_fts_rebuild_finish()``'s boundary sweep did
+        not, so finishing a deferred rebuild on a trigram-less runtime raised
+        ``no such table: messages_fts_trigram`` and aborted the whole
+        optimization. The base index must still be swept and the markers
+        cleared.
+        """
+        db_path = tmp_path / "state.db"
+        high_water = self._seed(db_path)
+
+        real_connect = sqlite3.connect
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "hermes_state.sqlite3.connect", connect_without_trigram
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db._trigram_available is False
+            # A trigram-less runtime leaves no trigram index on disk.
+            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            db._conn.commit()
+            assert db._fts_table_exists("messages_fts_trigram") is False
+
+            # Put the DB in the pending-deferred-rebuild state.
+            for key, value in (
+                ("fts_rebuild_high_water", str(high_water)),
+                ("fts_rebuild_progress", str(high_water)),
+            ):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            db._conn.commit()
+
+            # Pre-fix this raised OperationalError("no such table: ...").
+            db._fts_rebuild_finish()
+
+            # The sweep ran to completion: markers cleared…
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            # …and the base index is still usable (the fix must not disable
+            # real search to dodge the error).
+            assert db.search_messages("zebra")
+        finally:
+            db.close()
+
+    def test_optimize_fts_storage_succeeds_without_trigram(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end: the public optimize entry point returns ok=True."""
+        db_path = tmp_path / "state.db"
+        high_water = self._seed(db_path)
+
+        real_connect = sqlite3.connect
+
+        def connect_without_trigram(*args, **kwargs):
+            kwargs["factory"] = _NoTrigramConnection
+            return real_connect(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "hermes_state.sqlite3.connect", connect_without_trigram
+        )
+        db = SessionDB(db_path=db_path)
+        try:
+            db._conn.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            db._conn.commit()
+            assert db._trigram_available is False
+            for key, value in (
+                ("fts_rebuild_high_water", str(high_water)),
+                ("fts_rebuild_progress", "0"),
+            ):
+                db._conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, value),
+                )
+            db._conn.commit()
+
+            result = db.optimize_fts_storage(vacuum=False)
+            assert result["ok"] is True
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.search_messages("zebra")
+        finally:
+            db.close()
+
+
+
+class TestPerformancePragmasEndToEnd:
+    """E2E guard for PR #71755: config-gated cache_size / mmap_size /
+    temp_store must reach EVERY connection type (writer, read-only
+    cross-profile attach, WAL per-thread reader) — and default installs
+    (no ``database:`` keys) must see byte-identical SQLite defaults.
+
+    NOTE: SQLite's compiled-in default for ``cache_size`` is already
+    ``-2000``, so the configured value here is ``-16000`` — a value the
+    test can actually discriminate from the default (a reverted prod
+    change must FAIL this test, not accidentally pass it).
+    """
+
+    PRAGMAS = ("cache_size", "mmap_size", "temp_store")
+    CONFIGURED = {"cache_size": -16000, "mmap_size": 1048576, "temp_store": 2}
+
+    @staticmethod
+    def _read(conn):
+        return {
+            name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+            for name in ("cache_size", "mmap_size", "temp_store")
+        }
+
+    @staticmethod
+    def _sqlite_defaults(tmp_path):
+        import sqlite3
+
+        conn = sqlite3.connect(str(tmp_path / "baseline.db"))
+        try:
+            return {
+                name: conn.execute(f"PRAGMA {name}").fetchone()[0]
+                for name in ("cache_size", "mmap_size", "temp_store")
+            }
+        finally:
+            conn.close()
+
+    def _fresh_home(self, tmp_path, monkeypatch, config_text=None):
+        import hermes_state
+
+        # Local venvs may bundle a WAL-reset-vulnerable SQLite (e.g. 3.46.0),
+        # which would silently disable WAL and skip the per-thread reader
+        # path. Force WAL eligibility so _get_read_conn is truly exercised
+        # (established pattern used by the WAL tests above).
+        monkeypatch.setattr(
+            hermes_state,
+            "is_sqlite_wal_reset_vulnerable",
+            lambda version_info=None: False,
+        )
+        home = tmp_path / "hermes_home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        if config_text is not None:
+            (home / "config.yaml").write_text(config_text)
+        return home
+
+    def test_configured_pragmas_reach_all_connection_types(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_state import SessionDB
+
+        home = self._fresh_home(
+            tmp_path,
+            monkeypatch,
+            "database:\n"
+            "  cache_size: -16000\n"
+            "  temp_store: 2\n"
+            "  mmap_size: 1048576\n",
+        )
+        db_path = home / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            # Writer connection.
+            assert self._read(db._conn) == self.CONFIGURED
+            # WAL per-thread reader.
+            rconn = db._get_read_conn()
+            assert rconn is not None, "WAL reader expected on local filesystem"
+            assert self._read(rconn) == self.CONFIGURED
+        finally:
+            db.close()
+
+        # Read-only cross-profile attach.
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert self._read(ro._conn) == self.CONFIGURED
+        finally:
+            ro.close()
+
+    def test_defaults_unchanged_without_config(self, tmp_path, monkeypatch):
+        """No database: keys in config.yaml → SQLite defaults untouched."""
+        from hermes_state import SessionDB
+
+        defaults = self._sqlite_defaults(tmp_path)
+        home = self._fresh_home(tmp_path, monkeypatch, config_text=None)
+        db_path = home / "state.db"
+        db = SessionDB(db_path=db_path)
+        try:
+            assert self._read(db._conn) == defaults
+            rconn = db._get_read_conn()
+            if rconn is not None:
+                assert self._read(rconn) == defaults
+        finally:
+            db.close()
+
+        ro = SessionDB(db_path=db_path, read_only=True)
+        try:
+            assert self._read(ro._conn) == defaults
+        finally:
+            ro.close()
