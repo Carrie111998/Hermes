@@ -66,8 +66,9 @@ describe('ComposerApprovalMode', () => {
     await waitFor(() => {
       expect(requestGateway).toHaveBeenCalledWith('config.set', { key: 'approvals.mode', value: 'off' })
       const trigger = screen.getByRole('button', { name: 'Approval mode: Full access' })
-      expect(trigger.className).toContain('bg-amber-500/10')
-      expect(trigger.className).toContain('rounded-full')
+      expect(trigger.className).toContain('rounded-[var(--radius-sm)]')
+      expect(trigger.className).not.toContain('bg-amber-500/10')
+      expect(trigger.querySelectorAll('svg')).toHaveLength(2)
       expect(trigger.querySelector('svg')?.getAttribute('class')).toContain('text-amber-600')
     })
   })

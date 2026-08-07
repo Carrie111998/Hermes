@@ -27,7 +27,6 @@ export function ComposerApprovalMode({
   // ChatBar (including split-session tiles) renders this control, so syncing
   // here would fan one config read out across every open pane.
   const menu = useApprovalModeMenu(profile, requestGateway, { sync: false })
-  const fullAccess = menu.mode === 'off'
 
   return (
     <DropdownMenu>
@@ -37,9 +36,7 @@ export function ComposerApprovalMode({
             aria-label={menu.ariaLabel}
             className={cn(
               'h-7 gap-1 rounded-[var(--radius-sm)] px-1.5 py-0 text-[0.6875rem] font-medium text-(--ui-text-secondary)',
-              'hover:bg-(--chrome-action-hover) hover:text-foreground data-[state=open]:bg-(--chrome-action-hover) data-[state=open]:text-foreground',
-              fullAccess &&
-                'rounded-full bg-amber-500/10 px-2 text-amber-600 hover:bg-amber-500/15 hover:text-amber-600 data-[state=open]:bg-amber-500/15 data-[state=open]:text-amber-600 dark:text-amber-400 dark:hover:text-amber-400 dark:data-[state=open]:text-amber-400'
+              'hover:bg-(--chrome-action-hover) hover:text-foreground data-[state=open]:bg-(--chrome-action-hover) data-[state=open]:text-foreground'
             )}
             data-approval-mode={menu.mode}
             disabled={disabled}
@@ -50,7 +47,7 @@ export function ComposerApprovalMode({
           >
             <ApprovalModeGlyph className="size-3" mode={menu.mode} />
             <span className={cn('max-w-24 truncate', approvalModeToneClass[menu.mode])}>{menu.labels[menu.mode]}</span>
-            {!fullAccess && <ChevronDown className="size-3 text-(--ui-text-tertiary)" />}
+            <ChevronDown className="size-3 text-(--ui-text-tertiary)" />
           </Button>
         </DropdownMenuTrigger>
       </Tip>
