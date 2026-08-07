@@ -1555,6 +1555,17 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(pool, dict):
         pool = {}
 
+    if provider_id is not None:
+        provider_entries = pool.get(provider_id)
+        if isinstance(provider_entries, list) and provider_entries:
+            # Per-provider shadowing is also an I/O boundary: once this
+            # profile has entries for the requested provider, the optional
+            # global store cannot affect the result and must not be opened.
+            # Besides avoiding unnecessary secret-store access, this keeps an
+            # unreadable global auth.json from emitting a swallowed traceback
+            # during an otherwise valid profile-local runtime resolution.
+            return list(provider_entries)
+
     global_pool: Dict[str, Any] = {}
     global_store = _load_global_auth_store()
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
@@ -1573,9 +1584,6 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             merged[gp_key] = list(gp_entries)
         return merged
 
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
