@@ -7,8 +7,8 @@ PR, merge, deploy, worktree, or autonomy sentinel may appear.
 
 Tests 6-8 carry coverage explicitly deferred to this file by the Task 10/11
 adjudications: CLI bad-input negative paths, the explicit-adapter passthrough
-(including the list-typed safety_notes branch), and the malformed-confidence
-e2e negative path.
+(a list-typed safety_notes round-tripping intact to the envelope), and the
+malformed-confidence e2e negative path.
 """
 import io
 import json
@@ -57,20 +57,27 @@ def test_synthetic_request_traverses_full_control_plane(queue_all):
     assert "devflow.work_triaged" in types
     assert "devflow.work_planned" in types
 
-    # envelope durable in the canonical inbox
+    # envelope durable in the canonical inbox -- filename AND parsed content
     files = list(em.inbox_dir.glob("*.json"))
     assert len(files) == 1 and r.request_id in files[0].name
+    env = json.loads(files[0].read_text(encoding="utf-8"))
+    assert env["request_id"] == r.request_id
+    assert env["target"]["repo"] == "hermes"
 
 
 def test_duplicate_finding_aggregates_into_one_request(queue_all):
     em = DelegationEmitter()
     r1 = em.delegate(**make_delegate_kwargs())
+    # insert_request writes NO evidence_log row; the count is exactly 0 until a
+    # duplicate lands, so the post-duplicate == 1 below is a real aggregation
+    # gate (it also catches a double-append regression, which >= 1 could not).
+    assert em.ledger.evidence_count(r1.request_id) == 0
     r2 = em.delegate(**make_delegate_kwargs(
         source={"agent": "watchdog", "kind": "watchdog", "finding_id": "W-2"}))
     assert r1.status == "queued"
     assert r2.status == "duplicate" and r2.request_id == r1.request_id
     assert em.ledger.summary_counts()["total"] == 1
-    assert em.ledger.evidence_count(r1.request_id) >= 1
+    assert em.ledger.evidence_count(r1.request_id) == 1
     assert len(list(em.inbox_dir.glob("*.json"))) == 1
 
 
@@ -102,11 +109,12 @@ def test_detector_findings_classify_cleanly_in_dry_run(queue_all, hermes_root):
 
 def test_invalid_off_target_and_flooded_findings_never_reach_a_queue(queue_all):
     em = DelegationEmitter()
-    # evidence-less
-    assert em.delegate(**make_delegate_kwargs(evidence=[])).status == "declined"
-    # off-allowlist target
-    assert em.delegate(**make_delegate_kwargs(
-        target={"repo": "rogue", "subsystem": "x"})).reason == "target_unresolved"
+    # evidence-less -- assert BOTH the outcome and the classifying reason
+    ev = em.delegate(**make_delegate_kwargs(evidence=[]))
+    assert ev.status == "declined" and ev.reason == "invalid:missing_evidence"
+    # off-allowlist target -- same, both fields
+    off = em.delegate(**make_delegate_kwargs(target={"repo": "rogue", "subsystem": "x"}))
+    assert off.status == "declined" and off.reason == "target_unresolved"
     # flooded source (policy override to 1/window for explicit)
     (em.ledger.db_path.parent / "policy.json").write_text(
         json.dumps({"explicit": {"mode": "queue", "max_per_window": 1}}), encoding="utf-8")
