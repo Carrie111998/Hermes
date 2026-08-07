@@ -11,6 +11,7 @@ Coverage levels:
 """
 
 import time
+from decimal import Decimal
 
 import pytest
 import yaml
@@ -20,6 +21,7 @@ from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
     DEFAULT_FALLBACK_CONTEXT,
+    _pricing_unit_divisor,
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
@@ -1451,6 +1453,55 @@ class TestExtractPricing:
             "pricing": {"unit": "per_bazillion_tokens", "prompt": 1},
         })
         assert result == {"prompt": 1}
+
+    def test_unit_word_forms(self):
+        """Word-form units (per_million, per_thousand, per_1m) parse too."""
+        for unit, prompt_expected in (
+            ("per_million", "0.000001"),
+            ("per_million_tokens", "0.000001"),
+            ("per_1m", "0.000001"),
+            ("per_1000000", "0.000001"),
+            ("per_thousand", "0.001"),
+        ):
+            result = self._extract({
+                "id": "m",
+                "pricing": {"unit": unit, "prompt": 1, "completion": 2},
+            })
+            divisor = _pricing_unit_divisor(unit)
+            assert divisor is not None
+            assert result["prompt"] == prompt_expected
+            assert result["completion"] == str(Decimal("2") / divisor)
+
+    def test_nested_openai_official_key_names(self):
+        """OpenAI's input_cache_read key works in a unit-tagged pricing block."""
+        result = self._extract({
+            "id": "m",
+            "pricing": {
+                "unit": "per_1m_tokens",
+                "prompt": 1,
+                "completion": 2,
+                "input_cache_read": 1.25,
+            },
+        })
+        assert result == {
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "cache_read": "0.00000125",
+        }
+
+    def test_top_level_cache_read_input_field(self):
+        """OpenAI's cache_read_input_price_per_million top-level field."""
+        result = self._extract({
+            "id": "m",
+            "input_price_per_million": 1,
+            "output_price_per_million": 2,
+            "cache_read_input_price_per_million": 1.25,
+        })
+        assert result == {
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "cache_read": "0.00000125",
+        }
 
     def test_top_level_fields_take_precedence_over_nested(self):
         """Explicit top-level fields win when a nested block also exists."""
