@@ -277,6 +277,97 @@ class TestGitHubPREvidenceScope:
         "contract_version": "v2",
     }
 
+    @pytest.mark.asyncio
+    async def test_threaded_route_records_started_reply_before_dispatch(self):
+        route = {
+            "evidence": "github_pr",
+            "script": "trusted-gate.py",
+            "buzz_thread_lifecycle": True,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=(True, {"settled": "started"})
+        )
+
+        started = await adapter._mark_github_review_started(
+            "github-pr",
+            route,
+            {
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": 42,
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+            },
+            "l" * 43,
+            "https://github.com/org/repo/pull/42",
+        )
+
+        assert started is True
+        adapter._route_processor.run_route_script.assert_called_once_with(
+            "trusted-gate.py",
+            {
+                "operation": "started",
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": "42",
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "lease_token": "l" * 43,
+                "pr_url": "https://github.com/org/repo/pull/42",
+            },
+            trusted_github_pr_environment=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_threaded_http_route_records_started_before_agent_dispatch(self):
+        secret = "secret"
+        route = {
+            "evidence": "github_pr",
+            "review_evidence_mode": "concise",
+            "secret": secret,
+            "events": ["pull_request"],
+            "script": "trusted-gate.py",
+            "prompt": "review",
+            "buzz_thread_lifecycle": True,
+            "deliver_extra": {"contract_version": "v2"},
+            "execution_attestation_public_key": base64.b64encode(b"k" * 32).decode(),
+            "baseline_execution_gates": ["quality", "integration", "e2e"],
+            "execution_gate_policy_version": "newtonsapple-v1",
+            "execution_gate_policy_sha256": "f" * 64,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        gated = {
+            **self.payload,
+            "lease_token": "l" * 43,
+            "pr_url": "https://github.com/org/repo/pull/42",
+        }
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[(True, gated), (True, {"settled": "started"})]
+        )
+        adapter.handle_message = AsyncMock()
+        body = json.dumps(GITHUB_PR_PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as client:
+            response = await client.post(
+                "/webhooks/github-pr",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Event": "pull_request",
+                    "X-Hub-Signature-256": _github_signature(body, secret),
+                    "X-GitHub-Delivery": "threaded-delivery",
+                },
+            )
+        await asyncio.sleep(0)
+
+        assert response.status == 202
+        assert adapter._route_processor.run_route_script.call_count == 2
+        assert adapter._route_processor.run_route_script.call_args_list[-1].args[1][
+            "operation"
+        ] == "started"
+        adapter.handle_message.assert_awaited_once()
+
     def test_static_opted_in_route_builds_exact_tuple_scope(self):
         adapter = _make_adapter(
             {

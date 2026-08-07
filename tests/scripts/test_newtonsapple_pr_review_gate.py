@@ -767,14 +767,31 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
     lease_token = store.reserve(review_tuple, now=100, lease_seconds=60)
     assert isinstance(lease_token, str)
     live_pr = _live_pr()
-    marker_body = f"verified review\n\n{gate.review_marker(review_tuple)}"
+    marker_body = (
+        "## Findings\n\n"
+        "### P2 — Example finding\n\n"
+        "Detailed impact that belongs only on GitHub.\n\n"
+        "## Verification\n\n"
+        "| Gate / command | Status | SHA | Executor | Evidence |\n"
+        "|---|---|---|---|---|\n"
+        f"| `npm run check` | **unavailable** | `{HEAD_SHA}` | worker | offline |\n\n"
+        f"{gate.review_marker(review_tuple)}"
+    )
     monkeypatch.setattr(
         gate,
         "_authorized_live_tuple",
         lambda *args: (live_pr, None, [marker_body]),
     )
-    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
-    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-summary")
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    delivered = []
+
+    def buzz_send(content, reply_to=None):
+        delivered.append((content, reply_to))
+        return f"buzz-{len(delivered)}"
+
+    monkeypatch.setattr(
+        gate, "_buzz_send", buzz_send
+    )
     monkeypatch.setattr(gate.time, "time", lambda: 120)
 
     result = gate._settle(
@@ -793,6 +810,16 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
 
     assert result == {"settled": "complete", "outbox_delivered": 1}
     assert store.reserve(review_tuple, now=200, lease_seconds=30) is None
+    assert len(delivered) == 3
+    requested, started, completed = delivered
+    assert requested[1] is None
+    assert "PR review requested" in requested[0]
+    assert started[1] == "buzz-1"
+    assert "PR review started" in started[0]
+    assert completed[1] == "buzz-1"
+    assert "1 actionable finding; highest is P2: Example finding" in completed[0]
+    assert "Gates: 0 PASS, 0 FAIL, 1 UNAVAILABLE" in completed[0]
+    assert "Detailed impact" not in completed[0]
 
 
 def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
@@ -848,6 +875,10 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
         "scripts.newtonsapple_pr_review_gate._live_review_state",
         lambda number, login: (live_pr, [], []),
     )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    monkeypatch.setattr(
+        gate, "_buzz_send", lambda content, reply_to=None: "buzz-request"
+    )
 
     result = _gate_webhook(
         {
@@ -865,6 +896,64 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
     assert result["expected_base_ref"] == "dev"
     assert isinstance(result["lease_token"], str)
     assert len(result["lease_token"]) >= 32
+    assert store.requested_event_id(
+        ReviewTuple(
+            repository=gate.REPOSITORY,
+            pr_number=185,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+        )
+    ) == "buzz-request"
+
+
+def test_started_control_plane_replies_once_under_requested_thread(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    lease_token = store.reserve(review_tuple, now=100, lease_seconds=300)
+    assert isinstance(lease_token, str)
+    store.record_requested_event(review_tuple, "buzz-request")
+    monkeypatch.setattr(gate.time, "time", lambda: 120)
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    delivered = []
+    monkeypatch.setattr(
+        gate,
+        "_buzz_send",
+        lambda content, reply_to=None: delivered.append((content, reply_to))
+        or "buzz-started",
+    )
+    payload = {
+        "operation": "started",
+        "contract_version": "v2",
+        "repository": review_tuple.repository,
+        "pr_number": review_tuple.pr_number,
+        "base_sha": review_tuple.base_sha,
+        "head_sha": review_tuple.head_sha,
+        "lease_token": lease_token,
+        "pr_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/pull/185",
+    }
+
+    assert gate._settle(payload, "newtonsapple-bot", store) == {
+        "settled": "started"
+    }
+    assert gate._settle(payload, "newtonsapple-bot", store) == {
+        "settled": "started"
+    }
+    assert delivered == [
+        (
+            gate._started_content(
+                review_tuple,
+                "https://github.com/NewtonsAppleAI/newtonsapple-web/pull/185",
+            )
+            + "\n\n"
+            + gate._started_marker(review_tuple),
+            "buzz-request",
+        )
+    ]
 
 
 def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tmp_path):
@@ -898,16 +987,46 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
     sent = []
     processed = drain_summary_outbox(
         store,
-        find_existing=lambda candidate: "buzz-event-existing"
+        find_existing=lambda candidate, reply_to: "buzz-event-existing"
         if candidate == marker
         else None,
-        send=lambda content: sent.append(content) or "buzz-event-new",
+        send=lambda content, reply_to: sent.append((content, reply_to))
+        or "buzz-event-new",
     )
 
     assert processed == 1
     assert sent == []
     assert store.pending_summaries() == []
     assert store.sent_event_id(first_id) == "buzz-event-existing"
+
+
+def test_summary_outbox_replies_to_the_persisted_request_root(tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    store.enqueue_summary(
+        review_tuple,
+        marker="summary-marker",
+        content="one paragraph",
+        reply_to="request-root",
+    )
+    delivered = []
+
+    processed = drain_summary_outbox(
+        store,
+        find_existing=lambda marker, reply_to: None,
+        send=lambda content, reply_to: delivered.append((content, reply_to))
+        or "summary-event",
+    )
+
+    assert processed == 1
+    assert delivered == [
+        ("one paragraph\n\nsummary-marker", "request-root")
+    ]
 
 
 def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(monkeypatch):
@@ -955,6 +1074,45 @@ def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(m
     assert _buzz_find(marker) == "expected-channel-and-author"
 
 
+def test_buzz_marker_reconciliation_requires_the_expected_thread_parent(monkeypatch):
+    marker = "<!-- tuple-marker -->"
+    own_pubkey = "b" * 64
+    responses = iter(
+        [
+            [{"display_name": "Hermany", "pubkey": own_pubkey}],
+            [
+                {
+                    "id": "wrong-parent",
+                    "pubkey": own_pubkey,
+                    "content": marker,
+                    "tags": [
+                        ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
+                        ["e", "other-root", "", "reply"],
+                    ],
+                },
+                {
+                    "id": "expected-parent",
+                    "pubkey": own_pubkey,
+                    "content": marker,
+                    "tags": [
+                        ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
+                        ["e", "request-root", "", "reply"],
+                    ],
+                },
+            ],
+        ]
+    )
+    monkeypatch.setattr(
+        "scripts.newtonsapple_pr_review_gate.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(next(responses)),
+        ),
+    )
+
+    assert _buzz_find(marker, "request-root") == "expected-parent"
+
+
 def test_summary_outbox_remains_pending_when_buzz_delivery_fails(tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
@@ -967,8 +1125,10 @@ def test_summary_outbox_remains_pending_when_buzz_delivery_fails(tmp_path):
 
     processed = drain_summary_outbox(
         store,
-        find_existing=lambda marker: None,
-        send=lambda content: (_ for _ in ()).throw(RuntimeError("Buzz offline")),
+        find_existing=lambda marker, reply_to: None,
+        send=lambda content, reply_to: (_ for _ in ()).throw(
+            RuntimeError("Buzz offline")
+        ),
     )
 
     assert processed == 0
@@ -1116,8 +1276,10 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     monkeypatch.setattr(
         gate, "_captured_live_tuple", lambda *args: state, raising=False
     )
-    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
-    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-blocker")
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    monkeypatch.setattr(
+        gate, "_buzz_send", lambda content, reply_to=None: "buzz-blocker"
+    )
 
     result = gate._reconcile("newtonsapple-bot", store)
 
@@ -1140,8 +1302,10 @@ def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch
         "_captured_live_tuple",
         lambda *args: (live_pr, review_tuple, [marker_body]),
     )
-    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
-    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-summary")
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    monkeypatch.setattr(
+        gate, "_buzz_send", lambda content, reply_to=None: "buzz-summary"
+    )
 
     result = gate._reconcile("newtonsapple-bot", store)
 
@@ -1173,11 +1337,11 @@ def test_reconcile_isolates_a_malformed_candidate_and_continues(monkeypatch, tmp
 
     monkeypatch.setattr(gate, "_captured_live_tuple", captured)
     delivered = []
-    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
         gate,
         "_buzz_send",
-        lambda content: delivered.append(content) or "buzz-blocker",
+        lambda content, reply_to=None: delivered.append(content) or "buzz-blocker",
     )
 
     result = gate._reconcile("newtonsapple-bot", store)
@@ -1185,7 +1349,8 @@ def test_reconcile_isolates_a_malformed_candidate_and_continues(monkeypatch, tmp
     assert len(result["events"]) == 1
     assert result["events"][0]["payload"]["number"] == 186
     assert result["outbox_delivered"] == 1
-    assert "could not safely verify current request provenance" in delivered[0]
+    assert "PR review requested" in delivered[0]
+    assert "could not safely verify current request provenance" in delivered[-1]
 
 
 def test_reconciliation_accepts_latest_current_request_when_capture_status_is_missing():
@@ -1311,6 +1476,10 @@ def test_webhook_accepts_verified_payload_tuple_without_capture_status(monkeypat
         gate,
         "_live_review_state",
         lambda number, login: (live_pr, [], []),
+    )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
+    monkeypatch.setattr(
+        gate, "_buzz_send", lambda content, reply_to=None: "buzz-request"
     )
 
     result = _gate_webhook(

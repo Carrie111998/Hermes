@@ -1036,6 +1036,25 @@ class WebhookAdapter(BasePlatformAdapter):
             message_id=delivery_id,
         )
 
+        if evidence is not None and not await self._mark_github_review_started(
+            route_name,
+            route_config,
+            evidence.tuple_dict,
+            settlement_lease_token,
+            payload.get("pr_url"),
+        ):
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
+            self._delivery_info.pop(session_chat_id, None)
+            self._delivery_info_created.pop(session_chat_id, None)
+            self._seen_deliveries.pop(delivery_id, None)
+            assert web is not None
+            return web.json_response(
+                {"status": "unavailable", "error": "Review start unavailable"},
+                status=503,
+            )
+
         logger.info(
             "[webhook] %s event=%s route=%s prompt_len=%d delivery=%s",
             request.method,
@@ -1167,6 +1186,53 @@ class WebhookAdapter(BasePlatformAdapter):
             trusted_github_pr_environment=True,
         )
         return keep
+
+    async def _mark_github_review_started(
+        self,
+        route_name: str,
+        route_config: dict,
+        review_tuple: dict,
+        lease_token: Optional[str],
+        pr_url: Any,
+    ) -> bool:
+        """Record the active-review reply before the model run is dispatched."""
+        if not route_config.get("buzz_thread_lifecycle"):
+            return True
+        if (
+            self._static_routes.get(route_name) is not route_config
+            or route_config.get("evidence") != "github_pr"
+            or not isinstance(route_config.get("script"), str)
+            or not isinstance(review_tuple, dict)
+            or not isinstance(lease_token, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
+            or not isinstance(pr_url, str)
+        ):
+            return False
+        control = {
+            "operation": "started",
+            "contract_version": review_tuple.get("contract_version"),
+            "repository": review_tuple.get("repository"),
+            "pr_number": str(review_tuple.get("pr_number", "")),
+            "base_sha": review_tuple.get("base_sha"),
+            "head_sha": review_tuple.get("head_sha"),
+            "lease_token": lease_token,
+            "pr_url": pr_url,
+        }
+        try:
+            keep, result = await asyncio.to_thread(
+                self._route_processor.run_route_script,
+                route_config["script"],
+                control,
+                trusted_github_pr_environment=True,
+            )
+        except Exception:
+            logger.exception("[webhook] GitHub review start recording failed")
+            return False
+        return bool(
+            keep
+            and isinstance(result, dict)
+            and result.get("settled") == "started"
+        )
 
     async def _claim_review_publication(self, delivery: dict) -> bool:
         """Atomically fence the exact lease token before GitHub publication."""
@@ -1316,6 +1382,19 @@ class WebhookAdapter(BasePlatformAdapter):
             await self._release_review_reservation(
                 route_name, payload, settlement_lease_token
             )
+            return False
+
+        if evidence is not None and not await self._mark_github_review_started(
+            route_name,
+            route_config,
+            evidence.tuple_dict,
+            settlement_lease_token,
+            payload.get("pr_url"),
+        ):
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
+            self._seen_deliveries.pop(delivery_id, None)
             return False
 
         # Keep the lease capability outside the model-visible recovered payload.

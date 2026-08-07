@@ -182,7 +182,8 @@ class ReviewStateStore:
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "key TEXT NOT NULL UNIQUE, marker TEXT NOT NULL UNIQUE, "
                 "content TEXT NOT NULL, sent_event_id TEXT, "
-                "claim_token TEXT, claim_until INTEGER, retry_after INTEGER)"
+                "claim_token TEXT, claim_until INTEGER, retry_after INTEGER, "
+                "reply_to TEXT)"
             )
             outbox_columns = {
                 str(row[1])
@@ -194,11 +195,17 @@ class ReviewStateStore:
                 ("claim_token", "TEXT"),
                 ("claim_until", "INTEGER"),
                 ("retry_after", "INTEGER"),
+                ("reply_to", "TEXT"),
             ):
                 if column not in outbox_columns:
                     connection.execute(
                         f"ALTER TABLE summary_outbox ADD COLUMN {column} {column_type}"
                     )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS review_threads ("
+                "key TEXT PRIMARY KEY, requested_event_id TEXT NOT NULL, "
+                "started_event_id TEXT)"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
@@ -210,6 +217,75 @@ class ReviewStateStore:
         with self._connect() as connection:
             row = connection.execute("PRAGMA journal_mode").fetchone()
         return str(row[0]).lower()
+
+    def record_requested_event(
+        self, review_tuple: ReviewTuple, event_id: str
+    ) -> str:
+        if not event_id:
+            raise ValueError("missing requested event id")
+        key = tuple_key(review_tuple)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO review_threads(key, requested_event_id) "
+                "VALUES (?, ?)",
+                (key, event_id),
+            )
+            row = connection.execute(
+                "SELECT requested_event_id FROM review_threads WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("review thread was not recorded")
+        return str(row[0])
+
+    def requested_event_id(self, review_tuple: ReviewTuple) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT requested_event_id FROM review_threads WHERE key = ?",
+                (tuple_key(review_tuple),),
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    def record_started_event(
+        self, review_tuple: ReviewTuple, event_id: str
+    ) -> str:
+        if not event_id:
+            raise ValueError("missing started event id")
+        key = tuple_key(review_tuple)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE review_threads SET started_event_id = "
+                "COALESCE(started_event_id, ?) WHERE key = ?",
+                (event_id, key),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("review thread root is missing")
+            row = connection.execute(
+                "SELECT started_event_id FROM review_threads WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            raise ValueError("review start was not recorded")
+        return str(row[0])
+
+    def started_event_id(self, review_tuple: ReviewTuple) -> Optional[str]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT started_event_id FROM review_threads WHERE key = ?",
+                (tuple_key(review_tuple),),
+            ).fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
+    def active_lease(
+        self, review_tuple: ReviewTuple, *, lease_token: str, now: int
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM leases WHERE key = ? AND lease_token = ? "
+                "AND lease_until > ?",
+                (tuple_key(review_tuple), lease_token, now),
+            ).fetchone()
+        return row is not None
 
     def reserve(
         self, review_tuple: ReviewTuple, *, now: int, lease_seconds: int
@@ -315,13 +391,18 @@ class ReviewStateStore:
                 (key, failures, retry_after, now if dead_lettered else None),
             )
             if dead_lettered:
+                thread = connection.execute(
+                    "SELECT requested_event_id FROM review_threads WHERE key = ?",
+                    (key,),
+                ).fetchone()
                 connection.execute(
-                    "INSERT OR IGNORE INTO summary_outbox(key, marker, content) "
-                    "VALUES (?, ?, ?)",
+                    "INSERT OR IGNORE INTO summary_outbox"
+                    "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
                     (
                         f"blocker:dead-letter:{key}",
                         dead_letter_marker,
                         dead_letter_content,
+                        None if thread is None else str(thread[0]),
                     ),
                 )
         return {
@@ -355,6 +436,7 @@ class ReviewStateStore:
         now: int,
         marker: str,
         content: str,
+        reply_to: Optional[str] = None,
     ) -> int:
         """Atomically settle a GitHub-confirmed review and queue its Buzz summary."""
         key = tuple_key(review_tuple)
@@ -367,9 +449,9 @@ class ReviewStateStore:
             )
             connection.execute("DELETE FROM attempts WHERE key = ?", (key,))
             connection.execute(
-                "INSERT OR IGNORE INTO summary_outbox(key, marker, content) "
-                "VALUES (?, ?, ?)",
-                (key, marker, content),
+                "INSERT OR IGNORE INTO summary_outbox"
+                "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
+                (key, marker, content, reply_to),
             )
             row = connection.execute(
                 "SELECT id FROM summary_outbox WHERE key = ?", (key,)
@@ -386,6 +468,7 @@ class ReviewStateStore:
         now: int,
         marker: str,
         content: str,
+        reply_to: Optional[str] = None,
     ) -> int:
         """Atomically settle the current lease and queue its Buzz summary."""
         key = tuple_key(review_tuple)
@@ -403,9 +486,9 @@ class ReviewStateStore:
             )
             connection.execute("DELETE FROM attempts WHERE key = ?", (key,))
             connection.execute(
-                "INSERT OR IGNORE INTO summary_outbox(key, marker, content) "
-                "VALUES (?, ?, ?)",
-                (key, marker, content),
+                "INSERT OR IGNORE INTO summary_outbox"
+                "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
+                (key, marker, content, reply_to),
             )
             row = connection.execute(
                 "SELECT id FROM summary_outbox WHERE key = ?", (key,)
@@ -415,10 +498,18 @@ class ReviewStateStore:
         return int(row[0])
 
     def enqueue_summary(
-        self, review_tuple: ReviewTuple, *, marker: str, content: str
+        self,
+        review_tuple: ReviewTuple,
+        *,
+        marker: str,
+        content: str,
+        reply_to: Optional[str] = None,
     ) -> int:
         return self._enqueue_outbox(
-            tuple_key(review_tuple), marker=marker, content=content
+            tuple_key(review_tuple),
+            marker=marker,
+            content=content,
+            reply_to=reply_to,
         )
 
     def enqueue_blocker(
@@ -433,14 +524,22 @@ class ReviewStateStore:
             f"blocker:{kind}:{tuple_key(review_tuple)}",
             marker=marker,
             content=content,
+            reply_to=self.requested_event_id(review_tuple),
         )
 
-    def _enqueue_outbox(self, key: str, *, marker: str, content: str) -> int:
+    def _enqueue_outbox(
+        self,
+        key: str,
+        *,
+        marker: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> int:
         with self._connect() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO summary_outbox(key, marker, content) "
-                "VALUES (?, ?, ?)",
-                (key, marker, content),
+                "INSERT OR IGNORE INTO summary_outbox"
+                "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
+                (key, marker, content, reply_to),
             )
             row = connection.execute(
                 "SELECT id FROM summary_outbox WHERE key = ?", (key,)
@@ -467,7 +566,7 @@ class ReviewStateStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT id, key, marker, content FROM summary_outbox "
+                "SELECT id, key, marker, content, reply_to FROM summary_outbox "
                 "WHERE sent_event_id IS NULL "
                 "AND (retry_after IS NULL OR retry_after <= ?) "
                 "AND (claim_until IS NULL OR claim_until <= ?) "
@@ -486,6 +585,7 @@ class ReviewStateStore:
             "key": row[1],
             "marker": row[2],
             "content": row[3],
+            "reply_to": row[4],
             "claim_token": claim_token,
         }
 
@@ -548,8 +648,8 @@ class ReviewStateStore:
 def drain_summary_outbox(
     store: ReviewStateStore,
     *,
-    find_existing: Callable[[str], Optional[str]],
-    send: Callable[[str], str],
+    find_existing: Callable[[str, Optional[str]], Optional[str]],
+    send: Callable[[str, Optional[str]], str],
 ) -> int:
     """Deliver pending summaries effectively once, preserving failures."""
     processed = 0
@@ -559,7 +659,7 @@ def drain_summary_outbox(
         if item is None:
             break
         try:
-            event_id = find_existing(item["marker"])
+            event_id = find_existing(item["marker"], item["reply_to"])
             if event_id is None:
                 store.renew_summary_claim(
                     item["id"],
@@ -567,7 +667,10 @@ def drain_summary_outbox(
                     now=int(time.time()),
                     lease_seconds=5 * 60,
                 )
-                event_id = send(f'{item["content"]}\n\n{item["marker"]}')
+                event_id = send(
+                    f'{item["content"]}\n\n{item["marker"]}',
+                    item["reply_to"],
+                )
             store.mark_summary_sent(
                 item["id"], event_id, claim_token=item["claim_token"]
             )
@@ -1747,6 +1850,22 @@ def _summary_marker(review_tuple: ReviewTuple) -> str:
     )
 
 
+def _requested_marker(review_tuple: ReviewTuple) -> str:
+    return (
+        "<!-- newtonsapple-pr-review-requested:v2 "
+        f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+    )
+
+
+def _started_marker(review_tuple: ReviewTuple) -> str:
+    return (
+        "<!-- newtonsapple-pr-review-started:v2 "
+        f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+    )
+
+
 def _blocker_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-blocker:v2 "
@@ -1764,12 +1883,53 @@ def _dead_letter_marker(review_tuple: ReviewTuple) -> str:
 
 
 def _summary_content(review_tuple: ReviewTuple, pr_url: str, review_body: str) -> str:
+    findings = re.findall(
+        r"(?m)^###\s+(P[0-3])\s+[—-]\s+(.+?)\s*$", review_body
+    )
+    if findings:
+        first_severity, first_title = findings[0]
+        finding_summary = (
+            f"{len(findings)} actionable finding"
+            f"{'s' if len(findings) != 1 else ''}; highest is "
+            f"{first_severity}: {first_title.rstrip('.')}"
+        )
+    else:
+        finding_summary = "no actionable findings"
+    gate_statuses = re.findall(
+        r"(?im)^\|\s*`[^`]+`\s*\|\s*\*\*"
+        r"(pass|pr-fail|unavailable)\*\*\s*\|",
+        review_body,
+    )
+    if gate_statuses:
+        counts = {
+            status: sum(1 for candidate in gate_statuses if candidate.lower() == status)
+            for status in ("pass", "pr-fail", "unavailable")
+        }
+        gate_summary = (
+            f" Gates: {counts['pass']} PASS, {counts['pr-fail']} FAIL, "
+            f"{counts['unavailable']} UNAVAILABLE."
+        )
+    else:
+        gate_summary = ""
     return (
-        f"**PR review completed:** [#{review_tuple.pr_number}]({pr_url}) at "
-        f"head `{review_tuple.head_sha}` (base `{review_tuple.base_sha}`).\n\n"
-        f"{review_body}\n\n"
-        "**Verification:** verified v2 request provenance, live exact tuple, "
-        "formal bot review marker, and durable completion."
+        f"**PR review completed:** [#{review_tuple.pr_number}]({pr_url}) — "
+        f"{finding_summary}.{gate_summary} The full review on GitHub is the "
+        "source of truth."
+    )
+
+
+def _requested_content(review_tuple: ReviewTuple, pr_url: str) -> str:
+    return (
+        f"**PR review requested:** [#{review_tuple.pr_number}]({pr_url}) at "
+        f"head `{review_tuple.head_sha[:12]}`. Hermany is queued to review it locally."
+    )
+
+
+def _started_content(review_tuple: ReviewTuple, pr_url: str) -> str:
+    return (
+        f"**PR review started:** Hermany is reviewing "
+        f"[#{review_tuple.pr_number}]({pr_url}) at head "
+        f"`{review_tuple.head_sha[:12]}`."
     )
 
 
@@ -1814,7 +1974,7 @@ def _buzz_own_pubkey() -> str:
     return pubkey
 
 
-def _buzz_find(marker: str) -> Optional[str]:
+def _buzz_find(marker: str, reply_to: Optional[str] = None) -> Optional[str]:
     own_pubkey = _buzz_own_pubkey()
     result = subprocess.run(
         ["buzz", "messages", "search", "--query", marker, "--limit", "10"],
@@ -1844,8 +2004,19 @@ def _buzz_find(marker: str) -> Optional[str]:
             and tag[1] == BUZZ_CHANNEL
             for tag in tags
         )
+        is_expected_reply = reply_to is None or (
+            isinstance(tags, list)
+            and any(
+                isinstance(tag, list)
+                and len(tag) >= 2
+                and tag[0] == "e"
+                and tag[1] == reply_to
+                for tag in tags
+            )
+        )
         if (
             in_channel
+            and is_expected_reply
             and author_pubkey == own_pubkey
             and isinstance(content, str)
             and content.rstrip().endswith(marker)
@@ -1855,17 +2026,19 @@ def _buzz_find(marker: str) -> Optional[str]:
     return None
 
 
-def _buzz_send(content: str) -> str:
+def _buzz_send(content: str, reply_to: Optional[str] = None) -> str:
+    command = [
+        "buzz",
+        "messages",
+        "send",
+        "--channel",
+        BUZZ_CHANNEL,
+    ]
+    if reply_to is not None:
+        command.extend(["--reply-to", reply_to])
+    command.extend(["--content", "-"])
     result = subprocess.run(
-        [
-            "buzz",
-            "messages",
-            "send",
-            "--channel",
-            BUZZ_CHANNEL,
-            "--content",
-            "-",
-        ],
+        command,
         input=content,
         check=False,
         capture_output=True,
@@ -1881,6 +2054,37 @@ def _buzz_send(content: str) -> str:
     if not isinstance(event_id, str) or not event_id:
         raise RuntimeError("Buzz delivery returned no event id")
     return event_id
+
+
+def _ensure_requested_message(
+    store: ReviewStateStore, review_tuple: ReviewTuple, pr_url: str
+) -> str:
+    event_id = store.requested_event_id(review_tuple)
+    if event_id is not None:
+        return event_id
+    marker = _requested_marker(review_tuple)
+    event_id = _buzz_find(marker, None)
+    if event_id is None:
+        event_id = _buzz_send(
+            f"{_requested_content(review_tuple, pr_url)}\n\n{marker}", None
+        )
+    return store.record_requested_event(review_tuple, event_id)
+
+
+def _ensure_started_message(
+    store: ReviewStateStore, review_tuple: ReviewTuple, pr_url: str
+) -> str:
+    event_id = store.started_event_id(review_tuple)
+    if event_id is not None:
+        return event_id
+    reply_to = _ensure_requested_message(store, review_tuple, pr_url)
+    marker = _started_marker(review_tuple)
+    event_id = _buzz_find(marker, reply_to)
+    if event_id is None:
+        event_id = _buzz_send(
+            f"{_started_content(review_tuple, pr_url)}\n\n{marker}", reply_to
+        )
+    return store.record_started_event(review_tuple, event_id)
 
 
 def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[dict], list[str]]:
@@ -1988,6 +2192,9 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                     base_sha=base["sha"],
                     head_sha=head["sha"],
                 )
+                _ensure_requested_message(
+                    store, blocked_tuple, str(listed.get("html_url", ""))
+                )
                 store.enqueue_blocker(
                     blocked_tuple,
                     marker=_blocker_marker(blocked_tuple),
@@ -2009,11 +2216,14 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             )
             if matching_body is not None:
                 pr_url = str(live_pr.get("html_url", ""))
+                thread_root = _ensure_requested_message(store, selected, pr_url)
+                _ensure_started_message(store, selected, pr_url)
                 store.record_external_completion(
                     selected,
                     now=int(time.time()),
                     marker=_summary_marker(selected),
                     content=_summary_content(selected, pr_url, matching_body),
+                    reply_to=thread_root,
                 )
                 continue
             events.append(
@@ -2059,6 +2269,9 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 if isinstance(item, dict)
             }
         ):
+            _ensure_requested_message(
+                store, review_tuple, str(live_pr.get("html_url", ""))
+            )
             store.enqueue_blocker(
                 review_tuple,
                 marker=_blocker_marker(review_tuple),
@@ -2101,6 +2314,18 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         or LEASE_TOKEN_PATTERN.fullmatch(lease_token) is None
     ):
         raise RuntimeError("invalid settlement lease token")
+    if operation == "started":
+        if not store.active_lease(
+            review_tuple, lease_token=lease_token, now=int(time.time())
+        ):
+            raise RuntimeError("review lease is not active")
+        pr_url = payload.get("pr_url")
+        if not isinstance(pr_url, str) or not pr_url.startswith(
+            f"https://github.com/{REPOSITORY}/pull/"
+        ):
+            raise RuntimeError("invalid pull request URL")
+        _ensure_started_message(store, review_tuple, pr_url)
+        return {"settled": "started"}
     if operation == "claim_publish":
         store.claim_publication(
             review_tuple,
@@ -2148,12 +2373,15 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
     ):
         raise RuntimeError("live pull request tuple changed")
     pr_url = str(live_pr.get("html_url", ""))
+    thread_root = _ensure_requested_message(store, review_tuple, pr_url)
+    _ensure_started_message(store, review_tuple, pr_url)
     store.settle_review(
         review_tuple,
         lease_token=lease_token,
         now=int(time.time()),
         marker=_summary_marker(review_tuple),
         content=_summary_content(review_tuple, pr_url, matching_body),
+        reply_to=thread_root,
     )
     delivered = drain_summary_outbox(
         store, find_existing=_buzz_find, send=_buzz_send
@@ -2227,6 +2455,13 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
     )
     if lease_token is None:
         raise RuntimeError("review tuple is already leased or completed")
+    try:
+        _ensure_requested_message(
+            store, review_tuple, str(live_pr.get("html_url", ""))
+        )
+    except Exception:
+        store.release(review_tuple, lease_token=lease_token)
+        raise
     return {
         "contract_version": CONTRACT_VERSION,
         "repository": REPOSITORY,
@@ -2258,14 +2493,22 @@ def main() -> None:
             output = resolve_execution_gates(payload)
         elif operation == "execution_evidence":
             output = execution_evidence(payload)
-        elif operation in {"complete", "release"}:
+        elif operation in {"complete", "release", "started"}:
             output = _settle(payload, expected_login, store)
         elif operation is not None:
             raise RuntimeError("unsupported control-plane operation")
         else:
             output = _gate_webhook(payload, expected_login, store)
         print(json.dumps(output, separators=(",", ":")))
-    except (json.JSONDecodeError, OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError):
+    except (
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        sqlite3.Error,
+        subprocess.SubprocessError,
+    ):
         print(json.dumps({"__hermes_ignore__": True}))
 
 
