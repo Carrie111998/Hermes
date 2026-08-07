@@ -643,24 +643,14 @@ export function ChatSidebar({
           },
           isPinnedSession
         )
-      ),
-      activeProjectId
+      )
     )
 
     // Layer the user's manual drag-order on top of the deterministic sort. Empty
-    // (default) returns `sorted` untouched; projects the user hasn't ordered yet
-    // keep their sorted position rather than jumping the hand-picked list.
+    // (default) returns `sorted` untouched; newly discovered projects append
+    // instead of jumping above the hand-picked list.
     return orderProjectsByIds(sorted, projectOrderIds)
-  }, [
-    showAllProfiles,
-    projectTree,
-    dismissedAutoProjects,
-    orderRepos,
-    activeProjectId,
-    projectOrderIds,
-    isPinnedSession,
-    s
-  ])
+  }, [showAllProfiles, projectTree, dismissedAutoProjects, orderRepos, projectOrderIds, isPinnedSession, s])
 
   // The overview only renders in grouped mode; the model stays live regardless
   // so scoping is consistent across views.

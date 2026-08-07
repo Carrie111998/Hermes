@@ -124,34 +124,37 @@ export function ProjectOverviewRow({
           {!project.isNoProject && <ProjectMenu anchorRef={rowRef} isActive={isActive} project={project} />}
         </>
       }
-      className={cn('group/workspace', dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
+      className={cn(
+        'group/workspace',
+        isActive && 'bg-(--ui-control-active-background)',
+        dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)'
+      )}
       ref={rowRef}
     >
       <SidebarRowCluster className="min-w-0 flex-1">
         {lead}
         <SidebarRowLink
           aria-label={s.projects.enter(project.label)}
+          className="flex grow self-stretch items-center"
           labelClassName={cn('hover:text-foreground hover:underline', isActive && 'text-foreground')}
           onClick={() => onEnter?.(project.id)}
         >
           {project.label}
         </SidebarRowLink>
-        {preview.length > 0 ? (
+        {preview.length > 0 && (
           <Tip label={s.projects.toggle(project.label, !open)}>
             <button
               aria-label={s.projects.toggle(project.label, !open)}
-              className="flex flex-1 items-center self-stretch bg-transparent p-0"
+              className="grid size-5 shrink-0 place-items-center rounded bg-transparent p-0 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-(--ui-text-secondary)"
               onClick={toggleOpen}
               type="button"
             >
               <DisclosureCaret
-                className="shrink-0 text-(--ui-text-tertiary) opacity-0 transition group-hover/workspace:opacity-100"
+                className="shrink-0 opacity-70 transition-opacity group-hover/workspace:opacity-100"
                 open={open}
               />
             </button>
           </Tip>
-        ) : (
-          <span className="flex-1" />
         )}
       </SidebarRowCluster>
     </SidebarRowShell>
