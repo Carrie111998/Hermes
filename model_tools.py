@@ -344,6 +344,15 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
+        # A trusted static webhook can grant a task-local evidence tool. Keep
+        # that scope in the schema-cache key so a cached ordinary webhook tool
+        # list cannot hide it, and a cached privileged list cannot leak it.
+        try:
+            from tools.github_pr_evidence import evidence_scope_cache_key
+
+            context_tool_scope = evidence_scope_cache_key()
+        except Exception:
+            context_tool_scope = None
         if profile_scope != CHECK_FN_CACHE_BYPASS:
             cache_key = (
                 frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
@@ -355,6 +364,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                context_tool_scope,
             )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:

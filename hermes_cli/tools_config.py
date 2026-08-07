@@ -2274,6 +2274,14 @@ def _get_platform_tools(
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
 
+    # Webhook content is an untrusted ingress surface. Its authored composite
+    # is a hard security boundary, not a user-customisable starting point:
+    # ignore saved platform overrides, plugins, and globally enabled MCP
+    # servers. The composite itself includes only low-risk tools plus the
+    # ContextVar-gated GitHub PR evidence tool.
+    if platform == "webhook":
+        return {"hermes-webhook"}
+
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
     # Track whether the user explicitly saved a toolset list for this platform

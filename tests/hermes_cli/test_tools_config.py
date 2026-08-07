@@ -72,6 +72,25 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+def test_webhook_platform_is_always_the_safe_composite_without_mcp_inheritance():
+    config = {
+        "platform_toolsets": {
+            "webhook": [
+                "clarify",
+                "terminal",
+                "file",
+                "code_execution",
+                "browser",
+                "computer_use",
+                "unsafe-mcp-server",
+            ]
+        },
+        "mcp_servers": {"unsafe-mcp-server": {"enabled": True}},
+    }
+
+    assert _get_platform_tools(config, "webhook") == {"hermes-webhook"}
+
+
 
 
 

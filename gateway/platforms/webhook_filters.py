@@ -225,7 +225,13 @@ class WebhookRouteProcessor:
             for spec in filters
         )
 
-    def run_route_script(self, script_value: Any, payload: dict) -> tuple[bool, Optional[dict]]:
+    def run_route_script(
+        self,
+        script_value: Any,
+        payload: dict,
+        *,
+        timeout_seconds: Optional[int] = None,
+    ) -> tuple[bool, Optional[dict]]:
         """Run a route script and return (should_continue, transformed_payload)."""
         path, error = _resolve_script_path(script_value)
         if error or path is None:
@@ -253,7 +259,11 @@ class WebhookRouteProcessor:
                 input=json.dumps(payload),
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
-                timeout=self.script_timeout_seconds,
+                timeout=(
+                    self.script_timeout_seconds
+                    if timeout_seconds is None
+                    else timeout_seconds
+                ),
                 cwd=str(path.parent),
                 env=build_subprocess_env(),
                 **popen_kwargs,

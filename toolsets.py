@@ -99,6 +99,9 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
     "web_extract",
     "vision_analyze",
     "clarify",
+    # Hidden by its ContextVar-aware check_fn unless a trusted static route
+    # installs an immutable PR evidence scope for this delivery.
+    "github_pr_evidence",
 ]
 
 

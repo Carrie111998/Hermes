@@ -318,6 +318,21 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    # Some service-gated tools are authorized by a task-local ContextVar rather
+    # than process/profile state. Caching that verdict would leak one route's
+    # availability into another concurrent request, so those checks explicitly
+    # opt out of both TTL and last-good caching.
+    if getattr(fn, "_hermes_context_scoped", False):
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "context-scoped check_fn %s raised; dependent tools will be unavailable",
+                getattr(fn, "__qualname__", fn),
+                exc_info=True,
+            )
+            return False
+
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:

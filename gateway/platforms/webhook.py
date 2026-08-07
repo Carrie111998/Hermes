@@ -57,6 +57,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 from gateway.platforms.webhook_filters import (
@@ -64,6 +65,12 @@ from gateway.platforms.webhook_filters import (
     WebhookRouteProcessor,
 )
 from gateway.response_filters import is_autonomous_silence_response
+from tools.github_pr_evidence import (
+    EvidenceScope,
+    execution_evidence_complete_for,
+    evidence_scope,
+    review_evidence_complete_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +220,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info: Dict[str, dict] = {}
         self._delivery_info_created: Dict[str, float] = {}
         self._delivery_info_order: Deque[tuple[float, str]] = deque()
+        self._successful_github_reviews: set[str] = set()
 
         # Reference to gateway runner for cross-platform delivery (set externally)
         self.gateway_runner = None
@@ -240,6 +248,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
+        self._reconciliation_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -333,6 +342,7 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
         self._mark_connected()
+        self._start_reconciliation_tasks()
 
         route_names = ", ".join(self._routes.keys()) or "(none configured)"
         logger.info(
@@ -344,11 +354,53 @@ class WebhookAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        tasks = list(self._reconciliation_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._reconciliation_tasks.clear()
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
+
+    def _start_reconciliation_tasks(self) -> None:
+        """Start one immediate-and-periodic recovery loop per opted-in route."""
+        if self._reconciliation_tasks:
+            return
+        for route_name, route_config in self._static_routes.items():
+            raw_interval = route_config.get("reconcile_interval_seconds")
+            if not isinstance(raw_interval, (int, float, str)):
+                continue
+            try:
+                interval = float(raw_interval)
+            except (TypeError, ValueError):
+                continue
+            if interval < 30 or interval > 86_400:
+                continue
+            if not isinstance(route_config.get("script"), str):
+                continue
+            task = asyncio.create_task(
+                self._reconciliation_loop(route_name, route_config, interval)
+            )
+            self._reconciliation_tasks.add(task)
+            task.add_done_callback(self._reconciliation_tasks.discard)
+
+    async def _reconciliation_loop(
+        self, route_name: str, route_config: dict, interval: float
+    ) -> None:
+        while True:
+            try:
+                await self._run_reconciliation_once(route_name, route_config)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "[webhook] Recovery scan failed for route '%s'", route_name
+                )
+            await asyncio.sleep(interval)
 
     async def send(
         self,
@@ -381,6 +433,12 @@ class WebhookAdapter(BasePlatformAdapter):
 
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
+
+        if deliver_type == "github_review":
+            result = await self._deliver_github_review(content, delivery)
+            if result.success:
+                self._successful_github_reviews.add(chat_id)
+            return result
 
         # Cross-platform delivery — any platform with a gateway adapter.
         # Check both built-in names and plugin-registered platforms.
@@ -422,6 +480,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 continue
             self._delivery_info.pop(key, None)
             self._delivery_info_created.pop(key, None)
+            self._successful_github_reviews.discard(key)
 
     def _prune_seen_deliveries(self, now: float) -> None:
         """Occasionally prune expired delivery IDs without scanning every POST."""
@@ -763,6 +822,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 )
             payload = transformed_payload or payload
 
+        payload, settlement_lease_token = self._extract_settlement_lease_token(
+            route_name, payload
+        )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
@@ -774,6 +837,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # using /skill-name slash commands — the gateway's command parser
         # would intercept those and break the flow.
         skills = route_config.get("skills", [])
+        skill_loaded = not skills
         if skills:
             try:
                 from agent.skill_commands import (
@@ -790,6 +854,7 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
                         if skill_content:
                             prompt = skill_content
+                            skill_loaded = True
                             break  # Load the first matching skill
                     else:
                         logger.warning(
@@ -797,6 +862,15 @@ class WebhookAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
+        if route_config.get("evidence") and not skill_loaded:
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
+            assert web is not None
+            return web.json_response(
+                {"status": "unavailable", "error": "Required skill unavailable"},
+                status=503,
+            )
 
         # Build a unique delivery ID
         delivery_id = request.headers.get(
@@ -877,11 +951,34 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
+        evidence = self._evidence_scope_for_route(route_name, payload)
+        if route_config.get("evidence") and (
+            evidence is None or settlement_lease_token is None
+        ):
+            logger.error(
+                "[webhook] Refusing route '%s' without a valid evidence scope",
+                route_name,
+            )
+            try:
+                await self._release_review_reservation(
+                    route_name, payload, settlement_lease_token
+                )
+            except Exception:
+                logger.exception(
+                    "[webhook] Failed to release reservation for invalid evidence scope"
+                )
+            self._seen_deliveries.pop(delivery_id, None)
+            assert web is not None
+            return web.json_response(
+                {"status": "unavailable", "error": "Evidence scope unavailable"},
+                status=503,
+            )
+
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
 
-        # Store delivery info for send().  Read by every send() invocation
+        # Store delivery and settlement authority for send()/completion. Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
         deliver_config = {
@@ -890,6 +987,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 route_config.get("deliver_extra", {}), payload
             ),
         }
+        if evidence is not None:
+            deliver_config["_trusted_evidence_route"] = route_name
+            deliver_config["_evidence_tuple"] = evidence.tuple_dict
+            deliver_config["_settlement_lease_token"] = settlement_lease_token
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -927,7 +1028,14 @@ class WebhookAdapter(BasePlatformAdapter):
         # once the agent run actually finishes (``handle_message`` itself is
         # fire-and-forget: it spawns ``_process_message_background`` and
         # returns before the run starts, so nothing can be closed here).
-        task = asyncio.create_task(self.handle_message(event))
+        if evidence is not None:
+            # create_task copies the current ContextVar context. handle_message
+            # then creates the long-running processing task inside that copied
+            # context, while this request task resets immediately afterward.
+            with evidence_scope(evidence):
+                task = asyncio.create_task(self.handle_message(event))
+        else:
+            task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -940,6 +1048,348 @@ class WebhookAdapter(BasePlatformAdapter):
             },
             status=202,
         )
+
+    async def _run_reconciliation_once(
+        self, route_name: str, route_config: dict
+    ) -> int:
+        """Ask one trusted static route script for bounded recovery events."""
+        if self._static_routes.get(route_name) is not route_config:
+            return 0
+        script = route_config.get("script")
+        if not isinstance(script, str) or not script:
+            return 0
+        ok, result = await asyncio.to_thread(
+            self._route_processor.run_route_script,
+            script,
+            {"operation": "reconcile"},
+        )
+        if not ok or not isinstance(result, dict):
+            return 0
+        events = result.get("events")
+        if not isinstance(events, list) or len(events) > 100:
+            return 0
+
+        allowed_events = route_config.get("events", [])
+        dispatched = 0
+        for recovered in events:
+            if not isinstance(recovered, dict):
+                continue
+            delivery_id = recovered.get("delivery_id")
+            event_type = recovered.get("event_type")
+            payload = recovered.get("payload")
+            if (
+                not isinstance(delivery_id, str)
+                or not delivery_id
+                or len(delivery_id) > 128
+                or not isinstance(event_type, str)
+                or event_type not in allowed_events
+                or not isinstance(payload, dict)
+            ):
+                continue
+            if await self._dispatch_recovered_event(
+                route_name, route_config, recovered
+            ):
+                dispatched += 1
+        return dispatched
+
+    def _extract_settlement_lease_token(
+        self, route_name: str, payload: Any
+    ) -> tuple[Any, Optional[str]]:
+        """Remove the opaque lease capability before model-visible dispatch."""
+        static_route = self._static_routes.get(route_name)
+        if (
+            not isinstance(static_route, dict)
+            or static_route.get("evidence") != "github_pr"
+            or not isinstance(payload, dict)
+        ):
+            return payload, None
+        sanitized = dict(payload)
+        token = sanitized.pop("lease_token", None)
+        if not isinstance(token, str) or re.fullmatch(
+            r"[A-Za-z0-9_-]{32,128}", token
+        ) is None:
+            return sanitized, None
+        return sanitized, token
+
+    async def _release_review_reservation(
+        self, route_name: str, payload: Any, lease_token: Optional[str]
+    ) -> bool:
+        """Release only through the same statically trusted route script."""
+        static_route = self._static_routes.get(route_name)
+        if (
+            not isinstance(static_route, dict)
+            or static_route.get("evidence") != "github_pr"
+            or not isinstance(static_route.get("script"), str)
+            or not isinstance(payload, dict)
+            or lease_token is None
+        ):
+            return False
+        settlement = {
+            "operation": "release",
+            "contract_version": payload.get("contract_version"),
+            "repository": payload.get("repository"),
+            "pr_number": str(payload.get("pr_number", "")),
+            "base_sha": payload.get("expected_base_sha"),
+            "head_sha": payload.get("expected_head_sha"),
+            "lease_token": lease_token,
+        }
+        keep, _ = await asyncio.to_thread(
+            self._route_processor.run_route_script,
+            static_route["script"],
+            settlement,
+        )
+        return keep
+
+    async def _dispatch_recovered_event(
+        self, route_name: str, route_config: dict, recovered: dict
+    ) -> bool:
+        """Dispatch a validated recovery event through the trusted route gate."""
+        if self._static_routes.get(route_name) is not route_config:
+            return False
+        if route_config.get("enabled", True) is False or route_config.get(
+            "deliver_only"
+        ):
+            return False
+        payload = recovered["payload"]
+        event_type = recovered["event_type"]
+        delivery_id = recovered["delivery_id"]
+        if not self._route_processor.route_filters_match(
+            route_config, payload, event_type, {}
+        ):
+            return False
+        keep, transformed = await asyncio.to_thread(
+            self._route_processor.run_route_script,
+            route_config.get("script"),
+            payload,
+        )
+        if not keep:
+            return False
+        payload = transformed or payload
+        if not isinstance(payload, dict):
+            return False
+
+        payload, settlement_lease_token = self._extract_settlement_lease_token(
+            route_name, payload
+        )
+
+        prompt = self._render_prompt(
+            route_config.get("prompt", ""), payload, event_type, route_name
+        )
+        skills = route_config.get("skills", [])
+        skill_loaded = not skills
+        if skills:
+            try:
+                from agent.skill_commands import (
+                    build_skill_invocation_message,
+                    get_skill_commands,
+                )
+
+                skill_cmds = get_skill_commands()
+                for skill_name in skills:
+                    cmd_key = f"/{skill_name}"
+                    if cmd_key not in skill_cmds:
+                        continue
+                    skill_content = build_skill_invocation_message(
+                        cmd_key, user_instruction=prompt
+                    )
+                    if skill_content:
+                        prompt = skill_content
+                        skill_loaded = True
+                        break
+            except Exception:
+                logger.exception(
+                    "[webhook] Recovery skill loading failed for route '%s'",
+                    route_name,
+                )
+                await self._release_review_reservation(
+                    route_name, payload, settlement_lease_token
+                )
+                return False
+        if route_config.get("evidence") and not skill_loaded:
+            logger.error(
+                "[webhook] Required recovery skill unavailable for route '%s'",
+                route_name,
+            )
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
+            return False
+
+        now = time.time()
+        evidence = self._evidence_scope_for_route(route_name, payload)
+        if route_config.get("evidence") and (
+            evidence is None or settlement_lease_token is None
+        ):
+            logger.error(
+                "[webhook] Recovery evidence scope invalid for route '%s'",
+                route_name,
+            )
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
+            return False
+        if not self._record_delivery_id(delivery_id, now):
+            return False
+
+        # Keep the lease capability outside the model-visible recovered payload.
+        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        deliver_config = {
+            "deliver": route_config.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                route_config.get("deliver_extra", {}), payload
+            ),
+        }
+        if evidence is not None:
+            deliver_config["_trusted_evidence_route"] = route_name
+            deliver_config["_evidence_tuple"] = evidence.tuple_dict
+            deliver_config["_settlement_lease_token"] = settlement_lease_token
+        self._delivery_info[session_chat_id] = deliver_config
+        self._delivery_info_created[session_chat_id] = now
+        self._delivery_info_order.append((now, session_chat_id))
+        self._prune_delivery_info(now)
+
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name=f"webhook/{route_name}",
+            chat_type="webhook",
+            user_id=f"webhook:{route_name}",
+            user_name=route_name,
+        )
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=payload,
+            message_id=delivery_id,
+        )
+        if evidence is not None:
+            with evidence_scope(evidence):
+                task = asyncio.create_task(self.handle_message(event))
+        else:
+            task = asyncio.create_task(self.handle_message(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return True
+
+    def _evidence_scope_for_route(
+        self, route_name: str, payload: Any
+    ) -> Optional[EvidenceScope]:
+        """Build immutable evidence authority for an opted-in static route.
+
+        Dynamic subscriptions are agent/user-created mutable state and must
+        never grant this credential-bearing read interface. Only the startup
+        static route map is consulted for the opt-in bit.
+        """
+        static_route = self._static_routes.get(route_name)
+        if not isinstance(static_route, dict):
+            return None
+        if static_route.get("evidence") != "github_pr":
+            return None
+        if not isinstance(static_route.get("script"), str):
+            return None
+        delivery_extra = static_route.get("deliver_extra")
+        if (
+            not isinstance(delivery_extra, dict)
+            or delivery_extra.get("contract_version") != "v2"
+        ):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        public_key_value = static_route.get("execution_attestation_public_key")
+        baseline_gates = static_route.get("baseline_execution_gates")
+        policy_version = static_route.get("execution_gate_policy_version")
+        policy_sha256 = static_route.get("execution_gate_policy_sha256")
+        if (
+            not isinstance(public_key_value, str)
+            or not isinstance(baseline_gates, list)
+            or not isinstance(policy_version, str)
+            or not isinstance(policy_sha256, str)
+        ):
+            return None
+        try:
+            public_key = base64.b64decode(public_key_value, validate=True)
+            gate_ids = tuple(baseline_gates)
+            if (
+                len(public_key) != 32
+                or not gate_ids
+                or len(set(gate_ids)) != len(gate_ids)
+                or any(
+                    not isinstance(gate, str)
+                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", gate) is None
+                    for gate in gate_ids
+                )
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", policy_version)
+                is None
+                or re.fullmatch(r"[0-9a-f]{64}", policy_sha256) is None
+            ):
+                raise ValueError("invalid execution attestation contract")
+            scope = EvidenceScope(
+                contract_version="v2",
+                repository=str(payload.get("repository", "")),
+                pr_number=int(payload.get("pr_number", 0)),
+                base_sha=str(payload.get("expected_base_sha", "")),
+                head_sha=str(payload.get("expected_head_sha", "")),
+                execution_attestation_public_key=public_key,
+                baseline_execution_gates=gate_ids,
+                execution_gate_policy_version=policy_version,
+                execution_gate_policy_sha256=policy_sha256,
+            )
+        except (binascii.Error, TypeError, ValueError):
+            logger.error(
+                "[webhook] static route %s produced an invalid evidence tuple",
+                route_name,
+            )
+            return None
+
+        script = static_route["script"]
+
+        def load_signed_control_plane_result(
+            operation: str, payload_key: str, signature_key: str
+        ) -> tuple[bytes, str]:
+            request = {
+                "operation": operation,
+                "contract_version": scope.contract_version,
+                "repository": scope.repository,
+                "pr_number": str(scope.pr_number),
+                "base_sha": scope.base_sha,
+                "head_sha": scope.head_sha,
+            }
+            script_kwargs = (
+                {"timeout_seconds": 4 * 60 * 60}
+                if operation == "execution_evidence"
+                else {}
+            )
+            keep, result = self._route_processor.run_route_script(
+                script, request, **script_kwargs
+            )
+            if not keep or not isinstance(result, dict):
+                raise RuntimeError("Execution attestation control plane was unavailable")
+            encoded_payload = result.get(payload_key)
+            signature = result.get(signature_key)
+            if not isinstance(encoded_payload, str) or not isinstance(signature, str):
+                raise RuntimeError("Execution attestation control plane returned malformed data")
+            try:
+                attestation_payload = base64.b64decode(encoded_payload, validate=True)
+                decoded_signature = base64.b64decode(signature, validate=True)
+            except binascii.Error as exc:
+                raise RuntimeError(
+                    "Execution attestation control plane returned malformed data"
+                ) from exc
+            if len(attestation_payload) > 1_000_000 or len(decoded_signature) != 64:
+                raise RuntimeError("Execution attestation control plane exceeded fixed limits")
+            return attestation_payload, signature
+
+        scope.gate_resolution_loader = lambda: load_signed_control_plane_result(
+            "resolve_execution_gates",
+            "gate_resolution_payload",
+            "gate_resolution_signature",
+        )
+        scope.execution_attestation_loader = lambda: load_signed_control_plane_result(
+            "execution_evidence",
+            "attestation_payload",
+            "attestation_signature",
+        )
+        return scope
 
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
@@ -963,7 +1413,71 @@ class WebhookAdapter(BasePlatformAdapter):
         ``end_session()`` is first-reason-wins and no-ops on an already-ended
         row, so this never clobbers a ``compression``/``agent_close`` reason.
         """
+        await self._settle_github_review(event.source.chat_id, outcome)
         await self._end_webhook_session(event, event.source.chat_id)
+
+    async def _settle_github_review(
+        self, session_chat_id: str, outcome: Any
+    ) -> None:
+        """Complete or release a route-script reservation for a formal review."""
+        delivery = self._delivery_info.get(session_chat_id, {})
+        if delivery.get("deliver") != "github_review":
+            return
+        route_name = delivery.get("_trusted_evidence_route")
+        tuple_data = delivery.get("_evidence_tuple")
+        lease_token = delivery.get("_settlement_lease_token")
+        if not isinstance(route_name, str):
+            return
+        static_route = self._static_routes.get(route_name)
+        if (
+            not isinstance(tuple_data, dict)
+            or not isinstance(lease_token, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
+            or not isinstance(static_route, dict)
+            or static_route.get("evidence") != "github_pr"
+            or not isinstance(static_route.get("script"), str)
+            or not isinstance(static_route.get("deliver_extra"), dict)
+            or static_route["deliver_extra"].get("contract_version") != "v2"
+        ):
+            return
+        try:
+            trusted_tuple = EvidenceScope(**tuple_data)
+        except (TypeError, ValueError):
+            logger.error(
+                "[webhook] refusing malformed github_review settlement authority for %s",
+                session_chat_id,
+            )
+            return
+
+        operation = (
+            "complete"
+            if (
+                outcome == ProcessingOutcome.SUCCESS
+                and session_chat_id in self._successful_github_reviews
+            )
+            else "release"
+        )
+        settlement_payload = {
+            "operation": operation,
+            "contract_version": trusted_tuple.contract_version,
+            "repository": trusted_tuple.repository,
+            "pr_number": str(trusted_tuple.pr_number),
+            "base_sha": trusted_tuple.base_sha,
+            "head_sha": trusted_tuple.head_sha,
+            "lease_token": lease_token,
+        }
+        keep, _ = await asyncio.to_thread(
+            self._route_processor.run_route_script,
+            static_route["script"],
+            settlement_payload,
+        )
+        if not keep:
+            logger.error(
+                "[webhook] github_review reservation %s failed for %s",
+                operation,
+                session_chat_id,
+            )
+        self._successful_github_reviews.discard(session_chat_id)
 
     async def _end_webhook_session(
         self, event: "MessageEvent", session_chat_id: str
@@ -1282,11 +1796,179 @@ class WebhookAdapter(BasePlatformAdapter):
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
 
+        if deliver_type == "github_review":
+            return await self._deliver_github_review(content, delivery)
+
         # Fall through to the cross-platform dispatcher, which validates the
         # target name and routes via the gateway runner.
         return await self._deliver_cross_platform(
             deliver_type, content, delivery
         )
+
+    async def _deliver_github_review(
+        self, content: str, delivery: dict
+    ) -> SendResult:
+        """Publish one non-approving formal PR review after immutable-state checks."""
+        extra = delivery.get("deliver_extra", {})
+        repo = extra.get("repo", "")
+        pr_number = extra.get("pr_number", "")
+        base_sha = extra.get("base_sha", "")
+        head_sha = extra.get("head_sha", "")
+        publisher_login = extra.get("publisher_login", "")
+        requested_reviewer = extra.get("requested_reviewer", "")
+
+        try:
+            pr_int = int(pr_number)
+            if pr_int <= 0:
+                raise ValueError("non-positive")
+        except (ValueError, TypeError):
+            return SendResult(success=False, error="Invalid pr_number")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", repo):
+            return SendResult(success=False, error="Invalid repo format")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(base_sha)):
+            return SendResult(success=False, error="Invalid base_sha")
+        if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha)):
+            return SendResult(success=False, error="Invalid head_sha")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", str(publisher_login)):
+            return SendResult(success=False, error="Invalid publisher_login")
+        if requested_reviewer != publisher_login:
+            return SendResult(success=False, error="Reviewer/publisher mismatch")
+        if not review_evidence_complete_for(
+            "v2", repo, pr_int, str(base_sha), str(head_sha)
+        ):
+            return SendResult(
+                success=False,
+                error="GitHub PR review evidence is incomplete or out of scope",
+            )
+        if not execution_evidence_complete_for(
+            "v2", repo, pr_int, str(base_sha), str(head_sha)
+        ):
+            return SendResult(
+                success=False,
+                error="GitHub PR execution evidence is incomplete or out of scope",
+            )
+        review_marker = (
+            "<!-- newtonsapple-pr-review:v2 "
+            f"repo={repo} pr={pr_int} base={base_sha} head={head_sha} -->"
+        )
+        if review_marker not in content:
+            return SendResult(
+                success=False, error="Missing canonical review marker"
+            )
+
+        run_kwargs: Dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 30,
+        }
+        try:
+            actor_result = subprocess.run(["gh", "api", "user"], **run_kwargs)
+            if actor_result.returncode != 0:
+                return SendResult(success=False, error=actor_result.stderr)
+            actor = json.loads(actor_result.stdout)
+            if actor.get("login") != publisher_login:
+                return SendResult(success=False, error="Publisher identity mismatch")
+
+            pr_result = subprocess.run(
+                ["gh", "api", f"repos/{repo}/pulls/{pr_int}"], **run_kwargs
+            )
+            if pr_result.returncode != 0:
+                return SendResult(success=False, error=pr_result.stderr)
+            live_pr = json.loads(pr_result.stdout)
+            requested = {
+                item.get("login")
+                for item in live_pr.get("requested_reviewers", [])
+                if isinstance(item, dict)
+            }
+            if (
+                live_pr.get("state") != "open"
+                or live_pr.get("draft") is not False
+                or live_pr.get("base", {}).get("sha") != base_sha
+                or live_pr.get("base", {}).get("ref")
+                not in {"dev", "staging", "main"}
+                or live_pr.get("head", {}).get("sha") != head_sha
+                or requested_reviewer not in requested
+            ):
+                return SendResult(success=False, error="PR state changed before publish")
+
+            existing_bodies = []
+            for endpoint in (
+                f"repos/{repo}/issues/{pr_int}/comments",
+                f"repos/{repo}/pulls/{pr_int}/reviews",
+            ):
+                existing_result = subprocess.run(
+                    ["gh", "api", "--paginate", "--slurp", endpoint],
+                    **run_kwargs,
+                )
+                if existing_result.returncode != 0:
+                    return SendResult(
+                        success=False, error=existing_result.stderr
+                    )
+                pages = json.loads(existing_result.stdout)
+                if not isinstance(pages, list):
+                    return SendResult(
+                        success=False, error="Invalid GitHub marker response"
+                    )
+                pending = list(pages)
+                while pending:
+                    item = pending.pop()
+                    if isinstance(item, list):
+                        pending.extend(item)
+                    elif isinstance(item, dict):
+                        author = item.get("user")
+                        body = item.get("body")
+                        if (
+                            isinstance(author, dict)
+                            and author.get("login") == publisher_login
+                            and isinstance(body, str)
+                        ):
+                            existing_bodies.append(body)
+            if any(review_marker in body for body in existing_bodies):
+                logger.info(
+                    "[webhook] COMMENT review already exists on %s#%s",
+                    repo,
+                    pr_int,
+                )
+                return SendResult(success=True)
+
+            result = subprocess.run(
+                [
+                    "gh", "api", "--method", "POST",
+                    f"repos/{repo}/pulls/{pr_int}/reviews",
+                    "-f", f"body={content}",
+                    "-f", "event=COMMENT",
+                    "-f", f"commit_id={head_sha}",
+                ],
+                **run_kwargs,
+            )
+            if result.returncode == 0:
+                accepted = json.loads(result.stdout)
+                accepted_user = accepted.get("user")
+                if (
+                    isinstance(accepted.get("id"), int)
+                    and accepted.get("id") > 0
+                    and isinstance(accepted_user, dict)
+                    and accepted_user.get("login") == publisher_login
+                    and accepted.get("state") == "COMMENTED"
+                    and accepted.get("commit_id") == head_sha
+                ):
+                    logger.info(
+                        "[webhook] Posted COMMENT review on %s#%s", repo, pr_int
+                    )
+                    return SendResult(success=True)
+                return SendResult(
+                    success=False,
+                    error="GitHub did not confirm the expected formal review",
+                )
+            return SendResult(success=False, error=result.stderr)
+        except (FileNotFoundError, json.JSONDecodeError) as exc:
+            logger.error("[webhook] github_review delivery error: %s", exc)
+            return SendResult(success=False, error=str(exc))
+        except Exception as exc:
+            logger.error("[webhook] github_review delivery error: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def _deliver_github_comment(
         self, content: str, delivery: dict
