@@ -288,16 +288,31 @@ export function useSessionStateCache({
       // the param was always a fresh spread, so every call looked like a
       // change — including periodic ~1/s session.info heartbeats that churn
       // $sessionStates and its computed atoms on every tick.
-      const next = updater(previous)
+      const updated = updater(previous)
 
       // If the updater returned the same reference, nothing changed for this
       // session — skip the store write, publishSessionState, and view sync.
       // The cache entry was already updated by ensureSessionState (if
       // storedSessionId rotated); the caller gets its return value from the
-      // cache, so stale reads don't regress.
-      if (next === previous) {
+      // cache, so stale reads don't regress. `busy` cannot have changed on a
+      // same-reference return, so the revision below is correct to skip too.
+      if (updated === previous) {
         return previous
       }
+
+      // `busyRevision` is owned here, not by callers: every committed change to
+      // `busy` bumps it, whatever wrote it (stream event, prompt submit, resume
+      // snapshot). That gives an in-flight resume a way to detect that a live
+      // event landed while its snapshot RPC was in the air, so it can decline to
+      // apply a `running` flag that is already out of date (#70449). An updater
+      // that writes the field itself is overruled — a caller spreading a stale
+      // snapshot back in would otherwise rewind the counter and defeat the
+      // check. Only clones when the value needs correcting, so the hot streaming
+      // path (which just spreads the previous state) allocates nothing extra.
+      const expectedRevision = updated.busy === previous.busy ? previous.busyRevision : previous.busyRevision + 1
+
+      const next =
+        updated.busyRevision === expectedRevision ? updated : { ...updated, busyRevision: expectedRevision }
 
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
       // Crash-survivable turn progress: journal the running turn's visible

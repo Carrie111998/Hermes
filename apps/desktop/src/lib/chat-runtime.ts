@@ -49,6 +49,7 @@ export function createClientSessionState(
     yolo: false,
     personality: '',
     busy: false,
+    busyRevision: 0,
     awaitingResponse: false,
     streamId: null,
     sawAssistantPayload: false,

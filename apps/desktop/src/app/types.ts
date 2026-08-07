@@ -184,6 +184,15 @@ export interface ClientSessionState {
   yolo: boolean
   personality: string
   busy: boolean
+  /** Bumped by the state cache on every committed change to `busy`. Owned by
+   *  `updateSessionState` — updaters must never set it themselves.
+   *
+   *  Session resume reads `busy` from a snapshot RPC, so the value it applies
+   *  is as old as the round trip. A turn that starts while that RPC is in the
+   *  air would be clobbered by the older snapshot on arrival (#70449). Resume
+   *  captures this counter before issuing, and on landing only trusts its own
+   *  snapshot if the counter is unchanged — i.e. no live event got there first. */
+  busyRevision: number
   awaitingResponse: boolean
   streamId: string | null
   sawAssistantPayload: boolean
