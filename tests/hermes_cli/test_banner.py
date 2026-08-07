@@ -167,3 +167,40 @@ def test_build_welcome_banner_disabled_mcp_shows_disabled_not_failed():
     assert "broken" in output
     assert "failed" in output
 
+
+
+def test_category_labels_use_banner_dim_without_dim_modifier():
+    """Toolset and skill-category labels must use banner_dim color only.
+
+    Redundant ``dim`` modifier was removed in fix/banner-dim-double-dimming.
+    This test guards against regression.
+    """
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=(["web"], []),
+        ),
+        patch.object(
+            banner,
+            "get_available_skills",
+            return_value={"creative": ["comfyui", "pixel-art"]},
+        ),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=True, color_system="truecolor", width=160)
+        banner.build_welcome_banner(
+            console=console,
+            model="anthropic/test-model",
+            cwd="/tmp/project",
+            tools=[{"function": {"name": "web_search"}}],
+            get_toolset_for_tool=lambda n: "web",
+        )
+    markup = console.export_text()
+    # Labels must appear in output
+    assert "web:" in markup
+    assert "creative:" in markup
+    # Redundant dim modifier must NOT appear in the markup source
+    rendered = console.export_text(styles=False)
+    assert "dim dim" not in rendered
