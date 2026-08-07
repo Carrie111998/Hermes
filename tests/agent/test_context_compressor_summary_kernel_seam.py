@@ -77,3 +77,42 @@ def test_summary_kernel_import_orders_in_fresh_interpreters():
             check=False,
         )
         assert result.returncode == 0, result.stderr
+
+
+def test_godfile_reload_resynchronizes_summary_kernel_bindings(monkeypatch):
+    import importlib
+
+    importlib.reload(cc)
+    assert cc.SUMMARY_PREFIX is sk.SUMMARY_PREFIX
+    assert cc._HISTORICAL_SUMMARY_PREFIXES is sk._HISTORICAL_SUMMARY_PREFIXES
+
+
+def test_legacy_summary_prefix_patch_affects_kernel_method(monkeypatch):
+    monkeypatch.setattr(cc, "SUMMARY_PREFIX", "[PATCHED SUMMARY PREFIX]")
+
+    assert cc.ContextCompressor._strip_summary_prefix(
+        "[PATCHED SUMMARY PREFIX]\nBODY"
+    ) == "BODY"
+
+
+def test_legacy_todo_header_patch_affects_synthetic_user_detection(monkeypatch):
+    monkeypatch.setattr(cc, "TODO_INJECTION_HEADER", "[PATCHED TODO HEADER]")
+
+    assert cc.ContextCompressor._is_synthetic_compression_user_turn(
+        {"role": "user", "content": "[PATCHED TODO HEADER]\n- [ ] task"}
+    )
+
+
+def test_kernel_reload_preserves_mro_and_descriptor_identity():
+    import importlib
+
+    old_mixin = sk.ContextCompressorSummaryKernelMixin
+    old_descriptor = inspect.getattr_static(cc.ContextCompressor, "_strip_summary_prefix")
+
+    importlib.reload(sk)
+
+    assert sk.ContextCompressorSummaryKernelMixin is old_mixin
+    assert cc.ContextCompressorSummaryKernelMixin is old_mixin
+    assert inspect.getattr_static(
+        cc.ContextCompressor, "_strip_summary_prefix"
+    ) is old_descriptor

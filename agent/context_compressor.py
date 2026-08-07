@@ -21,7 +21,9 @@ import json
 import logging
 import sqlite3
 import re
+import sys
 import time
+import types
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -466,9 +468,38 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
 # Import after summary constants are initialized so the summary-kernel module
 # can bind its compatibility globals while preserving both import orders.
+import agent.context_compressor_summary_kernel as _summary_kernel  # noqa: E402
 from agent.context_compressor_summary_kernel import (  # noqa: E402
     ContextCompressorSummaryKernelMixin,
 )
+
+
+_SUMMARY_KERNEL_COMPATIBILITY_NAMES = (
+    "SUMMARY_PREFIX",
+    "LEGACY_SUMMARY_PREFIX",
+    "_HISTORICAL_SUMMARY_PREFIXES",
+    "_MERGED_SUMMARY_DELIMITER",
+    "_SUMMARY_END_MARKER",
+    "COMPRESSED_SUMMARY_METADATA_KEY",
+    "COMPRESSION_CONTINUATION_USER_CONTENT",
+    "_LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT",
+    "HISTORICAL_TASK_HEADING",
+    "_NO_USER_TASK_SENTINEL",
+    "TODO_INJECTION_HEADER",
+)
+
+
+class _SummaryKernelCompatibilityModule(types.ModuleType):
+    """Keep moved kernel globals aligned with legacy module monkeypatches."""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name in _SUMMARY_KERNEL_COMPATIBILITY_NAMES:
+            _summary_kernel._sync_compatibility_bindings()
+
+
+_summary_kernel._sync_compatibility_bindings()
+sys.modules[__name__].__class__ = _SummaryKernelCompatibilityModule
 
 
 def resolve_model_threshold(

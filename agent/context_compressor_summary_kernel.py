@@ -9,10 +9,27 @@ module can be imported first without a partially-initialized-class failure.
 from __future__ import annotations
 
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 from agent.context_compressor_text_utils import _content_text_for_contains
 from tools.todo_tool import TODO_INJECTION_HEADER
+
+
+_SUMMARY_KERNEL_COMPATIBILITY_NAMES = (
+    "SUMMARY_PREFIX",
+    "LEGACY_SUMMARY_PREFIX",
+    "_HISTORICAL_SUMMARY_PREFIXES",
+    "_MERGED_SUMMARY_DELIMITER",
+    "_SUMMARY_END_MARKER",
+    "COMPRESSED_SUMMARY_METADATA_KEY",
+    "COMPRESSION_CONTINUATION_USER_CONTENT",
+    "_LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT",
+    "HISTORICAL_TASK_HEADING",
+    "_NO_USER_TASK_SENTINEL",
+    "TODO_INJECTION_HEADER",
+)
+_EXISTING_SUMMARY_KERNEL_MIXIN = globals().get("ContextCompressorSummaryKernelMixin")
 
 
 # fmt: off
@@ -186,6 +203,25 @@ class ContextCompressorSummaryKernelMixin:
 # fmt: on
 
 
+# ``importlib.reload`` re-executes this module in its existing module
+# namespace. Restore the original class object so ContextCompressor's already
+# constructed MRO and descriptors remain valid across a kernel reload.
+if _EXISTING_SUMMARY_KERNEL_MIXIN is not None:
+    ContextCompressorSummaryKernelMixin = _EXISTING_SUMMARY_KERNEL_MIXIN
+
+
+def _sync_compatibility_bindings() -> None:
+    """Point moved-method globals at the legacy compatibility module values."""
+    compatibility_module = sys.modules.get("agent.context_compressor")
+    if compatibility_module is None:
+        return
+    compatibility_namespace = vars(compatibility_module)
+    kernel_namespace = vars(sys.modules[__name__])
+    for name in _SUMMARY_KERNEL_COMPATIBILITY_NAMES:
+        if name in compatibility_namespace:
+            kernel_namespace[name] = compatibility_namespace[name]
+
+
 # Bind the godfile's constants only after this mixin exists. This preserves
 # both import orders: importing this module first lets context_compressor import
 # the already-defined class, while the normal godfile import has constants ready.
@@ -195,11 +231,14 @@ from agent.context_compressor import (  # noqa: E402
     HISTORICAL_TASK_HEADING,
     LEGACY_SUMMARY_PREFIX,
     SUMMARY_PREFIX,
+    TODO_INJECTION_HEADER,
     _HISTORICAL_SUMMARY_PREFIXES,
     _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
     _MERGED_SUMMARY_DELIMITER,
     _NO_USER_TASK_SENTINEL,
     _SUMMARY_END_MARKER,
 )
+
+_sync_compatibility_bindings()
 
 __all__ = ["ContextCompressorSummaryKernelMixin"]
