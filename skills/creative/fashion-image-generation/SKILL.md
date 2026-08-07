@@ -60,12 +60,18 @@ shot, each garment must also be produced in **two additional variants** (in addi
 `front`), always on-model and always faithful to the ghost mannequin + model reference:
 - `bust34` — **three-quarter bust shot** (framed from the waist up, lower body/legs cropped out of frame), slight three-quarter angle.
 - `editorial` — **dynamic editorial fashion pose** (weight shifted, one hand in the coat
-  pocket or adjusting the collar), set on the **editorial/street scene** (`EDITORIAL_SCENE`),
-  not the studio background.
+  pocket or adjusting the collar), on the **same neutral studio background as all other poses**
+  (editorial is a POSITION, not a location — never an outdoor/street scene).
 
-So the full per-colorway STEP B set is: `front` (studio), `bust34` (studio), `editorial` (street).
+So the full per-colorway STEP B set is: `front` (studio), `bust34` (studio), `editorial` (studio — dynamic pose).
 Output naming: `indossato_<POSA>_<COLOR>.png` (e.g. `indossato_bust34_NOCCIOLA-302.png`,
 `indossato_editorial_NOCCIOLA-302.png`).
+
+**Surrounding-outfit guard (MANDATORY on every STEP B).** The model's base layers must be
+coherent with the garment, elegant/modern/casual (refined knitwear, turtleneck or long-sleeve
+top, full-length tailored trousers or jeans). **Never shorts, never skirts.** The reference
+garment itself must remain exactly identical to the ghost (shape, details, color, relation to
+body) — never add/remove/alter it.
 
 ## Workflow (end-to-end)
 1. **Enumerate the Drive source** — for each garment folder: identify the ghost mannequin (product photo on flat grey) vs. the color swatches (flat rectangle with a color name+code). Use vision to disambiguate and to map each swatch file → its color code (`NOCCIOLA-302`…). A single `seed` colorway may also come pre-generated.

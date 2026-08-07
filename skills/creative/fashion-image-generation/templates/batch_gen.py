@@ -50,9 +50,20 @@ POSES = {
     "bust34":      "framed as a close three-quarter bust shot from the waist up, the lower body and legs cropped out of frame, slight three-quarter angle, arms relaxed",
     "editorial":   "a dynamic editorial fashion pose, weight shifted, one hand in coat pocket or adjusting the collar, confident stance",
 }
-# Editorial scene replaces the studio background for campaign variants.
-EDITORIAL_SCENE = ("standing on a wet cobblestone street in a European winter city at early morning, "
-    "soft cold overcast light, light snowfall or mist, cinematic mood, desaturated cool tones")
+# All poses share the SAME neutral studio background (editorial is a pose, NOT a
+# location): the scene is never changed to a street/outdoor setting.
+STUDIO_SCENE = ("neutral light grey background, full body shot, professional ecommerce "
+    "fashion photography, clean studio lighting")
+
+# Surrounding-outfit guard (MANDATORY on every STEP B): the model's base layers must be
+# coherent with the garment — elegant, modern, casual. NO shorts, NO skirts. The reference
+# garment itself must never be altered.
+OUTFIT_GUARD = ("The model's surrounding outfit (base layers under/around the garment) must be "
+    "elegant, modern and casual and coherent with the garment worn — refined knitwear, a "
+    "turtleneck or long-sleeve top, and full-length tailored trousers or jeans. Never use "
+    "shorts and never use skirts. The reference garment itself must remain exactly identical "
+    "to the ghost reference — do not add, remove or alter the garment, its shape, details, "
+    "color or its relation to the body.")
 
 def data_url(path):
     b = open(path, "rb").read()
@@ -120,8 +131,8 @@ for capo, cfg in MANIFEST.items():
                     print(f"  STEP B {posa}: skip", flush=True)
                     continue
                 pose_clause = POSES.get(posa, POSES["front"])
-                scene = EDITORIAL_SCENE if posa == "editorial" else "neutral light grey background, full body shot, professional ecommerce fashion photography, clean studio lighting"
-                prompt = f"{STEPB_PROMPT} {pose_clause}, {scene}."
+                scene = STUDIO_SCENE  # all poses share the same studio background
+                prompt = f"{STEPB_PROMPT} {pose_clause}, {scene}. {OUTFIT_GUARD}."
                 try:
                     n, c = gen(prompt, [data_url(modela), data_url(g_out)], w_out)
                     print(f"  STEP B {posa} ok ${c}", flush=True); summary.append(("B", capo, colore, posa, c))
