@@ -86,6 +86,45 @@ def test_terminal_states_record_terminal_reason(ledger, bus):
     row = ledger.get_request(rid)
     assert row["state"] == "DECLINED"
     assert row["terminal_reason"] == "DECLINED"
+    # evidence_ref is routed to the transition-history row, NOT terminal_reason.
+    assert ledger.transitions_for(rid)[-1]["evidence_ref"] == "target_unresolved"
+
+
+def test_bus_none_suppresses_emission(ledger):
+    # bus=None is the documented dry-tooling path: the transition still
+    # persists durable state but emits nothing (and does not crash).
+    rid = seed(ledger)
+    assert transition(ledger, None, rid, "TRIAGED", actor="test") == "TRIAGED"
+    assert ledger.get_request(rid)["state"] == "TRIAGED"
+    assert [t["to_state"] for t in ledger.transitions_for(rid)] == ["TRIAGED"]
+
+
+def test_ledger_only_transition_emits_no_event(ledger, bus):
+    # CANCELLED maps to None in STATE_EVENTS — the emit gate must fire zero
+    # events while still persisting the durable transition.
+    rid = seed(ledger)
+    transition(ledger, bus, rid, "CANCELLED", actor="test")
+    assert ledger.get_request(rid)["state"] == "CANCELLED"
+    rows = bus._get_conn().execute("SELECT COUNT(*) AS n FROM events").fetchone()
+    assert rows["n"] == 0
+
+
+class _RaisingBus:
+    """A bus whose emit always raises, to prove telemetry failure never rolls
+    back durable ledger state."""
+
+    def emit(self, **_kwargs):
+        raise RuntimeError("telemetry sink down")
+
+
+def test_failed_emit_does_not_roll_back_durable_state(ledger):
+    # The module's central durability claim: a raising emit propagates, but the
+    # state advance and transition row committed before it remain durable.
+    rid = seed(ledger)
+    with pytest.raises(RuntimeError, match="telemetry sink down"):
+        transition(ledger, _RaisingBus(), rid, "TRIAGED", actor="test")
+    assert ledger.get_request(rid)["state"] == "TRIAGED"
+    assert [t["to_state"] for t in ledger.transitions_for(rid)] == ["TRIAGED"]
 
 
 def test_stage2_states_have_event_mappings():
