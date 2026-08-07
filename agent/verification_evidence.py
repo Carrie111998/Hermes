@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from agent.redact import redact_sensitive_text
 from hermes_constants import get_hermes_home
 
 
@@ -445,7 +446,13 @@ def classify_verification_command(
 
     canonical, trailing_args = match
     return VerificationEvidence(
-        command=command,
+        # Persisted (verification_evidence.db) and later replayed back to the
+        # caller verbatim via the verification.status RPC — force-redact so a
+        # command that embeds a credential inline (e.g. a curl auth header
+        # typed as part of an ad-hoc verification check) never survives on
+        # disk or on the wire unmasked. Mirrors redact_terminal_output's
+        # force=True posture for the same class of safety boundary.
+        command=redact_sensitive_text(command, force=True),
         canonical_command=canonical,
         kind="ad_hoc" if is_ad_hoc else _kind_for_command(canonical),
         scope="targeted" if is_ad_hoc else _scope_for_args(trailing_args),

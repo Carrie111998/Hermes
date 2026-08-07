@@ -82,6 +82,51 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
     assert echoed is None
 
 
+def test_classify_verification_command_redacts_embedded_secret(tmp_path, monkeypatch):
+    """A secret typed inline in a verification command must not survive
+    into the stored ``command`` field (#verification_status is later
+    replayed verbatim to the TUI/desktop client over the ``verification.status``
+    RPC, so an unredacted command persists a credential onto a wire surface)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    token = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+
+    evidence = classify_verification_command(
+        f"pnpm run test -- --token={token}",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+    )
+
+    assert evidence is not None
+    # Matching/classification still runs against the real command.
+    assert evidence.kind == "test"
+    assert token not in evidence.command
+    assert evidence.command != f"pnpm run test -- --token={token}"
+
+
+def test_record_terminal_result_persists_redacted_command_end_to_end(tmp_path, monkeypatch):
+    """The full record → verification_status() round trip (the RPC-exposed
+    path) must never carry the raw secret, not just the in-memory dataclass."""
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _node_project(tmp_path)
+    token = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+
+    record_terminal_result(
+        command=f"pnpm run test -- --token={token}",
+        cwd=tmp_path,
+        session_id="s1",
+        exit_code=0,
+        output="ok",
+    )
+
+    status = verification_status(session_id="s1", cwd=tmp_path)
+    assert token not in json.dumps(status)
+
+    with sqlite3.connect(home / "verification_evidence.db") as conn:
+        row = conn.execute("SELECT command FROM verification_events").fetchone()
+    assert token not in row[0]
 
 
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
