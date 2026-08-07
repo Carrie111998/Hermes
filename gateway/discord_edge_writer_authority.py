@@ -237,6 +237,8 @@ class CanonicalWriterDiscordAuthority:
             idempotency_key=intent.idempotency_key,
             issued_at_unix_ms=now,
             expires_at_unix_ms=now + self._request_timeout_seconds * 1_000,
+            subject_discord_user_id=str(authorization["approved_by_user_id"]),
+            case_id=str(authorization["case_id"]),
             operator_tier=str(authorization["operator_tier"]),
         )
         return sign_operational_envelope(

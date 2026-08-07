@@ -291,6 +291,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--requester", required=True)
     result.add_argument("--requester-id", default="")
     result.add_argument("--purpose", required=True)
+    # These exact Discord identifiers are signed route-back bindings.  The
+    # database helper never routes or interprets them; the privileged edge
+    # consumes them after the bounded read completes.
+    result.add_argument("--discord-guild-id", default="")
+    result.add_argument("--discord-channel-id", default="")
+    result.add_argument("--discord-thread-id", default="")
+    result.add_argument("--discord-message-id", default="")
     result.add_argument(
         "--expected-result-shape",
         default="bounded_rows",

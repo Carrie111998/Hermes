@@ -126,6 +126,17 @@ STAGED_APPROVAL_PASSKEY = EVIDENCE_ROOT / "staged" / "api-approval-passkey"
 OPERATIONAL_EDGE_KEY_STAGING_ROOT = EVIDENCE_ROOT / "staged" / "keys"
 OPERATIONAL_EDGE_KEY_ROOT = Path("/etc/muncho/keys")
 OPERATIONAL_EDGE_TRUST_ROOT = Path("/etc/muncho/operational-edge/trust")
+OWNER_GATE_PUBLIC_ROOT = Path("/etc/muncho-owner-gate/public")
+OWNER_GATE_WRITER_PUBLIC_KEY = (
+    OWNER_GATE_PUBLIC_ROOT / "writer-capability-public.pem"
+)
+OWNER_GATE_RECEIPT_PUBLIC_KEY = (
+    OWNER_GATE_PUBLIC_ROOT / "authority-receipt-public.pem"
+)
+OPERATIONAL_EDGE_OWNER_GATE_RECEIPT_PUBLIC_KEY = (
+    OPERATIONAL_EDGE_TRUST_ROOT
+    / "owner-gate-authority-receipt-public.pem"
+)
 OPERATIONAL_EDGE_SOCKET_ROOT = Path("/run/muncho-operational-edge")
 OPERATIONAL_EDGE_READINESS_PATH = Path(
     "/var/lib/muncho-operational-edge/readiness.json"
@@ -6824,6 +6835,213 @@ def _derive_ed25519_public(private_pem: bytes) -> tuple[bytes, str]:
     return public_pem, hashlib.sha256(raw_public).hexdigest()
 
 
+def _ed25519_public_key_id(public_pem: bytes) -> str:
+    public_der = _pem_der(
+        public_pem,
+        label="artifact_trust_anchor_public_key_invalid",
+        header=b"-----BEGIN PUBLIC KEY-----",
+        footer=b"-----END PUBLIC KEY-----",
+    )
+    public_prefix = bytes.fromhex("302a300506032b6570032100")
+    if (
+        len(public_der) != len(public_prefix) + 32
+        or not public_der.startswith(public_prefix)
+    ):
+        raise ArtifactError("artifact_trust_anchor_public_key_invalid")
+    return hashlib.sha256(public_der[len(public_prefix):]).hexdigest()
+
+
+def _create_only_public_trust_anchor(
+    *,
+    label: str,
+    source: Path,
+    target: Path,
+    expected_key_id: str,
+    source_uid: int,
+    source_gid: int,
+    source_mode: int,
+    target_uid: int,
+    target_gid: int,
+) -> Mapping[str, Any]:
+    if (
+        SHA256.fullmatch(expected_key_id or "") is None
+        or source == target
+        or source in target.parents
+        or target in source.parents
+    ):
+        raise ArtifactError("artifact_trust_anchor_identity_invalid")
+    payload = _read_exact_file(
+        source,
+        allowed_modes={source_mode},
+        owners={source_uid},
+        groups={source_gid},
+        maximum=8 * 1024,
+    )
+    if _ed25519_public_key_id(payload) != expected_key_id:
+        raise ArtifactError("artifact_trust_anchor_identity_invalid")
+    _trusted_parent(target, target_uid)
+    created = False
+    if os.path.lexists(target):
+        observed = _read_exact_file(
+            target,
+            allowed_modes={0o444},
+            owners={target_uid},
+            groups={target_gid},
+            maximum=8 * 1024,
+        )
+        if observed != payload:
+            raise ArtifactError("artifact_trust_anchor_conflict")
+    else:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                target,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o444,
+            )
+            created = True
+            os.fchmod(descriptor, 0o444)
+            os.fchown(descriptor, target_uid, target_gid)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise ArtifactError("artifact_trust_anchor_create_failed")
+                view = view[written:]
+            os.fsync(descriptor)
+        except ArtifactError:
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            if created:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            raise
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+                descriptor = -1
+            if created:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+            raise ArtifactError("artifact_trust_anchor_create_failed") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        _fsync_parent(target)
+    final = _read_exact_file(
+        target,
+        allowed_modes={0o444},
+        owners={target_uid},
+        groups={target_gid},
+        maximum=8 * 1024,
+    )
+    if final != payload or _ed25519_public_key_id(final) != expected_key_id:
+        raise ArtifactError("artifact_trust_anchor_install_unconfirmed")
+    return {
+        "label": label,
+        "source_path": str(source),
+        "source_uid": source_uid,
+        "source_gid": source_gid,
+        "source_mode": source_mode,
+        "target_path": str(target),
+        "target_uid": target_uid,
+        "target_gid": target_gid,
+        "target_mode": 0o444,
+        "public_key_id": expected_key_id,
+        "size": len(payload),
+        "created": created,
+        "byte_identical": True,
+    }
+
+
+def _provision_cross_service_trust_anchors(
+    manifest: Mapping[str, Any],
+    *,
+    writer_public_key_id: str,
+    trust_anchor_uid: int = 0,
+    trust_anchor_gid: int = 0,
+) -> Mapping[str, Any]:
+    identity = _identity_foundation(manifest)
+    writer = _discord_key_foundation(manifest, identity)["writer"]
+    bundle = _operational_edge_bundle(manifest)
+    owner_gate_key_id = bundle["owner_gate_receipt_public_key_id"]
+    if owner_gate_key_id is None:
+        raise ArtifactError("artifact_owner_gate_trust_anchor_unavailable")
+    if (
+        writer["public_key_id"] != writer_public_key_id
+        or owner_gate_key_id == writer_public_key_id
+        or owner_gate_key_id in set(bundle["receipt_public_key_ids"].values())
+    ):
+        raise ArtifactError("artifact_trust_anchor_identity_invalid")
+    anchors = [
+        _create_only_public_trust_anchor(
+            label="writer_to_owner_gate",
+            source=WRITER_CAPABILITY_PUBLIC_KEY,
+            target=OWNER_GATE_WRITER_PUBLIC_KEY,
+            expected_key_id=writer_public_key_id,
+            source_uid=trust_anchor_uid,
+            source_gid=writer["public_gid"],
+            source_mode=writer["public_mode"],
+            target_uid=trust_anchor_uid,
+            target_gid=trust_anchor_gid,
+        ),
+        _create_only_public_trust_anchor(
+            label="owner_gate_to_operational_edge",
+            source=OWNER_GATE_RECEIPT_PUBLIC_KEY,
+            target=OPERATIONAL_EDGE_OWNER_GATE_RECEIPT_PUBLIC_KEY,
+            expected_key_id=owner_gate_key_id,
+            source_uid=trust_anchor_uid,
+            source_gid=trust_anchor_gid,
+            source_mode=0o444,
+            target_uid=trust_anchor_uid,
+            target_gid=trust_anchor_gid,
+        ),
+    ]
+    unsigned = {
+        "schema": "muncho-production-cross-service-trust-anchors.v1",
+        "writer_public_key_id": writer_public_key_id,
+        "owner_gate_receipt_public_key_id": owner_gate_key_id,
+        "anchors": anchors,
+        "anchor_count": len(anchors),
+        "all_sources_and_targets_byte_identical": True,
+        "create_only": True,
+        "credential_values_read": False,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {**unsigned, "receipt_sha256": _sha_json(unsigned)}
+
+
+def _provision_cross_service_trust_anchors_if_required(
+    manifest: Mapping[str, Any],
+    *,
+    writer_public_key_id: str,
+    trust_anchor_uid: int = 0,
+    trust_anchor_gid: int = 0,
+) -> Mapping[str, Any] | None:
+    # Legacy v3 never carried this signed authority.  Preserve its old host
+    # transition and receipt shape without borrowing ambient host state.
+    if _operational_edge_bundle(manifest)[
+        "owner_gate_receipt_public_key_id"
+    ] is None:
+        return None
+    return _provision_cross_service_trust_anchors(
+        manifest,
+        writer_public_key_id=writer_public_key_id,
+        trust_anchor_uid=trust_anchor_uid,
+        trust_anchor_gid=trust_anchor_gid,
+    )
+
+
 def _key_private_bytes(path: Path, *, uid: int, gid: int, mode: int) -> bytes:
     return _read_exact_file(
         path,
@@ -7286,6 +7504,7 @@ def _operational_edge_bundle(
             "domains", "operation_count", "all_operations_implemented",
             "credentials_by_domain", "credential_count",
             "credential_values_read", "receipt_public_key_ids",
+            "owner_gate_receipt_public_key_id",
             "identity_contract", "units", "configs",
             "client_config_path", "client_config_sha256",
             "secret_material_recorded", "secret_digest_recorded",
@@ -7356,6 +7575,17 @@ def _operational_edge_bundle(
         or raw["credential_values_read"] is not False
         or raw["receipt_public_key_ids"]
         != manifest["operational_edge_receipt_public_key_ids"]
+        or (
+            raw["owner_gate_receipt_public_key_id"] is not None
+            and (
+                SHA256.fullmatch(
+                    str(raw["owner_gate_receipt_public_key_id"])
+                )
+                is None
+                or raw["owner_gate_receipt_public_key_id"]
+                in set(raw["receipt_public_key_ids"].values())
+            )
+        )
         or raw["units"] != expected_units
         or raw["configs"] != expected_configs
         or raw["client_config_path"]
@@ -7950,6 +8180,12 @@ def _host_apply(plan: Mapping[str, Any]) -> Mapping[str, Any]:
     discord_foundation = _bootstrap_discord_foundation(plan, manifest)
     operational_asset_readback = _operational_asset_readback(manifest)
     operational_edge_keys = _provision_operational_edge_keys(manifest)
+    cross_service_trust = (
+        _provision_cross_service_trust_anchors_if_required(
+            manifest,
+            writer_public_key_id=discord_foundation["writer_public_key_id"],
+        )
+    )
     _systemctl("daemon-reload")
     for unit in BOOT_ENABLE_UNITS:
         _systemctl_unit_file("disable", unit)
@@ -8005,8 +8241,12 @@ def _host_apply(plan: Mapping[str, Any]) -> Mapping[str, Any]:
         != topology["isolated_worker"]["service_fragment_sha256"]
     ):
         raise ArtifactError("artifact_host_apply_unconfirmed")
-    return _receipt({
-        "schema": "muncho-production-writer-host-apply.v2",
+    host_apply = {
+        "schema": (
+            "muncho-production-writer-host-apply.v2"
+            if cross_service_trust is None
+            else "muncho-production-writer-host-apply.v3"
+        ),
         "plan_sha256": plan["plan_sha256"],
         "artifact_sha256": plan["artifacts"]["host_activation"]["sha256"],
         "gateway_stopped": gateway,
@@ -8064,7 +8304,15 @@ def _host_apply(plan: Mapping[str, Any]) -> Mapping[str, Any]:
         "ok": True,
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
-    })
+    }
+    if cross_service_trust is not None:
+        host_apply.update({
+            "cross_service_trust_anchor_receipt_sha256": (
+                cross_service_trust["receipt_sha256"]
+            ),
+            "cross_service_trust_anchors_ready": True,
+        })
+    return _receipt(host_apply)
 
 
 def _host_start_writer(plan: Mapping[str, Any]) -> Mapping[str, Any]:

@@ -79,6 +79,7 @@ from gateway.operational_edge_service import (
     load_config,
 )
 from gateway.operational_edge_units import (
+    OWNER_GATE_RECEIPT_PUBLIC_KEY,
     OperationalEdgeUnitError,
     render_operational_edge_units,
     service_identity_name,
@@ -316,6 +317,8 @@ def test_mutation_capability_is_exactly_bound_to_writer_plan_intent() -> None:
         idempotency_key=intent.idempotency_key,
         issued_at_unix_ms=1_000,
         expires_at_unix_ms=2_000,
+        subject_discord_user_id="1391703330711142472",
+        case_id="case:case-1",
     )
     envelope = sign_envelope(
         capability.to_mapping(), key_id="canonical-writer-v1", private_key=private_key
@@ -334,6 +337,8 @@ def test_mutation_capability_is_exactly_bound_to_writer_plan_intent() -> None:
         now_unix_ms=1_500,
     )
     assert verified.authority_ref == "plan:case-1:lease-7"
+    assert verified.subject_discord_user_id == "1391703330711142472"
+    assert verified.case_id == "case:case-1"
 
     changed = OperationalRequest(
         request_id=str(uuid.uuid4()),
@@ -374,7 +379,7 @@ def test_existing_writer_consume_issues_edge_capability_from_same_plan_lease() -
         platform="discord",
         session_key_sha256="1" * 64,
         capability_epoch_sha256="2" * 64,
-        user_id="owner-1",
+        user_id="1279454038731264061",
         chat_id="public-channel-1",
         thread_id="public-thread-1",
         message_id="message-1",
@@ -836,6 +841,7 @@ def test_create_only_key_stager_and_pure_foundation_bind_real_key_ids(
         release_owner_uid=os.geteuid(),
         release_owner_gid=os.getegid(),
         writer_public_key_id=writer_id,
+        owner_gate_receipt_public_key_id="e" * 64,
         key_foundation=pre_owner,
         asset_verification=asset_verification,
         key_root=staged_root,
@@ -943,6 +949,7 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     assert bundle.manifest["operation_count"] == len(operation_catalog())
     assert bundle.manifest["release_owner_uid"] == 1006
@@ -1048,6 +1055,41 @@ def test_units_load_only_domain_credentials_and_attest_service_gid() -> None:
         assert all(f"LoadCredential={name}:" not in unit for name in foreign)
 
 
+def test_unit_renderer_requires_an_explicit_trust_anchor_choice() -> None:
+    receipt_key_ids = {
+        domain: f"{index:064x}"
+        for index, domain in enumerate(
+            sorted(CREDENTIALS_BY_DOMAIN), start=1
+        )
+    }
+    services, sockets = _edge_identities()
+    legacy = render_operational_edge_units(
+        revision=REVISION,
+        service_identities=services,
+        socket_groups=sockets,
+        release_owner_uid=1006,
+        release_owner_gid=1007,
+        read_peer_uids=(1004,),
+        mutation_peer_uid=1004,
+        mutation_peer_gid=1005,
+        receipt_public_key_ids=receipt_key_ids,
+        writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id=None,
+    )
+    config = json.loads(
+        legacy.configs["/etc/muncho/operational-edge/skyvision_db.json"]
+    )
+    unit = legacy.units[
+        "muncho-operational-edge-skyvision_db.service"
+    ].decode()
+
+    assert legacy.manifest["owner_gate_receipt_public_key_id"] is None
+    assert config["owner_gate_receipt_public_key_file"] is None
+    assert config["owner_gate_receipt_public_key_id"] is None
+    assert "owner-gate-receipt-public-key" not in unit
+    assert str(OWNER_GATE_RECEIPT_PUBLIC_KEY) not in unit
+
+
 def test_every_rendered_service_config_loads_with_gateway_only_peer(
     tmp_path: Path,
 ) -> None:
@@ -1069,6 +1111,7 @@ def test_every_rendered_service_config_loads_with_gateway_only_peer(
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     for domain in sorted(CREDENTIALS_BY_DOMAIN):
         path = tmp_path / f"{domain}.json"
@@ -1112,6 +1155,7 @@ def test_service_config_accepts_only_exact_production_or_canary_release_root(
         mutation_peer_gid=1005,
         receipt_public_key_ids=receipt_key_ids,
         writer_key_id="f" * 64,
+        owner_gate_receipt_public_key_id="e" * 64,
     )
     raw = next(iter(bundle.configs.values()))
     production = json.loads(raw)
@@ -1214,6 +1258,7 @@ def test_unit_renderer_rejects_any_cross_domain_identity_or_socket_alias() -> No
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
     aliased_sockets = {
         domain: dict(row) for domain, row in sockets.items()
@@ -1231,6 +1276,7 @@ def test_unit_renderer_rejects_any_cross_domain_identity_or_socket_alias() -> No
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
 
 
@@ -1267,6 +1313,7 @@ def test_unit_renderer_rejects_malformed_or_unauthorized_reader_sets(
             mutation_peer_gid=1005,
             receipt_public_key_ids=receipt_key_ids,
             writer_key_id="f" * 64,
+            owner_gate_receipt_public_key_id="e" * 64,
         )
 
 

@@ -92,6 +92,7 @@ _PAYLOAD_FIELDS = (
             "builder_identity",
             "reserved_runtime_uids",
             "reserved_runtime_gids",
+            "owner_gate_receipt_public_key_id",
         }
     )
 )
@@ -382,6 +383,20 @@ def validate_payload(value: Any) -> Mapping[str, Any]:
     )
     for field in _ARTIFACT_DIGEST_FIELDS:
         _sha256(raw.get(field), "release_unit_inputs_v4_payload_invalid")
+    owner_gate_receipt_public_key_id = _sha256(
+        raw.get("owner_gate_receipt_public_key_id"),
+        "release_unit_inputs_v4_payload_invalid",
+    )
+    if owner_gate_receipt_public_key_id in (
+        set(projected["operational_edge_receipt_public_key_ids"].values())
+        | {
+            projected["writer_capability_public_key_id"],
+            projected["discord_edge_receipt_public_key_id"],
+        }
+    ):
+        raise ProductionReleaseUnitInputsV4Error(
+            "release_unit_inputs_v4_payload_invalid"
+        )
     unchanged = _V3_COMPATIBILITY_FIELDS - {
         "release_owner_uid",
         "release_owner_gid",
@@ -402,6 +417,9 @@ def validate_payload(value: Any) -> Mapping[str, Any]:
         "builder_identity": builder,
         "reserved_runtime_uids": reserved_uids,
         "reserved_runtime_gids": reserved_gids,
+        "owner_gate_receipt_public_key_id": (
+            owner_gate_receipt_public_key_id
+        ),
         **{name: raw[name] for name in _ARTIFACT_DIGEST_FIELDS},
     }
 
@@ -414,6 +432,7 @@ def build_payload(
     whole_tree_manifest_sha256: str,
     candidate_seal_receipt_sha256: str,
     runtime_dependency_manifest_sha256: str,
+    owner_gate_receipt_public_key_id: str,
 ) -> Mapping[str, Any]:
     """Build v4 from one already valid v3 payload without changing v3."""
 
@@ -443,6 +462,9 @@ def build_payload(
         "candidate_seal_receipt_sha256": candidate_seal_receipt_sha256,
         "runtime_dependency_manifest_sha256": (
             runtime_dependency_manifest_sha256
+        ),
+        "owner_gate_receipt_public_key_id": (
+            owner_gate_receipt_public_key_id
         ),
     }
     return validate_payload(payload)

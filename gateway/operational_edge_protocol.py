@@ -29,8 +29,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 
-PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
-CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v2"
+PROTOCOL_SCHEMA = "muncho-operational-edge-request.v2"
+LEGACY_PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
+CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v3"
 RECEIPT_SCHEMA = "muncho-operational-edge-receipt.v2"
 PREDISPATCH_MUTATION_BLOCKERS = frozenset(
     {
@@ -52,6 +53,8 @@ _OPERATION = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+){1,7}$")
 _IDEMPOTENCY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,239}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_DISCORD_ID = re.compile(r"^[1-9][0-9]{16,21}$")
+_CASE_ID = re.compile(r"^case:[A-Za-z0-9][A-Za-z0-9._:/-]{0,190}$")
 OPERATOR_TIERS = ("standard", "top", "owner")
 
 
@@ -235,6 +238,8 @@ class OperationalCapability:
     idempotency_key: str
     issued_at_unix_ms: int
     expires_at_unix_ms: int
+    subject_discord_user_id: str
+    case_id: str
     operator_tier: str = "standard"
 
     @classmethod
@@ -251,6 +256,8 @@ class OperationalCapability:
                     "idempotency_key",
                     "issued_at_unix_ms",
                     "expires_at_unix_ms",
+                    "subject_discord_user_id",
+                    "case_id",
                     "operator_tier",
                 }
             ),
@@ -275,6 +282,15 @@ class OperationalCapability:
         operator_tier = raw["operator_tier"]
         if operator_tier not in OPERATOR_TIERS:
             _fail("invalid_capability_operator_tier")
+        subject_discord_user_id = raw["subject_discord_user_id"]
+        case_id = raw["case_id"]
+        if (
+            not isinstance(subject_discord_user_id, str)
+            or _DISCORD_ID.fullmatch(subject_discord_user_id) is None
+        ):
+            _fail("invalid_capability_subject")
+        if not isinstance(case_id, str) or _CASE_ID.fullmatch(case_id) is None:
+            _fail("invalid_capability_case")
         return cls(
             authority_kind="canonical_plan",
             authority_ref=authority_ref,
@@ -285,6 +301,8 @@ class OperationalCapability:
             idempotency_key=_idempotency(raw["idempotency_key"]),
             issued_at_unix_ms=issued,
             expires_at_unix_ms=expires,
+            subject_discord_user_id=subject_discord_user_id,
+            case_id=case_id,
             operator_tier=operator_tier,
         )
 
@@ -298,6 +316,8 @@ class OperationalCapability:
             "idempotency_key": self.idempotency_key,
             "issued_at_unix_ms": self.issued_at_unix_ms,
             "expires_at_unix_ms": self.expires_at_unix_ms,
+            "subject_discord_user_id": self.subject_discord_user_id,
+            "case_id": self.case_id,
             "operator_tier": self.operator_tier,
         }
 
@@ -398,6 +418,7 @@ class OperationalRequest:
     deadline_unix_ms: int
     intent: OperationalIntent
     capability: SignedEnvelope | None
+    step_up_authorization: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(
@@ -406,22 +427,18 @@ class OperationalRequest:
         *,
         now_unix_ms: int | None = None,
     ) -> "OperationalRequest":
-        raw = _exact(
-            value,
-            frozenset(
-                {
-                    "schema",
-                    "request_id",
-                    "sequence",
-                    "deadline_unix_ms",
-                    "intent",
-                    "capability",
-                }
-            ),
-            "invalid_request",
-        )
-        if raw["schema"] != PROTOCOL_SCHEMA:
+        if not isinstance(value, Mapping):
+            _fail("invalid_request")
+        schema = value.get("schema")
+        fields = {
+            "schema", "request_id", "sequence", "deadline_unix_ms",
+            "intent", "capability",
+        }
+        if schema == PROTOCOL_SCHEMA:
+            fields.add("step_up_authorization")
+        elif schema != LEGACY_PROTOCOL_SCHEMA:
             _fail("invalid_request_schema")
+        raw = _exact(value, frozenset(fields), "invalid_request")
         sequence = raw["sequence"]
         if type(sequence) is not int or not 0 <= sequence < (1 << 63):
             _fail("invalid_sequence")
@@ -442,6 +459,22 @@ class OperationalRequest:
             deadline_unix_ms=deadline,
             intent=OperationalIntent.from_mapping(raw["intent"]),
             capability=capability,
+            step_up_authorization=(
+                None
+                if schema == LEGACY_PROTOCOL_SCHEMA
+                or raw["step_up_authorization"] is None
+                else dict(
+                    _exact(
+                        raw["step_up_authorization"],
+                        frozenset({
+                            "schema", "retrieval_token_b64", "action_envelope",
+                            "challenge_record", "grant_record",
+                            "authorization_receipt",
+                        }),
+                        "invalid_step_up_authorization",
+                    )
+                )
+            ),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -452,6 +485,11 @@ class OperationalRequest:
             "deadline_unix_ms": self.deadline_unix_ms,
             "intent": self.intent.to_mapping(),
             "capability": self.capability.to_mapping() if self.capability else None,
+            "step_up_authorization": (
+                None
+                if self.step_up_authorization is None
+                else dict(self.step_up_authorization)
+            ),
         }
 
 
