@@ -71,7 +71,7 @@ Dyad config env:   DYAD_LANGUAGE_MODEL_CATALOG_URL  (override model catalog)
 Run the bridge script to list all Dyad projects:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py list
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py list
 ```
 
 Output: id, name, path, created_at, github_repo for each Dyad app.
@@ -81,13 +81,13 @@ Output: id, name, path, created_at, github_repo for each Dyad app.
 List chats for a project:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py chats <app_id>
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py chats <app_id>
 ```
 
 Read messages from a chat:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py messages <chat_id>
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py messages <chat_id>
 ```
 
 ### 3. Write AI_RULES.md (Hermes → Dyad context sync)
@@ -97,7 +97,7 @@ decisions, or task state into a Dyad project's `AI_RULES.md`. Dyad loads this fi
 and injects it as authoritative context into every AI chat turn.
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py write-rules \
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py write-rules \
   <project-name-or-id> --file /path/to/context.md
 ```
 
@@ -105,7 +105,7 @@ Or pipe content directly:
 
 ```bash
 echo "# Project Context\n\nBuild a React dashboard with..." | \
-  python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py write-rules \
+  python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py write-rules \
     <project-name-or-id> --stdin
 ```
 
@@ -144,7 +144,7 @@ transports.
 For a stdio MCP server (e.g., a Hermes tool bridge):
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-mcp \
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py add-mcp \
   --name "Hermes Bridge" \
   --transport stdio \
   --command python3 \
@@ -155,7 +155,7 @@ python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-mcp \
 For an SSE/URL-based MCP server:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-mcp \
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py add-mcp \
   --name "Remote Tools" \
   --transport sse \
   --url "http://localhost:8082/sse"
@@ -164,13 +164,13 @@ python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-mcp \
 List registered MCP servers:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py list-mcp
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py list-mcp
 ```
 
 Remove an MCP server:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py remove-mcp <server_id>
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py remove-mcp <server_id>
 ```
 
 **Note:** After adding an MCP server via the DB, Dyad needs to be restarted (or the
@@ -182,7 +182,7 @@ settings page — changes there write to the same `mcp_servers` table.
 Dyad stores reusable prompts in the `prompts` table. Add one from Hermes:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-prompt \
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py add-prompt \
   --title "Build Dashboard" \
   --description "Standard dashboard scaffold prompt" \
   --content "Create a React dashboard with chart.js, dark theme, responsive layout..."
@@ -191,7 +191,7 @@ python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py add-prompt \
 List prompts:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py list-prompts
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py list-prompts
 ```
 
 ### 7. Create a New Dyad Project
@@ -199,7 +199,7 @@ python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py list-prompts
 Create the project directory and register it in Dyad's DB:
 
 ```bash
-python3 ~/.hermes/skills/dyad-integration/scripts/dyad_bridge.py create-project \
+python3 ~/.hermes/skills/devops/dyad-integration/scripts/dyad_bridge.py create-project \
   --name "my-new-app" \
   --path ~/dyad-apps/my-new-app
 ```

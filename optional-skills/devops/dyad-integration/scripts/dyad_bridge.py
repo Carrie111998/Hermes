@@ -91,18 +91,18 @@ def resolve_project(identifier):
 
 
 def project_dir(app_row):
-    """Get the absolute filesystem path for a Dyad project."""
+    """Get the absolute filesystem path for a Dyad project.
+
+    Dyad stores either a bare project name (relative, resolved under
+    DYAD_PROJECTS_DIR) or an absolute path (when --path was used).
+    """
     path = app_row["path"]
-    # Dyad stores relative path (name only) — resolve under ~/dyad-apps/
-    abs_path = DYAD_PROJECTS_DIR / path
-    if abs_path.exists():
-        return abs_path
-    # Fallback: maybe it's already absolute
     p = Path(path)
-    if p.is_absolute() and p.exists():
+    # If it's already absolute, use it directly
+    if p.is_absolute():
         return p
-    # If nothing exists, return the ~/dyad-apps/<path> path anyway
-    return abs_path
+    # Otherwise resolve under DYAD_PROJECTS_DIR
+    return DYAD_PROJECTS_DIR / path
 
 
 def fmt_ts(ts):
@@ -278,12 +278,21 @@ def cmd_create_project(name, path=None):
             }
         }, indent=2))
 
+    # Determine what to store in apps.path:
+    # - If using the default dir (~/dyad-apps/<name>), store the bare name (relative —
+    #   Dyad's own convention, resolved by project_dir() under DYAD_PROJECTS_DIR).
+    # - If using a custom --path, store the absolute path so project_dir() can find it.
+    if path == DYAD_PROJECTS_DIR / name:
+        stored_path = name
+    else:
+        stored_path = str(path)
+
     # Register in Dyad DB
     conn = connect_db_write()
     try:
         conn.execute(
             "INSERT INTO apps (name, path, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (name, name, int(time.time()), int(time.time())),
+            (name, stored_path, int(time.time()), int(time.time())),
         )
         conn.commit()
     except sqlite3.IntegrityError as e:

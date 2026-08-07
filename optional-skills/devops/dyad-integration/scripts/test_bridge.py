@@ -529,12 +529,49 @@ class TestCreateProject(DyadBridgeTestBase):
         self.assertTrue((proj_dir / ".gitignore").exists())
 
     def test_create_custom_path(self):
-        """create-project with --path should use the custom path."""
+        """create-project with --path should use the custom path and store it in DB."""
         custom = self.tmp / "custom-location" / "my-app"
         rc, out, err = self.run_bridge("create-project", "--name", "custom-app", "--path", str(custom))
         self.assertEqual(rc, 0, f"stderr: {err}")
         self.assertTrue(custom.exists())
         self.assertTrue((custom / ".git").exists())
+
+        # Verify the DB stores the absolute path, not the project name
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path))
+        row = conn.execute("SELECT path FROM apps WHERE name = 'custom-app'").fetchone()
+        conn.close()
+        self.assertIsNotNone(row, "Project not found in DB")
+        self.assertEqual(row[0], str(custom), f"DB path should be '{custom}' but got '{row[0]}'")
+
+    def test_create_custom_path_then_write_rules(self):
+        """write-rules should resolve to the custom path after create-project."""
+        custom = self.tmp / "custom-loc" / "rules-app"
+        self.run_bridge("create-project", "--name", "rules-app", "--path", str(custom))
+
+        # Write rules to the project — should land in the custom dir, not ~/dyad-apps/
+        rules_file = self.tmp / "rules.md"
+        rules_file.write_text("# Custom Path Rules\n")
+        rc, out, err = self.run_bridge("write-rules", "rules-app", "--file", str(rules_file))
+        self.assertEqual(rc, 0, f"stderr: {err}")
+
+        # AI_RULES.md must be in the custom directory
+        self.assertTrue((custom / "AI_RULES.md").exists(),
+                        f"AI_RULES.md not in custom dir {custom}")
+        # And NOT in ~/dyad-apps/rules-app/
+        self.assertFalse((self.projects_dir / "rules-app" / "AI_RULES.md").exists(),
+                         "AI_RULES.md wrongly created in default dyad-apps dir")
+
+    def test_create_default_path_stores_name(self):
+        """create-project without --path should store the bare name in apps.path."""
+        self.run_bridge("create-project", "--name", "default-path-app")
+
+        import sqlite3
+        conn = sqlite3.connect(str(self.db_path))
+        row = conn.execute("SELECT path FROM apps WHERE name = 'default-path-app'").fetchone()
+        conn.close()
+        self.assertEqual(row[0], "default-path-app",
+                         f"Default path should store bare name, got '{row[0]}'")
 
     def test_create_registers_in_db(self):
         """create-project should insert a row into the apps table."""
