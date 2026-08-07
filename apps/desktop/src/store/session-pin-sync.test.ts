@@ -208,4 +208,41 @@ describe('watchSessionPins remote pull', () => {
 
     expect($pinnedSessionIds.get()).not.toContain('race')
   })
+
+  it('collapses tip+root local aliases onto the durable pin id', async () => {
+    // Historical LevelDB / pre-lineage pins store the live tip; pull also adds
+    // the root. Without collapse, unpin(root) leaves tip and push re-pins.
+    $sessions.set([row('tip', { _lineage_root_id: 'root', pinned: true })])
+    $pinnedSessionIds.set(['tip', 'root'])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toEqual(['root'])
+    expect($pinnedSessionIds.get()).not.toContain('tip')
+  })
+
+  it('user unpin of durable root does not re-push pinned=true via leftover tip', async () => {
+    const { unpinSession } = await import('@/store/layout')
+
+    $sessions.set([row('tip', { _lineage_root_id: 'root', pinned: true, profile: 'default' })])
+    await flush()
+    // Simulate polluted localStorage (tip alias survived an older exact-match unpin).
+    $pinnedSessionIds.set(['tip', 'root'])
+    await flush()
+    patch.mockClear()
+
+    unpinSession('root')
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('root')
+    expect($pinnedSessionIds.get()).not.toContain('tip')
+    // Leftover tip must not cause a pinned=true re-assert while false is in flight / after.
+    expect(patch.mock.calls.some(call => call[1] === true)).toBe(false)
+
+    // Server accepted unpin — refresh must stay clear.
+    $sessions.set([row('tip', { _lineage_root_id: 'root', pinned: false, profile: 'default' })])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('root')
+    expect($pinnedSessionIds.get()).not.toContain('tip')
+  })
 })
