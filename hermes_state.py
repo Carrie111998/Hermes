@@ -6395,10 +6395,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # back-filled root then projects to its live tip exactly like a row
         # that had made the page on its own. One extra query, bounded by the
         # number of pins (a handful), never N+1 per pin.
+        #
+        # IMPORTANT: the pinned back-fill must NOT inherit the archived filter.
+        # A pin is a "this must always be reachable" statement — an archived
+        # pinned conversation should still appear in the sidebar. We rebuild
+        # the WHERE for the pinned query by dropping the `s.archived` clause
+        # while keeping all other filters (source, min_message_count, etc.).
         if include_pinned:
             seen_ids = {s["id"] for s in sessions}
+            pinned_clauses = [
+                c for c in where_clauses
+                if c not in ("s.archived = 0", "s.archived = 1")
+            ]
             pinned_where = (
-                f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
+                f"WHERE {' AND '.join(pinned_clauses)} AND s.pinned = 1"
+                if pinned_clauses else "WHERE s.pinned = 1"
             )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             pinned_query = f"""
