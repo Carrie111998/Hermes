@@ -1447,7 +1447,8 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, profile_adapters=None, loop=None) -> Optional[str]:
+
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1577,6 +1578,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         from gateway.delivery import resolve_delivery_transport
 
         transport = resolve_delivery_transport(platform, config, adapters)
+        # Cross-profile cron delivery: when running under multiplex, resolve
+        # the adapter from the profile that owns this cron job instead of
+        # defaulting to the main profile's adapter (#cross-profile-cron-delivery).
+        if profile_adapters:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+                _profile_home = job.get("_profile_home")
+                if _profile_home:
+                    for pname, padapters in profile_adapters.items():
+                        if _profile_home == str(get_profile_dir(pname)):
+                            padapter = padapters.get(platform)
+                            if padapter is not None:
+                                from gateway.delivery import DeliveryTransport
+                                pconfig = padapter.config if hasattr(padapter, 'config') else None
+                                transport = DeliveryTransport(
+                                    adapter=padapter,
+                                    config=pconfig,
+                                    transport_platform=platform,
+                                )
+                                logger.info(
+                                    "Job '%s': using profile '%s' adapter for %s delivery",
+                                    job.get("id", "?"), pname, platform_name,
+                                )
+                            break
+            except Exception:
+                pass
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -3875,7 +3902,7 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(job: dict, *, adapters=None, profile_adapters=None, loop=None, verbose: bool = False) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -4008,7 +4035,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, profile_adapters=profile_adapters, loop=loop)
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4103,6 +4130,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    profile_adapters=None,
 ):
     """
     Check and run all due jobs.
@@ -4143,6 +4171,14 @@ def tick(
             return 0
 
         due_jobs = get_due_jobs()
+
+        # Stamp each job with the profile home so _deliver_result can route
+        # through the correct profile's adapter instead of defaulting to the
+        # main profile's bot (#cross-profile-cron-delivery).
+        _cron_profile_home = str(_get_hermes_home())
+        for _dj in due_jobs:
+            if "_profile_home" not in _dj:
+                _dj["_profile_home"] = _cron_profile_home
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
@@ -4191,7 +4227,7 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(job, adapters=adapters, profile_adapters=profile_adapters, loop=loop, verbose=verbose)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
