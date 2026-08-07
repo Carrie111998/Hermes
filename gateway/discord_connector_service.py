@@ -640,7 +640,17 @@ class DiscordConnectorRuntime:
     def _send(self, request: DiscordConnectorRequest) -> dict[str, Any]:
         payload = dict(request.payload)
         target = DiscordConnectorTarget.from_mapping(payload["target"])
-        request_sha256 = sha256_json(payload)
+        # The deadline is a per-transport-attempt freshness bound, not part of
+        # the logical Discord mutation. A caller reconciling the same stable
+        # idempotency key after losing the first receipt necessarily supplies a
+        # fresh deadline. Bind every mutation-bearing field while permitting
+        # that safe replay; changed target/content/reply still conflicts.
+        request_sha256 = sha256_json({
+            "idempotency_key": payload["idempotency_key"],
+            "target": payload["target"],
+            "content": payload["content"],
+            "reply_to_message_id": payload["reply_to_message_id"],
+        })
         idempotency_key = str(payload["idempotency_key"])
         content_sha256 = sha256_json({"content": payload["content"]})
         existing = self.journal.prepare_send(

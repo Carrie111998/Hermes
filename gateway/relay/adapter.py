@@ -935,6 +935,9 @@ class RelayAdapter(BasePlatformAdapter):
             message_id=result.get("message_id"),
             error=result.get("error"),
             raw_response=result,
+            retryable=result.get("retryable") is True,
+            retry_after=result.get("retry_after"),
+            error_kind=result.get("error_kind"),
         )
 
     async def send(

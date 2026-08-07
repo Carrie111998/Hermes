@@ -37,6 +37,8 @@ RELEASE_RETENTION_HELPER_RELATIVE_PATH="ops/muncho/runtime/release_retention.py"
 RUNTIME_CONFIG_ROOT_UID=0
 RUNTIME_CONFIG_ROOT_GID=0
 HERMES_HOME="/opt/adventico-ai-platform/hermes-home"
+MUNCHO_RELEASE_STATE_DIR="$HERMES_HOME/state/private/muncho-release"
+PRODUCTION_CONFIG_PATH="$HERMES_HOME/config.yaml"
 PLANNED_RESTART_HELPER="$HERMES_HOME/scripts/planned_gateway_restart.sh"
 STATE_DIR="/opt/adventico-ai-platform/canonical-brain/state/private/upstream_sync_monitor"
 REPORT_DIR="/opt/adventico-ai-platform/canonical-brain/state/reports"
@@ -2648,7 +2650,7 @@ try:
     bin_opened = os.fstat(bin_descriptor)
     if identity(bin_before) != identity(bin_opened):
         raise SystemExit("BLOCKED_RELEASE_ENTRYPOINT_BIN_CHANGED")
-    for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops"):
+    for name in ("hermes", "hermes-acp", "hermes-agent", "muncho-ops", "muncho-release"):
         try:
             before = os.stat(name, dir_fd=bin_descriptor, follow_symlinks=False)
             fd = os.open(name, flags, dir_fd=bin_descriptor)
@@ -2942,6 +2944,69 @@ print('routeback_context_import_smoke=ok')
 PY"
 }
 
+reserve_muncho_release_mapping() {
+  local release="$1"
+  local sha="$2"
+  sudo -n -u "$OWNER" env \
+    HERMES_HOME="$HERMES_HOME" \
+    "$release/.venv/bin/muncho-release" reserve \
+    --release-root "$release" \
+    --release-sha "$sha" \
+    --state-dir "$MUNCHO_RELEASE_STATE_DIR"
+}
+
+systemd_service_invocation_id() {
+  local observed
+  observed="$(systemctl show "$SERVICE" --property InvocationID --value 2>/dev/null || true)"
+  if [[ ! "$observed" =~ ^[0-9a-f]{32}$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "$observed"
+}
+
+prepare_muncho_restart_attestation() {
+  local release="$1"
+  local sha="$2"
+  local before_invocation_id="$3"
+  sudo -n -u "$OWNER" env \
+    HERMES_HOME="$HERMES_HOME" \
+    "$release/.venv/bin/muncho-release" restart-prepare \
+    --release-root "$release" \
+    --release-sha "$sha" \
+    --state-dir "$MUNCHO_RELEASE_STATE_DIR" \
+    --service "$SERVICE" \
+    --before-invocation-id "$before_invocation_id"
+}
+
+complete_muncho_restart_attestation() {
+  local release="$1"
+  local sha="$2"
+  local after_invocation_id="$3"
+  sudo -n -u "$OWNER" env \
+    HERMES_HOME="$HERMES_HOME" \
+    "$release/.venv/bin/muncho-release" restart-complete \
+    --release-root "$release" \
+    --release-sha "$sha" \
+    --state-dir "$MUNCHO_RELEASE_STATE_DIR" \
+    --service "$SERVICE" \
+    --after-invocation-id "$after_invocation_id"
+}
+
+announce_muncho_release_after_smoke() {
+  local release="$1"
+  local sha="$2"
+  sudo -n -u "$OWNER" env \
+    HERMES_HOME="$HERMES_HOME" \
+    "$release/.venv/bin/muncho-release" announce-after-smoke \
+    --release-root "$release" \
+    --release-sha "$sha" \
+    --state-dir "$MUNCHO_RELEASE_STATE_DIR" \
+    --production-config "$PRODUCTION_CONFIG_PATH" \
+    --check "Gateway service is active after the planned production restart." \
+    --check "Active release Git HEAD and source marker match the exact release SHA." \
+    --check "Release entrypoints, virtualenv, and post-restart production smokes passed."
+}
+
 run_deploy() {
   local sha="$1"
   local pr="$2"
@@ -2959,6 +3024,8 @@ run_deploy() {
   local rollback_rc
   local publish_rc
   local activation_rc
+  local restart_before_invocation
+  local restart_after_invocation
 
   write_status "deploy_running" "$sha" "$pr" "{}"
   active="$(readlink -f "$ACTIVE_LINK" 2>/dev/null || true)"
@@ -2979,14 +3046,34 @@ run_deploy() {
     if [ "$active_head" != "$sha" ] \
       || [ "$active_source" != "$sha" ] \
       || ! systemctl is-active --quiet "$SERVICE" \
+      || [ -e "$HERMES_HOME/.gateway-planned-stop.json" ] \
       || ! attest_target_release_entrypoints "$active" >/dev/null \
       || ! attest_target_release_venv "$active" "$active" >/dev/null \
       || ! cutover_artifacts_match "$active" "$sha"; then
       write_status "blocked_target_already_active_unhealthy" "$sha" "$pr" "{}"
       exit 4
     fi
+    local already_active_announcement
+    local already_active_invocation
+    if ! reserve_muncho_release_mapping "$active" "$sha" >/dev/null; then
+      write_status "blocked_muncho_release_mapping" "$sha" "$pr" \
+        "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true}"
+      return 13
+    fi
+    if ! already_active_invocation="$(systemd_service_invocation_id)" \
+      || ! complete_muncho_restart_attestation \
+        "$active" "$sha" "$already_active_invocation" >/dev/null; then
+      write_status "deploy_smoke_passed_release_announcement_blocked" "$sha" "$pr" \
+        "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true, \"release_completion\": \"qualifying_restart_unattested\"}"
+      return 13
+    fi
+    if ! already_active_announcement="$(announce_muncho_release_after_smoke "$active" "$sha")"; then
+      write_status "deploy_smoke_passed_release_announcement_blocked" "$sha" "$pr" \
+        "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true}"
+      return 13
+    fi
     write_status "deploy_pass" "$sha" "$pr" \
-      "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true}"
+      "{\"deployed_release\": \"$new\", \"deployed_head\": \"$active_head\", \"service_active\": \"active\", \"already_active\": true, \"muncho_release\": $already_active_announcement}"
     return 0
   fi
   require_no_active_voice_call "$sha" "$pr" "pre_release"
@@ -3123,6 +3210,12 @@ run_deploy() {
     exit 5
   fi
 
+  if ! reserve_muncho_release_mapping "$new" "$sha" >/dev/null; then
+    write_status "blocked_muncho_release_mapping" "$sha" "$pr" \
+      "{\"stage\": \"pre_activation\", \"deployed_release\": \"$new\"}"
+    exit 13
+  fi
+
   require_no_active_voice_call "$sha" "$pr" "pre_restart"
   require_inactive_target_with_unchanged_active \
     "$sha" "$pr" "$active" "$new" "pre_restart_marker" || return $?
@@ -3136,6 +3229,15 @@ run_deploy() {
   )"; then
     write_status "blocked_planned_stop_marker_failed" "$sha" "$pr" "{}"
     exit 7
+  fi
+  if [ "$marker_output" != "PLANNED_STOP_MARKER_PASS" ] \
+    || ! restart_before_invocation="$(systemd_service_invocation_id)" \
+    || ! prepare_muncho_restart_attestation \
+      "$new" "$sha" "$restart_before_invocation" >/dev/null; then
+    rm -f "$HERMES_HOME/.gateway-planned-stop.json"
+    write_status "blocked_muncho_restart_attestation_prepare" "$sha" "$pr" \
+      "{\"stage\": \"pre_activation\"}"
+    exit 13
   fi
   require_inactive_target_with_unchanged_active \
     "$sha" "$pr" "$active" "$new" "pre_link_activation" || {
@@ -3195,6 +3297,20 @@ run_deploy() {
     fail_after_activation "$sha" "$pr" "$active" "target_post_smoke_failed" "$active_head" || rollback_rc=$?
     exit "$rollback_rc"
   fi
+  if ! restart_after_invocation="$(systemd_service_invocation_id)" \
+    || [ "$restart_after_invocation" = "$restart_before_invocation" ] \
+    || ! complete_muncho_restart_attestation \
+      "$new" "$sha" "$restart_after_invocation" >/dev/null; then
+    write_status "deploy_smoke_passed_release_announcement_blocked" "$sha" "$pr" \
+      "{\"deployed_release\": \"$new\", \"deployed_head\": \"$deployed_head\", \"service_active\": \"$service_active\", \"release_completion\": \"qualifying_restart_unattested\"}"
+    return 13
+  fi
+  local release_announcement
+  if ! release_announcement="$(announce_muncho_release_after_smoke "$new" "$sha")"; then
+    write_status "deploy_smoke_passed_release_announcement_blocked" "$sha" "$pr" \
+      "{\"deployed_release\": \"$new\", \"deployed_head\": \"$deployed_head\", \"service_active\": \"$service_active\", \"release_completion\": \"discord_announcement_unconfirmed\"}"
+    return 13
+  fi
   local cleanup_output
   local cleanup_rc=0
   local cleanup_status="pass"
@@ -3205,7 +3321,7 @@ run_deploy() {
     # already healthy deployment.  Record the blocked cleanup explicitly.
     cleanup_status="blocked"
   fi
-  write_status "deploy_pass" "$sha" "$pr" "{\"deployed_release\": \"$new\", \"deployed_head\": \"$deployed_head\", \"service_active\": \"$service_active\", \"release_cleanup\": {\"status\": \"$cleanup_status\", \"returncode\": $cleanup_rc, \"detail\": $(printf '%s' "$cleanup_output" | json_escape)}}"
+  write_status "deploy_pass" "$sha" "$pr" "{\"deployed_release\": \"$new\", \"deployed_head\": \"$deployed_head\", \"service_active\": \"$service_active\", \"muncho_release\": $release_announcement, \"release_cleanup\": {\"status\": \"$cleanup_status\", \"returncode\": $cleanup_rc, \"detail\": $(printf '%s' "$cleanup_output" | json_escape)}}"
 }
 
 main() {
