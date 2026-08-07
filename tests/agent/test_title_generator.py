@@ -189,13 +189,15 @@ class TestAutoTitleSession:
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
-    def test_skips_if_not_first_exchange(self):
-        """Should not fire for conversations with more than 2 user messages."""
+    def test_skips_when_session_already_titled(self):
+        """A titled session is never re-titled, no matter how many
+        role=user entries the history carries."""
         db = MagicMock()
+        db.get_session_title.return_value = "Existing Title"
         history = [
-            {"role": "user", "content": "first"},
+            {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] ..."},
             {"role": "assistant", "content": "response 1"},
-            {"role": "user", "content": "second"},
+            {"role": "user", "content": "[IMPORTANT: Background process 42 exited (exit code 1). Command: sleep 30]"},
             {"role": "assistant", "content": "response 2"},
             {"role": "user", "content": "third"},
             {"role": "assistant", "content": "response 3"},
@@ -203,10 +205,63 @@ class TestMaybeAutoTitle:
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
             maybe_auto_title(db, "sess-1", "third", "response 3", history)
-            # Wait briefly for any thread to start
-            import time
-            time.sleep(0.1)
             mock_auto.assert_not_called()
+
+    def test_fires_despite_technical_user_entries(self):
+        """Regression for #76842: technical role=user markers (compaction
+        placeholders, background notifications, image attachments) must not
+        suppress titling — the persisted title is the single source of
+        truth, not a message-count heuristic."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        history = [
+            {"role": "user", "content": "[CONTEXT COMPACTION — REFERENCE ONLY] older turns"},
+            {"role": "assistant", "content": "compacted response"},
+            {"role": "user", "content": "[IMPORTANT: Background process 42 exited (exit code 1). Command: sleep 30]"},
+            {"role": "assistant", "content": "process notification handled"},
+            {"role": "user", "content": "[The user attached an image: screenshot.png]"},
+            {"role": "assistant", "content": "image description"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-2", "hello", "hi there", history)
+            assert called.wait(timeout=10), "auto_title thread never ran"
+            mock_auto.assert_called_once()
+
+    def test_no_double_fire_while_worker_in_flight(self):
+        """A second maybe_auto_title call for the same session while a
+        worker is still running must not spawn another thread."""
+        import threading
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_worker(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=10)
+
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        try:
+            with patch(
+                "agent.title_generator.auto_title_session",
+                side_effect=slow_worker,
+            ) as mock_auto:
+                maybe_auto_title(db, "sess-3", "hello", "hi there", history)
+                assert started.wait(timeout=10), "first worker never started"
+                # In-flight guard: this must return without spawning.
+                maybe_auto_title(db, "sess-3", "hello", "hi there", history)
+                mock_auto.assert_called_once()
+        finally:
+            release.set()
 
     def test_fires_on_first_exchange(self):
         """Should fire a background thread for the first exchange."""
@@ -221,13 +276,13 @@ class TestMaybeAutoTitle:
             import threading
             called = threading.Event()
             mock_auto.side_effect = lambda *a, **k: called.set()
-            maybe_auto_title(db, "sess-1", "hello", "hi there", history)
+            maybe_auto_title(db, "sess-4", "hello", "hi there", history)
             # Event-based wait: sleep-sync flaked when the daemon thread
             # wasn't scheduled within the fixed nap on a loaded runner.
             assert called.wait(timeout=10), "auto_title thread never ran"
             mock_auto.assert_called_once_with(
                 db,
-                "sess-1",
+                "sess-4",
                 "hello",
                 "hi there",
                 failure_callback=None,

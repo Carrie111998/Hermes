@@ -353,6 +353,15 @@ def _auto_title_session(
         logger.debug("Failed to set auto-generated title: %s", e)
 
 
+# Process-local in-flight guard: prevents a second title-generation worker
+# from being spawned for the same session while one is still running. The
+# set is keyed by session_id and entries are removed in the worker's
+# finally block, so a stale entry can only linger if the daemon thread is
+# killed mid-flight (process exit), which makes the whole set moot anyway.
+_title_in_flight: set = set()
+_title_in_flight_lock = threading.Lock()
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -364,39 +373,71 @@ def maybe_auto_title(
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
 ) -> None:
-    """Fire-and-forget title generation after the first exchange.
+    """Fire-and-forget title generation.
 
-    Only generates a title when:
-    - This appears to be the first user→assistant exchange
-    - No title is already set
+    Generates a title for any session that does not have one yet, using the
+    persisted title as the single source of truth instead of a first-exchange
+    message-count heuristic. The count heuristic assumed every
+    ``role="user"`` history entry is a real user turn, but gateway/desktop
+    histories persist system-injected markers with ``role="user"`` —
+    context-compaction placeholders, background-process notifications,
+    image-attachment descriptions, and replay duplicates. Once any of those
+    appeared before the first clean response, the session was permanently
+    left untitled with no log line and no retry (#76842).
+
+    A process-local in-flight guard (``_title_in_flight``) prevents a second
+    worker from being spawned for the same session while one is running.
+    The worker re-checks the DB title itself, so a manual ``/title`` set
+    after this guard still wins (see ``auto_title_session``).
+
+    ``conversation_history`` is kept in the signature for backward
+    compatibility with existing callers but is deliberately not used as a
+    first-exchange heuristic.
     """
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
-    # Count user messages in history to detect first exchange.
-    # conversation_history includes the exchange that just happened,
-    # so for a first exchange we expect exactly 1 user message
-    # (or 2 counting system). Be generous: generate on first 2 exchanges.
-    user_msg_count = sum(1 for m in (conversation_history or []) if m.get("role") == "user")
-    if user_msg_count > 2:
-        return
+    with _title_in_flight_lock:
+        if session_id in _title_in_flight:
+            logger.debug(
+                "Auto-title skipped: worker already in flight for session %s",
+                session_id,
+            )
+            return
+        try:
+            existing = session_db.get_session_title(session_id)
+        except Exception:
+            return
+        if existing:
+            logger.debug(
+                "Auto-title skipped: session %s already titled", session_id
+            )
+            return
+        _title_in_flight.add(session_id)
 
-    # Config read comes after the cheap first-exchange guard so the file
-    # isn't touched on every subsequent turn of a long session.
+    # Config read happens after the cheap guards so the file isn't touched
+    # on every turn of a long session.
     if not _auto_title_enabled():
+        with _title_in_flight_lock:
+            _title_in_flight.discard(session_id)
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
-    thread = threading.Thread(
-        target=auto_title_session,
-        args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-            "runtime_validator": runtime_validator,
-        },
-        daemon=True,
-        name="auto-title",
-    )
+    def _run() -> None:
+        try:
+            auto_title_session(
+                session_db,
+                session_id,
+                user_message,
+                assistant_response,
+                failure_callback=failure_callback,
+                main_runtime=main_runtime,
+                title_callback=title_callback,
+                runtime_validator=runtime_validator,
+            )
+        finally:
+            with _title_in_flight_lock:
+                _title_in_flight.discard(session_id)
+
+    thread = threading.Thread(target=_run, daemon=True, name="auto-title")
     thread.start()
