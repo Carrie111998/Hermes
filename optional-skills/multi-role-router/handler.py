@@ -277,7 +277,7 @@ async def _call_auxiliary_llm(prompt: str, aux_cfg: Dict[str, Any], config: Dict
         from agent.auxiliary_client import call_llm
         resp = await asyncio.to_thread(
             call_llm,
-            task="compression",  # use compression slot — cheap text, no vision
+            task="triage_specifier",  # match the config slot read by _get_auxiliary_config()
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=32,
@@ -419,12 +419,12 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
     # NOTE (TOCTOU): _load_meta() is called here without _META_LOCK.  This is a
     # deliberate trade-off: the gateway invokes message:pre_route hooks serially
     # (one hook at a time per turn), so concurrent writes to meta.yaml from this
-    # hook are not possible in normal operation.  The only writer is
-    # _update_meta_session(), which runs under _META_LOCK.  A concurrent turn on
-    # a different session could race, but hermes-agent's single-agent-per-session
-    # model means turns for the same user are also serialised.  If this hook is
-    # ever invoked from a multi-threaded context, load current_role and history
-    # inside _META_LOCK instead.
+    # hook are not possible in normal operation.  The only writer is the decision
+    # block below, which runs under _META_LOCK.  A concurrent turn on a different
+    # session could race, but hermes-agent's single-agent-per-session model means
+    # turns for the same user are also serialised.  If this hook is ever invoked
+    # from a multi-threaded context, load current_role and history inside
+    # _META_LOCK instead.
     meta = _load_meta()
 
     current_role: str = meta.get("current_role", "default")
@@ -460,6 +460,12 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
     # Decide — mutate + save under lock to prevent concurrent interleaving.
     # _META_LOCK serialises threads within this process; if hook instances
     # run in separate processes, a filesystem lock would be needed instead.
+    #
+    # History is recorded atomically inside this same lock so that the
+    # session map written by the decision block is never clobbered by a
+    # separate _update_meta_session() call (which would overwrite the
+    # target role's session_id with the *inbound* session_id, orphaning
+    # the isolated session).
     # ------------------------------------------------------------------
     decision: Optional[Dict[str, Any]] = None
     target_session_id: str = ""
@@ -476,7 +482,7 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
 
         if target_role == current_role:
             # No switch needed — save current session mapping and pass through
-            _save_meta(meta)
+            pass
         else:
             target_session_id = sessions.get(target_role, "")
 
@@ -496,7 +502,6 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
                 # pre-register a session_id for each role in meta.yaml during
                 # installation (see README.md § "Pre-seeding sessions").
                 meta["current_role"] = target_role
-                _save_meta(meta)
                 logger.info(
                     "[multi-role-router] Role switch to '%s' detected but no prior session exists "
                     "(first-turn isolation gap): current turn stays in session '%s'. "
@@ -505,22 +510,20 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
                     current_session_id,
                 )
             elif target_session_id == current_session_id:
-                _save_meta(meta)
+                pass
             else:
                 # Switch!
                 meta["current_role"] = target_role
-                _save_meta(meta)
                 decision = {"decision": "switch_session", "session_id": target_session_id}
 
-    # Record the exchange in history so future classifier calls have context.
-    # The assistant response is not available at pre_route time.
-    _update_meta_session(
-        role=target_role,
-        session_id=current_session_id,
-        current_role=current_role,
-        message=message,
-        response="",  # not available at pre_route time
-    )
+        # Append to rolling history atomically (inside the same lock) so
+        # the session map set above is never overwritten.  The assistant
+        # response is not available at pre_route time.
+        hist: List[Dict[str, str]] = meta.get("history", [])
+        hist.append({"role": current_role, "user": message[:300], "assistant": ""})
+        meta["history"] = hist[-(HISTORY_WINDOW * 2):]
+
+        _save_meta(meta)
 
     if decision:
         logger.info(
