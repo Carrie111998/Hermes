@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
 @pytest.fixture(autouse=True)
@@ -140,6 +140,99 @@ class TestEnvAssignments:
         assert result.startswith("export ")
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
+
+
+class TestBareSecretEnvSuffixes:
+    """Bare *_KEY / *_PASS / *_PW env suffixes mask, incl. lowercase — #77484."""
+
+    def test_upper_suffix_keys_mask(self):
+        for text in ("FAL_KEY=sk-abc123def456", "OPENAI_KEY=sk-abc123def456",
+                     "MYSQL_PASS=ghi789", "DB_PW=jkl012"):
+            result = redact_sensitive_text(text, force=True)
+            assert "=" in result and result.split("=", 1)[1] != text.split("=", 1)[1]
+
+    def test_lowercase_env_name_masks(self):
+        # Opaque value with NO known prefix: only the env-name regex can
+        # catch it — a sk-/ghp_ value would be masked by _PREFIX_RE on old
+        # code too, making this test false-pass (review finding).
+        result = redact_sensitive_text("openai_key=xyzzyplugh1234567890abcd", force=True)
+        assert "xyzzyplugh1234567890abcd" not in result
+
+    def test_prose_words_with_keyword_unchanged(self):
+        # KEYBOARD / PASSAGE embed the bare keyword but are prose, not creds
+        for text in ("KEYBOARD=notsecret", "PASSAGE=notsecret"):
+            result = redact_sensitive_text(text, force=True)
+            assert result == text
+
+    def test_form_body_not_swallowed(self):
+        # A bare `password=`/`token=` in a form body must not be eaten greedily
+        text = "password=mysecret&username=bob&token=opaqueValue"
+        result = redact_sensitive_text(text, force=True)
+        assert "mysecret" not in result
+        assert "opaqueValue" not in result
+        assert "username=bob" in result
+
+
+class TestControlCharSplitTokens:
+    """Tokens split by control/zero-width chars must still mask — #77484."""
+
+    def _assert_split_masked(self, text, tok):
+        # Bare token (no KEY= context). Assert the LONGEST FRAGMENT is gone
+        # from the result: the token is split in the input, so `tok` (whole,
+        # contiguous) is absent from ANY output — even one that leaks every
+        # fragment verbatim (review finding: whole-token assertion is a false
+        # negative; the tail fragment appears contiguously in the leak).
+        result = redact_sensitive_text(text, force=True)
+        longest = max(tok[10:], tok[:10], key=len)
+        assert longest not in result
+
+    def test_newline_split_token_masks(self):
+        tok = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{tok[:10]}\n{tok[10:]}", tok)
+
+    def test_esc_split_token_masks(self):
+        tok = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{tok[:10]}\x1b{tok[10:]}", tok)
+
+    def test_zero_width_split_token_masks(self):
+        tok = "ghp_abcdef1234567890ABCDEF1234567890abcdef"
+        self._assert_split_masked(f"{tok[:10]}\u200b{tok[10:]}", tok)
+
+    def test_complete_token_does_not_swallow_next_line(self):
+        # A COMPLETE token at end-of-line followed by ordinary text must not
+        # be joined across the newline — the ordinary prefix pass masks the
+        # token; joining would swallow the adjacent line (browser
+        # accessibility annotations regressed this way: "button [ref=e3]"
+        # disappeared into the mask).
+        tok = "ghp_" + "F" * 29
+        text = f"text: Token: {tok}\nbutton [ref=e3]: Copy\n"
+        result = redact_sensitive_text(text, force=True)
+        assert "F" * 20 not in result
+        assert "button" in result
+        assert "ref=e3" in result
+
+    def test_selfmatching_head_esc_split_tail_masked(self):
+        # A split where the HEAD fragment alone already matches _PREFIX_RE
+        # (>= 10 body chars) but the tail doesn't: the join must still run
+        # for non-newline controls, or the tail leaks in cleartext. Only
+        # LINE-crossing spans skip the join (see the annotation test).
+        head = "sk-" + "a" * 15
+        tail = "b" * 25
+        result = redact_sensitive_text(head + "\x1b" + tail, force=True)
+        assert tail not in result
+        assert "a" * 12 not in result
+
+    def test_env_dump_lines_not_joined(self):
+        # Control-stripping must not join unrelated env lines into one match
+        env_dump = (
+            "HOME=/home/user\n"
+            "ELEVENLABS_API_KEY=sk_abc123def456ghi789jkl\n"
+            "EXA_API_KEY=exa_XY789abcdef01234\n"
+            "SHELL=/bin/bash\n"
+        )
+        result = redact_sensitive_text(env_dump, force=True)
+        assert "SHELL=/bin/bash" in result
+        assert "HOME=/home/user" in result
 
 
 class TestEnvLookupPreserved:
@@ -711,7 +804,6 @@ class TestTerminalOutputRedaction:
 
     def test_command_text_never_changes_redaction_policy(self):
         from agent.redact import redact_terminal_output
-
         out = "CUSTOM_TOKEN=zzzopaque1234567890abcdef"
         from_env = redact_terminal_output(out, force=True)
         from_file = redact_terminal_output(out, force=True)
@@ -842,9 +934,27 @@ class TestKeywordWordBoundary:
         ):
             result = redact_sensitive_text(text)
             assert result != text, text
-
-
     def test_plural_keys_still_redacted(self):
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
+
+
+class TestMaskSecretControlStripping:
+    """Issue #55319/#55321: mask_secret() must not emit control bytes
+    (newline, NUL, DEL, C1) in the visible head/tail of a masked secret —
+    they corrupt config/status/dump display output."""
+
+    def test_newline_stripped_from_mask(self):
+        # The #55319 probe: a newline inside the preserved head.
+        assert mask_secret("ab\ncd0123456789zzzz") == "abcd...zzzz"
+
+    def test_c1_control_stripped_from_mask(self):
+        assert mask_secret("abcd0123456789zz\x85q") == "abcd...9zzq"
+
+    def test_printable_mask_unchanged(self):
+        assert mask_secret("abcdef0123456789zzzz") == "abcd...zzzz"
+
+    def test_all_control_value_returns_empty_fallback(self):
+        assert mask_secret("\n\x85\u200b") == ""
+        assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"

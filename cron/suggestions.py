@@ -286,7 +286,10 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     if not s or s.get("status") != _STATUS_PENDING:
         return None
 
-    from cron.jobs import create_job
+    from cron.scheduler import (
+        CronSchedulerRegistrationError,
+        create_job_with_scheduler_registration,
+    )
 
     spec = dict(s.get("job_spec") or {})
     if (
@@ -301,7 +304,13 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     if origin is not None and "origin" not in spec:
         spec["origin"] = origin
 
-    job = create_job(**spec)
+    try:
+        job = create_job_with_scheduler_registration(**spec)
+    except CronSchedulerRegistrationError:
+        # The job is already durable. Resolve the suggestion so retrying the
+        # same acceptance cannot create another local copy.
+        _set_status(s["id"], _STATUS_ACCEPTED)
+        raise
     _set_status(s["id"], _STATUS_ACCEPTED)
     return job
 
