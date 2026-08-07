@@ -24,12 +24,10 @@ from typing import Any, Iterable, Mapping, Sequence
 ROUTINE_CODER_MIN_HEADROOM = 0.30
 DEFAULT_MAX_TELEMETRY_AGE_SECONDS = 300
 
-# AGY accepts human-facing CLI selectors, not Hermes/provider model slugs. Keep
-# this table explicit: adding a model requires reviewing the exact identity AGY
-# reports back in its backend propagation log.
-AGY_CANONICAL_MODEL_LABELS: Mapping[str, str] = {
-    "gemini-3.1-pro-high": "Gemini 3.1 Pro (High)",
-}
+# AGY currently has no governance-CURRENT model identity. Keep this table empty
+# until a separately ratified current identity is supplied; a historical or
+# DROPPED model must never become an allowlist entry by default.
+AGY_CANONICAL_MODEL_LABELS: Mapping[str, str] = {}
 AGY_BACKEND_PROPAGATION_MARKER = "Propagating selected model override to backend:"
 _AGY_BACKEND_LABEL_OCCURRENCE_RE = re.compile(r'label="([^"\r\n]*)"')
 _AGY_BACKEND_PROPAGATION_RE = re.compile(
@@ -420,12 +418,8 @@ def evaluate_dispatch(
     attempts: list[CandidateAttempt] = []
     for index, route in enumerate(candidates):
         route_identity = None
-        if _is_agy_route(route):
-            route_identity, identity_failure = _agy_identity_result(route)
-            if identity_failure is not None:
-                attempts.append(CandidateAttempt(route, DecisionStatus.HOLD, None, (identity_failure,), route_identity))
-                continue
-        if (route.governance_status or "").strip().upper() == "DROPPED":
+        governance_status = (route.governance_status or "").strip().upper()
+        if governance_status == "DROPPED":
             governance_failure = DecisionReason(
                 "ROUTE_DROPPED_BY_GOVERNANCE",
                 "route is dropped by governance and cannot be requalified",
@@ -441,13 +435,21 @@ def evaluate_dispatch(
                 )
             attempts.append(CandidateAttempt(route, DecisionStatus.HOLD, None, (governance_failure,), route_identity))
             continue
+        if governance_status != "CURRENT":
+            governance_failure = DecisionReason(
+                "ROUTE_GOVERNANCE_NOT_CURRENT",
+                "route governance status must be CURRENT before it can be considered",
+                route.route_id,
+            )
+            attempts.append(CandidateAttempt(route, DecisionStatus.HOLD, None, (governance_failure,), route_identity))
+            continue
+        if _is_agy_route(route):
+            route_identity, identity_failure = _agy_identity_result(route)
+            if identity_failure is not None:
+                attempts.append(CandidateAttempt(route, DecisionStatus.HOLD, None, (identity_failure,), route_identity))
+                continue
         unavailable = _availability_reason(route, availability, decision_time, max_age)
-        # AGY's backend propagation receipt is intentionally sufficient only
-        # when no availability telemetry was supplied at all. Once an operator
-        # supplies any availability snapshot, unmatched or negative evidence
-        # must fail closed like every other provider.
-        agy_without_availability_telemetry = _is_agy_route(route) and not availability
-        if unavailable is not None and not agy_without_availability_telemetry:
+        if unavailable is not None:
             attempts.append(CandidateAttempt(route, DecisionStatus.HOLD, None, (unavailable,), route_identity))
             continue
         headroom = None

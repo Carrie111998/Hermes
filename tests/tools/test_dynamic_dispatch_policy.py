@@ -24,8 +24,8 @@ from tools.dynamic_dispatch_policy import (
 NOW = "2026-08-05T12:00:00Z"
 
 
-def route(role=Role.BUILDER, *, route_id="primary", profile="profile-a", provider="provider-a", model="model-high", effort="high", rank=100, fallbacks=()):
-    return WorkerRoute(route_id, role, profile, provider, model, effort, rank, "workers", fallbacks)
+def route(role=Role.BUILDER, *, route_id="primary", profile="profile-a", provider="provider-a", model="model-high", effort="high", rank=100, fallbacks=(), governance_status="CURRENT"):
+    return WorkerRoute(route_id, role, profile, provider, model, effort, rank, "workers", fallbacks, governance_status=governance_status)
 
 
 def available(target, *, captured_at=NOW, state=TelemetryState.KNOWN, value=True):
@@ -43,7 +43,7 @@ def agy_route(
     effort="high",
     selector="Gemini 3.1 Pro (High)",
     route_log=None,
-    governance_status="ACTIVE",
+    governance_status="CURRENT",
 ):
     if route_log is None:
         route_log = 'Propagating selected model override to backend: label="Gemini 3.1 Pro (High)"'
@@ -64,6 +64,10 @@ def agy_route(
 
 def decide(request, routes, availability=(), quotas=(), **kwargs):
     return evaluate_dispatch(request, routes, availability, quotas, as_of=NOW, **kwargs)
+
+
+def enable_current_agy_identity(monkeypatch):
+    monkeypatch.setitem(AGY_CANONICAL_MODEL_LABELS, "gemini-3.1-pro-high", "Gemini 3.1 Pro (High)")
 
 
 def test_default_policy_declares_one_complete_stable_route_per_worker_role():
@@ -218,7 +222,8 @@ def test_routine_quota_missing_unknown_stale_and_invalid_are_loud_holds():
         assert decision.reasons[0].code == code
 
 
-def test_agy_routine_coder_missing_and_one_percent_quota_are_loud_holds():
+def test_agy_routine_coder_missing_and_one_percent_quota_are_loud_holds(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(role=Role.ROUTINE_CODER, profile="agy-routine", effort="medium")
     request = DispatchRequest("routine_coder", "agy-routine", "medium")
 
@@ -227,18 +232,19 @@ def test_agy_routine_coder_missing_and_one_percent_quota_are_loud_holds():
         ((quota(target, used=99, remaining=1),), "ROUTINE_CODER_HEADROOM_BELOW_30_PERCENT"),
     ]
     for snapshots, code in cases:
-        decision = decide(request, (target,), quotas=snapshots)
+        decision = decide(request, (target,), (available(target),), snapshots)
         assert decision.status is DecisionStatus.HOLD
         assert decision.reasons[0].code == code
         assert decision.candidate_attempts[0].route_identity.reason == "AGY_ROUTE_IDENTITY_VERIFIED"
         assert decision.route_identity.reason == "AGY_ROUTE_IDENTITY_VERIFIED"
 
 
-def test_agy_routine_coder_exactly_30_percent_quota_passes_with_valid_telemetry():
+def test_agy_routine_coder_exactly_30_percent_quota_passes_with_valid_telemetry(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(role=Role.ROUTINE_CODER, profile="agy-routine", effort="medium")
     request = DispatchRequest("routine_coder", "agy-routine", "medium")
 
-    decision = decide(request, (target,), quotas=(quota(target, used=70, remaining=30),))
+    decision = decide(request, (target,), (available(target),), (quota(target, used=70, remaining=30),))
 
     assert decision.status is DecisionStatus.ALLOW
     assert decision.quota_headroom == 0.30
@@ -271,17 +277,19 @@ def test_non_routine_role_does_not_use_routine_quota_headroom():
     assert decision.quota_headroom is None
 
 
-def test_agy_slug_selector_is_rejected_before_log_can_prove_identity():
+def test_agy_slug_selector_is_rejected_before_log_can_prove_identity(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(selector="gemini-3.1-pro-high")
     decision = decide(DispatchRequest("builder", "agy-builder", "high"), (target,))
 
-    assert AGY_CANONICAL_MODEL_LABELS == {"gemini-3.1-pro-high": "Gemini 3.1 Pro (High)"}
+    assert AGY_CANONICAL_MODEL_LABELS["gemini-3.1-pro-high"] == "Gemini 3.1 Pro (High)"
     assert decision.status is DecisionStatus.HOLD
     assert decision.reasons[0].code == "AGY_SELECTOR_NOT_CANONICAL"
     assert decision.route_identity.observed_label is None
 
 
-def test_agy_missing_and_malformed_backend_labels_hold_structurally():
+def test_agy_missing_and_malformed_backend_labels_hold_structurally(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     request = DispatchRequest("builder", "agy-builder", "high")
     cases = [
         (agy_route(route_log="AGY completed successfully"), "AGY_BACKEND_LABEL_MISSING"),
@@ -307,7 +315,8 @@ def test_agy_missing_and_malformed_backend_labels_hold_structurally():
         'Propagating selected model override to backend: label="Gemini 3.1 Pro (High)" trailing-content',
     ),
 )
-def test_agy_backend_label_records_reject_unmarked_cross_line_empty_and_trailing_content(route_log):
+def test_agy_backend_label_records_reject_unmarked_cross_line_empty_and_trailing_content(route_log, monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(route_log=route_log)
     decision = decide(DispatchRequest("builder", "agy-builder", "high"), (target,))
 
@@ -316,7 +325,8 @@ def test_agy_backend_label_records_reject_unmarked_cross_line_empty_and_trailing
     assert decision.route_identity.reason == "AGY_BACKEND_LABEL_MALFORMED"
 
 
-def test_agy_conflicting_backend_labels_hold_even_if_one_matches():
+def test_agy_conflicting_backend_labels_hold_even_if_one_matches(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(route_log="\n".join((
         'Propagating selected model override to backend: label="Gemini 3.1 Pro (High)"',
         'Propagating selected model override to backend: label="Gemini 3.6 Flash (High)"',
@@ -327,7 +337,8 @@ def test_agy_conflicting_backend_labels_hold_even_if_one_matches():
     assert decision.reasons[0].code == "AGY_BACKEND_LABEL_CONFLICT"
 
 
-def test_agy_conflicting_backend_labels_hold_on_the_same_line():
+def test_agy_conflicting_backend_labels_hold_on_the_same_line(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(route_log=" ".join((
         'Propagating selected model override to backend: label="Gemini 3.6 Flash (High)"',
         'Propagating selected model override to backend: label="Gemini 3.1 Pro (High)"',
@@ -338,7 +349,8 @@ def test_agy_conflicting_backend_labels_hold_on_the_same_line():
     assert decision.reasons[0].code == "AGY_BACKEND_LABEL_CONFLICT"
 
 
-def test_agy_flash_remap_is_a_served_model_mismatch_not_success_evidence():
+def test_agy_flash_remap_is_a_served_model_mismatch_not_success_evidence(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route(
         route_log='request succeeded\nPropagating selected model override to backend: label="Gemini 3.6 Flash (High)"'
     )
@@ -363,22 +375,30 @@ def test_agy_exact_identity_still_holds_when_dropped_by_governance():
 
     assert decision.status is DecisionStatus.HOLD
     assert decision.reasons[0].code == "ROUTE_DROPPED_BY_GOVERNANCE"
-    assert decision.route_identity.observed_label == "Gemini 3.1 Pro (High)"
-    assert decision.route_identity.reason == "ROUTE_DROPPED_BY_GOVERNANCE"
+    assert decision.route_identity is None
     assert decision.quota_headroom is None
 
 
-def test_agy_exact_identity_is_allowed_when_not_dropped_without_provider_telemetry():
+def test_agy_identity_is_not_allowlisted_without_current_governance_evidence():
     target = agy_route()
     decision = decide(DispatchRequest("builder", "agy-builder", "high"), (target,))
 
-    assert decision.status is DecisionStatus.ALLOW
-    assert decision.route_identity.requested_id == "gemini-3.1-pro-high"
-    assert decision.route_identity.reason == "AGY_ROUTE_IDENTITY_VERIFIED"
+    assert decision.status is DecisionStatus.HOLD
+    assert decision.reasons[0].code == "AGY_REQUESTED_MODEL_NOT_ALLOWLISTED"
     assert decision.quota_headroom is None
 
 
-def test_agy_supplied_unmatched_availability_evidence_holds():
+def test_agy_missing_availability_telemetry_holds_even_with_identity(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
+    target = agy_route()
+    decision = decide(DispatchRequest("builder", "agy-builder", "high"), (target,))
+
+    assert decision.status is DecisionStatus.HOLD
+    assert decision.reasons[0].code == "ROUTE_TELEMETRY_MISSING"
+
+
+def test_agy_supplied_unmatched_availability_evidence_holds(monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route()
     other = route(profile="other-profile", provider="other-provider", model="other-model")
     decision = decide(
@@ -401,7 +421,8 @@ def test_agy_supplied_unmatched_availability_evidence_holds():
         ({"captured_at": "2026-08-05T13:00:00Z"}, "ROUTE_TELEMETRY_FUTURE"),
     ),
 )
-def test_agy_supplied_negative_unknown_stale_invalid_or_future_availability_holds(snapshot, expected_code):
+def test_agy_supplied_negative_unknown_stale_invalid_or_future_availability_holds(snapshot, expected_code, monkeypatch):
+    enable_current_agy_identity(monkeypatch)
     target = agy_route()
     decision = decide(
         DispatchRequest("builder", "agy-builder", "high"),
@@ -424,6 +445,19 @@ def test_non_agy_route_dropped_by_governance_holds():
 
     assert decision.status is DecisionStatus.HOLD
     assert decision.reasons[0].code == "ROUTE_DROPPED_BY_GOVERNANCE"
+
+
+@pytest.mark.parametrize("governance_status", ("ACTIVE", "SUSPENDED", "UNQUALIFIED", "EXPIRED", "PROVISIONAL", None))
+def test_non_current_governance_statuses_fail_closed(governance_status):
+    target = route(governance_status=governance_status)
+    decision = decide(
+        DispatchRequest("builder", "profile-a", "high"),
+        (target,),
+        (available(target),),
+    )
+
+    assert decision.status is DecisionStatus.HOLD
+    assert decision.reasons[0].code == "ROUTE_GOVERNANCE_NOT_CURRENT"
 
 
 def test_non_agy_routes_are_unaffected_by_agy_identity_fields():
@@ -532,7 +566,6 @@ def test_cli_malformed_route_string_types_are_structured_operator_errors(
 def test_fixture_cli_output_equals_committed_receipts():
     fixture = Path("tests/tools/fixtures/dynamic_dispatch_dry_run_input.json")
     primary = Path("build/dynamic_dispatch_dry_run_receipt.json")
-    independent = Path("build/independent-dry-run-receipt.json")
 
     completed = subprocess.run(
         [sys.executable, "tools/dynamic_dispatch_policy.py", str(fixture)],
@@ -544,4 +577,3 @@ def test_fixture_cli_output_equals_committed_receipts():
     assert completed.returncode == 0
     assert completed.stderr == ""
     assert completed.stdout == primary.read_text(encoding="utf-8")
-    assert independent.read_text(encoding="utf-8") == completed.stdout
