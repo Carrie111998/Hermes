@@ -1988,6 +1988,9 @@ class TestModelAuthoredProgressGuidance:
         assert first == second
         assert "goal, the result just established" in first
         assert "Never expose private chain-of-thought" in first
+        assert "one long foreground wait" in first
+        assert "bounded status reads" in first
+        assert "accept steering" in first
 
     def test_default_off_preserves_existing_transcript_volume(self):
         from agent.prompt_builder import MODEL_AUTHORED_PROGRESS_GUIDANCE

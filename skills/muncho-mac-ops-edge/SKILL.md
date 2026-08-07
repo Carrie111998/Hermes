@@ -36,6 +36,16 @@ whether it answers the task, and continue through the normal plan. If the edge
 reports uncertain dispatch, reconcile the same idempotency key; do not create a
 new key to bypass uncertainty.
 
+Keep the interactive model turn available while the local worker runs. Use
+`mac_ops_task_read` as a bounded observation, return control to the model after
+each read, and decide when another read is useful. Do not replace the structured
+read loop with one long foreground shell watcher or a `--wait-closed` command.
+Before waiting again, give the user a concise authored update when a meaningful
+boundary has changed. Interpret the structured milestone or result; never copy
+raw heartbeat lines, worker logs, commands, or credentials into chat. This keeps
+steering responsive without turning host output into a synthetic assistant
+message.
+
 This first-wave edge is read-only. If the task requires a mutation, explain the
 exact blocked mutation and request the applicable owner approval instead of
 relabeling it as read-only.
