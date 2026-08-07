@@ -1347,7 +1347,7 @@ class TestGitHubReviewDelivery:
         assert result.error == "GitHub did not confirm the expected formal review"
 
     @pytest.mark.asyncio
-    async def test_github_review_send_claims_publication_with_opaque_lease_first(self):
+    async def test_github_review_send_publishes_with_reserved_delivery_authority(self):
         adapter = _make_adapter(
             {
                 "pr-review": {
@@ -1373,10 +1373,6 @@ class TestGitHubReviewDelivery:
         adapter._delivery_info[chat_id] = delivery
 
         with patch.object(
-            adapter._route_processor,
-            "run_route_script",
-            return_value=(True, {"settled": "claim_publish"}),
-        ) as claim, patch.object(
             adapter,
             "_deliver_github_review",
             new=AsyncMock(return_value=SendResult(success=True)),
@@ -1384,23 +1380,10 @@ class TestGitHubReviewDelivery:
             result = await adapter.send(chat_id, self._marker())
 
         assert result.success is True
-        claim.assert_called_once_with(
-            "newtonsapple-pr-review-gate.py",
-            {
-                "operation": "claim_publish",
-                "contract_version": "v2",
-                "repository": "org/repo",
-                "pr_number": "42",
-                "base_sha": self.base_sha,
-                "head_sha": self.head_sha,
-                "lease_token": "l" * 43,
-            },
-            trusted_github_pr_environment=True,
-        )
         publish.assert_awaited_once_with(self._marker(), delivery)
 
     @pytest.mark.asyncio
-    async def test_github_review_send_fails_closed_when_publication_claim_is_rejected(self):
+    async def test_github_review_send_propagates_publication_failure(self):
         adapter = _make_adapter(
             {
                 "pr-review": {
@@ -1425,19 +1408,15 @@ class TestGitHubReviewDelivery:
         }
 
         with patch.object(
-            adapter._route_processor,
-            "run_route_script",
-            return_value=(False, {"settled": "claim_publish"}),
-        ), patch.object(
             adapter,
             "_deliver_github_review",
-            new=AsyncMock(return_value=SendResult(success=True)),
+            new=AsyncMock(return_value=SendResult(success=False, error="publish failed")),
         ) as publish:
             result = await adapter.send(chat_id, self._marker())
 
         assert result.success is False
-        assert result.error == "GitHub review publication lease is missing or stale"
-        publish.assert_not_awaited()
+        assert result.error == "publish failed"
+        publish.assert_awaited_once()
         assert chat_id not in adapter._successful_github_reviews
 
     @pytest.mark.asyncio

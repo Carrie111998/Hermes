@@ -447,11 +447,6 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "github_review":
-            if not await self._claim_review_publication(delivery):
-                return SendResult(
-                    success=False,
-                    error="GitHub review publication lease is missing or stale",
-                )
             result = await self._deliver_github_review(content, delivery)
             if result.success:
                 self._successful_github_reviews.add(chat_id)
@@ -1894,11 +1889,6 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "github_review":
-            if not await self._claim_review_publication(delivery):
-                return SendResult(
-                    success=False,
-                    error="GitHub review publication lease is missing or stale",
-                )
             return await self._deliver_github_review(content, delivery)
 
         # Fall through to the cross-platform dispatcher, which validates the
