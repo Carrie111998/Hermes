@@ -2306,11 +2306,26 @@ def _format_async_delegation(evt: dict) -> str:
     if isinstance(dispatched_at, (int, float)):
         age = f" ({_format_age(completed_at - dispatched_at)} ago)"
 
+    if evt.get("external_background_task"):
+        header = f"[BACKGROUND TASK COMPLETE — {deleg_id}]"
+        intro = (
+            "A background task you registered earlier has finished. You may "
+            "have moved on since registering it; the original request is "
+            "below so you can act on the result or re-register it if things "
+            "have changed."
+        )
+    else:
+        header = f"[ASYNC DELEGATION COMPLETE — {deleg_id}]"
+        intro = (
+            "A background subagent you dispatched earlier has finished. You "
+            "may have moved on since dispatching it; the full task source is "
+            "below so you can act on the result or re-dispatch if things have "
+            "changed."
+        )
+
     lines = [
-        f"[ASYNC DELEGATION COMPLETE — {deleg_id}]",
-        "A background subagent you dispatched earlier has finished. You may "
-        "have moved on since dispatching it; the full task source is below so "
-        "you can act on the result or re-dispatch if things have changed.",
+        header,
+        intro,
         "",
     ]
     if isinstance(dispatched_at, (int, float)):
