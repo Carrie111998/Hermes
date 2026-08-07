@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+# The only characters JSON permits as whitespace between tokens (RFC 8259
+# section 2).  Python's ``str.isspace()`` / bare ``str.rstrip()`` are
+# Unicode-aware and also match U+001C-U+001F, U+0085, U+00A0, U+2028 and
+# friends -- all of which are *illegal* outside a JSON string.  Treating them
+# as skippable whitespace lets the repair passes delete them and hand back a
+# payload that parses, turning input JSON rightly rejects into an executed
+# tool call.  Every whitespace test in the repair path uses this instead.
+_JSON_WHITESPACE = " \t\n\r"
+
 
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).
@@ -183,6 +192,154 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
+def _strip_trailing_commas(raw: str) -> str:
+    r"""Drop commas that sit directly before a closing brace or bracket.
+
+    String-aware replacement for a ``re.sub(r',\s*([}\]])', r'\1', ...)``
+    pass.  The regex had no notion of string boundaries, so a comma inside a
+    string *value* followed by ``]`` or ``}`` was rewritten too: the payload
+    ``{"sep": ", ]", ...}`` had its separator silently changed to ``"]"``.
+    On its own that produced JSON that still failed to parse and degraded to
+    ``"{}"``, but paired with a nesting-aware closer it parses cleanly and the
+    corrupted value reaches the tool.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    pending: int | None = None  # index in `out` of a comma awaiting a verdict
+    for ch in raw:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if pending is not None:
+            if ch in _JSON_WHITESPACE:
+                out.append(ch)
+                continue
+            if ch in "}]":
+                del out[pending:]  # drop the comma and any whitespace after it
+            pending = None
+        if ch == '"':
+            in_string = True
+        elif ch == ",":
+            pending = len(out)
+        out.append(ch)
+    return "".join(out)
+
+
+def _close_unclosed_json_structures(raw: str) -> str:
+    """Close a truncated JSON payload, honouring nesting order.
+
+    Walks ``raw`` tracking string and escape state, pushing ``{``/``[`` onto a
+    stack and popping on the matching closer, then appends whatever the stack
+    still holds in LIFO (innermost-first) order.
+
+    This replaces a ``str.count`` deficit calculation that appended *all*
+    missing ``}`` before *all* missing ``]`` regardless of actual nesting, and
+    that counted delimiters appearing inside string *values*.  Either made the
+    repair emit invalid JSON for payloads it could otherwise close, which then
+    degraded to the ``"{}"`` last resort and dropped the model's arguments
+    entirely (#35151).
+
+    A payload that ends *inside* a string value is returned unchanged: there
+    the truncation cut a value rather than the structure around it, and
+    inventing a closing quote would hand the tool a plausible-looking but
+    silently incomplete argument (the failure #62948 reports).  Those stay
+    unrepairable on purpose so the caller routes them through the
+    partial-stream/truncation path instead of executing them.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+
+    if in_string or not stack:
+        return raw
+
+    # Note: a comma the truncation left dangling is deliberately NOT trimmed.
+    # ``{"a": [1, 2,`` ends on a comma, which is the model promising another
+    # element that never arrived -- trimming it would append the closer and
+    # present a short list as a complete one.  Leaving the comma in place makes
+    # the result unparseable, so the payload falls through to ``"{}"`` and the
+    # caller's truncation path, same as before this change.  A *stray* trailing
+    # comma in otherwise-complete JSON (``{"a": [1, 2,]}``) is a different case
+    # and is still handled by ``_strip_trailing_commas``.
+    return raw + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
+
+
+def _unmatched_trailing_closer_index(raw: str) -> int:
+    """Index of a trailing ``}``/``]`` that closes nothing, or -1.
+
+    Companion to :func:`_close_unclosed_json_structures` for the opposite
+    problem: a payload carrying one closer too many.  Shares the same
+    string/escape tracking, so a delimiter inside a string *value* is not
+    mistaken for structure -- the ``str.count`` version this replaces saw the
+    brace in ``{"s":"{","x":[1]}}`` and concluded the braces were balanced, so
+    it never removed the genuinely excess ``}`` and a recoverable payload
+    degraded to ``"{}"``.
+
+    Only reports a closer that is the payload's LAST token.  An excess closer
+    in the middle (``{"a": [1]]}``) is deliberately left alone: the caller
+    repairs by dropping the character it is told about, and dropping the tail
+    there would take a legitimate closer with it and mangle the payload.  Those
+    stay unparseable and fall through to ``"{}"``, exactly as before.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    unmatched = -1
+    last_token = -1
+    for i, ch in enumerate(raw):
+        if in_string:
+            last_token = i
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch in _JSON_WHITESPACE:
+            continue
+        last_token = i
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+            else:
+                unmatched = i
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+            else:
+                unmatched = i
+    return unmatched if unmatched >= 0 and unmatched == last_token else -1
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Attempt to repair malformed tool_call argument JSON.
 
@@ -211,39 +368,36 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     # the most common local-model repair case (#12068).
     try:
         parsed = json.loads(raw_stripped, strict=False)
-        reserialised = json.dumps(parsed, separators=(",", ":"))
+        # allow_nan=False: json.loads turns 1e999 into inf, and the default
+        # dumps would re-emit a bare ``Infinity`` token, which is not JSON.
+        # Raising here drops us into the repair passes instead.
+        reserialised = json.dumps(parsed, separators=(",", ":"), allow_nan=False)
         if reserialised != raw_stripped:
             logger.warning(
                 "Repaired unescaped control chars in tool_call arguments for %s",
                 tool_name,
             )
         return reserialised
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         pass
 
     # Attempt common JSON repairs
     fixed = raw_stripped
-    # 1. Strip trailing commas before } or ]
-    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-    # 2. Close unclosed structures
-    open_curly = fixed.count('{') - fixed.count('}')
-    open_bracket = fixed.count('[') - fixed.count(']')
-    if open_curly > 0:
-        fixed += '}' * open_curly
-    if open_bracket > 0:
-        fixed += ']' * open_bracket
-    # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
+    # 1. Strip trailing commas before } or ] (string-aware)
+    fixed = _strip_trailing_commas(fixed)
+    # 2. Close unclosed structures, innermost first (string-aware)
+    fixed = _close_unclosed_json_structures(fixed)
+    # 3. Remove excess closing braces/brackets (bounded to 50 iterations),
+    #    string-aware so a delimiter inside a value is not counted as structure
     for _ in range(50):
         try:
             json.loads(fixed)
             break
-        except json.JSONDecodeError:
-            if fixed.endswith('}') and fixed.count('}') > fixed.count('{'):
-                fixed = fixed[:-1]
-            elif fixed.endswith(']') and fixed.count(']') > fixed.count('['):
-                fixed = fixed[:-1]
-            else:
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            drop = _unmatched_trailing_closer_index(fixed)
+            if drop < 0:
                 break
+            fixed = fixed[:drop] + fixed[drop + 1:]
 
     try:
         json.loads(fixed)
@@ -252,7 +406,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
             tool_name, raw_stripped[:80], fixed[:80],
         )
         return fixed
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         pass
 
     # Repair pass 4: escape unescaped control chars inside JSON strings,
@@ -267,7 +421,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
                 tool_name, raw_stripped[:80], escaped[:80],
             )
             return escaped
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         pass
 
     # Last resort: replace with empty object so the API request doesn't
