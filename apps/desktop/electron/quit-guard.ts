@@ -103,14 +103,16 @@ export function quitPromptFor(work: ActiveWork, quittingForHandoff: boolean): nu
  *
  * macOS is excluded: closing the primary window there is the standard
  * "window stays in Dock" gesture, not a quit, and prompting on it would
- * block a normal workflow.
+ * block a normal workflow. Chat windows other than the final one are also
+ * excluded because closing them does not stop the application or its work.
  */
 export function shouldGuardWindowClose(
   work: ActiveWork,
   quittingForHandoff: boolean,
-  isMac: boolean
+  isMac: boolean,
+  hasOtherChatWindows: boolean
 ): boolean {
-  if (isMac || quittingForHandoff || work.count < 1) {
+  if (isMac || quittingForHandoff || hasOtherChatWindows || work.count < 1) {
     return false
   }
 

@@ -8773,6 +8773,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  registerChatWindow(win)
+
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
@@ -8852,6 +8854,8 @@ function createInstanceWindow() {
     backgroundColor: getWindowBackgroundColor(),
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
+
+  registerChatWindow(win)
 
   instanceWindows.add(win)
 
@@ -9272,6 +9276,8 @@ function createWindow() {
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  registerChatWindow(mainWindow)
+
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
 
@@ -9348,57 +9354,11 @@ function createWindow() {
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
 
-  // On Windows/Linux, closing the last window triggers app.quit() → before-quit,
-  // but by then the renderer's webContents is already destroyed and its entry
-  // has been removed from the active-work map — so the before-quit guard finds
-  // nothing and the app exits silently, killing any turn in flight. Intercept
-  // 'close' instead, while the work data is still live. macOS is excluded: there
-  // closing the primary window is the standard "stay in Dock" gesture.
+  // Persist geometry on close. The quit guard is installed centrally by
+  // registerChatWindow so primary, session, and instance windows share the
+  // same last-chat-window behavior.
   mainWindow.on('close', event => {
     schedulePersistWindowState.flush()
-
-    if (!shouldGuardWindowClose(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff, IS_MAC)) {
-      return
-    }
-
-    // Reuse the same latch as the before-quit guard so the two paths never
-    // stack dialogs. Once the user confirms, a second close (or the app.quit()
-    // it triggers) falls through.
-    if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
-      return
-    }
-
-    const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
-
-    if (!prompt) {
-      return
-    }
-
-    event.preventDefault()
-    quitPromptOpen = true
-
-    void dialog
-      .showMessageBox(mainWindow!, {
-        buttons: ['Keep Running', 'Quit Anyway'],
-        cancelId: 0,
-        defaultId: 0,
-        detail: prompt.detail,
-        message: prompt.message,
-        type: 'question'
-      })
-      .then(({ response }) => {
-        quitPromptOpen = false
-
-        if (response === 1) {
-          quitConfirmedWithActiveWork = true
-          app.quit()
-        }
-      })
-      .catch(() => {
-        quitPromptOpen = false
-        quitConfirmedWithActiveWork = true
-        app.quit()
-      })
   })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
@@ -10635,6 +10595,27 @@ ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWat
 // Each renderer reports the turns it has in flight; the quit guard reads the
 // merged picture. Keyed by webContents id so a closed window stops counting.
 const activeWorkByWebContents = new Map<number, ActiveWork>()
+
+// Only real chat windows participate in the close guard. Helper windows (pet,
+// quick-entry, wake indicator) must not make the app look like another usable
+// chat window remains open.
+const chatWindows = new Set<any>()
+
+function registerChatWindow(window: any) {
+  chatWindows.add(window)
+  window.on('close', (event: Electron.Event) => heldCloseForActiveWork(event, window))
+  window.once('closed', () => chatWindows.delete(window))
+}
+
+function hasOtherChatWindows(window: any): boolean {
+  for (const candidate of chatWindows) {
+    if (candidate !== window && !candidate.isDestroyed()) {
+      return true
+    }
+  }
+
+  return false
+}
 
 // The same merged picture drives background throttling: chat windows run
 // unthrottled while any turn is in flight (streaming must paint while hidden)
@@ -11997,6 +11978,56 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
     })
     .catch(() => {
       // A dialog we can't show must not become a quit we can't perform.
+      quitPromptOpen = false
+      quitConfirmedWithActiveWork = true
+      app.quit()
+    })
+
+  return true
+}
+
+function heldCloseForActiveWork(event: Electron.Event, window: BrowserWindow): boolean {
+  if (
+    !shouldGuardWindowClose(
+      mergeActiveWork(activeWorkByWebContents.values()),
+      isQuittingForHandoff,
+      IS_MAC,
+      hasOtherChatWindows(window)
+    ) ||
+    SKIP_QUIT_CONFIRM ||
+    quitConfirmedWithActiveWork ||
+    quitPromptOpen
+  ) {
+    return false
+  }
+
+  const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
+
+  if (!prompt) {
+    return false
+  }
+
+  event.preventDefault()
+  quitPromptOpen = true
+
+  void dialog
+    .showMessageBox(window, {
+      buttons: ['Keep Running', 'Quit Anyway'],
+      cancelId: 0,
+      defaultId: 0,
+      detail: prompt.detail,
+      message: prompt.message,
+      type: 'question'
+    })
+    .then(({ response }) => {
+      quitPromptOpen = false
+
+      if (response === 1) {
+        quitConfirmedWithActiveWork = true
+        app.quit()
+      }
+    })
+    .catch(() => {
       quitPromptOpen = false
       quitConfirmedWithActiveWork = true
       app.quit()
