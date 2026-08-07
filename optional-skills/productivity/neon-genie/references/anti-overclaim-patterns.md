@@ -24,8 +24,17 @@ Use alongside mandatory gates in `SKILL.md`. Labels: `OBSERVED` · `INFERRED` ·
 | **P — Skip find** | Public gap, tools available, no research attempt, claim still asserted or NC without attempt | Run research loop or record attempt failure |
 | **Q — Skip request** | Private/operator gap is decision-critical and no DataRequest | Emit DataRequest; block promotion if needed |
 | **R — Silent private invent** | Private fact as OBSERVED without source/request | Downgrade; emit request or NOT_COMPUTABLE |
+| **S — Egress destination unknown** | `external_actions` entry with `sent: true` and empty/unknown destination | Block send; log `BLOCK`; fix destination before allow |
+| **T — Offline external send** | `LOCAL_ONLY` or research disabled but any `sent: true` | Fail CLEAR; correct mode or strip sent actions |
+| **U — Secret egress** | Credential/secret-like payload would be or was sent externally | `BLOCK`; never promote leaked secret to `OBSERVED` |
+| **V — Private egress without consent** | Private/operator material egress without `consent_ref` | `REQUEST_CONSENT` or keep local / DataRequest |
+| **W — Unsupported privacy claim** | Absolute privacy (“never leaves device”, zero host retention, never trained) without matching mode + evidence | `NOT_COMPUTABLE` and/or `privacy_warnings[]` |
+| **X — Telemetry not disabled** | `telemetry_status` anything other than `disabled` (W1) | Force disabled; fail validate |
+| **Y — Incomplete privacy SEAL** | SEAL without required privacy provenance fields on receipt | Complete receipt before SEAL |
 
-Gates **A–R** apply during CLEAR. See Evidence Request Protocol in `SKILL.md`.
+Gates **A–R** apply during CLEAR (evidence + anti-overclaim). Gates **S–Y** are privacy-by-construction (after authority and evidence P–R). See Evidence Request Protocol and privacy doctrine in `SKILL.md`; profile `profiles/privacy.md`; contract `references/PRIVACY.md`.
+
+CLEAR order: **authority → evidence P–R → privacy S–Y → remaining anti-overclaim**.
 
 ## Scorecard rule
 
@@ -36,3 +45,5 @@ A composite score **never** overrides a mandatory gate failure or an anti-overcl
 - Domain invariants: `references/GOLDEN_TESTS.md`
 - Eval fixtures: `evals/cases/`
 - Runtime authority: `references/hermes-runtime-contract.md`
+- Privacy contract: `references/PRIVACY.md` / root `PRIVACY.md`
+- Gate registry: `references/gates.yaml`

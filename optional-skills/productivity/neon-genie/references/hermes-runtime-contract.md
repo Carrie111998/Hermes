@@ -80,8 +80,8 @@ Host research tools and Wayfinder are optional extensions. Their absence cannot 
 
 ## Research policy
 
-- Research is **proactive by default** when host tools can improve the result.
-- Operator may set `research.enabled=false` or `offline: true` to skip live fetches.
+- Research is disabled by default (`local_only`). Operator may explicitly select `external_research_allowed` for purpose-bound, minimized public research. Briefs may carry `privacy:` configuration (mode, approved domains/tools, purpose-bound consents only — never a global privacy disable). Configuration flows into receipt, envelope, and local learning-ledger disclosure.
+- `research.enabled=false` or `offline: true` permits no Neon-Genie-initiated external research action.
 - Operator-supplied and workspace sources always outrank live fetches.
 - Model prior without fetch is at most `SPECULATIVE`.
 - Missing tooling or failed fetch → `NOT_COMPUTABLE` with attempted query — never fabricate `OBSERVED` claims.
@@ -115,6 +115,7 @@ No output packet grants execution authority.
 - Label material claims: `OBSERVED`, `INFERRED`, `SPECULATIVE`, `NOT_COMPUTABLE`.
 - Never modify `references/`, `profiles/`, `schemas/`, or other skill corpus files during ordinary runs.
 - Write generated operational artifacts under a user-selected project directory or `./out/neon-genie/`.
+- See `PRIVACY.md` and `references/privacy-contract.md`: host/provider retention is `NOT_COMPUTABLE` unless independently established.
 
 ## Wayfinder handoff
 

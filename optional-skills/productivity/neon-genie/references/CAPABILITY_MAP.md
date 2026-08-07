@@ -18,6 +18,9 @@
 16. Full packet schema surface (including evidence, memetic, audit)
 17. Evidence Request Protocol — find public, request private (`DataRequest`), then `NOT_COMPUTABLE`
 18. Receipt evidence fields (`data_requests`, `open_blocking_requests`, `research_attempts`)
+19. Privacy-by-construction — `local_only` default, purpose-bound consents, egress gates S–Y, secret preflight, `do privacy --json`
+20. Capital sprint protocol (time-bounded nonprofit capital-raise profile; optional load)
 
-Packet schemas: `schemas/`. Profile contracts: `profiles/`. Gates: `references/anti-overclaim-patterns.md`.
+Packet schemas: `schemas/`. Profile contracts: `profiles/`. Gates: `references/anti-overclaim-patterns.md` · `references/gates.yaml`.
 DataRequest: `schemas/data-request.schema.json`.
+Privacy: `PRIVACY.md` / `references/PRIVACY.md`, `references/privacy-contract.md`, `profiles/privacy.md`, `schemas/privacy-context.schema.json`, `scripts/privacy_runtime.py`, `scripts/privacy_diagnostics.py`, `scripts/privacy_preflight.py`.

@@ -23,6 +23,9 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import privacy_runtime  # noqa: E402
 
 CLASSES = {
     "failed_opportunity",
@@ -103,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     recipe = None
     envelope_path = None
+    privacy_ctx: dict[str, Any] | None = None
 
     if args.envelope is not None:
         ep = args.envelope if args.envelope.is_absolute() else Path.cwd() / args.envelope
@@ -121,9 +125,14 @@ def main(argv: list[str] | None = None) -> int:
         recipe = (env.get("request") or {}).get("recipe")
         if not source_run:
             source_run = run_id or envelope_path
+        if isinstance(env.get("privacy"), dict):
+            privacy_ctx = env["privacy"]
 
     if not source_run:
         source_run = run_id or "unspecified"
+
+    # Never put raw secrets into ledger summaries.
+    safe_summary = privacy_runtime.sanitize_error_message(args.summary)
 
     entry: dict[str, Any] = {
         "entry_id": f"ll-{uuid.uuid4().hex[:12]}",
@@ -131,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         "source_run": source_run,
         "run_id": run_id or None,
         "observation_class": args.obs_class,
-        "summary": args.summary,
+        "summary": safe_summary,
         "related_profiles": profiles,
         "related_gates": [g.strip() for g in args.gates.split(",") if g.strip()],
         "evidence_refs": [],
@@ -139,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         "authority": "advisory_only",
         "auto_apply_forbidden": True,
         "skill": "neon-genie",
+        **privacy_runtime.learning_ledger_privacy_fields(privacy_ctx),
     }
     if recipe:
         entry["recipe"] = recipe
@@ -172,6 +182,14 @@ def main(argv: list[str] | None = None) -> int:
         print("FAIL: NG-LEARN-005: auto_apply_forbidden must be true", file=sys.stderr)
         return 1
 
+    try:
+        privacy_runtime.assert_no_raw_secrets(
+            json.dumps(entry, sort_keys=True), context="learning-ledger-entry"
+        )
+    except ValueError as exc:
+        print(f"FAIL: {privacy_runtime.sanitize_error_message(str(exc))}", file=sys.stderr)
+        return 1
+
     ledger: Path = args.ledger
     if not ledger.is_absolute():
         ledger = Path.cwd() / ledger
@@ -185,7 +203,9 @@ def main(argv: list[str] | None = None) -> int:
     if entry.get("run_id"):
         print(f"  run_id: {entry['run_id']}")
     print(f"  class: {entry['observation_class']}")
+    print(f"  privacy_mode: {entry.get('privacy_mode')}")
     print("  canon_status: PROPOSED (never auto-applied)")
+    print("  learning: local operator artifact only; auto-apply forbidden")
     return 0
 
 

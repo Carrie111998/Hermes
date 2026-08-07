@@ -195,13 +195,30 @@ def check_invariants(text: str, inv: dict[str, Any], *, label: str = "artifact")
 
     if inv.get("require_gate"):
         g = str(inv["require_gate"])
-        if not re.search(rf"\b(Gate\s*{re.escape(g)}|gate:\s*{re.escape(g)}|gates_failed:.*{re.escape(g)})", text):
+        # Allow "Gate T", "Gate **T**", gate: T, gates_failed/checked lists
+        if not re.search(
+            rf"\b(Gate\s*\**{re.escape(g)}\**|gate:\s*{re.escape(g)}|"
+            rf"gates_failed:.*{re.escape(g)}|gates_checked:.*{re.escape(g)})",
+            text,
+        ):
             errors.append(f"NG-RUNTIME-013: {label}: expected gate {g}")
 
     if inv.get("forbid_fictional_resource"):
         if re.search(r"\b(invent(ed)? (capital|audience|credentials)|fictional (api|budget))\b", lower):
             if "must not" not in lower and "do not invent" not in lower and "no fiction" not in lower:
                 errors.append(f"NG-RUNTIME-014: {label}: fictional resource language")
+
+    if inv.get("require_privacy_mode"):
+        mode = str(inv["require_privacy_mode"])
+        if f"privacy_mode: {mode}" not in seal and f"privacy_mode: {mode}" not in text:
+            if f"`{mode}`" not in text and mode not in seal:
+                errors.append(f"NG-RUNTIME-020: {label}: missing privacy_mode {mode}")
+
+    if inv.get("forbid_external_sent_true"):
+        if re.search(r"sent:\s*true", text, re.I):
+            errors.append(f"NG-RUNTIME-021: {label}: sent: true forbidden")
+
+    # require_gate already covers S–Y letter gates via Gate X / gates_failed patterns
 
     return errors
 

@@ -63,7 +63,17 @@
       "type": "string",
       "enum": ["advisory_only"]
     },
-    "auto_apply_forbidden": { "type": "boolean", "const": true }
+    "auto_apply_forbidden": { "type": "boolean", "const": true },
+    "privacy_mode": {
+      "type": "string",
+      "enum": ["local_only", "external_research_allowed", "custom"]
+    },
+    "privacy_contract_version": { "type": "string" },
+    "privacy_telemetry": { "const": "disabled" },
+    "learning_local_only": { "type": "boolean", "const": true },
+    "learning_auto_apply_forbidden": { "type": "boolean", "const": true },
+    "learning_disclosure": { "type": "string" },
+    "host_provider_retention": { "const": "NOT_COMPUTABLE" }
   },
   "additionalProperties": true
 }

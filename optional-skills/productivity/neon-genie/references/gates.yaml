@@ -96,3 +96,78 @@ gates:
     refs:
       - docs/adr/0004-neon-genie-wayfinder-boundary.md
       - evals/behavioral/cases/wayfinder-change-control.json
+
+  # Privacy-by-construction (S–Y). CLEAR order: authority → evidence P–R → privacy S–Y → rest.
+  S:
+    name: egress_destination_known
+    severity: blocking
+    condition: external_action_sent_true && (destination_unknown || destination_empty)
+    remediation: block_send_and_log_BLOCK
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - references/PRIVACY.md
+      - docs/adr/0006-privacy-by-construction.md
+
+  T:
+    name: offline_no_external_send
+    severity: blocking
+    condition: (privacy_mode_LOCAL_ONLY || research_disabled) && external_action_sent_true
+    remediation: fail_CLEAR_and_correct_mode_or_actions
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - references/PRIVACY.md
+
+  U:
+    name: secret_no_egress
+    severity: blocking
+    condition: credential_or_secret_like_payload_would_be_or_was_sent
+    remediation: BLOCK_never_OBSERVED_from_leaked_secret
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - scripts/privacy_preflight.py
+      - references/PRIVACY.md
+
+  V:
+    name: private_egress_needs_consent
+    severity: blocking
+    condition: private_or_operator_egress_without_consent_ref
+    remediation: REQUEST_CONSENT_or_keep_local
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - references/PRIVACY.md
+
+  W:
+    name: privacy_claim_must_be_supported
+    severity: blocking
+    condition: absolute_privacy_claim_without_matching_mode_and_evidence
+    remediation: NOT_COMPUTABLE_or_privacy_warning
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - references/PRIVACY.md
+      - docs/adr/0006-privacy-by-construction.md
+
+  X:
+    name: telemetry_off_unless_opt_in
+    severity: blocking
+    condition: telemetry_status_not_disabled
+    remediation: force_disabled_and_fail_validate
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - references/PRIVACY.md
+
+  Y:
+    name: sealed_receipt_privacy_complete
+    severity: blocking
+    condition: SEAL_without_required_privacy_provenance_fields
+    remediation: complete_receipt_before_SEAL
+    refs:
+      - SKILL.md
+      - profiles/privacy.md
+      - schemas/run-receipt.schema.json
+      - references/PRIVACY.md

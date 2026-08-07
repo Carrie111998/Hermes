@@ -24,6 +24,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import lineage  # noqa: E402
 import paths as ng_paths  # noqa: E402
+import privacy_runtime  # noqa: E402
 
 ENVELOPE_SCHEMA_ID = "neon-genie/run-envelope"
 ENVELOPE_SCHEMA_VERSION = "1.0.0"
@@ -78,6 +79,11 @@ def build_envelope(
             f"NG-SCHEMA-002: run-receipt.json required before envelope: {receipt_path}"
         )
     receipt = _load(receipt_path)
+    privacy = receipt.get("privacy") or privacy_runtime.default_privacy_context(str(out_dir))
+    try:
+        privacy_runtime.assert_envelope_privacy(privacy)
+    except ValueError as exc:
+        raise ValueError(privacy_runtime.sanitize_error_message(str(exc))) from exc
 
     route = route or {}
     route_path = out_dir / "profile-route.json"
@@ -91,6 +97,8 @@ def build_envelope(
     )
     if "core" not in profiles:
         profiles = ["core"] + profiles
+    if "privacy" not in profiles:
+        profiles.append("privacy")
 
     summary_path = out_dir / "recipe-summary.json"
     summary = _load(summary_path) if summary_path.is_file() else {}
@@ -233,7 +241,19 @@ def build_envelope(
         },
         "canonical_sources": receipt.get("canonical_sources") or [],
         "assumptions": receipt.get("assumptions") or [],
+        **privacy_runtime.privacy_receipt_fields(privacy),
+        "external_actions": privacy_runtime.enumerate_external_actions(privacy),
     }
+
+    # Fail closed: envelope must not embed raw secrets.
+    privacy_runtime.assert_no_raw_secrets(
+        json.dumps({k: v for k, v in envelope.items() if k != "content_hash"}, sort_keys=True),
+        context="run-envelope",
+    )
+
+    # Optional schema fields must be omitted rather than emitted as null.
+    envelope["request"] = {k: v for k, v in envelope["request"].items() if v is not None}
+    envelope["wayfinder"] = {k: v for k, v in envelope["wayfinder"].items() if v is not None}
 
     # content_hash over body without content_hash
     body = {k: v for k, v in envelope.items() if k != "content_hash"}

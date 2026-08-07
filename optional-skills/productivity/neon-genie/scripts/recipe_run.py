@@ -96,6 +96,7 @@ def recipe_product_audit(out: Path) -> int:
         promotion_state="SPEC_COMPLETE",
         packets=[product_path, handoff_path],
         data_requests=data_requests,
+        brief=brief,
     )
     return rc.finish(
         recipe="product-audit",
@@ -148,6 +149,7 @@ def recipe_zero_option(out: Path) -> int:
         promotion_state="NOT_COMPUTABLE",
         not_computable="capabilities,access,opportunities",
         packets=[packet_path],
+        brief=brief,
     )
     return rc.finish(
         recipe="zero-option",
@@ -211,6 +213,7 @@ def recipe_zero_option_executable(out: Path) -> int:
         status="PROPOSED",
         promotion_state="TESTABLE",
         packets=[packet_path],
+        brief=brief,
     )
     return rc.finish(
         recipe="zero-option-executable",
@@ -281,6 +284,7 @@ def recipe_fragmentation(out: Path) -> int:
         promotion_state="MAPPED",
         not_computable="critical_integration_access",
         packets=[packet_path],
+        brief=brief,
     )
     return rc.finish(
         recipe="fragmentation",
@@ -373,6 +377,7 @@ def recipe_commercial(out: Path) -> int:
         not_computable="buyer_map,firm_price,revenue_scenarios",
         packets=[packet_path],
         data_requests=data_requests,
+        brief=brief,
     )
     return rc.finish(
         recipe="commercial",
@@ -474,6 +479,7 @@ def recipe_audit(out: Path) -> int:
         not_computable="quantified_cost_of_inaction",
         packets=[packet_path],
         data_requests=data_requests,
+        brief=brief,
     )
     return rc.finish(
         recipe="audit",
@@ -557,6 +563,7 @@ def recipe_agentic(out: Path) -> int:
         status="PROPOSED",
         promotion_state="CONCEPTUAL",
         packets=[packet_path],
+        brief=brief,
     )
     return rc.finish(
         recipe="agentic",
@@ -630,6 +637,7 @@ def recipe_memetic(out: Path) -> int:
         status="PROPOSED",
         promotion_state="CONCEPTUAL",
         packets=[packet_path],
+        brief=brief,
     )
     return rc.finish(
         recipe="memetic",
@@ -725,6 +733,7 @@ def recipe_evidence(out: Path) -> int:
         not_computable="crm_pipeline_conversion,uncited_market_size",
         packets=[packet_path],
         data_requests=data_requests,
+        brief=brief,
     )
     return rc.finish(
         recipe="evidence",
@@ -810,6 +819,7 @@ def recipe_opportunity(out: Path) -> int:
         not_computable="buyer,capabilities_until_declared",
         packets=[packet_path],
         data_requests=data_requests,
+        brief=brief,
     )
     return rc.finish(
         recipe="opportunity",
@@ -827,6 +837,78 @@ def recipe_opportunity(out: Path) -> int:
     )
 
 
+def recipe_capital_sprint(out: Path) -> int:
+    brief = SKILL_ROOT / "examples" / "capital-sprint.brief.yaml"
+    route = rc.route_request(brief)
+    rc.write_json(out / "profile-route.json", route)
+    profiles = route.get("selected") or ["core", "privacy", "capital_sprint"]
+
+    data_req = {
+        "request_id": "dr-org-identity-deadline",
+        "field": "org_legal_identity_and_hard_deadline",
+        "why_decision_critical": "Capital sprint fails closed without legal org identity and deadline",
+        "sensitivity": "operator",
+        "suggested_source": "Operator org records (EIN, tax status) and board-approved deadline",
+        "blocks_promotion": True,
+        "status": "open",
+    }
+    data_requests = [data_req]
+    rc.write_json(out / "data-requests.json", data_requests)
+
+    packet = {
+        "sprint_window": {"days": [7, 14, 30], "deadline": "NOT_COMPUTABLE_until_operator"},
+        "impact_object": {
+            "goal": "NOT_COMPUTABLE_until_operator",
+            "unit_cost": "NOT_COMPUTABLE_until_operator",
+            "note": "Stub packaging packet; full CapitalSprintPacket is prose-runtime",
+        },
+        "warm_network_classes": ["member", "alumni", "corporate", "creator", "cold"],
+        "completion_proof": "externally checkable gift total vs floor by deadline OR documented shortfall",
+        "proof_path": [
+            "satisfy DataRequest for org identity and deadline",
+            "publish advisory campaign card (operator executes)",
+            "record gifts against floor",
+            "ledger proof_obtained or proof_failed",
+        ],
+        "promotion_state": "TESTABLE",
+        "authority": "advisory_only",
+        "grants_execution": False,
+        "constraints": [
+            "no private org names in shared corpus",
+            "dues are not donations",
+        ],
+    }
+    packet_path = out / "capital-sprint-packet.stub.json"
+    rc.write_json(packet_path, packet)
+    # Typed validate skipped: validate_packet has no capital_sprint type yet
+
+    receipt_path = out / "run-receipt.json"
+    rc.build_receipt(
+        receipt_path,
+        profiles,
+        status="PROPOSED",
+        promotion_state="TESTABLE",
+        not_computable="org_identity,deadline,floor_until_declared",
+        packets=[packet_path],
+        data_requests=data_requests,
+        brief=brief,
+    )
+    return rc.finish(
+        recipe="capital-sprint",
+        brief=brief,
+        out=out,
+        route=route,
+        artifacts=[
+            out / "profile-route.json",
+            packet_path,
+            out / "data-requests.json",
+            receipt_path,
+            out / "recipe-summary.json",
+        ],
+        extra={"outcome": "CAPITAL_SPRINT_STUB_WITH_REQUEST"},
+    )
+
+
 RECIPES: dict[str, RecipeFn] = {
     "product-audit": recipe_product_audit,
     "zero-option": recipe_zero_option,
@@ -838,6 +920,7 @@ RECIPES: dict[str, RecipeFn] = {
     "memetic": recipe_memetic,
     "evidence": recipe_evidence,
     "opportunity": recipe_opportunity,
+    "capital-sprint": recipe_capital_sprint,
 }
 
 

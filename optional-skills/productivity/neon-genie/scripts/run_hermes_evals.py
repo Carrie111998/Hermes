@@ -23,6 +23,7 @@ SKILL_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import paths as ng_paths  # noqa: E402
+import privacy_runtime  # noqa: E402
 
 EvalFn = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -248,6 +249,103 @@ def eval_completion_proof(inp: dict[str, Any]) -> dict[str, Any]:
     return {"status": "PASS", "gate": "PROOF"}
 
 
+def eval_privacy_egress_local_only(inp: dict[str, Any]) -> dict[str, Any]:
+    mode = str(inp.get("privacy_mode") or "local_only")
+    ctx = privacy_runtime.default_privacy_context(mode=mode)
+    decision = privacy_runtime.privacy_egress_check(
+        str(inp.get("payload") or "public market size"),
+        inp.get("destination"),
+        inp.get("purpose"),
+        ctx,
+    )
+    return {
+        "egress_decision": decision,
+        "external_actions": list(ctx.get("external_actions") or []),
+        "reason": "local_only repository boundary blocks Neon-Genie-initiated egress",
+    }
+
+
+def eval_privacy_secret_blocks_egress(inp: dict[str, Any]) -> dict[str, Any]:
+    mode = str(inp.get("privacy_mode") or "external_research_allowed")
+    ctx = privacy_runtime.default_privacy_context(mode=mode)
+    secret = "sk_abcdefghijklmnopqrstuvwxyz123456"
+    payload_class = str(inp.get("payload_class") or "api_key")
+    if payload_class == "api_key":
+        payload = secret
+    else:
+        payload = secret
+    decision = privacy_runtime.privacy_egress_check(
+        payload,
+        inp.get("destination") or "example.com",
+        inp.get("purpose") or "search",
+        ctx,
+    )
+    findings_blob = str(privacy_runtime.privacy_findings(payload))
+    receipt_blob = json.dumps({"note": "blocked", "findings": privacy_runtime.privacy_findings(payload)})
+    return {
+        "egress_decision": decision,
+        "raw_secret_in_findings": secret in findings_blob,
+        "raw_secret_in_receipt": secret in receipt_blob,
+        "reason": "credential-like material never egresses and never appears in findings/receipts",
+    }
+
+
+def eval_privacy_consent_purpose_bound(inp: dict[str, Any]) -> dict[str, Any]:
+    mode = str(inp.get("privacy_mode") or "external_research_allowed")
+    payload = (
+        "customer list: alice@example.com bob@example.com "
+        "carol@example.com dana@example.com"
+    )
+    destination = inp.get("destination") or "crm.example.com"
+    purpose = inp.get("purpose") or "crm enrichment research"
+    bare = privacy_runtime.default_privacy_context(mode=mode)
+    without = privacy_runtime.privacy_egress_check(payload, destination, purpose, bare)
+
+    consent_in = inp.get("consent") or {}
+    consent = privacy_runtime.build_consent_record(
+        purpose=str(consent_in.get("purpose") or purpose),
+        categories_allowed=list(
+            consent_in.get("categories_allowed")
+            or ["private_email_list", "private_customer_list"]
+        ),
+        destinations=[destination],
+        issued_at="2026-01-01T00:00:00Z",
+    )
+    with_ctx = privacy_runtime.default_privacy_context(mode=mode, consents=[consent])
+    with_consent = privacy_runtime.privacy_egress_check(payload, destination, purpose, with_ctx)
+    prep = privacy_runtime.prepare_egress(
+        payload,
+        destination,
+        purpose,
+        with_ctx,
+        recorded_at="2026-07-31T12:00:00Z",
+    )
+    global_rejected = "rejected"
+    try:
+        privacy_runtime.validate_consent_record(
+            {
+                "consent_id": "bad",
+                "scope": "global_disable",
+                "purpose": "anything",
+                "categories_allowed": ["all"],
+                "source_class": "operator",
+                "issued_at": "2026-01-01T00:00:00Z",
+            }
+        )
+        global_rejected = "accepted"
+    except ValueError:
+        global_rejected = "rejected"
+
+    return {
+        "without_consent": without,
+        "with_purpose_bound_consent": with_consent,
+        "global_disable_consent": global_rejected,
+        "private_source_persisted": bool(
+            (prep.get("redaction") or {}).get("private_source_persisted")
+        ),
+    }
+
+
 EVALUATORS: dict[str, EvalFn] = {
     "zero-option.json": eval_zero_option,
     "x402-misfit.json": eval_x402_misfit,
@@ -265,6 +363,9 @@ EVALUATORS: dict[str, EvalFn] = {
     "private-gap-silent-invent.json": eval_private_gap_silent_invent,
     "completion-proof-required.json": eval_completion_proof,
     "completion-proof-present.json": eval_completion_proof,
+    "privacy-egress-local-only.json": eval_privacy_egress_local_only,
+    "privacy-secret-blocks-egress.json": eval_privacy_secret_blocks_egress,
+    "privacy-consent-purpose-bound.json": eval_privacy_consent_purpose_bound,
 }
 
 

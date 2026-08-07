@@ -51,6 +51,7 @@ PACKET_TYPES = [
 
 CLI_JOBS = [
     "doctor",
+    "privacy",
     "check",
     "run",
     "recipe",
@@ -92,6 +93,18 @@ def build_capabilities() -> dict[str, Any]:
         "gates": GATES,
         "cli_jobs": CLI_JOBS,
         "runtime_features": {
+            "privacy_contract": "1.0.0",
+            "privacy_default": "local_only",
+            "privacy_purpose_bound_consent_only": True,
+            "privacy_global_disable": False,
+            "privacy_egress_decisions": [
+                "ALLOW",
+                "REDACT_THEN_ALLOW",
+                "REQUEST_CONSENT",
+                "BLOCK",
+            ],
+            "repository_telemetry": "disabled",
+
             "research": "host_dependent",
             "research_default": "proactive",
             "offline_opt_out": True,

@@ -1,8 +1,9 @@
 {
   "skill": "neon-genie",
-  "version": "3.23.0",
+  "version": "3.25.0",
   "profiles": [
     "core",
+    "privacy",
     "product_architecture",
     "opportunity_mining",
     "fragmentation",
@@ -12,10 +13,12 @@
     "evidence_intelligence",
     "memetic",
     "audit_delivery",
-    "wayfinder_handoff"
+    "wayfinder_handoff",
+    "capital_sprint"
   ],
   "default_profiles": [
-    "core"
+    "core",
+    "privacy"
   ],
   "claim_labels": [
     "OBSERVED",
@@ -32,8 +35,8 @@
   ],
   "authority": "advisory_only",
   "research": {
-    "mode": "proactive",
-    "default": true,
+    "mode": "local_only",
+    "default": false,
     "offline_opt_out": true,
     "source_priority": [
       "operator_supplied",

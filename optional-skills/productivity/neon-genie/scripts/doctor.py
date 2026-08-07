@@ -38,6 +38,7 @@ def step(name: str, args: list[str]) -> int:
 def main() -> int:
     steps: list[tuple[str, list[str]]] = [
         ("skill integrity", ["do", "check"]),
+        ("privacy diagnostics", ["do", "privacy", "--json"]),
     ]
     # Distribution spine only on full tree (has distribution.yaml + root schemas/)
     if (SKILL_ROOT / "distribution.yaml").is_file() and not ng_paths.is_hub_layout():
@@ -81,6 +82,10 @@ def main() -> int:
             ["do", "recipe", "--name", "opportunity", "--out", "out/neon-genie/doctor-opportunity"],
         ),
         (
+            "recipe smoke: capital-sprint",
+            ["do", "recipe", "--name", "capital-sprint", "--out", "out/neon-genie/doctor-capital-sprint"],
+        ),
+        (
             "sample opportunity validate",
             [
                 "do",
@@ -110,6 +115,19 @@ def main() -> int:
         code = step(name, args)
         if code != 0:
             return code
+
+    # Founder-routing regression (packaging CLI) — keep cold-start triggers honest
+    route_test = SCRIPT_DIR / "test_route_profiles.py"
+    if route_test.is_file():
+        print("==> founder profile routing")
+        r = subprocess.run([PY, str(route_test)], cwd=SKILL_ROOT)
+        if r.returncode != 0:
+            print("FAIL: founder profile routing", file=sys.stderr)
+            return r.returncode
+        print("OK: founder profile routing")
+    else:
+        print("==> founder profile routing")
+        print("SKIP: test_route_profiles.py not present")
 
     print("")
     print("PASS: neon-genie doctor (all smokes green)")

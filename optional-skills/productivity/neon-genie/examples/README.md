@@ -23,6 +23,7 @@ They are **not** execution authority.
 | `memetic.brief.yaml` | Name pressure without promotion override |
 | `evidence.brief.yaml` | Evidence intelligence find/request scaffold |
 | `opportunity.brief.yaml` | Opportunity mining with completion proof |
+| `privacy-external-research.brief.yaml` | Explicit `privacy.mode` + purpose-bound consents (no global disable) |
 
 ## Sample packets
 
@@ -30,6 +31,11 @@ They are **not** execution authority.
 |------|----------|
 | `packets/sample-opportunity.packet.json` | `do validate --type opportunity` |
 | `packets/sample-receipt.packet.json` | `do validate --type receipt --strict-authority` |
+| `packets/sample-privacy-context.json` | `do validate --type privacy` |
+| `packets/sample-external-action.json` | Schema: external action required fields |
+| `packets/sample-purpose-bound-consent.json` | Schema: purpose_bound consent only |
+
+Privacy boundary: `PRIVACY.md`, `python scripts/neon_genie.py do privacy --json`.
 
 ## Packaging recipes
 

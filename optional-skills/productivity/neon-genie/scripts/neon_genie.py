@@ -25,6 +25,10 @@ INTENTS: dict[str, dict[str, str]] = {
         "script": "doctor.py",
         "description": "Full smoke suite (start here after install)",
     },
+    "privacy": {
+        "script": "privacy_diagnostics.py",
+        "description": "Show resolved repository privacy boundary (--json)",
+    },
     "check": {
         "script": "validate_hermes_skill.py",
         "description": "Validate skill install and required files",
@@ -93,7 +97,7 @@ INTENTS: dict[str, dict[str, str]] = {
 
 # Everyday first in help; aliases for older script-style names
 EVERYDAY = ("doctor", "check", "run", "recipe", "route", "validate", "capabilities")
-VERIFY = ("eval", "transcripts", "behavioral", "runtime", "dist", "release-check")
+VERIFY = ("eval", "transcripts", "behavioral", "runtime", "dist", "release-check", "privacy")
 OUTCOMES = ("receipt", "envelope", "learn", "reconcile")
 
 ALIASES = {

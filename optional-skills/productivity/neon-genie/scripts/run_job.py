@@ -43,6 +43,8 @@ PROFILE_RECIPE_HINTS: list[tuple[str, str]] = [
     ("zero_option", "zero-option"),
     ("product_architecture", "product-audit"),
     ("fragmentation", "fragmentation"),
+    # capital_sprint before commercial: capital briefs often also match commercial
+    ("capital_sprint", "capital-sprint"),
     ("commercial", "commercial"),
     ("audit_delivery", "audit"),
     ("agentic_services", "agentic"),
@@ -154,6 +156,7 @@ def run_scaffold(
             status="PROPOSED",
             promotion_state="RAW_SIGNAL",
             packets=packets or None,
+            brief=brief,
         )
     except RuntimeError as exc:
         return fail("NG-PKG-021", f"receipt failed: {exc}")

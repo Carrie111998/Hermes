@@ -22,6 +22,7 @@ SKILL_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import paths as ng_paths  # noqa: E402
+import privacy_runtime  # noqa: E402
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -101,11 +102,34 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="JSON file: one DataRequest object or array of DataRequests",
     )
+    parser.add_argument(
+        "--privacy-mode",
+        default=None,
+        choices=["local_only", "external_research_allowed", "custom"],
+        help="Privacy mode (default: from --brief privacy section or local_only)",
+    )
+    parser.add_argument(
+        "--brief",
+        type=Path,
+        help="Optional request brief YAML — privacy/research config flows into receipt",
+    )
+    parser.add_argument(
+        "--privacy-context",
+        type=Path,
+        help="Optional JSON privacy context (overrides --privacy-mode defaults)",
+    )
+    parser.add_argument(
+        "--external-actions",
+        type=Path,
+        help="Optional JSON array of external action records to enumerate on the receipt",
+    )
     args = parser.parse_args(argv)
 
     profiles = [p.strip() for p in args.profiles.split(",") if p.strip()]
     if "core" not in profiles:
         profiles = ["core"] + profiles
+    if "privacy" not in profiles:
+        profiles.append("privacy")
 
     packet_hashes: dict[str, str] = {}
     for path in args.packet:
@@ -152,6 +176,58 @@ def main(argv: list[str] | None = None) -> int:
             " Open blocking data requests present; do not promote until satisfied or waived."
         )
 
+    artifact_path = str(args.out.parent) if args.out else "out/neon-genie/example"
+    try:
+        if args.privacy_context is not None:
+            if not args.privacy_context.is_file():
+                print(f"FAIL: privacy-context not found: {args.privacy_context}", file=sys.stderr)
+                return 1
+            privacy = json.loads(args.privacy_context.read_text(encoding="utf-8"))
+            privacy_runtime.assert_contract_version(privacy.get("contract_version"))
+        elif args.brief is not None:
+            if not args.brief.is_file():
+                print(f"FAIL: brief not found: {args.brief}", file=sys.stderr)
+                return 1
+            privacy = privacy_runtime.resolve_privacy_config_from_brief(
+                args.brief, artifact_path=artifact_path
+            )
+            if args.privacy_mode is not None:
+                privacy = privacy_runtime.default_privacy_context(
+                    artifact_path,
+                    args.privacy_mode,
+                    approved_domains=privacy.get("egress", {}).get("approved_domains"),
+                    approved_tool_classes=privacy.get("egress", {}).get("approved_tool_classes"),
+                    consents=privacy.get("consents"),
+                )
+        else:
+            privacy = privacy_runtime.default_privacy_context(
+                artifact_path, args.privacy_mode or "local_only"
+            )
+
+        if args.external_actions is not None:
+            if not args.external_actions.is_file():
+                print(
+                    f"FAIL: external-actions not found: {args.external_actions}",
+                    file=sys.stderr,
+                )
+                return 1
+            actions_raw = json.loads(args.external_actions.read_text(encoding="utf-8"))
+            if not isinstance(actions_raw, list):
+                print("FAIL: --external-actions must be a JSON array", file=sys.stderr)
+                return 1
+            privacy = privacy_runtime.merge_privacy_context(
+                privacy, external_actions=actions_raw
+            )
+        else:
+            privacy_runtime.assert_envelope_privacy(privacy)
+    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        msg = privacy_runtime.sanitize_error_message(str(exc))
+        print(f"FAIL: {msg}", file=sys.stderr)
+        return 1
+
+    privacy_fields = privacy_runtime.privacy_receipt_fields(privacy)
+    external_actions = privacy_runtime.enumerate_external_actions(privacy)
+
     receipt = {
         "status": args.status,
         "profiles_loaded": profiles,
@@ -177,7 +253,18 @@ def main(argv: list[str] | None = None) -> int:
         "open_blocking_requests": open_blocking,
         "research_attempts": [],
         "evidence_protocol": "find_request_not_computable",
+        **privacy_fields,
+        "external_actions": external_actions,
     }
+
+    # Fail closed: receipt body must not embed raw secrets.
+    try:
+        privacy_runtime.assert_no_raw_secrets(
+            json.dumps(receipt, sort_keys=True), context="run-receipt"
+        )
+    except ValueError as exc:
+        print(f"FAIL: {privacy_runtime.sanitize_error_message(str(exc))}", file=sys.stderr)
+        return 1
 
     text = json.dumps(receipt, indent=2) + "\n"
     if args.out:

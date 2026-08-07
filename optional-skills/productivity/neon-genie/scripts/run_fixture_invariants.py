@@ -40,6 +40,9 @@ REQUIRED_CASES = {
     "private-gap-silent-invent.json",
     "completion-proof-required.json",
     "completion-proof-present.json",
+    "privacy-egress-local-only.json",
+    "privacy-secret-blocks-egress.json",
+    "privacy-consent-purpose-bound.json",
 }
 
 
@@ -91,6 +94,26 @@ def main() -> int:
             exp = data.get("expected") or {}
             if exp.get("promotion_blocked") is not True:
                 errors.append("scorecard-cannot-override-gate.json must block promotion")
+        if path.name == "privacy-egress-local-only.json":
+            exp = data.get("expected") or {}
+            if exp.get("egress_decision") != "BLOCK":
+                errors.append("privacy-egress-local-only.json expected.egress_decision must be BLOCK")
+        if path.name == "privacy-secret-blocks-egress.json":
+            exp = data.get("expected") or {}
+            if exp.get("egress_decision") != "BLOCK":
+                errors.append("privacy-secret-blocks-egress.json expected.egress_decision must be BLOCK")
+            if exp.get("raw_secret_in_findings") is not False:
+                errors.append("privacy-secret-blocks-egress.json must forbid raw secrets in findings")
+        if path.name == "privacy-consent-purpose-bound.json":
+            exp = data.get("expected") or {}
+            if exp.get("without_consent") != "REQUEST_CONSENT":
+                errors.append("privacy-consent-purpose-bound.json without_consent must be REQUEST_CONSENT")
+            if exp.get("with_purpose_bound_consent") != "REDACT_THEN_ALLOW":
+                errors.append(
+                    "privacy-consent-purpose-bound.json with_purpose_bound_consent must be REDACT_THEN_ALLOW"
+                )
+            if exp.get("global_disable_consent") != "rejected":
+                errors.append("privacy-consent-purpose-bound.json must reject global disable")
 
     if errors:
         print("FAIL: fixture invariants", file=sys.stderr)

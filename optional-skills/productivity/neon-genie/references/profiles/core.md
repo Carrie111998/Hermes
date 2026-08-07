@@ -13,7 +13,7 @@ Record non-goals and authority ceiling (`advisory_only` unless operator raises).
 1. Merge operator-supplied canonical sources with workspace context (no external KB required to load).
 2. Build evidence hierarchy and non-goals.
 3. **Gap-detect** material claims that would be weak without external facts.
-4. **Research plan + first fetch pass** using host tools unless `research: false` / `offline: true`.
+4. Load `privacy` with core. Research is local-only by default; before any host-tool action apply `RUNE.PRIVACY_EGRESS_CHECK`. Private gaps remain DataRequests.
 5. Normalize and cite; set novelty, buildability, and success criteria on the refreshed evidence base.
 6. Auto-load `evidence_intelligence` when external facts would change the recommendation.
 
@@ -77,6 +77,7 @@ Composite score never overrides a mandatory gate failure.
 - `RUNE.NG.ROUTE`
 - `RUNE.NG.CLEAR_CHECK`
 - `RUNE.NG.SEAL`
+- `RUNE.PRIVACY_EGRESS_CHECK`
 
 ## Outputs
 

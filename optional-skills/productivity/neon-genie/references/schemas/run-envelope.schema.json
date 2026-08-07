@@ -146,6 +146,12 @@
     "receipt_path": {
       "type": "string"
     },
+    "privacy": { "$ref": "privacy-context.schema.json" },
+    "privacy_mode": { "enum": ["local_only", "external_research_allowed", "custom"] },
+    "external_actions": { "type": "array" },
+    "artifact_paths": { "type": "array" },
+    "telemetry_status": { "const": "disabled" },
+    "deletion_instructions": { "type": "string" },
     "content_hash": {
       "type": "string",
       "description": "sha256 of envelope body without content_hash field"

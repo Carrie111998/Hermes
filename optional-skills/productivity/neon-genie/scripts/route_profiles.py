@@ -42,6 +42,20 @@ PROFILE_TRIGGERS: dict[str, tuple[str, ...]] = {
         "blocked transition",
         "opportunity mining",
         "weak signal",
+        "roadmap",
+        "business idea",
+        "go into business",
+        "for myself",
+        "self-employed",
+        "side project",
+        "launch my",
+        "turn my idea",
+        "app idea",
+        "product idea",
+        "what should i build",
+        "where do i start",
+        "next steps for my idea",
+        "how do i approach",
     ),
     "fragmentation": (
         "many portals",
@@ -59,6 +73,16 @@ PROFILE_TRIGGERS: dict[str, tuple[str, ...]] = {
         "zero option",
         "zero-option",
         "no capital",
+        "limited money",
+        "limited resources",
+        "limited capital",
+        "between jobs",
+        "bootstrapped",
+        "no budget",
+        "can't afford",
+        "cannot afford",
+        "first revenue",
+        "make money from",
     ),
     "agentic_services": (
         "agent workflow",
@@ -107,6 +131,19 @@ PROFILE_TRIGGERS: dict[str, tuple[str, ...]] = {
         "execution packet",
         "wayfinder handoff",
         "wayfinder",
+    ),
+    "capital_sprint": (
+        "capital sprint",
+        "annual fund",
+        "donation drive",
+        "membership drive",
+        "fundraising deadline",
+        "501c3 campaign",
+        "501(c)(3)",
+        "impact object",
+        "donor sprint",
+        "nonprofit capital",
+        "raise money by deadline",
     ),
 }
 
@@ -163,6 +200,18 @@ def match_profiles(text: str) -> list[str]:
     return matched
 
 
+def ensure_privacy(profiles: list[str]) -> list[str]:
+    """Always co-load privacy after core on every route result."""
+    out = list(profiles)
+    if "core" not in out:
+        out = ["core"] + out
+    if "privacy" not in out:
+        # insert after core
+        idx = out.index("core") + 1
+        out = out[:idx] + ["privacy"] + out[idx:]
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Route Neon Genie profiles")
     src = parser.add_mutually_exclusive_group(required=True)
@@ -190,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
 
     triggered = match_profiles(text)
     # Prefer explicit preferred_profiles when present
-    selected = list(dict.fromkeys(["core"] + preferred + triggered))
+    selected = list(dict.fromkeys(["core", "privacy"] + preferred + triggered))
 
     known: list[str] = []
     try:
@@ -205,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         unknown = []
 
+    # Always co-load privacy after known-filter so it is never stripped as unknown
+    # (privacy may land in manifest/profiles later; selected still requires it).
+    selected = ensure_privacy(selected)
+
     notes: list[str] = []
     if "evidence_intelligence" not in selected and args.auto_evidence:
         notes.append(
@@ -214,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         notes.append(f"ignored unknown profiles: {', '.join(unknown)}")
 
     result = {
-        "default": ["core"],
+        "default": ["core", "privacy"],
         "preferred_profiles": preferred,
         "triggered": [p for p in triggered if p != "core"],
         "selected": selected,

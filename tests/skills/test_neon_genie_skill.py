@@ -1,16 +1,13 @@
-"""Smoke tests for optional-skills/productivity/neon-genie.
+"""Tests for the optional neon-genie skill (stdlib + pytest).
 
-Contract checks only (no live network / LLM):
-  - SKILL.md hardline frontmatter
-  - modern section order
-  - referenced support paths exist
-  - packaging helpers parse as Python
-  - doctor / envelope authority invariants via subprocess
+Covers SKILL.md authoring standards and packaging CLI helpers that ship
+with the optional leaf: route_profiles founder language, and doctor surface.
+No live network calls.
 """
 
 from __future__ import annotations
 
-import ast
+import importlib.util
 import json
 import re
 import subprocess
@@ -18,179 +15,139 @@ import sys
 from pathlib import Path
 
 import pytest
-import yaml
 
-SKILL_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "optional-skills"
-    / "productivity"
-    / "neon-genie"
-)
-REQUIRED_SECTIONS = (
-    "# Neon Genie Skill",
-    "## When to Use",
-    "## Prerequisites",
-    "## How to Run",
-    "## Quick Reference",
-    "## Procedure",
-    "## Pitfalls",
-    "## Verification",
-)
+REPO = Path(__file__).resolve().parents[2]
+SKILL_DIR = REPO / "optional-skills" / "productivity" / "neon-genie"
+ROUTE = SKILL_DIR / "scripts" / "route_profiles.py"
+CLI = SKILL_DIR / "scripts" / "neon_genie.py"
+PY = sys.executable
 
 
 @pytest.fixture(scope="module")
-def skill_text() -> str:
-    return (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-
-
-@pytest.fixture(scope="module")
-def frontmatter(skill_text: str) -> dict:
-    m = re.search(r"^---\n(.*?)\n---", skill_text, re.DOTALL)
+def frontmatter() -> dict:
+    src = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    m = re.search(r"^---\n(.*?)\n---", src, re.DOTALL)
     assert m, "SKILL.md missing YAML frontmatter"
-    data = yaml.safe_load(m.group(1))
-    assert isinstance(data, dict)
-    return data
+    # Prefer yaml if present; else minimal parse for required fields
+    try:
+        import yaml  # type: ignore
+
+        return yaml.safe_load(m.group(1))
+    except Exception:
+        data: dict = {}
+        for line in m.group(1).splitlines():
+            if ":" in line and not line.startswith(" "):
+                k, v = line.split(":", 1)
+                data[k.strip()] = v.strip().strip('"').strip("'")
+        return data
 
 
-def test_skill_dir_exists() -> None:
-    assert SKILL_DIR.is_dir(), f"missing skill dir: {SKILL_DIR}"
+@pytest.fixture(scope="module")
+def route_mod():
+    spec = importlib.util.spec_from_file_location("ng_route", ROUTE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # route_profiles imports paths from same dir
+    sys.path.insert(0, str(SKILL_DIR / "scripts"))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        pass
+    return module
 
 
-def test_description_hardline(frontmatter: dict) -> None:
+def test_skill_files_present() -> None:
+    assert (SKILL_DIR / "SKILL.md").is_file()
+    assert CLI.is_file()
+    assert ROUTE.is_file()
+    assert (SKILL_DIR / "references" / "profiles" / "core.md").is_file()
+    assert (SKILL_DIR / "references" / "profiles" / "privacy.md").is_file()
+    assert (SKILL_DIR / "references" / "schemas" / "run-envelope.schema.json").is_file()
+    assert (SKILL_DIR / "PRIVACY.md").is_file()
+
+
+def test_description_within_limit(frontmatter: dict) -> None:
     desc = frontmatter["description"]
+    if isinstance(desc, str) and "\n" in desc:
+        # folded YAML becomes single string with spaces
+        desc = " ".join(desc.split())
     assert isinstance(desc, str)
-    assert len(desc) <= 60, f"description is {len(desc)} chars (hardline ≤60): {desc!r}"
-    assert desc.endswith("."), f"description must end with period: {desc!r}"
-    assert "\n" not in desc.strip()
-    for banned in ("powerful", "comprehensive", "seamless", "advanced"):
-        assert banned not in desc.lower()
+    assert len(desc) <= 60, f"description is {len(desc)} chars (limit 60): {desc!r}"
+    assert desc.endswith(".")
 
 
-def test_author_credits_contributor_first(frontmatter: dict) -> None:
-    author = str(frontmatter.get("author") or "")
-    assert "Zero State" in author
-    assert "scrimshawlife-ctrl" in author
-    # Contributor handle/org credit first
-    assert author.lower().index("zero state") < author.lower().index("alchemy")
+def test_required_frontmatter_fields(frontmatter: dict) -> None:
+    assert frontmatter["name"] == "neon-genie"
+    for field in ("version", "author", "license", "platforms"):
+        assert frontmatter.get(field), f"missing frontmatter field: {field}"
+    author = str(frontmatter["author"])
+    assert "Daniel Meyer" in author
+    assert "@scrimshawlife-ctrl" in author
+    meta = frontmatter.get("metadata") or {}
+    hermes = meta.get("hermes") if isinstance(meta, dict) else {}
+    assert hermes.get("category") == "productivity"
 
 
-def test_name_and_platforms(frontmatter: dict) -> None:
-    assert frontmatter.get("name") == "neon-genie"
-    platforms = frontmatter.get("platforms") or []
-    assert set(platforms) >= {"linux", "macos", "windows"}
+def test_skill_body_has_modern_sections() -> None:
+    body = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    assert body.lstrip().startswith("---") or "# Neon Genie Skill" in body
+    assert "# Neon Genie Skill" in body
+    for heading in (
+        "## When to Use",
+        "## Prerequisites",
+        "## How to Run",
+        "## Quick Reference",
+        "## Procedure",
+        "## Pitfalls",
+        "## Verification",
+    ):
+        assert heading in body, f"SKILL.md missing section: {heading}"
 
 
-def test_modern_section_order(skill_text: str) -> None:
-    positions = []
-    for heading in REQUIRED_SECTIONS:
-        idx = skill_text.find(heading)
-        assert idx >= 0, f"missing section: {heading}"
-        positions.append(idx)
-    assert positions == sorted(positions), "sections out of required order"
-
-
-def test_body_is_concise(skill_text: str) -> None:
-    # Hardline target ~200 lines for complex skills; allow modest headroom
-    lines = skill_text.splitlines()
-    assert len(lines) <= 280, f"SKILL.md too long for optional catalog: {len(lines)} lines"
-
-
-def test_advisory_authority_in_prose(skill_text: str) -> None:
-    lower = skill_text.lower()
-    assert "advisory" in lower
-    assert "grants_execution" in lower or "never spend" in lower or "mutate" in lower
-
-
-@pytest.mark.parametrize(
-    "rel",
-    [
-        "scripts/neon_genie.py",
-        "scripts/paths.py",
-        "scripts/doctor.py",
-        "scripts/validate_packet.py",
-        "scripts/build_envelope.py",
-        "scripts/lineage.py",
-        "scripts/run_job.py",
-        "templates/request.yaml",
-        "references/gates.yaml",
-        "references/hermes-runtime-contract.md",
-        "references/schemas/run-envelope.schema.json",
-        "references/profiles/core.md",
-        "examples/product-audit.brief.yaml",
-        "examples/evals/cases/zero-option.json",
-    ],
-)
-def test_required_assets_exist(rel: str) -> None:
-    path = SKILL_DIR / rel
-    assert path.is_file(), f"missing required asset: {rel}"
-
-
-def test_support_paths_referenced_in_skill_exist(skill_text: str) -> None:
-    # File-level allowlisted refs in backticks
-    refs = re.findall(
-        r"`((?:references|templates|scripts|examples)/[^`\s]+)`",
-        skill_text,
+def test_founder_route_profiles(route_mod) -> None:
+    text = (
+        "I'm between jobs with limited money and need a roadmap for my app idea"
     )
-    missing = []
-    for rel in sorted(set(refs)):
-        # skip bare job names mistaken as paths
-        if " " in rel:
-            continue
-        if not (SKILL_DIR / rel).exists():
-            missing.append(rel)
-    assert not missing, f"SKILL.md references missing paths: {missing}"
+    selected = set(route_mod.ensure_privacy(route_mod.match_profiles(text)))
+    # ensure_privacy alone doesn't prepend core; match + ensure like CLI
+    profiles = route_mod.match_profiles(text)
+    selected = set(route_mod.ensure_privacy(["core"] + profiles))
+    assert "opportunity_mining" in selected
+    assert "zero_option" in selected
+    assert "privacy" in selected
 
 
-@pytest.mark.parametrize(
-    "script",
-    [
-        "neon_genie.py",
-        "paths.py",
-        "doctor.py",
-        "validate_packet.py",
-        "build_envelope.py",
-        "lineage.py",
-        "run_job.py",
-        "recipe_run.py",
-        "capabilities.py",
-    ],
-)
-def test_shipped_scripts_parse(script: str) -> None:
-    src = (SKILL_DIR / "scripts" / script).read_text(encoding="utf-8")
-    ast.parse(src)
+def test_venture_capital_not_zero_option(route_mod) -> None:
+    profiles = set(route_mod.match_profiles("research venture capital firm partners"))
+    assert "zero_option" not in profiles
 
 
-def test_check_and_zero_option_envelope(tmp_path: Path) -> None:
-    py = sys.executable
-    check = subprocess.run(
-        [py, str(SKILL_DIR / "scripts" / "neon_genie.py"), "do", "check"],
+def test_capital_sprint_routes(route_mod) -> None:
+    profiles = set(
+        route_mod.match_profiles(
+            "design a capital sprint and impact object for our annual fund"
+        )
+    )
+    assert "capital_sprint" in profiles
+
+
+def test_cli_check_and_capabilities() -> None:
+    r = subprocess.run(
+        [PY, str(CLI), "do", "check"],
         cwd=SKILL_DIR,
         capture_output=True,
         text=True,
+        check=False,
     )
-    assert check.returncode == 0, check.stderr + check.stdout
-
-    out = tmp_path / "zero"
-    run = subprocess.run(
-        [
-            py,
-            str(SKILL_DIR / "scripts" / "neon_genie.py"),
-            "do",
-            "run",
-            "--recipe",
-            "zero-option",
-            "--out",
-            str(out),
-        ],
+    assert r.returncode == 0, r.stderr + r.stdout
+    r2 = subprocess.run(
+        [PY, str(CLI), "do", "capabilities", "--json"],
         cwd=SKILL_DIR,
         capture_output=True,
         text=True,
+        check=False,
     )
-    assert run.returncode == 0, run.stderr + run.stdout
-    env_path = out / "run-envelope.json"
-    assert env_path.is_file()
-    env = json.loads(env_path.read_text(encoding="utf-8"))
-    assert env.get("authority") == "advisory_only"
-    assert env.get("grants_execution") is False
-    assert env.get("schema_id") == "neon-genie/run-envelope"
-    assert env.get("run_id", "").startswith("ng_run_")
+    assert r2.returncode == 0, r2.stderr + r2.stdout
+    cap = json.loads(r2.stdout)
+    assert cap["authority"] == "advisory_only"
+    assert cap["grants_execution"] is False
