@@ -2233,6 +2233,10 @@ class AIAgent:
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),
                     "finish_reason": msg.get("finish_reason"),
+                    # Per-message token accounting (epic #1 / ticket #2):
+                    # stamped by build_assistant_message; absent on user/tool
+                    # rows so the column stays NULL there.
+                    "token_count": msg.get("token_count"),
                     # Reasoning/codex fields are role-gated (assistant-only)
                     # inside _insert_message_rows — pass through untouched.
                     "reasoning": msg.get("reasoning"),

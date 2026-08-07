@@ -1602,6 +1602,13 @@ def run_conversation(
             api_msg.pop("display_kind", None)
             api_msg.pop("display_metadata", None)
 
+            # Per-message token accounting (epic #1 / ticket #2). Stamped on
+            # the in-memory assistant dict by build_assistant_message for the
+            # session-DB flush; it is bookkeeping, never a provider field —
+            # strict providers (Mistral, Fireworks) reject unknown message
+            # keys with HTTP 400/422, so strip it from every outgoing copy.
+            api_msg.pop("token_count", None)
+
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).
             # Bookkeeping, never a provider field — only the chat-completions

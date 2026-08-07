@@ -1665,6 +1665,22 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             tool_calls.append(tc_dict)
         msg["tool_calls"] = tool_calls
 
+    # Per-message token accounting (epic #1 / ticket #2): stamp the
+    # assistant message with the response's output-token count so the
+    # session-DB flush can persist it on the row. The normalized response
+    # carries ``usage`` for chat_completions/bedrock; anthropic_messages
+    # and codex_responses leave it None (their usage is accounted at the
+    # session level via queue_token_counts — per-message is additive and
+    # must not double-count). Absent usage → no key, so the DB column
+    # stays NULL and the wire-strip below is a no-op.
+    _usage = getattr(assistant_message, "usage", None)
+    if _usage is not None:
+        _out = getattr(_usage, "completion_tokens", None)
+        if _out is None:
+            _out = getattr(_usage, "output_tokens", None)
+        if _out is not None:
+            msg["token_count"] = int(_out)
+
     return msg
 
 
