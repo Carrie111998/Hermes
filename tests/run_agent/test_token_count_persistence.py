@@ -76,6 +76,90 @@ class TestBuilderStampsTokenCount:
 
 
 # ---------------------------------------------------------------------------
+# Seam 1b — handle_max_iterations stamps the summary assistant row
+# ---------------------------------------------------------------------------
+
+def _make_summary_agent():
+    """Real AIAgent (constructor) with mocked client + transport for
+    handle_max_iterations — mirrors the ``agent`` fixture in test_run_agent."""
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    agent.transport = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    return agent
+
+
+class TestSummaryPathStampsTokenCount:
+    def test_summary_row_carries_token_count(self):
+        from agent.chat_completion_helpers import handle_max_iterations
+
+        agent = _make_summary_agent()
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Summary of work.", tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(completion_tokens=17, prompt_tokens=10, total_tokens=27),
+        )
+        agent.client.chat.completions.create.return_value = resp
+        agent.transport.normalize_response.return_value = SimpleNamespace(
+            content="Summary of work.",
+            tool_calls=None,
+            finish_reason="stop",
+            usage=SimpleNamespace(completion_tokens=17, prompt_tokens=10, total_tokens=27),
+        )
+
+        messages = [{"role": "user", "content": "do stuff"}]
+        with patch("agent.relay_llm.complete_logical_call"):
+            result = handle_max_iterations(agent, messages, 5)
+
+        assert result == "Summary of work."
+        assistant_rows = [m for m in messages if m.get("role") == "assistant"]
+        assert len(assistant_rows) == 1
+        assert assistant_rows[0]["token_count"] == 17
+
+    def test_summary_row_no_key_when_usage_absent(self):
+        from agent.chat_completion_helpers import handle_max_iterations
+
+        agent = _make_summary_agent()
+        resp = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Summary.", tool_calls=None),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        agent.client.chat.completions.create.return_value = resp
+        agent.transport.normalize_response.return_value = SimpleNamespace(
+            content="Summary.",
+            tool_calls=None,
+            finish_reason="stop",
+            usage=None,
+        )
+
+        messages = [{"role": "user", "content": "do stuff"}]
+        with patch("agent.relay_llm.complete_logical_call"):
+            handle_max_iterations(agent, messages, 5)
+
+        assistant_rows = [m for m in messages if m.get("role") == "assistant"]
+        assert len(assistant_rows) == 1
+        assert "token_count" not in assistant_rows[0]
+
+
+# ---------------------------------------------------------------------------
 # Seam 2 — flush path passes token_count through to the batch rows
 # ---------------------------------------------------------------------------
 

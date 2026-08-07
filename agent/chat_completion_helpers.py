@@ -1423,6 +1423,24 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
 
 
+def _stamp_token_count(msg: dict, assistant_message) -> None:
+    """Stamp ``msg["token_count"]`` from the normalized response's output-token
+    count (epic #1 / ticket #2) so the session-DB flush can persist it on the
+    row. The normalized response carries ``usage`` for chat_completions/bedrock;
+    anthropic_messages and codex_responses leave it None (their usage is
+    accounted at the session level via queue_token_counts — per-message is
+    additive and must not double-count). Absent usage → no key, so the DB
+    column stays NULL and the wire-strip is a no-op.
+    """
+    _usage = getattr(assistant_message, "usage", None)
+    if _usage is not None:
+        _out = getattr(_usage, "completion_tokens", None)
+        if _out is None:
+            _out = getattr(_usage, "output_tokens", None)
+        if _out is not None:
+            msg["token_count"] = int(_out)
+
+
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
@@ -1667,19 +1685,8 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
     # Per-message token accounting (epic #1 / ticket #2): stamp the
     # assistant message with the response's output-token count so the
-    # session-DB flush can persist it on the row. The normalized response
-    # carries ``usage`` for chat_completions/bedrock; anthropic_messages
-    # and codex_responses leave it None (their usage is accounted at the
-    # session level via queue_token_counts — per-message is additive and
-    # must not double-count). Absent usage → no key, so the DB column
-    # stays NULL and the wire-strip below is a no-op.
-    _usage = getattr(assistant_message, "usage", None)
-    if _usage is not None:
-        _out = getattr(_usage, "completion_tokens", None)
-        if _out is None:
-            _out = getattr(_usage, "output_tokens", None)
-        if _out is not None:
-            msg["token_count"] = int(_out)
+    # session-DB flush can persist it on the row. See _stamp_token_count.
+    _stamp_token_count(msg, assistant_message)
 
     return msg
 
@@ -2138,6 +2145,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
+    # Last normalized summary response — carries usage for chat_completions/
+    # bedrock so the appended assistant row can be token-stamped (epic #1 /
+    # ticket #2). None on failure paths (no provider usage to record).
+    _summary_normalized = None
 
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
@@ -2360,6 +2371,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     retry_count=0,
                 )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _summary_normalized = _summary_result
                 final_response = (_summary_result.content or "").strip()
             else:
                 summary_client = agent._ensure_primary_openai_client(
@@ -2371,14 +2383,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     retry_count=0,
                 )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
+                _summary_normalized = _summary_result
                 final_response = (_summary_result.content or "").strip()
 
         if final_response:
-            if "<think>" in final_response:
-                final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
+            if " thinking" in final_response:
+                final_response = re.sub(r' thinking.*? response\s*', '', final_response, flags=re.DOTALL).strip()
             if final_response:
                 summary_call_outcome = "success"
-                messages.append({"role": "assistant", "content": final_response})
+                _summary_msg = {"role": "assistant", "content": final_response}
+                _stamp_token_count(_summary_msg, _summary_normalized)
+                messages.append(_summary_msg)
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
         else:
@@ -2389,6 +2404,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 retry_response = agent._run_codex_stream(codex_kwargs)
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
+                _summary_normalized = _cnr_retry
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
                 _tretry = agent._get_transport()
@@ -2409,6 +2425,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     retry_count=1,
                 )
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
+                _summary_normalized = _retry_result
                 final_response = (_retry_result.content or "").strip()
             else:
                 summary_kwargs = {
@@ -2433,14 +2450,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     retry_count=1,
                 )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
+                _summary_normalized = _retry_result
                 final_response = (_retry_result.content or "").strip()
 
             if final_response:
-                if "<think>" in final_response:
-                    final_response = re.sub(r'<think>.*?</think>\s*', '', final_response, flags=re.DOTALL).strip()
+                if " thinking" in final_response:
+                    final_response = re.sub(r' thinking.*? response\s*', '', final_response, flags=re.DOTALL).strip()
                 if final_response:
                     summary_call_outcome = "success"
-                    messages.append({"role": "assistant", "content": final_response})
+                    _summary_msg = {"role": "assistant", "content": final_response}
+                    _stamp_token_count(_summary_msg, _summary_normalized)
+                    messages.append(_summary_msg)
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
