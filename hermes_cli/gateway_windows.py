@@ -714,6 +714,58 @@ def _install_startup_entry(script_path: Path) -> Path:
     return entry
 
 
+def _remove_startup_entries() -> list[Path]:
+    """Remove both Startup-folder gateway entries (.vbs fallback + legacy .cmd).
+
+    The Scheduled Task and the Startup entry are alternatives — the fallback
+    is only installed when schtasks is unavailable (see ``install``). If both
+    persist, logon fires the same launcher twice and spawns duplicate
+    gateways (#80569). Best-effort per path; returns the paths removed.
+    """
+    removed: list[Path] = []
+    for path in (get_startup_entry_path(), _legacy_startup_entry_path()):
+        try:
+            path.unlink()
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
+
+
+def reconcile_autostart_launchers() -> list[str]:
+    """Converge Windows gateway autostart persistence to a single mechanism.
+
+    Pre-#45610 installs left a ``cmd.exe`` launcher (``Hermes_Gateway.cmd``)
+    in the Startup folder, and successful Scheduled Task installs never
+    removed Startup entries — so both could coexist and fire the same
+    launcher at logon, spawning duplicate gateways (#80569).
+
+    Rules (idempotent):
+    * Scheduled Task registered  -> remove Startup entries (.vbs + legacy .cmd).
+    * No task, legacy .cmd present -> migrate to the console-less .vbs
+      fallback (``_install_startup_entry`` removes the legacy .cmd itself).
+    * No task, .vbs fallback present -> already converged, no-op.
+
+    File-ops only (no schtasks mutation, no elevation), safe to run from
+    install, update, and ``hermes doctor``. Returns human-readable actions
+    taken; empty when already converged or schtasks is unavailable.
+    """
+    actions: list[str] = []
+    try:
+        task_registered = is_task_registered()
+    except Exception:
+        return actions
+    if task_registered:
+        for path in _remove_startup_entries():
+            actions.append(f"Removed redundant Windows login item: {path}")
+        return actions
+    if _legacy_startup_entry_path().exists():
+        script_path = _write_task_script()
+        entry = _install_startup_entry(script_path)
+        actions.append(f"Migrated legacy Windows login item to: {entry}")
+    return actions
+
+
 def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     """Return (hidden_console_python, venv_dir, extra_pythonpath) for detached runs.
 
@@ -1096,6 +1148,12 @@ def install(
         print(f"✓ {detail}")
         print(f"  Task script: {script_path}")
         print("ℹ Gateway auto-start installed for Windows login.")
+        # The Scheduled Task and the Startup entry are alternatives — if a
+        # Startup fallback or a legacy pre-#45610 .cmd entry still exists,
+        # logon would fire the same launcher twice and spawn duplicate
+        # gateways (#80569). Converge to the task only.
+        for entry in _remove_startup_entries():
+            print(f"✓ Removed redundant Windows login item: {entry}")
         if start_now:
             running_pids = _gateway_pids()
             if running_pids:
