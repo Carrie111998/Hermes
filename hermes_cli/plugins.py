@@ -348,6 +348,7 @@ class PluginContext:
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
+        self._background_tasks: Any = None
 
     # -- host-owned LLM access ----------------------------------------------
 
@@ -385,6 +386,32 @@ class PluginContext:
                 get_active_subagent_parent
             )
         return self._subagent_lifecycle
+
+    @property
+    def background_tasks(self) -> Any:
+        """Return the plugin's durable external background-task service.
+
+        Lets trusted plugins register an EXTERNAL background task (a run owned
+        by a separate system), immediately hand the parent agent an
+        unguessable handle, and later complete / fail / cancel it through the
+        same durable parent-session completion delivery Hermes uses for
+        ``delegate_task(background=True)``.
+
+        The service captures this plugin's identity from the manifest and
+        binds each registration to the ACTIVE host parent supplied by Hermes —
+        never to platform/chat/session values supplied by the plugin. Every
+        handle is plugin-owned and tamper-evident. No model tool is added.
+        """
+        if self._background_tasks is None:
+            from agent.background_tasks import ExternalBackgroundTasksService
+            from agent.host_context import get_active_host_parent
+
+            plugin_id = self.manifest.key or self.manifest.name
+            self._background_tasks = ExternalBackgroundTasksService(
+                plugin_id=plugin_id,
+                parent_agent_resolver=get_active_host_parent,
+            )
+        return self._background_tasks
 
     # -- profile awareness --------------------------------------------------
 
