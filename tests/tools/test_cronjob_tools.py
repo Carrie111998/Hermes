@@ -409,6 +409,9 @@ class TestUnifiedCronjobTool:
     def test_new_script_job_defaults_to_backend(self, monkeypatch):
         """Agent-created script jobs inherit the active terminal backend."""
         monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "docker",
+        )
+        monkeypatch.setattr(
             "tools.cronjob_tools._validate_backend_script", lambda script, workdir=None: None,
         )
         created = json.loads(
@@ -440,6 +443,9 @@ class TestUnifiedCronjobTool:
 
     def test_backend_target_rejects_missing_script_before_scheduling(self, monkeypatch):
         """Backend jobs are rejected when their declared backend lacks the file."""
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "docker",
+        )
         monkeypatch.setattr(
             "tools.cronjob_tools._validate_backend_script",
             lambda script, workdir=None: "Script not found in terminal backend: /workspace/missing.py",
@@ -497,6 +503,9 @@ class TestUnifiedCronjobTool:
 
     def test_backend_script_revalidated_when_update_changes_workdir(self, monkeypatch):
         """A changed backend cwd is checked before the job can become broken."""
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "docker",
+        )
         calls = []
 
         def validate(script, workdir=None):
