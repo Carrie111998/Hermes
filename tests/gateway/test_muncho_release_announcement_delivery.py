@@ -32,6 +32,7 @@ from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.discord_connector_transport import (
     DiscordConnectorRelayTransport,
 )
+from plugins.platforms.discord.adapter import DiscordAdapter
 from ops.muncho.release.completion import (
     ReleaseCompletionError,
     complete_restart_attestation,
@@ -576,6 +577,78 @@ async def test_verified_native_delivery_reaches_exact_sha_terminal_health(
         version="2.3.2",
         release_sha=RELEASE_SHA,
     )["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_real_live_discord_adapter_path_sends_and_reads_exact_receipt(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    state, draft = _queued(tmp_path)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="unused"))
+    bot_user = SimpleNamespace(id=323456789012345679)
+    default_role = object()
+    guild = SimpleNamespace(id=int(GUILD_ID), default_role=default_role)
+    sent_message = SimpleNamespace(
+        id=423456789012345678,
+        author=bot_user,
+        content=draft["summary"],
+    )
+    sends = []
+
+    async def history(**_kwargs):
+        if False:  # pragma: no cover - preserve async-iterator shape
+            yield None
+
+    async def send(**kwargs):
+        sends.append(kwargs)
+        return sent_message
+
+    channel = SimpleNamespace(
+        id=int(CHANNEL_ID),
+        type=0,
+        guild=guild,
+        permissions_for=lambda role: SimpleNamespace(
+            view_channel=role is default_role
+        ),
+        history=history,
+        send=send,
+        fetch_message=lambda _message_id: None,
+    )
+
+    async def fetch_message(_message_id):
+        return sent_message
+
+    channel.fetch_message = fetch_message
+    adapter._client = SimpleNamespace(
+        user=bot_user,
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=None,
+    )
+    direct_config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+
+    outcome = await dispatch_pending_gateway_discord_deliveries(
+        state_dir=state,
+        gateway_config=direct_config,
+        adapters={Platform.DISCORD: adapter},
+        production_config=_production_config(),
+        deployed_release_sha=RELEASE_SHA,
+        active_service_invocation_id=AFTER_INVOCATION_ID,
+        published_at=NOW,
+    )
+
+    assert outcome[0]["state"] == "delivered"
+    assert outcome[0]["message_id"] == str(sent_message.id)
+    assert sends == [
+        {
+            "content": draft["summary"],
+            "reference": None,
+            "nonce": outcome[0]["discord_enforced_nonce"],
+        }
+    ]
 
 
 @pytest.mark.asyncio
