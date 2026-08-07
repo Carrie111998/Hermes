@@ -108,11 +108,17 @@ def test_production_owner_team_agent_projection_is_frozen_before_creation() -> N
     team = runner._production_agent_access(original, team_source)
     assert team is not None
     assert team.role == "team"
-    assert set(team.enabled_toolsets) == {"file", "skills_readonly", "todo"}
+    assert set(team.enabled_toolsets) == {
+        "skills_readonly",
+        "session_search",
+        "memory",
+        "file",
+        "todo",
+    }
     assert runner._agent_startup_isolation_kwargs(
         team_source,
         production_access=team,
-    ) == {"skip_memory": True, "skip_context_files": False}
+    ) == {"skip_memory": False, "skip_context_files": False}
 
     # The owner ID alone is not authority: only the connector-authenticated
     # source marker can grant owner capabilities.
@@ -125,7 +131,7 @@ def test_production_owner_team_agent_projection_is_frozen_before_creation() -> N
     )
     assert forged is not None
     assert forged.role == "team"
-    assert forged.skip_memory is True
+    assert forged.skip_memory is False
 
 
 def test_production_discord_resolution_cannot_recover_unreviewed_toolsets() -> None:
@@ -165,7 +171,7 @@ def test_production_discord_resolution_cannot_recover_unreviewed_toolsets() -> N
     assert "kanban" not in team.enabled_toolsets
 
 
-def test_production_two_user_real_agent_tool_schemas_are_disjoint(
+def test_production_trusted_team_real_agent_has_full_session_tools(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -227,13 +233,13 @@ def test_production_two_user_real_agent_tool_schemas_are_disjoint(
         )
         assert "cronjob" in owner_agent.valid_tool_names
         assert "execute_code" not in owner_agent.valid_tool_names
-        assert not (
-            {"memory", "session_search", "skill_manage"}
-            & team_agent.valid_tool_names
-        )
-        assert {"skills_list", "skill_view"}.issubset(
-            team_agent.valid_tool_names
-        )
+        assert {
+            "memory",
+            "session_search",
+            "skills_list",
+            "skill_view",
+        }.issubset(team_agent.valid_tool_names)
+        assert "skill_manage" not in team_agent.valid_tool_names
         assert "cronjob" not in team_agent.valid_tool_names
         assert owner_agent._cached_system_prompt is None
         assert team_agent._cached_system_prompt is None

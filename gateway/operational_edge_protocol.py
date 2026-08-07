@@ -30,10 +30,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 
 PROTOCOL_SCHEMA = "muncho-operational-edge-request.v1"
-CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v1"
+CAPABILITY_SCHEMA = "muncho-operational-edge-capability.v2"
 RECEIPT_SCHEMA = "muncho-operational-edge-receipt.v2"
 PREDISPATCH_MUTATION_BLOCKERS = frozenset(
-    {"mutation_capability_required", "mutation_capability_invalid"}
+    {
+        "mutation_capability_required",
+        "mutation_capability_invalid",
+        "mutation_operator_tier_insufficient",
+    }
 )
 SIGNED_ENVELOPE_SCHEMA = "muncho-ed25519-envelope.v1"
 COMMAND_AUTHORIZATION_SCHEMA = "muncho-operational-edge-command-authorization.v1"
@@ -48,6 +52,7 @@ _OPERATION = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z0-9_]+){1,7}$")
 _IDEMPOTENCY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,239}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+OPERATOR_TIERS = ("standard", "top", "owner")
 
 
 class OperationalAccess(StrEnum):
@@ -230,6 +235,7 @@ class OperationalCapability:
     idempotency_key: str
     issued_at_unix_ms: int
     expires_at_unix_ms: int
+    operator_tier: str = "standard"
 
     @classmethod
     def from_mapping(cls, value: Any) -> "OperationalCapability":
@@ -245,13 +251,14 @@ class OperationalCapability:
                     "idempotency_key",
                     "issued_at_unix_ms",
                     "expires_at_unix_ms",
+                    "operator_tier",
                 }
             ),
             "invalid_capability",
         )
         if raw["schema"] != CAPABILITY_SCHEMA:
             _fail("invalid_capability_schema")
-        if raw["authority_kind"] != "canonical_owner_plan":
+        if raw["authority_kind"] != "canonical_plan":
             _fail("invalid_capability_authority")
         authority_ref = raw["authority_ref"]
         if (
@@ -265,8 +272,11 @@ class OperationalCapability:
         expires = _timestamp(raw["expires_at_unix_ms"], "invalid_capability_time")
         if expires <= issued or expires - issued > MAX_CAPABILITY_SECONDS * 1000:
             _fail("invalid_capability_time")
+        operator_tier = raw["operator_tier"]
+        if operator_tier not in OPERATOR_TIERS:
+            _fail("invalid_capability_operator_tier")
         return cls(
-            authority_kind="canonical_owner_plan",
+            authority_kind="canonical_plan",
             authority_ref=authority_ref,
             operation_id=_operation(raw["operation_id"]),
             arguments_sha256=_digest(
@@ -275,6 +285,7 @@ class OperationalCapability:
             idempotency_key=_idempotency(raw["idempotency_key"]),
             issued_at_unix_ms=issued,
             expires_at_unix_ms=expires,
+            operator_tier=operator_tier,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -287,6 +298,7 @@ class OperationalCapability:
             "idempotency_key": self.idempotency_key,
             "issued_at_unix_ms": self.issued_at_unix_ms,
             "expires_at_unix_ms": self.expires_at_unix_ms,
+            "operator_tier": self.operator_tier,
         }
 
     def require(self, intent: OperationalIntent, *, now_unix_ms: int) -> None:

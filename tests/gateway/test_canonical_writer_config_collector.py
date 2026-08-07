@@ -935,6 +935,8 @@ def test_staged_config_readback_controls_receipt(
             owner_discord_user_ids=(
                 frozenset() if readback_matches else frozenset({"unexpected"})
             ),
+            plan_operator_discord_user_ids=frozenset(),
+            top_trusted_operator_discord_user_ids=frozenset(),
             discord_edge_authority=SimpleNamespace(enabled=False),
         ),
     )

@@ -537,6 +537,18 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
     assert effective["approvals"]["plan_owner_user_ids"] == [
         runtime.PRODUCTION_OWNER_DISCORD_USER_ID
     ]
+    assert set(effective["approvals"]["plan_operator_user_ids"]) == set(
+        runtime.PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS
+    )
+    assert set(effective["approvals"]["top_trusted_operator_user_ids"]) == {
+        "1282938967888498720",  # Nassi
+        "1391703330711142472",  # Ivs
+        "1282940511962791959",  # Alex
+        "1282940574533423125",  # Plamenka
+    }
+    assert set(effective["approvals"]["top_trusted_operator_user_ids"]) <= set(
+        effective["approvals"]["plan_operator_user_ids"]
+    )
     assert effective["approvals"]["gateway_authorized_user_ids"] == [
         runtime.PRODUCTION_OWNER_DISCORD_USER_ID
     ]

@@ -1897,4 +1897,38 @@ def test_service_adapter_ignores_wire_claimed_internal_and_owner_authority():
     assert len(observed) == 1
     assert observed[0].user_id == "attacker"
     assert observed[0].owner_authenticated is False
+    assert observed[0].plan_operator_authenticated is False
     assert observed[0].service_internal is False
+
+
+def test_service_adapter_derives_plan_operator_without_owner_authority():
+    observed = []
+
+    class _Backend(InMemoryCanonicalWriterBackend):
+        def ping(self, runtime):
+            observed.append(runtime)
+            return {"status": "ok"}
+
+    handlers = CanonicalWriterHandlers(_Backend(clock=lambda: NOW))
+    adapter = CanonicalWriterTypedDispatcher(
+        handlers,
+        owner_user_ids=frozenset({"real-owner"}),
+        plan_operator_user_ids=frozenset({"trusted-operator"}),
+    )
+    context = DispatchContext(
+        request_id="trusted-operator-runtime",
+        sequence=1,
+        deadline_unix_ms=9999999999999,
+        idempotency_key=None,
+        peer=PeerCredentials(pid=999, uid=1000, gid=1000),
+        runtime={
+            "platform": "discord",
+            "user_id": "trusted-operator",
+        },
+    )
+
+    result = adapter.dispatch(CanonicalWriterOperation.PING, {}, context)
+
+    assert result.status == "ok"
+    assert observed[0].owner_authenticated is False
+    assert observed[0].plan_operator_authenticated is True

@@ -235,6 +235,22 @@ TEAM_MEMBERS: tuple[TeamMember, ...] = (
         default_channel_name="booking-ops",
         aliases=("plamenka", "plamena", "пламенка", "пламена"),
     ),
+    TeamMember(
+        key="ivs",
+        display_name="Ivs",
+        discord_user_id="1391703330711142472",
+        default_channel_id=SKYVISION_BOOKING_OPS_CHANNEL_ID,
+        default_channel_name="booking-ops",
+        aliases=("ivs", "ивс"),
+    ),
+    TeamMember(
+        key="nassi",
+        display_name="Nassi",
+        discord_user_id="1282938967888498720",
+        default_channel_id=SKYVISION_NASI_AI_OPS_CHANNEL_ID,
+        default_channel_name="nasi-ai-ops",
+        aliases=("nassi", "nasi", "наси"),
+    ),
 )
 
 TEAM_MEMBERS_BY_KEY = {member.key: member for member in TEAM_MEMBERS}

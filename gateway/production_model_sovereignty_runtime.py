@@ -35,6 +35,8 @@ import yaml
 from gateway.mac_ops_edge_client import MacOpsEdgeClientConfig
 from gateway.production_access_policy import (
     PRODUCTION_OWNER_DISCORD_USER_ID,
+    PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS,
+    PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS,
     production_access_config,
 )
 from gateway.support_ops_team_registry import (
@@ -663,6 +665,12 @@ def overlay_production_gateway_config(
     approvals["cron_mode"] = "approve"
     approvals.pop("deny", None)
     approvals["plan_owner_user_ids"] = [PRODUCTION_OWNER_DISCORD_USER_ID]
+    approvals["plan_operator_user_ids"] = sorted(
+        PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS
+    )
+    approvals["top_trusted_operator_user_ids"] = sorted(
+        PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS
+    )
     approvals["gateway_authorized_user_ids"] = [
         PRODUCTION_OWNER_DISCORD_USER_ID
     ]
@@ -910,6 +918,10 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
         or "deny" in approvals
         or approvals.get("plan_owner_user_ids")
         != [PRODUCTION_OWNER_DISCORD_USER_ID]
+        or approvals.get("plan_operator_user_ids")
+        != sorted(PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS)
+        or approvals.get("top_trusted_operator_user_ids")
+        != sorted(PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS)
         or approvals.get("gateway_authorized_user_ids")
         != [PRODUCTION_OWNER_DISCORD_USER_ID]
         or approvals.get("gateway_authorized_user_names") != []

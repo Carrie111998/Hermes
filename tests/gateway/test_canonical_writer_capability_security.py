@@ -100,6 +100,52 @@ def test_successful_durable_consume_returns_exact_plan_and_scope_receipt():
     assert backend.store.capabilities["approval:1"]["remaining_uses"][COMMAND_HASH] == 1
 
 
+def test_authenticated_plan_operator_grants_without_owner_identity():
+    handlers, backend = _handler_fixture()
+    runtime = RuntimeContext(
+        request_id="request-operator-capability-1",
+        platform="discord",
+        session_key_sha256=SESSION_HASH,
+        capability_epoch_sha256=CAPABILITY_EPOCH_HASH,
+        user_id="operator-1",
+        message_id="operator-message-1",
+        owner_authenticated=False,
+        plan_operator_authenticated=True,
+    )
+
+    granted = handlers.dispatch(
+        CanonicalWriterOperation.CAPABILITY_GRANT.value,
+        _grant_payload(),
+        runtime=runtime,
+    )
+
+    assert granted["ok"] is True
+    assert backend.store.capabilities["approval:1"]["approved_by_user_id"] == (
+        "operator-1"
+    )
+
+
+def test_unconfigured_discord_user_cannot_grant_plan_capability():
+    handlers, _ = _handler_fixture()
+    runtime = RuntimeContext(
+        request_id="request-untrusted-capability-1",
+        platform="discord",
+        session_key_sha256=SESSION_HASH,
+        capability_epoch_sha256=CAPABILITY_EPOCH_HASH,
+        user_id="untrusted-1",
+        message_id="untrusted-message-1",
+    )
+
+    result = handlers.dispatch(
+        CanonicalWriterOperation.CAPABILITY_GRANT.value,
+        _grant_payload(),
+        runtime=runtime,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "operator_required"
+
+
 @pytest.mark.parametrize(
     "payload_key,transport_key",
     [("payload-key", "transport-key"), ("payload-key", None)],

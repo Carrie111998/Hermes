@@ -126,6 +126,8 @@ _SERVICE_KEYS = frozenset(
         "socket_gid",
         "projector_gid",
         "owner_discord_user_ids",
+        "plan_operator_discord_user_ids",
+        "top_trusted_operator_discord_user_ids",
         "connection_timeout_seconds",
         "max_connections",
     }
@@ -201,6 +203,8 @@ class CanonicalWriterServiceConfig:
     discord_edge_authority: DiscordEdgeWriterAuthorityConfig
     source_config_path: Path | None = None
     source_config_sha256: str = ""
+    plan_operator_discord_user_ids: frozenset[str] = frozenset()
+    top_trusted_operator_discord_user_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -738,6 +742,22 @@ def load_service_config(
             "service.owner_discord_user_ids",
         )
     )
+    plan_operator_discord_user_ids = frozenset(
+        _required_text(value, "service.plan_operator_discord_user_ids item")
+        for value in _strings(
+            service.get("plan_operator_discord_user_ids", []),
+            "service.plan_operator_discord_user_ids",
+        )
+    )
+    top_trusted_operator_discord_user_ids = frozenset(
+        _required_text(value, "service.top_trusted_operator_discord_user_ids item")
+        for value in _strings(
+            service.get("top_trusted_operator_discord_user_ids", []),
+            "service.top_trusted_operator_discord_user_ids",
+        )
+    )
+    if not top_trusted_operator_discord_user_ids <= plan_operator_discord_user_ids:
+        raise ValueError("top-trusted operator IDs must be plan operators")
     discord_edge_authority = _load_discord_edge_authority_config(
         root["discord_edge_authority"],
         writer_uid=writer_uid,
@@ -969,6 +989,10 @@ def load_service_config(
         socket_gid=socket_gid,
         projector_gid=projector_gid,
         owner_discord_user_ids=owner_discord_user_ids,
+        plan_operator_discord_user_ids=plan_operator_discord_user_ids,
+        top_trusted_operator_discord_user_ids=(
+            top_trusted_operator_discord_user_ids
+        ),
         connection_timeout_seconds=_number(
             service.get("connection_timeout_seconds", 30.0),
             "service.connection_timeout_seconds",
@@ -1268,6 +1292,10 @@ def build_service(
     dispatcher = CanonicalWriterTypedDispatcher(
         handlers,
         owner_user_ids=config.owner_discord_user_ids,
+        plan_operator_user_ids=config.plan_operator_discord_user_ids,
+        top_trusted_operator_user_ids=(
+            config.top_trusted_operator_discord_user_ids
+        ),
     )
     authorizer = SystemdMainPidAuthorizer(
         config.gateway_unit,

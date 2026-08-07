@@ -191,6 +191,8 @@ class CanonicalWriterDiscordAuthority:
             "plan_revision",
             "active_plan_revision",
             "command_sha256",
+            "approved_by_user_id",
+            "operator_tier",
         }
         if (
             authorization.get("authorized") is not True
@@ -221,18 +223,21 @@ class CanonicalWriterDiscordAuthority:
             "plan_revision": authorization["plan_revision"],
             "active_plan_revision": authorization["active_plan_revision"],
             "command_sha256": authorization["command_sha256"],
+            "approved_by_user_id": authorization["approved_by_user_id"],
+            "operator_tier": authorization["operator_tier"],
         }
-        authority_ref = "canonical-owner-plan:" + hashlib.sha256(
+        authority_ref = "canonical-plan:" + hashlib.sha256(
             operational_canonical_json_bytes(reference_fields)
         ).hexdigest()
         capability = OperationalCapability(
-            authority_kind="canonical_owner_plan",
+            authority_kind="canonical_plan",
             authority_ref=authority_ref,
             operation_id=intent.operation_id,
             arguments_sha256=intent.arguments_sha256,
             idempotency_key=intent.idempotency_key,
             issued_at_unix_ms=now,
             expires_at_unix_ms=now + self._request_timeout_seconds * 1_000,
+            operator_tier=str(authorization["operator_tier"]),
         )
         return sign_operational_envelope(
             capability.to_mapping(),

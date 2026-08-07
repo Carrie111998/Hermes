@@ -846,6 +846,8 @@ def test_bootstrap_dispatcher_preserves_flat_public_writer_contract(monkeypatch)
         socket_gid=2001,
         gateway_uid=2001,
         owner_discord_user_ids=frozenset({"owner-1"}),
+        plan_operator_discord_user_ids=frozenset(),
+        top_trusted_operator_discord_user_ids=frozenset(),
         gateway_unit="hermes-cloud-gateway.service",
         socket_path=Path("/run/muncho-canonical-writer/writer.sock"),
         connection_timeout_seconds=2.0,

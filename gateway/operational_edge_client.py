@@ -66,6 +66,8 @@ def _predispatch_capability_truth_matches(
         return not capability_present
     if blocker_code == "mutation_capability_invalid":
         return capability_present
+    if blocker_code == "mutation_operator_tier_insufficient":
+        return capability_present
     return False
 
 

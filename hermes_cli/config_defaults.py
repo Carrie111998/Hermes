@@ -2042,6 +2042,13 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+        # Exact identities allowed to grant an already model-authored plan's
+        # bounded execution capabilities.  ``plan_owner_user_ids`` remains
+        # reserved for global owner/security scope; operators can complete
+        # routine work but do not acquire owner identity.
+        "plan_owner_user_ids": [],
+        "plan_operator_user_ids": [],
+        "top_trusted_operator_user_ids": [],
         # Optional gateway approval-authority allowlist. Empty preserves the
         # personal-bot behavior: ask in the conversation that triggered the
         # command. Team bots can bind approval prompts to known operators.

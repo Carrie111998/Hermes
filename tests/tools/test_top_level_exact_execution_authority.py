@@ -361,6 +361,7 @@ def test_terminal_exact_hit_needs_no_gateway_lifecycle_text_parser(
     )
 
     assert result["exit_code"] == 0
-    assert result["approval"].startswith(
-        "Command was authorized by exact owner-approved plan capability"
-    )
+    approval = result["approval"]
+    assert "requester-authorized" in approval
+    assert "plan-top-level-exact" in approval
+    assert "owner-approved" not in approval

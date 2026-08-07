@@ -166,4 +166,6 @@ def test_temp_root_real_terminal_and_execute_code_paths_use_exact_plan(
     assert code_payload["status"] == "success"
     assert "stage-b-code-ok" in code_payload["output"]
     assert blocked_payload["status"] == "blocked"
-    assert "exact owner-approved plan capability" in blocked_payload["error"]
+    error = blocked_payload["error"]
+    assert "exact requester-authorized plan capability" in error
+    assert "owner-approved" not in error

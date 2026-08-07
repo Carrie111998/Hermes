@@ -2742,7 +2742,7 @@ def terminal_tool(
                 _approved_run = True
             elif approval.get("plan_capability"):
                 approval_note = (
-                    "Command was authorized by exact owner-approved plan capability "
+                    "Command was authorized by exact requester-authorized plan capability "
                     f"{approval['plan_capability']}."
                 )
                 _approved_run = True
