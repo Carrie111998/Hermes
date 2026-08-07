@@ -2216,13 +2216,13 @@ def resolve_runtime_provider(
         # an explicitly configured fallback chain). LM Studio's no-auth path
         # supplies a non-empty placeholder in the credential resolver above.
         if not has_usable_secret(creds.get("api_key")) and pconfig.auth_type != "none":
-                env_names = ", ".join(pconfig.api_key_env_vars)
-                hint = f" Set {env_names}." if env_names else ""
-                raise AuthError(
-                    f"No usable credentials found for provider '{provider}'.{hint}",
-                    provider=provider,
-                    code="missing_api_key",
-                )
+            env_names = ", ".join(pconfig.api_key_env_vars)
+            hint = f" Set {env_names}." if env_names else ""
+            raise AuthError(
+                f"No usable credentials found for provider '{provider}'.{hint}",
+                provider=provider,
+                code="missing_api_key",
+            )
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic

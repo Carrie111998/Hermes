@@ -516,6 +516,13 @@ try:
             continue
         if _pp.auth_type not in ("api_key", "none"):
             continue
+        # Keep the env_vars requirement for key-requiring plugins: an api_key
+        # profile without env vars previously stayed out of PROVIDER_REGISTRY
+        # and resolved through the generic/custom endpoint path. Registering it
+        # now would make runtime resolution raise "No usable credentials found"
+        # (empty env var list) instead of falling back.
+        if _pp.auth_type == "api_key" and not _pp.env_vars:
+            continue
         # Skip providers that need custom token resolution or are special-cased
         # in resolve_provider() (copilot/kimi/zai have bespoke token refresh;
         # openrouter/custom are aggregator/user-supplied and handled outside
