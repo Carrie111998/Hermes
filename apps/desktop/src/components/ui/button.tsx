@@ -32,6 +32,14 @@ const buttonVariants = cva(
         // the actionable affordance in a row ("Change", "Set", "Open logs", …).
         textStrong: `font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground ${TEXT_ACTION_ICON}`
       },
+      // Most surface buttons get a subtle lift on hover. Controls that are
+      // positioned with their own transform (for example, a titlebar close
+      // button centered with `-translate-y-1/2`) can opt out without losing
+      // the shared color and focus treatments.
+      motion: {
+        lift: '',
+        none: ''
+      },
       size: {
         default: 'px-3 py-1.5 has-[>svg]:px-2.5',
         xs: "gap-1 px-2 py-0.5 text-[0.6875rem] leading-4 has-[>svg]:px-1.5 [&_svg:not([class*='size-'])]:size-3",
@@ -60,11 +68,13 @@ const buttonVariants = cva(
       },
       {
         variant: ['default', 'destructive', 'outline', 'secondary', 'ghost'],
+        motion: 'lift',
         class: 'hover:-translate-y-px active:translate-y-0 active:scale-[0.98] active:duration-[90ms]'
       }
     ],
     defaultVariants: {
       variant: 'default',
+      motion: 'lift',
       size: 'default'
     }
   }
@@ -73,6 +83,7 @@ const buttonVariants = cva(
 function Button({
   className,
   variant = 'default',
+  motion = 'lift',
   size = 'default',
   asChild = false,
   ...props
@@ -84,7 +95,7 @@ function Button({
 
   return (
     <Comp
-      className={cn(buttonVariants({ variant, size }), className)}
+      className={cn(buttonVariants({ motion, size, variant }), className)}
       data-size={size}
       data-slot="button"
       data-variant={variant}

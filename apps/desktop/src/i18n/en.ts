@@ -1014,6 +1014,9 @@ export const en: Translations = {
   skills: {
     title: 'Capabilities',
     description: 'Skills and tools',
+    installedDescription: 'Manage the skills, tools, and MCP servers available in this profile.',
+    installedMcpDescription: 'Installed MCP servers start automatically whenever you open Hermes.',
+    tabInstalled: 'Installed',
     tabSkills: 'Skills',
     tabToolsets: 'Tools',
     tabMcp: 'MCP',
@@ -1021,6 +1024,7 @@ export const en: Translations = {
     all: 'All',
     searchSkills: 'Search skills...',
     searchToolsets: 'Search tools...',
+    searchMcp: 'Search MCP servers...',
     refresh: 'Refresh skills',
     refreshing: 'Refreshing skills',
     loading: 'Loading capabilities...',
@@ -1063,6 +1067,7 @@ export const en: Translations = {
     emptyNoneFound: noun => `No ${noun} found`,
     emptyNothingMatches: query => `Nothing matches “${query}”.`,
     emptyNoneAvailable: noun => `No ${noun} available yet.`,
+    emptyMcp: 'No MCP servers are installed yet. Browse Hub to add one.',
     changesApplyNewSessions: 'Changes apply to new sessions.',
     skillUpdated: 'Skill updated',
     edit: 'Edit',
@@ -2062,6 +2067,8 @@ export const en: Translations = {
     wakeWordListening: phrase => `Wake word: "${phrase}" — listening`,
     wakeWordOff: phrase => `Wake word: "${phrase}" — off`,
     wakeWordPausedVoice: phrase => `Wake word: "${phrase}" — paused during voice chat`,
+    contextRemaining: tokens => `${tokens} left`,
+    contextRemainingDetail: (remaining, total) => `${remaining} tokens remaining of ${total}`,
     lookupLoading: 'Looking up…',
     lookupNoMatches: 'No matches.',
     lookupTry: 'Try',
@@ -2493,7 +2500,7 @@ export const en: Translations = {
       manualDescription: 'Ask before actions that require approval',
       smart: 'Smart',
       smartDescription: 'Automatically assess actions and ask when needed',
-      off: 'Off',
+      off: 'Full access',
       offDescription: 'Run without approval prompts'
     },
     statusbar: {

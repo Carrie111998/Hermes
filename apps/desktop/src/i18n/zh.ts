@@ -1214,6 +1214,9 @@ export const zh: Translations = {
   skills: {
     title: '功能',
     description: '技能和工具',
+    installedDescription: '管理此配置文件中可用的技能、工具和 MCP 服务器。',
+    installedMcpDescription: '已安装的 MCP 服务器会在每次打开 Hermes 时自动启动。',
+    tabInstalled: '已安装',
     tabSkills: '技能',
     tabToolsets: '工具集',
     tabMcp: 'MCP',
@@ -1221,6 +1224,7 @@ export const zh: Translations = {
     all: '全部',
     searchSkills: '搜索技能…',
     searchToolsets: '搜索工具集…',
+    searchMcp: '搜索 MCP 服务器…',
     refresh: '刷新技能',
     refreshing: '正在刷新技能',
     loading: '正在加载能力…',
@@ -1262,6 +1266,7 @@ export const zh: Translations = {
     emptyNoneFound: noun => `未找到${noun}`,
     emptyNothingMatches: query => `没有匹配“${query}”的内容。`,
     emptyNoneAvailable: noun => `暂无可用的${noun}。`,
+    emptyMcp: '尚未安装 MCP 服务器。请在浏览中心添加一个。',
     changesApplyNewSessions: '更改将应用于新会话。',
     skillUpdated: '技能已更新',
     edit: '编辑',
@@ -2256,6 +2261,8 @@ export const zh: Translations = {
     wakeWordListening: phrase => `唤醒词:"${phrase}" — 正在监听`,
     wakeWordOff: phrase => `唤醒词:"${phrase}" — 已关闭`,
     wakeWordPausedVoice: phrase => `唤醒词:"${phrase}" — 语音对话期间暂停`,
+    contextRemaining: tokens => `剩余 ${tokens}`,
+    contextRemainingDetail: (remaining, total) => `${total} 个词元中剩余 ${remaining}`,
     lookupLoading: '查找中…',
     lookupNoMatches: '没有匹配项。',
     lookupTry: '试试',
@@ -2675,7 +2682,7 @@ export const zh: Translations = {
       manualDescription: '执行需要审批的操作前询问',
       smart: '智能',
       smartDescription: '自动评估操作，并在需要时询问',
-      off: '关闭',
+      off: '完全访问',
       offDescription: '不显示审批提示，直接运行'
     },
     statusbar: {

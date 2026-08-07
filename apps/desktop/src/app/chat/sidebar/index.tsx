@@ -1315,7 +1315,7 @@ export function ChatSidebar({
                 activeSessionId={activeSidebarSessionId}
                 collapsible={!inProject}
                 contentClassName={cn(
-                  'flex min-h-0 flex-1 flex-col pb-1.75',
+                  'sidebar-history-scroll flex min-h-0 flex-1 flex-col pb-1.75',
                   SCROLL_Y,
                   // Separate profile sections clearly in the ALL view; rows inside
                   // each group keep their own tight gap-px rhythm.

@@ -882,6 +882,9 @@ export interface Translations {
   skills: {
     title: string
     description: string
+    installedDescription: string
+    installedMcpDescription: string
+    tabInstalled: string
     tabSkills: string
     tabToolsets: string
     tabMcp: string
@@ -889,6 +892,7 @@ export interface Translations {
     all: string
     searchSkills: string
     searchToolsets: string
+    searchMcp: string
     refresh: string
     refreshing: string
     loading: string
@@ -926,6 +930,7 @@ export interface Translations {
     emptyNoneFound: (noun: string) => string
     emptyNothingMatches: (query: string) => string
     emptyNoneAvailable: (noun: string) => string
+    emptyMcp: string
     changesApplyNewSessions: string
     skillUpdated: string
     edit: string
@@ -1741,6 +1746,8 @@ export interface Translations {
     wakeWordListening: (phrase: string) => string
     wakeWordOff: (phrase: string) => string
     wakeWordPausedVoice: (phrase: string) => string
+    contextRemaining: (tokens: string) => string
+    contextRemainingDetail: (remaining: string, total: string) => string
     lookupLoading: string
     lookupNoMatches: string
     lookupTry: string

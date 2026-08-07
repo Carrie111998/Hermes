@@ -62,14 +62,14 @@ function catalogEntry(patch: Partial<McpCatalogEntry> = {}): McpCatalogEntry {
   }
 }
 
-async function renderCatalog() {
+async function renderCatalog(props: { onlyInstalled?: boolean } = {}) {
   const { IntegrationsCatalog } = await import('./integrations-catalog')
   let result: ReturnType<typeof render>
 
   await act(async () => {
     result = render(
       <QueryClientProvider client={queryClient}>
-        <IntegrationsCatalog />
+        <IntegrationsCatalog {...props} />
       </QueryClientProvider>
     )
   })
@@ -119,6 +119,18 @@ describe('IntegrationsCatalog', () => {
     const ready = await screen.findByRole('button', { name: 'Ready Linear' })
     expect((ready as HTMLButtonElement).disabled).toBe(true)
     expect(installMcpCatalogEntry).not.toHaveBeenCalled()
+  })
+
+  it('can show only MCP servers already installed in this profile', async () => {
+    getMcpCatalog.mockResolvedValue({
+      diagnostics: [],
+      entries: [catalogEntry(), catalogEntry({ enabled: true, installed: true, name: 'notion' })]
+    })
+
+    await renderCatalog({ onlyInstalled: true })
+
+    expect(await screen.findByRole('button', { name: 'Ready Notion' })).toBeTruthy()
+    expect(screen.queryByText('Linear')).toBeNull()
   })
 
   it('only asks an OAuth integration to sign in when its saved token is missing', async () => {

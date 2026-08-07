@@ -1798,6 +1798,8 @@ export const zhHant = defineLocale({
     wakeWordListening: phrase => `喚醒詞:「${phrase}」— 正在聆聽`,
     wakeWordOff: phrase => `喚醒詞:「${phrase}」— 已關閉`,
     wakeWordPausedVoice: phrase => `喚醒詞:「${phrase}」— 語音對話期間暫停`,
+    contextRemaining: tokens => `剩餘 ${tokens}`,
+    contextRemainingDetail: (remaining, total) => `${total} 個詞元中剩餘 ${remaining}`,
     lookupLoading: '查詢中…',
     lookupNoMatches: '沒有相符項目。',
     lookupTry: '試試',
@@ -2216,7 +2218,7 @@ export const zhHant = defineLocale({
       manualDescription: '執行需要核准的操作前詢問',
       smart: '智慧',
       smartDescription: '自動評估操作，並在需要時詢問',
-      off: '關閉',
+      off: '完整存取',
       offDescription: '不顯示核准提示，直接執行'
     },
     statusbar: {

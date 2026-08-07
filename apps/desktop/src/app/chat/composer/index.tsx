@@ -12,16 +12,19 @@ import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
+import type { ApprovalModeRequester } from '@/store/approval-mode'
 import { sessionCompacting } from '@/store/compaction'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
+import { $activeGatewayProfile } from '@/store/profile'
 import { toggleReview } from '@/store/review'
 import { $gatewayState } from '@/store/session'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { $autoSpeakReplies } from '@/store/voice-prefs'
 import { useTheme } from '@/themes'
 
+import { ComposerApprovalMode } from './approval-mode'
 import { AttachmentList } from './attachments'
 import {
   acceptsTriggerCompletion,
@@ -195,8 +198,20 @@ export function ChatBar({
 
   const { t } = useI18n()
   const gatewayState = useStore($gatewayState)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
   const inputDisabled = disabled && !reconnecting
+
+  const requestApprovalMode = useCallback<ApprovalModeRequester>(
+    (method, params) => {
+      if (!gateway) {
+        return Promise.reject(new Error('Gateway unavailable'))
+      }
+
+      return gateway.request(method, params)
+    },
+    [gateway]
+  )
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
   // selectors); typing never re-renders the chrome. ChatBar owns `queueEditRef`
@@ -1256,6 +1271,13 @@ export function ChatBar({
                   >
                     <div className="flex translate-y-[3px] items-start gap-(--composer-control-gap) self-start [grid-area:menu]">
                       {contextMenu}
+                      {gateway && (
+                        <ComposerApprovalMode
+                          disabled={disabled}
+                          profile={activeGatewayProfile}
+                          requestGateway={requestApprovalMode}
+                        />
+                      )}
                       <ContribSlot area={COMPOSER_AREAS.leading} />
                     </div>
                     <div className="min-w-0 [grid-area:input]">{input}</div>

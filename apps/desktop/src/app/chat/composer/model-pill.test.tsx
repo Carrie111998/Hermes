@@ -4,9 +4,15 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatBarState } from '@/app/chat/composer/types'
 import { type SessionView, SessionViewProvider } from '@/app/chat/session-view'
-import { $activeSessionId, $currentModel, setCurrentModel, setCurrentModelSource } from '@/store/session'
+import {
+  $activeSessionId,
+  $currentModel,
+  setCurrentModel,
+  setCurrentModelSource,
+  setCurrentUsage
+} from '@/store/session'
 
-import { ModelPill } from './model-pill'
+import { contextTokensRemaining, ModelPill } from './model-pill'
 
 const modelState = (over: Partial<ChatBarState['model']> = {}): ChatBarState['model'] => ({
   canSwitch: true,
@@ -20,6 +26,7 @@ afterEach(() => {
   $activeSessionId.set(null)
   setCurrentModel('')
   setCurrentModelSource('')
+  setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
 })
 
 // #62055: a manual composer pick is sticky and silently overrides the
@@ -98,7 +105,8 @@ describe('ModelPill per-surface model label', () => {
       $provider: atom('anthropic'),
       $reasoningEffort: atom('high'),
       $runtimeId: atom('tile-runtime'),
-      $storedId: atom('stored-tile')
+      $storedId: atom('stored-tile'),
+      $usage: atom({ calls: 0, context_max: 200_000, context_used: 50_000, input: 0, output: 0, total: 0 })
     }
 
     render(
@@ -112,5 +120,39 @@ describe('ModelPill per-surface model label', () => {
 
     expect(screen.getByText('Sonnet · High')).toBeTruthy()
     expect(screen.queryByText(/primary/i)).toBeNull()
+    expect(screen.getByTestId('context-remaining').textContent).toBe('150k left')
+  })
+})
+
+describe('ModelPill context remaining', () => {
+  it('shows the reported remaining context beside the model picker', () => {
+    setCurrentUsage({ calls: 0, context_max: 200_000, context_used: 50_000, input: 0, output: 0, total: 0 })
+
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    const counter = screen.getByTestId('context-remaining')
+
+    expect(counter.textContent).toBe('150k left')
+    expect(counter.getAttribute('aria-label')).toBe('150k tokens remaining of 200k')
+  })
+
+  it('derives remaining context from the reported percentage when exact usage is unavailable', () => {
+    expect(
+      contextTokensRemaining({ calls: 0, context_max: 128_000, context_percent: 25, input: 0, output: 0, total: 0 })
+    ).toBe(96_000)
+  })
+
+  it('stays hidden until the selected session reports a context window', () => {
+    render(<ModelPill disabled={false} model={modelState()} />)
+
+    expect(screen.queryByTestId('context-remaining')).toBeNull()
+  })
+
+  it('stays out of the compact composer controls', () => {
+    setCurrentUsage({ calls: 0, context_max: 200_000, context_used: 50_000, input: 0, output: 0, total: 0 })
+
+    render(<ModelPill compact disabled={false} model={modelState()} />)
+
+    expect(screen.queryByTestId('context-remaining')).toBeNull()
   })
 })

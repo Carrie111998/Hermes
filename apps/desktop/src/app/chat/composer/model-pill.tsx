@@ -9,10 +9,12 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { releaseTypingFocus } from '@/components/ui/keyboard-first'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { compactNumber } from '@/lib/format'
 import { ChevronDown } from '@/lib/icons'
 import { formatModelStatusLabel } from '@/lib/model-status-label'
 import { cn } from '@/lib/utils'
 import { $currentModelSource, $defaultReasoningEffort, setModelPickerOpen } from '@/store/session'
+import type { UsageStats } from '@/types/hermes'
 
 import { onComposerModelMenuRequest } from './focus'
 import { useComposerScope } from './scope'
@@ -22,6 +24,31 @@ const PILL = cn(
   'h-(--composer-control-size) max-w-40 shrink-0 gap-1 rounded-md px-2 text-xs font-normal',
   'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
 )
+
+/** Returns the remaining model context only when the gateway reported a real window. */
+export function contextTokensRemaining(usage: null | UsageStats | undefined): null | number {
+  const contextMax = usage?.context_max
+
+  if (typeof contextMax !== 'number' || !Number.isFinite(contextMax) || contextMax <= 0) {
+    return null
+  }
+
+  const contextUsed = usage?.context_used
+
+  if (typeof contextUsed === 'number' && Number.isFinite(contextUsed)) {
+    return Math.max(0, Math.round(contextMax - Math.max(0, contextUsed)))
+  }
+
+  const contextPercent = usage?.context_percent
+
+  if (typeof contextPercent !== 'number' || !Number.isFinite(contextPercent)) {
+    return null
+  }
+
+  const boundedPercent = Math.max(0, Math.min(100, contextPercent))
+
+  return Math.max(0, Math.round(contextMax * (1 - boundedPercent / 100)))
+}
 
 /**
  * Composer model selector — the relocated status-bar pill. Reuses the live
@@ -40,7 +67,8 @@ export function ModelPill({
   disabled: boolean
   model: ChatBarState['model']
 }) {
-  const copy = useI18n().t.shell.statusbar
+  const { t } = useI18n()
+  const copy = t.shell.statusbar
   const view = useSessionView()
   // Prefer the chat-bar snapshot (already view-scoped by ChatView); fall back
   // to the live SessionView atoms so a mid-flight session.info still paints.
@@ -53,6 +81,7 @@ export function ModelPill({
   const modelSource = useStore($currentModelSource)
   const defaultEffort = useStore($defaultReasoningEffort)
   const runtimeId = useStore(view.$runtimeId)
+  const usage = useStore(view.$usage)
   const [open, setOpen] = useState(false)
   const scope = useComposerScope()
   const hasLiveMenu = Boolean(model.modelMenuContent)
@@ -126,21 +155,45 @@ export function ModelPill({
     : copy.switchModel
 
   const title = pinnedOverride ? `${baseTitle} — ${copy.modelPinned}` : baseTitle
+  const remainingContext = compact ? null : contextTokensRemaining(usage)
+  const contextMax = usage?.context_max
+  const contextLabel = remainingContext === null ? null : t.composer.contextRemaining(compactNumber(remainingContext))
+
+  const contextDetail =
+    contextLabel && typeof contextMax === 'number'
+      ? t.composer.contextRemainingDetail(compactNumber(remainingContext ?? 0), compactNumber(contextMax))
+      : null
+
+  const contextCounter =
+    contextLabel && contextDetail ? (
+      <Tip label={contextDetail} side="top">
+        <span
+          aria-label={contextDetail}
+          className="inline-flex h-(--composer-control-size) shrink-0 cursor-default items-center rounded-md px-1 text-[0.6875rem] font-medium tabular-nums text-(--ui-text-quaternary)"
+          data-testid="context-remaining"
+        >
+          {contextLabel}
+        </span>
+      </Tip>
+    ) : null
 
   if (!model.modelMenuContent) {
     return (
-      <Tip label={pinnedOverride ? `${copy.openModelPicker} — ${copy.modelPinned}` : copy.openModelPicker} side="top">
-        <Button
-          aria-label={copy.openModelPicker}
-          className={pillClass}
-          disabled={disabled}
-          onClick={() => setModelPickerOpen(true)}
-          type="button"
-          variant="ghost"
-        >
-          {label}
-        </Button>
-      </Tip>
+      <div className="flex shrink-0 items-center gap-1">
+        <Tip label={pinnedOverride ? `${copy.openModelPicker} — ${copy.modelPinned}` : copy.openModelPicker} side="top">
+          <Button
+            aria-label={copy.openModelPicker}
+            className={pillClass}
+            disabled={disabled}
+            onClick={() => setModelPickerOpen(true)}
+            type="button"
+            variant="ghost"
+          >
+            {label}
+          </Button>
+        </Tip>
+        {contextCounter}
+      </div>
     )
   }
 
@@ -156,19 +209,22 @@ export function ModelPill({
   }
 
   return (
-    <DropdownMenu onOpenChange={setMenuOpen} open={open}>
-      <Tip label={title} side="top">
-        <DropdownMenuTrigger asChild>
-          <Button aria-label={title} className={pillClass} disabled={disabled} type="button" variant="ghost">
-            {label}
-          </Button>
-        </DropdownMenuTrigger>
-      </Tip>
-      <DropdownMenuContent align="end" className="w-64 p-0" side="top" sideOffset={8}>
-        <ModelMenuCloseContext.Provider value={() => setMenuOpen(false)}>
-          {model.modelMenuContent}
-        </ModelMenuCloseContext.Provider>
-      </DropdownMenuContent>
-    </DropdownMenu>
+    <div className="flex shrink-0 items-center gap-1">
+      <DropdownMenu onOpenChange={setMenuOpen} open={open}>
+        <Tip label={title} side="top">
+          <DropdownMenuTrigger asChild>
+            <Button aria-label={title} className={pillClass} disabled={disabled} type="button" variant="ghost">
+              {label}
+            </Button>
+          </DropdownMenuTrigger>
+        </Tip>
+        <DropdownMenuContent align="end" className="w-64 p-0" side="top" sideOffset={8}>
+          <ModelMenuCloseContext.Provider value={() => setMenuOpen(false)}>
+            {model.modelMenuContent}
+          </ModelMenuCloseContext.Provider>
+        </DropdownMenuContent>
+      </DropdownMenu>
+      {contextCounter}
+    </div>
   )
 }

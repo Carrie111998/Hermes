@@ -10,6 +10,7 @@ import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CountSkeleton } from '@/components/ui/skeleton'
+import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import {
   editLearningNode,
   getLearningNode,
@@ -49,6 +50,7 @@ import { PageSearchShell } from '../page-search-shell'
 import { SETTINGS_ROUTE, SKILLS_ROUTE } from '../routes'
 import { ComputerUsePanel } from '../settings/computer-use-panel'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
+import { IntegrationsCatalog } from '../settings/integrations-catalog'
 import { TerminalBackendPanel } from '../settings/terminal-backend-panel'
 import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
@@ -56,7 +58,8 @@ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 import { SkillsHub } from './hub'
 import { $skillsSortDesc, $toolsetsSortDesc } from './store'
 
-const SKILLS_MODES = ['skills', 'toolsets', 'hub'] as const
+const CAPABILITIES_MODES = ['installed', 'hub'] as const
+const INSTALLED_CAPABILITY_MODES = ['skills', 'tools', 'mcp'] as const
 
 // Skills + toolsets live in the RQ cache so switching tabs/pages paints the
 // cached lists instantly (no reload flash) and mount only fires a deduped
@@ -179,15 +182,46 @@ interface SkillsViewProps extends React.ComponentProps<'section'> {
   setStatusbarItemGroup?: SetStatusbarItemGroup
 }
 
+function InstalledMcpCatalog({ query }: { query: string }) {
+  const { t } = useI18n()
+
+  return (
+    <div className="h-full min-h-0 overflow-y-auto [scrollbar-gutter:stable]">
+      <div className="mx-auto w-full max-w-[52rem] px-5 pb-20 pt-5">
+        <IntegrationsCatalog
+          description={t.skills.installedMcpDescription}
+          emptyDescription={t.skills.emptyMcp}
+          onlyInstalled
+          query={query}
+          title={t.skills.tabMcp}
+        />
+      </div>
+    </div>
+  )
+}
+
 export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: SkillsViewProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const { search } = useLocation()
-  const [mode, setMode] = useRouteEnumParam('tab', SKILLS_MODES, 'skills')
+  const [mode, setMode] = useRouteEnumParam('tab', CAPABILITIES_MODES, 'installed')
+  const [installedMode, setInstalledMode] = useRouteEnumParam('installed', INSTALLED_CAPABILITY_MODES, 'skills')
 
   useEffect(() => {
-    if (new URLSearchParams(search).get('tab') === 'mcp') {
-      navigate(SKILLS_ROUTE + '?tab=hub', { replace: true })
+    const legacyMode = new URLSearchParams(search).get('tab')
+
+    const nextInstalledMode =
+      legacyMode === 'skills' ? 'skills' : legacyMode === 'toolsets' ? 'tools' : legacyMode === 'mcp' ? 'mcp' : null
+
+    if (nextInstalledMode) {
+      const params = new URLSearchParams(search)
+      params.delete('tab')
+      params.delete('installed')
+      const trailing = params.toString()
+
+      navigate(`${SKILLS_ROUTE}?tab=installed&installed=${nextInstalledMode}${trailing ? `&${trailing}` : ''}`, {
+        replace: true
+      })
     }
   }, [navigate, search])
   // $gateway only feeds the MCP tab — gate the subscription so Skills/Toolsets/Hub
@@ -253,7 +287,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   // the first time Toolsets is shown, never on Skills or MCP, so it can't
   // starve the MCP tab's config load. Absent → toolsets sort A–Z until it lands.
   useEffect(() => {
-    if (mode !== 'toolsets' || toolCalls !== null) {
+    if (mode !== 'installed' || installedMode !== 'tools' || toolCalls !== null) {
       return
     }
 
@@ -269,7 +303,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       .catch(() => live() && setToolCalls({}))
 
     return () => void (cancelled = true)
-  }, [mode, toolCalls])
+  }, [installedMode, mode, toolCalls])
 
   // On a profile switch the analytics cache is profile-keyed, but our local
   // toolCalls state isn't — leaving it non-null would keep the lazy effect from
@@ -299,7 +333,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   // Rotating placeholder nudges from the user's own data — teach that search
   // understands categories and tool names, not just titles.
   const searchHints = useMemo(() => {
-    if (mode === 'skills' && skills?.length) {
+    if (mode === 'installed' && installedMode === 'skills' && skills?.length) {
       const counts = new Map<string, number>()
 
       for (const skill of skills) {
@@ -313,7 +347,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
         .map(([category]) => t.common.tryHint(category.toLowerCase()))
     }
 
-    if (mode === 'toolsets' && toolsets?.length) {
+    if (mode === 'installed' && installedMode === 'tools' && toolsets?.length) {
       return toolsets
         .filter(ts => isDesktopToolsetVisible(ts.name) && toolNames(ts).length > 0)
         .slice(0, 5)
@@ -321,7 +355,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     }
 
     return undefined
-  }, [mode, skills, toolsets, t])
+  }, [installedMode, mode, skills, toolsets, t])
 
   // Keep a valid selection: fall back to the first visible row when the
   // current selection is filtered out (or nothing is selected yet).
@@ -398,7 +432,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
       notify({ kind: 'success', title: t.skills.bulkUpdated(done), message: '' })
     } catch (err) {
-      notifyError(err, t.skills.failedToUpdate(mode === 'skills' ? t.skills.tabSkills : t.skills.tabToolsets))
+      notifyError(err, t.skills.failedToUpdate(installedMode === 'skills' ? t.skills.tabSkills : t.skills.tabToolsets))
     } finally {
       invalidateSlashCompletions()
       setBulkBusy(false)
@@ -406,7 +440,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   }
 
   const bulkToggle = (enabled: boolean) =>
-    mode === 'skills'
+    installedMode === 'skills'
       ? bulkApply(
           bulkSkills.filter(row => row.enabled !== enabled),
           [],
@@ -441,6 +475,12 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
   const sortButton = (desc: boolean, flip: () => void) => (
     <ListStripButton onClick={flip}>{desc ? t.skills.sortMostUsedDesc : t.skills.sortLeastUsedAsc}</ListStripButton>
   )
+
+  const installedTabs = [
+    { id: 'skills', label: t.skills.tabSkills, meta: skills?.length ?? null },
+    { id: 'tools', label: t.skills.tabToolsets, meta: toolsets ? visibleToolsetCount(toolsets) : null },
+    { id: 'mcp', label: t.skills.tabMcp }
+  ]
 
   // Full-bleed empty state, matching the MCP tab (spans both columns, not a
   // cramped note in the left rail). Query-aware, and says "tools" not the
@@ -546,141 +586,177 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     <PageSearchShell
       {...props}
       activeTab={mode}
-      contentWidth={mode === 'hub' ? 'reading' : 'wide'}
-      description={mode === 'hub' ? t.skills.hub.description : t.skills.description}
+      contentWidth={mode === 'hub' || installedMode === 'mcp' ? 'reading' : 'wide'}
+      description={mode === 'hub' ? t.skills.hub.description : t.skills.installedDescription}
       onSearchChange={setQuery}
-      onTabChange={id => setMode(id as (typeof SKILLS_MODES)[number])}
+      onTabChange={id => setMode(id as (typeof CAPABILITIES_MODES)[number])}
       searchBelowTitle={mode === 'hub'}
       // MCP manages a handful of entries with the editor right there —
       // searching it is noise.
       searchHints={searchHints}
       searchPlaceholder={
-        mode === 'skills'
-          ? t.skills.searchSkills
-          : mode === 'hub'
-            ? t.skills.hub.searchPlaceholder
-            : t.skills.searchToolsets
+        mode === 'hub'
+          ? t.skills.hub.searchPlaceholder
+          : installedMode === 'skills'
+            ? t.skills.searchSkills
+            : installedMode === 'tools'
+              ? t.skills.searchToolsets
+              : t.skills.searchMcp
       }
       searchValue={query}
       tabs={[
-        { id: 'skills', label: t.skills.tabSkills, meta: skills?.length ?? null },
-        { id: 'toolsets', label: t.skills.tabToolsets, meta: toolsets ? visibleToolsetCount(toolsets) : null },
+        { id: 'installed', label: t.skills.tabInstalled },
         { id: 'hub', label: t.skills.tabHub }
       ]}
-      title={mode === 'hub' ? t.skills.hub.title : t.skills.title}
+      title={t.skills.title}
     >
       {mode === 'hub' ? (
         <SkillsHub query={query} />
-      ) : (skillsFailed || toolsetsFailed) && (!skills || !toolsets) ? (
-        <PanelEmpty
-          action={
-            <Button onClick={() => void refreshCapabilities()} size="sm">
-              {t.skills.refresh}
-            </Button>
-          }
-          description={skillsError instanceof Error ? skillsError.message : undefined}
-          icon="error"
-          title={t.skills.skillsLoadFailed}
-        />
-      ) : !skills || !toolsets ? (
-        <PageLoader label={t.skills.loading} />
-      ) : mode === 'skills' ? (
-        visibleSkills.length === 0 ? (
-          capabilityEmpty('skills')
-        ) : (
-          <MasterDetail pane={skillEditorPane} split="wide">
-            <ListColumn
-              header={
-                <ListStrip
-                  label={t.skills.tabSkills}
-                  left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
-                  meta={visibleSkills.length}
-                  right={
-                    <ListStripMenu
-                      items={[
-                        { disabled: bulkBusy, label: t.skills.disableUnused, onSelect: () => void disableUnused() }
-                      ]}
-                      label={t.skills.tabSkills}
-                      toggle={bulkSwitch(allSkillsEnabled)}
-                    />
-                  }
-                />
+      ) : (
+        <div className="flex h-full min-h-0 flex-col">
+          <div className="shrink-0 border-b border-(--ui-stroke-quaternary)">
+            <div
+              className={
+                installedMode === 'mcp'
+                  ? 'mx-auto w-full max-w-[52rem] px-5 py-2'
+                  : 'mx-auto w-full max-w-[75rem] px-[clamp(1.25rem,4vw,4rem)] py-2'
               }
             >
-              {visibleSkills.map(skill => (
-                <CapRow
-                  active={activeSkill?.name === skill.name}
-                  busy={bulkBusy}
-                  enabled={skill.enabled}
-                  key={skill.name}
-                  meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
-                  onSelect={() => setSelectedSkill(skill.name)}
-                  onToggle={enabled => void handleToggleSkill(skill, enabled)}
-                  subtitle={skillSubtitle(skill)}
-                  title={skill.name}
-                  toggleLabel={skill.name}
-                />
-              ))}
-            </ListColumn>
-            <DetailColumn footer={t.skills.changesApplyNewSessions}>
-              {activeSkill && (
-                <SkillDetail
-                  onArchive={() => setArchiveTarget(activeSkill.name)}
-                  onEdit={() => void openSkillEditor(activeSkill.name)}
-                  skill={activeSkill}
-                />
-              )}
-            </DetailColumn>
-          </MasterDetail>
-        )
-      ) : visibleToolsets.length === 0 ? (
-        capabilityEmpty('tools')
-      ) : (
-        <MasterDetail split="wide">
-          <ListColumn
-            header={
-              <ListStrip
-                label={t.skills.tabToolsets}
-                left={sortButton(toolsetsSortDesc, () => $toolsetsSortDesc.set(!$toolsetsSortDesc.get()))}
-                meta={visibleToolsets.length}
-                right={<ListStripMenu label={t.skills.tabToolsets} toggle={bulkSwitch(allToolsetsEnabled)} />}
+              <ResponsiveTabs
+                align="start"
+                onChange={id => setInstalledMode(id as (typeof INSTALLED_CAPABILITY_MODES)[number])}
+                tabs={installedTabs}
+                value={installedMode}
+                wideClassName="justify-start"
               />
-            }
-          >
-            {visibleToolsets.map(toolset => {
-              const label = toolsetDisplayLabel(toolset)
-              const calls = toolCalls ? toolsetCalls(toolset, toolCalls) : null
-
-              return (
-                <CapRow
-                  active={activeToolset?.name === toolset.name}
-                  busy={bulkBusy}
-                  enabled={toolset.enabled}
-                  key={toolset.name}
-                  meta={
-                    calls === null ? (
-                      <CountSkeleton />
-                    ) : calls > 0 ? (
-                      `×${compactNumber(calls)}`
-                    ) : (
-                      `${toolNames(toolset).length} tools`
-                    )
-                  }
-                  onSelect={() => setSelectedToolset(toolset.name)}
-                  onToggle={checked => void handleToggleToolset(toolset, checked)}
-                  subtitle={asText(toolset.description)}
-                  title={label}
-                  toggleLabel={t.skills.toggleToolset(label, !toolset.enabled)}
-                />
+            </div>
+          </div>
+          <div className="min-h-0 flex-1">
+            {installedMode === 'mcp' ? (
+              <InstalledMcpCatalog query={query} />
+            ) : (installedMode === 'skills' ? skillsFailed && !skills : toolsetsFailed && !toolsets) ? (
+              <PanelEmpty
+                action={
+                  <Button onClick={() => void refreshCapabilities()} size="sm">
+                    {t.skills.refresh}
+                  </Button>
+                }
+                description={
+                  installedMode === 'skills' && skillsError instanceof Error ? skillsError.message : undefined
+                }
+                icon="error"
+                title={t.skills.skillsLoadFailed}
+              />
+            ) : (installedMode === 'skills' ? !skills : !toolsets) ? (
+              <PageLoader label={t.skills.loading} />
+            ) : installedMode === 'skills' ? (
+              visibleSkills.length === 0 ? (
+                capabilityEmpty('skills')
+              ) : (
+                <MasterDetail pane={skillEditorPane} split="wide">
+                  <ListColumn
+                    header={
+                      <ListStrip
+                        label={t.skills.tabSkills}
+                        left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                        meta={visibleSkills.length}
+                        right={
+                          <ListStripMenu
+                            items={[
+                              {
+                                disabled: bulkBusy,
+                                label: t.skills.disableUnused,
+                                onSelect: () => void disableUnused()
+                              }
+                            ]}
+                            label={t.skills.tabSkills}
+                            toggle={bulkSwitch(allSkillsEnabled)}
+                          />
+                        }
+                      />
+                    }
+                  >
+                    {visibleSkills.map(skill => (
+                      <CapRow
+                        active={activeSkill?.name === skill.name}
+                        busy={bulkBusy}
+                        enabled={skill.enabled}
+                        key={skill.name}
+                        meta={usageOf(skill) > 0 ? `×${compactNumber(usageOf(skill))}` : undefined}
+                        onSelect={() => setSelectedSkill(skill.name)}
+                        onToggle={enabled => void handleToggleSkill(skill, enabled)}
+                        subtitle={skillSubtitle(skill)}
+                        title={skill.name}
+                        toggleLabel={skill.name}
+                      />
+                    ))}
+                  </ListColumn>
+                  <DetailColumn footer={t.skills.changesApplyNewSessions}>
+                    {activeSkill && (
+                      <SkillDetail
+                        onArchive={() => setArchiveTarget(activeSkill.name)}
+                        onEdit={() => void openSkillEditor(activeSkill.name)}
+                        skill={activeSkill}
+                      />
+                    )}
+                  </DetailColumn>
+                </MasterDetail>
               )
-            })}
-          </ListColumn>
-          <DetailColumn footer={t.skills.changesApplyNewSessions}>
-            {activeToolset && (
-              <ToolsetDetail onConfiguredChange={refreshToolsets} toolCalls={toolCalls ?? {}} toolset={activeToolset} />
+            ) : visibleToolsets.length === 0 ? (
+              capabilityEmpty('tools')
+            ) : (
+              <MasterDetail split="wide">
+                <ListColumn
+                  header={
+                    <ListStrip
+                      label={t.skills.tabToolsets}
+                      left={sortButton(toolsetsSortDesc, () => $toolsetsSortDesc.set(!$toolsetsSortDesc.get()))}
+                      meta={visibleToolsets.length}
+                      right={<ListStripMenu label={t.skills.tabToolsets} toggle={bulkSwitch(allToolsetsEnabled)} />}
+                    />
+                  }
+                >
+                  {visibleToolsets.map(toolset => {
+                    const label = toolsetDisplayLabel(toolset)
+                    const calls = toolCalls ? toolsetCalls(toolset, toolCalls) : null
+
+                    return (
+                      <CapRow
+                        active={activeToolset?.name === toolset.name}
+                        busy={bulkBusy}
+                        enabled={toolset.enabled}
+                        key={toolset.name}
+                        meta={
+                          calls === null ? (
+                            <CountSkeleton />
+                          ) : calls > 0 ? (
+                            `×${compactNumber(calls)}`
+                          ) : (
+                            `${toolNames(toolset).length} tools`
+                          )
+                        }
+                        onSelect={() => setSelectedToolset(toolset.name)}
+                        onToggle={checked => void handleToggleToolset(toolset, checked)}
+                        subtitle={asText(toolset.description)}
+                        title={label}
+                        toggleLabel={t.skills.toggleToolset(label, !toolset.enabled)}
+                      />
+                    )
+                  })}
+                </ListColumn>
+                <DetailColumn footer={t.skills.changesApplyNewSessions}>
+                  {activeToolset && (
+                    <ToolsetDetail
+                      onConfiguredChange={refreshToolsets}
+                      toolCalls={toolCalls ?? {}}
+                      toolset={activeToolset}
+                    />
+                  )}
+                </DetailColumn>
+              </MasterDetail>
             )}
-          </DetailColumn>
-        </MasterDetail>
+          </div>
+        </div>
       )}
       {archiveTarget && (
         <ArchiveSkillConfirmDialog

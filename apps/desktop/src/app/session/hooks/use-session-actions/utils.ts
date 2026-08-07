@@ -927,7 +927,16 @@ export async function resolveSessionProfile(storedSessionId: null | string): Pro
 type SessionRuntimeStatePatch = Partial<
   Pick<
     ClientSessionState,
-    'branch' | 'cwd' | 'fast' | 'model' | 'personality' | 'provider' | 'reasoningEffort' | 'serviceTier' | 'yolo'
+    | 'branch'
+    | 'cwd'
+    | 'fast'
+    | 'model'
+    | 'personality'
+    | 'provider'
+    | 'reasoningEffort'
+    | 'serviceTier'
+    | 'usage'
+    | 'yolo'
   >
 >
 
@@ -1043,6 +1052,10 @@ export function applyRuntimeInfo(
 
   if (typeof info.yolo === 'boolean') {
     sessionState.yolo = info.yolo
+  }
+
+  if (info.usage) {
+    sessionState.usage = { calls: 0, input: 0, output: 0, total: 0, ...info.usage }
   }
 
   if (foreground) {

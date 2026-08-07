@@ -36,6 +36,8 @@ interface IntegrationsCatalogProps {
   query?: string
   /** Keeps installed entries in the Hub's shared Installed section instead of repeating them below. */
   hideInstalled?: boolean
+  /** Shows only integrations that have already been added to this profile. */
+  onlyInstalled?: boolean
   /** Do not leave an empty section behind when another content type has results. */
   hideWhenEmpty?: boolean
   /** Lets the Browse Hub use its own section copy without duplicating install behavior. */
@@ -44,6 +46,8 @@ interface IntegrationsCatalogProps {
   meta?: null | string
   /** `null` intentionally suppresses the otherwise helpful default description. */
   description?: null | string
+  /** Optional empty-state copy for embedded surfaces with a narrower scope. */
+  emptyDescription?: string
 }
 
 function Tag({ children }: { children: string }) {
@@ -94,9 +98,11 @@ export function matchesIntegrationCatalogQuery(entry: McpCatalogEntry, query: st
  */
 export function IntegrationsCatalog({
   description,
+  emptyDescription,
   hideInstalled = false,
   hideWhenEmpty = false,
   meta,
+  onlyInstalled = false,
   query = '',
   title
 }: IntegrationsCatalogProps) {
@@ -116,7 +122,7 @@ export function IntegrationsCatalog({
 
   const entries = [...(catalogQuery.data?.entries ?? [])]
     .filter(entry => matchesIntegrationCatalogQuery(entry, query))
-    .filter(entry => !hideInstalled || !entry.installed)
+    .filter(entry => (onlyInstalled ? entry.installed : !hideInstalled || !entry.installed))
     .sort((a, b) => Number(b.installed) - Number(a.installed) || prettyName(a.name).localeCompare(prettyName(b.name)))
 
   const readyCount = entries.filter(entry => entry.installed && entry.enabled && entry.authenticated !== false).length
@@ -260,7 +266,7 @@ export function IntegrationsCatalog({
         </ErrorBanner>
       ) : entries.length === 0 ? (
         <SettingsGroup>
-          <ListRow description={p.integrationsEmpty} title={sectionTitle} />
+          <ListRow description={emptyDescription ?? p.integrationsEmpty} title={sectionTitle} />
         </SettingsGroup>
       ) : (
         <SettingsGroup>

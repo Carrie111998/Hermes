@@ -110,6 +110,15 @@ describe('applyRuntimeInfo foreground scoping', () => {
     // ...while the caller still gets everything it needs for its own session.
     expect(patch).toMatchObject({ branch: 'bb/tile', cwd: '/other-worktree' })
   })
+
+  it('keeps reported context usage with the owning session patch', () => {
+    const patch = applyRuntimeInfo(
+      { usage: { calls: 0, context_max: 200_000, context_used: 50_000, input: 0, output: 0, total: 0 } },
+      { foreground: false }
+    )
+
+    expect(patch?.usage).toMatchObject({ context_max: 200_000, context_used: 50_000 })
+  })
 })
 
 describe('isSessionGoneError', () => {

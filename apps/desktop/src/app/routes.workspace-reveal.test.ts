@@ -85,8 +85,9 @@ describe('classification of targets carrying a query', () => {
   // The palette navigates to every one of these. Unstripped, they parsed as
   // SESSION ids and read as 'chat'.
   it.each([
-    [`${SKILLS_ROUTE}?tab=skills`, 'skills'],
-    [`${SKILLS_ROUTE}?tab=toolsets`, 'skills'],
+    [`${SKILLS_ROUTE}?tab=installed&installed=skills`, 'skills'],
+    [`${SKILLS_ROUTE}?tab=installed&installed=tools`, 'skills'],
+    [`${SKILLS_ROUTE}?tab=installed&installed=mcp`, 'skills'],
     [`${SKILLS_ROUTE}?tab=hub`, 'skills'],
     [`${SETTINGS_ROUTE}?tab=plugins`, 'settings']
   ])('%s is not a session route', (to, view) => {
@@ -159,14 +160,16 @@ describe('navigateToWorkspacePage', () => {
     expect(fronted()).toBe(true)
   })
 
-  it.each([`${SKILLS_ROUTE}?tab=skills`, `${SKILLS_ROUTE}?tab=toolsets`, `${SKILLS_ROUTE}?tab=hub`])(
-    'fronts for the palette target %s',
-    to => {
-      navigateToWorkspacePage(vi.fn(), to)
+  it.each([
+    `${SKILLS_ROUTE}?tab=installed&installed=skills`,
+    `${SKILLS_ROUTE}?tab=installed&installed=tools`,
+    `${SKILLS_ROUTE}?tab=installed&installed=mcp`,
+    `${SKILLS_ROUTE}?tab=hub`
+  ])('fronts for the palette target %s', to => {
+    navigateToWorkspacePage(vi.fn(), to)
 
-      expect(fronted()).toBe(true)
-    }
-  )
+    expect(fronted()).toBe(true)
+  })
 
   it('passes navigation options through', () => {
     const navigate = vi.fn()

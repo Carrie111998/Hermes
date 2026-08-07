@@ -62,14 +62,14 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()
 
-  // Keep legacy MCP links working by redirecting them to the unified Hub.
+  // Keep legacy MCP links working by redirecting them to Installed MCP.
   // `/settings?tab=mcp` deep links working — `useRouteEnumParam` would silently
   // coerce the unknown tab to the default view otherwise.
   useEffect(() => {
     const params = new URLSearchParams(search)
 
     if (params.get('tab') === 'mcp') {
-      navigate(SKILLS_ROUTE + '?tab=hub', { replace: true })
+      navigate(SKILLS_ROUTE + '?tab=installed&installed=mcp', { replace: true })
     }
   }, [navigate, search])
 

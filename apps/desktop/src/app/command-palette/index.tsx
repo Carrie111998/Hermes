@@ -983,9 +983,8 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
       })
     }
 
-    // Deep-link straight to a Capabilities sub-tab. The root "Go to" entry only
-    // lands on the top-level Skills view; typing "tools" or "skills" should
-    // jump to the exact tab.
+    // Deep-link straight to an Installed category. The root "Go to" entry only
+    // lands on Capabilities; typing a specific kind should open its section.
     const capLabel = t.commandCenter.nav.skills.title
 
     result.push({
@@ -996,28 +995,26 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           id: 'cap-skills',
           keywords: ['skills', 'capabilities'],
           label: `${capLabel}: ${t.skills.tabSkills}`,
-          run: go(`${SKILLS_ROUTE}?tab=skills`)
+          run: go(`${SKILLS_ROUTE}?tab=installed&installed=skills`)
         },
         {
           icon: SlidersHorizontal,
           id: 'cap-toolsets',
           keywords: ['tools', 'toolsets', 'capabilities'],
           label: `${capLabel}: ${t.skills.tabToolsets}`,
-          run: go(`${SKILLS_ROUTE}?tab=toolsets`)
+          run: go(`${SKILLS_ROUTE}?tab=installed&installed=tools`)
+        },
+        {
+          icon: Package,
+          id: 'cap-mcp',
+          keywords: ['mcp', 'servers', 'integrations', 'model context protocol', 'capabilities'],
+          label: `${capLabel}: ${t.skills.tabMcp}`,
+          run: go(`${SKILLS_ROUTE}?tab=installed&installed=mcp`)
         },
         {
           icon: Package,
           id: 'cap-hub',
-          keywords: [
-            'hub',
-            'skills',
-            'plugins',
-            'integrations',
-            'mcp',
-            'servers',
-            'extensions',
-            'model context protocol'
-          ],
+          keywords: ['hub', 'skills', 'plugins', 'integrations', 'extensions', 'model context protocol'],
           label: capLabel + ': ' + t.skills.tabHub,
           run: go(SKILLS_ROUTE + '?tab=hub')
         }

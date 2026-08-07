@@ -1059,10 +1059,43 @@ button[class*='rounded-full'],
   border-radius: calc(var(--radius-scalar) * 9999rem);
 }
 
-@keyframes overlay-surface-in {
+/* Full-page overlays use one compact, spring-like transition. The backdrop is
+   animated independently so the card remains crisp as it enters and exits. */
+[data-overlay-surface]::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  content: '';
+  background: rgb(0 0 0 / 22%);
+  backdrop-filter: blur(0.125rem);
+  -webkit-backdrop-filter: blur(0.125rem);
+}
+
+@keyframes overlay-backdrop-in {
   from {
     opacity: 0;
-    transform: translateY(0.5rem) scale(0.992);
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes overlay-backdrop-out {
+  from {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes overlay-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.625rem) scale(0.986);
   }
 
   to {
@@ -1071,8 +1104,32 @@ button[class*='rounded-full'],
   }
 }
 
-.overlay-surface-enter {
-  animation: overlay-surface-in 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+@keyframes overlay-card-out {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+
+  to {
+    opacity: 0;
+    transform: translateY(0.375rem) scale(0.992);
+  }
+}
+
+[data-overlay-surface][data-motion='open']::before {
+  animation: overlay-backdrop-in 180ms ease-out both;
+}
+
+[data-overlay-surface][data-motion='closing']::before {
+  animation: overlay-backdrop-out 180ms ease-in both;
+}
+
+[data-overlay-surface][data-motion='open'] > [data-slot='overlay-card'] {
+  animation: overlay-card-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+[data-overlay-surface][data-motion='closing'] > [data-slot='overlay-card'] {
+  animation: overlay-card-out 180ms ease-in both;
 }
 
 /* User bubbles are <button>s (click → edit), so the rule above would kill
@@ -1197,6 +1254,26 @@ code {
   .scrollbar-dt::-webkit-scrollbar-button,
   .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-button {
     display: none;
+  }
+
+  /* Session history needs a little more room than generic panes: selected rows
+     must stop before the thumb instead of painting beneath it, especially in a
+     narrow split. The 6px thumb remains subtle but is materially easier to see
+     and grab than the app-wide 4px default. */
+  #root .sidebar-history-scroll {
+    scrollbar-gutter: stable;
+  }
+
+  #root .sidebar-history-scroll::-webkit-scrollbar {
+    width: 0.375rem;
+  }
+
+  #root .sidebar-history-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--dt-midground) 24%, transparent);
+  }
+
+  #root .sidebar-history-scroll::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--dt-midground) 44%, transparent);
   }
 
   /* Variant for portaled overlays (Radix DropdownMenu, Popover, etc.) that
