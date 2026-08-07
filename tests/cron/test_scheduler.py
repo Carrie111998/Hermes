@@ -286,6 +286,108 @@ class TestDeliverResultWrapping:
         assert "To stop or manage this job" in sent_content
 
 
+    def test_live_teams_delivery_records_reply_context(self):
+        """A successful live send records its returned Teams message ID."""
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        teams = Platform("teams")
+        adapter = AsyncMock()
+        send_result = SendResult(success=True, message_id="teams-message-1")
+        adapter.send.return_value = send_result
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock()
+        config.platforms = {teams: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        record_context = MagicMock()
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+            patch(
+                "gateway.cron_reply_context.record_cron_reply_context",
+                new=record_context,
+            ),
+        ):
+            result = _deliver_result(
+                {
+                    "id": "teams-live-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "teams", "chat_id": "teams-chat-1"},
+                },
+                "Live Teams cron body",
+                adapters={teams: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        record_context.assert_called_once_with(
+            "teams",
+            "teams-chat-1",
+            "Live Teams cron body",
+            thread_id="teams-message-1",
+            message_id="teams-message-1",
+            job_id="teams-live-job",
+        )
+
+    def test_standalone_teams_delivery_records_reply_context(self):
+        """A successful standalone send records its returned Teams message ID."""
+        from gateway.config import Platform
+
+        teams = Platform("teams")
+        pconfig = MagicMock(enabled=True)
+        config = MagicMock()
+        config.platforms = {teams: pconfig}
+        standalone_send = AsyncMock(
+            return_value={"success": True, "message_id": "teams-message-2"}
+        )
+        record_context = MagicMock()
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch(
+                "tools.send_message_tool._send_to_platform",
+                new=standalone_send,
+            ),
+            patch(
+                "gateway.cron_reply_context.record_cron_reply_context",
+                new=record_context,
+            ),
+        ):
+            result = _deliver_result(
+                {
+                    "id": "teams-standalone-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "teams", "chat_id": "teams-chat-2"},
+                },
+                "Standalone Teams cron body",
+            )
+
+        assert result is None
+        record_context.assert_called_once_with(
+            "teams",
+            "teams-chat-2",
+            "Standalone Teams cron body",
+            thread_id="teams-message-2",
+            message_id="teams-message-2",
+            job_id="teams-standalone-job",
+        )
+
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
         """Persisted Slack home survives restart without native Slack config."""
         from concurrent.futures import Future
