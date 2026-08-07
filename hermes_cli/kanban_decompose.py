@@ -48,6 +48,12 @@ from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
 
+# Author stamp used by the gateway dispatcher's auto-decompose tick
+# (gateway/kanban_watchers.py). decompose_task uses it to distinguish the
+# automated path (which must never re-specify a block-loop-escalated card)
+# from an explicit operator call (which is the human-in-the-loop decision).
+AUTO_DECOMPOSER_AUTHOR = "auto-decomposer"
+
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
 
@@ -283,12 +289,27 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-    if task is None:
-        return DecomposeOutcome(task_id, False, "unknown task id")
-    if task.status != "triage":
-        return DecomposeOutcome(
-            task_id, False, f"task is not in triage (status={task.status!r})"
-        )
+        if task is None:
+            return DecomposeOutcome(task_id, False, "unknown task id")
+        if task.status != "triage":
+            return DecomposeOutcome(
+                task_id, False, f"task is not in triage (status={task.status!r})"
+            )
+        if kb.is_block_loop_escalated(conn, task_id):
+            if author == AUTO_DECOMPOSER_AUTHOR:
+                # Block-loop escalations are waiting on a human decision; the
+                # breaker exists precisely to stop automated unblock↔re-block
+                # loops, so re-specifying one from the dispatcher would undo
+                # the human-in-the-loop gate (#79738, #79728).
+                return DecomposeOutcome(
+                    task_id, False,
+                    "task escalated to triage after repeated blocks; "
+                    "waiting on human input — refusing to re-specify",
+                )
+            # Explicit manual decomposition IS the operator's human-in-the-loop
+            # decision: acknowledge the escalation (audited) and proceed, so
+            # `hermes kanban decompose <id>` stays seamless (#79728).
+            kb.recover_escalated_triage_task(conn, task_id)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -457,12 +478,22 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return auto-decomposable task ids currently in the triage column.
+
+    Excludes block-loop-escalated cards (reached triage via the unblock-loop
+    breaker — ``block_loop_detected`` event without a newer operator
+    recovery). Those are waiting on a human decision and must not be
+    re-specified by the auto-decomposer (#79738, #79728).
+    """
+    query = (
+        "SELECT id FROM tasks "
+        "WHERE status = 'triage' AND NOT " + kb._BLOCK_LOOP_ESCALATED_SQL
+    )
+    params: list[str] = []
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    query += " ORDER BY priority DESC, created_at ASC LIMIT 1000"
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
-            conn,
-            status="triage",
-            tenant=tenant,
-            limit=1000,
-        )
-    return [row.id for row in rows]
+        rows = conn.execute(query, params).fetchall()
+    return [row["id"] for row in rows]
