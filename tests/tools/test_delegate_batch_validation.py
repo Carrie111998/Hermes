@@ -101,7 +101,6 @@ class TestBatchPlaceholderGoals(unittest.TestCase):
         # Error must tell the model HOW to fix the call.
         self.assertIn("specific", result["error"].lower())
 
-
 class TestSingleTaskBatch(unittest.TestCase):
     def test_one_task_batch_rejected_pointing_to_goal_form(self):
         result = _call([{"goal": GOOD_A}])
@@ -133,6 +132,27 @@ class TestValidBatchStillRuns(unittest.TestCase):
             }
             result = json.loads(delegate_task(goal="test", parent_agent=parent))
         self.assertNotIn("error", result)
+
+    def test_concrete_syntax_is_not_treated_as_template_marker(self):
+        concrete_goals = (
+            'Ensure JSON output is {"status": "ok"}',
+            "Compare x < y and z > zero safely",
+            "Review the <button> rendering behavior",
+            "Read the ${HOME} environment variable safely",
+        )
+        for concrete_goal in concrete_goals:
+            with self.subTest(goal=concrete_goal), patch(
+                "tools.delegate_tool._run_single_child"
+            ) as mock_run:
+                mock_run.side_effect = [
+                    {"task_index": 0, "status": "completed", "summary": "A done",
+                     "api_calls": 1, "duration_seconds": 1.0, "_child_role": None},
+                    {"task_index": 1, "status": "completed", "summary": "B done",
+                     "api_calls": 1, "duration_seconds": 1.0, "_child_role": None},
+                ]
+                result = _call([{"goal": GOOD_A}, {"goal": concrete_goal}])
+            self.assertNotIn("error", result)
+            self.assertEqual(len(result["results"]), 2)
 
 
 if __name__ == "__main__":

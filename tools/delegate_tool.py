@@ -3057,9 +3057,14 @@ def _recover_tasks_from_json_string(
 
 
 # Placeholder shapes for batch goal validation: bare 'TODO', bare 'task N'
-# labels, or goals still carrying unexpanded template markers.
+# labels, or goals still carrying conventional unexpanded template markers.
+# Keep this conservative: arbitrary braces/angle brackets are valid in concrete
+# goals that contain JSON, comparisons, HTML tags, or shell variables.
 _PLACEHOLDER_GOAL_RE = re.compile(r"^(todo|task\s*\d+)$", re.IGNORECASE)
-_TEMPLATE_MARKER_RE = re.compile(r"<[^<>]+>|\{[^{}]+\}")
+_TEMPLATE_MARKER_NAME = r"(?:[A-Z][A-Z0-9_]*|[a-z][a-z0-9]*_[a-z0-9_]+)"
+_TEMPLATE_MARKER_RE = re.compile(
+    rf"<{_TEMPLATE_MARKER_NAME}>|(?<!\$)\{{{_TEMPLATE_MARKER_NAME}\}}"
+)
 _MIN_BATCH_GOAL_LEN = 10
 
 
