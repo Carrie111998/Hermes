@@ -119,11 +119,32 @@ def inject_memory_provider_tools(agent: Any) -> int:
         for tool in tools
         if isinstance(tool, dict)
     }
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    disabled_toolsets = getattr(agent, "disabled_toolsets", None)
     if not memory_provider_tools_enabled(
-        getattr(agent, "enabled_toolsets", None),
-        getattr(agent, "disabled_toolsets", None),
+        enabled_toolsets,
+        disabled_toolsets,
         memory_tool_present="memory" in existing_tool_names,
     ):
+        # Surface the silent suppression. The provider was initialized above
+        # (it might still produce a system_prompt_block, which we gate in
+        # build_system_prompt() above) but its tools are not in this agent's
+        # tool surface — emit a single WARNING so an operator reading
+        # agent.log can correlate the dangling instructions with the gate
+        # that produced them (#81014).
+        if memory_manager.providers:
+            try:
+                _schemas = list(memory_manager.get_all_tool_schemas())
+                _count = len(_schemas)
+            except Exception:
+                _count = "?"
+            logger.warning(
+                "Memory provider is initialized with %s tool schemas, but "
+                "they are NOT in the agent's tool surface. Enable the "
+                "'memory' toolset in platform_toolsets (or remove "
+                "memory from disabled_toolsets) to expose them (#81014).",
+                _count,
+            )
         return 0
 
     get_schemas = getattr(memory_manager, "get_all_tool_schemas", None)
@@ -381,6 +402,13 @@ class MemoryManager:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        # Toolset gating state — set via ``set_tool_gating()`` so
+        # ``build_system_prompt()`` can suppress provider blocks whose tools
+        # are not exposed in the agent's tool surface (#81014). ``None``
+        # means "no restriction" — the legacy behavior that always injects
+        # the provider block.
+        self._enabled_toolsets: Optional[List[str]] = None
+        self._disabled_toolsets: Optional[List[str]] = None
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -483,15 +511,58 @@ class MemoryManager:
 
     # -- System prompt -------------------------------------------------------
 
+    def set_tool_gating(
+        self,
+        *,
+        enabled_toolsets: Optional[List[str]] = None,
+        disabled_toolsets: Optional[List[str]] = None,
+    ) -> None:
+        """Record the agent's current toolset gating so ``build_system_prompt``
+        can suppress provider blocks whose tools are not exposed (#81014).
+
+        Called from agent_init after the agent's enabled/disabled toolset
+        configuration is known. ``None`` for either argument means "no
+        restriction" — the legacy behavior that always emits the block.
+        """
+        self._enabled_toolsets = enabled_toolsets
+        self._disabled_toolsets = disabled_toolsets
+
     def build_system_prompt(self) -> str:
         """Collect system prompt blocks from all providers.
 
         Returns combined text, or empty string if no providers contribute.
-        Each non-empty block is labeled with the provider name.
+        Each non-empty block is labeled with the provider name. A provider
+        whose tools are gated out of the agent's tool surface is skipped —
+        emitting instructions for tools that do not exist would dangle
+        (#81014).
         """
+        # Decide whether the provider tools are exposed. When no gating
+        # state has been set yet (``enabled_toolsets`` is ``None``) we
+        # preserve the legacy behavior — always emit. After agent_init
+        # calls ``set_tool_gating()`` the gate is honored.
+        gate_set = (
+            self._enabled_toolsets is not None
+            or self._disabled_toolsets is not None
+        )
+        tools_exposed = True
+        if gate_set:
+            tools_exposed = memory_provider_tools_enabled(
+                self._enabled_toolsets,
+                self._disabled_toolsets,
+            )
         blocks = []
         for provider in self._providers:
             try:
+                if gate_set and not tools_exposed:
+                    logger.warning(
+                        "Memory provider '%s' is initialized but its tools "
+                        "are NOT in the tool surface (platform_toolsets/"
+                        "disabled_toolsets gate). Suppressing "
+                        "system_prompt_block() to avoid dangling tool "
+                        "references (#81014).",
+                        provider.name,
+                    )
+                    continue
                 block = provider.system_prompt_block()
                 if block and block.strip():
                     blocks.append(block)

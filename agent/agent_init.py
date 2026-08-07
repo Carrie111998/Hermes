@@ -1763,6 +1763,14 @@ def init_agent(
             agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
+    # Record the toolset gating on the manager BEFORE injecting tools so a
+    # provider whose tools are gated out can suppress its system_prompt_block
+    # rather than dangling instructions for non-existent tools (#81014).
+    if agent._memory_manager is not None:
+        agent._memory_manager.set_tool_gating(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        )
     _inject_memory_provider_tools(agent)
 
     # Skills config: nudge interval for skill creation reminders
