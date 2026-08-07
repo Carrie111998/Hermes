@@ -13,6 +13,7 @@ import {
   $activeSessionId,
   $activeSessionStoredIdRotation,
   $currentCwd,
+  $currentCwdExplicit,
   $currentFastMode,
   $currentModel,
   $currentProvider,
@@ -396,6 +397,7 @@ async function createWith(
 
   setCurrentCwd('')
   setNewChatWorkspaceTarget(undefined)
+  $currentCwdExplicit.set(false)
   profileSetup()
 
   let handle: HarnessHandle | null = null
@@ -447,6 +449,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
+    $currentCwdExplicit.set(false)
     vi.restoreAllMocks()
   })
 
@@ -492,7 +495,16 @@ describe('createBackendSessionForSend profile routing', () => {
       $currentCwd.set('/remote/worktree')
     })
 
-    expect(params).toMatchObject({ cwd: '/remote/worktree' })
+    expect(params).toMatchObject({ cwd: '/remote/worktree', cwd_explicit: false })
+  })
+
+  it('marks an explicitly selected workspace so the gateway preserves it', async () => {
+    const params = await createWith(() => {
+      $currentCwd.set('/remote/launch-workspace')
+      $currentCwdExplicit.set(true)
+    })
+
+    expect(params).toMatchObject({ cwd: '/remote/launch-workspace', cwd_explicit: true })
   })
 
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {

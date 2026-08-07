@@ -507,6 +507,11 @@ export const $yoloActive = atom(false)
 export const $currentCwd = atom(getRememberedWorkspaceCwd())
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
+// True only when the user deliberately chose the current cwd for the next
+// session. This provenance matters in global-remote mode: an inherited launch
+// workspace may equal a user's explicit selection, so path equality alone is
+// insufficient (#52589).
+export const $currentCwdExplicit = atom(false)
 export const $currentBranch = atom('')
 export const $currentUsage = atom<UsageStats>({
   calls: 0,
@@ -635,6 +640,8 @@ export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number 
 
   return generation
 }
+
+export const setCurrentCwdExplicit = (next: Updater<boolean>) => updateAtom($currentCwdExplicit, next)
 
 export const workspaceCwdForNewSession = (): string => {
   if ($connection.get()?.mode === 'remote') {
