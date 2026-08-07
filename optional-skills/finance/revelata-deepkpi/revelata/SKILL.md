@@ -12,16 +12,6 @@ description: >
   pressure-test analyst PDFs, peer benchmarks, idea generation, or company summaries
   across multiple needs.
 version: 1.0.0
-homepage: https://www.revelata.com
-metadata:
-  openclaw:
-    emoji: "📊"
-    requires:
-      env:
-        - DEEPKPI_API_KEY
-      bins:
-        - curl
-version: 1.0.0
 author: Revelata
 license: Apache-2.0
 homepage: https://www.revelata.com
@@ -31,6 +21,14 @@ metadata:
     tags: [Revelata, Finance, SEC, KPI, deepKPI]
     category: finance
     related_skills: [kpi, company-summary, filing, implied-metric, seasonality, pressure-test, benchmark, ideas]
+  openclaw:
+    emoji: "📊"
+    requires:
+      env:
+        - DEEPKPI_API_KEY
+      bins:
+        - curl
+    primaryEnv: DEEPKPI_API_KEY
 ---
 
 # Revelata deepKPI orchestrator
