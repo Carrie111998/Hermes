@@ -16,14 +16,27 @@ export type KeyRowProps = Omit<EnvRowProps, 'info' | 'varKey'>
 
 // Redacted rotation-pool readout: label + active/exhausted status per stored
 // credential, so a user juggling e.g. a personal + a shared Copilot account
-// can see which one requests are actually using without touching the CLI.
-export function CredentialPoolStatus({ entries }: { entries: CredentialPoolEntry[] }) {
+// can see — and manually switch — which one requests are actually using,
+// without touching the CLI.
+export function CredentialPoolStatus({
+  activating,
+  entries,
+  onActivate
+}: {
+  activating?: number
+  entries: CredentialPoolEntry[]
+  onActivate?: (index: number) => void
+}) {
+  const { t } = useI18n()
   const sorted = [...entries].sort((a, b) => a.priority - b.priority)
+  const current = sorted[0]?.index
 
   return (
     <ul className="mb-1 ml-3 grid gap-0.5 border-l border-(--ui-border) pl-3">
       {sorted.map(entry => {
         const active = entry.last_status !== 'exhausted' && entry.last_status !== 'error'
+        const isCurrent = entry.index === current
+        const busy = activating === entry.index
 
         return (
           <li className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground" key={entry.index}>
@@ -32,12 +45,28 @@ export function CredentialPoolStatus({ entries }: { entries: CredentialPoolEntry
             />
             <span className="truncate">{entry.label || entry.token_preview}</span>
             <span className="text-muted-foreground/60">{entry.last_status ?? (active ? 'active' : 'idle')}</span>
+            {onActivate && !isCurrent && (
+              <Button
+                className="ml-auto h-6 px-1.5 text-[11px]"
+                disabled={busy}
+                onClick={e => {
+                  e.stopPropagation()
+                  onActivate(entry.index)
+                }}
+                size="sm"
+                type="button"
+                variant="ghost"
+              >
+                {busy ? <Loader2 className="size-3 animate-spin" /> : t.settings.credentials.useThisAccount}
+              </Button>
+            )}
           </li>
         )
       })}
     </ul>
   )
 }
+
 
 /** Matches Advanced / config field controls (ListRow + Input). */
 export const CREDENTIAL_CONTROL_CLASS = cn('h-8', CONTROL_TEXT)
@@ -278,7 +307,16 @@ export function CredentialKeyCard({
 }
 
 /** Provider API key group — collapsible card; description, docs link, and advanced fields expand on click. */
-export function ProviderKeyRows({ expanded, group, onExpand, onToggle, poolEntries, rowProps }: ProviderKeyRowsProps) {
+export function ProviderKeyRows({
+  activatingIndex,
+  expanded,
+  group,
+  onActivate,
+  onExpand,
+  onToggle,
+  poolEntries,
+  rowProps
+}: ProviderKeyRowsProps) {
   const { t } = useI18n()
   const docsUrl = group.docsUrl?.trim()
   const description = group.description?.trim()
@@ -361,7 +399,7 @@ export function ProviderKeyRows({ expanded, group, onExpand, onToggle, poolEntri
             no "which one is active" affordance. */}
         {poolEntries && poolEntries.length > 1 && (
           <div className="@2xl:col-span-2">
-            <CredentialPoolStatus entries={poolEntries} />
+            <CredentialPoolStatus activating={activatingIndex} entries={poolEntries} onActivate={onActivate} />
           </div>
         )}
 
@@ -423,8 +461,10 @@ interface CredentialKeyCardProps {
 }
 
 interface ProviderKeyRowsProps {
+  activatingIndex?: number
   expanded: boolean
   group: ProviderKeyRowGroup
+  onActivate?: (index: number) => void
   onExpand: () => void
   onToggle: () => void
   poolEntries?: CredentialPoolEntry[]

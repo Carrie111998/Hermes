@@ -15,7 +15,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
-import { disconnectOAuthProvider, getCredentialPool, listOAuthProviders } from '@/hermes'
+import { activateCredentialPoolEntry, disconnectOAuthProvider, getCredentialPool, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
@@ -357,6 +357,7 @@ export function ProvidersSettings({
   const { rowProps, vars } = useEnvCredentials()
   const [oauthProviders, setOauthProviders] = useState<OAuthProvider[]>([])
   const [poolByProvider, setPoolByProvider] = useState<Record<string, CredentialPoolEntry[]>>({})
+  const [activating, setActivating] = useState<null | { index: number; provider: string }>(null)
   const [openProvider, setOpenProvider] = useState<null | string>(null)
   const [disconnecting, setDisconnecting] = useState<null | string>(null)
   // Free-text filter for the API-keys view (provider name / env-var key / desc).
@@ -397,23 +398,40 @@ export function ProvidersSettings({
   // Rotation-pool status is a lightweight, best-effort readout (redacted, no
   // secrets) — used only to annotate connected provider rows that have more
   // than one stored credential. Loads once; skipped entirely if it fails.
-  useEffect(() => {
-    let cancelled = false
-
-    void (async () => {
-      try {
-        const { providers } = await getCredentialPool()
-
-        if (!cancelled) {
-          setPoolByProvider(Object.fromEntries(providers.map(p => [p.provider, p.entries])))
-        }
-      } catch {
-        // Ignore — falls back to the plain connected row with no pool detail.
-      }
-    })()
-
-    return () => void (cancelled = true)
+  const refreshPool = useCallback(async () => {
+    try {
+      const { providers } = await getCredentialPool()
+      setPoolByProvider(Object.fromEntries(providers.map(p => [p.provider, p.entries])))
+    } catch {
+      // Ignore — falls back to the plain connected row with no pool detail.
+    }
   }, [])
+
+  useEffect(() => {
+    void refreshPool()
+  }, [refreshPool])
+
+  // Manual "use this account" — the user's alternative to switching Copilot
+  // (or any pooled provider) via the CLI. Re-fetches afterwards so the status
+  // list reflects the new active entry.
+  const handleActivate = useCallback(
+    async (provider: string, index: number) => {
+      setActivating({ index, provider })
+      try {
+        await activateCredentialPoolEntry(provider, index)
+        await refreshPool()
+      } catch (err) {
+        notify({
+          kind: 'error',
+          title: t.settings.providers.removedTitle,
+          message: err instanceof Error ? err.message : String(err)
+        })
+      } finally {
+        setActivating(null)
+      }
+    },
+    [refreshPool, t]
+  )
 
 
   // External (CLI-managed) providers can't be cleared via the API by design —
@@ -506,9 +524,13 @@ export function ProvidersSettings({
               <div className="grid gap-2">
                 {visibleGroups.map(group => (
                   <ProviderKeyRows
+                    activatingIndex={
+                      activating && activating.provider === group.poolProvider ? activating.index : undefined
+                    }
                     expanded={openProvider === group.name}
                     group={group}
                     key={group.name}
+                    onActivate={group.poolProvider ? index => void handleActivate(group.poolProvider!, index) : undefined}
                     onExpand={() => setOpenProvider(group.name)}
                     onToggle={() => setOpenProvider(prev => (prev === group.name ? null : group.name))}
                     poolEntries={group.poolProvider ? poolByProvider[group.poolProvider] : undefined}

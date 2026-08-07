@@ -894,6 +894,16 @@ export function getCredentialPool(): Promise<CredentialPoolResponse> {
   })
 }
 
+// Manual "use this account" — forces `index` (1-based, per getCredentialPool)
+// to be the next credential the pool selects for `provider`.
+export function activateCredentialPoolEntry(provider: string, index: number): Promise<{ ok: boolean; provider: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; provider: string }>({
+    ...profileScoped(),
+    path: `/api/credentials/pool/${encodeURIComponent(provider)}/${index}/activate`,
+    method: 'POST'
+  })
+}
+
 export function disconnectOAuthProvider(providerId: string): Promise<{ ok: boolean; provider: string }> {
   return window.hermesDesktop.api<{ ok: boolean; provider: string }>({
     ...profileScoped(),
