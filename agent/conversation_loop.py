@@ -871,9 +871,9 @@ def _invalid_tool_name_error_content(
 def _deferred_tool_names_for_agent(agent) -> frozenset[str]:
     """Resolve the current session's bridge-reachable names on error only."""
     try:
-        from agent.tool_executor import _tool_search_scoped_names
+        from agent.tool_executor import tool_search_scoped_names
 
-        return _tool_search_scoped_names(agent)
+        return tool_search_scoped_names(agent)
     except Exception:
         return frozenset()
 

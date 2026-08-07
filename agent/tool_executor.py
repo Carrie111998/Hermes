@@ -323,7 +323,7 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
-def _tool_search_scoped_names(agent, config=None) -> frozenset:
+def tool_search_scoped_names(agent, config=None) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
     The Tool Search unwrap dispatches the underlying tool directly, bypassing
@@ -373,6 +373,36 @@ def _tool_search_scoped_names(agent, config=None) -> frozenset:
     except Exception:
         pass
     return names
+
+
+def _unwrap_tool_search_call(agent, function_name: str, function_args: dict):
+    """Resolve and authorize a tool_call bridge invocation for this session."""
+    scope_block = None
+    try:
+        from tools import tool_search as _ts
+
+        if function_name != _ts.TOOL_CALL_NAME:
+            return function_name, function_args, scope_block
+        config = _ts.load_config()
+        underlying, underlying_args, error = _ts.resolve_underlying_call(
+            function_args,
+            builtin_policy=config.builtins,
+        )
+        if error or not underlying:
+            return function_name, function_args, scope_block
+        if underlying not in tool_search_scoped_names(agent, config=config):
+            return (
+                function_name,
+                function_args,
+                f"'{underlying}' is not available in this session. "
+                "Use tool_search to find tools you can call.",
+            )
+        probe_error = _ts.validate_deferred_call_args(underlying, underlying_args)
+        if probe_error is not None:
+            return function_name, function_args, probe_error
+        return underlying, underlying_args, scope_block
+    except Exception:
+        return function_name, function_args, scope_block
 
 
 @dataclass
@@ -840,36 +870,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # scope check), so we enforce session toolset scope HERE. A tool
         # the session was not granted is rejected before any checkpoint,
         # hook, or dispatch fires.
-        _ts_scope_block = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _ts_config = _ts.load_config()
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
-                    function_args,
-                    builtin_policy=_ts_config.builtins,
-                )
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(
-                        agent,
-                        config=_ts_config,
-                    ):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
-                    else:
-                        _ts_scope_block = (
-                            f"'{_underlying}' is not available in this session. "
-                            "Use tool_search to find tools you can call."
-                        )
-        except Exception:
-            pass
+        function_name, function_args, _ts_scope_block = _unwrap_tool_search_call(
+            agent,
+            function_name,
+            function_args,
+        )
 
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
@@ -1688,46 +1693,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
         # rationale, including the scope gate (the unwrap dispatches the
         # underlying tool directly, so session toolset scope is enforced here).
-        _ts_scope_block: Optional[str] = None
-        try:
-            from tools import tool_search as _ts
-            if function_name == _ts.TOOL_CALL_NAME:
-                _ts_config = _ts.load_config()
-                _underlying, _underlying_args, _err = _ts.resolve_underlying_call(
-                    function_args,
-                    builtin_policy=_ts_config.builtins,
-                )
-                if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(
-                        agent,
-                        config=_ts_config,
-                    ):
-                        # Probe-validate before unwrapping (ironclaw#5149):
-                        # missing required args return the parameter schema
-                        # instead of dispatching into an opaque failure.
-                        _probe_err = _ts.validate_deferred_call_args(_underlying, _underlying_args)
-                        if _probe_err is not None:
-                            # This path wraps _block_msg in {"error": ...} —
-                            # flatten the probe payload to one plain string.
-                            try:
-                                _probe = json.loads(_probe_err)
-                                _ts_scope_block = (
-                                    f"{_probe.get('error', '')} Parameters schema: "
-                                    f"{json.dumps(_probe.get('parameters', {}), ensure_ascii=False)}. "
-                                    f"{_probe.get('hint', '')}"
-                                ).strip()
-                            except Exception:
-                                _ts_scope_block = _probe_err
-                        else:
-                            function_name = _underlying
-                            function_args = _underlying_args
-                    else:
-                        _ts_scope_block = (
-                            f"'{_underlying}' is not available in this session. "
-                            "Use tool_search to find tools you can call."
-                        )
-        except Exception:
-            pass
+        function_name, function_args, _ts_scope_block = _unwrap_tool_search_call(
+            agent,
+            function_name,
+            function_args,
+        )
+        if _ts_scope_block:
+            # This path wraps _block_msg in {"error": ...}; flatten the probe
+            # payload to one plain string while preserving ordinary scope errors.
+            try:
+                _probe = json.loads(_ts_scope_block)
+                _ts_scope_block = (
+                    f"{_probe.get('error', '')} Parameters schema: "
+                    f"{json.dumps(_probe.get('parameters', {}), ensure_ascii=False)}. "
+                    f"{_probe.get('hint', '')}"
+                ).strip()
+            except Exception:
+                pass
 
         middleware_trace: list[dict[str, Any]] = []
         _execution_blocked = False

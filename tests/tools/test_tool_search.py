@@ -869,7 +869,7 @@ class TestRegression_ToolsetScoping:
 
     def test_executor_scope_cache_fingerprint_includes_builtin_policy(self, monkeypatch):
         import model_tools
-        from agent.tool_executor import _tool_search_scoped_names
+        from agent.tool_executor import tool_search_scoped_names
         from tools.tool_search import ToolSearchConfig
 
         class Agent:
@@ -899,10 +899,10 @@ class TestRegression_ToolsetScoping:
             },
         })
 
-        assert _tool_search_scoped_names(agent, browser_cfg) == frozenset({
+        assert tool_search_scoped_names(agent, browser_cfg) == frozenset({
             "browser_navigate"
         })
-        assert _tool_search_scoped_names(agent, todo_cfg) == frozenset({"todo"})
+        assert tool_search_scoped_names(agent, todo_cfg) == frozenset({"todo"})
         assert len(calls) == 2
 
 

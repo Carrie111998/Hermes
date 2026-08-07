@@ -386,7 +386,11 @@ def setup_isolated_home(enabled: bool, listing: str = "off",
                 "listing_max_tokens": listing_max_tokens,
                 "builtins": {
                     "enabled": builtins_enabled,
-                    "defer": builtin_defer_groups or BUILTIN_DEFER_GROUPS,
+                    "defer": (
+                        BUILTIN_DEFER_GROUPS
+                        if builtin_defer_groups is None
+                        else builtin_defer_groups
+                    ),
                     "min_schema_tokens": builtin_min_schema_tokens,
                 },
             },
@@ -468,18 +472,15 @@ def _prepare_fixtures() -> None:
 
 def run_one_scenario(
     scenario: Dict[str, Any],
-    enabled: bool,
     out_dir: Path,
     *,
     suite: str = "mcp",
-    mode: str | None = None,
+    mode: str,
 ) -> Dict[str, Any]:
-    """Run one (scenario, enabled) combination. Returns the recorded transcript."""
+    """Run one selected scenario/mode combination and record its transcript."""
     reset_module_state()
-    if mode is None:
-        mode = "enabled" if enabled else "disabled"
     builtin_disclosure = suite == "builtins" and mode == "deferred"
-    tool_search_enabled = enabled and mode != "off"
+    tool_search_enabled = mode not in ("disabled", "off")
     home = setup_isolated_home(
         enabled=tool_search_enabled,
         builtins_enabled=builtin_disclosure,
@@ -555,7 +556,7 @@ def run_one_scenario(
         "scenario_description": scenario["description"],
         "suite": suite,
         "mode": mode,
-        "tool_search_enabled": enabled,
+        "tool_search_enabled": tool_search_enabled,
         "builtin_disclosure_enabled": builtin_disclosure,
         "builtin_defer_groups": scenario.get("builtin_defer_groups", []),
         "model": "anthropic/claude-haiku-4.5 (via openrouter)",
@@ -738,11 +739,9 @@ def main(argv: List[str] | None = None) -> int:
         for case in cases:
             scenario = case["scenario"]
             mode = case["mode"]
-            enabled = mode not in ("disabled", "off")
             print(f"\n{'='*72}\nScenario {scenario['id']} ({case['suite']}={mode})\n{'='*72}")
             record = run_one_scenario(
                 scenario,
-                enabled,
                 out_dir,
                 suite=case["suite"],
                 mode=mode,
@@ -758,7 +757,7 @@ def main(argv: List[str] | None = None) -> int:
                 "scenario": scenario["id"],
                 "suite": case["suite"],
                 "mode": mode,
-                "enabled": enabled,
+                "enabled": record["tool_search_enabled"],
                 "n_bridge": n_bridge,
                 "n_underlying": n_under,
                 "elapsed": record["elapsed_seconds"],

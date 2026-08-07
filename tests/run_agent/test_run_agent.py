@@ -1537,7 +1537,7 @@ class TestExecuteToolCalls:
         })
         monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
         monkeypatch.setattr(
-            "agent.tool_executor._tool_search_scoped_names",
+            "agent.tool_executor.tool_search_scoped_names",
             lambda _agent, config=None: frozenset({"browser_back"}),
         )
         tc = _mock_tool_call(
@@ -1902,7 +1902,7 @@ class TestConcurrentToolExecution:
         })
         monkeypatch.setattr(tool_search, "load_config", lambda: cfg)
         monkeypatch.setattr(
-            "agent.tool_executor._tool_search_scoped_names",
+            "agent.tool_executor.tool_search_scoped_names",
             lambda _agent, config=None: frozenset({"browser_back", "browser_press"}),
         )
         calls = [

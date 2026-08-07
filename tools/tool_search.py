@@ -45,6 +45,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from tools.registry import tool_error
@@ -264,7 +265,7 @@ def _safe_bool(value: Any, fallback: bool) -> bool:
 def load_config() -> ToolSearchConfig:
     """Load tool-search config from the user config file."""
     try:
-        from hermes_cli.config import load_config as _load
+        from hermes_cli.config import load_config_readonly as _load
         cfg = _load() or {}
         tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
         if not isinstance(tools_cfg, dict):
@@ -280,6 +281,7 @@ def load_config() -> ToolSearchConfig:
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=1)
 def _core_tool_names() -> frozenset[str]:
     """Return the set of tool names that must NEVER be deferred.
 
@@ -370,20 +372,33 @@ def classify_tools_for_config(
         tool_defs,
         builtin_policy=config.builtins,
     )
+    core_names = _core_tool_names()
     selected_builtin_defs = [
         td for td in deferrable
         if (td.get("function") or {}).get("name")
         in config.builtins.deferred_names
-        and (td.get("function") or {}).get("name") in _core_tool_names()
+        and (td.get("function") or {}).get("name") in core_names
     ]
     if (
         selected_builtin_defs
         and estimate_tokens_from_schemas(selected_builtin_defs)
         < config.builtins.min_schema_tokens
     ):
-        # Reclassifying without the built-in policy keeps existing MCP/plugin
-        # tools deferred while returning the below-threshold built-ins eager.
-        return classify_tools(tool_defs)
+        # Keep existing MCP/plugin tools deferred while returning only the
+        # below-threshold built-ins eager. Rebuild from the first pass's names
+        # to preserve input ordering without a second registry walk.
+        deferred_names = {
+            (td.get("function") or {}).get("name") for td in deferrable
+        }
+        eager_builtin_names = {
+            (td.get("function") or {}).get("name") for td in selected_builtin_defs
+        }
+        remaining_deferred_names = deferred_names - eager_builtin_names
+        visible = []
+        deferrable = []
+        for td in tool_defs:
+            name = (td.get("function") or {}).get("name")
+            (deferrable if name in remaining_deferred_names else visible).append(td)
     return visible, deferrable
 
 
@@ -916,10 +931,10 @@ def assemble_tool_defs(
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
-    When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
+    When tool search is inactive (off or no deferrable tools), this is a
+    passthrough. When active, MCP/plugin tools and reviewed built-ins selected
+    by the opt-in policy are stripped from the visible list and replaced with
+    the three bridge tools. Built-in availability is unchanged.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,
