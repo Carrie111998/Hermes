@@ -12,6 +12,9 @@ from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from tests.gateway.test_canonical_writer_production_cutover import (
     _runtime_attestation,
 )
+from tests.scripts.canary import (
+    test_production_release_unit_inputs_v4 as v4_test,
+)
 
 
 ROOT = Path(__file__).parents[3]
@@ -265,6 +268,51 @@ bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision}
     # There is deliberately no active release or active-side bootstrap command
     # in this fixture; success proves the reviewed target Git blob is sufficient.
     assert not (tmp_path / "active").exists()
+
+
+def test_legacy_deploy_never_downgrades_stage_c_v4_authority(
+    tmp_path: Path,
+) -> None:
+    documents = v4_test._documents()
+    revision = v4_test.TARGET
+    staged = (tmp_path / "staged-v4").resolve()
+    staged.mkdir(mode=0o700)
+    plan_path = staged / "unit-input-plan.json"
+    approval_path = staged / "unit-input-approval.json"
+    output_path = staged / "production-unit-inputs.json"
+    plan_path.write_bytes(_canonical(documents["unit_plan"]))
+    approval_path.write_bytes(_canonical(documents["unit_approval"]))
+    output_path.write_bytes(_canonical(documents["fixed"]) + b"\n")
+    plan_path.chmod(0o400)
+    approval_path.chmod(0o400)
+    output_path.chmod(0o444)
+    for path in (staged, plan_path, approval_path, output_path):
+        os.chown(path, os.geteuid(), os.getegid())
+
+    bootstrap_marker = (tmp_path / "legacy-bootstrap-called").resolve()
+    body = f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(plan_path))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(approval_path))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(output_path))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {revision}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "42"
+    assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
 
 
 def test_root_config_seal_rejects_owner_payload_drift_before_chown(

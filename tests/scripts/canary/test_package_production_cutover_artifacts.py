@@ -3587,7 +3587,7 @@ def test_deploy_packages_and_verifies_before_release_activation():
     cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
     activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
     bootstrap = run_deploy.index(
-        'bootstrap_cutover_unit_inputs_from_target "$tmp" "$sha"'
+        'prepare_legacy_cutover_unit_inputs "$tmp" "$sha"'
     )
     require_inputs = run_deploy.index(
         'require_cutover_unit_inputs "$sha" "$pr"',
