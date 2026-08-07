@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -634,6 +635,526 @@ class TestMediaDeliveryDefaultMode:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            ".env",
+            "auth.json",
+            "auth.lock",
+            "config.yaml",
+            ".anthropic_oauth.json",
+            "google_token.json",
+            "google_oauth_pending.json",
+            "auth/google_oauth.json",
+            "webhook_subscriptions.json",
+            "credentials/x",
+            "cache/bws_cache.json",
+            "cache/bws_cache.enc.json",
+            "mcp-tokens/t.json",
+            "pairing/x.json",
+        ],
+    )
+    def test_denylist_blocks_sibling_profile_credentials(
+        self, tmp_path, monkeypatch, rel,
+    ):
+        """Active profile alice must not deliver bob's credential stores.
+
+        Default mode accepts any non-denied regular file. The denylist must
+        therefore cover every <root>/profiles/<name>/ entry with the same
+        credential file/dir policy as the active home and shared root —
+        otherwise MEDIA:<root>/profiles/bob/.env (etc.) exfiltrates as a
+        chat attachment. Supersedes the incomplete four-file list in #47220.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / rel
+        secret.parent.mkdir(parents=True, exist_ok=True)
+        secret.write_text("SECRET=1")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_denylist_blocks_sibling_profile_when_home_is_root(
+        self, tmp_path, monkeypatch,
+    ):
+        """Default (non-profile) HERMES_HOME==root must still deny profiles/*.
+
+        The hole also exists for a root-home gateway that coexists with
+        profile directories on disk — not only when the active home is itself
+        under profiles/<name>/.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        bob = hermes_root / "profiles" / "bob"
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_root)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_sibling_profile_non_credential_still_delivers(
+        self, tmp_path, monkeypatch,
+    ):
+        """Non-credential files under a sibling profile remain deliverable.
+
+        The denylist is per-credential-store, not a whole-tree deny of
+        profiles/<other>/ (same #32090/#34425 posture as the active home).
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        notes = bob / "notes.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("# shared notes\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(
+            notes.resolve()
+        )
+
+    def test_sibling_credential_denied_when_profiles_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Fail closed on known sibling credentials when profiles/ can't be listed.
+
+        POSIX execute-only (0111) profiles/ lets open(bob/.env) succeed while
+        iterdir() raises. Denial must be structural under profiles/<name>/,
+        not derived from enumeration (which returns [] on OSError).
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        # Simulate execute-only / unreadable profiles/: listing fails, but
+        # the known child paths remain openable (already created above).
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(
+            notes.resolve()
+        )
+
+    def test_symlinked_sibling_profile_credentials_denied(
+        self, tmp_path, monkeypatch,
+    ):
+        """Directory-symlink siblings must still deny credentials after resolve.
+
+        Profile discovery accepts directory symlinks (``profiles/bob`` ->
+        external home). ``validate_media_delivery_path`` resolves the
+        candidate first, so a structural ``<root>/profiles/<name>/`` match
+        misses the external target. Discovered profile homes must apply the
+        same credential-relative policy to their resolved targets, while
+        ordinary sibling files remain deliverable.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob_link = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        external_bob = tmp_path / "external_bob"
+        external_bob.mkdir()
+        secret = external_bob / ".env"
+        secret.write_text("SECRET=1")
+        token = external_bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = external_bob / "notes.md"
+        notes.write_text("# ok\n")
+        try:
+            bob_link.symlink_to(external_bob, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        # Access via the profiles/ symlink entry (the MEDIA-tag shape).
+        linked_secret = bob_link / ".env"
+        linked_token = bob_link / "mcp-tokens" / "t.json"
+        linked_notes = bob_link / "notes.md"
+
+        import gateway.platforms.base as base
+
+        # Structural check alone misses the resolved external target.
+        assert base._path_is_profile_tree_credential(linked_secret.resolve()) is False
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_token)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_notes)) == str(
+            linked_notes.resolve()
+        )
+
+    def test_symlinked_sibling_credential_denied_when_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Symlink sibling + unreadable profiles/ must still deny credentials.
+
+        resolve() drops ``profiles/<name>/`` ancestry for directory-symlink
+        homes, and ``_iter_hermes_profile_dirs`` returns [] when listing fails.
+        Lexical ancestry on the submitted absolute path must close that
+        conjunction while non-credential sibling files remain deliverable.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob_link = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        external_bob = tmp_path / "external_bob"
+        external_bob.mkdir()
+        secret = external_bob / ".env"
+        secret.write_text("SECRET=1")
+        token = external_bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = external_bob / "notes.md"
+        notes.write_text("# ok\n")
+        try:
+            bob_link.symlink_to(external_bob, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        linked_secret = bob_link / ".env"
+        linked_token = bob_link / "mcp-tokens" / "t.json"
+        linked_notes = bob_link / "notes.md"
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert base._path_is_profile_tree_credential(linked_secret.resolve()) is False
+        assert base._path_is_lexical_profile_tree_credential(linked_secret) is True
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_secret)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_token)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(linked_notes)) == str(
+            linked_notes.resolve()
+        )
+
+    def _mixed_case_alias(self, path: Path, *replacements: tuple[str, str]) -> str:
+        """Rewrite path components' spelling without touching the real file."""
+        text = str(path)
+        for old, new in replacements:
+            text = text.replace(old, new)
+        return text
+
+    def _mixed_case_opens_same_file(self, alias: str, real: Path) -> bool:
+        """True when the mixed-case spelling opens the same on-disk file.
+
+        Case-sensitive volumes (Linux CI) do not resolve ``PROFILES/...`` to
+        ``profiles/...``; the alias simply does not exist. Case-insensitive
+        volumes (default macOS / Windows) open the real credential/file.
+        """
+        try:
+            return Path(alias).resolve(strict=True).samefile(real.resolve(strict=True))
+        except OSError:
+            return False
+
+    def test_mixed_case_sibling_credential_helpers(self, tmp_path, monkeypatch):
+        """Casefolded profile/credential matching must catch mixed-case aliases.
+
+        On case-insensitive volumes, ``Path.resolve()`` can preserve the
+        supplied spelling of non-symlink components. Helpers must therefore
+        deny ``PROFILES/bob/.ENV`` even when on-disk names are lowercase.
+        """
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        import gateway.platforms.base as base
+
+        mixed = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / ".env",
+            ("profiles", "PROFILES"),
+            (".env", ".ENV"),
+        ))
+        mixed_token = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / "mcp-tokens" / "t.json",
+            ("profiles", "PROFILES"),
+            ("mcp-tokens", "MCP-TOKENS"),
+        ))
+        mixed_notes = Path(self._mixed_case_alias(
+            hermes_root / "profiles" / "bob" / "notes.md",
+            ("profiles", "PROFILES"),
+        ))
+
+        assert base._rel_matches_hermes_root_credential(Path(".ENV")) is True
+        assert base._rel_matches_hermes_root_credential(Path("MCP-TOKENS") / "t.json") is True
+        assert base._path_is_profile_tree_credential(mixed) is True
+        assert base._path_is_lexical_profile_tree_credential(mixed) is True
+        assert base._path_is_profile_tree_credential(mixed_token) is True
+        assert base._path_is_lexical_profile_tree_credential(mixed_token) is True
+        assert base._path_is_profile_tree_credential(mixed_notes) is False
+        assert base._path_is_lexical_profile_tree_credential(mixed_notes) is False
+
+    def test_mixed_case_sibling_credential_denied(self, tmp_path, monkeypatch):
+        """Mixed-case MEDIA paths must not deliver sibling credentials."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        token = bob / "mcp-tokens" / "t.json"
+        token.parent.mkdir()
+        token.write_text("{}")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        mixed_secret = self._mixed_case_alias(
+            secret, ("profiles", "PROFILES"), (".env", ".ENV"),
+        )
+        mixed_token = self._mixed_case_alias(
+            token, ("profiles", "PROFILES"), ("mcp-tokens", "MCP-TOKENS"),
+        )
+        mixed_notes = self._mixed_case_alias(notes, ("profiles", "PROFILES"))
+
+        # Credential aliases must never deliver. On case-sensitive volumes the
+        # mixed spelling does not open the file (also None); on case-insensitive
+        # volumes the deny helpers reject the opened secret.
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_token) is None
+        if self._mixed_case_opens_same_file(mixed_notes, notes):
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+                notes.resolve()
+            )
+        else:
+            # Case-sensitive FS: alias path does not exist, so delivery is None.
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) is None
+
+    def test_mixed_case_sibling_credential_denied_when_enumeration_fails(
+        self, tmp_path, monkeypatch,
+    ):
+        """Mixed-case aliases stay denied when profiles/ listing raises."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        profiles_dir = hermes_root / "profiles"
+        alice = profiles_dir / "alice"
+        bob = profiles_dir / "bob"
+        alice.mkdir(parents=True)
+        secret = bob / ".env"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("SECRET=1")
+        notes = bob / "notes.md"
+        notes.write_text("# ok\n")
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        real_iterdir = type(profiles_dir).iterdir
+
+        def _iterdir_raises(self):
+            if self.resolve() == profiles_dir.resolve():
+                raise PermissionError("profiles dir not readable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr(type(profiles_dir), "iterdir", _iterdir_raises)
+
+        import gateway.platforms.base as base
+
+        mixed_secret = self._mixed_case_alias(
+            secret, ("profiles", "PROFILES"), (".env", ".ENV"),
+        )
+        mixed_notes = self._mixed_case_alias(notes, ("profiles", "PROFILES"))
+
+        assert base._iter_hermes_profile_dirs() == []
+        assert BasePlatformAdapter.validate_media_delivery_path(mixed_secret) is None
+        if self._mixed_case_opens_same_file(mixed_notes, notes):
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) == str(
+                notes.resolve()
+            )
+        else:
+            assert BasePlatformAdapter.validate_media_delivery_path(mixed_notes) is None
+
+    def test_sibling_credential_symlink_into_cache_denied(
+        self, tmp_path, monkeypatch,
+    ):
+        """Credential-shaped paths must not redeem via safe-root after resolve.
+
+        ``profiles/bob/.env`` symlinked to ``bob/cache/images/...`` resolves
+        into an unconditional profile-cache allowlist root. Lexical sibling
+        credential policy must reject that submission before safe-root
+        acceptance, while the cache target addressed directly still delivers.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_root = fake_home / ".hermes"
+        alice = hermes_root / "profiles" / "alice"
+        bob = hermes_root / "profiles" / "bob"
+        alice.mkdir(parents=True)
+        cache_file = bob / "cache" / "images" / "credential.txt"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("leaked-secret\n")
+        secret_link = bob / ".env"
+        try:
+            secret_link.symlink_to(cache_file)
+        except OSError:
+            pytest.skip("symlink creation is unavailable")
+
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", alice)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret_link)) is None
+        assert BasePlatformAdapter.validate_media_delivery_path(str(cache_file)) == str(
+            cache_file.resolve()
+        )
+
+    def test_case_sensitive_home_exception_preserves_denied_root_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        """Casefold-equal but distinct homes must not exempt a hard-denied tree.
+
+        On case-sensitive filesystems, ``/Etc`` and ``/etc`` can both exist.
+        The running-home exception must require filesystem identity so a
+        configured home that only casefolds to a denied system root cannot
+        unlock files under the real denied tree.
+        """
+        self._patch_roots(monkeypatch)
+
+        denied_root = tmp_path / "etc"
+        home_alias = tmp_path / "Etc"
+        denied_root.mkdir()
+        try:
+            home_alias.mkdir()
+        except FileExistsError:
+            pytest.skip("filesystem is case-insensitive")
+        try:
+            if denied_root.samefile(home_alias):
+                pytest.skip("filesystem is case-insensitive")
+        except OSError:
+            pytest.skip("cannot compare directory identity")
+
+        secret = denied_root / "shadow"
+        secret.write_text("root:*:0:0\n")
+
+        monkeypatch.setenv("HOME", str(home_alias))
+        monkeypatch.setenv("USERPROFILE", str(home_alias))
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(denied_root),),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_HOME_SUBPATHS",
+            (),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            tmp_path / "unused-hermes",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            tmp_path / "unused-hermes",
+        )
+
+        import gateway.platforms.base as base
+
+        assert base._paths_equal_casefold(denied_root, home_alias) is True
+        assert base._paths_refer_to_same_home(
+            denied_root.resolve(), home_alias.resolve(),
+        ) is False
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_running_home_exception_allows_exact_home_identity(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the denied prefix IS the running home, non-credential files deliver."""
+        self._patch_roots(monkeypatch)
+
+        home = tmp_path / "rootish"
+        home.mkdir()
+        notes = home / "notes.md"
+        notes.write_text("# ok\n")
+
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
+            (str(home),),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._MEDIA_DELIVERY_DENIED_HOME_SUBPATHS",
+            (),
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            tmp_path / "unused-hermes",
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            tmp_path / "unused-hermes",
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(notes)) == str(
+            notes.resolve()
+        )
 
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
         """Integration credentials at the HERMES_HOME root (google_token.json)

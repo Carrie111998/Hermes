@@ -1190,9 +1190,11 @@ _MEDIA_DELIVERY_TRUST_RECENT_DEFAULT_SECONDS = 600
 # Hard denylist applied even when a path would otherwise pass recency trust.
 # These prefixes hold credentials, system state, or process introspection that
 # should never be uploaded as a gateway attachment, regardless of how new the
-# file looks. The cache-dir allowlist still beats this — an operator-configured
-# allowed root can intentionally live under one of these prefixes (rare, but
-# their choice).
+# file looks. The cache-dir allowlist still beats system-prefix denial for
+# ordinary artifacts — an operator-configured allowed root can intentionally
+# live under one of these prefixes (rare, but their choice). Credential-shaped
+# sibling-profile paths are checked before that allowlist so a ``.env``
+# symlink into ``cache/images`` cannot redeem via safe-root acceptance.
 _MEDIA_DELIVERY_DENIED_PREFIXES = (
     "/etc",
     "/proc",
@@ -1232,6 +1234,203 @@ _MEDIA_DELIVERY_CACHE_SUBDIRS = (
     "screenshots",
 )
 
+# Per-file credential / secret stores that live at a Hermes home root.
+# Mirrored from agent/file_safety.py (get_read_block_error / build_write_denied_*)
+# so delivery (read/exfil) can't trail the write side. Enumerated per-file
+# rather than denying the whole tree, so skills/, logs/, and ad-hoc agent
+# files under a Hermes home stay deliverable (see #32090, #34425).
+_MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES = (
+    ".env",
+    "auth.json",
+    "auth.lock",
+    "credentials",
+    "config.yaml",
+    # Anthropic PKCE / OAuth refresh credential store.
+    ".anthropic_oauth.json",
+    # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
+    # every turn, which defeated the strict-mode recency window) plus the
+    # pending-exchange session/verifier file.
+    "google_token.json",
+    "google_oauth_pending.json",
+    os.path.join("auth", "google_oauth.json"),
+    # Webhook subscription HMAC secrets.
+    "webhook_subscriptions.json",
+    # Bitwarden Secrets Manager plaintext and encrypted disk caches.
+    os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "bws_cache.enc.json"),
+)
+
+# Directory trees whose every child is credential material.
+#
+# mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
+# dynamically-registered client credentials (<server>.client.json); see
+# tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
+# The write side already denies it (file_tools _check_sensitive_path);
+# this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
+# tag can't deliver a live bearer token as a native attachment.
+# (session/kanban SQLite stores are handled by #41071 — kept out here.)
+_MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS = (
+    "pairing",
+    "mcp-tokens",
+)
+
+
+def _iter_hermes_profile_dirs() -> List[Path]:
+    """Return ``<root>/profiles/<name>/`` directories that currently exist.
+
+    Used by cache allowlisting and by media-delivery credential denial for
+    discovered profile homes (including directory-symlink targets). Missing
+    or unreadable ``profiles/`` yields an empty list — ordinary sibling
+    credential denial must NOT depend solely on this helper (see
+    ``_path_is_profile_tree_credential``).
+    """
+    profiles_dir = _HERMES_ROOT / "profiles"
+    try:
+        return [p for p in profiles_dir.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
+def _path_parts_casefold(path: Path) -> Tuple[str, ...]:
+    """Return path parts casefolded for case-insensitive deny matching."""
+    return tuple(part.casefold() for part in Path(path).parts)
+
+
+def _parts_is_within_casefold(
+    path_parts: Tuple[str, ...],
+    root_parts: Tuple[str, ...],
+) -> bool:
+    """Return True if ``path_parts`` is ``root_parts`` or a descendant."""
+    if not root_parts:
+        return False
+    return (
+        len(path_parts) >= len(root_parts)
+        and path_parts[: len(root_parts)] == root_parts
+    )
+
+
+def _paths_equal_casefold(left: Path, right: Path) -> bool:
+    """Return True if both paths match under casefold semantics."""
+    return _path_parts_casefold(left) == _path_parts_casefold(right)
+
+
+def _paths_refer_to_same_home(left: Path, right: Path) -> bool:
+    """Return True when both paths identify the same filesystem home.
+
+    The running-home denylist exception must preserve filesystem identity.
+    Exact resolved equality is always enough. Casefold equality alone is
+    not: on a case-sensitive volume, ``/Etc`` and ``/etc`` are distinct
+    directories, and treating them as the same home would incorrectly exempt
+    a hard-denied system tree. When spellings differ only by case, require
+    ``Path.samefile`` so case-insensitive volumes still recognize aliases.
+    """
+    if left == right:
+        return True
+    if not _paths_equal_casefold(left, right):
+        return False
+    try:
+        return left.samefile(right)
+    except OSError:
+        # Cannot prove identity — do not exempt the deny entry.
+        return False
+
+
+def _path_is_within_casefold(path: Path, root: Path) -> bool:
+    """Containment check that treats path components case-insensitively.
+
+    Used only on the media-delivery denylist side. Case-insensitive volumes
+    (default macOS / Windows) preserve mixed-case spellings through
+    ``Path.resolve()`` for non-symlink components, so case-sensitive
+    ``relative_to`` would miss real credential files opened via alias
+    casing. Fail closed: deny when the casefolded ancestry matches.
+    """
+    return _parts_is_within_casefold(
+        _path_parts_casefold(path),
+        _path_parts_casefold(root),
+    )
+
+
+def _relative_parts_casefold(path: Path, root: Path) -> Optional[Tuple[str, ...]]:
+    """Return casefolded parts of ``path`` relative to ``root``, or None."""
+    path_parts = _path_parts_casefold(path)
+    root_parts = _path_parts_casefold(root)
+    if not _parts_is_within_casefold(path_parts, root_parts):
+        return None
+    return path_parts[len(root_parts) :]
+
+
+def _rel_matches_hermes_root_credential(rel: Path) -> bool:
+    """Return True if ``rel`` (relative to a Hermes home) is a credential path."""
+    if not rel.parts:
+        return False
+    rel_parts = _path_parts_casefold(rel)
+    for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES:
+        denied_parts = _path_parts_casefold(Path(denied_rel))
+        if rel_parts == denied_parts or _parts_is_within_casefold(rel_parts, denied_parts):
+            return True
+    for denied_rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS:
+        denied_parts = _path_parts_casefold(Path(denied_rel))
+        if rel_parts == denied_parts or _parts_is_within_casefold(rel_parts, denied_parts):
+            return True
+    return False
+
+
+def _path_is_profile_tree_credential(resolved: Path) -> bool:
+    """Deny credentials under ``<root>/profiles/<name>/`` without listing profiles.
+
+    ``profiles/`` enumeration can fail while a known child path remains
+    openable (POSIX execute-only directory). Structural matching keeps the
+    credential policy intact under that error condition — denial must not
+    depend on ``_iter_hermes_profile_dirs()``.
+
+    Comparisons are casefolded so mixed-case aliases on case-insensitive
+    filesystems (``PROFILES/bob/.ENV``) cannot miss the deny check while
+    still opening the real credential file.
+    """
+    profiles_root = _HERMES_ROOT / "profiles"
+    try:
+        profiles_root = profiles_root.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        # Fail closed: still match against the unresolved profiles path
+        # rather than skipping sibling credential denial entirely.
+        profiles_root = _HERMES_ROOT / "profiles"
+    rel_parts = _relative_parts_casefold(resolved, profiles_root)
+    if rel_parts is None:
+        return False
+    # Need at least <profile_name>/<credential...> — a bare profiles/<name>
+    # path is not a deliverable file anyway (validate requires is_file).
+    if len(rel_parts) < 2:
+        return False
+    return _rel_matches_hermes_root_credential(Path(*rel_parts[1:]))
+
+
+def _path_is_lexical_profile_tree_credential(absolute: Path) -> bool:
+    """Deny profile credentials using lexical ancestry (no symlink resolve).
+
+    ``validate_media_delivery_path`` canonicalizes candidates before the
+    denylist runs. A ``profiles/<name>`` directory symlink therefore loses
+    its profile-tree prefix on the resolved path, and when
+    ``_iter_hermes_profile_dirs`` also returns empty the discovered-home
+    denylist cannot recover the target. Matching the normalized absolute
+    input against ``<root>/profiles/<name>/<credential...>`` closes that
+    conjunction without depending on directory enumeration.
+
+    Path components are compared casefolded so case-insensitive volumes
+    cannot bypass denial via mixed-case spelling of ``profiles/`` or
+    credential basenames.
+    """
+    try:
+        profiles_root = Path(os.path.normpath(str(_HERMES_ROOT.expanduser() / "profiles")))
+        candidate = Path(os.path.normpath(str(absolute)))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    rel_parts = _relative_parts_casefold(candidate, profiles_root)
+    if rel_parts is None:
+        return False
+    if len(rel_parts) < 2:
+        return False
+    return _rel_matches_hermes_root_credential(Path(*rel_parts[1:]))
+
 
 def _profile_cache_roots() -> List[Path]:
     """Return per-profile canonical cache roots under the shared Hermes root.
@@ -1247,12 +1446,7 @@ def _profile_cache_roots() -> List[Path]:
     denied prefix and $HOME is not that prefix). See issue #31733.
     """
     roots: List[Path] = []
-    profiles_dir = _HERMES_ROOT / "profiles"
-    try:
-        profile_dirs = [p for p in profiles_dir.iterdir() if p.is_dir()]
-    except OSError:
-        return roots
-    for profile_dir in profile_dirs:
+    for profile_dir in _iter_hermes_profile_dirs():
         for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS:
             roots.append(profile_dir / "cache" / subdir)
     return roots
@@ -1336,61 +1530,48 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
-    # The active Hermes profile and shared Hermes root both contain control
-    # files and credentials. Only cache subdirectories under them are
-    # explicitly allowlisted above (matched BEFORE this denylist in
+    # The active Hermes home and the shared Hermes root contain control files
+    # and credentials. Only cache subdirectories under them are explicitly
+    # allowlisted above (matched BEFORE this denylist in
     # validate_media_delivery_path, so generated media still delivers).
     #
-    # These are the per-file credential / secret stores that live at the
-    # HERMES_HOME root. The set mirrors the canonical read guard in
-    # agent/file_safety.py (get_read_block_error / build_write_denied_*) so the
-    # delivery (read/exfil) side can't trail the write side: a credential the
-    # agent is forbidden to write or read must also never be auto-attached to a
-    # chat reply. Enumerated explicitly per-file rather than denying the whole
-    # tree, so skills/, logs/, and ad-hoc agent-written files under ~/.hermes
-    # stay deliverable (see #32090, #34425).
-    _ROOT_CREDENTIAL_FILES = (
-        ".env",
-        "auth.json",
-        "auth.lock",
-        "credentials",
-        "config.yaml",
-        # Anthropic PKCE / OAuth refresh credential store.
-        ".anthropic_oauth.json",
-        # Google Workspace skill: auto-refreshing OAuth token (mtime bumps
-        # every turn, which defeated the strict-mode recency window) plus the
-        # pending-exchange session/verifier file.
-        "google_token.json",
-        "google_oauth_pending.json",
-        os.path.join("auth", "google_oauth.json"),
-        # Webhook subscription HMAC secrets.
-        "webhook_subscriptions.json",
-        # Bitwarden Secrets Manager plaintext and encrypted disk caches.
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
-    )
-    # Directory trees whose every child is credential material.
-    #
-    # mcp-tokens/ holds live MCP OAuth access tokens (<server>.json) and
-    # dynamically-registered client credentials (<server>.client.json); see
-    # tools/mcp_oauth.py. Same credential class as auth.json/credentials/.
-    # The write side already denies it (file_tools _check_sensitive_path);
-    # this pairs the media-delivery (exfil) side so a prompt-injection MEDIA
-    # tag can't deliver a live bearer token as a native attachment.
-    # (session/kanban SQLite stores are handled by #41071 — kept out here.)
-    _ROOT_CREDENTIAL_DIRS = (
-        "pairing",
-        "mcp-tokens",
-    )
-    for hermes_root in (_HERMES_HOME, _HERMES_ROOT):
-        for rel in _ROOT_CREDENTIAL_FILES:
+    # Sibling/inactive profiles under <root>/profiles/<name>/ use the same
+    # credential file/dir policy. Denial is layered:
+    #   1. Lexical match in ``_path_is_lexical_profile_tree_credential`` —
+    #      preserves ``profiles/<name>/`` ancestry from the submitted path
+    #      even when resolve() collapses a directory symlink and listing fails.
+    #   2. Structural match in ``_path_is_profile_tree_credential`` — works
+    #      without listing ``profiles/`` (POSIX execute-only dirs) for
+    #      ordinary (non-symlink) sibling paths after resolve.
+    #   3. Discovered profile homes below — covers directory-symlink siblings
+    #      (``profiles/bob -> /elsewhere``) whose resolved targets sit outside
+    #      the structural profiles root when enumeration succeeds.
+    hermes_dirs: List[Path] = []
+    for base in (_HERMES_HOME, _HERMES_ROOT):
+        try:
+            real = base.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            # Fail closed: still deny under the unresolved path rather than
+            # skipping the home entirely.
+            real = base
+        if real not in hermes_dirs:
+            hermes_dirs.append(real)
+    for profile_dir in _iter_hermes_profile_dirs():
+        try:
+            real = profile_dir.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            real = profile_dir
+        if real not in hermes_dirs:
+            hermes_dirs.append(real)
+    for hermes_root in hermes_dirs:
+        for rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_FILES:
             denied.append(hermes_root / rel)
-        for rel in _ROOT_CREDENTIAL_DIRS:
+        for rel in _MEDIA_DELIVERY_ROOT_CREDENTIAL_DIRS:
             denied.append(hermes_root / rel)
     return denied
 
 
-def _path_under_denied_prefix(resolved: Path) -> bool:
+def _path_under_denied_prefix(resolved: Path, lexical: Optional[Path] = None) -> bool:
     """Return True if ``resolved`` lives under a deny-listed system path.
 
     One narrow exception: when a denied prefix IS the running user's own home,
@@ -1403,7 +1584,20 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     denied paths, so they stay blocked regardless of this exception — it can
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
+
+    ``lexical`` is the normalized absolute input before symlink resolution.
+    When present, sibling-profile credential policy is also applied to that
+    ancestry so a ``profiles/<name>`` directory symlink cannot drop the
+    profile-tree prefix before denial runs.
     """
+    # Lexical sibling-profile credential check — independent of resolve()
+    # and of whether ``profiles/`` can be listed.
+    if lexical is not None and _path_is_lexical_profile_tree_credential(lexical):
+        return True
+    # Structural sibling-profile credential check on the resolved path —
+    # independent of whether ``profiles/`` can be listed.
+    if _path_is_profile_tree_credential(resolved):
+        return True
     try:
         home = Path(os.path.expanduser("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
@@ -1413,11 +1607,19 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
             resolved_denied = denied.expanduser().resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             continue
-        if not (_path_is_within(resolved, resolved_denied) or resolved == resolved_denied):
+        # Casefold deny matching: on case-insensitive volumes, resolve() may
+        # preserve mixed-case input spelling while discovered denied paths use
+        # the on-disk casing from iterdir()/Path construction.
+        if not (
+            _path_is_within_casefold(resolved, resolved_denied)
+            or _paths_equal_casefold(resolved, resolved_denied)
+        ):
             continue
         # Allow the running user's own home tree; its credential sub-dirs are
         # caught by their own (more-specific) denylist entries above.
-        if home is not None and resolved_denied == home:
+        # Identity-preserving: never exempt a distinct hard-denied root that
+        # only casefolds to the configured home (case-sensitive volumes).
+        if home is not None and _paths_refer_to_same_home(resolved_denied, home):
             continue
         return True
     return False
@@ -1486,6 +1688,11 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not expanded.is_absolute():
         return None
 
+    # Keep a symlink-preserving lexical form for sibling-profile credential
+    # policy. resolve() below collapses directory-symlink profile homes and
+    # would otherwise erase ``profiles/<name>/`` ancestry before denial.
+    lexical = Path(os.path.normpath(str(expanded)))
+
     try:
         resolved = expanded.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
@@ -1494,8 +1701,19 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     if not resolved.is_file():
         return None
 
-    # Cache / operator allowlist is always honored — these are unconditionally
-    # trusted regardless of mode.
+    # Credential-shaped sibling-profile paths must be denied before safe-root
+    # acceptance. Otherwise ``profiles/<name>/.env`` (or another credential
+    # relative path) that symlinks into ``cache/images`` resolves into an
+    # unconditional allowlisted root and returns before lexical/structural
+    # credential denial can run. Direct cache artifacts remain deliverable.
+    if (
+        _path_is_lexical_profile_tree_credential(lexical)
+        or _path_is_profile_tree_credential(resolved)
+    ):
+        return None
+
+    # Cache / operator allowlist is always honored for paths that are not
+    # credential-shaped — these remain trusted regardless of mode.
     for root in _media_delivery_allowed_roots():
         try:
             resolved_root = root.expanduser().resolve(strict=False)
@@ -1512,7 +1730,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
     # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
     if not _media_delivery_strict_mode():
-        if _path_under_denied_prefix(resolved):
+        if _path_under_denied_prefix(resolved, lexical=lexical):
             return None
         return str(resolved)
 
@@ -1522,7 +1740,7 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
     # credential locations remain blocked even when "recent" — see
     # ``_MEDIA_DELIVERY_DENIED_PREFIXES`` for the denylist.
     window = _media_delivery_recency_seconds()
-    if window > 0 and not _path_under_denied_prefix(resolved):
+    if window > 0 and not _path_under_denied_prefix(resolved, lexical=lexical):
         if _file_is_recently_produced(resolved, window):
             return str(resolved)
 
