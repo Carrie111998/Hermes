@@ -61,6 +61,15 @@ def fixture_env(hermes_root, allowlist_file, tmp_path):
     return roadmap
 
 
+@pytest.fixture
+def dry_run_policy_env(hermes_root, allowlist_file, tmp_path):
+    # Identical to fixture_env but WITHOUT a policy.json override, so arch-review
+    # inherits the shipped default mode="dry_run" — the stock-machine posture.
+    roadmap = tmp_path / "roadmap.md"
+    roadmap.write_text(FIXTURE_ROADMAP, encoding="utf-8")
+    return roadmap
+
+
 def test_default_mode_still_dry_run(intake, fixture_env, hermes_root, capsys):
     rc = intake.main(["--roadmap", str(fixture_env),
                       "--mailbox", str(hermes_root / "mailbox" / "devflow"),
@@ -89,11 +98,46 @@ def test_emit_writes_v3_through_shared_emitter(intake, fixture_env, hermes_root,
     assert em.ledger.find_by_idempotency_key("roadmap:sr-901:v1") is not None
 
 
-def test_emit_twice_dedups(intake, fixture_env, hermes_root, capsys):
+def test_emit_under_dry_run_policy_reports_shadow_not_emitted(
+        intake, dry_run_policy_env, hermes_root, capsys):
+    """Under the shipped dry_run default, --emit classifies but writes NOTHING.
+    The script must not report those as EMITTED requests (that would make the
+    sentinel-gated cron on a stock machine lie about queueing work)."""
+    rc = intake.main(["--roadmap", str(dry_run_policy_env),
+                      "--mailbox", str(hermes_root / "mailbox" / "devflow"),
+                      "--emit", "--no-canvas"])
+    assert rc == 0
+    inbox = hermes_root / "mailbox" / "devflow" / "inbox"
+    assert not inbox.exists() or not list(inbox.glob("*.json")), \
+        "dry_run policy mode must not write an envelope"
+    out = capsys.readouterr().out
+    assert "EMITTED 1" not in out, \
+        "a dry_run shadow-classification must never be reported as EMITTED"
+    assert "SHADOW-CLASSIFIED 1" in out, \
+        "the shadow-classified count must be surfaced so the no-op is visible"
+
+
+def test_emit_twice_dedups_via_ledger(intake, fixture_env, hermes_root, capsys):
+    """Positive control for the emitter's durable dedup: delete the queued
+    envelope between runs so the script's inbox pre-filter CANNOT be what
+    dedups run #2 — only the shared emitter's ledger can. Under the
+    pre-migration v2 code the ledger stays empty (total == 0), so this fails
+    on revert."""
     argv = ["--roadmap", str(fixture_env),
             "--mailbox", str(hermes_root / "mailbox" / "devflow"),
             "--emit", "--no-canvas"]
     intake.main(argv)
-    intake.main(argv)
     inbox = hermes_root / "mailbox" / "devflow" / "inbox"
-    assert len(list(inbox.glob("*.json"))) == 1
+    first = list(inbox.glob("*.json"))
+    assert len(first) == 1
+    first[0].unlink()  # inbox pre-filter can no longer see run #1
+
+    intake.main(argv)
+
+    from devflow_delegation.emitter import DelegationEmitter
+
+    em = DelegationEmitter()
+    assert em.ledger.summary_counts()["total"] == 1, \
+        "second emit must dedup through the ledger, not create a second row"
+    assert list(inbox.glob("*.json")) == [], \
+        "dedup short-circuits before write, so the envelope is not recreated"
