@@ -18,6 +18,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _find_skill,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -68,6 +69,57 @@ description: Use when deploying multi-region Kubernetes clusters with custom CNI
 
 Step 1.
 """
+
+
+# ---------------------------------------------------------------------------
+# _find_skill
+# ---------------------------------------------------------------------------
+
+
+class TestFindSkill:
+    def _make_skill(self, path: Path) -> Path:
+        path.mkdir(parents=True)
+        (path / "SKILL.md").write_text(VALID_SKILL_CONTENT)
+        return path
+
+    def test_find_skill_behind_flat_symlink(self, tmp_path):
+        """A skill whose directory is a symlink (farm-style, e.g.
+        ~/.hermes/skills/<name> -> ~/.agents/skills/<cat>/<name>) must be
+        found. rglob() skips symlinked dirs; the walker must follow them."""
+        real = self._make_skill(tmp_path / "real-dir" / "demo-skill")
+        (tmp_path / "demo-skill").symlink_to(real, target_is_directory=True)
+
+        with _skill_dir(tmp_path):
+            found = _find_skill("demo-skill")
+        assert found is not None
+        assert found["path"] == tmp_path / "demo-skill"
+
+    def test_find_skill_behind_shell_symlink(self, tmp_path):
+        """A skill inside a real category shell whose entry is a symlink
+        (~/.hermes/skills/<cat>/<name> -> ~/.agents/skills/<cat>/<name>)
+        must be found."""
+        real = self._make_skill(tmp_path / "real-dir" / "cat" / "demo-skill")
+        shell = tmp_path / "cat"
+        shell.mkdir()
+        (shell / "demo-skill").symlink_to(real, target_is_directory=True)
+
+        with _skill_dir(tmp_path):
+            found = _find_skill("demo-skill")
+        assert found is not None
+        assert found["path"] == tmp_path / "cat" / "demo-skill"
+
+    def test_find_skill_plain_dir_still_found(self, tmp_path):
+        """Regression guard: non-symlinked skills keep resolving."""
+        real = self._make_skill(tmp_path / "plain-skill")
+
+        with _skill_dir(tmp_path):
+            found = _find_skill("plain-skill")
+        assert found is not None
+        assert found["path"] == tmp_path / "plain-skill"
+
+    def test_find_skill_missing_returns_none(self, tmp_path):
+        with _skill_dir(tmp_path):
+            assert _find_skill("no-such-skill") is None
 
 
 # ---------------------------------------------------------------------------
