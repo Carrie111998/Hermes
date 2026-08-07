@@ -1367,7 +1367,9 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# v3: entries gained folder_slug/declared_name identity aliases; older
+# snapshots (including matching v2 manifests) are discarded and rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1496,10 +1498,17 @@ def _build_snapshot_entry(
     if isinstance(platforms, str):
         platforms = [platforms]
 
+    # ``skill_name`` historically held the folder slug; keep it for backward
+    # compatibility with existing snapshot consumers. Expose unambiguous
+    # aliases so diagnostics can distinguish folder slug from declared name
+    # (e.g. folder ``audiocraft`` declaring ``audiocraft-audio-generation``).
+    declared_name = str(frontmatter.get("name", skill_name) or skill_name)
     entry = {
         "skill_name": skill_name,
+        "folder_slug": skill_name,
+        "declared_name": declared_name,
+        "frontmatter_name": declared_name,
         "category": category,
-        "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),

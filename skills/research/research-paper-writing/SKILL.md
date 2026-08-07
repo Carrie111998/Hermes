@@ -2,7 +2,7 @@
 name: research-paper-writing
 title: Research Paper Writing Pipeline
 description: "Write ML papers for NeurIPS/ICML/ICLR: design→submit."
-version: 1.1.0
+version: 1.2.0
 author: Orchestra Research
 license: MIT
 dependencies: [semanticscholar, arxiv, habanero, requests, scipy, numpy, matplotlib, SciencePlots]
@@ -46,7 +46,7 @@ This is **not a linear pipeline** — it is an iterative loop. Results trigger n
 
 ---
 
-## When To Use This Skill
+## When to Use
 
 Use this skill when:
 - **Starting a new research paper** from an existing codebase or idea
@@ -58,6 +58,35 @@ Use this skill when:
 - **Writing non-empirical papers** — theory, survey, benchmark, or position papers (see [Paper Types Beyond Empirical ML](#paper-types-beyond-empirical-ml))
 - **Designing human evaluations** for NLP, HCI, or alignment research
 - **Preparing post-acceptance deliverables** — posters, talks, code releases
+
+## Prerequisites
+
+- Python packages from frontmatter `dependencies` (semanticscholar, arxiv, habanero, scipy, numpy, matplotlib, SciencePlots).
+- A TeX distribution with `latexmk` for PDF builds.
+- Hermes toolsets: `terminal`, file tools (`read_file`/`write_file`/`patch`), and preferably `web` for literature lookup.
+- Optional related skills: `arxiv`, `plan`, `subagent-driven-development`.
+
+## How to Run
+
+1. Load this skill with `skill_view("research-paper-writing")`.
+2. Follow Phases 0–8 in order, looping back when results or reviews demand it.
+3. Load progressive references with `skill_view("research-paper-writing", file_path="references/<file>.md")` only when that phase needs them.
+
+## Quick Reference
+
+| Need | Where |
+|------|-------|
+| Citations / BibTeX | `references/citation-workflow.md` + `arxiv` skill |
+| Experiment design / stats | `references/experiment-patterns.md` |
+| Writing / figures | `references/writing-guide.md` |
+| LaTeX templates | `references/latex-and-templates.md` + `templates/` |
+| Venue checklists | `references/checklists.md` |
+| Non-empirical paper types | `references/paper-types.md` |
+| Hermes tool patterns | `references/hermes-integration.md` |
+
+## Procedure
+
+Execute the phase pipeline below (Setup → Literature → Design → Execution → Analysis → Drafting → Review → Submission → Post-acceptance). Treat it as an iterative loop, not a one-pass checklist.
 
 ## Core Philosophy
 
@@ -1151,386 +1180,9 @@ Model Card (Appendix):
 
 ### Using LaTeX Templates
 
-**Always copy the entire template directory first, then write within it.**
+Copy the full venue template directory from `templates/` before editing. Verify it compiles unchanged, then replace example content section by section.
 
-```
-Template Setup Checklist:
-- [ ] Step 1: Copy entire template directory to new project
-- [ ] Step 2: Verify template compiles as-is (before any changes)
-- [ ] Step 3: Read the template's example content to understand structure
-- [ ] Step 4: Replace example content section by section
-- [ ] Step 5: Use template macros (check preamble for \newcommand definitions)
-- [ ] Step 6: Clean up template artifacts only at the end
-```
-
-**Step 1: Copy the Full Template**
-
-```bash
-cp -r templates/neurips2025/ ~/papers/my-paper/
-cd ~/papers/my-paper/
-ls -la  # Should see: main.tex, neurips.sty, Makefile, etc.
-```
-
-Copy the ENTIRE directory, not just the .tex file. Templates include style files (.sty), bibliography styles (.bst), example content, and Makefiles.
-
-**Step 2: Verify Template Compiles First**
-
-Before making ANY changes:
-```bash
-latexmk -pdf main.tex
-# Or manual: pdflatex main.tex && bibtex main && pdflatex main.tex && pdflatex main.tex
-```
-
-If the unmodified template doesn't compile, fix that first (usually missing TeX packages — install via `tlmgr install <package>`).
-
-**Step 3: Keep Template Content as Reference**
-
-Don't immediately delete example content. Comment it out and use as formatting reference:
-```latex
-% Template example (keep for reference):
-% \begin{figure}[t]
-%   \centering
-%   \includegraphics[width=0.8\linewidth]{example-image}
-%   \caption{Template shows caption style}
-% \end{figure}
-
-% Your actual figure:
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=0.8\linewidth]{your-figure.pdf}
-  \caption{Your caption following the same style.}
-\end{figure}
-```
-
-**Step 4: Replace Content Section by Section**
-
-Work through systematically: title/authors → abstract → introduction → methods → experiments → related work → conclusion → references → appendix. Compile after each section.
-
-**Step 5: Use Template Macros**
-
-```latex
-\newcommand{\method}{YourMethodName}  % Consistent method naming
-\newcommand{\eg}{e.g.,\xspace}        % Proper abbreviations
-\newcommand{\ie}{i.e.,\xspace}
-```
-
-### Template Pitfalls
-
-| Pitfall | Problem | Solution |
-|---------|---------|----------|
-| Copying only `.tex` file | Missing `.sty`, won't compile | Copy entire directory |
-| Modifying `.sty` files | Breaks conference formatting | Never edit style files |
-| Adding random packages | Conflicts, breaks template | Only add if necessary |
-| Deleting template content early | Lose formatting reference | Keep as comments until done |
-| Not compiling frequently | Errors accumulate | Compile after each section |
-| Raster PNGs for figures | Blurry in paper | Always use vector PDF via `savefig('fig.pdf')` |
-
-### Quick Template Reference
-
-| Conference | Main File | Style File | Page Limit |
-|------------|-----------|------------|------------|
-| NeurIPS 2025 | `main.tex` | `neurips.sty` | 9 pages |
-| ICML 2026 | `example_paper.tex` | `icml2026.sty` | 8 pages |
-| ICLR 2026 | `iclr2026_conference.tex` | `iclr2026_conference.sty` | 9 pages |
-| ACL 2025 | `acl_latex.tex` | `acl.sty` | 8 pages (long) |
-| AAAI 2026 | `aaai2026-unified-template.tex` | `aaai2026.sty` | 7 pages |
-| COLM 2025 | `colm2025_conference.tex` | `colm2025_conference.sty` | 9 pages |
-
-**Universal**: Double-blind, references don't count, appendices unlimited, LaTeX required.
-
-Templates in `templates/` directory. See [templates/README.md](templates/README.md) for compilation setup (VS Code, CLI, Overleaf, other IDEs).
-
-### Tables and Figures
-
-**Tables** — use `booktabs` for professional formatting:
-
-```latex
-\usepackage{booktabs}
-\begin{tabular}{lcc}
-\toprule
-Method & Accuracy $\uparrow$ & Latency $\downarrow$ \\
-\midrule
-Baseline & 85.2 & 45ms \\
-\textbf{Ours} & \textbf{92.1} & 38ms \\
-\bottomrule
-\end{tabular}
-```
-
-Rules:
-- Bold best value per metric
-- Include direction symbols ($\uparrow$ higher better, $\downarrow$ lower better)
-- Right-align numerical columns
-- Consistent decimal precision
-
-**Figures**:
-- **Vector graphics** (PDF, EPS) for all plots and diagrams — `plt.savefig('fig.pdf')`
-- **Raster** (PNG 600 DPI) only for photographs
-- **Colorblind-safe palettes** (Okabe-Ito or Paul Tol)
-- Verify **grayscale readability** (8% of men have color vision deficiency)
-- **No title inside figure** — the caption serves this function
-- **Self-contained captions** — reader should understand without main text
-
-### Conference Resubmission
-
-For converting between venues, see Phase 7 (Submission Preparation) — it covers the full conversion workflow, page-change table, and post-rejection guidance.
-
-### Professional LaTeX Preamble
-
-Add these packages to any paper for professional quality. They are compatible with all major conference style files:
-
-```latex
-% --- Professional Packages (add after conference style file) ---
-
-% Typography
-\usepackage{microtype}              % Microtypographic improvements (protrusion, expansion)
-                                     % Makes text noticeably more polished — always include
-
-% Tables
-\usepackage{booktabs}               % Professional table rules (\toprule, \midrule, \bottomrule)
-\usepackage{siunitx}                % Consistent number formatting, decimal alignment
-                                     % Usage: \num{12345} → 12,345; \SI{3.5}{GHz} → 3.5 GHz
-                                     % Table alignment: S column type for decimal-aligned numbers
-
-% Figures
-\usepackage{graphicx}               % Include graphics (\includegraphics)
-\usepackage{subcaption}             % Subfigures with (a), (b), (c) labels
-                                     % Usage: \begin{subfigure}{0.48\textwidth} ... \end{subfigure}
-
-% Diagrams and Algorithms
-\usepackage{tikz}                   % Programmable vector diagrams
-\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc, fit, backgrounds}
-\usepackage[ruled,vlined]{algorithm2e}  % Professional pseudocode
-                                     % Alternative: \usepackage{algorithmicx} if template bundles it
-
-% Cross-references
-\usepackage{cleveref}               % Smart references: \cref{fig:x} → "Figure 1"
-                                     % MUST be loaded AFTER hyperref
-                                     % Handles: figures, tables, sections, equations, algorithms
-
-% Math (usually included by conference .sty, but verify)
-\usepackage{amsmath,amssymb}        % AMS math environments and symbols
-\usepackage{mathtools}              % Extends amsmath (dcases, coloneqq, etc.)
-
-% Colors (for figures and diagrams)
-\usepackage{xcolor}                 % Color management
-% Okabe-Ito colorblind-safe palette:
-\definecolor{okblue}{HTML}{0072B2}
-\definecolor{okorange}{HTML}{E69F00}
-\definecolor{okgreen}{HTML}{009E73}
-\definecolor{okred}{HTML}{D55E00}
-\definecolor{okpurple}{HTML}{CC79A7}
-\definecolor{okcyan}{HTML}{56B4E9}
-\definecolor{okyellow}{HTML}{F0E442}
-```
-
-**Notes:**
-- `microtype` is the single highest-impact package for visual quality. It adjusts character spacing at a sub-pixel level. Always include it.
-- `siunitx` handles decimal alignment in tables via the `S` column type — eliminates manual spacing.
-- `cleveref` must be loaded **after** `hyperref`. Most conference .sty files load hyperref, so put cleveref last.
-- Check if the conference template already loads any of these (especially `algorithm`, `amsmath`, `graphicx`). Don't double-load.
-
-### siunitx Table Alignment
-
-`siunitx` makes number-heavy tables significantly more readable:
-
-```latex
-\begin{tabular}{l S[table-format=2.1] S[table-format=2.1] S[table-format=2.1]}
-\toprule
-Method & {Accuracy $\uparrow$} & {F1 $\uparrow$} & {Latency (ms) $\downarrow$} \\
-\midrule
-Baseline         & 85.2  & 83.7  & 45.3 \\
-Ablation (no X)  & 87.1  & 85.4  & 42.1 \\
-\textbf{Ours}    & \textbf{92.1} & \textbf{90.8} & \textbf{38.7} \\
-\bottomrule
-\end{tabular}
-```
-
-The `S` column type auto-aligns on the decimal point. Headers in `{}` escape the alignment.
-
-### Subfigures
-
-Standard pattern for side-by-side figures:
-
-```latex
-\begin{figure}[t]
-  \centering
-  \begin{subfigure}[b]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\textwidth]{fig_results_a.pdf}
-    \caption{Results on Dataset A.}
-    \label{fig:results-a}
-  \end{subfigure}
-  \hfill
-  \begin{subfigure}[b]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\textwidth]{fig_results_b.pdf}
-    \caption{Results on Dataset B.}
-    \label{fig:results-b}
-  \end{subfigure}
-  \caption{Comparison of our method across two datasets. (a) shows the scaling
-  behavior and (b) shows the ablation results. Both use 5 random seeds.}
-  \label{fig:results}
-\end{figure}
-```
-
-Use `\cref{fig:results}` → "Figure 1", `\cref{fig:results-a}` → "Figure 1a".
-
-### Pseudocode with algorithm2e
-
-```latex
-\begin{algorithm}[t]
-\caption{Iterative Refinement with Judge Panel}
-\label{alg:method}
-\KwIn{Task $T$, model $M$, judges $J_1 \ldots J_n$, convergence threshold $k$}
-\KwOut{Final output $A^*$}
-$A \gets M(T)$ \tcp*{Initial generation}
-$\text{streak} \gets 0$\;
-\While{$\text{streak} < k$}{
-  $C \gets \text{Critic}(A, T)$ \tcp*{Identify weaknesses}
-  $B \gets M(T, C)$ \tcp*{Revised version addressing critique}
-  $AB \gets \text{Synthesize}(A, B)$ \tcp*{Merge best elements}
-  \ForEach{judge $J_i$}{
-    $\text{rank}_i \gets J_i(\text{shuffle}(A, B, AB))$ \tcp*{Blind ranking}
-  }
-  $\text{winner} \gets \text{BordaCount}(\text{ranks})$\;
-  \eIf{$\text{winner} = A$}{
-    $\text{streak} \gets \text{streak} + 1$\;
-  }{
-    $A \gets \text{winner}$; $\text{streak} \gets 0$\;
-  }
-}
-\Return{$A$}\;
-\end{algorithm}
-```
-
-### TikZ Diagram Patterns
-
-TikZ is the standard for method diagrams in ML papers. Common patterns:
-
-**Pipeline/Flow Diagram** (most common in ML papers):
-
-```latex
-\begin{figure}[t]
-\centering
-\begin{tikzpicture}[
-  node distance=1.8cm,
-  box/.style={rectangle, draw, rounded corners, minimum height=1cm, 
-              minimum width=2cm, align=center, font=\small},
-  arrow/.style={-{Stealth[length=3mm]}, thick},
-]
-  \node[box, fill=okcyan!20] (input) {Input\\$x$};
-  \node[box, fill=okblue!20, right of=input] (encoder) {Encoder\\$f_\theta$};
-  \node[box, fill=okgreen!20, right of=encoder] (latent) {Latent\\$z$};
-  \node[box, fill=okorange!20, right of=latent] (decoder) {Decoder\\$g_\phi$};
-  \node[box, fill=okred!20, right of=decoder] (output) {Output\\$\hat{x}$};
-  
-  \draw[arrow] (input) -- (encoder);
-  \draw[arrow] (encoder) -- (latent);
-  \draw[arrow] (latent) -- (decoder);
-  \draw[arrow] (decoder) -- (output);
-\end{tikzpicture}
-\caption{Architecture overview. The encoder maps input $x$ to latent 
-representation $z$, which the decoder reconstructs.}
-\label{fig:architecture}
-\end{figure}
-```
-
-**Comparison/Matrix Diagram** (for showing method variants):
-
-```latex
-\begin{tikzpicture}[
-  cell/.style={rectangle, draw, minimum width=2.5cm, minimum height=1cm, 
-               align=center, font=\small},
-  header/.style={cell, fill=gray!20, font=\small\bfseries},
-]
-  % Headers
-  \node[header] at (0, 0) {Method};
-  \node[header] at (3, 0) {Converges?};
-  \node[header] at (6, 0) {Quality?};
-  % Rows
-  \node[cell] at (0, -1) {Single Pass};
-  \node[cell, fill=okgreen!15] at (3, -1) {N/A};
-  \node[cell, fill=okorange!15] at (6, -1) {Baseline};
-  \node[cell] at (0, -2) {Critique+Revise};
-  \node[cell, fill=okred!15] at (3, -2) {No};
-  \node[cell, fill=okred!15] at (6, -2) {Degrades};
-  \node[cell] at (0, -3) {Ours};
-  \node[cell, fill=okgreen!15] at (3, -3) {Yes ($k$=2)};
-  \node[cell, fill=okgreen!15] at (6, -3) {Improves};
-\end{tikzpicture}
-```
-
-**Iterative Loop Diagram** (for methods with feedback):
-
-```latex
-\begin{tikzpicture}[
-  node distance=2cm,
-  box/.style={rectangle, draw, rounded corners, minimum height=0.8cm, 
-              minimum width=1.8cm, align=center, font=\small},
-  arrow/.style={-{Stealth[length=3mm]}, thick},
-  label/.style={font=\scriptsize, midway, above},
-]
-  \node[box, fill=okblue!20] (gen) {Generator};
-  \node[box, fill=okred!20, right=2.5cm of gen] (critic) {Critic};
-  \node[box, fill=okgreen!20, below=1.5cm of $(gen)!0.5!(critic)$] (judge) {Judge Panel};
-  
-  \draw[arrow] (gen) -- node[label] {output $A$} (critic);
-  \draw[arrow] (critic) -- node[label, right] {critique $C$} (judge);
-  \draw[arrow] (judge) -| node[label, left, pos=0.3] {winner} (gen);
-\end{tikzpicture}
-```
-
-### latexdiff for Revision Tracking
-
-Essential for rebuttals — generates a marked-up PDF showing changes between versions:
-
-```bash
-# Install
-# macOS: brew install latexdiff (or comes with TeX Live)
-# Linux: sudo apt install latexdiff
-
-# Generate diff
-latexdiff paper_v1.tex paper_v2.tex > paper_diff.tex
-pdflatex paper_diff.tex
-
-# For multi-file projects (with \input{} or \include{})
-latexdiff --flatten paper_v1.tex paper_v2.tex > paper_diff.tex
-```
-
-This produces a PDF with deletions in red strikethrough and additions in blue — standard format for rebuttal supplements.
-
-### SciencePlots for matplotlib
-
-Install and use for publication-quality plots:
-
-```bash
-pip install SciencePlots
-```
-
-```python
-import matplotlib.pyplot as plt
-import scienceplots  # registers styles
-
-# Use science style (IEEE-like, clean)
-with plt.style.context(['science', 'no-latex']):
-    fig, ax = plt.subplots(figsize=(3.5, 2.5))  # Single-column width
-    ax.plot(x, y, label='Ours', color='#0072B2')
-    ax.plot(x, y2, label='Baseline', color='#D55E00', linestyle='--')
-    ax.set_xlabel('Training Steps')
-    ax.set_ylabel('Accuracy')
-    ax.legend()
-    fig.savefig('paper/fig_results.pdf', bbox_inches='tight')
-
-# Available styles: 'science', 'ieee', 'nature', 'science+ieee'
-# Add 'no-latex' if LaTeX is not installed on the machine generating plots
-```
-
-**Standard figure sizes** (two-column format):
-- Single column: `figsize=(3.5, 2.5)` — fits in one column
-- Double column: `figsize=(7.0, 3.0)` — spans both columns
-- Square: `figsize=(3.5, 3.5)` — for heatmaps, confusion matrices
-
----
+Full template setup, venue pitfalls, preamble macros, tables/figures, siunitx alignment, subfigures, algorithm2e, TikZ patterns, latexdiff, and SciencePlots sizing live in [references/latex-and-templates.md](references/latex-and-templates.md). Load with `skill_view("research-paper-writing", file_path="references/latex-and-templates.md")`.
 
 ## Phase 6: Self-Review & Revision
 
@@ -2062,57 +1714,7 @@ ACL venues have distinct submission types:
 
 The main pipeline above targets empirical ML papers. Other paper types require different structures and evidence standards. See [references/paper-types.md](references/paper-types.md) for detailed guidance on each type.
 
-### Theory Papers
-
-**Structure**: Introduction → Preliminaries (definitions, notation) → Main Results (theorems) → Proof Sketches → Discussion → Full Proofs (appendix)
-
-**Key differences from empirical papers:**
-- Contribution is a theorem, bound, or impossibility result — not experimental numbers
-- Methods section replaced by "Preliminaries" and "Main Results"
-- Proofs are the evidence, not experiments (though empirical validation of theory is welcome)
-- Proof sketches in main text, full proofs in appendix is standard practice
-- Experimental section is optional but strengthens the paper if it validates theoretical predictions
-
-**Proof writing principles:**
-- State theorems formally with all assumptions explicit
-- Provide intuition before formal proof ("The key insight is...")
-- Proof sketches should convey the main idea in 0.5-1 page
-- Use `\begin{proof}...\end{proof}` environments
-- Number assumptions and reference them in theorems: "Under Assumptions 1-3, ..."
-
-### Survey / Tutorial Papers
-
-**Structure**: Introduction → Taxonomy / Organization → Detailed Coverage → Open Problems → Conclusion
-
-**Key differences:**
-- Contribution is the organization, synthesis, and identification of open problems — not new methods
-- Must be comprehensive within scope (reviewers will check for missing references)
-- Requires a clear taxonomy or organizational framework
-- Value comes from connections between works that individual papers don't make
-- Best venues: TMLR (survey track), JMLR, Foundations and Trends in ML, ACM Computing Surveys
-
-### Benchmark Papers
-
-**Structure**: Introduction → Task Definition → Dataset Construction → Baseline Evaluation → Analysis → Intended Use & Limitations
-
-**Key differences:**
-- Contribution is the benchmark itself — it must fill a genuine evaluation gap
-- Dataset documentation is mandatory, not optional (see Datasheets, Step 5.11)
-- Must demonstrate the benchmark is challenging (baselines don't saturate it)
-- Must demonstrate the benchmark measures what you claim it measures (construct validity)
-- Best venues: NeurIPS Datasets & Benchmarks track, ACL (resource papers), LREC-COLING
-
-### Position Papers
-
-**Structure**: Introduction → Background → Thesis / Argument → Supporting Evidence → Counterarguments → Implications
-
-**Key differences:**
-- Contribution is an argument, not a result
-- Must engage seriously with counterarguments
-- Evidence can be empirical, theoretical, or logical analysis
-- Best venues: ICML (position track), workshops, TMLR
-
----
+Detailed structures for theory, survey/tutorial, benchmark, and position papers are in [references/paper-types.md](references/paper-types.md).
 
 ## Hermes Agent Integration
 
@@ -2152,126 +1754,8 @@ Compose this skill with other Hermes skills for specific phases:
 
 ### Tool Usage Patterns
 
-**Experiment monitoring** (most common):
-```
-terminal("ps aux | grep <pattern>")
-→ terminal("tail -30 <logfile>")
-→ terminal("ls results/")
-→ execute_code("analyze results JSON, compute metrics")
-→ terminal("git add -A && git commit -m '<descriptive message>' && git push")
-→ (final response auto-delivers "Experiment complete: <summary>"; for unattended runs, schedule via cron with a deliver: target)
-```
+Experiment monitoring, parallel section drafting, state management with `memory`/`todo`, cron monitoring, and communication patterns are in [references/hermes-integration.md](references/hermes-integration.md). Load with `skill_view("research-paper-writing", file_path="references/hermes-integration.md")`.
 
-**Parallel section drafting** (using delegation):
-```
-delegate_task("Draft the Methods section based on these experiment scripts and configs. 
-  Include: pseudocode, all hyperparameters, architectural details sufficient for 
-  reproduction. Write in LaTeX using the neurips2025 template conventions.")
-
-delegate_task("Draft the Related Work section. Use web_search and web_extract to 
-  find papers. Verify every citation via Semantic Scholar. Group by methodology.")
-
-delegate_task("Draft the Experiments section. Read all result files in results/. 
-  State which claim each experiment supports. Include error bars and significance.")
-```
-
-Each delegate runs as a **fresh subagent** with no shared context — provide all necessary information in the prompt. Collect outputs and integrate.
-
-**Citation verification** (using execute_code):
-```python
-# In execute_code:
-from semanticscholar import SemanticScholar
-import requests
-
-sch = SemanticScholar()
-results = sch.search_paper("attention mechanism transformers", limit=5)
-for paper in results:
-    doi = paper.externalIds.get('DOI', 'N/A')
-    if doi != 'N/A':
-        bibtex = requests.get(f"https://doi.org/{doi}", 
-                              headers={"Accept": "application/x-bibtex"}).text
-        print(bibtex)
-```
-
-### State Management with `memory` and `todo`
-
-**`memory` tool** — persist key decisions (bounded: ~2200 chars for MEMORY.md):
-
-```
-memory("add", "Paper: autoreason. Venue: NeurIPS 2025 (9 pages). 
-  Contribution: structured refinement works when generation-evaluation gap is wide.
-  Key results: Haiku 42/42, Sonnet 3/5, S4.6 constrained 2/3.
-  Status: Phase 5 — drafting Methods section.")
-```
-
-Update memory after major decisions or phase transitions. This persists across sessions.
-
-**`todo` tool** — track granular progress:
-
-```
-todo("add", "Design constrained task experiments for Sonnet 4.6")
-todo("add", "Run Haiku baseline comparison")
-todo("add", "Draft Methods section")
-todo("update", id=3, status="in_progress")
-todo("update", id=1, status="completed")
-```
-
-**Session startup protocol:**
-```
-1. todo("list")                           # Check current task list
-2. memory("read")                         # Recall key decisions
-3. terminal("git log --oneline -10")      # Check recent commits
-4. terminal("ps aux | grep python")       # Check running experiments
-5. terminal("ls results/ | tail -20")     # Check for new results
-6. Report status to user, ask for direction
-```
-
-### Cron Monitoring with `cronjob`
-
-Use the `cronjob` tool to schedule periodic experiment checks:
-
-```
-cronjob("create", {
-  "schedule": "*/30 * * * *",  # Every 30 minutes
-  "prompt": "Check experiment status:
-    1. ps aux | grep run_experiment
-    2. tail -30 logs/experiment_haiku.log
-    3. ls results/haiku_baselines/
-    4. If complete: read results, compute Borda scores, 
-       git add -A && git commit -m 'Add Haiku results' && git push
-    5. Report: table of results, key finding, next step
-    6. If nothing changed: respond with [SILENT]"
-})
-```
-
-**[SILENT] protocol**: When nothing has changed since the last check, respond with exactly `[SILENT]`. This suppresses notification delivery to the user. Only report when there are genuine changes worth knowing about.
-
-**Deadline tracking**:
-```
-cronjob("create", {
-  "schedule": "0 9 * * *",  # Daily at 9am
-  "prompt": "NeurIPS 2025 deadline: May 22. Today is {date}. 
-    Days remaining: {compute}. 
-    Check todo list — are we on track? 
-    If <7 days: warn user about remaining tasks."
-})
-```
-
-### Communication Patterns
-
-**When to notify the user** (via your direct/final response, or a cron `deliver:` target for unattended runs):
-- Experiment batch completed (with results table)
-- Unexpected finding or failure requiring decision
-- Draft section ready for review
-- Deadline approaching with incomplete tasks
-
-**When NOT to notify:**
-- Experiment still running, no new results → `[SILENT]`
-- Routine monitoring with no changes → `[SILENT]`
-- Intermediate steps that don't need attention
-
-**Report format** — always include structured data:
-```
 ## Experiment: <name>
 Status: Complete / Running / Failed
 
@@ -2324,7 +1808,7 @@ See [references/reviewer-guidelines.md](references/reviewer-guidelines.md) for d
 
 ---
 
-## Common Issues and Solutions
+## Pitfalls
 
 | Issue | Solution |
 |-------|----------|
@@ -2342,6 +1826,14 @@ See [references/reviewer-guidelines.md](references/reviewer-guidelines.md) for d
 | Results are negative/null | See Phase 4.3 on handling negative results. Consider workshops, TMLR, or reframing as analysis. |
 
 ---
+
+## Verification
+
+- Every citation resolves via Semantic Scholar / arXiv / CrossRef (no hallucinated refs).
+- Paper compiles with the target venue template (`latexmk -pdf`).
+- Contribution is stated in one sentence; every experiment maps to a claim.
+- Venue checklist in `references/checklists.md` is complete before submission.
+- Self-review ensemble (Phase 6) has been run and major weaknesses addressed.
 
 ## Reference Documents
 

@@ -76,8 +76,17 @@ def test_skills_breakdown_shape_sorted_and_attributed(isolated_home):
     names = {s["name"] for s in skills}
     assert {"small-skill", "big-skill"} <= names
     for s in skills:
-        assert set(s) >= {"name", "index_line_bytes", "skill_md_bytes", "path"}
+        assert set(s) >= {
+            "name",
+            "declared_name",
+            "folder_slug",
+            "index_line_bytes",
+            "skill_md_bytes",
+            "path",
+        }
         assert s["index_line_bytes"] > 0
+        assert s["declared_name"] == s["name"]
+        assert s["folder_slug"]  # directory slug always present when path maps
     # Sorted largest-first by on-disk SKILL.md size.
     md_sizes = [s["skill_md_bytes"] or 0 for s in skills]
     assert md_sizes == sorted(md_sizes, reverse=True)
