@@ -4863,6 +4863,14 @@ class AIAgent:
                 self._client_log_context(),
                 exc,
             )
+        # #79244 / #80792: force_close_tcp_sockets() deliberately does NOT
+        # call close() to avoid the FD-recycling race with SSL BIO (#29507).
+        # FD release is deferred to GC.  In long sessions with repeated
+        # provider fallbacks, retired clients accumulate and their FDs are
+        # only reclaimed when the GC actually runs — which may be too late,
+        # causing EMFILE.  Trigger a collection here to release promptly.
+        import gc
+        gc.collect()
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():
