@@ -55,14 +55,15 @@ def save_l0_state(state: Dict[str, Any]) -> None:
 
 
 def _load_l0_review_prompt() -> str:
-    """Load the L0 review prompt from the constitution registry file."""
+    """Load the L0 review prompt from hermes.md (2026-08-07 用户决策：
+    constitution-registry 配置融合进 hermes.md——单一真相源，不再维护第二个文件)."""
     from hermes_cli.config import get_hermes_home
 
     _FALLBACK = (
         "Review the conversation and save important facts to memory. "
         "If nothing is worth saving, say 'Nothing to save.' and stop."
     )
-    registry_path = get_hermes_home() / "constitution-registry.md"
+    registry_path = get_hermes_home() / "hermes.md"
     if not registry_path.exists():
         return _FALLBACK
     try:
@@ -74,33 +75,38 @@ def _load_l0_review_prompt() -> str:
         prompt = content[idx + len(marker):].strip()
         return prompt if prompt else _FALLBACK
     except Exception as e:
-        logger.warning("Failed to load L0 review prompt from registry: %s", e)
+        logger.warning("Failed to load L0 review prompt from hermes.md: %s", e)
         return _FALLBACK
 
 
 def _load_l0_registry_config() -> Dict[str, Any]:
-    """Parse structured config from the constitution registry YAML frontmatter.
+    """Parse structured config from hermes.md L0_CONFIG section (2026-08-07
+    用户决策：registry 融合进 hermes.md——找 '## L0_CONFIG' 段的 trigger_turns 行).
 
     Returns a dict with key ``trigger_turns``.  Falls back to hardcoded
-    default (10) when the registry is missing or the YAML is unparseable.
+    default (10) when the section is missing or unparseable.
     """
     _DEFAULTS = {
         "trigger_turns": 10,
     }
     from hermes_cli.config import get_hermes_home
 
-    registry_path = get_hermes_home() / "constitution-registry.md"
+    registry_path = get_hermes_home() / "hermes.md"
     if not registry_path.exists():
         return dict(_DEFAULTS)
     try:
         content = registry_path.read_text(encoding="utf-8")
-        if not content.startswith("---"):
+        marker = "## L0_CONFIG"
+        idx = content.find(marker)
+        if idx == -1:
             return dict(_DEFAULTS)
-        # Extract YAML between first two --- markers
-        end_marker = content.index("\n---", 3)
-        yaml_str = content[3:end_marker].strip()
+        # 段内容到下一个 ## 或文件尾
+        seg = content[idx + len(marker):]
+        end = seg.find("\n## ")
+        if end != -1:
+            seg = seg[:end]
         result = dict(_DEFAULTS)
-        for line in yaml_str.split("\n"):
+        for line in seg.split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -118,7 +124,7 @@ def _load_l0_registry_config() -> Dict[str, Any]:
                         pass
         return result
     except Exception as e:
-        logger.debug("Failed to parse registry config: %s", e)
+        logger.debug("Failed to parse L0 config from hermes.md: %s", e)
         return dict(_DEFAULTS)
 
 

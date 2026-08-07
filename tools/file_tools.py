@@ -699,26 +699,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
-    # Prevent agents (including L0 review fork) from modifying the
-    # constitution registry.  It contains structured config that only
-    # the human user should edit; LLM-driven changes to this file would
-    # create a recursive self-modification feedback loop.
-    from hermes_constants import get_hermes_home as _gethome
-    _registry = str(_gethome().resolve() / "constitution-registry.md")
-    if resolved == _registry or normalized == _registry:
-        _reg_err = (
-            f"Refusing to write to constitution-registry.md: {filepath}\n"
-            "This file is the L0 constitution registry \u2014 it can only be "
-            "edited manually by the user. If the registry content needs "
-            "updating, report the suggested change to the user.\n"
-        )
-        # Log the blocked attempt so the background_review callback
-        # can surface it as a self-change alert.
-        logger.warning(
-            "Blocked write attempt to constitution-registry.md (%s)",
-            filepath,
-        )
-        return _reg_err
+    # 2026-08-07 用户决策：constitution-registry.md 写保护取消——
+    # L0 配置已融合进 hermes.md（background_review 改读 hermes.md），
+    # 本文件不再是配置源，无需保护（原保护注释见 git 历史）
     return None
 
 
