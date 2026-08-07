@@ -23,6 +23,14 @@ _TRUSTED_GITHUB_PR_SCRIPT_ENV = (
     "BUZZ_PRIVATE_KEY",
     "BUZZ_AUTH_TAG",
 )
+_TRUSTED_SIGNED_CONTROL_PLANE_FIELDS = {
+    "resolve_execution_gates": frozenset(
+        {"gate_resolution_payload", "gate_resolution_signature"}
+    ),
+    "execution_evidence": frozenset(
+        {"attestation_payload", "attestation_signature"}
+    ),
+}
 _MISSING = object()
 
 
@@ -290,7 +298,8 @@ class WebhookRouteProcessor:
             logger.warning("[webhook] script execution failed: %s", exc)
             return False, None
 
-        stdout = (result.stdout or "").strip()
+        raw_stdout = (result.stdout or "").strip()
+        stdout = raw_stdout
         stderr = (result.stderr or "").strip()
         try:
             from agent.redact import redact_sensitive_text
@@ -312,10 +321,39 @@ class WebhookRouteProcessor:
         if not stdout or stdout == "[SILENT]":
             return False, None
 
-        try:
-            transformed = json.loads(stdout)
-        except json.JSONDecodeError:
-            transformed = {**payload, "script_output": stdout}
+        signed_control_plane_result: Optional[dict] = None
+        signed_fields = (
+            _TRUSTED_SIGNED_CONTROL_PLANE_FIELDS.get(payload.get("operation"))
+            if trusted_github_pr_environment
+            else None
+        )
+        if signed_fields is not None:
+            try:
+                candidate = json.loads(raw_stdout)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "[webhook] trusted control-plane script returned malformed JSON"
+                )
+                return False, None
+            if (
+                not isinstance(candidate, dict)
+                or frozenset(candidate) != signed_fields
+                or any(not isinstance(candidate[field], str) for field in signed_fields)
+                or len(raw_stdout) > 2_000_000
+            ):
+                logger.warning(
+                    "[webhook] trusted control-plane script returned an invalid envelope"
+                )
+                return False, None
+            signed_control_plane_result = candidate
+
+        if signed_control_plane_result is not None:
+            transformed = signed_control_plane_result
+        else:
+            try:
+                transformed = json.loads(stdout)
+            except json.JSONDecodeError:
+                transformed = {**payload, "script_output": stdout}
         if not isinstance(transformed, dict):
             logger.warning("[webhook] script stdout must be a JSON object or text")
             return False, None

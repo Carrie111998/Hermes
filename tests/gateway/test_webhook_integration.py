@@ -81,6 +81,76 @@ def test_trusted_github_pr_script_receives_only_its_reviewed_control_plane_env(
     assert "UNRELATED_PROVIDER_SECRET" not in child_env
 
 
+def test_trusted_signed_control_plane_envelope_survives_generic_redaction():
+    payload_value = base64.b64encode(b'{"baseline_gates":["quality"]}').decode()
+    signature_value = base64.b64encode(b"s" * 64).decode()
+
+    with patch(
+        "gateway.platforms.webhook_filters._resolve_script_path",
+        return_value=(Path("/tmp/trusted-gate.py"), None),
+    ), patch(
+        "tools.environments.local.build_subprocess_env",
+        return_value={"PATH": "/usr/bin:/bin", "HOME": "/tmp/safe-home"},
+    ), patch(
+        "gateway.platforms.webhook_filters.subprocess.run",
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "gate_resolution_payload": payload_value,
+                    "gate_resolution_signature": signature_value,
+                }
+            ),
+            stderr="",
+        ),
+    ), patch(
+        "agent.redact.redact_sensitive_text",
+        side_effect=lambda value: value.replace(payload_value, "eyJiYX...JdfQ=="),
+    ):
+        keep, transformed = WebhookRouteProcessor().run_route_script(
+            "trusted-gate.py",
+            {"operation": "resolve_execution_gates"},
+            trusted_github_pr_environment=True,
+        )
+
+    assert keep is True
+    assert transformed == {
+        "gate_resolution_payload": payload_value,
+        "gate_resolution_signature": signature_value,
+    }
+
+
+def test_trusted_signed_control_plane_rejects_extra_fields():
+    with patch(
+        "gateway.platforms.webhook_filters._resolve_script_path",
+        return_value=(Path("/tmp/trusted-gate.py"), None),
+    ), patch(
+        "tools.environments.local.build_subprocess_env",
+        return_value={"PATH": "/usr/bin:/bin", "HOME": "/tmp/safe-home"},
+    ), patch(
+        "gateway.platforms.webhook_filters.subprocess.run",
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "gate_resolution_payload": "payload",
+                    "gate_resolution_signature": "signature",
+                    "unexpected": "must-not-cross-boundary",
+                }
+            ),
+            stderr="",
+        ),
+    ):
+        keep, transformed = WebhookRouteProcessor().run_route_script(
+            "trusted-gate.py",
+            {"operation": "resolve_execution_gates"},
+            trusted_github_pr_environment=True,
+        )
+
+    assert keep is False
+    assert transformed is None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
