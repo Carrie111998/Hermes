@@ -40,6 +40,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
     clear_turn_marker,
+    list_turn_markers,
     read_turn_marker,
     record_turn_start,
 )
@@ -669,6 +670,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     """
     if not session or session.get("_finalized"):
         return
+    # Update / backend death / compute-host SIGTERM: keep the crash marker so
+    # the next process can auto-continue. User-initiated closes still clear.
+    _preserve_turn_marker_for_shutdown(session, end_reason)
     session["_finalized"] = True
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
@@ -3520,6 +3524,11 @@ def _ensure_skin_watcher() -> None:
         return
     _skin_watcher_started = True
     _note_skin_broadcast()  # seed the baseline so only a real change repaints
+    # Same gate as gateway.ready — recover chats killed by update/backend death.
+    try:
+        _ensure_interrupted_turn_recovery()
+    except Exception:
+        logger.debug("interrupted-turn recovery failed to start", exc_info=True)
 
     def _loop() -> None:
         while True:
@@ -7272,15 +7281,14 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
 
 # ── Auto-continue: resume a turn killed by a process/machine death ────
 #
-# A turn that concludes — success, handled error, interrupt — clears its
-# durable marker (see tui_gateway/turn_marker.py) in _run_prompt_submit's
-# finally. Only a process death leaves the marker behind, so a marker found
-# at session.resume time is positive proof the turn never finished AND the
-# client never saw a terminal frame. If the interruption is fresh, re-submit
-# the interrupted prompt automatically (the messaging gateway has done this
-# for restart-interrupted sessions since #27856); if it's stale, clear the
-# marker and let the recovered partial transcript speak for itself — the
-# user can ask to continue manually.
+# A turn that concludes cleanly — success, handled error, *user* interrupt —
+# clears its durable marker (see tui_gateway/turn_marker.py) in
+# _run_prompt_submit's finally. Process death, update handoff, and
+# tui_shutdown KEEP the marker (see _preserve_turn_marker_for_shutdown) so a
+# marker found at session.resume or backend-boot time is positive proof the
+# turn never finished. If the interruption is fresh, re-submit the interrupted
+# prompt automatically; if it's stale, clear the marker and let the recovered
+# partial transcript speak for itself — the user can ask to continue manually.
 
 _AUTO_CONTINUE_ENABLED_DEFAULT = True
 _AUTO_CONTINUE_FRESHNESS_MINUTES_DEFAULT = 15
@@ -7312,6 +7320,99 @@ def _session_home(session: dict) -> Path:
     return Path(profile_home) if profile_home else Path(_hermes_home)
 
 
+# End reasons where the process is going away out from under the turn — NOT
+# a user Stop. Keep the crash marker so boot recovery can auto-continue.
+_PRESERVE_MARKER_END_REASONS = frozenset(
+    {
+        "tui_shutdown",
+        "ws_disconnect",
+        "ws_orphan_reap",
+        "compute_host_sigterm",
+        "compute_host_sigint",
+        "compute_host_shutdown",
+        "compute_host_parent_gone",
+        "compute_host_stdin_close",
+    }
+)
+
+
+def _inflight_prompt_for_marker(session: dict) -> str:
+    """Best-effort original user prompt for a running/interrupted turn."""
+    key = str(session.get("session_key") or "")
+    if key:
+        existing = read_turn_marker(_session_home(session), key)
+        if existing and existing.get("prompt"):
+            return str(existing["prompt"])
+    turn = session.get("inflight_turn") or {}
+    for field in ("prompt", "text", "user", "input"):
+        val = turn.get(field)
+        if isinstance(val, str) and val.strip():
+            return val
+    try:
+        history = list(session.get("history") or [])
+    except Exception:
+        history = []
+    for msg in reversed(history):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts = [
+                str(p.get("text") or "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") in (None, "text", "input_text")
+            ]
+            joined = "\n".join(p for p in parts if p.strip())
+            if joined.strip():
+                return joined
+    return ""
+
+
+def _preserve_turn_marker_for_shutdown(session: dict, end_reason: str) -> None:
+    """Keep the crash marker across process/update teardown.
+
+    Without this, a clean interrupt path retires the marker in
+    ``_run_prompt_submit``'s finally *before* the process dies, so the next
+    boot has nothing to auto-continue — the "update killed all my chats"
+    failure mode. User-initiated closes (``tui_close``, ``session.close``)
+    intentionally do NOT preserve.
+    """
+    reason = str(end_reason or "")
+    preserve = reason in _PRESERVE_MARKER_END_REASONS or reason.startswith("compute_host_")
+    if not preserve:
+        return
+    running = bool(session.get("running"))
+    has_inflight = bool(session.get("inflight_turn"))
+    key = str(session.get("session_key") or "")
+    home = _session_home(session)
+    already = read_turn_marker(home, key) if key else None
+    if not running and not has_inflight and already is None:
+        return
+    session["_preserve_turn_marker"] = True
+    prompt = _inflight_prompt_for_marker(session)
+    if not prompt.strip() or not key:
+        return
+    attempts = int((already or {}).get("attempts") or 0)
+    try:
+        record_turn_start(
+            home,
+            key,
+            prompt,
+            attempts=attempts,
+            cause=reason or "shutdown",
+            keep_started_at=True,
+        )
+        logger.info(
+            "preserved turn marker for session %s (end_reason=%s)",
+            key,
+            reason,
+        )
+    except Exception:
+        logger.debug("failed to preserve turn marker for %s", key, exc_info=True)
+
+
 def _retire_turn_marker(session: dict, *keys: str) -> None:
     """Drop the crash marker for a turn whose outcome is about to reach the client.
 
@@ -7321,7 +7422,12 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
     window would leave a marker that looks like a crash — re-running a finished
     turn on the next launch. Extra ``keys`` cover a session_key that
     compression rotated mid-turn.
+
+    Skipped when shutdown/update marked the session for preserve — the next
+    process must still see the interrupted prompt.
     """
+    if session.get("_preserve_turn_marker"):
+        return
     home = _session_home(session)
     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
         if key:
@@ -7422,6 +7528,96 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
         age,
     )
     return {"attempt": attempt, "interrupted_at": marker["started_at"]}
+
+
+_interrupted_turn_recovery_started = False
+
+
+def _ensure_interrupted_turn_recovery() -> None:
+    """Once per process: resume every chat that still has a fresh crash marker.
+
+    ``session.resume`` already auto-continues the focused tab, but after an
+    update/refresh only the active tile mounts — other running chats stay
+    silent until clicked. Scan the marker sidecar at gateway.ready and cold-
+    resume each fresh key so work comes back without a manual nudge.
+    """
+    global _interrupted_turn_recovery_started
+    if _interrupted_turn_recovery_started:
+        return
+    _interrupted_turn_recovery_started = True
+
+    def _run() -> None:
+        try:
+            enabled, freshness_secs, max_attempts = _auto_continue_config()
+            if not enabled:
+                return
+            # Small delay so the first WS client can register transports and
+            # the REST/session list path is warm.
+            time.sleep(1.5)
+            markers = list_turn_markers(_hermes_home)
+            if not markers:
+                return
+            now = time.time()
+            candidates: list[tuple[str, dict]] = []
+            for key, marker in markers.items():
+                age = now - float(marker.get("started_at") or 0)
+                attempts = int(marker.get("attempts") or 0)
+                if age > freshness_secs or attempts >= max_attempts:
+                    clear_turn_marker(_hermes_home, key)
+                    continue
+                candidates.append((key, marker))
+            candidates.sort(
+                key=lambda item: float(item[1].get("started_at") or 0),
+                reverse=True,
+            )
+            candidates = candidates[:12]
+            if not candidates:
+                return
+            resume = _methods.get("session.resume")
+            if resume is None:
+                logger.warning(
+                    "interrupted-turn recovery: session.resume handler missing"
+                )
+                return
+            logger.info(
+                "interrupted-turn recovery: resuming %d session(s) with fresh markers",
+                len(candidates),
+            )
+            for key, _marker in candidates:
+                try:
+                    live = _find_live_session_by_key(key)
+                    if live is not None:
+                        sid, session = live
+                        _maybe_schedule_auto_continue(sid, session, key)
+                        continue
+                    resp = resume(
+                        f"__boot_recover__{key}",
+                        {
+                            "session_id": key,
+                            "source": "desktop",
+                            "omit_messages": True,
+                            "eager_build": False,
+                        },
+                    )
+                    if isinstance(resp, dict) and resp.get("error"):
+                        logger.info(
+                            "interrupted-turn recovery: resume failed for %s: %s",
+                            key,
+                            resp.get("error"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "interrupted-turn recovery failed for %s",
+                        key,
+                        exc_info=True,
+                    )
+                time.sleep(0.4)
+        except Exception:
+            logger.warning("interrupted-turn recovery crashed", exc_info=True)
+
+    threading.Thread(
+        target=_run, name="hermes-interrupted-turn-recovery", daemon=True
+    ).start()
 
 
 def _enqueue_prompt(
