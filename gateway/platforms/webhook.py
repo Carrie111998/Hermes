@@ -1067,6 +1067,15 @@ class WebhookAdapter(BasePlatformAdapter):
         if gl_token:
             return _hmac_str_equal(gl_token, secret)
 
+        # Plain shared-secret header (PostHog, n8n, Zapier, etc.): the
+        # service is configured with a custom header whose value IS the
+        # secret.  Unlike HMAC, no signing is done — the header is a bearer
+        # token.  TLS (in production) provides the confidentiality that the
+        # shared secret isn't sniffed in transit.
+        plain_token = _header("X-Webhook-Secret")
+        if plain_token:
+            return _hmac_str_equal(plain_token, secret)
+
         # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
         #             X-Webhook-Timestamp = <unix seconds> (required for V2)
         # Checked independently of (and before) legacy V1 below — a sender
