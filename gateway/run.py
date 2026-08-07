@@ -9352,6 +9352,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
+                                    # Wire the gateway's SessionDB so
+                                    # _compress_context can rotate the session
+                                    # forward (archive + create the new row).
+                                    # Without it hygiene compresses in a loop:
+                                    # it produces a summary every run but can
+                                    # never write it back (#21301).
+                                    session_db=self._session_db,
                                 )
                                 try:
                                     # The hygiene agent rotates the session
