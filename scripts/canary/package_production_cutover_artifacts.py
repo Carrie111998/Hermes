@@ -776,7 +776,6 @@ def _validated_owner_gate_receipt_public_key_id(
     expected_key_id: str | None,
     *,
     public_key_path: Path,
-    expected_uid: int,
 ) -> str | None:
     """Bind the v4 trust anchor to the exact staged raw Ed25519 key.
 
@@ -790,8 +789,6 @@ def _validated_owner_gate_receipt_public_key_id(
     if (
         not isinstance(expected_key_id, str)
         or re.fullmatch(r"[0-9a-f]{64}", expected_key_id) is None
-        or not isinstance(expected_uid, int)
-        or expected_uid < 0
     ):
         raise PackagingError(
             "cutover_owner_gate_receipt_public_key_invalid"
@@ -805,8 +802,9 @@ def _validated_owner_gate_receipt_public_key_id(
             "cutover_owner_gate_receipt_public_key_invalid"
         ) from exc
     if (
-        metadata.st_uid != expected_uid
-        or stat.S_IMODE(metadata.st_mode) & 0o022
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o444
         or not isinstance(key, Ed25519PublicKey)
         or _sha256(key.public_bytes_raw()) != expected_key_id
     ):
@@ -1982,7 +1980,6 @@ def _sealed_runtime_artifact_request(
             _validated_owner_gate_receipt_public_key_id(
                 owner_gate_receipt_public_key_id,
                 public_key_path=owner_gate_receipt_public_key_path,
-                expected_uid=verified_assets["expected_uid"],
             )
         )
         capability = render_production_capability_units(

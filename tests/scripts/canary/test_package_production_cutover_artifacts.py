@@ -1748,6 +1748,7 @@ def test_operational_edges_grant_projector_read_without_mutation_authority():
 
 def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
@@ -1759,14 +1760,48 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
     )
-    public_path.chmod(0o400)
+    public_path.chmod(0o444)
     key_id = hashlib.sha256(public_raw).hexdigest()
+
+    real_lstat = Path.lstat
+
+    def root_owned_public_key(path: Path):
+        observed = real_lstat(path)
+        if path != public_path:
+            return observed
+        return SimpleNamespace(
+            st_mode=observed.st_mode,
+            st_uid=0,
+            st_gid=0,
+            st_nlink=observed.st_nlink,
+            st_size=observed.st_size,
+            st_dev=observed.st_dev,
+            st_ino=observed.st_ino,
+            st_mtime_ns=observed.st_mtime_ns,
+            st_ctime_ns=observed.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(Path, "lstat", root_owned_public_key)
+
+    nonroot_release_assets = copy.deepcopy(
+        _operational_asset_verification()
+    )
+    nonroot_release_assets["expected_uid"] = 12345
+    nonroot_release_assets["expected_gid"] = 12346
+    for row in nonroot_release_assets["files"]:
+        row["uid"] = 12345
+        row["gid"] = 12346
+    nonroot_release_assets["verification_sha256"] = _sha_json({
+        name: value
+        for name, value in nonroot_release_assets.items()
+        if name != "verification_sha256"
+    })
 
     request, descriptor = package._sealed_runtime_artifact_request(
         revision=REVISION,
         runtime_dependency=_runtime_dependency_for_units(),
         unit_inputs=_unit_inputs(),
-        operational_asset_verification=_operational_asset_verification(),
+        operational_asset_verification=nonroot_release_assets,
         owner_gate_receipt_public_key_id=key_id,
         owner_gate_receipt_public_key_path=public_path,
     )
@@ -1829,6 +1864,38 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
             release,
             REVISION,
             unit_inputs=_unit_inputs(),
+            owner_gate_receipt_public_key_path=public_path,
+        )
+
+    def nonroot_public_key(path: Path):
+        observed = root_owned_public_key(path)
+        if path != public_path:
+            return observed
+        return SimpleNamespace(
+            st_mode=observed.st_mode,
+            st_uid=12345,
+            st_gid=observed.st_gid,
+            st_nlink=observed.st_nlink,
+            st_size=observed.st_size,
+            st_dev=observed.st_dev,
+            st_ino=observed.st_ino,
+            st_mtime_ns=observed.st_mtime_ns,
+            st_ctime_ns=observed.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(Path, "lstat", nonroot_public_key)
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_owner_gate_receipt_public_key_invalid",
+    ):
+        package._sealed_runtime_artifact_request(
+            revision=REVISION,
+            runtime_dependency=_runtime_dependency_for_units(),
+            unit_inputs=_unit_inputs(),
+            operational_asset_verification=(
+                _operational_asset_verification()
+            ),
+            owner_gate_receipt_public_key_id=key_id,
             owner_gate_receipt_public_key_path=public_path,
         )
 
