@@ -266,6 +266,24 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
 
+test('cleanupStale escalates an owned pid after the SIGTERM grace period', async () => {
+  const ssh = fakeSsh([[/print\("OWNED"/, 'OWNED\n']])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, {
+    pid: 9,
+    spawnNonce: SPAWN_NONCE,
+    hermesPath: '/x/hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
+  })
+
+  const killCommand = ssh.calls.find(command => command.includes('kill 9'))
+  assert.ok(killCommand)
+  assert.match(killCommand, /kill 9/)
+  assert.match(killCommand, /-ge 50/)
+  assert.match(killCommand, /kill -9 9/)
+  assert.match(killCommand, /-ge 10/)
+})
+
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.match(cmd, /serve --isolated/)

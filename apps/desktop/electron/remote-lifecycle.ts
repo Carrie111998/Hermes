@@ -37,6 +37,8 @@ const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
 const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
 const DEFAULT_READY_TIMEOUT_MS = 45_000
 const READY_POLL_INTERVAL_MS = 750
+const STALE_TERM_WAIT_ITERATIONS = 50
+const STALE_KILL_WAIT_ITERATIONS = 10
 
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
@@ -412,9 +414,14 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
     try {
       const result = (
         await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
+          `kill ${Number(lock.pid)} 2>/dev/null || true; ` +
             `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+            `i=$((i+1)); [ "$i" -ge ${STALE_TERM_WAIT_ITERATIONS} ] && break; sleep 0.1; done; ` +
+            `if kill -0 ${Number(lock.pid)} 2>/dev/null; then ` +
+            `kill -9 ${Number(lock.pid)} 2>/dev/null || true; ` +
+            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge ${STALE_KILL_WAIT_ITERATIONS} ] && exit 1; sleep 0.1; done; ` +
+            `fi`
         )
       ).trim()
 
