@@ -37,7 +37,11 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
-import { cleanupFailedBackendPoolEntry, deleteBackendPoolEntryIfCurrent } from './backend-pool-state'
+import {
+  assertBackendPoolEntryCurrent,
+  cleanupFailedBackendPoolEntry,
+  deleteBackendPoolEntryIfCurrent
+} from './backend-pool-state'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -8145,6 +8149,7 @@ async function spawnPoolBackend(profile, entry) {
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+    assertBackendPoolEntryCurrent(backendPool, profile, entry)
 
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
@@ -8185,6 +8190,7 @@ async function spawnPoolBackend(profile, entry) {
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
+  assertBackendPoolEntryCurrent(backendPool, profile, entry)
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
@@ -8292,15 +8298,16 @@ async function spawnPoolBackend(profile, entry) {
   }
 }
 
-function stopPoolBackend(profile) {
-  const entry = backendPool.get(profile)
+function stopPoolBackend(profile, expectedEntry = backendPool.get(profile)) {
+  const entry = expectedEntry
 
-  if (!entry) {
-    return
+  if (!entry || !deleteBackendPoolEntryIfCurrent(backendPool, profile, entry)) {
+    return false
   }
 
-  backendPool.delete(profile)
   stopBackendChild(entry.process)
+
+  return true
 }
 
 async function teardownPoolBackendAndWait(profile) {
@@ -9528,7 +9535,7 @@ function revalidatePool() {
     entries: backendPool.entries(),
     log: rememberLog,
     probe: fetchPublicJson,
-    stopBackend: stopPoolBackend,
+    stopBackend: (profile, entry) => stopPoolBackend(profile, entry),
     tracker: remoteLiveness
   })
 }

@@ -2,7 +2,11 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { cleanupFailedBackendPoolEntry, deleteBackendPoolEntryIfCurrent } from './backend-pool-state'
+import {
+  assertBackendPoolEntryCurrent,
+  cleanupFailedBackendPoolEntry,
+  deleteBackendPoolEntryIfCurrent
+} from './backend-pool-state'
 
 test('a stale backend exit cannot remove the replacement pool entry', () => {
   const staleEntry = { id: 'stale' }
@@ -31,4 +35,16 @@ test('a failed stale startup stops its child without removing the replacement', 
 
   assert.deepEqual(stopped, [staleEntry.process])
   assert.equal(entries.get('brainkit'), replacementEntry)
+})
+
+test('a startup cannot continue after its pool entry is replaced', () => {
+  const staleEntry = { id: 'stale' }
+  const replacementEntry = { id: 'replacement' }
+  const entries = new Map([['brainkit', replacementEntry]])
+
+  assert.throws(
+    () => assertBackendPoolEntryCurrent(entries, 'brainkit', staleEntry),
+    /Backend pool entry is no longer current/
+  )
+  assert.doesNotThrow(() => assertBackendPoolEntryCurrent(entries, 'brainkit', replacementEntry))
 })
