@@ -63,6 +63,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from agent.i18n import t
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -3363,25 +3364,25 @@ class QQAdapter(BasePlatformAdapter):
         for index, attachment in enumerate(attachments, start=1):
             if not isinstance(attachment, dict):
                 continue
-            parts = [f"[附件{index}]"]
-            content_type = str(attachment.get("content_type") or "未知")
-            parts.append(f"类型:{content_type}")
+            parts = [t("qqbot.attachment_label", index=index)]
+            content_type = str(attachment.get("content_type") or t("qqbot.unknown"))
+            parts.append(t("qqbot.attachment_type", value=content_type))
             filename = str(attachment.get("filename") or "").strip()
             if filename:
-                parts.append(f"文件名:{filename}")
+                parts.append(t("qqbot.attachment_filename", value=filename))
             width = attachment.get("width")
             height = attachment.get("height")
             if width and height:
-                parts.append(f"尺寸:{width}x{height}")
+                parts.append(t("qqbot.attachment_dimensions", width=width, height=height))
             try:
                 size = int(attachment.get("size") or 0)
             except (TypeError, ValueError):
                 size = 0
             if size > 0:
-                parts.append(f"大小:{size / 1024:.1f}KB")
+                parts.append(t("qqbot.attachment_size", value=f"{size / 1024:.1f}KB"))
             url = str(attachment.get("url") or "").strip()
             if url:
-                parts.append(f"URL:{url}")
+                parts.append(t("qqbot.attachment_url", value=url))
             details.append(" ".join(parts))
         if not details:
             return content
@@ -3391,10 +3392,10 @@ class QQAdapter(BasePlatformAdapter):
     def _group_sender_label(author: Dict[str, Any], sender_id: str) -> str:
         """Render an optional QQ group role before the sender display name."""
         sender_name = str(author.get("username") or sender_id[-6:]).strip() or "unknown"
-        role = {"owner": "群主", "admin": "管理员"}.get(
+        role_key = {"owner": "qqbot.owner", "admin": "qqbot.administrator"}.get(
             str(author.get("member_role", "")).strip().lower()
         )
-        return f"{role}·{sender_name}" if role else sender_name
+        return f"{t(role_key)}: {sender_name}" if role_key else sender_name
 
     def _resolve_group_mentions(
             self, group_openid: str, content: str, d: Dict[str, Any]

@@ -405,7 +405,7 @@ class TestQQGroupMessageModes:
             }),
         )
 
-        assert [event.text for event in received] == ["[群主·Alice|owner-1]\nhello", "/status"]
+        assert [event.text for event in received] == ["[Owner: Alice|owner-1]\nhello", "/status"]
 
     @pytest.mark.asyncio
     async def test_full_group_message_is_cached_without_agent_turn(self):
@@ -491,9 +491,26 @@ class TestQQGroupMessageModes:
         }])
 
         assert text == (
-            "hello\n[附件1] 类型:image/jpeg 文件名:photo.jpg 尺寸:960x960 "
-            "大小:100.0KB URL:https://cdn.example/photo.jpg"
+            "hello\n[Attachment 1] Type: image/jpeg Filename: photo.jpg "
+            "Dimensions: 960x960 Size: 100.0KB URL: https://cdn.example/photo.jpg"
         )
+
+    @pytest.mark.parametrize(("language", "expected"), [
+        ("zh", "群主: Alice"),
+        ("ru", "Владелец: Alice"),
+        ("ko", "소유자: Alice"),
+    ])
+    def test_group_labels_follow_configured_language(self, monkeypatch, language, expected):
+        from agent.i18n import reset_language_cache
+
+        monkeypatch.setenv("HERMES_LANGUAGE", language)
+        reset_language_cache()
+        try:
+            assert self._make_adapter()._group_sender_label(
+                {"username": "Alice", "member_role": "owner"}, "owner-1"
+            ) == expected
+        finally:
+            reset_language_cache()
 
     @pytest.mark.asyncio
     async def test_full_then_at_event_does_not_drop_or_duplicate_trigger(self):
