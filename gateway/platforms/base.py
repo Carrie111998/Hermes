@@ -178,8 +178,23 @@ def build_auto_tts_output_path(platform) -> str:
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
+    # The official Docker image sets HERMES_WRITE_SAFE_ROOT=/opt/data.
+    # Keep generated auto-TTS files inside that sandbox when it is active;
+    # otherwise retain the normal system-temp behavior.
+    output_root = Path(tempfile.gettempdir())
+    try:
+        from agent.file_safety import get_safe_write_roots
+
+        safe_roots = get_safe_write_roots()
+        if safe_roots:
+            output_root = Path(sorted(safe_roots)[0])
+    except (ImportError, OSError, ValueError):
+        # Auto-TTS should remain best-effort if the optional safety helper
+        # cannot be loaded in a minimal runtime.
+        pass
+
     audio_path = os.path.join(
-        tempfile.gettempdir(),
+        str(output_root),
         "hermes_voice",
         f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
     )

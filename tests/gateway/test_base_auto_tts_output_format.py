@@ -86,6 +86,13 @@ def test_output_path_is_mp3_for_non_opus_platforms(platform):
     assert path.endswith(".mp3"), path
 
 
+def test_output_path_stays_inside_write_safe_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    path = build_auto_tts_output_path(Platform.DISCORD)
+    assert path.startswith(str(tmp_path / "hermes_voice"))
+    assert path.endswith(".mp3")
+
+
 # ---------------------------------------------------------------------------
 # Base-adapter auto-TTS block: explicit output_path, no contextvar reliance
 # ---------------------------------------------------------------------------
