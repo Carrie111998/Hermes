@@ -1,10 +1,17 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { $projectTree, projectRootCwd } from '@/store/projects'
+
+import type { SidebarProjectTree } from './projects/workspace-groups'
 import { SessionActionsMenu } from './session-actions-menu'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  $projectTree.set([])
+  vi.clearAllMocks()
+})
 
 // Exercises the real SessionActionsMenu end-to-end (no DropdownMenu mock) so
 // a broken asChild composition on the kebab trigger fails here — the menu
@@ -94,6 +101,18 @@ function renderMenu() {
   )
 }
 
+function project(id: string, label: string): SidebarProjectTree {
+  return {
+    id,
+    isAuto: false,
+    label,
+    path: `/projects/${id}`,
+    previewSessions: [],
+    repos: [],
+    sessionCount: 0
+  }
+}
+
 describe('SessionActionsMenu', () => {
   it('opens the dropdown on click without a tooltip on the kebab', async () => {
     renderMenu()
@@ -112,5 +131,32 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+  })
+
+  it('sorts Move to project targets alphabetically', async () => {
+    $projectTree.set([project('z', 'zeta'), project('a', 'Alpha'), project('b', 'beta')])
+    vi.mocked(projectRootCwd).mockImplementation(node => node.path ?? '')
+    renderMenu()
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    const moveTrigger = await screen.findByRole('menuitem', { name: 'Move to project' })
+
+    fireEvent.pointerMove(moveTrigger, { pointerType: 'mouse' })
+    fireEvent.click(moveTrigger)
+
+    const alpha = await screen.findByRole('menuitem', { name: 'Alpha' })
+    const submenu = alpha.closest('[role="menu"]')
+
+    expect(submenu).not.toBeNull()
+    expect(
+      within(submenu as HTMLElement)
+        .getAllByRole('menuitem')
+        .map(item => item.textContent)
+    ).toEqual(['Alpha', 'beta', 'zeta'])
   })
 })

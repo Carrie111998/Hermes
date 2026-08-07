@@ -145,7 +145,7 @@ export function ProjectOverviewRow({
           <Tip label={s.projects.toggle(project.label, !open)}>
             <button
               aria-label={s.projects.toggle(project.label, !open)}
-              className="grid size-5 shrink-0 place-items-center rounded bg-transparent p-0 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-(--ui-text-secondary)"
+              className="grid size-6 shrink-0 place-items-center rounded bg-transparent p-0 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-(--ui-text-secondary)"
               onClick={toggleOpen}
               type="button"
             >

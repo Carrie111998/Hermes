@@ -77,7 +77,7 @@ export function orderProjectsByIds(projects: SidebarProjectTree[], orderIds: str
   const byId = new Map(projects.map(project => [project.id, project]))
   const ordered = orderIds.map(id => byId.get(id)).filter((p): p is SidebarProjectTree => Boolean(p))
   const seen = new Set(ordered.map(project => project.id))
-  const fresh = projects.filter(project => !seen.has(project.id))
+  const fresh = sortProjectsByLabel(projects.filter(project => !seen.has(project.id)))
 
   if (!fresh.length) {
     return homeFirst(ordered)

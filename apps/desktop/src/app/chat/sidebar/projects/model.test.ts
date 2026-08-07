@@ -42,7 +42,7 @@ describe('orderProjectsByIds', () => {
     // The regression: a disk scan keeps finding git checkouts the user has
     // never opened in Hermes. Surfacing every unsaved id at the top buried the
     // projects they deliberately dragged into place.
-    const projects = [makeProject('scanned-1', 0), makeProject('mine', 4), makeProject('scanned-2', 0)]
+    const projects = [makeProject('scanned-2', 0), makeProject('mine', 4), makeProject('scanned-1', 0)]
 
     expect(ids(orderProjectsByIds(projects, ['mine']))).toEqual(['mine', 'scanned-1', 'scanned-2'])
   })
