@@ -2,6 +2,10 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
+  AvatarPackListResult,
+  ResolvedAvatarPack
+} from './store/avatar-pack-types'
+import type {
   PetOverlayBounds,
   PetOverlayControl,
   PetOverlayOpenRequest,
@@ -170,6 +174,13 @@ declare global {
       }
       revealLogs: () => Promise<{ ok: boolean; path: string; error?: string }>
       getRecentLogs: () => Promise<{ path: string; lines: string[] }>
+      // Avatar Pack system (P1): scan/resolve local avatar packs from
+      // ~/.hermes/avatar-packs/.
+      avatarPacks: {
+        list: () => Promise<AvatarPackListResult>
+        resolve: () => Promise<ResolvedAvatarPack[]>
+        open: () => Promise<{ ok: boolean; error?: string }>
+      }
       readDir: (path: string) => Promise<HermesReadDirResult>
       gitRoot?: (path: string) => Promise<string | null>
       // Reveal a path in the OS file manager (Finder / Explorer).

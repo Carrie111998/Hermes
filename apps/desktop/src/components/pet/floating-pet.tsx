@@ -6,6 +6,7 @@ import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
 import { PetHeartField } from '@/components/chat/vibe-hearts'
 import { persistString, storedString } from '@/lib/storage'
+import { $avatarRendererType, $resolvedAvatarPacks, $selectedAvatarPackId } from '@/store/avatar-pack-store'
 import { $changeEventsAvailable, $petChange } from '@/store/live-sync'
 import {
   $petAtRest,
@@ -21,7 +22,7 @@ import {
   setPetInfo
 } from '@/store/pet'
 import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
-import { $petOverlayActive, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
+import { $avatarMode, $petOverlayActive, autoPopOutPet, initAvatarPacks, initPetOverlayBridge, popOutPet, restorePetOverlay } from '@/store/pet-overlay'
 import { $gatewayState } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
@@ -110,6 +111,8 @@ export function FloatingPet() {
 
   const [position, setPosition] = useState<Point>(loadPosition)
   const containerRef = useRef<HTMLDivElement | null>(null)
+  // P0.1: Tracks whether we already auto-popped this pet activation.
+  const [hasAutoPopped, setHasAutoPopped] = useState(false)
   // The facing mirror lives on the sprite wrapper, not the container, so the
   // speech bubble (a container child) never renders flipped/backwards.
   const spriteWrapRef = useRef<HTMLDivElement | null>(null)
@@ -129,12 +132,19 @@ export function FloatingPet() {
   // edge can't leave the window cropping it. Shared by drag + the reclamp effect.
   const clamp = useCallback(({ x, y }: Point): Point => clampPoint(x, y, petW, petH), [petW, petH])
 
-  // Fetch pet.info on connect, then let pet.changed drive refreshes: the
-  // change watcher broadcasts when /pet (de)activates a pet or the hatch flow
-  // rewrites a sheet, so event-capable backends need no interval at all —
-  // users with no pet especially (this used to poll hardest for them). Older
-  // backends keep the legacy fast-while-inactive poll.
-  const active = info.enabled && Boolean(info.spritesheetBase64)
+  // Fetch pet.info on connect. Poll quickly while inactive so an in-app
+  // `/pet <slug>` appears, then slowly while active so regenerated spritesheets
+  // and row-count metadata replace the cached base64 payload.
+  // A pet is "active" when EITHER a petdex sprite is loaded OR the renderer is
+  // set to avatar-pack with a resolved pack. The old guard required
+  // spritesheetBase64 unconditionally, which blocked the overlay from ever
+  // opening in avatar-pack mode (where no petdex sprite exists).
+  const rendererType = useStore($avatarRendererType)
+  const resolvedPacks = useStore($resolvedAvatarPacks)
+  const selectedPackId = useStore($selectedAvatarPackId)
+  const hasAvatarPack = rendererType === 'avatar-pack' &&
+    resolvedPacks.some(p => p.id === (selectedPackId ?? resolvedPacks[0]?.id) && Object.keys(p.assets).length > 0)
+  const active = info.enabled && (Boolean(info.spritesheetBase64) || hasAvatarPack)
   useEffect(() => {
     if (gatewayState !== 'open') {
       return
@@ -237,9 +247,11 @@ export function FloatingPet() {
   // Pets are per-profile. When the active profile changes, drop the previous
   // profile's mascot + gallery cache so the poll above refetches the new
   // profile's pet (its config + pets dir resolve per-profile on the backend).
+  // Also reset the auto-popout ref so the new profile's pet can auto-pop.
   useOnProfileSwitch(() => {
     setPetInfo({ enabled: false })
     resetPetGallery()
+    setHasAutoPopped(false)
   })
 
   // Wire the overlay control channel once, only in the primary window — the
@@ -249,6 +261,9 @@ export function FloatingPet() {
     if (isSecondaryWindow()) {
       return
     }
+
+    // P1: Load avatar packs on init so the overlay settings panel has data.
+    void initAvatarPacks()
 
     return initPetOverlayBridge()
   }, [])
@@ -266,18 +281,35 @@ export function FloatingPet() {
     return () => window.removeEventListener('focus', onFocus)
   }, [])
 
-  // Restore a popped-out pet on boot, once the pet has loaded (so we never spawn
-  // an empty overlay window). Primary window only; runs at most once.
-  const restoredRef = useRef(false)
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  // P0.1: When the pet becomes active, auto-pop to desktop overlay if
+  // avatarMode is 'desktop' (the default). If the user previously docked,
+  // fall back to restorePetOverlay (reopens only if it was already popped).
+  // Primary window only; runs at most once per pet activation.
   useEffect(() => {
-    if (isSecondaryWindow() || restoredRef.current || !active) {
+    if (isSecondaryWindow() || !active) {
       return
     }
 
-    restoredRef.current = true
-    restorePetOverlay()
-  }, [active])
+    // One-shot sentinel: auto-pop at most once per activation.
+    if (hasAutoPopped) {
+      return
+    }
+    setHasAutoPopped(true)
+
+    const mode = $avatarMode.get()
+
+    console.info('[floating-pet] pet became active, auto-pop check:', {
+      active,
+      avatarMode: mode,
+      hasBridge: Boolean(window.hermesDesktop?.petOverlay)
+    })
+
+    if (mode === 'desktop') {
+      autoPopOutPet()
+    } else {
+      restorePetOverlay()
+    }
+  }, [active, hasAutoPopped])
 
   // Never strand or crop the pet: re-clamp (and persist) whenever the viewport
   // shrinks or the pet's own size changes (wheel/slider). `clamp` carries the
