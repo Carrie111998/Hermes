@@ -32,6 +32,7 @@ CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"
 CUTOVER_UNIT_INPUTS_FD_ENV="MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
 CUTOVER_STAGE_C_INTERLOCK_RC=42
+CUTOVER_AUTHORITY_AMBIGUOUS_RC=43
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
 RELEASE_RETENTION_HELPER_RELATIVE_PATH="ops/muncho/runtime/release_retention.py"
@@ -1318,6 +1319,132 @@ require_legacy_deploy_topology() {
   esac
 }
 
+probe_cutover_stage_c_authority() {
+  python3 - \
+    "$CUTOVER_UNIT_INPUTS_PATH" \
+    "$CUTOVER_UNIT_INPUT_PLAN_PATH" \
+    "$CUTOVER_UNIT_INPUT_APPROVAL_PATH" \
+    "$CUTOVER_STAGE_C_INTERLOCK_RC" \
+    "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+STAGE_C_SCHEMAS = {
+    "muncho-production-release-unit-inputs.v4",
+    "muncho-production-release-unit-input-plan.v4",
+    "muncho-production-release-unit-input-approval.v4",
+}
+stage_c_interlock_rc = int(sys.argv[4])
+authority_ambiguous_rc = int(sys.argv[5])
+members = (
+    (Path(sys.argv[1]), True, 128 * 1024),
+    (Path(sys.argv[2]), False, 1024 * 1024),
+    (Path(sys.argv[3]), False, 1024 * 1024),
+)
+
+
+def identity(item):
+    return (
+        item.st_dev, item.st_ino, item.st_mode, item.st_nlink,
+        item.st_uid, item.st_gid, item.st_size, item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def canonical(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+
+
+def pairs(items):
+    value = {}
+    for name, item in items:
+        if name in value:
+            raise ValueError("duplicate authority member key")
+        value[name] = item
+    return value
+
+
+def constant(_value):
+    raise ValueError("non-finite authority member value")
+
+
+def probe(path, *, newline, maximum):
+    descriptor = None
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or not 0 < before.st_size <= maximum
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, maximum + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        reachable = path.lstat()
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or len(raw) > maximum
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or identity(before) != identity(reachable)
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        value = json.loads(
+            bytes(raw).decode("utf-8", errors="strict"),
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(authority_ambiguous_rc)
+    expected = canonical(value) + (b"\n" if newline else b"")
+    if not isinstance(value, dict) or bytes(raw) != expected:
+        raise SystemExit(authority_ambiguous_rc)
+    return value.get("schema")
+
+
+for member_path, member_newline, member_maximum in members:
+    if probe(
+        member_path,
+        newline=member_newline,
+        maximum=member_maximum,
+    ) in STAGE_C_SCHEMAS:
+        raise SystemExit(stage_c_interlock_rc)
+PY
+}
+
 validate_cutover_unit_inputs() {
   local expected_revision="$1"
   python3 - \
@@ -1807,7 +1934,17 @@ PY
 prepare_legacy_cutover_unit_inputs() {
   local target_release="$1"
   local expected_revision="$2"
+  local probe_rc=0
   local validation_rc=0
+  probe_cutover_stage_c_authority || probe_rc=$?
+  if [ "$probe_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
+    echo "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER: a root-owned Stage C v4 authority cannot be consumed by the legacy symlink deploy." >&2
+    return "$CUTOVER_STAGE_C_INTERLOCK_RC"
+  fi
+  if [ "$probe_rc" -ne 0 ]; then
+    echo "BLOCKED_CUTOVER_AUTHORITY_AMBIGUOUS: the staged authority cannot be safely classified before legacy bootstrap." >&2
+    return "$CUTOVER_AUTHORITY_AMBIGUOUS_RC"
+  fi
   if validate_cutover_unit_inputs "$expected_revision" >/dev/null 2>&1; then
     return 0
   else
@@ -3147,6 +3284,11 @@ run_deploy() {
         write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
           "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
         exit 11
+      elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" ]; then
+        rm -rf "$tmp"
+        write_status "blocked_cutover_authority_ambiguous" "$sha" "$pr" \
+          "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+        exit 11
       else
         rm -rf "$tmp"
         write_status "blocked_cutover_unit_input_bootstrap_failed" "$sha" "$pr" \
@@ -3221,6 +3363,10 @@ run_deploy() {
   if [ "$unit_input_prepare_rc" -ne 0 ]; then
     if [ "$unit_input_prepare_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
       write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
+        "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+      exit 11
+    elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" ]; then
+      write_status "blocked_cutover_authority_ambiguous" "$sha" "$pr" \
         "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
       exit 11
     else

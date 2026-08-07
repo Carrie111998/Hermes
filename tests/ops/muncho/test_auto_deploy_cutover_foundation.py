@@ -6,7 +6,6 @@ import os
 import shutil
 import subprocess
 import sys
-from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -283,37 +282,30 @@ def test_legacy_deploy_never_downgrades_stage_c_v4_authority(
 ) -> None:
     original = v4_test._documents()
     documents = {
-        name: deepcopy(original[name])
-        for name in ("fixed", "unit_plan", "unit_approval")
+        "fixed": original["fixed"],
+        "plan": original["unit_plan"],
+        "approval": original["unit_approval"],
     }
-    if stage_c_document != "all":
-        for name in ("fixed", "unit_plan", "unit_approval"):
-            documents[name]["schema"] = "non-stage-c-authority.v1"
-        selected = {
-            "fixed": "fixed",
-            "plan": "unit_plan",
-            "approval": "unit_approval",
-        }[stage_c_document]
-        documents[selected]["schema"] = {
-            "fixed": "muncho-production-release-unit-inputs.v4",
-            "unit_plan": "muncho-production-release-unit-input-plan.v4",
-            "unit_approval": (
-                "muncho-production-release-unit-input-approval.v4"
-            ),
-        }[selected]
     revision = v4_test.TARGET
     staged = (tmp_path / "staged-v4").resolve()
     staged.mkdir(mode=0o700)
     plan_path = staged / "unit-input-plan.json"
     approval_path = staged / "unit-input-approval.json"
     output_path = staged / "production-unit-inputs.json"
-    plan_path.write_bytes(_canonical(documents["unit_plan"]))
-    approval_path.write_bytes(_canonical(documents["unit_approval"]))
-    output_path.write_bytes(_canonical(documents["fixed"]) + b"\n")
-    plan_path.chmod(0o400)
-    approval_path.chmod(0o400)
-    output_path.chmod(0o444)
-    for path in (staged, plan_path, approval_path, output_path):
+    paths = {
+        "fixed": output_path,
+        "plan": plan_path,
+        "approval": approval_path,
+    }
+    modes = {"fixed": 0o444, "plan": 0o400, "approval": 0o400}
+    selected_names = paths if stage_c_document == "all" else (stage_c_document,)
+    for name in selected_names:
+        suffix = b"\n" if name == "fixed" else b""
+        paths[name].write_bytes(_canonical(documents[name]) + suffix)
+        paths[name].chmod(modes[name])
+    for path in (staged, *paths.values()):
+        if not path.exists():
+            continue
         os.chown(path, os.geteuid(), os.getegid())
 
     bootstrap_marker = (tmp_path / "legacy-bootstrap-called").resolve()
@@ -339,6 +331,97 @@ printf '%s\n' "$rc"
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip() == "42"
     assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+@pytest.mark.parametrize("stage_c_document", ("fixed", "plan", "approval"))
+def test_legacy_deploy_detects_validation_unreadable_stage_c_fragment(
+    tmp_path: Path,
+    stage_c_document: str,
+) -> None:
+    original = v4_test._documents()
+    documents = {
+        "fixed": original["fixed"],
+        "plan": original["unit_plan"],
+        "approval": original["unit_approval"],
+    }
+    staged = (tmp_path / "staged-v4-wrong-mode").resolve()
+    staged.mkdir(mode=0o700)
+    paths = {
+        "fixed": staged / "production-unit-inputs.json",
+        "plan": staged / "unit-input-plan.json",
+        "approval": staged / "unit-input-approval.json",
+    }
+    selected = paths[stage_c_document]
+    suffix = b"\n" if stage_c_document == "fixed" else b""
+    selected.write_bytes(_canonical(documents[stage_c_document]) + suffix)
+    selected.chmod(0o600)
+    for path in (staged, selected):
+        os.chown(path, os.geteuid(), os.getegid())
+
+    bootstrap_marker = (tmp_path / "wrong-mode-bootstrap-called").resolve()
+    body = f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(paths['plan']))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(paths['approval']))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(paths['fixed']))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "42"
+    assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+@pytest.mark.parametrize("opaque_document", ("fixed", "plan", "approval"))
+def test_legacy_deploy_never_bootstraps_over_unreadable_authority_fragment(
+    tmp_path: Path,
+    opaque_document: str,
+) -> None:
+    staged = (tmp_path / "staged-opaque-fragment").resolve()
+    staged.mkdir(mode=0o700)
+    paths = {
+        "fixed": staged / "production-unit-inputs.json",
+        "plan": staged / "unit-input-plan.json",
+        "approval": staged / "unit-input-approval.json",
+    }
+    paths[opaque_document].mkdir(mode=0o700)
+
+    bootstrap_marker = (tmp_path / "opaque-bootstrap-called").resolve()
+    body = f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(paths['plan']))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(paths['approval']))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(paths['fixed']))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "43"
+    assert "BLOCKED_CUTOVER_AUTHORITY_AMBIGUOUS" in completed.stderr
     assert not bootstrap_marker.exists()
 
 
