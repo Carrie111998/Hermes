@@ -1161,18 +1161,12 @@ def _path_escapes_sandbox(path: str, scratch: str) -> bool:
     if not raw:
         return False
     # `~` / `~user` always point at the real home — outside the sandbox.
-    if raw == "~" or raw.startswith("~/"):
+    if raw.startswith("~"):
         return True
-    # Relative `..` traversal is a classic escape (the cwd is pinned to scratch).
-    if raw.startswith(".."):
-        return True
-    if not os.path.isabs(raw):
-        return False  # relative paths resolve under scratch by default
-    try:
-        resolved = os.path.realpath(raw)
-    except Exception:
-        resolved = os.path.abspath(raw)
+
     scratch_resolved = os.path.realpath(scratch)
+    candidate = raw if os.path.isabs(raw) else os.path.join(scratch_resolved, raw)
+    resolved = os.path.realpath(candidate)
     return not (
         resolved == scratch_resolved
         or resolved.startswith(scratch_resolved + os.sep)
