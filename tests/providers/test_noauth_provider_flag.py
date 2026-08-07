@@ -183,10 +183,20 @@ class TestNoAuthProvider:
         from hermes_cli.auth import PROVIDER_REGISTRY
         assert "noauth-no-env" in PROVIDER_REGISTRY
 
-    def test_fetch_models_called_without_api_key(self, noauth_profile):
+    def test_fetch_models_called_without_api_key(self, noauth_profile, monkeypatch):
         """models.py must call fetch_models for auth_type=none even with empty key."""
         from hermes_cli.models import provider_model_ids
-        # This exercises the `if api_key or _p.auth_type == "none"` path
+
+        calls = []
+
+        def _fake_fetch_models(*args, **kwargs):
+            calls.append((args, kwargs))
+            return ["live-model"]
+
+        # Replace the profile's fetch_models with a recording stub so the test
+        # proves the hook actually runs for auth_type=none (the outer gate
+        # `auth_type in ("api_key", "none")` + inner `api_key or none` path).
+        monkeypatch.setattr(noauth_profile, "fetch_models", _fake_fetch_models)
         ids = provider_model_ids("noauth-preview", force_refresh=True)
-        # Returns fallback_models (empty tuple) or fetch_models result
-        assert isinstance(ids, list)
+        assert "live-model" in ids
+        assert calls, "fetch_models was never called for auth_type=none"
