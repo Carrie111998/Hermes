@@ -1077,6 +1077,11 @@ class SignalAdapter(BasePlatformAdapter):
             params["groupId"] = chat_id[6:]
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
+            # #80845: When replying to Note to Self (chat_id matches our own
+            # account), include notifySelf so the primary device renders the
+            # reply as an incoming message instead of self-authored sync.
+            if self._account_normalized and chat_id == self._account_normalized:
+                params["notifySelf"] = True
 
         logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
         result = await self._rpc("send", params)
@@ -1251,6 +1256,8 @@ class SignalAdapter(BasePlatformAdapter):
             base_params["groupId"] = chat_id[6:]
         else:
             base_params["recipient"] = [await self._resolve_recipient(chat_id)]
+            if self._account_normalized and chat_id == self._account_normalized:
+                base_params["notifySelf"] = True
 
         att_batches = [
             attachments[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
@@ -1403,6 +1410,8 @@ class SignalAdapter(BasePlatformAdapter):
             params["groupId"] = chat_id[6:]
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
+            if self._account_normalized and chat_id == self._account_normalized:
+                params["notifySelf"] = True
 
         result = await self._rpc("send", params)
         if result is not None:
@@ -1445,6 +1454,8 @@ class SignalAdapter(BasePlatformAdapter):
             params["groupId"] = chat_id[6:]
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
+            if self._account_normalized and chat_id == self._account_normalized:
+                params["notifySelf"] = True
 
         result = await self._rpc("send", params)
         if result is not None:
