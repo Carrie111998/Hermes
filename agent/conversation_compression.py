@@ -1909,6 +1909,7 @@ _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous tool call",
     "[Your active task list was preserved across context compression]",
     "[IMPORTANT: Background process ",
+    "You've reached the maximum number of tool-calling iterations allowed.",
 )
 
 
@@ -1931,6 +1932,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_dropped_toolcall_nudge",
+    "_max_iterations_nudge",
 )
 
 
