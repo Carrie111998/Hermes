@@ -32,15 +32,15 @@ def test_bundled_metadata_keeps_hermes_version_separate_and_history_append_only(
     bundle = load_release_bundle(ROOT)
 
     assert bundle.metadata.version > bundle.history.releases[-1].version
-    assert str(bundle.metadata.version) == "2.3.5"
+    assert str(bundle.metadata.version) == "2.3.6"
     assert (
         str(bundle.history.releases[-1].version),
         bundle.history.releases[-1].release_sha,
         bundle.history.releases[-1].record_kind,
         bundle.history.releases[-1].metadata_present_at_source,
     ) == (
-        "2.3.4",
-        "ab6e2235c3a566893f6d9ba63d654b1dd6c657e4",
+        "2.3.5",
+        "6b19f8edf5062f01659e352f55f8c671080ffdea",
         "source_release",
         True,
     )
