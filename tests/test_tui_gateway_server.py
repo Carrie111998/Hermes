@@ -9187,6 +9187,101 @@ def test_session_undo_allowed_when_idle():
         server._sessions.pop("sid", None)
 
 
+def test_session_undo_skips_legacy_compaction_handoff_without_display_kind():
+    """Undo removes the real exchange, not a persisted role=user handoff."""
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        HISTORICAL_TASK_HEADING,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+
+    handoff = {
+        "role": "user",
+        "content": (
+            f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n"
+            "User asked: 'already completed work'\n\n"
+            f"{_SUMMARY_END_MARKER}"
+        ),
+        COMPRESSED_SUMMARY_METADATA_KEY: True,
+        COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: True,
+        # Legacy persisted shape: no display_kind marker.
+    }
+    server._sessions["sid"] = _session(
+        running=False,
+        history=[
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+            handoff,
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["removed"] == 3
+        assert server._sessions["sid"]["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    "scaffolding_kind",
+    [
+        pytest.param("wire-summary", id="metadata-stripped-wire-summary"),
+        pytest.param("hidden-summary", id="modern-hidden-summary"),
+        pytest.param("continuation", id="compression-continuation"),
+    ],
+)
+def test_session_undo_skips_modern_compaction_scaffolding(scaffolding_kind):
+    """Modern reference/continuation rows are not undo turn boundaries."""
+    from agent.context_compressor import (
+        COMPRESSED_SUMMARY_METADATA_KEY,
+        COMPRESSION_CONTINUATION_USER_CONTENT,
+        SUMMARY_PREFIX,
+        _SUMMARY_END_MARKER,
+    )
+
+    if scaffolding_kind == "continuation":
+        scaffolding = {
+            "role": "user",
+            "content": COMPRESSION_CONTINUATION_USER_CONTENT,
+        }
+    else:
+        scaffolding = {
+            "role": "user",
+            "content": f"{SUMMARY_PREFIX}\nreference only\n{_SUMMARY_END_MARKER}",
+        }
+        if scaffolding_kind == "hidden-summary":
+            scaffolding[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            scaffolding["display_kind"] = "hidden"
+
+    first_exchange = [
+        {"role": "user", "content": "keep question"},
+        {"role": "assistant", "content": "keep answer"},
+    ]
+    server._sessions["sid"] = _session(
+        running=False,
+        history=first_exchange
+        + [
+            {"role": "user", "content": "undo question"},
+            {"role": "assistant", "content": "undo answer"},
+            scaffolding,
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
+        )
+
+        assert resp["result"]["removed"] == 3
+        assert server._sessions["sid"]["history"] == first_exchange
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_session_compress_rejects_while_running(monkeypatch):
     server._sessions["sid"] = _session(running=True)
     try:
