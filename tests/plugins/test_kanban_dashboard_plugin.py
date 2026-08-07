@@ -33,7 +33,8 @@ def _load_plugin_router():
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
 
     spec = importlib.util.spec_from_file_location(
-        "hermes_dashboard_plugin_kanban_test", plugin_file,
+        "hermes_dashboard_plugin_kanban_test",
+        plugin_file,
     )
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -66,13 +67,21 @@ def client(kanban_home):
 
 
 def test_board_empty(client):
-    r = client.get("/api/plugins/kanban/board")
+    r = client.get("/api/plugins/kanban/board", params={"board": "default"})
     assert r.status_code == 200
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
     assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for expected in (
+        "triage",
+        "todo",
+        "scheduled",
+        "ready",
+        "running",
+        "blocked",
+        "done",
+    ):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
@@ -105,7 +114,7 @@ def test_create_task_appears_on_board(client):
     task_id = task["id"]
 
     # Board now lists it under 'ready'.
-    r = client.get("/api/plugins/kanban/board")
+    r = client.get("/api/plugins/kanban/board", params={"board": "default"})
     assert r.status_code == 200
     data = r.json()
     ready = next(c for c in data["columns"] if c["name"] == "ready")
@@ -155,7 +164,7 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     finally:
         conn.close()
 
-    r = client.get("/api/plugins/kanban/board")
+    r = client.get("/api/plugins/kanban/board", params={"board": "default"})
     assert r.status_code == 200
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
     assert any(t["id"] == task["id"] for t in columns["scheduled"])
@@ -166,12 +175,16 @@ def test_tenant_filter(client):
     client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
     client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
 
-    r = client.get("/api/plugins/kanban/board?tenant=t1")
+    r = client.get(
+        "/api/plugins/kanban/board", params={"board": "default", "tenant": "t1"}
+    )
     counts = {c["name"]: len(c["tasks"]) for c in r.json()["columns"]}
     total = sum(counts.values())
     assert total == 1
 
-    r = client.get("/api/plugins/kanban/board?tenant=t2")
+    r = client.get(
+        "/api/plugins/kanban/board", params={"board": "default", "tenant": "t2"}
+    )
     total = sum(len(c["tasks"]) for c in r.json()["columns"])
     assert total == 1
 
@@ -185,8 +198,11 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 
     assert "function sanitizeMarkdownHtml(html)" in js
     assert "MARKDOWN_ALLOWED_TAGS" in js
-    assert "sanitizeMarkdownHtml(renderMarkdown(props.source || \"\"))" in js
-    assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
+    assert 'sanitizeMarkdownHtml(renderMarkdown(props.source || ""))' in js
+    assert (
+        'dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || "") }'
+        not in js
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +212,8 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 
 def test_task_detail_includes_links_and_events(client):
     parent = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "parent"},
+        "/api/plugins/kanban/tasks",
+        json={"title": "parent"},
     ).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
@@ -205,14 +222,18 @@ def test_task_detail_includes_links_and_events(client):
     assert child["status"] == "todo"  # parent not done yet
 
     # Detail for the child shows the parent link.
-    r = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
+    r = client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}", params={"board": "default"}
+    )
     assert r.status_code == 200
     data = r.json()
     assert data["task"]["id"] == child["id"]
     assert parent["id"] in data["links"]["parents"]
 
     # Detail for the parent shows the child.
-    r = client.get(f"/api/plugins/kanban/tasks/{parent['id']}")
+    r = client.get(
+        f"/api/plugins/kanban/tasks/{parent['id']}", params={"board": "default"}
+    )
     assert child["id"] in r.json()["links"]["children"]
 
     # Events exist from creation.
@@ -231,7 +252,9 @@ def test_reopening_parent_demotes_ready_child(client):
     should not keep showing a stale child as ready after an operator drags
     its parent back out of done for more work.
     """
-    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()[
+        "task"
+    ]
     child = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "c", "parents": [parent["id"]]},
@@ -245,7 +268,7 @@ def test_reopening_parent_demotes_ready_child(client):
     assert r.status_code == 200
 
     child_after_done = client.get(
-        f"/api/plugins/kanban/tasks/{child['id']}"
+        f"/api/plugins/kanban/tasks/{child['id']}", params={"board": "default"}
     ).json()["task"]
     assert child_after_done["status"] == "ready"
 
@@ -256,7 +279,7 @@ def test_reopening_parent_demotes_ready_child(client):
     assert r.status_code == 200
 
     child_after_reopen = client.get(
-        f"/api/plugins/kanban/tasks/{child['id']}"
+        f"/api/plugins/kanban/tasks/{child['id']}", params={"board": "default"}
     ).json()["task"]
     assert child_after_reopen["status"] == "todo"
 
@@ -265,20 +288,23 @@ def test_reopening_parent_demotes_ready_child(client):
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
+
 def test_delete_task(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()[
+        "task"
+    ]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
     assert r.json()["task_id"] == t["id"]
 
     # Gone from board
-    board = client.get("/api/plugins/kanban/board").json()
+    board = client.get("/api/plugins/kanban/board", params={"board": "default"}).json()
     all_ids = [tt["id"] for col in board["columns"] for tt in col["tasks"]]
     assert t["id"] not in all_ids
 
     # Gone from detail
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}", params={"board": "default"})
     assert r.status_code == 404
 
 
@@ -295,7 +321,7 @@ def test_add_comment(client):
     )
     assert r.status_code == 200
 
-    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}", params={"board": "default"})
     comments = r.json()["comments"]
     assert len(comments) == 1
     assert comments[0]["body"] == "how's progress?"
@@ -372,6 +398,7 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 
     # No token → policy violation close.
     from starlette.websockets import WebSocketDisconnect
+
     with pytest.raises(WebSocketDisconnect) as exc:
         with c.websocket_connect("/api/plugins/kanban/events"):
             pass
@@ -384,11 +411,8 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
     assert exc.value.code == 1008
 
     # Correct token → accepted (connect then close cleanly from our side).
-    with c.websocket_connect(
-        "/api/plugins/kanban/events?token=secret-xyz"
-    ) as ws:
+    with c.websocket_connect("/api/plugins/kanban/events?token=secret-xyz") as ws:
         assert ws is not None  # handshake succeeded
-
 
     # The bug symptom was a traceback; we don't assert on stderr because
     # capturing asyncio's internal "exception was never retrieved" logging
@@ -406,16 +430,20 @@ def test_bulk_status_ready(client):
     c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
     # Parent-less tasks land in "ready" already; push them to blocked first.
     for tid in (a["id"], b["id"], c2["id"]):
-        client.patch(f"/api/plugins/kanban/tasks/{tid}",
-                     json={"status": "blocked", "block_reason": "wait"})
+        client.patch(
+            f"/api/plugins/kanban/tasks/{tid}",
+            json={"status": "blocked", "block_reason": "wait"},
+        )
 
-    r = client.post("/api/plugins/kanban/tasks/bulk",
-                    json={"ids": [a["id"], b["id"], c2["id"]], "status": "ready"})
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"], c2["id"]], "status": "ready"},
+    )
     assert r.status_code == 200
     results = r.json()["results"]
     assert all(r["ok"] for r in results)
     # All three are now ready.
-    board = client.get("/api/plugins/kanban/board").json()
+    board = client.get("/api/plugins/kanban/board", params={"board": "default"}).json()
     ready = next(col for col in board["columns"] if col["name"] == "ready")
     ids = {t["id"] for t in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
@@ -452,9 +480,12 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    r = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"}
+    )
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
+
     conn = kb.connect()
     try:
         kb.claim_task(conn, tid)
@@ -463,7 +494,7 @@ def test_event_dict_includes_run_id(client):
     finally:
         conn.close()
 
-    r = client.get(f"/api/plugins/kanban/tasks/{tid}")
+    r = client.get(f"/api/plugins/kanban/tasks/{tid}", params={"board": "default"})
     assert r.status_code == 200
     events = r.json()["events"]
     # Every event in the response must have a run_id key (None or int).
@@ -553,6 +584,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
     a manual reclaimed event."""
     import secrets
+
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="running", assignee="x")
@@ -587,7 +619,8 @@ def test_reclaim_endpoint_releases_running_claim(client):
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
+            "SELECT status, claim_lock FROM tasks WHERE id=?",
+            (t,),
         ).fetchone()
         assert row["status"] == "ready"
         assert row["claim_lock"] is None
@@ -613,7 +646,8 @@ def test_reassign_endpoint_switches_profile(client):
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT assignee FROM tasks WHERE id=?", (t,),
+            "SELECT assignee FROM tasks WHERE id=?",
+            (t,),
         ).fetchone()
         assert row["assignee"] == "newbie"
     finally:
@@ -631,9 +665,12 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
         parent = kb.create_task(conn, title="parent", assignee="alice")
         real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
         import pytest as _pytest
+
         with _pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(
-                conn, parent, summary="phantom",
+                conn,
+                parent,
+                summary="phantom",
                 created_cards=[real, "t_ffff00001234"],
             )
     finally:
@@ -681,9 +718,7 @@ def test_specify_happy_path(client, monkeypatch):
 
     _patch_specifier_response(
         monkeypatch,
-        content=jsonlib.dumps(
-            {"title": "Polished", "body": "**Goal**\nDo the thing."}
-        ),
+        content=jsonlib.dumps({"title": "Polished", "body": "**Goal**\nDo the thing."}),
     )
 
     r = client.post(
@@ -697,7 +732,9 @@ def test_specify_happy_path(client, monkeypatch):
     assert body["new_title"] == "Polished"
 
     # Task should have moved off the triage column.
-    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()["task"]
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{t['id']}", params={"board": "default"}
+    ).json()["task"]
     assert detail["status"] in {"todo", "ready"}
     assert detail["title"] == "Polished"
     assert "**Goal**" in (detail["body"] or "")
@@ -706,5 +743,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-
