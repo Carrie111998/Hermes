@@ -59,6 +59,21 @@ echo "Owner: $OWNER, Repo: $REPO"
 
 This part is pure `git` — identical either way:
 
+### Minimum-diff gate
+
+Unless the user explicitly requests another base or broader scope, start from the current remote `main` and keep the branch limited to the stated deliverable.
+
+Before implementation:
+
+1. Fetch and verify `origin/main`.
+2. Create the worktree/branch from `origin/main`, not from an existing feature branch, backup branch, or worktree with unrelated changes.
+3. Write down the requested outcome and the files/features that are actually required.
+4. Check `git diff --stat origin/main...HEAD` and inspect any pre-existing commits before editing.
+5. Treat related functionality as out of scope unless the task has a concrete dependency: an import, route, schema, runtime call, or failing verification that proves it is required.
+6. If a broader change appears necessary, stop and report the evidence before adding it.
+
+After implementation, review the final diff against `origin/main` and remove unrelated routes, fixtures, snapshots, generated artifacts, and feature code. A previous branch or backup containing related work is context, not an implicit dependency.
+
 ```bash
 # Make sure you're up to date
 git fetch origin
