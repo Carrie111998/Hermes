@@ -1473,6 +1473,21 @@ def on_session_finalize(*, session_id: str = "", **_: Any) -> None:
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finalize flush failed: {exc}")
 
+    # Explicitly shut down the Langfuse client at the true session boundary
+    # while the interpreter is still alive.  The Langfuse SDK registers its
+    # own atexit shutdown handler, but that runs during interpreter
+    # finalization — by then module globals (notably opentelemetry.trace.Span)
+    # may already be torn down to None, and the SDK's span-finalization path
+    # (use_span -> isinstance(span, Span)) raises "TypeError: isinstance()
+    # arg 2 must be a type" which surfaces as a noisy "Exception ignored in:
+    # <generator>" traceback on quit.  Calling shutdown() here flushes pending
+    # spans and joins the background export threads while all modules are
+    # intact; the SDK's atexit handler then becomes a no-op.
+    try:
+        client.shutdown()
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"langfuse shutdown failed: {exc}")
+
 
 def on_subagent_start(*, parent_session_id: Any = None, parent_turn_id: str = "",
                       parent_subagent_id: Any = None, child_session_id: Any = None,
