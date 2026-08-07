@@ -4,7 +4,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
+import { persistInFlightTurnState, sweepExpiredInFlightTurnJournals } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
@@ -56,6 +56,14 @@ export function useSessionStateCache({
   const busy = useStore($busy)
   const activeSessionIdRef = useRef<string | null>(activeSessionId)
   const selectedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
+
+  // The journal's retention window is its whole confidentiality bound, so it
+  // must not depend on the user happening to open a session: the sweep inside
+  // the journal's own load only runs when some other call reaches it. This hook
+  // owns the write path, so it is where the bound gets made unconditional.
+  useEffect(() => {
+    sweepExpiredInFlightTurnJournals()
+  }, [])
 
   // Mirror the latest prop into its ref synchronously during render — not via
   // a passive useEffect, which only fires a frame after paint and left the
@@ -303,7 +311,11 @@ export function useSessionStateCache({
       // Crash-survivable turn progress: journal the running turn's visible
       // tail (throttled localStorage write; cleared the moment the turn
       // settles) so a renderer/app death mid-turn can be recovered on resume.
-      persistInFlightTurnState(next)
+      // The RUNTIME id is passed because `next.storedSessionId` ROTATES mid-turn
+      // (see `ensureSessionState` above): it is the journal's only rotation-proof
+      // link back to the key this write supersedes, so the old key cannot be
+      // stranded holding the same prompt and tool args.
+      persistInFlightTurnState(next, sessionId)
       // Publishing to $sessionStates automatically fires transition side-effects
       // (watchdog, settle grace, unread marker, compression id rotation) inside
       // publishSessionState — no manual transition call needed.

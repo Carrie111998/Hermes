@@ -15,6 +15,8 @@ import { sessionTitle } from '@/lib/chat-runtime'
 import { pathLeaf } from '@/lib/display-path'
 import { triggerHaptic } from '@/lib/haptics'
 import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
+import { purgeInFlightTurnJournals } from '@/lib/inflight-turn-journal'
+import { clearQueuedPrompts } from '@/store/composer-queue'
 import { notify, notifyError } from '@/store/notifications'
 import { untombstoneSessions } from '@/store/projects'
 import { applyConfiguredDefaultProjectDir, ensureDefaultWorkspaceCwd, setSessions } from '@/store/session'
@@ -83,6 +85,14 @@ export function SessionsSettings() {
 
       try {
         await deleteSession(session.id, session.profile)
+        // Same contract as the sidebar delete: a deleted session must not leave
+        // a copy of the user's prompt text in localStorage. Both stores hold it —
+        // the journal keeps the in-flight tail, the composer queue keeps unsent
+        // entries — and both are keyed on either the stored tip or the durable
+        // lineage root (`resolveComposerSessionKey`), so both ids are cleared.
+        purgeInFlightTurnJournals([session.id, session._lineage_root_id])
+        clearQueuedPrompts(session.id)
+        clearQueuedPrompts(session._lineage_root_id)
         setLocalSessions(prev => prev.filter(s => s.id !== session.id))
         triggerHaptic('warning')
       } catch (err) {
