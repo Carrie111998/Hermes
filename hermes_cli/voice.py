@@ -981,7 +981,7 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
             tts_text = prepare_spoken_text(text, max_chars=4000)
         except Exception:
             # Legacy fallback pipeline — keep speak_text best-effort.
-            tts_text = text[:4000] if len(text) > 4000 else text
+            tts_text = text[:10000] if len(text) > 10000 else text
             tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)             # fenced code blocks
             tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)    # [text](url) → text
             tts_text = re.sub(r'https?://\S+', '', tts_text)                # bare URLs

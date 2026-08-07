@@ -163,13 +163,12 @@ def _make_update_side_effect(
 
 
 # ---------------------------------------------------------------------------
-# reset --hard failure — don't attempt stash restore
+# Diverged history → preserve local commits with rebase
 # ---------------------------------------------------------------------------
 
-def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, capsys):
-    """When reset --hard fails, stash restore is skipped with a helpful message."""
+def test_cmd_update_rebases_and_preserves_local_commits(monkeypatch, tmp_path, capsys):
+    """Divergence must rebase local commits, never reset them away."""
     _setup_update_mocks(monkeypatch, tmp_path)
-    # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
         hermes_main, "_stash_local_changes_if_needed",
         lambda *a, **kw: "abc123deadbeef",
@@ -180,17 +179,17 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
         lambda *a, **kw: restore_calls.append(1) or True,
     )
 
-    side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
-    with pytest.raises(SystemExit, match="1"):
-        hermes_main.cmd_update(SimpleNamespace())
+    hermes_main.cmd_update(SimpleNamespace())
 
-    # Stash restore should NOT have been called
-    assert len(restore_calls) == 0
+    assert any("rebase" in call and "origin/main" in call for call in recorded)
+    assert not any("reset" in call and "--hard" in call for call in recorded)
+    assert len(restore_calls) == 1
 
     out = capsys.readouterr().out
-    assert "preserved in stash" in out
+    assert "preserved and rebased" in out
 
 
 # ---------------------------------------------------------------------------
