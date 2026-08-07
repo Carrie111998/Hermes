@@ -258,6 +258,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 summary_sha256=arguments.summary_sha256,
                 attempt_receipt_sha256=arguments.attempt_receipt_sha256,
             )
+            health = release_health(
+                arguments.state_dir,
+                version=completion["muncho_version"],
+                release_sha=completion["release_sha"],
+            )
+            if health["healthy"] is not True:
+                raise ReleaseCompletionError(
+                    "muncho_release_completion_health_unconfirmed"
+                )
             _emit({
                 "schema": "muncho-release-coordinator-completion.v1",
                 "muncho_version": completion["muncho_version"],
@@ -267,7 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "codex_task_delivery_receipt_sha256": codex["receipt_sha256"],
                 "completion_receipt_sha256": completion["receipt_sha256"],
                 "release_completion": "complete",
-                "healthy": True,
+                "healthy": health["healthy"],
             })
             return 0
         projection = release_status if arguments.command == "status" else release_health

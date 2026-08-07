@@ -1126,8 +1126,23 @@ def _gateway_discord_request_binds(
     """Return whether one validated request belongs to the full release chain."""
 
     destination = draft["discord_destination"]
+    identity = (
+        draft["muncho_version"],
+        draft["release_sha"],
+        draft["release_idempotency_key"],
+    )
     return (
-        request["attempt_receipt_sha256"] == discord_attempt["receipt_sha256"]
+        all(
+            (
+                item["muncho_version"],
+                item["release_sha"],
+                item["release_idempotency_key"],
+            )
+            == identity
+            for item in (request, restart, smoke, draft, discord_attempt)
+        )
+        and request["attempt_receipt_sha256"]
+        == discord_attempt["receipt_sha256"]
         and request["draft_receipt_sha256"] == draft["receipt_sha256"]
         and request["restart_attestation_receipt_sha256"]
         == restart["receipt_sha256"]

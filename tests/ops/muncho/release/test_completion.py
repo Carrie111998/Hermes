@@ -20,6 +20,7 @@ from ops.muncho.release.completion import (
     record_production_smoke,
     record_reserved_summary_delivery,
     release_health,
+    release_idempotency_key,
     release_status,
     reserve_codex_task_summary,
     reserve_release_mapping,
@@ -137,9 +138,9 @@ def _record_gateway_delivery(
     )
 
 
-def _tamper_and_reseal(path: Path, field: str, value: str) -> None:
+def _tamper_and_reseal(path: Path, changes: dict[str, str]) -> None:
     record = json.loads(path.read_text(encoding="ascii"))
-    record[field] = value
+    record.update(changes)
     record.pop("receipt_sha256")
     record["receipt_sha256"] = sha256_bytes(canonical_bytes(record))
     path.write_bytes(canonical_bytes(record) + b"\n")
@@ -424,17 +425,30 @@ def test_gateway_request_is_mandatory_for_terminal_completion_and_health(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    "changes",
     [
-        ("after_invocation_id", "3" * 32),
-        ("channel_id", "333456789012345678"),
+        {"after_invocation_id": "3" * 32},
+        {"channel_id": "333456789012345678"},
+        {
+            "release_sha": "b" * 40,
+            "release_idempotency_key": release_idempotency_key(
+                "2.3.2",
+                "b" * 40,
+            ),
+        },
+        {
+            "muncho_version": "9.9.9",
+            "release_idempotency_key": release_idempotency_key(
+                "9.9.9",
+                RELEASE_SHA,
+            ),
+        },
     ],
 )
 def test_coordinator_complete_rejects_tampered_gateway_request_chain(
     tmp_path: Path,
     capsys,
-    field: str,
-    value: str,
+    changes: dict[str, str],
 ):
     state, _mapping, _smoke, draft = _draft(tmp_path)
     _record_gateway_delivery(state, draft)
@@ -449,8 +463,7 @@ def test_coordinator_complete_rejects_tampered_gateway_request_chain(
     assert created is True
     _tamper_and_reseal(
         next(state.glob("gateway-discord-request-*.json")),
-        field,
-        value,
+        changes,
     )
 
     result = cli.main([
