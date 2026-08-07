@@ -218,6 +218,13 @@ ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
 
+# Directory plugins share the process-global ``hermes_plugins`` import
+# namespace even though multiplex gateways keep one PluginManager per profile.
+# Serialize discovery across managers so two routed profiles cannot overwrite
+# the same package entry while one of them is still importing its submodules.
+# Re-entrant because a plugin's register() path may trigger discovery again.
+_PLUGIN_DISCOVERY_LOCK = threading.RLock()
+
 
 def _env_enabled(name: str) -> bool:
     """Return True when an env var is set to a truthy opt-in value."""
@@ -1296,6 +1303,11 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     def discover_and_load(self, force: bool = False) -> None:
+        """Serialize plugin imports across profile-scoped managers."""
+        with _PLUGIN_DISCOVERY_LOCK:
+            self._discover_and_load_serialized(force=force)
+
+    def _discover_and_load_serialized(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
 
         When ``force`` is true, clear cached discovery state first so config

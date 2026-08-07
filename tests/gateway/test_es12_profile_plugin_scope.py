@@ -8,6 +8,8 @@ plugin registry and its own ``plugins/`` directory was never scanned.
 """
 
 from pathlib import Path
+import threading
+import time
 
 import pytest
 import yaml
@@ -111,6 +113,54 @@ def test_profile_hooks_do_not_bleed(two_profiles):
 
     assert results_a == ["es12_plugin_a"]
     assert results_b == ["es12_plugin_b"]
+
+
+def test_profile_discovery_is_serialized_across_managers(two_profiles, monkeypatch):
+    """Concurrent profile startup must not race imports in a shared namespace."""
+    from gateway.run import _profile_runtime_scope
+
+    profile_a, profile_b = two_profiles
+    start = threading.Barrier(2)
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+    errors = []
+
+    def observe_discovery(_manager):
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with state_lock:
+            active -= 1
+
+    monkeypatch.setattr(
+        plugins_mod.PluginManager,
+        "_discover_and_load_inner",
+        observe_discovery,
+    )
+
+    def discover(home):
+        try:
+            start.wait(timeout=1)
+            with _profile_runtime_scope(home):
+                plugins_mod.discover_plugins()
+        except BaseException as exc:  # pragma: no cover - failure capture
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=discover, args=(profile_a,)),
+        threading.Thread(target=discover, args=(profile_b,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert max_active == 1
 
 
 def test_single_profile_gateway_behaviour_unchanged(tmp_path, monkeypatch):
