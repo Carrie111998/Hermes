@@ -646,7 +646,11 @@ def _build_apikey_providers_list() -> list:
             def _normalize_provider(_name: str) -> str:
                 return (_name or "").strip().lower()
         for _pp in list_providers():
-            if not isinstance(_pp, _PP) or _pp.auth_type != "api_key" or not _pp.env_vars:
+            if not isinstance(_pp, _PP):
+                continue
+            if _pp.auth_type not in ("api_key", "none"):
+                continue
+            if not _pp.env_vars and _pp.auth_type == "api_key":
                 continue
             _label = _pp.display_name or _pp.name
             if _label in _known_names or _pp.name in _known_canonical:
@@ -667,7 +671,7 @@ def _build_apikey_providers_list() -> list:
                 (v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")),
                 None,
             )
-            if not _key_vars:
+            if not _key_vars and _pp.auth_type == "api_key":
                 continue
             _models_url = (
                 (_pp.models_url or (_pp.base_url.rstrip("/") + "/models"))
