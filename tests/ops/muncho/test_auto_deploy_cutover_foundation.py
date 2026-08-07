@@ -6,7 +6,10 @@ import os
 import shutil
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from tests.gateway.test_canonical_writer_production_cutover import (
@@ -270,10 +273,34 @@ bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision}
     assert not (tmp_path / "active").exists()
 
 
+@pytest.mark.parametrize(
+    "stage_c_document",
+    ("all", "fixed", "plan", "approval"),
+)
 def test_legacy_deploy_never_downgrades_stage_c_v4_authority(
     tmp_path: Path,
+    stage_c_document: str,
 ) -> None:
-    documents = v4_test._documents()
+    original = v4_test._documents()
+    documents = {
+        name: deepcopy(original[name])
+        for name in ("fixed", "unit_plan", "unit_approval")
+    }
+    if stage_c_document != "all":
+        for name in ("fixed", "unit_plan", "unit_approval"):
+            documents[name]["schema"] = "non-stage-c-authority.v1"
+        selected = {
+            "fixed": "fixed",
+            "plan": "unit_plan",
+            "approval": "unit_approval",
+        }[stage_c_document]
+        documents[selected]["schema"] = {
+            "fixed": "muncho-production-release-unit-inputs.v4",
+            "unit_plan": "muncho-production-release-unit-input-plan.v4",
+            "unit_approval": (
+                "muncho-production-release-unit-input-approval.v4"
+            ),
+        }[selected]
     revision = v4_test.TARGET
     staged = (tmp_path / "staged-v4").resolve()
     staged.mkdir(mode=0o700)

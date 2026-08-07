@@ -31,6 +31,7 @@ CUTOVER_ACTIVATION_LOCK_PATH="/run/muncho-writer-activation.lock"
 CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"
 CUTOVER_UNIT_INPUTS_FD_ENV="MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
+CUTOVER_STAGE_C_INTERLOCK_RC=42
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
 RELEASE_RETENTION_HELPER_RELATIVE_PATH="ops/muncho/runtime/release_retention.py"
@@ -1325,7 +1326,8 @@ validate_cutover_unit_inputs() {
     "$CUTOVER_UNIT_INPUT_APPROVAL_PATH" \
     "$CUTOVER_STAGED_TRUSTED_UID" \
     "$CUTOVER_STAGED_TRUSTED_GID" \
-    "$expected_revision" <<'PY'
+    "$expected_revision" \
+    "$CUTOVER_STAGE_C_INTERLOCK_RC" <<'PY'
 import hashlib
 import ipaddress
 import json
@@ -1342,7 +1344,6 @@ APPROVAL_SCHEMA = "muncho-production-cutover-unit-input-approval.v3"
 STAGE_C_UNIT_SCHEMA = "muncho-production-release-unit-inputs.v4"
 STAGE_C_PLAN_SCHEMA = "muncho-production-release-unit-input-plan.v4"
 STAGE_C_APPROVAL_SCHEMA = "muncho-production-release-unit-input-approval.v4"
-STAGE_C_REQUIRES_PINNED_UPDATER = 42
 RECONCILIATION_SCHEMA = "muncho-production-discord-reconciliation-intent.v1"
 RECONCILIATION_PURPOSE = "production_discord_policy_reconciliation"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -1415,6 +1416,7 @@ approval_path = Path(sys.argv[3])
 trusted_uid = int(sys.argv[4])
 trusted_gid = int(sys.argv[5])
 expected_revision = sys.argv[6]
+stage_c_interlock_rc = int(sys.argv[7])
 
 
 class GateError(RuntimeError):
@@ -1532,25 +1534,22 @@ approval_raw = read_exact(approval_path, mode=0o400, maximum=1024 * 1024)
 unit = decode(unit_raw, newline=True)
 plan = decode(plan_raw, newline=False)
 approval = decode(approval_raw, newline=False)
-plan_sha256 = self_digest(plan, "plan_sha256")
-approval_sha256 = self_digest(approval, "approval_sha256")
-if (
-    unit.get("schema") == STAGE_C_UNIT_SCHEMA
-    and plan.get("schema") == STAGE_C_PLAN_SCHEMA
-    and approval.get("schema") == STAGE_C_APPROVAL_SCHEMA
-    and unit.get("release_revision") == expected_revision
-    and plan.get("release_revision") == expected_revision
-    and approval.get("release_revision") == expected_revision
-    and unit.get("unit_input_authority_plan_sha256") == plan_sha256
-    and unit.get("unit_input_authority_approval_sha256") == approval_sha256
+if any(
+    observed == stage_c
+    for observed, stage_c in (
+        (unit.get("schema"), STAGE_C_UNIT_SCHEMA),
+        (plan.get("schema"), STAGE_C_PLAN_SCHEMA),
+        (approval.get("schema"), STAGE_C_APPROVAL_SCHEMA),
+    )
 ):
-    self_digest(unit, "fixed_inputs_sha256")
     # The legacy deploy publishes an ai-platform-brain-owned release and runs
     # target packaging code as that unprivileged identity.  Stage C v4 instead
     # authorizes a root-owned release produced by the still-inert pinned
     # release-updater boundary.  Never reinterpret or replace that authority
     # with the target's legacy v3 bootstrap.
-    raise SystemExit(STAGE_C_REQUIRES_PINNED_UPDATER)
+    raise SystemExit(stage_c_interlock_rc)
+plan_sha256 = self_digest(plan, "plan_sha256")
+approval_sha256 = self_digest(approval, "approval_sha256")
 runtime_attestation = plan.get("owner_runtime_attestation")
 if not isinstance(runtime_attestation, dict):
     raise GateError("cutover_unit_inputs_owner_runtime_invalid")
@@ -1814,9 +1813,9 @@ prepare_legacy_cutover_unit_inputs() {
   else
     validation_rc=$?
   fi
-  if [ "$validation_rc" -eq 42 ]; then
+  if [ "$validation_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
     echo "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER: a root-owned Stage C v4 authority cannot be consumed by the legacy symlink deploy." >&2
-    return 42
+    return "$CUTOVER_STAGE_C_INTERLOCK_RC"
   fi
   bootstrap_cutover_unit_inputs_from_target \
     "$target_release" "$expected_revision" >/dev/null
@@ -3143,7 +3142,7 @@ run_deploy() {
     prepare_legacy_cutover_unit_inputs "$tmp" "$sha" \
       || unit_input_prepare_rc=$?
     if [ "$unit_input_prepare_rc" -ne 0 ]; then
-      if [ "$unit_input_prepare_rc" -eq 42 ]; then
+      if [ "$unit_input_prepare_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
         rm -rf "$tmp"
         write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
           "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
@@ -3220,7 +3219,7 @@ run_deploy() {
   prepare_legacy_cutover_unit_inputs "$new" "$sha" \
     || unit_input_prepare_rc=$?
   if [ "$unit_input_prepare_rc" -ne 0 ]; then
-    if [ "$unit_input_prepare_rc" -eq 42 ]; then
+    if [ "$unit_input_prepare_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
       write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
         "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
       exit 11
