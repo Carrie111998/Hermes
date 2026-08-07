@@ -363,6 +363,35 @@ def get_running_job_ids() -> "frozenset[str]":
         return frozenset(_running_job_ids)
 
 
+def try_register_running_job(job_id: str) -> bool:
+    """Atomically add ``job_id`` to the in-flight running set.
+
+    Returns False (without registering) when the job is already mid-run —
+    the caller must skip the fire. This is the single dedupe owner shared by
+    the ticker's ``_submit_with_guard`` and manual runs
+    (``tools/cronjob_tools``): the fire claim alone cannot prevent a
+    double-fire because its TTL (300s) is routinely outlived by real jobs,
+    after which a manual ``cronjob(action='run')`` would claim successfully
+    and run the same job concurrently (idea from #53395 by @izumi0uu).
+
+    Registration also makes the run visible to ``get_running_job_ids`` (the
+    gateway shutdown drain, #60432) and ``mark_running_jobs_interrupted``.
+    Callers MUST pair a successful registration with
+    ``release_running_job`` in a ``finally`` block.
+    """
+    with _running_lock:
+        if job_id in _running_job_ids:
+            return False
+        _running_job_ids.add(job_id)
+        return True
+
+
+def release_running_job(job_id: str) -> None:
+    """Remove ``job_id`` from the in-flight running set (idempotent)."""
+    with _running_lock:
+        _running_job_ids.discard(job_id)
+
+
 def mark_running_jobs_interrupted(reason: str) -> list:
     """Best-effort: mark every currently in-flight cron job interrupted.
 
@@ -2455,7 +2484,11 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+def _build_job_prompt(
+    job: dict,
+    prerun_script: Optional[tuple] = None,
+    extra_prompt: Optional[str] = None,
+) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
     Args:
@@ -2465,8 +2498,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             When provided, the script is not re-executed and the cached
             result is used for prompt injection. When omitted, the script
             (if any) runs inline as before.
+        extra_prompt: Optional per-run context (from ``cronjob(action='run')``,
+            #57331 — salvaged from #57342 by @liuhao1024). Appended to the
+            stored prompt under a ``## Run Context`` header for this single
+            fire only — never persisted to the job definition.
     """
     user_prompt = str(job.get("prompt") or "")
+    if extra_prompt:
+        user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
     prompt = user_prompt
     skills = job.get("skills")
     # True when runtime-collected DATA (script stdout, upstream-job output)
@@ -2777,7 +2816,8 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict, *, defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2791,6 +2831,10 @@ def run_job(
     torn-down async client (defense-in-depth alongside the interpreter-shutdown
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
+
+    ``extra_prompt``: optional per-run context from ``cronjob(action='run',
+    prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
+    never persisted to the job definition.
 
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
@@ -3000,7 +3044,9 @@ def run_job(
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = _build_job_prompt(
+            job, prerun_script=prerun_script, extra_prompt=extra_prompt
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3927,7 +3973,10 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict, *, adapters=None, loop=None, verbose: bool = False,
+    extra_prompt: Optional[str] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3995,7 +4044,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                extra_prompt=extra_prompt,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4288,11 +4338,9 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+            if not try_register_running_job(job_id):
+                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                return None
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
@@ -4303,14 +4351,12 @@ def tick(
                 try:
                     return ctx.run(_process_job, j)
                 finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                    release_running_job(j["id"])
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                release_running_job(job_id)
                 finish_execution(
                     execution["id"],
                     success=False,

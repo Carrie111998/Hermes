@@ -24,7 +24,6 @@ import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
 import { $gateway } from '@/store/gateway'
-import { reconnectGateway } from '@/store/gateway-reconnect'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
@@ -95,9 +94,6 @@ export const host = {
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
-
-  /** Re-resolve the active connection and re-dial its socket without restarting the backend. */
-  reconnectGateway: async () => reconnectGateway(),
 
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
