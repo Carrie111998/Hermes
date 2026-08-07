@@ -120,7 +120,7 @@ class TestMissingProviderKeyBlocks:
         assert agent_constructed is False
         assert success is False
         assert error is not None
-        assert "[blocked_config]" in error
+        assert error.startswith("provider credential missing:")
         assert "blocked" in output.lower() or "BLOCKED" in output
 
     def test_single_alert_across_two_ticks_and_blocked_status(self, tmp_path):
@@ -129,7 +129,9 @@ class TestMissingProviderKeyBlocks:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(
+            job, content, adapters=None, loop=None, *, delivery_observation=None
+        ):
             deliveries.append(content)
             return None
 
@@ -233,7 +235,9 @@ class TestOptOut:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(
+            job, content, adapters=None, loop=None, *, delivery_observation=None
+        ):
             deliveries.append(content)
             return None
 
@@ -287,7 +291,7 @@ class TestSkillReadiness:
 
         assert agent_constructed is False
         assert success is False
-        assert error is not None and "[blocked_config]" in error
+        assert error is not None and "is not ready" in error
         assert "NEEDY_API_KEY" in f"{error} {output}"
 
     def test_ready_skill_runs(self, tmp_path):
@@ -326,7 +330,7 @@ class TestDeliveryPlatform:
 
         assert agent_constructed is False
         assert success is False
-        assert error is not None and "[blocked_config]" in error
+        assert error is not None and "not a known cron delivery target" in error
         assert "notaplatform" in f"{error} {output}"
 
     def test_local_delivery_never_touches_gateway_config(self, tmp_path):

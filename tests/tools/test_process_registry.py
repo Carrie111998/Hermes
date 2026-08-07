@@ -1488,7 +1488,11 @@ class TestHandleProcessRedaction:
             monkeypatch, "printenv",
             "MY_SERVICE_TOKEN=abc123randomopaquetokenvalue999\nHOME=/home/u",
         )
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "log", "session_id": sess.id}, task_id=sess.task_id
+            )
+        )
         assert "abc123randomopaquetokenvalue999" not in out["output"]
         assert "HOME=/home/u" in out["output"]
 
@@ -1497,7 +1501,11 @@ class TestHandleProcessRedaction:
             monkeypatch, "python app.py",
             "leaked OPENAI_API_KEY sk-proj-abc123def456ghi789jkl012 here",
         )
-        out = json.loads(pr._handle_process({"action": "poll", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "poll", "session_id": sess.id}, task_id=sess.task_id
+            )
+        )
         assert "abc123def456" not in out["output_preview"]
 
     def test_list_redacts_command_and_output(self, monkeypatch):
@@ -1529,7 +1537,11 @@ class TestHandleProcessRedaction:
         sess.exit_code = 0
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
-        out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
+        out = json.loads(
+            pr._handle_process(
+                {"action": "log", "session_id": sess.id}, task_id=sess.task_id
+            )
+        )
         assert "zzzopaque1234567890abcdef" in out["output"]
 
 

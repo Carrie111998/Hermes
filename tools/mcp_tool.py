@@ -55,7 +55,7 @@ Example config::
         command: "npx"
         args: ["-y", "analysis-server"]
         sampling:                    # server-initiated LLM requests
-          enabled: true              # default: true
+          enabled: true              # explicit opt-in; default: false
           model: "gemini-3-flash"    # override model (optional)
           max_tokens_cap: 4096       # max tokens per request
           timeout: 30                # LLM call timeout (seconds)
@@ -110,6 +110,7 @@ import shutil
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -119,17 +120,6 @@ from urllib.parse import urlparse
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
-
-# Upper bound for the OSV malware preflight during stdio MCP startup. The
-# check makes a blocking urllib HTTPS call whose own timeout can fail to
-# interrupt a stalled SSL handshake, which froze the asyncio event loop and
-# blew past the gateway's 15s startup budget (#29184). We run it off the loop
-# AND bound it here; the check is fail-open, so a timeout lets startup proceed.
-# Set just ABOVE osv_check._TIMEOUT (10s) so the inner socket timeout fires
-# first in the normal case; this outer bound only bites when a stalled SSL
-# handshake defeats the inner timeout (the #29184 failure mode).
-_OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
-
 
 # ---------------------------------------------------------------------------
 # Stdio subprocess stderr redirection
@@ -368,6 +358,23 @@ def _jittered(seconds: float) -> float:
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
+def _enabled_sampling_config(config: Any) -> Optional[Dict[str, Any]]:
+    """Return sampling config only after an exact per-server boolean opt-in.
+
+    Missing/malformed sections and truthy non-booleans fail off. Sampling gives
+    an MCP server model access, so schema ambiguity must never enable it or
+    prevent the rest of the server from starting.
+    """
+    if not isinstance(config, Mapping):
+        return None
+    sampling = config.get("sampling")
+    if not isinstance(sampling, Mapping):
+        return None
+    if sampling.get("enabled") is not True:
+        return None
+    return dict(sampling)
+
+
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
@@ -542,58 +549,6 @@ def _is_method_not_found_error(exc: BaseException) -> bool:
         or "unknown method" in msg
         or "not found: ping" in msg
     )
-
-
-# ---------------------------------------------------------------------------
-# MCP tool description content scanning
-# ---------------------------------------------------------------------------
-
-# Patterns that indicate potential prompt injection in MCP tool descriptions.
-# These are WARNING-level — we log but don't block, since false positives
-# would break legitimate MCP servers.
-_MCP_INJECTION_PATTERNS = [
-    (re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I),
-     "prompt override attempt ('ignore previous instructions')"),
-    (re.compile(r"you\s+are\s+now\s+a", re.I),
-     "identity override attempt ('you are now a...')"),
-    (re.compile(r"your\s+new\s+(task|role|instructions?)\s+(is|are)", re.I),
-     "task override attempt"),
-    (re.compile(r"system\s*:\s*", re.I),
-     "system prompt injection attempt"),
-    (re.compile(r"<\s*(system|human|assistant)\s*>", re.I),
-     "role tag injection attempt"),
-    (re.compile(r"do\s+not\s+(tell|inform|mention|reveal)", re.I),
-     "concealment instruction"),
-    (re.compile(r"(curl|wget|fetch)\s+https?://", re.I),
-     "network command in description"),
-    (re.compile(r"base64\.(b64decode|decodebytes)", re.I),
-     "base64 decode reference"),
-    (re.compile(r"exec\s*\(|eval\s*\(", re.I),
-     "code execution reference"),
-    (re.compile(r"import\s+(subprocess|os|shutil|socket)", re.I),
-     "dangerous import reference"),
-]
-
-
-def _scan_mcp_description(server_name: str, tool_name: str, description: str) -> List[str]:
-    """Scan an MCP tool description for prompt injection patterns.
-
-    Returns a list of finding strings (empty = clean).
-    """
-    findings = []
-    if not description:
-        return findings
-    for pattern, reason in _MCP_INJECTION_PATTERNS:
-        if pattern.search(description):
-            findings.append(reason)
-    if findings:
-        logger.warning(
-            "MCP server '%s' tool '%s': suspicious description content — %s. "
-            "Description: %.200s",
-            server_name, tool_name, "; ".join(findings),
-            description,
-        )
-    return findings
 
 
 def _prepend_path(env: dict, directory: str) -> dict:
@@ -2482,32 +2437,6 @@ class MCPServerTask:
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
-        # Check package against OSV malware database before spawning.
-        # Run off the event loop (the urllib HTTPS call is blocking) and bound
-        # it with a wall-clock timeout so a stalled SSL handshake can't freeze
-        # MCP discovery / gateway startup (#29184). The check is fail-open, so
-        # on timeout we log and proceed rather than blocking indefinitely.
-        # NOTE: must run against the REAL command/args — the watchdog wrap
-        # below rewrites argv to `python -m tools.mcp_stdio_watchdog …`,
-        # which would silently turn the preflight into a no-op.
-        from tools.osv_check import check_package_for_malware
-        try:
-            malware_error = await asyncio.wait_for(
-                asyncio.to_thread(check_package_for_malware, command, args),
-                timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s': OSV malware preflight timed out after %.0fs "
-                "(network slow/unreachable) — proceeding without the check.",
-                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
-            malware_error = None
-        if malware_error:
-            raise ValueError(
-                f"MCP server '{self.name}': {malware_error}"
-            )
-
         # Wrap the real command in a parent-death watchdog supervisor so an
         # ungraceful exit of this Hermes process (kill -9, crash, force-quit)
         # can't leave the stdio MCP child (and its own descendants, e.g.
@@ -2516,8 +2445,6 @@ class MCPServerTask:
         # the reaping as before -- this only covers the case where that code
         # never gets to run. POSIX-only (relies on process groups); no-op
         # elsewhere, matching existing killpg-based cleanup's platform scope.
-        # Applied AFTER the OSV preflight so the check inspects the real
-        # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
 
         server_params = StdioServerParameters(
@@ -3153,8 +3080,8 @@ class MCPServerTask:
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
 
         # Set up sampling handler if enabled and SDK types are available
-        sampling_config = config.get("sampling", {})
-        if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
+        sampling_config = _enabled_sampling_config(config)
+        if sampling_config is not None and _MCP_SAMPLING_TYPES:
             self._sampling = SamplingHandler(self.name, sampling_config)
         else:
             self._sampling = None
@@ -4845,31 +4772,22 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> List[str]:
     return flagged
 
 
-def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
-    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
-    try:
-        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
-    except Exception:
-        _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
+def _filter_invalid_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Drop entries that violate the exact MCP transport/schema contract."""
+    from hermes_cli.mcp_validation import validate_mcp_server_entry
 
-    if _validate_mcp_server_entry is None:
-        return servers
-
-    safe_servers = {}
+    valid_servers = {}
     for name, cfg in servers.items():
-        if not isinstance(cfg, dict):
-            safe_servers[name] = cfg
-            continue
-        issues = _validate_mcp_server_entry(name, cfg)
+        issues = validate_mcp_server_entry(name, cfg)
         if issues:
             logger.warning(
-                "Skipping suspicious MCP server '%s': %s",
+                "Skipping invalid MCP server '%s': %s",
                 name,
                 "; ".join(issues),
             )
             continue
-        safe_servers[name] = cfg
-    return safe_servers
+        valid_servers[name] = cfg
+    return valid_servers
 
 
 def _load_mcp_config() -> Dict[str, dict]:
@@ -4900,7 +4818,8 @@ def _load_mcp_config() -> Dict[str, dict]:
         except Exception:
             pass
         safe_servers: Dict[str, dict] = {}
-        for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+        native_servers = _filter_invalid_mcp_servers(servers)
+        for name, cfg in native_servers.items():
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
@@ -4910,7 +4829,7 @@ def _load_mcp_config() -> Dict[str, dict]:
 
             discover_plugins()
             portable = get_plugin_manager().get_portable_mcp_servers()
-            for name, cfg in _filter_suspicious_mcp_servers(portable).items():
+            for name, cfg in _filter_invalid_mcp_servers(portable).items():
                 if name in safe_servers:
                     logger.warning(
                         "Portable MCP server '%s' conflicts with native config; skipping",
@@ -5910,9 +5829,9 @@ def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
     """True if ``tool_name`` matches any entry in ``patterns``.
 
     Exact names match literally; entries containing fnmatch metacharacters
-    (``*``, ``?``, ``[``) match as case-sensitive globs — the same pattern
-    semantics as ``approvals.deny``. Exact membership is checked first so
-    large literal lists stay O(1).
+    (``*``, ``?``, ``[``) match as case-sensitive globs. This is a configured
+    MCP tool-name visibility filter, not terminal-command authorization.
+    Exact membership is checked first so large literal lists stay O(1).
     """
     if not patterns:
         return False
@@ -6141,7 +6060,6 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         candidates.append(
             {
@@ -6380,9 +6298,6 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             raw.get("description") or "",
             raw_schema if isinstance(raw_schema, dict) else {},
         )
-        # Defense-in-depth: the cache file is user-writable JSON, so run the
-        # same injection scan the eager discovery path applies.
-        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         registry_name = schema["name"]
         existing_toolset = registry.get_toolset_for_tool(registry_name)
@@ -6534,7 +6449,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
-    servers = _filter_suspicious_mcp_servers(servers)
+    servers = _filter_invalid_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []

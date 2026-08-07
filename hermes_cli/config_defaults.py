@@ -97,23 +97,26 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Empty preserves each provider's historical default. The exact
+        # GPT-5.6 Responses path mechanically applies a high baseline at API
+        # time without changing the default for any other model/provider.
+        "reasoning_effort": "",
+        "adaptive_reasoning": {
+            "enabled": True,
+            # GPT-5.6 Sol supports the full model-authored effort range.
+            "max_effort": "max",
+        },
+        # Post-turn memory/skill review runs a separate model fork after the
+        # primary answer. Production model-sovereignty runtimes may disable it
+        # so semantic memory and skill decisions remain in the primary loop.
+        "background_review_enabled": True,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
-        # Values: "auto" (default — applies to gpt/codex models), true/false
-        # (force on/off for all models), or a list of model-name substrings
-        # to match (e.g. ["gpt", "codex", "gemini", "qwen"]).
+        # Only an explicit true enables it for every model. Legacy "auto" and
+        # model-name-list values are retained as non-injecting config inputs;
+        # model identifiers never route behavioral prompt content.
         "tool_use_enforcement": "auto",
-        # Intent-ack continuation: when the model opens a turn by narrating an
-        # action it will take ("I'll go check the logs...") but emits no tool
-        # call, intercept the turn-end, inject a "continue now, execute the
-        # tools" nudge, and loop instead of ending the turn (capped at 2 nudges
-        # per turn). This is the corrective sibling of tool_use_enforcement (the
-        # preventive prompt-side guard). Values: "auto" (default — fires only on
-        # the codex_responses api_mode, the historical behavior), true (all
-        # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
-        # false (never), or a list of model-name substrings to match.
-        "intent_ack_continuation": "auto",
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating
@@ -129,6 +132,11 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Ask the acting model to publish concise, useful progress commentary
+        # during multi-step work. The model decides the semantic boundaries;
+        # Hermes does not classify tasks or synthesize status text. Default is
+        # False to preserve existing transcript volume.
+        "model_authored_progress": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
@@ -166,23 +174,15 @@ DEFAULT_CONFIG = {
         # approve. Clean the diff before you commit and push." Cache-safe:
         # takes effect next session. Empty by default.
         "coding_instructions": "",
-        # When verify-on-stop finds edited code without fresh verification
-        # evidence, append guidance for creative UI work (avoid broad
-        # tsc/lint/test before visual approval) and clean-diff expectations.
-        # Set false to keep the evidence nudge terse.
+        # Guidance appended to explicit user/plugin `pre_verify`
+        # continuations. The retired built-in filename/command classifier
+        # cannot activate this path.
         "verify_guidance": True,
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
         "max_verify_nudges": 3,
-        # Verification closure: after the agent edits files in a code workspace,
-        # do not accept a final answer until fresh verification evidence exists
-        # or the agent explains why it cannot run checks. The loop is bounded
-        # and uses the passive verification ledger. Default is "auto" —
-        # surface-aware: on for interactive coding surfaces (CLI, TUI, desktop)
-        # and programmatic callers, off for conversational messaging surfaces
-        # (Telegram, Discord, etc.) where the verification narrative would reach
-        # a human as chat noise. Doc/markdown/skill-only edits never fire it.
-        # Set true to force on everywhere, or false to disable.
+        # Legacy compatibility key. The built-in verify-on-stop classifier is
+        # retired and cannot be reactivated by bool/string/env configuration.
         "verify_on_stop": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
@@ -349,6 +349,13 @@ DEFAULT_CONFIG = {
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
         "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        # Config-only AF_UNIX boundary. Runtime UIDs/GIDs are deployment pins;
+        # no lease id or host workspace path is user-configurable.
+        "isolated_worker_socket": "/run/muncho-isolated-worker/worker.sock",
+        "isolated_worker_server_uid": 0,
+        "isolated_worker_server_gid": 0,
+        "isolated_worker_socket_uid": 0,
+        "isolated_worker_socket_gid": 0,
         # Vercel Sandbox runtime (vercel_sandbox backend only).
         # Supported: node24, node22, python3.13.
         "vercel_runtime": "node24",
@@ -708,7 +715,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # When True, auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -926,15 +933,6 @@ DEFAULT_CONFIG = {
         "skills_hub": {
             "provider": "auto",
             "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "extra_body": {},
-            "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
-        },
-        "approval": {
-            "provider": "auto",
-            "model": "",           # fast/cheap model recommended (e.g. gemini-flash, haiku)
             "base_url": "",
             "api_key": "",
             "timeout": 30,
@@ -1232,10 +1230,7 @@ DEFAULT_CONFIG = {
         # only visible when show_reasoning is enabled.
         "show_commentary": True,
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
-        # NOTE: display.tool_progress_overrides is deprecated and no longer
-        # seeded here — use display.platforms. A user-set value is still
-        # honored at runtime (gateway display_config back-compat read) and
-        # folded into display.platforms by the v15→16 migration.
+        "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
         # Human-phrased tool status labels for built-in tools: "Searching the
         # web for ...", "Reading <file>", "Browsing <url>" instead of the raw
@@ -1352,7 +1347,7 @@ DEFAULT_CONFIG = {
         # are a local debug estimate: they only count successful main-agent
         # responses with a usable ``response.usage``, and silently exclude every
         # auxiliary call (context compression, title generation, vision,
-        # session search, web extract, smart approval, MCP routing, plugin LLM
+        # session search, web extract, MCP routing, plugin LLM
         # access) plus provider-side retries, fallback attempts, and any call
         # whose usage block didn't come back.  Cache writes are also missing
         # from the API response.  On models with heavy auxiliary traffic
@@ -1759,15 +1754,6 @@ DEFAULT_CONFIG = {
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
-        # When a subagent hits a dangerous-command approval prompt, the parent's
-        # prompt_toolkit TUI owns stdin — a thread-local input() call from the
-        # subagent worker would deadlock the parent UI. To avoid the deadlock,
-        # subagent threads ALWAYS resolve approvals non-interactively:
-        #   false (default) → auto-deny with a logger.warning audit line (safe)
-        #   true             → auto-approve "once" with a logger.warning audit line
-        # Flip to true only if you trust delegated work to run dangerous cmds
-        # without human review (cron pipelines, batch automation, etc.).
-        "subagent_auto_approve": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -1911,7 +1897,7 @@ DEFAULT_CONFIG = {
         # long-unused built-in is archived only after archive_after_days of
         # genuine non-use (never a mass-prune on the first run). Set to false
         # to keep all bundled built-ins permanently.
-        "prune_builtins": True,
+        "prune_builtins": False,
         # Pre-run backup: before every real curator pass (dry-run is
         # skipped), snapshot ~/.hermes/skills/ into
         # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the
@@ -2070,14 +2056,13 @@ DEFAULT_CONFIG = {
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
 
-    # Approval mode for dangerous commands:
+    # Approval mode for terminal and code-execution operations:
     #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
-    # cron_mode — what to do when a cron job hits a dangerous command:
-    #   deny    — block the command and let the agent find another way (default, safe)
-    #   approve — auto-approve all dangerous commands in cron jobs
+    # cron_mode — whole-surface authority for scheduled terminal/code execution:
+    #   deny    — block the surface and let the model find another way (default)
+    #   approve — authorize the whole surface for scheduled jobs
     #
     # timeout — seconds to wait for the user's approve/deny before failing
     # closed (deny). Shared by the CLI prompt and gateway/messaging waits.
@@ -2085,33 +2070,9 @@ DEFAULT_CONFIG = {
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
     "approvals": {
-        "mode": "smart",
+        "mode": "manual",
         "timeout": 300,
         "cron_mode": "deny",
-        # Operator-customizable policy text for smart approvals. When
-        # non-empty, this is appended to the smart-approval guardian's
-        # SYSTEM prompt (trusted channel) as additional rules — e.g.
-        # "Always ESCALATE commands touching /etc" or "APPROVE docker
-        # compose restarts under ~/deploys". Inspired by ChatGPT Work's
-        # customizable auto-review guardian policy.
-        "smart_policy": "",
-        # Consecutive-denial circuit breaker for smart approvals: after this
-        # many guardian DENY verdicts in a row within one session, the deny
-        # message returned to the model escalates to a hard-stop instruction
-        # (report to the user / ask for manual run or /approve) instead of a
-        # plain "Do NOT retry". Any approval resets the count. 0 disables.
-        # Inspired by ChatGPT Work's auto-review circuit breaker.
-        "denial_breaker_threshold": 3,
-        # User-defined deny rules: fnmatch globs matched against terminal
-        # commands. A match blocks the command unconditionally — BEFORE the
-        # --yolo / /yolo / mode=off bypass — making this the user-editable
-        # counterpart to the code-shipped hardline blocklist. Patterns are
-        # case-insensitive and must be quoted in YAML when they start with
-        # * or contain {}/!/: sequences. Example:
-        #   deny:
-        #     - "git push --force*"
-        #     - "*curl*|*sh*"
-        "deny": [],
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
@@ -2129,10 +2090,21 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+        # Exact identities allowed to grant an already model-authored plan's
+        # bounded execution capabilities.  ``plan_owner_user_ids`` remains
+        # reserved for global owner/security scope; operators can complete
+        # routine work but do not acquire owner identity.
+        "plan_owner_user_ids": [],
+        "plan_operator_user_ids": [],
+        "top_trusted_operator_user_ids": [],
+        # Optional gateway approval-authority allowlist. Empty preserves the
+        # personal-bot behavior: ask in the conversation that triggered the
+        # command. Team bots can bind approval prompts to known operators.
+        "gateway_authorized_user_ids": [],
+        "gateway_authorized_user_names": [],
+        "gateway_authorized_labels": [],
     },
 
-    # Permanently allowed dangerous command patterns (added via "always" approval)
-    "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
 
@@ -2171,7 +2143,6 @@ DEFAULT_CONFIG = {
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
 
-    # Pre-exec security scanning via tirith
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
@@ -2314,12 +2285,9 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
-        # Run the dispatcher inside the gateway process. On by default —
-        # the cost is ~300µs every `dispatch_interval_seconds` when idle,
-        # and gateway is the supervisor users already have. Set to false
-        # only if you run the dispatcher as a separate systemd unit or
-        # don't want the gateway to spawn workers.
-        "dispatch_in_gateway": True,
+        # Mechanical worker dispatch stays off unless an operator explicitly
+        # enables the Kanban execution service.
+        "dispatch_in_gateway": False,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -2327,6 +2295,9 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Master opt-in for legacy auxiliary Kanban planning surfaces.
+        # The main Hermes model owns semantic planning/routing by default.
+        "auxiliary_planning_enabled": False,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
@@ -2355,7 +2326,7 @@ DEFAULT_CONFIG = {
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
         # the dashboard's Decompose button.
-        "auto_decompose": True,
+        "auto_decompose": False,
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.

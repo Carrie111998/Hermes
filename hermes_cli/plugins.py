@@ -40,9 +40,11 @@ import importlib.util
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 import types
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Union
@@ -138,22 +140,12 @@ VALID_HOOKS: Set[str] = {
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
-    # Transform LLM output before it's returned to the user.
-    # Plugins return a string to replace the response text, or None/empty to leave unchanged.
-    # First non-None string wins. Useful for vocabulary/personality transformation.
+    # Legacy transformation event; callback returns are notification-only.
     "transform_llm_output",
     "pre_llm_call",
     "post_llm_call",
-    # Verification-loop gate. Fired once per turn when the agent has edited code
-    # and is about to verify/finish (after the verify-on-stop guard). A callback
-    # may keep the agent going — run a check, defer it, tidy the diff — instead
-    # of stopping by returning:
-    #   {"action": "continue", "message": "<follow-up instruction>"}
-    # The Claude-Code Stop shape {"decision": "block", "reason": "..."} (block
-    # the stop == keep going) is accepted too. Anything else lets the turn
-    # finish. Hermes' shipped guidance lives in the evidence-based
-    # verification-stop nudge; this hook is for user/plugin policy and is
-    # bounded by agent.max_verify_nudges.
+    # Verification observation fired at the legacy pre-verify seam. Callback
+    # returns cannot keep a turn running or override stop/verification.
     "pre_verify",
     "pre_api_request",
     "post_api_request",
@@ -167,28 +159,21 @@ VALID_HOOKS: Set[str] = {
     "on_skill_lifecycle",
     "subagent_start",
     "subagent_stop",
-    # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
-    # after the internal-event guard but BEFORE auth/pairing and agent
-    # dispatch. Plugins may return a dict to influence flow:
-    #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
-    #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
-    #   {"action": "allow"}  /  None             -> normal dispatch
-    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    # Gateway pre-dispatch observation. Callback returns cannot skip/rewrite
+    # the incoming message. Kwargs are delivered as detached snapshots.
     "pre_gateway_dispatch",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
-    # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
+    # and gateway/ACP owner approvals.
     # Observers only: return values are ignored. Plugins cannot veto or
     # pre-answer an approval from these hooks (use pre_tool_call to block
     # a tool before it reaches approval).
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
+    #   session_key: str, surface: "cli" | "gateway"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
-    #           | "smart_approve" | "smart_deny"
-    #   decided_by: "aux_llm"  -- only on surface="smart"
     "pre_approval_request",
     "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
@@ -218,9 +203,46 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_blocked",
 }
 
+# These legacy hooks historically let plugin return values change model/tool
+# semantics.  They remain deliverable as observer events for compatibility,
+# but their return values are never surfaced to the runtime.  This keeps
+# trusted-model decisions authoritative while preserving useful telemetry.
+_NOTIFICATION_ONLY_HOOKS: frozenset[str] = frozenset(
+    {
+        "pre_tool_call",
+        "transform_terminal_output",
+        "transform_tool_result",
+        "transform_llm_output",
+        "pre_llm_call",
+        "pre_verify",
+        "pre_gateway_dispatch",
+    }
+)
+
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+@dataclass(frozen=True)
+class _OpaqueObserverValue:
+    """Safe placeholder for a live object that cannot be deep-copied."""
+
+    type_name: str
+
+
+def _observer_snapshot(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Detach every callback argument without leaking uncopyable live state."""
+    snapshot: Dict[str, Any] = {}
+    for key, value in kwargs.items():
+        try:
+            snapshot[key] = deepcopy(value)
+        except Exception:
+            value_type = type(value)
+            snapshot[key] = _OpaqueObserverValue(
+                type_name=f"{value_type.__module__}.{value_type.__qualname__}"
+            )
+    return snapshot
 
 
 def _env_enabled(name: str) -> bool:
@@ -279,6 +301,12 @@ def _get_enabled_plugins() -> Optional[set]:
 # ---------------------------------------------------------------------------
 
 _VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+
+# Bundled backend plugins are normally auto-loaded by broad discovery.  Strict
+# discovery keeps that surface closed; only backends audited as pure mechanical
+# executors may be named by an isolated allowlist.  ``web/ddgs`` registers one
+# provider object and no tools, hooks, middleware, prompts, or commands.
+_ISOLATED_BUNDLED_BACKEND_KEYS = frozenset({"web/ddgs"})
 
 
 def _portable_skill_namespace(key: str) -> str:
@@ -1111,7 +1139,7 @@ class PluginContext:
         """Register a plugin-defined auxiliary LLM task.
 
         Auxiliary tasks are LLM-backed side jobs (vision analysis, web extraction,
-        compression, smart-approval, etc.) that route through ``auxiliary_client.py``.
+        compression, etc.) that route through ``auxiliary_client.py``.
         Each task has its own ``auxiliary.<key>`` config block where users can
         pin a provider/model independent of the main chat model.
 
@@ -1157,20 +1185,25 @@ class PluginContext:
                 f"Plugin '{self.manifest.name}' tried to register auxiliary task "
                 f"with invalid key {key!r}"
             )
-        if not all(c.isalnum() or c == "_" for c in key):
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", key):
             raise ValueError(
                 f"Plugin '{self.manifest.name}' auxiliary task key {key!r} "
-                f"must contain only alphanumeric characters and underscores"
+                "must be ASCII lowercase snake_case"
             )
 
         # Lazy import to avoid circular: hermes_cli.main imports plugins indirectly
         from hermes_cli.main import _AUX_TASKS as _BUILTIN_AUX_TASKS
 
         builtin_keys = {k for k, _name, _desc in _BUILTIN_AUX_TASKS}
-        if key in builtin_keys:
+        # ``approval`` is deliberately not an auxiliary model task: owner
+        # authorization is a deterministic authority boundary.  Keep the
+        # legacy name reserved so a plugin cannot recreate a model-authored
+        # approval path under the old configuration key.
+        reserved_keys = builtin_keys | {"approval"}
+        if key in reserved_keys:
             raise ValueError(
                 f"Plugin '{self.manifest.name}' cannot register auxiliary task "
-                f"{key!r} — that key is reserved for a built-in task. "
+                f"{key!r} — that key is reserved by Hermes. "
                 f"Pick a plugin-namespaced key (e.g. '{self.manifest.name}_{key}')."
             )
 
@@ -1231,12 +1264,12 @@ class PluginContext:
     # -- middleware registration -------------------------------------------
 
     def register_middleware(self, kind: str, callback: Callable) -> None:
-        """Register a behavior-changing middleware callback.
+        """Register a notification-only middleware callback.
 
-        Middleware is separate from observer hooks: request middleware may
-        rewrite the effective payload, and execution middleware may wrap the
-        real callback. Unknown kinds are stored for forward compatibility but
-        warned so plugin authors can catch typos.
+        Callbacks receive detached request/execution snapshots. Their return
+        values and exceptions are ignored; they cannot rewrite model/tool
+        inputs, wrap or skip execution, or replace results. Unknown kinds are
+        stored for forward compatibility but warned so authors catch typos.
         """
         if kind not in VALID_MIDDLEWARE:
             logger.warning(
@@ -1319,6 +1352,8 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        self._isolated_allowlist: Optional[frozenset[str]] = None
+        self._isolated_discovery_failure: Optional[str] = None
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1338,16 +1373,51 @@ class PluginManager:
     # Public
     # -----------------------------------------------------------------------
 
-    def discover_and_load(self, force: bool = False) -> None:
+    def discover_and_load(
+        self,
+        force: bool = False,
+        *,
+        isolated_allowlist: Optional[frozenset[str]] = None,
+    ) -> None:
         """Scan all plugin sources and load each plugin found.
 
         When ``force`` is true, clear cached discovery state first so config
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        if self._discovered and not force:
-            return
+        if isolated_allowlist is not None and (
+            type(isolated_allowlist) is not frozenset
+            or any(not isinstance(item, str) or not item for item in isolated_allowlist)
+        ):
+            raise TypeError("isolated plugin allowlist must be a frozenset of names")
+        if self._isolated_discovery_failure is not None:
+            raise RuntimeError(
+                "isolated plugin discovery previously failed: "
+                + self._isolated_discovery_failure
+            )
+        if self._discovered:
+            if self._isolated_allowlist is not None:
+                if isolated_allowlist in {None, self._isolated_allowlist} and not force:
+                    # Once a process enters strict discovery it cannot be
+                    # broadened by a later generic discovery call.
+                    return
+                raise RuntimeError("isolated plugin discovery mode cannot be changed")
+            if isolated_allowlist is not None:
+                if any(plugin.enabled for plugin in self._plugins.values()):
+                    raise RuntimeError(
+                        "general plugins loaded before isolated discovery"
+                    )
+                force = True
+            elif not force:
+                return
         if env_var_enabled("HERMES_SAFE_MODE"):
+            if isolated_allowlist is not None:
+                self._isolated_discovery_failure = (
+                    "safe mode cannot satisfy isolated plugin allowlist"
+                )
+                raise RuntimeError(
+                    "safe mode cannot satisfy isolated plugin allowlist"
+                )
             logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
             self._discovered = True
             return
@@ -1371,22 +1441,68 @@ class PluginManager:
         # permanently stranded on the early-return above (the "No web provider
         # configured" class of failures).
         self._discovered = True
+        self._isolated_allowlist = isolated_allowlist
         try:
-            self._discover_and_load_inner()
-        except BaseException:
+            if isolated_allowlist is None:
+                self._discover_and_load_inner()
+            else:
+                self._discover_and_load_inner(
+                    isolated_allowlist=isolated_allowlist,
+                )
+        except BaseException as exc:
             self._discovered = False
+            if isolated_allowlist is None:
+                self._isolated_allowlist = None
+            else:
+                self._isolated_allowlist = isolated_allowlist
+                self._isolated_discovery_failure = (
+                    f"{type(exc).__name__}: {exc}"
+                )
             raise
 
-    def _discover_and_load_inner(self) -> None:
+    def _discover_and_load_inner(
+        self,
+        *,
+        isolated_allowlist: Optional[frozenset[str]] = None,
+    ) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
-        manifests: List[PluginManifest] = self._collect_directory_manifests()
+        manifests: List[PluginManifest]
+        if isolated_allowlist is not None:
+            # Clean-room discovery scans only immutable top-level bundled
+            # manifests, then retains the exact explicit allowlist. It never
+            # enumerates platform categories, user/project paths, entrypoints,
+            # or auto-loaded backend categories.
+            repo_plugins = get_bundled_plugins_dir()
+            logger.debug("Scanning bundled plugins: %s", repo_plugins)
+            manifests = self._scan_directory(
+                repo_plugins,
+                source="bundled",
+                skip_names={"memory", "context_engine", "platforms", "model-providers"},
+            )
+            manifests = [
+                manifest
+                for manifest in manifests
+                if (manifest.key or manifest.name) in isolated_allowlist
+            ]
+            resolved = {
+                manifest.key or manifest.name
+                for manifest in manifests
+            }
+            missing = sorted(isolated_allowlist - resolved)
+            if missing:
+                raise RuntimeError(
+                    "isolated bundled plugin allowlist is unavailable: "
+                    + ", ".join(missing)
+                )
+        else:
+            manifests = self._collect_directory_manifests()
 
-        # Directory plugins are collected above. Pip / entry-point plugins
-        # are intentionally separate: portable packages are directory-only
-        # and the startup MCP probe must not import or register entry points.
-        ep_manifests = self._scan_entry_points()
-        logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
-        manifests.extend(ep_manifests)
+            # Directory plugins are collected above. Pip / entry-point plugins
+            # are intentionally separate: portable packages are directory-only
+            # and the startup MCP probe must not import or register entry points.
+            ep_manifests = self._scan_entry_points()
+            logger.debug("  entrypoints: %d manifest(s)", len(ep_manifests))
+            manifests.extend(ep_manifests)
 
         # Load each manifest (skip user-disabled plugins).
         # Later sources override earlier ones on key collision — user
@@ -1395,8 +1511,12 @@ class PluginManager:
         # winner. Keys are path-derived (``image_gen/openai``,
         # ``disk-cleanup``) so ``tts/openai`` and ``image_gen/openai``
         # don't collide even when both manifests say ``name: openai``.
-        disabled = _get_disabled_plugins()
-        enabled = _get_enabled_plugins()  # None = opt-in default (nothing enabled)
+        disabled = set() if isolated_allowlist is not None else _get_disabled_plugins()
+        enabled = (
+            set(isolated_allowlist)
+            if isolated_allowlist is not None
+            else _get_enabled_plugins()
+        )  # None = opt-in default (nothing enabled)
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
@@ -1410,6 +1530,40 @@ class PluginManager:
                 loaded.error = "disabled via config"
                 self._plugins[lookup_key] = loaded
                 logger.debug("Skipping disabled plugin '%s'", lookup_key)
+                continue
+
+            if isolated_allowlist is not None:
+                # Strict discovery may include an explicitly named, audited
+                # bundled backend as well as a standalone observer.  These are
+                # existing mechanical executors behind core tool schemas;
+                # allowing one here does not enumerate user/project/entry-point
+                # code and does not add a model tool.  The caller's exact
+                # allowlist remains the capability and production separately
+                # attests every surface the backend registered before READY.
+                allowed_kind = manifest.kind == "standalone" or (
+                    manifest.kind == "backend"
+                    and lookup_key in _ISOLATED_BUNDLED_BACKEND_KEYS
+                )
+                if manifest.source != "bundled" or not allowed_kind:
+                    raise RuntimeError(
+                        "isolated plugin must be bundled standalone or an audited "
+                        "mechanical backend: "
+                        + lookup_key
+                    )
+                self._load_plugin(manifest)
+                loaded = self._plugins.get(lookup_key)
+                if (
+                    not isinstance(loaded, LoadedPlugin)
+                    or loaded.manifest is not manifest
+                    or loaded.enabled is not True
+                    or loaded.error is not None
+                    or loaded.deferred is not False
+                    or loaded.module is None
+                ):
+                    error = getattr(loaded, "error", None) or "not enabled"
+                    raise RuntimeError(
+                        f"isolated bundled plugin failed to load: {lookup_key}: {error}"
+                    )
                 continue
 
             # Exclusive plugins (memory providers) have their own
@@ -1485,6 +1639,11 @@ class PluginManager:
                 )
                 continue
             self._load_plugin(manifest)
+
+        if isolated_allowlist is not None and set(self._plugins) != set(
+            isolated_allowlist
+        ):
+            raise RuntimeError("isolated loaded plugin set is not exact")
 
         if manifests:
             logger.info(
@@ -2103,30 +2262,32 @@ class PluginManager:
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
-        Each callback is wrapped in its own try/except so a misbehaving
-        plugin cannot break the core agent loop.
+        Each callback receives its own deep-copied snapshot and is wrapped in
+        its own try/except, so a plugin cannot mutate live runtime objects or
+        break the core agent loop.
 
         Returns a list of non-``None`` return values from callbacks.
 
-        For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
-
-            {"context": "recalled text..."}
-            "recalled text..."          # plain string, equivalent
-
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        Hooks listed in ``_NOTIFICATION_ONLY_HOOKS`` retain event delivery but
+        never surface callback return values to semantic runtime paths.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
-                if ret is not None:
+                callback_kwargs = _observer_snapshot(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' observer snapshot for %s failed: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                continue
+            try:
+                ret = cb(**callback_kwargs)
+                if ret is not None and hook_name not in _NOTIFICATION_ONLY_HOOKS:
                     results.append(ret)
             except Exception as exc:
                 logger.warning(
@@ -2146,19 +2307,25 @@ class PluginManager:
         return bool(self._middleware.get(kind))
 
     def invoke_middleware(self, kind: str, **kwargs: Any) -> List[Any]:
-        """Call registered middleware callbacks for *kind*.
+        """Deliver detached middleware observer snapshots for *kind*.
 
-        Each callback is isolated so one plugin cannot break the base runtime
-        path. Middleware that wants to change behavior must return the shape
-        documented by the caller-specific contract.
+        Callback return values are intentionally discarded.  A callback can
+        neither mutate the live payload nor acquire an execution continuation.
         """
         callbacks = self._middleware.get(kind, [])
-        results: List[Any] = []
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
-                if ret is not None:
-                    results.append(ret)
+                callback_kwargs = _observer_snapshot(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "Middleware '%s' observer snapshot for %s failed: %s",
+                    kind,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                continue
+            try:
+                cb(**callback_kwargs)
             except Exception as exc:
                 logger.warning(
                     "Middleware '%s' callback %s raised: %s",
@@ -2166,7 +2333,7 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
-        return results
+        return []
 
     # -----------------------------------------------------------------------
     # Slack action handler accessor
@@ -2281,13 +2448,20 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
     return PluginManager().has_enabled_portable_mcp(raw_config)
 
 
-def discover_plugins(force: bool = False) -> None:
+def discover_plugins(
+    force: bool = False,
+    *,
+    isolated_allowlist: Optional[frozenset[str]] = None,
+) -> None:
     """Discover and load all plugins.
 
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
     """
-    get_plugin_manager().discover_and_load(force=force)
+    get_plugin_manager().discover_and_load(
+        force=force,
+        isolated_allowlist=isolated_allowlist,
+    )
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
@@ -2299,10 +2473,7 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
-    """Invoke registered middleware callbacks.
-
-    Returns a list of non-``None`` return values from middleware callbacks.
-    """
+    """Deliver middleware observer snapshots; callback returns are discarded."""
     return get_plugin_manager().invoke_middleware(kind, **kwargs)
 
 
@@ -2352,31 +2523,10 @@ def _get_pre_tool_call_directive_details(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
+    """Deliver ``pre_tool_call`` as observation and return no plugin directive.
 
-    Plugins that need to enforce policy (rate limiting, security
-    restrictions, approval workflows) can return one of::
-
-        {"action": "block",   "message": "Reason the tool was blocked"}
-        {"action": "approve", "message": "Why this needs human confirmation"}
-        {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
-
-    from their ``pre_tool_call`` callback.
-
-    - ``block`` vetoes the tool call outright (the message becomes the tool
-      result the model sees).
-    - ``approve`` ESCALATES to the existing human-approval gate
-      (``prompt_dangerous_approval`` on CLI, the approval callback on the
-      gateway) — the same mechanism Tier-2 dangerous shell patterns use.
-      This lets a plugin require a human ``[o]nce/[s]ession/[a]lways/[d]eny``
-      decision on ANY tool, not just terminal command strings. The caller is
-      responsible for invoking the gate (see
-      :func:`tools.approval.request_tool_approval`).
-    - ``rule_key`` is optional and only honored for ``approve`` directives. It
-      lets plugins choose the allowlist grain for `[a]lways` approvals.
-
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    The thread tool whitelist is a host-created structural capability scope,
+    not plugin semantic authority, so it remains enforceable here.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2386,9 +2536,7 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
-
-    hook_results = invoke_lifecycle_hook(
+    invoke_hook(
         "pre_tool_call",
         tool_name=tool_name,
         args=args if isinstance(args, dict) else {},
@@ -2399,24 +2547,6 @@ def _get_pre_tool_call_directive_details(
         api_request_id=api_request_id,
         middleware_trace=list(middleware_trace or []),
     )
-
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        action = result.get("action")
-        if action not in ("block", "approve"):
-            continue
-        message = result.get("message")
-        message = message if isinstance(message, str) and message else None
-        # A block directive requires a message (it becomes the tool result);
-        # an approve directive can carry an optional reason.
-        if action == "block" and not message:
-            continue
-        rule_key = result.get("rule_key") if action == "approve" else None
-        rule_key = rule_key.strip() if isinstance(rule_key, str) else None
-        if not rule_key:
-            rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
 
     return _PreToolCallDirective()
 
@@ -2431,12 +2561,10 @@ def get_pre_tool_call_directive(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Check ``pre_tool_call`` hooks for a blocking or approval directive.
+    """Compatibility helper for observer-only pre-tool events.
 
-    Backward-compatible public helper: returns ``(directive, message)`` where
-    ``directive`` is ``"block"``, ``"approve"``, or ``None``. Internal callers
-    that need approve-specific metadata use
-    :func:`_get_pre_tool_call_directive_details`.
+    Plugin returns always resolve to ``(None, None)``. A host-created thread
+    capability scope may still produce a structural ``block`` result.
     """
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
@@ -2456,13 +2584,7 @@ def get_pre_tool_call_block_message(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Back-compat shim: return only a ``block`` message (or ``None``).
-
-    Deprecated in favor of :func:`get_pre_tool_call_directive`, which also
-    surfaces the ``approve`` escalation directive. Kept so any external caller
-    importing the old name keeps working; ``approve`` directives are invisible
-    to this shim (it only reports blocks).
-    """
+    """Back-compat shim for structural scope blocks; plugin returns are inert."""
     directive, message = get_pre_tool_call_directive(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
@@ -2481,20 +2603,7 @@ def resolve_pre_tool_block(
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
-    """Resolve the pre_tool_call directive to a final block message (or None).
-
-    Single entry point for every tool-dispatch site: fetches the plugin
-    directive and, for an ``approve`` escalation, invokes the human-approval
-    gate (:func:`tools.approval.request_tool_approval`). Returns the message
-    the tool result should carry when the call is blocked, or ``None`` when
-    the call may proceed.
-
-    Centralizing this keeps the security-critical fail-closed logic in ONE
-    place instead of copy-pasted across the concurrent/sequential/helper
-    dispatch paths: an ``approve`` directive whose gate errors, denies, or
-    times out is fail-closed to a block; ``block`` blocks with its message;
-    anything else proceeds.
-    """
+    """Notify pre-tool observers and return only structural-scope blocks."""
     details = _get_pre_tool_call_directive_details(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
@@ -2502,43 +2611,6 @@ def resolve_pre_tool_block(
     )
     if details.action == "block":
         return details.message
-    if details.action == "approve":
-        try:
-            from tools.approval import (
-                request_tool_approval,
-                reset_current_observability_context,
-                set_current_observability_context,
-            )
-
-            approval_tokens = None
-            try:
-                approval_tokens = set_current_observability_context(
-                    turn_id=turn_id,
-                    tool_call_id=tool_call_id,
-                )
-            except Exception:
-                pass
-            try:
-                result = request_tool_approval(
-                    tool_name,
-                    details.message or "",
-                    rule_key=details.rule_key or tool_name,
-                )
-            finally:
-                if approval_tokens is not None:
-                    try:
-                        reset_current_observability_context(approval_tokens)
-                    except Exception:
-                        pass
-        except Exception:
-            # Fail-closed: if the gate itself errors, block rather than
-            # silently execute an action a plugin flagged for approval.
-            return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
-            )
     return None
 
 
@@ -2552,24 +2624,8 @@ def get_pre_verify_continue_message(
     final_response: str = "",
     changed_paths: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """Check user ``pre_verify`` hooks for a directive to keep the agent going.
-
-    Fired once per turn when the agent edited code and is about to verify/finish.
-    A hook keeps the turn going (run a check, defer it, tidy the diff) by
-    returning::
-
-        {"action": "continue", "message": "<follow-up for the model>"}
-
-    The Claude-Code Stop shape ``{"decision": "block", "reason": "..."}`` (block
-    the stop == keep going) is accepted too. The first directive carrying a
-    non-empty message wins; any other return lets the turn finish. Mirrors
-    :func:`get_pre_tool_call_block_message` — the call site stays a one-liner.
-
-    ``coding`` / ``attempt`` let a hook scope itself (``if not coding`` …) and
-    self-throttle (``if attempt`` …), the same way a ``pre_tool_call`` hook
-    scopes on ``tool_name``.
-    """
-    hook_results = invoke_hook(
+    """Notify verification observers without granting stop/continue authority."""
+    invoke_hook(
         "pre_verify",
         session_id=session_id,
         platform=platform,
@@ -2579,16 +2635,6 @@ def get_pre_verify_continue_message(
         final_response=final_response,
         changed_paths=list(changed_paths or []),
     )
-
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        action = str(result.get("action") or result.get("decision") or "").strip().lower()
-        if action not in ("continue", "block"):
-            continue
-        message = result.get("message") or result.get("reason")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
 
     return None
 

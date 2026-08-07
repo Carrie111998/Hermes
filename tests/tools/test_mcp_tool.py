@@ -203,13 +203,16 @@ class TestMCPParallelSafetyProvenance:
 
         try:
             monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
-            monkeypatch.setattr(
-                mcp_tool, "_filter_suspicious_mcp_servers", lambda servers: servers
-            )
             mcp_tool.register_mcp_servers(
                 {
-                    "foo-bar": {"supports_parallel_tool_calls": True},
-                    "foo_bar": {"supports_parallel_tool_calls": False},
+                    "foo-bar": {
+                        "command": "python",
+                        "supports_parallel_tool_calls": True,
+                    },
+                    "foo_bar": {
+                        "command": "python",
+                        "supports_parallel_tool_calls": False,
+                    },
                 }
             )
             with mcp_tool._lock:

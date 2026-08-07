@@ -210,7 +210,7 @@ def test_first_run_always_runs_agent(hermes_env, monkeypatch):
 
 def test_unchanged_output_suppresses_agent_run(hermes_env, monkeypatch):
     from cron.jobs import get_job
-    from cron.scheduler import SILENT_MARKER, run_job
+    from cron.scheduler import run_job
 
     job = _make_monitor_job(hermes_env, "echo 'state A'\n")
     observed: dict = {}
@@ -221,10 +221,16 @@ def test_unchanged_output_suppresses_agent_run(hermes_env, monkeypatch):
 
     # Second tick with identical output → suppressed: no agent, silent.
     job = get_job(job["id"])
-    success, doc, final, error = run_job(job)
+    result = run_job(job)
+    success, doc, final, error = result
     assert success is True
     assert error is None
-    assert final == SILENT_MARKER
+    assert final == ""
+    assert result.delivery_outcome == {
+        "action": "suppress",
+        "reason": "monitor output unchanged",
+        "turn_id": result.turn_id,
+    }
     assert observed["agent_runs"] == 1  # unchanged — agent NOT re-invoked
     assert "no_change" in doc
 
@@ -276,9 +282,12 @@ def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
 
     job = cron.jobs.get_job(job["id"])
     assert job["monitor_state"]["last_output_hash"]
-    success, doc, final, error = cron.scheduler.run_job(job)
+    result = cron.scheduler.run_job(job)
+    success, doc, final, error = result
     assert success is True
-    assert final == cron.scheduler.SILENT_MARKER
+    assert final == ""
+    assert result.delivery_outcome["action"] == "suppress"
+    assert result.delivery_outcome["turn_id"] == result.turn_id
     assert observed["agent_runs"] == 1  # still suppressed after restart
 
 

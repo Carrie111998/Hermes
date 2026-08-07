@@ -250,12 +250,14 @@ class TestRunSingleChildSchemaValidation:
         assert "schema_retries" not in entry
         assert len(child.calls) == 1
 
-    def test_failed_child_skips_validation(self):
-        """A child with no output never gets a schema retry turn."""
+    def test_completed_child_with_empty_output_preserves_terminal_authority(self):
+        """Schema validation reports empty output without rewriting completion."""
         child = _StubChild([""])
         child._delegate_output_schema = ADDRESS_SCHEMA
         entry = _run(child)
-        assert entry["status"] == "failed"
+        assert entry["status"] == "completed"
+        assert entry["summary_missing"] is True
+        assert entry["usable_result"] is False
         assert len(child.calls) == 1
         assert entry.get("schema_valid") is False
 

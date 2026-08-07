@@ -161,7 +161,11 @@ class TestDegradedToolResult:
         monkeypatch.setattr(subprocess, "run", real_run)
         monkeypatch.setattr(real_shutil, "which", real_which)
         monkeypatch.setenv("TERMINAL_ENV", "local")
-        r2 = json.loads(isolated_env.terminal_tool("echo back", task_id="t-degraded-recover"))
+        r2 = json.loads(
+            isolated_env.terminal_tool(
+                "echo back", task_id="t-degraded-recover", force=True
+            )
+        )
         assert r2["exit_code"] == 0
         assert "back" in r2["output"]
 
@@ -169,14 +173,21 @@ class TestDegradedToolResult:
 class TestNonInfrastructureFailuresUntouched:
     def test_nonzero_exit_is_not_degraded(self, isolated_env, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
-        r = json.loads(isolated_env.terminal_tool("exit 3", task_id="t-degraded-exit3"))
+        r = json.loads(
+            isolated_env.terminal_tool(
+                "exit 3", task_id="t-degraded-exit3", force=True
+            )
+        )
         assert r["exit_code"] == 3
         assert r.get("status") != "degraded"
 
     def test_command_not_found_is_not_degraded(self, isolated_env, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
         r = json.loads(isolated_env.terminal_tool(
-            "definitely_not_a_real_command_zzz_42", task_id="t-degraded-notfound"))
+            "definitely_not_a_real_command_zzz_42",
+            task_id="t-degraded-notfound",
+            force=True,
+        ))
         assert r["exit_code"] != 0
         assert r.get("status") != "degraded"
 

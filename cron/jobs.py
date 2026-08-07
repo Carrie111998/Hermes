@@ -1217,6 +1217,13 @@ def _save_jobs_unlocked(
     ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
     that mean to rewrite the store wholesale).
     """
+    # This is the common persistence choke point for the model tool, CLI,
+    # dashboard/API, scheduler state changes, and future direct callers. Once
+    # the production latch is active, validate the complete post-mutation set
+    # while the jobs lock is still held and before a temporary file exists.
+    # Per-caller prechecks remain useful UX, but are not the security boundary.
+    from cron.production_policy import enforce_production_cron_jobs
+
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1244,6 +1251,7 @@ def _save_jobs_unlocked(
         for _attempt in range(5):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+            enforce_production_cron_jobs(jobs)
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
             )
@@ -1313,6 +1321,7 @@ def _save_jobs_unlocked(
         # Exhausted retries — last merge + write without another re-peek.
         if not replace:
             jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+        enforce_production_cron_jobs(jobs)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
         )
@@ -1592,8 +1601,17 @@ def create_job(
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
-    normalized_model = _normalize_job_optional_text(model)
-    normalized_provider = _normalize_job_optional_text(provider)
+    # Production create remains ergonomic for callers that omit the inference
+    # axes, while preserving the exact sealed route. Explicit alternatives are
+    # rejected by the policy helper; they are never silently overwritten.
+    from cron.production_policy import pin_production_cron_create_route
+
+    routed_provider, routed_model = pin_production_cron_create_route(
+        provider,
+        model,
+    )
+    normalized_model = _normalize_job_optional_text(routed_model)
+    normalized_provider = _normalize_job_optional_text(routed_provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -1639,14 +1657,6 @@ def create_job(
         context_from = None
 
     prompt_text = _coerce_job_text(prompt)
-
-    # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
-    # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive
-    # (#30719). Enforced here (not only in the CLI layer) so the agent's
-    # `cronjob` model tool — which calls create_job directly — is also
-    # covered, not just `hermes cron create`.
-    from cron.lifecycle_guard import check_gateway_lifecycle
-    check_gateway_lifecycle(prompt_text, normalized_script)
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -1709,6 +1719,8 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "last_delivery_status": "none",
+        "last_delivery_confirmed_at": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -2009,9 +2021,14 @@ def clear_preflight_alerted(job_id: str) -> None:
     _set_preflight_alerted(job_id, False)
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    delivery_status: Optional[str] = None,
+    status: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
@@ -2020,6 +2037,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``delivery_status`` is an exact mechanical observation. A missing status
+    never becomes a receipt merely because ``delivery_error`` is absent.
 
     ``status`` overrides the derived ``last_status`` ("ok"/"error") with a
     specific terminal status for this run — e.g. ``"blocked_config"`` when
@@ -2027,6 +2046,16 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
     """
+    normalized_delivery_status = delivery_status or (
+        "failed" if delivery_error else "none"
+    )
+    if normalized_delivery_status not in {
+        "none",
+        "confirmed",
+        "failed",
+        "unconfirmed",
+    }:
+        raise ValueError("invalid delivery_status")
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -2042,6 +2071,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job.pop("preflight_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job["last_delivery_status"] = normalized_delivery_status
+                job["last_delivery_confirmed_at"] = (
+                    now if normalized_delivery_status == "confirmed" else None
+                )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
