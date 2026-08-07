@@ -19,6 +19,7 @@ RELEASE_ENTRYPOINTS = (
     "hermes-acp",
     "hermes-agent",
     "muncho-ops",
+    "muncho-passkey-enrollment",
     "muncho-release",
 )
 
@@ -1697,6 +1698,7 @@ hermes = "entrypoint_probe:main"
 hermes-acp = "entrypoint_probe:main"
 hermes-agent = "entrypoint_probe:main"
 muncho-ops = "entrypoint_probe:main"
+muncho-passkey-enrollment = "entrypoint_probe:main"
 muncho-release = "entrypoint_probe:main"
 
 [tool.setuptools]

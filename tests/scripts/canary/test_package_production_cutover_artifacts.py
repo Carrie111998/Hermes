@@ -1665,6 +1665,7 @@ def test_packager_binds_gateway_imports_to_its_target_release_under_isolation(
     (gateway / "operational_edge_units.py").write_text(
         "from pathlib import Path\n"
         "CLIENT_CONFIG_PATH=Path('/etc/operational-edge-client.json')\n"
+        "OWNER_GATE_RECEIPT_PUBLIC_KEY=Path('/etc/owner-gate-public.pem')\n"
         "class OperationalEdgeUnitError(ValueError): pass\n"
         "def render_operational_edge_units(**kwargs): raise AssertionError\n"
         "def service_config_path(domain): return Path('/etc') / (domain + '.json')\n"
@@ -1743,6 +1744,120 @@ def test_operational_edges_grant_projector_read_without_mutation_authority():
         )
         assert config["allowed_read_peer_uids"] == expected_readers
         assert config["mutation_peer_uid"] == inputs["gateway"]["uid"]
+
+
+def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
+    tmp_path: Path,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    public_raw = public_key.public_bytes_raw()
+    public_path = (tmp_path / "owner-gate-receipt-public.pem").resolve()
+    public_path.write_bytes(
+        public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    public_path.chmod(0o400)
+    key_id = hashlib.sha256(public_raw).hexdigest()
+
+    request, descriptor = package._sealed_runtime_artifact_request(
+        revision=REVISION,
+        runtime_dependency=_runtime_dependency_for_units(),
+        unit_inputs=_unit_inputs(),
+        operational_asset_verification=_operational_asset_verification(),
+        owner_gate_receipt_public_key_id=key_id,
+        owner_gate_receipt_public_key_path=public_path,
+    )
+
+    assert descriptor["schema"] == (
+        package.SEALED_RUNTIME_ARTIFACT_REQUEST_V4_SCHEMA
+    )
+    assert descriptor["owner_gate_receipt_public_key_id"] == key_id
+    for domain in sorted(_operational_receipt_key_ids()):
+        config = json.loads(
+            request["payloads"][f"operational_edge_config_{domain}"]
+        )
+        unit = request["payloads"][f"operational_edge_unit_{domain}"]
+        if domain == "skyvision_db":
+            assert config["owner_gate_receipt_public_key_id"] == key_id
+            assert config["owner_gate_receipt_public_key_file"].endswith(
+                "/owner-gate-receipt-public-key"
+            )
+            assert b"owner-gate-receipt-public-key" in unit
+        else:
+            assert config["owner_gate_receipt_public_key_id"] is None
+            assert config["owner_gate_receipt_public_key_file"] is None
+            assert b"owner-gate-receipt-public-key" not in unit
+
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_owner_gate_receipt_public_key_invalid",
+    ):
+        package._sealed_runtime_artifact_request(
+            revision=REVISION,
+            runtime_dependency=_runtime_dependency_for_units(),
+            unit_inputs=_unit_inputs(),
+            operational_asset_verification=(
+                _operational_asset_verification()
+            ),
+            owner_gate_receipt_public_key_id="f" * 64,
+            owner_gate_receipt_public_key_path=public_path,
+        )
+
+    release = _release((tmp_path / "v4-release").resolve())
+    manifest = package.build_release_artifacts(
+        release,
+        REVISION,
+        unit_inputs=_unit_inputs(),
+        owner_gate_receipt_public_key_id=key_id,
+        owner_gate_receipt_public_key_path=public_path,
+    )
+    assert package.verify_release_artifacts(
+        release,
+        REVISION,
+        unit_inputs=_unit_inputs(),
+        owner_gate_receipt_public_key_id=key_id,
+        owner_gate_receipt_public_key_path=public_path,
+    ) == manifest
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_packaging_manifest_invalid",
+    ):
+        package.verify_release_artifacts(
+            release,
+            REVISION,
+            unit_inputs=_unit_inputs(),
+            owner_gate_receipt_public_key_path=public_path,
+        )
+
+
+def test_legacy_v3_operational_edges_cannot_borrow_host_owner_gate_key(
+    tmp_path: Path,
+) -> None:
+    public_path = (tmp_path / "owner-gate-receipt-public.pem").resolve()
+    public_path.write_text("not-a-public-key\n", encoding="ascii")
+    public_path.chmod(0o400)
+
+    request, descriptor = package._sealed_runtime_artifact_request(
+        revision=REVISION,
+        runtime_dependency=_runtime_dependency_for_units(),
+        unit_inputs=_unit_inputs(),
+        operational_asset_verification=_operational_asset_verification(),
+        owner_gate_receipt_public_key_path=public_path,
+    )
+
+    assert descriptor["schema"] == (
+        package.SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA
+    )
+    assert "owner_gate_receipt_public_key_id" not in descriptor
+    for domain in sorted(_operational_receipt_key_ids()):
+        config = json.loads(
+            request["payloads"][f"operational_edge_config_{domain}"]
+        )
+        assert config["owner_gate_receipt_public_key_id"] is None
+        assert config["owner_gate_receipt_public_key_file"] is None
 
 
 def test_generated_runtime_requires_exact_projector_read_and_gateway_mutation(

@@ -480,6 +480,7 @@ def _fixture(tmp_path: Path) -> Fixture:
             runtime_dependency_manifest_sha256=input_file_sha256[
                 "runtime_dependency_manifest_sha256"
             ],
+            owner_gate_receipt_public_key_id="0b" * 32,
         )
     )
     unit_plan, unit_approval, unit_publication = v4_test._unit_documents(

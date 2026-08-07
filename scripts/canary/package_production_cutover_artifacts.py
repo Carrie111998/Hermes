@@ -33,6 +33,7 @@ if _REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, _REPOSITORY_ROOT)
 
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from gateway.isolated_worker_units import (
@@ -59,6 +60,7 @@ from gateway.operational_edge_assets import (
 from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from gateway.operational_edge_units import (
     CLIENT_CONFIG_PATH as OPERATIONAL_EDGE_CLIENT_CONFIG,
+    OWNER_GATE_RECEIPT_PUBLIC_KEY,
     OperationalEdgeUnitError,
     render_operational_edge_units,
     service_config_path as operational_edge_config_path,
@@ -109,6 +111,9 @@ SENTINELS = {
 UNIT_INPUT_SCHEMA = "muncho-production-cutover-unit-inputs.v3"
 SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA = (
     "muncho-production-cutover-sealed-runtime-artifacts.v1"
+)
+SEALED_RUNTIME_ARTIFACT_REQUEST_V4_SCHEMA = (
+    "muncho-production-cutover-sealed-runtime-artifacts.v2"
 )
 CUTOVER_STAGED_ROOT = Path("/var/lib/muncho-production-legacy-cutover/staged")
 STAGED_UNIT_INPUT_PLAN_PATH = CUTOVER_STAGED_ROOT / "unit-input-plan.json"
@@ -765,6 +770,50 @@ def _read_source(path: Path, *, maximum: int) -> bytes:
     except UnicodeDecodeError as exc:
         raise PackagingError("cutover_packaging_source_encoding_invalid") from exc
     return payload
+
+
+def _validated_owner_gate_receipt_public_key_id(
+    expected_key_id: str | None,
+    *,
+    public_key_path: Path,
+    expected_uid: int,
+) -> str | None:
+    """Bind the v4 trust anchor to the exact staged raw Ed25519 key.
+
+    A legacy v3 build deliberately supplies no key id and never reads mutable
+    host state.  The v4 release-update path must supply a signed, non-null id;
+    that id is accepted only when the already-staged public PEM reproduces it.
+    """
+
+    if expected_key_id is None:
+        return None
+    if (
+        not isinstance(expected_key_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_key_id) is None
+        or not isinstance(expected_uid, int)
+        or expected_uid < 0
+    ):
+        raise PackagingError(
+            "cutover_owner_gate_receipt_public_key_invalid"
+        )
+    raw = _read_source(public_key_path, maximum=16 * 1024)
+    try:
+        metadata = public_key_path.lstat()
+        key = serialization.load_pem_public_key(raw)
+    except (OSError, TypeError, ValueError) as exc:
+        raise PackagingError(
+            "cutover_owner_gate_receipt_public_key_invalid"
+        ) from exc
+    if (
+        metadata.st_uid != expected_uid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not isinstance(key, Ed25519PublicKey)
+        or _sha256(key.public_bytes_raw()) != expected_key_id
+    ):
+        raise PackagingError(
+            "cutover_owner_gate_receipt_public_key_invalid"
+        )
+    return expected_key_id
 
 
 def _file_identity(item: os.stat_result) -> tuple[int, ...]:
@@ -1909,6 +1958,10 @@ def _sealed_runtime_artifact_request(
     runtime_dependency: Mapping[str, Any],
     unit_inputs: Mapping[str, Any],
     operational_asset_verification: Mapping[str, Any],
+    owner_gate_receipt_public_key_id: str | None = None,
+    owner_gate_receipt_public_key_path: Path = (
+        OWNER_GATE_RECEIPT_PUBLIC_KEY
+    ),
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     """Render and seal the complete no-secret operational host boundary."""
 
@@ -1924,6 +1977,13 @@ def _sealed_runtime_artifact_request(
         verified_assets = validate_packaged_operational_asset_verification(
             operational_asset_verification,
             revision=revision,
+        )
+        verified_owner_gate_receipt_public_key_id = (
+            _validated_owner_gate_receipt_public_key_id(
+                owner_gate_receipt_public_key_id,
+                public_key_path=owner_gate_receipt_public_key_path,
+                expected_uid=verified_assets["expected_uid"],
+            )
         )
         capability = render_production_capability_units(
             revision=revision,
@@ -1976,12 +2036,9 @@ def _sealed_runtime_artifact_request(
                 "operational_edge_receipt_public_key_ids"
             ],
             writer_key_id=inputs["writer_capability_public_key_id"],
-            # The immutable v3 unit-input authority predates the owner-gate
-            # receipt trust anchor.  Keep its byte contract intact and select
-            # the legacy fail-closed unit variant explicitly.  A successor
-            # authority version must carry the exact key id before enabling
-            # sensitive-report execution in the six-artifact cutover.
-            owner_gate_receipt_public_key_id=None,
+            owner_gate_receipt_public_key_id=(
+                verified_owner_gate_receipt_public_key_id
+            ),
         )
     except (
         OperationalEdgeAssetError,
@@ -2107,7 +2164,11 @@ def _sealed_runtime_artifact_request(
         ],
     }
     descriptor_unsigned = {
-        "schema": SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA,
+        "schema": (
+            SEALED_RUNTIME_ARTIFACT_REQUEST_SCHEMA
+            if verified_owner_gate_receipt_public_key_id is None
+            else SEALED_RUNTIME_ARTIFACT_REQUEST_V4_SCHEMA
+        ),
         "release_revision": revision,
         "target": inputs["target"],
         "files": files,
@@ -2129,6 +2190,10 @@ def _sealed_runtime_artifact_request(
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
     }
+    if verified_owner_gate_receipt_public_key_id is not None:
+        descriptor_unsigned["owner_gate_receipt_public_key_id"] = (
+            verified_owner_gate_receipt_public_key_id
+        )
     descriptor = {
         **descriptor_unsigned,
         "request_sha256": _sha256(_canonical_bytes(descriptor_unsigned)),
@@ -2142,6 +2207,10 @@ def render_release_sealed_host_payloads(
     release_root: Path,
     revision: str,
     unit_inputs: Mapping[str, Any],
+    owner_gate_receipt_public_key_id: str | None = None,
+    owner_gate_receipt_public_key_path: Path = (
+        OWNER_GATE_RECEIPT_PUBLIC_KEY
+    ),
 ) -> tuple[Mapping[str, bytes], Mapping[str, Any], Mapping[str, Any]]:
     """Re-render the release-sealed host bytes without mutating the release.
 
@@ -2173,6 +2242,12 @@ def render_release_sealed_host_payloads(
         runtime_dependency=runtime_dependency,
         unit_inputs=normalized,
         operational_asset_verification=operational_assets,
+        owner_gate_receipt_public_key_id=(
+            owner_gate_receipt_public_key_id
+        ),
+        owner_gate_receipt_public_key_path=(
+            owner_gate_receipt_public_key_path
+        ),
     )
     if descriptor != manifest["sealed_runtime_artifact_request"]:
         raise PackagingError("cutover_packaging_manifest_invalid")
@@ -2260,6 +2335,10 @@ def build_release_artifacts(
     *,
     release_address: Path | None = None,
     unit_inputs: Mapping[str, Any],
+    owner_gate_receipt_public_key_id: str | None = None,
+    owner_gate_receipt_public_key_path: Path = (
+        OWNER_GATE_RECEIPT_PUBLIC_KEY
+    ),
 ) -> Mapping[str, Any]:
     if REVISION.fullmatch(revision) is None:
         raise PackagingError("cutover_packaging_revision_invalid")
@@ -2305,6 +2384,12 @@ def build_release_artifacts(
         runtime_dependency=runtime_dependency,
         unit_inputs=normalized_unit_inputs,
         operational_asset_verification=operational_assets,
+        owner_gate_receipt_public_key_id=(
+            owner_gate_receipt_public_key_id
+        ),
+        owner_gate_receipt_public_key_path=(
+            owner_gate_receipt_public_key_path
+        ),
     )
     host_artifact_contract = _host_artifact_contract(
         sealed_descriptor=sealed_descriptor,
@@ -2383,6 +2468,10 @@ def verify_release_artifacts(
     *,
     release_address: Path | None = None,
     unit_inputs: Mapping[str, Any],
+    owner_gate_receipt_public_key_id: str | None = None,
+    owner_gate_receipt_public_key_path: Path = (
+        OWNER_GATE_RECEIPT_PUBLIC_KEY
+    ),
 ) -> Mapping[str, Any]:
     try:
         release = release_root.resolve(strict=True)
@@ -2467,6 +2556,12 @@ def verify_release_artifacts(
         runtime_dependency=runtime_dependency,
         unit_inputs=normalized_unit_inputs,
         operational_asset_verification=operational_assets,
+        owner_gate_receipt_public_key_id=(
+            owner_gate_receipt_public_key_id
+        ),
+        owner_gate_receipt_public_key_path=(
+            owner_gate_receipt_public_key_path
+        ),
     )
     if manifest.get("sealed_runtime_artifact_request") != sealed_descriptor:
         raise PackagingError("cutover_packaging_manifest_invalid")

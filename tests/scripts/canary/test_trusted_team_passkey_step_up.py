@@ -822,6 +822,40 @@ def test_owner_invite_registers_one_phone_passkey_without_report_approval(
         )
 
 
+def test_installed_enrollment_cli_emits_seed_once_only_to_operator_stdout(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assert enrollment.main(
+        [
+            "create",
+            "--owner-discord-user-id",
+            IVS,
+            "--user-label",
+            "Ivs",
+            "--ttl-seconds",
+            "3600",
+            "--root",
+            str(tmp_path),
+        ]
+    ) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.startswith(
+        f"{protocol.PRODUCTION_ORIGIN}/enroll/"
+    )
+    assert captured.out.count("#") == 1
+    seed = captured.out.rstrip().split("#", 1)[1]
+    assert seed
+    assert caplog.text == ""
+    assert seed not in "".join(
+        path.read_text(encoding="ascii")
+        for path in tmp_path.rglob("*.json")
+    )
+
+
 def test_phone_enrollment_web_wire_imports_one_credential_create_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

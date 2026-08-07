@@ -1923,6 +1923,8 @@ def test_unix_client_uses_fixed_long_mutation_deadline() -> None:
         "consume",
         "sensitive_create",
         "sensitive_consume",
+        "enrollment_options",
+        "enrollment_complete",
         "preflight",
         "execute",
         "terminal",
