@@ -757,8 +757,9 @@ def reconcile_autostart_launchers() -> list[str]:
     actions: list[str] = []
     try:
         task_registered = is_task_registered()
-    except Exception as exc:
-        actions.append(f"⚠ Could not verify Scheduled Task state ({exc}) — reconcile skipped")
+    except Exception:
+        # Fail open: never let a wedged schtasks query block install/update/doctor.
+        actions.append("⚠ Could not verify Scheduled Task state — reconcile skipped")
         return actions
     if task_registered:
         removed, failed = _remove_startup_entries()

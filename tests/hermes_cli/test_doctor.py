@@ -1473,3 +1473,23 @@ def test_windows_gateway_launcher_check_warns_on_incomplete_reconcile(monkeypatc
     assert "Could not remove redundant Windows login item" in out
     assert "reconcile incomplete" in out
     assert "reconciled to a single mechanism" not in out
+
+
+def test_windows_gateway_launcher_check_warns_when_schtasks_wedges(monkeypatch, capsys):
+    """A schtasks query failure surfaces as a doctor warning, not a clean ok."""
+    import hermes_cli.gateway_windows as gateway_windows
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows,
+        "reconcile_autostart_launchers",
+        lambda: ["⚠ Could not verify Scheduled Task state — reconcile skipped"],
+    )
+
+    doctor._check_windows_gateway_launcher([])
+
+    out = capsys.readouterr().out
+    assert "Could not verify Scheduled Task state" in out
+    assert "reconcile incomplete" in out
+    assert "reconciled to a single mechanism" not in out
