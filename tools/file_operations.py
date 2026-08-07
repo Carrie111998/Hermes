@@ -894,20 +894,17 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
-            # Undecodable bytes: the terminal env decodes stdout with
-            # errors="replace", so any non-UTF-8 byte arrives here already
-            # turned into U+FFFD. That char is "printable" (ord 65533), so the
-            # non-printable ratio below never catches it — and returning the
-            # lossy text would let a read→edit→write round-trip silently
-            # overwrite the original bytes with mojibake. Treat a file whose
-            # sample carries the replacement char as binary (read-only) so the
-            # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # NUL bytes are the strongest binary indicator — text files never
+            # contain \x00.  U+FFFD alone is NOT reliable because head -c
+            # byte-truncation can split a multi-byte UTF-8 sequence (CJK
+            # chars are 3-4 bytes), and the terminal decoder emits U+FFFD for
+            # the incomplete trailing bytes.  Only treat U+FFFD as binary
+            # when a NUL byte is also present in the sample.
+            if "\x00" in content_sample[:1500]:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in content_sample[:1500]
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(content_sample), 1500) > 0.30
         
         return False
     
@@ -1189,7 +1186,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        sample_cmd = f"head -c 1500 {self._escape_shell_arg(path)} 2>/dev/null"
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
@@ -1307,7 +1304,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_result = self._exec(f"head -c 1500 {self._escape_shell_arg(path)} 2>/dev/null")
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
