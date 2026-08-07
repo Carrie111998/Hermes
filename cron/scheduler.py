@@ -53,6 +53,22 @@ from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
 )
+from agent.bandit_router import (
+    is_enabled as _bandit_is_enabled,
+    select_model as _bandit_select,
+    get_candidates_from_config as _bandit_get_candidates,
+    get_quality_floor as _bandit_get_quality_floor,
+    record_outcome as _bandit_record_outcome,
+)
+from agent.autotune import (
+    is_enabled as _autotune_is_enabled,
+    compute_params as _autotune_compute_params,
+)
+from agent.stm_transforms import (
+    is_enabled as _stm_is_enabled,
+    apply_stm as _stm_apply,
+    get_modules as _stm_get_modules,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3551,6 +3567,57 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # ── Bandit Router: auto-select cost-optimal model for unpinned jobs ──
+        _bandit_decision = None
+        if not job.get("model"):
+            try:
+                if _bandit_is_enabled(_cfg):
+                    _bandit_candidates = _bandit_get_candidates(_cfg)
+                    if _bandit_candidates:
+                        _bandit_ctx = {
+                            "prompt": job.get("prompt", ""),
+                            "toolsets": job.get("enabled_toolsets"),
+                            "skills": job.get("skills"),
+                            "has_script": bool(job.get("script")),
+                            "no_agent": bool(job.get("no_agent")),
+                        }
+                        _bandit_decision = _bandit_select(
+                            _bandit_ctx, _bandit_candidates, _bandit_get_quality_floor(_cfg)
+                        )
+                        model = _bandit_decision.model
+                        logger.info(
+                            "Job '%s': bandit routed to %s (bucket=%s, θ=%.3f, %s)",
+                            job_id, model, _bandit_decision.bucket,
+                            _bandit_decision.sampled_theta, _bandit_decision.reason,
+                        )
+            except Exception as _bandit_exc:
+                logger.debug("Job '%s': bandit routing skipped: %s", job_id, _bandit_exc)
+
+        # ── AutoTune: compute context-adaptive sampling params ──
+        _autotune_params = None
+        try:
+            if _autotune_is_enabled(_cfg):
+                _autotune_params = _autotune_compute_params(
+                    message=job.get("prompt", ""),
+                    toolsets=job.get("enabled_toolsets"),
+                    skills=job.get("skills"),
+                )
+                logger.info(
+                    "Job '%s': autotune ctx=%s temp=%.3f top_p=%.3f",
+                    job_id, _autotune_params["detected_context"],
+                    _autotune_params["temperature"], _autotune_params["top_p"],
+                )
+        except Exception as _at_exc:
+            logger.debug("Job '%s': autotune skipped: %s", job_id, _at_exc)
+
+        # Build request_overrides from AutoTune (if active)
+        _request_overrides = None
+        if _autotune_params:
+            _request_overrides = {
+                "temperature": _autotune_params["temperature"],
+                "top_p": _autotune_params["top_p"],
+            }
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -3565,6 +3632,7 @@ def run_job(
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
+            request_overrides=_request_overrides,
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
             providers_order=pr.get("order"),
@@ -3777,6 +3845,16 @@ def run_job(
                     turn_exit_reason,
                 )
                 final_response = ""
+
+        # ── STM: post-process response before delivery ──
+        if final_response:
+            try:
+                if _stm_is_enabled(_cfg):
+                    _stm_modules = _stm_get_modules(_cfg)
+                    if _stm_modules:
+                        final_response = _stm_apply(final_response, _stm_modules)
+            except Exception:
+                logger.warning("Job '%s': STM post-processing failed", job_id, exc_info=True)
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -3797,11 +3875,26 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+
+        # ── Bandit Router: record success outcome ──
+        if _bandit_decision is not None:
+            try:
+                _bandit_record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=True)
+            except Exception:
+                logger.warning("Job '%s': bandit outcome record (success) failed", job_id, exc_info=True)
+
         return True, output, final_response, None
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+
+        # ── Bandit Router: record failure outcome ──
+        if _bandit_decision is not None:
+            try:
+                _bandit_record_outcome(_bandit_decision.model, _bandit_decision.bucket, success=False)
+            except Exception:
+                logger.warning("Job '%s': bandit outcome record (failure) failed", job_id, exc_info=True)
         
         output = f"""# Cron Job: {job_name} (FAILED)
 

@@ -34,6 +34,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from agent.bandit_router import (
+    is_enabled as _bandit_is_enabled,
+    select_model as _bandit_select,
+    get_candidates_from_config as _bandit_get_candidates,
+    get_quality_floor as _bandit_get_quality_floor,
+    record_outcome as _bandit_record_outcome,
+)
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -1442,6 +1449,31 @@ def _build_child_agent(
     # Resolve the child's effective model early so it can ride on every event.
     effective_model_for_cb = model or getattr(parent_agent, "model", None)
 
+    # ── Bandit Router: route subagent to cost-optimal model ──
+    _bandit_decision = None
+    if not model:
+        try:
+            import yaml
+            from pathlib import Path
+            _cfg_path = Path("~/.hermes/config.yaml").expanduser()
+            if _cfg_path.exists():
+                _cfg = yaml.safe_load(_cfg_path.read_text()) or {}
+                if _bandit_is_enabled(_cfg):
+                    _candidates = _bandit_get_candidates(_cfg)
+                    if _candidates:
+                        _ctx = {
+                            "prompt": goal or "",
+                            "toolsets": child_toolsets,
+                            "skills": [],
+                        }
+                        _bandit_decision = _bandit_select(
+                            _ctx, _candidates, _bandit_get_quality_floor(_cfg)
+                        )
+                        effective_model_for_cb = _bandit_decision.model
+                        model = _bandit_decision.model
+        except Exception:
+            logger.warning("Bandit routing failed for subagent, using default model", exc_info=True)
+
     # Build progress callback to relay tool calls to parent display.
     # Identity kwargs thread the subagent_id through every emitted event so the
     # TUI can reconstruct the spawn tree and route per-branch controls.
@@ -1717,6 +1749,9 @@ def _build_child_agent(
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
+
+    # Attach bandit decision to child for outcome recording in delegate_task()
+    child._bandit_decision = _bandit_decision
 
     return child
 
@@ -3363,6 +3398,21 @@ def delegate_task(
                 if _idx < len(live_paths):
                     entry["live_transcript"] = live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
+
+        # ── Bandit Router: record outcome for subagent routing ──
+        if results:
+            try:
+                # Read bandit decisions from the children list (single source of truth).
+                # The old _child_agent dir() guard was dead code in the batch path.
+                _any_success = any(
+                    r.get("status") == "ok" for r in results if isinstance(r, dict)
+                )
+                for _i, _t, _child in children:
+                    _bd = getattr(_child, "_bandit_decision", None)
+                    if _bd is not None:
+                        _bandit_record_outcome(_bd.model, _bd.bucket, success=_any_success)
+            except Exception:
+                logger.warning("Bandit outcome recording failed for subagent", exc_info=True)
 
         combined: Dict[str, Any] = {
             "results": results,

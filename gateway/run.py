@@ -17510,6 +17510,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        # Drop turns where the actual user content is empty after timestamp
+        # stripping. Without this guard an empty Telegram event (reaction,
+        # delivery receipt, etc.) fires an agent turn whose only content is
+        # the context/timestamp prefix — producing phantom responses.
+        # Also strip Hermes runtime context annotations like
+        # "[Context: Current time is ...]" before checking emptiness.
+        import re as _re
+        _stripped = _re.sub(r'^\[Context:[^\]]*\]\s*', '', (message_text or ''), flags=_re.MULTILINE).strip()
+        if not _stripped:
+            logger.debug("Dropping empty user turn (no content after context/timestamp strip)")
+            return
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
