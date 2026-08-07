@@ -175,6 +175,36 @@ hermes skills uninstall <skill-name>
 | [**unsloth**](/docs/user-guide/skills/optional/mlops/mlops-training-unsloth) | Unsloth: 2-5x faster LoRA/QLoRA fine-tuning, less VRAM. |
 | [**whisper**](/docs/user-guide/skills/optional/mlops/mlops-whisper) | Transcribe and translate speech in 99 languages. |
 
+## moonpay
+
+| Skill | Description |
+|-------|-------------|
+| [**auth**](/docs/user-guide/skills/optional/moonpay/moonpay-auth) | Set up the CLI, authenticate, and manage local wallets. |
+| [**block-explorer**](/docs/user-guide/skills/optional/moonpay/moonpay-block-explorer) | Open MoonPay activity in the correct block explorer. |
+| [**budget-agent**](/docs/user-guide/skills/optional/moonpay/moonpay-budget-agent) | Enforce a daily spending budget for agent actions. |
+| [**buy-crypto**](/docs/user-guide/skills/optional/moonpay/moonpay-buy-crypto) | Create a fiat-to-crypto checkout link. |
+| [**check-wallet**](/docs/user-guide/skills/optional/moonpay/moonpay-check-wallet) | Check wallet balances, holdings, and portfolio value. |
+| [**commerce**](/docs/user-guide/skills/optional/moonpay/moonpay-commerce) | Shop and pay with crypto through Solana Pay. |
+| [**deposit**](/docs/user-guide/skills/optional/moonpay/moonpay-deposit) | Create cross-chain crypto deposit links. |
+| [**discover-tokens**](/docs/user-guide/skills/optional/moonpay/moonpay-discover-tokens) | Research token prices, briefs, and trading risk. |
+| [**export-data**](/docs/user-guide/skills/optional/moonpay/moonpay-export-data) | Export wallet balances and transactions to CSV or JSON. |
+| [**feedback**](/docs/user-guide/skills/optional/moonpay/moonpay-feedback) | Submit MoonPay CLI feedback and bug reports. |
+| [**fund-polymarket**](/docs/user-guide/skills/optional/moonpay/moonpay-fund-polymarket) | Fund a Polymarket wallet with USDC.e and POL. |
+| [**hardware-wallet**](/docs/user-guide/skills/optional/moonpay/moonpay-hardware-wallet) | Connect a Ledger wallet for physical transaction signing. |
+| [**iron-dca**](/docs/user-guide/skills/optional/moonpay/moonpay-iron-dca) | Automate bounded fiat-to-token dollar-cost averaging. |
+| [**mcp**](/docs/user-guide/skills/optional/moonpay/moonpay-mcp) | Expose MoonPay CLI tools through an MCP server. |
+| [**missions**](/docs/user-guide/skills/optional/moonpay/moonpay-missions) | Run guided missions across MoonPay CLI capabilities. |
+| [**polymarket-ready**](/docs/user-guide/skills/optional/moonpay/moonpay-polymarket-ready) | Prepare a Polygon wallet for Polymarket trading. |
+| [**prediction-market**](/docs/user-guide/skills/optional/moonpay/moonpay-prediction-market) | Trade and monitor Polymarket or Kalshi positions. |
+| [**price-alerts**](/docs/user-guide/skills/optional/moonpay/moonpay-price-alerts) | Create observe-only desktop token-price alerts. |
+| [**scout**](/docs/user-guide/skills/optional/moonpay/moonpay-scout) | Scout Polymarket and Kalshi for arbitrage opportunities. |
+| [**swap-tokens**](/docs/user-guide/skills/optional/moonpay/moonpay-swap-tokens) | Swap or bridge tokens across supported chains. |
+| [**trading-automation**](/docs/user-guide/skills/optional/moonpay/moonpay-trading-automation) | Create bounded DCA, limit, and stop-loss automations. |
+| [**upgrade**](/docs/user-guide/skills/optional/moonpay/moonpay-upgrade) | Increase MoonPay API rate limits through x402. |
+| [**virtual-account**](/docs/user-guide/skills/optional/moonpay/moonpay-virtual-account) | Manage fiat on-ramp and off-ramp virtual accounts. |
+| [**x402**](/docs/user-guide/skills/optional/moonpay/moonpay-x402) | Call x402 APIs using the local MoonPay wallet. |
+| [**x402-analyst**](/docs/user-guide/skills/optional/moonpay/moonpay-x402-analyst) | Research markets through paid x402 APIs. |
+
 ## payments
 
 | Skill | Description |
