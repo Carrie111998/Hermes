@@ -123,8 +123,14 @@ class ExternalBackgroundTasksService:
             raise BackgroundTaskError("plugin_id must be a non-empty string.")
         if not callable(parent_agent_resolver):
             raise BackgroundTaskError("parent_agent_resolver must be callable.")
-        self.plugin_id = plugin_id
+        self._plugin_id = plugin_id
         self._parent_agent_resolver = parent_agent_resolver
+
+    @property
+    def plugin_id(self) -> str:
+        """Plugin identity captured at construction and immutable via the public API."""
+
+        return self._plugin_id
 
     # -- registration -------------------------------------------------------
 

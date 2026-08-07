@@ -123,17 +123,27 @@ def transaction() -> Iterator[sqlite3.Connection]:
 
 def load_or_create_hmac_key(conn: sqlite3.Connection) -> bytes:
     """Load the persisted profile-local handle key, creating it on first use."""
-    row = conn.execute(
-        "SELECT value FROM state_meta WHERE key=?", (_HMAC_META_KEY,)
-    ).fetchone()
-    if row is not None:
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        candidate = secrets.token_bytes(32)
+        conn.execute(
+            "INSERT OR IGNORE INTO state_meta (key, value) VALUES (?, ?)",
+            (_HMAC_META_KEY, candidate.hex()),
+        )
+        row = conn.execute(
+            "SELECT value FROM state_meta WHERE key=?", (_HMAC_META_KEY,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("background-task HMAC key initialization failed")
+        if owns_transaction:
+            conn.commit()
         return bytes.fromhex(row[0])
-    key = secrets.token_bytes(32)
-    conn.execute(
-        "INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
-        (_HMAC_META_KEY, key.hex()),
-    )
-    return key
+    except Exception:
+        if owns_transaction:
+            conn.rollback()
+        raise
 
 
 def sign_handle(

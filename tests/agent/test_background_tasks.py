@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ProcessPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -26,6 +27,7 @@ from agent.background_tasks import (
     ExternalTaskState,
     ExternalTaskStatus,
 )
+from agent.background_tasks_store import connect, load_or_create_hmac_key
 from agent.host_context import bind_host_parent, get_active_host_parent
 from hermes_constants import get_hermes_home
 from tools.process_registry import process_registry
@@ -49,6 +51,15 @@ def _service(plugin_id="test-plugin", resolver=None):
         plugin_id=plugin_id,
         parent_agent_resolver=resolver or get_active_host_parent,
     )
+
+
+def _load_hmac_key_from_process(hermes_home: str) -> bytes:
+    os.environ["HERMES_HOME"] = hermes_home
+    connection = connect()
+    try:
+        return load_or_create_hmac_key(connection)
+    finally:
+        connection.close()
 
 
 def _drain_one():
@@ -92,6 +103,24 @@ def test_plugin_context_service_is_per_plugin_identity():
     b = PluginContext(PluginManifest(name="plugin-b", key="plugin-b"), mgr)
     assert a.background_tasks.plugin_id == "plugin-a"
     assert b.background_tasks.plugin_id == "plugin-b"
+
+
+def test_plugin_identity_is_read_only_after_service_creation():
+    service = _service("plugin-a")
+
+    with pytest.raises(AttributeError):
+        service.plugin_id = "plugin-b"  # type: ignore[misc]
+
+    assert service.plugin_id == "plugin-a"
+
+
+def test_hmac_key_initialization_is_atomic_across_processes(tmp_path):
+    hermes_home = str(tmp_path / "shared-home")
+
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        keys = list(executor.map(_load_hmac_key_from_process, [hermes_home] * 8))
+
+    assert len(set(keys)) == 1
 
 
 # ---------------------------------------------------------------------------
