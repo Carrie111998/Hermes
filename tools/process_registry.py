@@ -1065,6 +1065,16 @@ class ProcessRegistry:
                 session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
+            # Close the parent-side pipes so finished background processes do
+            # not leak file descriptors (Errno 24 over long-running sessions).
+            try:
+                if session.process is not None:
+                    if session.process.stdout is not None:
+                        session.process.stdout.close()
+                    if session.process.stderr is not None:
+                        session.process.stderr.close()
+            except Exception as e:
+                logger.debug("Process stdout/stderr close failed: %s", e)
             session.exited = True
             if session.completion_reason != "killed":
                 session.exit_code = session.process.returncode
@@ -1174,6 +1184,15 @@ class ProcessRegistry:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
+        # Close the PTY master fds so finished interactive processes do not leak
+        # file descriptors (Errno 24 over long-running sessions).
+        try:
+            if session._pty is not None:
+                if hasattr(session._pty, 'close'):
+                    session._pty.close()
+                session._pty = None
+        except Exception as e:
+            logger.debug("PTY close failed: %s", e)
         session.exited = True
         if session.completion_reason != "killed":
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
