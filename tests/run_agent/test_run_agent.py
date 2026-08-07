@@ -658,10 +658,12 @@ class TestMaskApiKey:
 class TestInit:
     def test_anthropic_base_url_accepted(self):
         """Anthropic base URLs should route to native Anthropic client."""
+        mock_anthropic = MagicMock()
+        mock_anthropic.Anthropic.return_value = MagicMock()
         with (
             patch("run_agent.get_tool_definitions", return_value=[]),
             patch("run_agent.check_toolset_requirements", return_value={}),
-            patch("agent.anthropic_adapter._anthropic_sdk") as mock_anthropic,
+            patch("agent.anthropic_adapter._get_anthropic_sdk", return_value=mock_anthropic),
         ):
             agent = AIAgent(
                 api_key="test-key-1234567890",
