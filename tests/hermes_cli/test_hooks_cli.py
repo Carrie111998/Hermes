@@ -203,3 +203,68 @@ class TestHooksDoctor:
         )
         assert "not allowlisted" in out.lower()
         assert "skipped JSON smoke test" in out
+
+
+class TestHooksDoctorInline:
+    """Doctor output for inline ``sh -c '…'`` hooks (#75069 review round).
+
+    The helper-level classification lives in agent/shell_hooks.py; these
+    drive the configured doctor path end-to-end so the CLI wiring — distinct
+    inline diagnostic, JSON smoke test, un-allowlisted safety gate — is
+    covered, not just the helpers."""
+
+    INLINE_COMMAND = "sh -c 'printf \"{}\\n\" 2>/dev/null'"
+
+    def _allowlist(self, command: str) -> None:
+        from agent.shell_hooks import allowlist_path
+
+        allowlist_path().parent.mkdir(parents=True, exist_ok=True)
+        allowlist_path().write_text(json.dumps({
+            "approvals": [
+                {
+                    "event": "on_session_start",
+                    "command": command,
+                    "approved_at": "2000-01-01T00:00:00Z",
+                }
+            ]
+        }))
+
+    def test_allowlisted_inline_hook_reports_inline_diagnostic_and_smokes(self):
+        """An allowlisted inline hook with a shell redirect must pass with a
+        diagnostic that names the interpreter — not claim a script file
+        exists — and still run the JSON smoke test."""
+        self._allowlist(self.INLINE_COMMAND)
+        cfg = {"hooks": {"on_session_start": [{"command": self.INLINE_COMMAND}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert "inline shell command" in out
+        assert "script exists and is executable" not in out
+        assert "script missing" not in out
+        assert "produced valid JSON on synthetic payload" in out
+        assert "All shell hooks look healthy." in out
+
+    def test_unallowlisted_inline_hook_is_not_executed(self, tmp_path):
+        """The M4 safety gate holds for inline commands too: doctor must not
+        execute an un-allowlisted inline body."""
+        sentinel = tmp_path / "executed"
+        command = f"sh -c 'touch {sentinel}'"
+        cfg = {"hooks": {"on_session_start": [{"command": command}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert not sentinel.exists(), "doctor executed an un-allowlisted inline hook"
+        assert "inline shell command" in out
+        assert "not allowlisted" in out.lower()
+        assert "skipped JSON smoke test" in out
+
+    def test_bare_sh_dash_c_without_body_fails_doctor(self):
+        """``sh -c`` with no command body can execute nothing — it must fail
+        the first check, not pass as a healthy inline hook."""
+        cfg = {"hooks": {"on_session_start": [{"command": "sh -c"}]}}
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            out = _run(SimpleNamespace(hooks_action="doctor"))
+
+        assert "inline shell command" not in out
+        assert "script missing or not executable" in out
+        assert "issue(s) found" in out
