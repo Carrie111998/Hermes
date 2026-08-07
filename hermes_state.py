@@ -1294,6 +1294,135 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
+# Categories surfaced through ``session_persistence_failed`` so the error
+# message shown to the user names the real cause instead of a generic
+# "often a full disk" hint. Tested by ``tests/state/test_persistence_error_classification.py``.
+PERSISTENCE_CAUSE_COMPRESSION_LOCK = "compression_lock"
+PERSISTENCE_CAUSE_DATABASE_LOCKED = "database_locked"
+PERSISTENCE_CAUSE_DISK_FULL = "disk_full"
+PERSISTENCE_CAUSE_PERMISSION_DENIED = "permission_denied"
+PERSISTENCE_CAUSE_DB_CORRUPTION = "db_corruption"
+PERSISTENCE_CAUSE_UNKNOWN = "unknown"
+
+_PERSISTENCE_ALL_CAUSES = frozenset({
+    PERSISTENCE_CAUSE_COMPRESSION_LOCK,
+    PERSISTENCE_CAUSE_DATABASE_LOCKED,
+    PERSISTENCE_CAUSE_DISK_FULL,
+    PERSISTENCE_CAUSE_PERMISSION_DENIED,
+    PERSISTENCE_CAUSE_DB_CORRUPTION,
+    PERSISTENCE_CAUSE_UNKNOWN,
+})
+
+
+# Order matters: each entry is tried top-to-bottom. The first match wins so the
+# more specific compression-lock class is caught before the generic busy
+# markers below it would otherwise match the same string. ``db_corruption`` is
+# keyed off explicit string markers ("disk image is malformed", "corrupt") so
+# a generic ``sqlite3.OperationalError`` without that text — which is also a
+# subclass of ``DatabaseError`` — does not pull every OperationalError into
+# the corruption bucket.
+_PERSISTENCE_CAUSE_MATCHERS = (
+    (
+        PERSISTENCE_CAUSE_COMPRESSION_LOCK,
+        lambda exc: isinstance(exc, CompressionSessionBusyError),
+    ),
+    (
+        PERSISTENCE_CAUSE_DISK_FULL,
+        lambda exc: is_disk_full_error(exc),
+    ),
+    (
+        PERSISTENCE_CAUSE_PERMISSION_DENIED,
+        lambda exc: (
+            isinstance(exc, PermissionError)
+            or (
+                isinstance(exc, OSError)
+                and getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM, errno.EROFS}
+            )
+            or (isinstance(exc, sqlite3.OperationalError) and "permission" in str(exc).lower())
+            or (isinstance(exc, sqlite3.OperationalError) and "readonly" in str(exc).lower())
+        ),
+    ),
+    (
+        PERSISTENCE_CAUSE_DB_CORRUPTION,
+        lambda exc: (
+            isinstance(exc, sqlite3.DatabaseError)
+            and not isinstance(exc, sqlite3.IntegrityError)
+            and not isinstance(exc, sqlite3.OperationalError)
+            and ("corrupt" in str(exc).lower() or "malformed" in str(exc).lower())
+        ),
+    ),
+    (
+        PERSISTENCE_CAUSE_DATABASE_LOCKED,
+        lambda exc: (
+            isinstance(exc, sqlite3.OperationalError)
+            and ("locked" in str(exc).lower() or "busy" in str(exc).lower())
+        ),
+    ),
+)
+
+
+def classify_persistence_error(exc: BaseException | str | None) -> str:
+    """Return the canonical cause bucket for a failed ``session_persistence_failed`` write.
+
+    Distinct from :func:`is_disk_full_error` because the user-facing message
+    should name the *real* failure reason — a compression lock, a held
+    write-lock, a permission failure, or genuine disk-full — instead of
+    always pointing at the disk (#81227).
+
+    Order-sensitive: the compression subclass is checked before the generic
+    SQLite busy markers so a live foreign compression lock is reported as
+    ``compression_lock`` rather than ``database_locked``.
+    """
+    if exc is None:
+        return PERSISTENCE_CAUSE_UNKNOWN
+    for cause, predicate in _PERSISTENCE_CAUSE_MATCHERS:
+        try:
+            if predicate(exc):
+                return cause
+        except Exception:
+            # A naive predicate must never break persistence. Fall through.
+            continue
+    return PERSISTENCE_CAUSE_UNKNOWN
+
+
+def persistence_cause_message(cause: str) -> str:
+    """Return a short, user-facing hint for a ``session_persistence_failed`` cause.
+
+    Callers surface this when ``agent._last_persistence_failure`` points at a
+    real exception and the cause bucket is known. Falls back to the legacy
+    "often a full disk" wording for the unknown bucket so the existing helpers
+    keep working when classification is not available.
+    """
+    if cause == PERSISTENCE_CAUSE_COMPRESSION_LOCK:
+        return (
+            "the session is being compressed by another writer; the compression "
+            "is in progress and should finish in seconds — please retry shortly"
+        )
+    if cause == PERSISTENCE_CAUSE_DATABASE_LOCKED:
+        return (
+            "the state.db is held by another process (likely a long maintenance "
+            "operation such as VACUUM or a large WAL checkpoint); retry after "
+            "the maintenance finishes"
+        )
+    if cause == PERSISTENCE_CAUSE_DISK_FULL:
+        return (
+            "free disk space (and verify state.db is writable)"
+        )
+    if cause == PERSISTENCE_CAUSE_PERMISSION_DENIED:
+        return (
+            "fix the state.db file permissions (or run Hermes as the owning user)"
+        )
+    if cause == PERSISTENCE_CAUSE_DB_CORRUPTION:
+        return (
+            "the state.db may be corrupted — inspect the gateway logs and "
+            "consider restoring from the most recent backup"
+        )
+    return (
+        "this is often a full disk — free some space (or fix state.db "
+        "permissions), then send your message again"
+    )
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 

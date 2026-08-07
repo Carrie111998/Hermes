@@ -1472,6 +1472,12 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    # Mirrors the last exception raised by ``_flush_messages_to_session_db``
+    # so the turn-finalizer / user-facing message can name the real cause
+    # (compression lock / DB lock / disk full / permission) instead of
+    # always blaming disk space — #81227. Cleared each turn so a fresh
+    # success does not leak the previous failure's cause.
+    agent._last_persistence_failure = None
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -6505,6 +6511,14 @@ def run_conversation(
                     )
                 except Exception as exc:
                     _tool_turn_persisted = False
+                    # Preserve the cause so the user-facing message names
+                    # the real failure (compression lock / DB lock / disk
+                    # full / permission) instead of defaulting to "often a
+                    # full disk" — #81227. The legacy boolean flag is also
+                    # reflected so guards that only check the flag keep
+                    # working.
+                    agent._last_persistence_failure = exc
+                    agent._incremental_persistence_failed = True
                     logger.warning(
                         "Incremental tool-call persistence failed before execution "
                         "(session=%s): %s",

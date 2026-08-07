@@ -66,6 +66,41 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _persistence_failure_error_message(agent, final_response):
+    """Return the user-facing error string for a ``session_persistence_failed`` turn.
+
+    The previous behavior always surfaced the generic "free disk space" hint,
+    which is misleading when the real cause is a held compression lock, a
+    competing VACUUM, or a permission failure (#81227). When the agent
+    preserves the original exception on ``_last_persistence_failure`` we
+    classify it via ``classify_persistence_error`` and pick the matching
+    cause-specific message. Falls back to the legacy wording when no
+    exception is recorded so callers without ``_last_persistence_failure``
+    keep working unchanged.
+    """
+    fallback = (
+        final_response or "session storage could not be written — free disk space and try again"
+    )
+    exc = getattr(agent, "_last_persistence_failure", None)
+    if exc is None:
+        return fallback
+    try:
+        from hermes_state import classify_persistence_error, persistence_cause_message
+    except Exception:
+        # Defensive: never let the message path crash the turn terminator.
+        return fallback
+    try:
+        cause = classify_persistence_error(exc)
+    except Exception:
+        return fallback
+    if cause == "unknown":
+        return fallback
+    return (
+        "session storage could not be written: "
+        + persistence_cause_message(cause)
+    )
+
+
 def finalize_turn(
     agent,
     *,
@@ -677,9 +712,7 @@ def finalize_turn(
     # final_response; also stamp `error` so gateway surfaces status="error"
     # (and desktop can toast disk-full) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
-        )
+        result["error"] = _persistence_failure_error_message(agent, final_response)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

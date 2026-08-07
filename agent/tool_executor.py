@@ -195,6 +195,12 @@ def _flush_session_db_after_tool_progress(
         return persisted
     except Exception as exc:
         agent._incremental_persistence_failed = True
+        # Preserve the cause so the turn-finalizer / user-facing message can
+        # name the real failure instead of always blaming disk space
+        # (#81227). The boolean flag is kept for backward compatibility with
+        # every ``getattr(agent, "_incremental_persistence_failed", False)``
+        # guard in this module.
+        agent._last_persistence_failure = exc
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
         return False
 

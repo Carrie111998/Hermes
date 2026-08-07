@@ -3668,14 +3668,50 @@ class AIAgent:
         if reason == "session_persistence_failed":
             return (
                 prefix
-                + "the turn was stopped because session storage could not be "
-                "written (the transcript would have been lost on restart). "
-                "This is often a full disk — free some space (or fix state.db "
-                "permissions), then send your message again."
+                + _format_session_persistence_reason(self)
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
         return ""
+
+    def _format_session_persistence_reason(self) -> str:
+        """Pick the user-facing cause string for a ``session_persistence_failed`` turn.
+
+        The previous one-liner always claimed the disk was full, which is
+        actively misleading when the real cause is a held compression lock,
+        a competing VACUUM, or a permission failure (#81227). When the
+        per-turn ``_last_persistence_failure`` carries the originating
+        exception, classify it and surface the matching hint; otherwise
+        fall back to the original "often a full disk" wording so older
+        callers and test stubs without the new attribute keep the
+        prior behavior.
+        """
+        fallback = (
+            "the turn was stopped because session storage could not be "
+            "written (the transcript would have been lost on restart). "
+            "This is often a full disk — free some space (or fix state.db "
+            "permissions), then send your message again."
+        )
+        exc = getattr(self, "_last_persistence_failure", None)
+        if exc is None:
+            return fallback
+        try:
+            from hermes_state import classify_persistence_error, persistence_cause_message
+        except Exception:
+            return fallback
+        try:
+            cause = classify_persistence_error(exc)
+        except Exception:
+            return fallback
+        if cause == "unknown":
+            return fallback
+        return (
+            "the turn was stopped because session storage could not be "
+            "written (the transcript would have been lost on restart). "
+            "Cause: "
+            + persistence_cause_message(cause)
+            + "."
+        )
 
     def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
         """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
