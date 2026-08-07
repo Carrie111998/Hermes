@@ -37,6 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
+import { profileFaviconHref, profileTabTitle } from "@/lib/profile-tab-identity";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
@@ -321,7 +322,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
-  const { profile: scopedProfile } = useProfileScope();
+  const { profile: scopedProfile, currentProfile } = useProfileScope();
+  const agentProfile = scopedProfile || currentProfile || "default";
   const channel = useMemo(
     () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
     [resumeParam, scopedProfile],
@@ -343,6 +345,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setTitle(sessionTitle);
     return () => setTitle(null);
   }, [isActive, sessionTitle, setTitle]);
+
+  useEffect(() => {
+    if (!isActive) return;
+
+    const icon = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+    const previousTitle = document.title;
+    const previousIcon = icon?.href;
+
+    document.title = profileTabTitle(agentProfile, sessionTitle);
+    if (icon) icon.href = profileFaviconHref(agentProfile);
+
+    return () => {
+      document.title = previousTitle;
+      if (icon && previousIcon) icon.href = previousIcon;
+    };
+  }, [agentProfile, isActive, sessionTitle]);
 
   useEffect(() => {
     if (!resumeParam) return;
