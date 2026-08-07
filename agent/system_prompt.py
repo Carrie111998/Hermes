@@ -523,10 +523,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in)
+    # External memory provider system prompt block (additive to built-in).
+    # Issue #81014: must apply the same toolset gate as
+    # ``inject_memory_provider_tools`` — otherwise the provider's
+    # ``system_prompt_block()`` tells the model to use tools (e.g.
+    # ``mnemosyne_remember``) that are gated out of the agent's tool
+    # surface, producing a silent dangling-instruction bug.
     if agent._memory_manager:
         try:
-            _ext_mem_block = agent._memory_manager.build_system_prompt()
+            _existing_tool_names = {
+                t.get("function", {}).get("name")
+                for t in (agent.tools or [])
+                if isinstance(t, dict)
+            }
+            _ext_mem_block = agent._memory_manager.build_system_prompt(
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                memory_tool_present="memory" in _existing_tool_names,
+            )
             if _ext_mem_block:
                 volatile_parts.append(_ext_mem_block)
         except Exception:

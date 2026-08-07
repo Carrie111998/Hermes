@@ -968,6 +968,143 @@ class TestMemoryToolToolsetGate:
         assert names == {"fact_store", "memory_search", "memory_add"}
 
 
+class TestSystemPromptToolsetGate:
+    """Issue #81014: system_prompt_block() must respect the same toolset gate.
+
+    Before the fix, MemoryManager.build_system_prompt() always emitted every
+    registered provider's ``system_prompt_block()`` — even when the provider's
+    tools were gated out of the agent's tool surface by ``disabled_toolsets``
+    or by an empty ``enabled_toolsets``. Result: the system prompt told the
+    model to use ``mnemosyne_remember`` etc. while those tools were NOT in
+    the model's tool schema (silent dangling instruction). Mirrors the gate
+    used by ``inject_memory_provider_tools`` so the two paths cannot drift.
+    """
+
+    def _mgr_with_prompt_block(self, block_text, *tool_names):
+        mgr = MemoryManager()
+        provider = FakeMemoryProvider(
+            "ext",
+            tools=[{"name": n, "description": n, "parameters": {}} for n in tool_names],
+        )
+        provider._prompt_block = block_text
+        mgr.add_provider(provider)
+        return mgr
+
+    def test_disabled_memory_toolset_suppresses_system_prompt_block(self):
+        """The gate-closed case from the issue: memory disabled, prompt block must be empty."""
+        mgr = self._mgr_with_prompt_block(
+            "# Mnemosyne Memory\nUse mnemosyne_remember to store facts.",
+            "mnemosyne_remember", "mnemosyne_recall",
+        )
+        result = mgr.build_system_prompt(
+            enabled_toolsets=["file", "terminal"],
+            disabled_toolsets=["memory"],
+        )
+        assert result == ""
+
+    def test_empty_enabled_toolsets_suppresses_system_prompt_block(self):
+        """`platform_toolsets: cli: []` (empty) must suppress the prompt block."""
+        mgr = self._mgr_with_prompt_block(
+            "# Mnemosyne Memory\nUse mnemosyne_remember to store facts.",
+            "mnemosyne_remember",
+        )
+        result = mgr.build_system_prompt(enabled_toolsets=[])
+        assert result == ""
+
+    def test_toolsets_without_memory_suppresses_system_prompt_block(self):
+        """Toolsets that don't include memory must suppress the prompt block."""
+        mgr = self._mgr_with_prompt_block(
+            "# Mnemosyne Memory\nUse mnemosyne_remember to store facts.",
+            "mnemosyne_remember",
+        )
+        result = mgr.build_system_prompt(enabled_toolsets=["file", "terminal"])
+        assert result == ""
+
+    @pytest.mark.parametrize("enabled_toolsets", [None, ["memory"], ["all"], ["hermes-acp"]])
+    def test_gate_open_emits_system_prompt_block(self, enabled_toolsets):
+        """When the gate is open, the prompt block must reach the model."""
+        block_text = (
+            "# Mnemosyne Memory\n"
+            "Use mnemosyne_remember to store facts, mnemosyne_recall to search."
+        )
+        mgr = self._mgr_with_prompt_block(
+            block_text,
+            "mnemosyne_remember", "mnemosyne_recall",
+        )
+        result = mgr.build_system_prompt(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=None,
+        )
+        assert "mnemosyne_remember" in result
+        assert "mnemosyne_recall" in result
+
+    def test_memory_tool_present_carveout_emits_block(self):
+        """When ``memory`` is already on the tool surface (custom carve-out path),
+        the prompt block must still be emitted even with ``enabled_toolsets=[]`` —
+        matches the carve-out used by ``inject_memory_provider_tools``.
+        """
+        mgr = self._mgr_with_prompt_block(
+            "# Mnemosyne Memory\nUse mnemosyne_remember.",
+            "mnemosyne_remember",
+        )
+        result = mgr.build_system_prompt(
+            enabled_toolsets=[],
+            memory_tool_present=True,
+        )
+        assert "mnemosyne_remember" in result
+
+    def test_no_provider_no_block(self):
+        """Empty manager still returns empty string — sanity for the gate."""
+        mgr = MemoryManager()
+        result = mgr.build_system_prompt(enabled_toolsets=["memory"])
+        assert result == ""
+
+    def test_provider_with_empty_prompt_block_skipped(self):
+        """A provider whose system_prompt_block() returns empty must contribute nothing,
+        regardless of the gate — preserves existing per-provider behavior."""
+        mgr = self._mgr_with_prompt_block("", "fact_store")
+        result = mgr.build_system_prompt(enabled_toolsets=["memory"])
+        assert result == ""
+
+    def test_gate_consistent_with_tool_injection(self):
+        """build_system_prompt() and inject_memory_provider_tools() must use the SAME
+        gate — every (enabled_toolsets, disabled_toolsets) combination must give the
+        same open/closed verdict. This is the property that closes the dangling
+        instruction bug: the prompt block and the tool surface must always agree.
+        """
+        from agent.memory_manager import memory_provider_tools_enabled
+        cases = [
+            (None, None),
+            (["memory"], None),
+            (["terminal"], None),
+            (["hermes-acp"], None),
+            ([], None),
+            (None, ["memory"]),
+            (["memory"], ["memory"]),
+            (["hermes-acp"], ["memory"]),
+        ]
+        for enabled, disabled in cases:
+            # Simulate the same gate used by both call paths
+            gate = memory_provider_tools_enabled(enabled, disabled)
+            mgr = self._mgr_with_prompt_block("block", "fact_store")
+            prompt = mgr.build_system_prompt(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+            )
+            # If the gate is closed, the prompt block must be empty.
+            # If open, the prompt block must contain the body.
+            if not gate:
+                assert prompt == "", (
+                    f"gate closed but prompt block emitted for "
+                    f"enabled={enabled} disabled={disabled}: {prompt!r}"
+                )
+            else:
+                assert prompt, (
+                    f"gate open but prompt block empty for "
+                    f"enabled={enabled} disabled={disabled}"
+                )
+
+
 class TestContextEngineToolsetGate:
     """Issue #5544 (sibling): context engine tools follow the same gate.
 

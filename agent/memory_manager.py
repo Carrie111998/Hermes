@@ -483,12 +483,43 @@ class MemoryManager:
 
     # -- System prompt -------------------------------------------------------
 
-    def build_system_prompt(self) -> str:
+    def build_system_prompt(
+        self,
+        enabled_toolsets: Optional[List[str]] = None,
+        disabled_toolsets: Optional[List[str]] = None,
+        *,
+        memory_tool_present: bool = False,
+    ) -> str:
         """Collect system prompt blocks from all providers.
 
         Returns combined text, or empty string if no providers contribute.
         Each non-empty block is labeled with the provider name.
+
+        Issue #81014: the system prompt block must be gated by the same
+        ``memory_provider_tools_enabled`` check that governs tool injection.
+        Otherwise, a config that disables the memory toolset (e.g. a CLI
+        setup with ``agent.disabled_toolsets: [memory]``) still injects the
+        provider's ``system_prompt_block()`` — which tells the model to use
+        ``mnemosyne_remember`` etc. — even though those tools are NOT in
+        the model's tool surface. The model receives instructions for tools
+        that don't exist (silent dangling-instruction bug).
+
+        When the gate is closed, ``system_prompt_block()`` is skipped for
+        every provider whose tools would be gated (the typical case — one
+        external provider at a time). Providers that expose tools which
+        happen to already be on the agent's tool surface for a non-gated
+        reason (the ``memory_tool_present`` carve-out, mirroring the tool
+        injection path) still contribute.
+
+        The gate uses the same ``memory_provider_tools_enabled`` helper as
+        ``inject_memory_provider_tools`` so the two paths cannot drift.
         """
+        if not memory_provider_tools_enabled(
+            enabled_toolsets,
+            disabled_toolsets,
+            memory_tool_present=memory_tool_present,
+        ):
+            return ""
         blocks = []
         for provider in self._providers:
             try:
