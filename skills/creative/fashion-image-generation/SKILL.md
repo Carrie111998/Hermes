@@ -23,8 +23,10 @@ Generate catalog/editorial product imagery from a garment's **ghost mannequin** 
 ## References & scripts
 - `references/openrouter-image-api.md` — exact OpenRouter image API wire format (endpoint, `input_references`, params, billing).
 - `references/openrouter-video-api.md` — OpenRouter image-to-video API (async submit/poll/download), incl. the **Seedance real-person block**, **hailuo-3 2K-only resolution** quirk, and the Drive-public-first-frame pattern. Use when asked to turn a campaign still into a vertical/editorial video.
-- `references/fw26-altitude-collection.md` — verified ghost/swatch→file/color manifest + Drive topology for the FW26 Altitude batch (resume without re-identifying swatches). **NOTE: this Drive has TWO parallel ALTITUDE trees (`FW 26` vs `GEN IMAGE`); only `FW 26` under `HELMUR - ALTITUDE` is the user's real destination — see the ⚠️ in the file before uploading.**
+- `references/fw26-altitude-collection.md` — verified ghost/swatch→file/color manifest + Drive topology for the FW26 Altitude batch (resume without re-identifying swatches). **NOTE: this Drive has TWO parallel ALTITUDE trees (`FW 26` vs `GEN IMAGE`); only `FW 26` under `HELMUR - ALTITUDE` is the user's real destination — see the ⚠️ in the file before uploading. Effective 2026-08-07 the final output destination is `PRODUCT IMG` (see `fw26-sku-map.md`), not `_OUTPUT` — re-run needs confirm.**
+- `references/fw26-sku-map.md` — **output destination & SKU renaming** (MODIFICA 3): target `PRODUCT IMG > DONNA|UOMO > MODELLO > COLORE`, and the progressive SKU-based filename convention `<SKU>_<modello>-<colore>_<NN>_<posa>.png` derived from the `HELMUR-master-prodotti` spreadsheet tab VARIANTI. Re-derive the map from the live xlsx — never hand-maintain.
 - `templates/batch_gen.py` — known-good manifest-driven batch script (STEP A + STEP B, idempotent, cost-logging). Copy and adapt.
+- `templates/organize_output.py` — renames generated outputs with the SKU convention and uploads them into `PRODUCT IMG` (idempotent per exact filename).
 
 ## The two-step pipeline
 For each garment, for each colorway N:
