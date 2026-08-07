@@ -11759,7 +11759,12 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     token = set_hermes_home_override(str(home))
     try:
         with cron_jobs.use_cron_store(home):
-            result = getattr(cron_jobs, func_name)(*args, **kwargs)
+            if func_name == "create_job":
+                from cron.scheduler import create_job_with_scheduler_registration
+
+                result = create_job_with_scheduler_registration(*args, **kwargs)
+            else:
+                result = getattr(cron_jobs, func_name)(*args, **kwargs)
     finally:
         reset_hermes_home_override(token)
 
@@ -11806,6 +11811,19 @@ async def _run_cron_dashboard_io(func, *args, **kwargs):
     if inspect.isawaitable(result):
         raise TypeError("_run_cron_dashboard_io sync callable returned an awaitable")
     return result
+
+
+def _raise_if_cron_registration_error(e: Exception) -> None:
+    """Re-raise a cron partial-failure (job saved, external scheduler
+    registration failed) as HTTP 424 with the structured envelope.
+
+    Shared by every dashboard cron-create surface so the contract can't
+    drift between copies. The lazy import keeps cron out of module import.
+    """
+    from cron.scheduler import CronSchedulerRegistrationError
+
+    if isinstance(e, CronSchedulerRegistrationError):
+        raise HTTPException(status_code=424, detail=e.to_dict()) from e
 
 
 from hermes_cli.web_routers import cron as _cron_routes  # noqa: E402
@@ -11921,6 +11939,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
     except HTTPException:
         raise
     except Exception as e:
+        _raise_if_cron_registration_error(e)
         _log.exception("POST /api/cron/jobs failed")
         raise HTTPException(status_code=400, detail=str(e))
 

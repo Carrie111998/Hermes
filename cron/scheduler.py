@@ -4444,6 +4444,51 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
+class CronSchedulerRegistrationError(RuntimeError):
+    """A job was persisted but its first external trigger was not registered."""
+
+    def __init__(self, job: dict, cause: Exception) -> None:
+        self.job = job
+        self.cause = cause
+        super().__init__(
+            f"Cron job '{job['id']}' was saved, but its first scheduler "
+            f"registration failed ({type(cause).__name__}). Do not create a "
+            "duplicate. Pause/resume or update the job to retry registration."
+        )
+
+    def user_message(self) -> str:
+        """Human-facing variant for chat/CLI surfaces (no exception class name)."""
+        label = self.job.get("name") or self.job["id"]
+        return (
+            f"Saved cron job '{label}', but couldn't register it with the "
+            "external scheduler yet. The job is kept — don't re-create it; "
+            "pause/resume or edit it (e.g. via /cron) to retry registration."
+        )
+
+    def to_dict(self) -> dict:
+        """Return the public partial-failure contract without provider details."""
+        return {
+            "error": str(self),
+            "job_id": self.job["id"],
+            "job_saved": True,
+            "scheduler_registered": False,
+            "retry_create": False,
+        }
+
+
+def create_job_with_scheduler_registration(**kwargs) -> dict:
+    """Persist one job and register its first trigger with the active provider."""
+    from cron.jobs import create_job
+    from cron.scheduler_provider import resolve_cron_scheduler
+
+    job = create_job(**kwargs)
+    try:
+        resolve_cron_scheduler().register_job(job)
+    except Exception as exc:
+        raise CronSchedulerRegistrationError(job, exc) from exc
+    return job
+
+
 def tick(
     verbose: bool = True,
     adapters=None,

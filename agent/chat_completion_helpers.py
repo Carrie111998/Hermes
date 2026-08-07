@@ -3348,6 +3348,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         else:
                             # Unrepairable — flag for truncation handling
                             has_truncated_tool_args = True
+                elif finish_reason is None:
+                    # Stream ended with no finish_reason AND this tool call's
+                    # arguments never received a single byte (name arrived,
+                    # argument generation never started before the connection
+                    # died). Left unflagged, this fell through to
+                    # `effective_finish_reason = finish_reason or "stop"`
+                    # below — a normal "stop" turn carrying a tool call whose
+                    # empty arguments string later gets silently coerced to
+                    # "{}" at the dispatch boundary and executed with no
+                    # arguments and no retry (#80498). Route it through the
+                    # same dropped-mid-tool-call stub path already used for a
+                    # truncated-but-nonempty JSON string.
+                    has_truncated_tool_args = True
                 mock_tool_calls.append(SimpleNamespace(
                     id=tc["id"],
                     type=tc["type"],
@@ -3617,6 +3630,34 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         if agent._interrupt_requested:
             return None
+
+        def _tool_use_dropped_mid_stream(message) -> bool:
+            """True when the stream died mid tool call (#80498 sibling).
+
+            Mirror of the chat_completions zero-byte/truncated-args gate: a
+            legitimate completion always carries a ``stop_reason``
+            (``tool_use``/``end_turn``/...), so a message that contains a
+            ``tool_use`` block but NO stop_reason means the SSE closed after
+            ``content_block_start`` and before ``message_delta`` — the
+            block's ``input`` is whatever partial state the SDK snapshot
+            accumulated (typically ``{}`` when no ``input_json_delta`` ever
+            arrived). Without this gate the empty-input call passed the
+            empty-stream guards (content is non-empty) and executed the tool
+            with no arguments and no retry. Raising EmptyStreamError blocks
+            that execution on every path; when no assistant text streamed
+            before the drop it additionally rides the bounded stream-retry
+            the eventless case uses (probe-verified recovery), while a
+            drop after streamed preamble text degrades to the
+            partial-stream-stub/continuation path instead — still never an
+            empty-args execution.
+            """
+            if getattr(message, "stop_reason", None) is not None:
+                return False
+            for block in getattr(message, "content", None) or []:
+                if getattr(block, "type", None) == "tool_use":
+                    return True
+            return False
+
         if (
             base_final_message is not None
             and not getattr(base_final_message, "content", None)
@@ -3627,6 +3668,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 "(possible upstream error or malformed event stream)."
             )
         if base_final_message is not None and not stream.output_modified:
+            if _tool_use_dropped_mid_stream(base_final_message):
+                raise EmptyStreamError(
+                    "Stream ended with no stop_reason while a tool_use "
+                    "block was still incomplete; treating as a "
+                    "mid-tool-call stream drop (#80498)."
+                )
             return base_final_message
         final_message = accumulator.response(base_final_message)
         if (
@@ -3636,6 +3683,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             raise EmptyStreamError(
                 "Provider returned an empty stream with no stop_reason "
                 "(possible upstream error or malformed event stream)."
+            )
+        if _tool_use_dropped_mid_stream(final_message):
+            raise EmptyStreamError(
+                "Stream ended with no stop_reason while a tool_use "
+                "block was still incomplete; treating as a "
+                "mid-tool-call stream drop (#80498)."
             )
         return final_message
 

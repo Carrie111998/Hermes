@@ -511,14 +511,21 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         body = m.group(1)
         start_orig = orig_idx[m.start(1)]
         end_orig = orig_idx[m.end(1) - 1] + 1
-        # If any fragment inside the original span already matches _PREFIX_RE
-        # on its own, the ordinary prefix pass will mask it — do NOT join.
-        # Joining here would swallow adjacent legitimate text: a complete
-        # token at end-of-line followed by a word line (``ghp_<token>\n
-        # button [ref=e3]``) joins into one stripped-copy match and the
-        # mask eats ``button``. Join only when fragments alone are too
-        # short/broken to match (the actual smuggling shape).
-        if _PREFIX_RE.search(text[start_orig:end_orig]):
+        # If a fragment inside the span already matches _PREFIX_RE on its
+        # own AND the span crosses a LINE boundary (\n / \r), do NOT join.
+        # A complete token at end-of-line followed by a word line
+        # (``ghp_<token>\nbutton [ref=e3]``) joins into one stripped-copy
+        # match and the mask eats ``button``. Line structure is legitimate;
+        # the self-matching fragment is handled by the ordinary prefix pass
+        # (any remainder past the newline is left unmasked — accepted
+        # residual to preserve line structure).
+        # For NON-newline controls (ESC, ZWSP, ...) the join proceeds even
+        # when a fragment self-matches: those bytes never legitimately sit
+        # between a token and adjacent prose, and skipping there let the
+        # non-matching remainder of a split token leak
+        # (``sk-<head>\x1b<tail>`` masked only the head).
+        span = text[start_orig:end_orig]
+        if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
             continue
         # Reject matches whose original span crosses a non-token char
         # (e.g. ``sk_abc…\nTAVILY_API_KEY=…`` — the ``=`` is not part of a
@@ -526,7 +533,7 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
         # reject when the match runs into a ``KEY=`` name: a real token value
         # is followed by a newline/space/end, not ``=``.
         if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c)
-                for c in text[start_orig:end_orig])
+                for c in span)
                 and (end_orig >= len(text) or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
