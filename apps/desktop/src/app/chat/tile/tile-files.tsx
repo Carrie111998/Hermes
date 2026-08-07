@@ -10,7 +10,7 @@ import { useI18n } from '@/i18n'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { notifyError } from '@/store/notifications'
-import { openPreview } from '@/store/preview'
+import { openPreview, type PreviewTarget } from '@/store/preview'
 
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
 
@@ -22,6 +22,12 @@ interface TileFilesProps {
   cwd: string
   onActivateFile: (path: string) => void
   onActivateFolder: (path: string) => void
+  /** Collapse this panel (tile drawer) — provided by tiles; the workspace
+   *  pane collapses via the chat header button instead. */
+  onFilesCollapse?: () => void
+  /** Route file PREVIEWS (tree click/dblclick/Enter activation) to an
+   *  embedded preview instead of the global preview rail. Absent → the rail. */
+  onPreviewTarget?: (preview: PreviewTarget) => void
 }
 
 /**
@@ -33,7 +39,7 @@ interface TileFilesProps {
  * Moved from the global right sidebar (right-sidebar/index.tsx): the panel is
  * identical, minus the app-chrome chrome (titlebar padding, flip borders).
  */
-export function TileFiles({ cwd, onActivateFile, onActivateFolder }: TileFilesProps) {
+export function TileFiles({ cwd, onActivateFile, onActivateFolder, onFilesCollapse, onPreviewTarget }: TileFilesProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
   const currentCwd = cwd.trim()
@@ -73,7 +79,11 @@ export function TileFiles({ cwd, onActivateFile, onActivateFolder }: TileFilesPr
         throw new Error(r.couldNotPreview(path))
       }
 
-      openPreview(preview, 'file-browser')
+      if (onPreviewTarget) {
+        onPreviewTarget(preview)
+      } else {
+        openPreview(preview, 'file-browser')
+      }
     } catch (error) {
       notifyError(error, r.previewUnavailable)
     }
@@ -96,6 +106,7 @@ export function TileFiles({ cwd, onActivateFile, onActivateFolder }: TileFilesPr
         onActivateFile={onActivateFile}
         onActivateFolder={onActivateFolder}
         onCollapseAll={collapseAll}
+        onFilesCollapse={onFilesCollapse}
         onLoadChildren={loadChildren}
         onNodeOpenChange={setNodeOpen}
         onPreviewFile={previewFile}
@@ -111,6 +122,7 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   cwdName: string
   hasWorkspace: boolean
   onCollapseAll: () => void
+  onFilesCollapse?: () => void
   onRefresh: () => void
 }
 
@@ -133,6 +145,7 @@ function FilesystemTab({
   onActivateFile,
   onActivateFolder,
   onCollapseAll,
+  onFilesCollapse,
   onLoadChildren,
   onNodeOpenChange,
   onPreviewFile,
@@ -178,6 +191,19 @@ function FilesystemTab({
             <Codicon name="collapse-all" size="0.8125rem" />
           </Button>
         </Tip>
+        {onFilesCollapse && (
+          <Tip label={t.titlebar.hideRightSidebar}>
+            <Button
+              aria-label={t.titlebar.hideRightSidebar}
+              className={HEADER_ACTION_CLASS}
+              onClick={onFilesCollapse}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name="chevron-right" size="0.8125rem" />
+            </Button>
+          </Tip>
+        )}
       </RightSidebarSectionHeader>
       <FileTreeBody
         collapseNonce={collapseNonce}
