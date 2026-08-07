@@ -88,6 +88,18 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
+    def recover_interrupted_deliveries(self) -> int:
+        """Classify ambiguous in-flight sends without retrying them."""
+        from cron.executions import recover_interrupted_deliveries
+
+        return recover_interrupted_deliveries()
+
+    def retry_deliveries(self, *, adapters: Any = None, loop: Any = None) -> int:
+        """Reconcile due post-execution sends at this provider's wake points."""
+        from cron.scheduler import retry_due_deliveries
+
+        return retry_due_deliveries(adapters=adapters, loop=loop)
+
     def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -184,7 +196,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None,
     ):
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import retry_due_deliveries, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -219,6 +231,12 @@ class InProcessCronScheduler(CronScheduler):
                 "Marked %d interrupted cron execution(s) unknown after restart",
                 recovered,
             )
+        recovered_deliveries = self.recover_interrupted_deliveries()
+        if recovered_deliveries:
+            logger.warning(
+                "Marked %d in-flight cron delivery attempt(s) unknown after restart",
+                recovered_deliveries,
+            )
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
@@ -228,6 +246,7 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
+                    retry_due_deliveries(adapters=adapters, loop=loop)
                     cron_tick(
                         verbose=False,
                         adapters=adapters,
@@ -279,7 +298,7 @@ class InProcessCronScheduler(CronScheduler):
         ``web_server.py`` scopes per-profile cron API calls.
         """
         import logging
-        from cron.scheduler import tick as cron_tick
+        from cron.scheduler import retry_due_deliveries, tick as cron_tick
         from cron.jobs import (
             clear_ticker_error,
             record_ticker_error,
@@ -308,6 +327,13 @@ class InProcessCronScheduler(CronScheduler):
                             recovered,
                             home,
                         )
+                    recovered_deliveries = self.recover_interrupted_deliveries()
+                    if recovered_deliveries:
+                        logger.warning(
+                            "Marked %d in-flight cron delivery attempt(s) for profile at %s unknown",
+                            recovered_deliveries,
+                            home,
+                        )
                     record_ticker_heartbeat()
             finally:
                 reset_hermes_home_override(home_token)
@@ -323,6 +349,7 @@ class InProcessCronScheduler(CronScheduler):
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                retry_due_deliveries(adapters=adapters, loop=loop)
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,

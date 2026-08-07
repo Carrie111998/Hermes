@@ -91,6 +91,22 @@ def test_reconcile_arms_all_enabled(temp_home, chronos, monkeypatch):
     assert fake.cancels == []
 
 
+def test_job_change_cancels_invalid_delivery_before_registry_reconcile(
+    chronos, monkeypatch
+):
+    prov, _fake = chronos
+    events = []
+    monkeypatch.setattr(
+        "cron.scheduler.cancel_invalid_deliveries",
+        lambda: events.append("cancel-delivery") or 1,
+    )
+    monkeypatch.setattr(prov, "reconcile", lambda: events.append("reconcile"))
+
+    prov.on_jobs_changed()
+
+    assert events == ["cancel-delivery", "reconcile"]
+
+
 # -- fire_due re-arm ----------------------------------------------------------
 
 def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
@@ -104,5 +120,4 @@ def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):
     assert prov.fire_due("j1") is True
     assert [p["job_id"] for p in fake.provisions] == ["j1"]
     assert fake.provisions[0]["fire_at"] == "2026-06-18T12:05:00+00:00"
-
 

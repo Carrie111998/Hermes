@@ -18,6 +18,11 @@ Design constraints (see the plan's DQ-1):
   - reconcile runs only on a warm process (start / on_jobs_changed / piggybacked
     on a fire), never as a periodic wake of a sleeping machine.
 
+Delivery retries remain durable in the profile-local SQLite ledger while the
+gateway is scaled to zero. Their ``next_attempt_at`` is an eligibility time,
+not a Chronos wake request: retries execute at the next warm lifecycle callback
+(startup, job change, or fire), which may be later than the recorded backoff.
+
 Inert unless ``cron.provider: chronos``. ``resolve_cron_scheduler`` falls back
 to the built-in if Chronos is unavailable, so cron never loses its trigger.
 
@@ -110,6 +115,8 @@ class ChronosCronScheduler(CronScheduler):
         # process did. Classify those attempts unknown for audit only; do not
         # requeue them here.
         self.recover_interrupted()
+        self.recover_interrupted_deliveries()
+        self.retry_deliveries(adapters=adapters, loop=loop)
         try:
             self.reconcile()
         except Exception as e:
@@ -122,6 +129,15 @@ class ChronosCronScheduler(CronScheduler):
     def on_jobs_changed(self) -> None:
         """A job was created/updated/removed/paused/resumed — reconcile the NAS
         registry so the affected one-shot is (re-)armed or cancelled."""
+        # Scrub deliveries for deleted/disabled jobs immediately. Chronos has
+        # no periodic wake, so deferring this to the next due timestamp could
+        # retain payloads forever after the final job is removed.
+        try:
+            from cron.scheduler import cancel_invalid_deliveries
+
+            cancel_invalid_deliveries()
+        except Exception as e:
+            logger.debug("Chronos delivery cancellation reconcile failed: %s", e)
         try:
             self.reconcile()
         except Exception as e:
@@ -224,6 +240,9 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
+        # A callback is also a safe warm-process reconciliation point for
+        # result deliveries that failed on an earlier fire.
+        self.retry_deliveries(adapters=adapters, loop=loop)
         ran = super().fire_due(job_id, adapters=adapters, loop=loop)
         if ran:
             from cron.jobs import get_job
