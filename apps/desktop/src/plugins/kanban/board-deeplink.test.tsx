@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, cleanup, render, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter, useNavigate } from 'react-router'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as KanbanApi from './api'
@@ -122,7 +122,7 @@ describe('KanbanBoardPage deep link (?task=<id>)', () => {
     await waitFor(() => expect(fetchTask).toHaveBeenCalledWith('t_abc123'))
   })
 
-  it('does not open a drawer for an id missing from the board', async () => {
+  it('does not open a drawer for an id missing from the board, and still consumes the param', async () => {
     fetchBoard.mockResolvedValue(boardWith(null))
 
     renderPage('/kanban?task=t_ghost')
@@ -130,6 +130,15 @@ describe('KanbanBoardPage deep link (?task=<id>)', () => {
     // Let the board query land and the effect settle before asserting absence.
     await waitFor(() => expect(fetchBoard).toHaveBeenCalled())
     await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+    expect(fetchTask).not.toHaveBeenCalled()
+
+    // A refetch after the foreign id was processed must stay silent — the
+    // param was dropped even though nothing opened, so it can't leak onto a
+    // later board where the id happens to exist.
+    await act(async () => {
+      queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
       await new Promise(resolve => setTimeout(resolve, 50))
     })
     expect(fetchTask).not.toHaveBeenCalled()
@@ -164,5 +173,41 @@ describe('KanbanBoardPage deep link (?task=<id>)', () => {
       await new Promise(resolve => setTimeout(resolve, 50))
     })
     expect(fetchTask).not.toHaveBeenCalled()
+  })
+
+  it('opens the drawer when the route gains the param after mount (in-app navigation)', async () => {
+    fetchBoard.mockResolvedValue(boardWith('t_abc123'))
+    fetchTask.mockResolvedValue(detailFor('t_abc123'))
+    fetchLog.mockResolvedValue({ entries: [] })
+
+    function NavigateToDeepLink() {
+      const navigate = useNavigate()
+
+      return (
+        <>
+          <KanbanBoardPage />
+          <button onClick={() => navigate('/kanban?task=t_abc123')}>nav</button>
+        </>
+      )
+    }
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={['/kanban']}>
+          <NavigateToDeepLink />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+
+    // Plain mount: no deep link yet.
+    await waitFor(() => expect(fetchBoard).toHaveBeenCalled())
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+    expect(fetchTask).not.toHaveBeenCalled()
+
+    // Navigating to the same route with the param is a deep link too.
+    fireEvent.click(screen.getByRole('button', { name: 'nav' }))
+    await waitFor(() => expect(fetchTask).toHaveBeenCalledWith('t_abc123'))
   })
 })

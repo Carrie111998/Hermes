@@ -58,7 +58,7 @@ import {
   useRef,
   useState
 } from 'react'
-import { useLocation } from 'react-router'
+import { useLocation, useNavigate } from 'react-router'
 
 import {
   $boardSlug,
@@ -1103,29 +1103,28 @@ export function KanbanBoardPage() {
 
   // Deep link: /kanban?task=<id> opens that card's drawer. The router location
   // (hash route) is the source of truth, so this reacts to in-app navigation
-  // too, not just first mount. Consumed once per param value — a board refetch
-  // must never re-open a drawer the user closed while the param is unchanged.
+  // too, not just first mount. The param is dropped from the URL after it's
+  // been handled, so a board refetch, a reload, or a board switch can never
+  // re-open a drawer the user closed. A foreign id (other board, deleted,
+  // archived) opens nothing — but the param is still dropped, so it can't
+  // leak onto a later board where the id happens to exist.
   const location = useLocation()
+  const navigate = useNavigate()
   const deepLinkTask = useMemo(() => new URLSearchParams(location.search).get('task'), [location.search])
-  const consumedDeepLinkRef = useRef<null | string>(null)
 
-  // eslint-disable-next-line no-restricted-syntax -- one-shot consumed-deep-link sentinel, not an atom mirror
   useEffect(() => {
-    if (!deepLinkTask || deepLinkTask === consumedDeepLinkRef.current || !board) {
+    if (!deepLinkTask || !board) {
       return
     }
 
-    // Only open when the id actually lives on the board being shown — a
-    // foreign id (other board, deleted, archived) would just draw a 404 drawer.
     const exists = board.columns.some(col => col.tasks.some(task => task.id === deepLinkTask))
 
-    if (!exists) {
-      return
+    if (exists) {
+      setOpenId(deepLinkTask)
     }
 
-    consumedDeepLinkRef.current = deepLinkTask
-    setOpenId(deepLinkTask)
-  }, [board, deepLinkTask])
+    navigate(location.pathname, { replace: true })
+  }, [board, deepLinkTask, location.pathname, navigate])
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
