@@ -4808,7 +4808,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
     _TOKEN_DELTA_ROUTE_FIELDS = (
-        "model", "cost_status", "cost_source", "pricing_version",
+        "model", "resolved_model", "cost_status", "cost_source", "pricing_version",
         "billing_provider", "billing_base_url", "billing_mode",
     )
 
@@ -5048,6 +5048,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         input_tokens: int = 0,
         output_tokens: int = 0,
         model: str = None,
+        resolved_model: Optional[str] = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
@@ -5191,10 +5192,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             conn.execute(sql, params)
             if record_model_usage:
+                # ``resolved_model`` is the model that actually served this
+                # request (for routers/aggregators like openrouter/auto-beta,
+                # this is the selected upstream model, distinct from the
+                # configured ``model`` slug). Attribution to the per-model usage
+                # table must use the resolved model so distribution/spend is
+                # accurate; the ``sessions`` summary row keeps the configured
+                # route.
+                _attr_model = resolved_model or model
                 self._record_model_usage(
                     conn,
                     session_id,
-                    model=model,
+                    model=_attr_model,
                     billing_provider=billing_provider,
                     billing_base_url=billing_base_url,
                     billing_mode=billing_mode,

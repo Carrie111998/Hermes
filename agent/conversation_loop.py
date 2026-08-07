@@ -3344,7 +3344,7 @@ def run_conversation(
                     # aggregator does the full acting loop). Price the aggregator
                     # turn at its REAL model/provider, read from the MoA client's
                     # resolved aggregator slot.
-                    _agg_cost_model = agent.model
+                    _agg_cost_model = getattr(response, "model", None) or agent.model
                     _agg_cost_provider = agent.provider
                     _agg_cost_base_url = agent.base_url
                     _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
@@ -3420,6 +3420,13 @@ def run_conversation(
                                 billing_mode="subscription_included"
                                 if cost_result.status == "included" else None,
                                 model=agent.model,
+                                # Resolved upstream model (for routers like
+                                # openrouter/auto-beta, response.model carries
+                                # the selected upstream model, distinct from the
+                                # configured slug) — used for per-model usage
+                                # attribution only.
+                                resolved_model=getattr(response, "model", None)
+                                or agent.model,
                                 api_call_count=1,
                             )
                         except Exception as e:

@@ -506,3 +506,60 @@ class TestCoalesceFieldContract:
             f"coalescing field lists reference kwargs update_token_counts "
             f"no longer accepts: {sorted(phantom)}"
         )
+
+
+class TestResolvedModel:
+    def test_resolved_model_attributions_for_router(self, db):
+        """Router/aggregator calls attribute session_model_usage to the
+        RESOLVED upstream model, not the configured slug.
+
+        The sessions summary row keeps the configured route; the per-model
+        table gets the resolved model so distribution/spend is accurate.
+        """
+        db.create_session("s-r", "test", model="openrouter/auto-beta")
+        db.update_token_counts(
+            "s-r", input_tokens=200, output_tokens=100,
+            model="openrouter/auto-beta", resolved_model="anthropic/claude-sonnet-5",
+            billing_provider="openrouter", api_call_count=1,
+        )
+        usage = _model_usage(db, "s-r")
+        assert len(usage) == 1
+        assert usage[0]["model"] == "anthropic/claude-sonnet-5"
+        assert usage[0]["api_call_count"] == 1
+        assert usage[0]["input_tokens"] == 200
+        assert usage[0]["output_tokens"] == 100
+        # Summary row keeps the configured router route.
+        assert _totals(db, "s-r")["model"] == "openrouter/auto-beta"
+
+    def test_resolved_model_falls_back_to_configured(self, db):
+        """Without resolved_model, behavior is unchanged (attributes to the
+        configured model) — preserves all existing callers."""
+        db.create_session("s-f", "test", model="openrouter/auto-beta")
+        db.update_token_counts(
+            "s-f", input_tokens=10, output_tokens=5,
+            model="openrouter/auto-beta", billing_provider="openrouter",
+            api_call_count=1,
+        )
+        usage = _model_usage(db, "s-f")
+        assert usage[0]["model"] == "openrouter/auto-beta"
+
+    def test_resolved_model_breaks_coalescing_across_route_change(self, db):
+        """Two adjacent deltas with different resolved models must not merge —
+        resolved_model is a route field."""
+        db.create_session("s-c2", "test")
+        db.queue_token_counts(
+            "s-c2", input_tokens=10, output_tokens=1,
+            model="openrouter/auto-beta", resolved_model="anthropic/claude-sonnet-5",
+            billing_provider="openrouter", api_call_count=1,
+        )
+        db.queue_token_counts(
+            "s-c2", input_tokens=10, output_tokens=1,
+            model="openrouter/auto-beta", resolved_model="anthropic/claude-opus-5",
+            billing_provider="openrouter", api_call_count=1,
+        )
+        assert db.flush_token_counts()
+        usage = _model_usage(db, "s-c2")
+        assert {r["model"] for r in usage} == {
+            "anthropic/claude-sonnet-5", "anthropic/claude-opus-5",
+        }
+        assert len(usage) == 2
