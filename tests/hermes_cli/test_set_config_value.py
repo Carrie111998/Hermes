@@ -8,6 +8,7 @@ from unittest.mock import patch, call
 import pytest
 
 from hermes_cli.config import set_config_value, config_command
+from hermes_cli.subcommands.config import build_config_parser
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +173,91 @@ class TestFalsyValues:
         config_command(args)
         config = _read_config(_isolated_hermes_home)
         assert "model" in config
+
+    def test_space_separated_key_form_sets_value(self, _isolated_hermes_home):
+        """`config set memory provider holographic` (space-separated key) must
+        be equivalent to `config set memory.provider holographic`.
+
+        Regression for #50553: switching the memory provider via the natural
+        space-separated form previously failed to take effect (argparse
+        rejected the trailing token, so memory.provider was never written).
+        """
+        import yaml as _yaml
+        args = argparse.Namespace(
+            config_command="set", key="memory", value="provider",
+            extra=["holographic"],
+        )
+        config_command(args)
+        data = _yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert data["memory"]["provider"] == "holographic"
+
+    def test_space_separated_deeper_key(self, _isolated_hermes_home):
+        """Three key tokens fold into a dotted path: a b c value."""
+        import yaml as _yaml
+        args = argparse.Namespace(
+            config_command="set", key="terminal", value="docker_env",
+            extra=["FOO", "bar"],
+        )
+        config_command(args)
+        data = _yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert data["terminal"]["docker_env"]["FOO"] == "bar"
+
+    def test_dotted_key_form_still_works(self, _isolated_hermes_home):
+        """The canonical dotted form must be unaffected by the new extra arg."""
+        import yaml as _yaml
+        args = argparse.Namespace(
+            config_command="set", key="memory.provider", value="holographic",
+            extra=[],
+        )
+        config_command(args)
+        data = _yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert data["memory"]["provider"] == "holographic"
+
+
+# ---------------------------------------------------------------------------
+# Parser-level regression for #50553 — exercises the real argparse contract
+# ---------------------------------------------------------------------------
+
+class TestSpaceSeparatedKeyParser:
+    """The space-separated key form must survive the actual config parser.
+
+    Unlike the manual-``Namespace`` tests above, this drives
+    ``build_config_parser()`` + ``parse_args()`` end-to-end, so it fails if
+    the ``set`` subparser still rejects the extra trailing token with
+    "unrecognized arguments".  Regression for #50553.
+    """
+
+    @staticmethod
+    def _parse(argv):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_config_parser(subparsers, cmd_config=lambda args: None)
+        return parser.parse_args(argv)
+
+    def test_space_separated_key_parses(self):
+        """`config set memory provider holographic` parses without error and
+        folds provider into the dotted key with holographic as the value."""
+        args = self._parse(["config", "set", "memory", "provider", "holographic"])
+        assert args.config_command == "set"
+        assert args.key == "memory"
+        assert args.value == "provider"
+        assert args.extra == ["holographic"]
+
+    def test_space_separated_key_sets_value(self, _isolated_hermes_home):
+        """Parse, then dispatch, then verify memory.provider was written."""
+        args = self._parse(["config", "set", "memory", "provider", "holographic"])
+        config_command(args)
+        import yaml as _yaml
+        data = _yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert data["memory"]["provider"] == "holographic"
+
+    def test_dotted_key_parses(self):
+        """The canonical dotted form still parses with an empty extra list."""
+        args = self._parse(["config", "set", "memory.provider", "holographic"])
+        assert args.config_command == "set"
+        assert args.key == "memory.provider"
+        assert args.value == "holographic"
+        assert args.extra == []
 
 
 # ---------------------------------------------------------------------------
