@@ -154,6 +154,26 @@ _POLICY: Dict[EventType, _Spec] = {
     _E.DEVFLOW_BUILD_SUCCEEDED: _Spec(Attention.TRACE, DEVFLOW),
     # Broken build = WARN; phone-worthy by operator request 2026-07-11.
     _E.DEVFLOW_BUILD_FAILED: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
+    # ----- DevFlow Delegation Plane lifecycle (2026-08-06) ------------
+    # Control-plane telemetry for delegated work. New work and human-facing
+    # merge/deploy gates are INFO in the DevFlow firehose; flood-control
+    # outcomes (duplicate/suppressed/declined) are TRACE so a flapping
+    # detector batched-collapses instead of paging. merge_pending is INFO,
+    # not ACT: during shadow mode EVERY request parks there by design.
+    # auto_merged is WARN because an autonomous merge must stand out.
+    # deploy_failed mirrors build_failed: WARN alerts + urgent WhatsApp.
+    _E.DEVFLOW_WORK_REQUESTED: _Spec(Attention.INFO, DEVFLOW),
+    _E.DEVFLOW_WORK_TRIAGED: _Spec(Attention.TRACE, DEVFLOW),
+    _E.DEVFLOW_WORK_PLANNED: _Spec(Attention.TRACE, DEVFLOW),
+    _E.DEVFLOW_WORK_DUPLICATE: _Spec(Attention.TRACE, DEVFLOW),
+    _E.DEVFLOW_WORK_DECLINED: _Spec(Attention.TRACE, DEVFLOW),
+    _E.DEVFLOW_WORK_SUPPRESSED: _Spec(Attention.TRACE, DEVFLOW),
+    _E.DEVFLOW_MERGE_PENDING: _Spec(Attention.INFO, DEVFLOW),
+    _E.DEVFLOW_MERGED: _Spec(Attention.INFO, DEVFLOW),
+    _E.DEVFLOW_AUTO_MERGED: _Spec(Attention.WARN, DEVFLOW),
+    _E.DEVFLOW_DEPLOY_STARTED: _Spec(Attention.INFO, DEVFLOW),
+    _E.DEVFLOW_DEPLOYED: _Spec(Attention.INFO, DEVFLOW),
+    _E.DEVFLOW_DEPLOY_FAILED: _Spec(Attention.WARN, ALERTS, wa=WA_URGENT),
     # ----- system health → WARN alerts -------------------------------
     _E.GATEWAY_HEALTH: _Spec(Attention.WARN, ALERTS),       # hook: up → INFO
     _E.GATEWAY_STARTED: _Spec(Attention.INFO, ALERTS),

@@ -240,6 +240,29 @@ class EventType(Enum):
     DEVFLOW_BUILD_SUCCEEDED = ("devflow.build_succeeded", Priority.NORMAL)
     DEVFLOW_BUILD_FAILED = ("devflow.build_failed", Priority.HIGH)
 
+    # DevFlow Delegation Plane (DDP) lifecycle -- added 2026-08-06. Stage 1
+    # control plane of the delegation design (spec:
+    # docs/superpowers/specs/2026-08-06-devflow-delegation-plane-design.md).
+    # Producers: devflow_delegation.emitter / .lifecycle / .cli. The existing
+    # devflow.build_* / devflow.pr_* members above are REUSED for the
+    # BUILDING and PR_OPEN lifecycle states; only genuinely new lifecycle
+    # names are added here. work_requested/work_triaged/work_planned surface
+    # new delegated work; duplicate/suppressed/declined are flood-control
+    # outcomes (LOW so they batch quietly); merge/deploy members land in
+    # Stage 2/3 but are registered now so the routing table is total.
+    DEVFLOW_WORK_REQUESTED = ("devflow.work_requested", Priority.NORMAL)
+    DEVFLOW_WORK_TRIAGED = ("devflow.work_triaged", Priority.NORMAL)
+    DEVFLOW_WORK_PLANNED = ("devflow.work_planned", Priority.NORMAL)
+    DEVFLOW_WORK_DUPLICATE = ("devflow.work_duplicate", Priority.LOW)
+    DEVFLOW_WORK_DECLINED = ("devflow.work_declined", Priority.NORMAL)
+    DEVFLOW_WORK_SUPPRESSED = ("devflow.work_suppressed", Priority.LOW)
+    DEVFLOW_MERGE_PENDING = ("devflow.merge_pending", Priority.HIGH)
+    DEVFLOW_MERGED = ("devflow.merged", Priority.HIGH)
+    DEVFLOW_AUTO_MERGED = ("devflow.auto_merged", Priority.HIGH)
+    DEVFLOW_DEPLOY_STARTED = ("devflow.deploy_started", Priority.NORMAL)
+    DEVFLOW_DEPLOYED = ("devflow.deployed", Priority.NORMAL)
+    DEVFLOW_DEPLOY_FAILED = ("devflow.deploy_failed", Priority.HIGH)
+
     # Notification delivery reverse-signal — added 2026-04-30. The bus
     # is one-way today: events emit -> telegram_notifier / whatsapp_escalator
     # deliver via their adapters -> no signal flows back. These two types
