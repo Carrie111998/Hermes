@@ -1,7 +1,69 @@
 """Tests for the provider module registry and profiles."""
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
+
+
+class TestProviderCapabilityDefaults:
+    def test_prompt_cache_policy_is_unspecified(self):
+        profile = ProviderProfile(name="example")
+        assert profile.prompt_cache_policy(
+            model="model", api_mode="chat_completions", base_url="https://example.test"
+        ) is None
+
+
+def test_user_plugin_prompt_cache_policy_resolves_end_to_end(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    plugin_dir = hermes_home / "plugins" / "model-providers" / "cache-provider"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: cache-provider\nkind: model-provider\nversion: 1.0.0\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        """from providers import register_provider
+from providers.base import ProviderProfile
+
+class CacheProvider(ProviderProfile):
+    def prompt_cache_policy(self, *, model=None, api_mode=None, base_url=None):
+        if model == "cache-model-v1" and api_mode == "chat_completions":
+            return True, False
+        return None
+
+register_provider(CacheProvider(name="cache-provider"))
+""",
+        encoding="utf-8",
+    )
+
+    script = """from types import SimpleNamespace
+from agent.agent_runtime_helpers import anthropic_prompt_cache_policy
+
+agent = SimpleNamespace(
+    provider="cache-provider",
+    base_url="https://cache-provider.example/v1",
+    api_mode="chat_completions",
+    model="cache-model-v1",
+    _cache_disabled=False,
+)
+assert anthropic_prompt_cache_policy(agent) == (True, False)
+"""
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 class TestRegistry:

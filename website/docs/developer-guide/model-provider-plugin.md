@@ -114,6 +114,17 @@ from typing import Any
 from providers.base import ProviderProfile
 
 class AcmeProfile(ProviderProfile):
+    def prompt_cache_policy(self, *, model=None, api_mode=None, base_url=None):
+        """Declare explicit prompt-cache support for this request.
+
+        Return (enabled, native_layout), or None to use Hermes' existing
+        provider/model detection. native_layout=False selects the OpenAI-wire
+        cache-control envelope; True selects native inner-block markers.
+        """
+        if model == "acme-large-v3" and api_mode == "chat_completions":
+            return True, False
+        return None
+
     def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Provider-specific message preprocessing. Runs after codex
         sanitization, before developer-role swap. Default: pass-through."""
@@ -142,6 +153,11 @@ class AcmeProfile(ProviderProfile):
         (Bedrock → None), or public/unauthenticated catalogs (OpenRouter)."""
         return super().fetch_models(api_key=api_key, base_url=base_url, timeout=timeout)
 ```
+
+`prompt_cache_policy()` must return exactly a two-boolean tuple or `None`.
+Hermes logs and ignores invalid values or exceptions, preserving its core
+fallback. An explicit user cache disable always takes precedence over a
+provider profile.
 
 ## Hook reference examples
 
