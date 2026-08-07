@@ -78,7 +78,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
 }) {
   const gatewayState = useStore($gatewayState)
   const freshDraftReady = useStore($freshDraftReady)
-  const { inferenceStatus, statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
+  const { statusSnapshot } = useStatusSnapshot(gatewayState, actions.requestGateway)
   const extraLeftItems = useStatusbarContributions('left')
   const extraRightItems = useStatusbarContributions('right')
 
@@ -90,9 +90,7 @@ export const StatusbarSurface = memo(function StatusbarSurface({
     extraRightItems,
     freshDraftReady,
     gatewayState,
-    inferenceStatus,
     openAgents: actions.openAgents,
-    openCommandCenterSection: actions.openCommandCenterSection,
     requestGateway: actions.requestGateway,
     statusSnapshot,
     toggleCommandCenter: actions.toggleCommandCenter

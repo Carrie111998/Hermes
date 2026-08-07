@@ -1,17 +1,13 @@
 import { useStore } from '@nanostores/react'
 import { useCallback, useMemo } from 'react'
 
-import type { CommandCenterSection } from '@/app/command-center'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
-import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
-import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
-import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
-import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
@@ -36,7 +32,6 @@ import {
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
-import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
   $backendUpdateStatus,
@@ -59,9 +54,7 @@ interface StatusbarItemsOptions {
   extraLeftItems: readonly StatusbarItem[]
   extraRightItems: readonly StatusbarItem[]
   gatewayState: string
-  inferenceStatus: RuntimeReadinessResult | null
   openAgents: () => void
-  openCommandCenterSection: (section: CommandCenterSection) => void
   freshDraftReady: boolean
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   statusSnapshot: StatusResponse | null
@@ -75,9 +68,7 @@ export function useStatusbarItems({
   extraLeftItems,
   extraRightItems,
   gatewayState,
-  inferenceStatus,
   openAgents,
-  openCommandCenterSection,
   requestGateway,
   statusSnapshot,
   toggleCommandCenter
@@ -97,7 +88,6 @@ export function useStatusbarItems({
   // own cwd in `$sessionStates` and must not paint the primary's workspace.
   const primaryCwd = useStore($currentCwd)
   const primaryUsage = useStore($currentUsage)
-  const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
 
@@ -235,40 +225,6 @@ export function useStatusbarItems({
 
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
 
-  const gatewayMenuContent = useMemo(
-    () => (close: () => void) => (
-      <GatewayMenuPanel
-        gatewayState={gatewayState}
-        inferenceStatus={inferenceStatus}
-        onClose={close}
-        onOpenSystem={() => openCommandCenterSection('system')}
-        statusSnapshot={statusSnapshot}
-      />
-    ),
-    [gatewayState, inferenceStatus, openCommandCenterSection, statusSnapshot]
-  )
-
-  const gatewayOpen = gatewayState === 'open'
-  const gatewayConnecting = gatewayState === 'connecting'
-  const inferenceReady = gatewayOpen && inferenceStatus?.ready === true
-  const gatewayDegraded = gatewayOpen || gatewayConnecting
-
-  const gatewayDetail = gatewayOpen
-    ? inferenceStatus?.ready
-      ? copy.gatewayReady
-      : inferenceStatus
-        ? copy.gatewayNeedsSetup
-        : copy.gatewayChecking
-    : gatewayConnecting
-      ? copy.gatewayConnecting
-      : copy.gatewayOffline
-
-  const gatewayClassName = inferenceReady
-    ? undefined
-    : gatewayDegraded
-      ? 'text-amber-600 hover:text-amber-600'
-      : 'text-destructive hover:text-destructive'
-
   const clientVersionItem = useMemo<StatusbarItem>(() => {
     const applying = updateApply.applying || updateApply.stage === 'restart'
 
@@ -395,25 +351,6 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
-        className: gatewayRestarting ? undefined : gatewayClassName,
-        detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
-        icon: gatewayRestarting ? (
-          <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
-        ) : inferenceReady ? (
-          <Activity className="size-3" />
-        ) : (
-          <AlertCircle className="size-3" />
-        ),
-        id: 'gateway-health',
-        label: copy.gateway,
-        menuClassName: 'w-72',
-        menuContent: gatewayMenuContent,
-        // Tip only when there's a real status reason — not "gateway status" restating the label.
-        title: inferenceStatus?.reason || undefined,
-        toggleLabel: copy.gateway,
-        variant: 'menu'
-      },
-      {
         hidden: !currentCwd,
         icon: <FolderOpen className="size-3" />,
         id: 'workspace-cwd',
@@ -499,12 +436,6 @@ export function useStatusbarItems({
       fileMenu.copyPath,
       fileMenu.revealFileManager,
       fileMenu.revealInSidebar,
-      gatewayMenuContent,
-      gatewayClassName,
-      gatewayDetail,
-      gatewayRestarting,
-      inferenceReady,
-      inferenceStatus?.reason,
       openAgents,
       projectName,
       subagentsFailed,
