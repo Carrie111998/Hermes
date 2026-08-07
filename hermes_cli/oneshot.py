@@ -174,11 +174,12 @@ def run_oneshot(
     # Redirect stderr AND stdout to devnull for the entire call tree.
     # We'll print the final response to the real stdout at the end.
     real_stdout = sys.stdout
+    real_stderr = sys.stderr
     devnull = open(os.devnull, "w", encoding="utf-8")
 
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
-            response = _run_agent(
+            response, result = _run_agent(
                 prompt,
                 model=model,
                 provider=provider,
@@ -191,11 +192,29 @@ def run_oneshot(
         except Exception:
             pass
 
-    if response:
-        real_stdout.write(response)
-        if not response.endswith("\n"):
-            real_stdout.write("\n")
-        real_stdout.flush()
+    if not (response or "").strip():
+        # A turn that produced no text (final_response is None/empty) can
+        # still carry a descriptive ``error`` — provider/API failure, invalid
+        # model id, unusable credentials for the resolved provider, truncation,
+        # content-policy block, ... . Surface that real diagnostic instead of
+        # the opaque generic message, which previously left the run looking
+        # like it succeeded with zero output and nothing in the log to explain
+        # it (see #50420, where a non-default profile resolved to a provider
+        # whose call failed and the run exited with no explanation).
+        err = (result.get("error") or "").strip()
+        if err:
+            real_stderr.write(f"hermes -z: agent failed: {err}\n")
+        else:
+            real_stderr.write(
+                "hermes -z: no final response was produced; treating the run as failed.\n"
+            )
+        real_stderr.flush()
+        return 1
+
+    real_stdout.write(response)
+    if not response.endswith("\n"):
+        real_stdout.write("\n")
+    real_stdout.flush()
     return 0
 
 
@@ -221,9 +240,17 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-) -> str:
+) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns the final response string."""
+    run a single conversation.
+
+    Returns:
+        A ``(final_response, result)`` tuple: the final response text (or "")
+        and the full ``run_conversation()`` result dict. The dict may carry a
+        descriptive ``error`` when the turn produced no final response — see
+        run_oneshot, which surfaces it instead of an opaque empty-result
+        message.
+    """
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -333,7 +360,19 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    # Use run_conversation (not the thin .chat() wrapper) so we can read the
+    # turn's "error" field.  Every non-success terminal path in the
+    # conversation loop returns ``final_response: None`` *plus* a descriptive
+    # ``error`` (provider/API failure, invalid model id, missing/unusable
+    # credentials for the resolved provider, truncation, content-policy
+    # block, ...).  ``.chat()`` returns only ``final_response``, so an empty
+    # result reaches the caller with the real reason discarded -- surfacing
+    # as the generic "no final response was produced" with nothing in the log
+    # to explain it.  That swallowing is exactly the failure mode in #50420 (a
+    # non-default profile resolves to a provider whose call fails, and the
+    # run exits after plugin discovery with no diagnostic).
+    result = agent.run_conversation(prompt)
+    return (result.get("final_response") or ""), result
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:
