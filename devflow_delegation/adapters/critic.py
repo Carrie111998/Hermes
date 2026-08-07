@@ -25,7 +25,7 @@ def delegate_critic_finding(emitter, finding: dict) -> DelegationResult:
         target=finding.get("target"),
         severity=finding.get("severity", "medium"),
         priority=finding.get("priority", "P2"),
-        confidence=float(finding.get("confidence", 0.0)),
+        confidence=finding.get("confidence", 0.0),
         proposed_approach=finding.get("proposed_approach"),
         safety_notes=safety,
         idempotency_key=finding.get("idempotency_key") or f"critic:{finding_id}:v1",

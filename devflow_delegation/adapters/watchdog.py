@@ -29,6 +29,6 @@ def delegate_watchdog_alert(emitter, alert: dict) -> DelegationResult:
         target=alert.get("target") or {"repo": "hermes", "subsystem": component},
         severity=severity,
         priority=alert.get("priority", "P2"),
-        confidence=float(alert.get("confidence", 0.85)),
+        confidence=alert.get("confidence", 0.85),
         idempotency_key=alert.get("idempotency_key") or f"watchdog:{component.lower()}:{severity}:v1",
     )

@@ -1,7 +1,10 @@
+import json
+
 from devflow_delegation.adapters import (
     critic, curator, explicit, matcher_shadow, nightly_gate, roadmap,
     security_audit, tracker, watchdog,
 )
+from devflow_delegation.emitter import DelegationEmitter
 from tests.devflow_delegation.conftest import make_delegate_kwargs
 
 
@@ -57,10 +60,66 @@ def test_nightly_gate_rejects_generic_red(emitter):
     assert nightly_gate.delegate_gate_failure(emitter, {**good, "culprit": "  "}).reason == "generic_red_headline"
 
 
-def test_nightly_gate_bounds_output(emitter):
+def test_nightly_gate_bounds_output(hermes_root, allowlist_file):
+    # Positive control for the MAX_OUTPUT_CHARS bound: queue the request (so the
+    # envelope is actually written) with a 10k-char output, then read back the
+    # envelope and assert the embedded output is truncated to the bound. If the
+    # `[:MAX_OUTPUT_CHARS]` slice were removed, the full 10k run would survive
+    # into the problem_statement and the `+1` run assertion below would fail.
+    (hermes_root / "devflow" / "policy.json").write_text(
+        json.dumps({"nightly-gate": {"mode": "queue"}}), encoding="utf-8")
+    em = DelegationEmitter()
     huge = {"culprit": "suite", "failed_command": "pytest", "output": "x" * 10000}
-    r = nightly_gate.delegate_gate_failure(emitter, huge)
-    assert r.status == "queued"  # bounded internally; no exception
+    r = nightly_gate.delegate_gate_failure(em, huge)
+    assert r.status == "queued" and r.reason == "queued"
+
+    env = json.loads(next(em.inbox_dir.glob("*.json")).read_text(encoding="utf-8"))
+    assert "x" * nightly_gate.MAX_OUTPUT_CHARS in env["problem_statement"]
+    assert "x" * (nightly_gate.MAX_OUTPUT_CHARS + 1) not in env["problem_statement"]
+
+
+def test_adapters_decline_gracefully_on_malformed_confidence(emitter):
+    # A non-numeric or explicit-None `confidence` must NOT raise out of the
+    # adapter (spec: adapters classify, they never crash the caller). It should
+    # flow to the emitter, which rejects it via validate_payload and returns a
+    # DECLINED result. Pre-fix, `float("high")`/`float(None)` raised
+    # ValueError/TypeError straight out of the adapter.
+    base = {
+        "kind": "proposal", "proposal_id": "P-9", "title": "Raise weight",
+        "problem_statement": "Underrated skill.",
+        "evidence": [{"kind": "critic_evidence", "ref": "audit", "summary": "3 hits"}],
+        "acceptance_criteria": ["metadata updated"],
+        "target": {"repo": "hermes", "subsystem": "skills"},
+        "severity": "medium", "priority": "P2",
+    }
+    assert critic.delegate_critic_finding(emitter, {**base, "confidence": "high"}).status == "declined"
+    assert critic.delegate_critic_finding(emitter, {**base, "confidence": None}).status == "declined"
+
+    walert = {"component": "gateway", "severity": "high", "detail": "loop blocked",
+              "alert_id": "W-1", "persistent": True,
+              "target": {"repo": "hermes", "subsystem": "gateway-health"}}
+    assert watchdog.delegate_watchdog_alert(emitter, {**walert, "confidence": "sure"}).status == "declined"
+    assert watchdog.delegate_watchdog_alert(emitter, {**walert, "confidence": None}).status == "declined"
+
+
+def test_evidence_threshold_adapters_survive_none_title(emitter):
+    # curator/matcher-shadow/tracker derive a finding_id fallback from the title
+    # when no finding_id is present. A present-but-None title must not crash
+    # (`None[:40]`); it should fall back to an empty id and still classify.
+    curator_finding = {
+        "title": None, "meets_evidence_threshold": True, "problem_statement": "...",
+        "evidence": [{"kind": "curator_evidence", "ref": "log", "summary": "s"}],
+        "acceptance_criteria": ["pruned"], "target": {"repo": "hermes", "subsystem": "memory"},
+    }
+    assert curator.delegate_curator_change(emitter, curator_finding).status == "queued"
+    assert matcher_shadow.delegate_matcher_shadow_change(emitter, curator_finding).status == "queued"
+
+    tracker_finding = {
+        "title": None, "repro": "run matcher twice", "problem_statement": "...",
+        "evidence": [{"kind": "repro", "ref": "log", "summary": "s"}],
+        "acceptance_criteria": ["partial persists"], "target": {"repo": "hermes", "subsystem": "tracker"},
+    }
+    assert tracker.delegate_tracker_defect(emitter, tracker_finding).status == "queued"
 
 
 def test_security_audit_hold_and_verification(emitter):
