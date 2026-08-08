@@ -1592,11 +1592,15 @@ def _deliver_result(job: dict, content: str, adapters=None, profile_adapters=Non
                             if padapter is not None:
                                 from gateway.delivery import DeliveryTransport
                                 pconfig = padapter.config if hasattr(padapter, 'config') else None
+                                runtime_adapter = padapter
                                 transport = DeliveryTransport(
                                     adapter=padapter,
                                     config=pconfig,
                                     transport_platform=platform,
                                 )
+                                # Swap adapters dict so DeliveryRouter uses the
+                                # profile-specific bot instead of the default one.
+                                adapters = padapters
                                 logger.info(
                                     "Job '%s': using profile '%s' adapter for %s delivery",
                                     job.get("id", "?"), pname, platform_name,
