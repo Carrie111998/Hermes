@@ -100,3 +100,70 @@ class TestSlashCommandPrefixMatching:
         mock_help.assert_called_once()
         printed = " ".join(str(c) for c in cli_obj.console.print.call_args_list)
         assert "Ambiguous" not in printed
+
+    def test_prefix_matching_ignores_blocked_bundles_for_selection(self):
+        """/research-p should not select a blocked bundle under protected governance."""
+        cli_obj = _make_cli()
+        printed = []
+        import cli as cli_mod
+
+        with (
+            patch.object(cli_mod, "_skill_commands", {}),
+            patch.object(cli_mod, "get_skill_bundles", return_value={"/research-pack": {"name": "Research Pack"}}),
+            patch.object(cli_mod, "get_discoverable_skill_bundles", return_value={}),
+            patch.object(cli_mod, "_cprint", side_effect=lambda text: printed.append(str(text))),
+        ):
+            cli_obj.process_command("/research-p")
+
+        combined = " ".join(printed)
+        assert "Unknown command" in combined
+        assert "research-pack" not in combined
+
+    def test_exact_blocked_bundle_invocation_path_remains_preserved(self):
+        """Typing the full bundle name still reaches explicit bundle invocation."""
+        cli_obj = _make_cli()
+        import cli as cli_mod
+
+        with (
+            patch.object(cli_mod, "_skill_commands", {}),
+            patch.object(cli_mod, "get_skill_bundles", return_value={"/research-pack": {"name": "Research Pack"}}),
+            patch.object(cli_mod, "get_discoverable_skill_bundles", return_value={}),
+            patch.object(
+                cli_mod,
+                "build_bundle_invocation_message",
+                return_value=("bundle payload", ["alpha"], []),
+            ) as mock_build,
+            patch("builtins.print"),
+        ):
+            cli_obj.process_command("/research-pack investigate")
+
+        mock_build.assert_called_once_with(
+            "/research-pack",
+            "investigate",
+            task_id=None,
+        )
+        cli_obj._pending_input.put.assert_called_once_with("bundle payload")
+
+    def test_prefix_matching_preserves_unprotected_bundle_behavior(self):
+        """/research-p should still expand to a visible bundle when unprotected."""
+        cli_obj = _make_cli()
+        import cli as cli_mod
+
+        with (
+            patch.object(cli_mod, "_skill_commands", {}),
+            patch.object(cli_mod, "get_skill_bundles", return_value={"/research-pack": {"name": "Research Pack"}}),
+            patch.object(cli_mod, "get_discoverable_skill_bundles", return_value={"/research-pack": {"name": "Research Pack"}}),
+            patch.object(
+                cli_mod,
+                "build_bundle_invocation_message",
+                return_value=("bundle payload", ["alpha"], []),
+            ) as mock_build,
+            patch("builtins.print"),
+        ):
+            cli_obj.process_command("/research-p investigate")
+
+        mock_build.assert_called_once_with(
+            "/research-pack",
+            "investigate",
+            task_id=None,
+        )

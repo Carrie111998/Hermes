@@ -2,7 +2,6 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
-
 def _make_skill(skills_dir: Path, name: str, body: str = "Do the thing.") -> None:
     skill_dir = skills_dir / name
     skill_dir.mkdir(parents=True, exist_ok=True)
@@ -193,3 +192,70 @@ def test_show_help_keeps_bundles_visible_when_unprotected(monkeypatch, tmp_path)
 
     output = "\n".join(printed)
     assert "/safe-pack" in output
+
+
+def test_slash_exec_help_and_commands_hide_governance_blocked_skills(monkeypatch, tmp_path):
+    from hermes_cli.slash_exec import CommandContext, execute_command
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _configure_protected_governance(home)
+    _make_skill(skills_dir, "ToolTrust", body="blocked")
+    _make_skill(skills_dir, "SafeSkill", body="allowed")
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+
+    help_reply = execute_command("help", CommandContext(surface="gateway"))
+    commands_reply = execute_command(
+        "commands",
+        CommandContext(surface="gateway", options={"page_size": 200}),
+    )
+
+    assert "/safeskill" in help_reply.text
+    assert "/tooltrust" not in help_reply.text
+    assert "/safeskill" in commands_reply.text
+    assert "/tooltrust" not in commands_reply.text
+
+
+def test_slash_exec_bundles_hide_bundles_when_governance_config_is_malformed(monkeypatch, tmp_path):
+    from hermes_cli.slash_exec import CommandContext, execute_command
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    home.mkdir()
+    skills_dir.mkdir()
+    (home / "config.yaml").write_text("skills:\n  governance: []\n", encoding="utf-8")
+    _make_skill(skills_dir, "SafeSkill", body="allowed")
+    _make_bundle(bundles_dir, "safe-pack", ["SafeSkill"])
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+
+    reply = execute_command("bundles", CommandContext(surface="gateway"))
+
+    assert "/safe-pack" not in reply.text
+    assert reply.data["bundles"] == []
+
+
+def test_slash_exec_bundles_preserve_unprotected_behavior(monkeypatch, tmp_path):
+    from hermes_cli.slash_exec import CommandContext, execute_command
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    skills_dir.mkdir()
+    _make_skill(skills_dir, "SafeSkill", body="allowed")
+    _make_bundle(bundles_dir, "safe-pack", ["SafeSkill"])
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+
+    reply = execute_command("bundles", CommandContext(surface="gateway"))
+
+    assert "/safe-pack" in reply.text
+    assert [info["slug"] for info in reply.data["bundles"]] == ["safe-pack"]

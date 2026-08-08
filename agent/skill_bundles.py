@@ -323,6 +323,12 @@ def list_bundles() -> List[Dict[str, Any]]:
     return sorted(bundles.values(), key=lambda b: b["slug"])
 
 
+def list_discoverable_bundles() -> List[Dict[str, Any]]:
+    """Return governance-filtered bundle info dicts for display surfaces."""
+    bundles = get_discoverable_skill_bundles()
+    return sorted(bundles.values(), key=lambda b: b["slug"])
+
+
 def build_bundle_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
