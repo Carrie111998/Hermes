@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import hashlib
 import inspect
 import json
@@ -6593,6 +6594,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    desktop_attachment_fallback_roots: list[str] | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -6613,6 +6615,9 @@ def _init_session(
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
             "source": _resolve_session_source(source),
+            "desktop_attachment_fallback_roots": list(
+                desktop_attachment_fallback_roots or []
+            ),
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
@@ -7805,6 +7810,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    desktop_attachment_fallback_roots: list[str] | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7820,6 +7826,9 @@ def _deferred_session_record(
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
+        "desktop_attachment_fallback_roots": list(
+            desktop_attachment_fallback_roots or []
+        ),
         "edit_snapshots": {},
         "explicit_cwd": False,
         "history": history,
@@ -9610,6 +9619,7 @@ def _run_prompt_submit(
                     prompt,
                     cwd=cwd,
                     allowed_root=cwd,
+                    extra_allowed_file_roots=_desktop_attachment_allowed_file_roots(session),
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
@@ -10492,9 +10502,128 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
 
 
 def _desktop_attachment_dir(session: dict) -> Path:
-    root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    workspace = Path(_session_cwd(session)).resolve()
+    root = workspace / ".hermes" / "desktop-attachments"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError as exc:
+        if not _should_fallback_attachment_path(exc):
+            raise
+        fallback = _desktop_attachment_fallback_dir(session, workspace=workspace)
+        fallback.mkdir(parents=True, exist_ok=True)
+        _remember_desktop_attachment_fallback_dir(session, fallback)
+        return fallback
+
+
+def _desktop_attachment_fallback_dir(session: dict, *, workspace: Path | None = None) -> Path:
+    workspace = (workspace or Path(_session_cwd(session))).resolve()
+    profile_home = Path(str(session.get("profile_home") or _hermes_home)).resolve()
+    workspace_digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:12]
+    session_digest = hashlib.sha256(
+        str(session.get("session_key") or "").encode("utf-8")
+    ).hexdigest()[:12]
+    name = workspace.name or "workspace"
+    return profile_home / "desktop-attachments" / f"{name}-{workspace_digest}-{session_digest}"
+
+
+_DESKTOP_ATTACHMENT_ROOTS_CONFIG_KEY = "_desktop_attachment_fallback_roots"
+
+
+def _stored_desktop_attachment_fallback_roots(
+    row: dict | None,
+    *,
+    profile_home: str | Path | None = None,
+) -> list[str]:
+    if not row:
+        return []
+    raw_config = row.get("model_config")
+    if isinstance(raw_config, str):
+        try:
+            raw_config = json.loads(raw_config)
+        except (TypeError, ValueError):
+            return []
+    if not isinstance(raw_config, dict):
+        return []
+    roots = raw_config.get(_DESKTOP_ATTACHMENT_ROOTS_CONFIG_KEY)
+    if not isinstance(roots, list):
+        return []
+    return [
+        str(root)
+        for root in _validated_desktop_attachment_fallback_roots(
+            roots,
+            profile_home=profile_home,
+        )
+    ]
+
+
+def _validated_desktop_attachment_fallback_roots(
+    roots,
+    *,
+    profile_home: str | Path | None = None,
+) -> list[Path]:
+    base = Path(str(profile_home or _hermes_home)).resolve() / "desktop-attachments"
+    validated: list[Path] = []
+    for raw_root in roots or []:
+        try:
+            root = Path(str(raw_root)).resolve()
+            root.relative_to(base)
+        except (OSError, ValueError):
+            continue
+        if root not in validated:
+            validated.append(root)
+    return validated
+
+
+def _persist_desktop_attachment_fallback_roots(session: dict) -> None:
+    agent = session.get("agent")
+    db = getattr(agent, "_session_db", None)
+    session_key = str(session.get("session_key") or "").strip()
+    if db is None or not session_key or not hasattr(db, "update_session_meta"):
+        return
+    try:
+        row = db.get_session(session_key) or {}
+        raw_config = row.get("model_config")
+        if isinstance(raw_config, dict):
+            model_config = dict(raw_config)
+        elif isinstance(raw_config, str) and raw_config.strip():
+            parsed = json.loads(raw_config)
+            model_config = dict(parsed) if isinstance(parsed, dict) else {}
+        else:
+            model_config = {}
+        roots = _validated_desktop_attachment_fallback_roots(
+            session.get("desktop_attachment_fallback_roots", []),
+            profile_home=session.get("profile_home"),
+        )
+        model_config[_DESKTOP_ATTACHMENT_ROOTS_CONFIG_KEY] = [str(root) for root in roots]
+        db.update_session_meta(session_key, json.dumps(model_config), None)
+    except Exception:
+        logger.debug("failed to persist desktop attachment fallback roots", exc_info=True)
+
+
+def _remember_desktop_attachment_fallback_dir(session: dict, root: Path) -> None:
+    roots = session.setdefault("desktop_attachment_fallback_roots", [])
+    root_str = str(root.resolve())
+    if root_str not in roots:
+        roots.append(root_str)
+        _persist_desktop_attachment_fallback_roots(session)
+
+
+def _desktop_attachment_allowed_file_roots(session: dict) -> list[Path]:
+    return _validated_desktop_attachment_fallback_roots(
+        session.get("desktop_attachment_fallback_roots", []),
+        profile_home=session.get("profile_home"),
+    )
+
+
+def _should_fallback_attachment_path(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or exc.errno in {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOTDIR,
+        errno.EEXIST,
+    }
 
 
 def _sanitize_attachment_name(name: str) -> str:
@@ -10572,10 +10701,10 @@ def _stage_session_file_attachment(
       1. The path resolves to a file already INSIDE the session workspace — use
          it as-is (no copy, ``uploaded=False``).
       2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into ``.hermes/desktop-attachments/`` so the ``@file:`` ref resolves.
+         it into session attachment storage so the ``@file:`` ref resolves.
       3. The path doesn't exist on the gateway (the common remote case: it's a
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into ``.hermes/desktop-attachments/``.
+         write them into session attachment storage.
 
     Returns ``(stored_path, uploaded)``.
     """
@@ -10594,9 +10723,22 @@ def _stage_session_file_attachment(
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
+    filename = _sanitize_attachment_name(filename)
     upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
+    target = _unique_attachment_path(upload_dir, filename)
+    try:
+        target.write_bytes(payload)
+    except OSError as exc:
+        fallback_dir = _desktop_attachment_fallback_dir(session, workspace=workspace)
+        if (
+            upload_dir.resolve() == fallback_dir.resolve()
+            or not _should_fallback_attachment_path(exc)
+        ):
+            raise
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        _remember_desktop_attachment_fallback_dir(session, fallback_dir)
+        target = _unique_attachment_path(fallback_dir, filename)
+        target.write_bytes(payload)
     return target.resolve(), True
 
 
