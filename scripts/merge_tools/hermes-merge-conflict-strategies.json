@@ -87,6 +87,26 @@
       "note": "Official ComfyUI suite guidance follows the current test runner; restore the upstream documentation."
     },
     {
+      "pattern": "skills/creative/comfyui/scripts/_common.py",
+      "action": "upstream",
+      "note": "The fork retained the ComfyUI skill but had previously removed this shared helper; restore the official UTF-8 and security-maintained implementation."
+    },
+    {
+      "pattern": "skills/creative/comfyui/scripts/check_deps.py",
+      "action": "upstream",
+      "note": "The fork retained the ComfyUI skill but had previously removed this dependency checker; restore the official BOM-tolerant implementation."
+    },
+    {
+      "pattern": "skills/creative/comfyui/scripts/health_check.py",
+      "action": "upstream",
+      "note": "The fork retained the ComfyUI skill but had previously removed this health-check entry point; restore the official UTF-8 implementation."
+    },
+    {
+      "pattern": "skills/creative/comfyui/scripts/run_batch.py",
+      "action": "upstream",
+      "note": "The fork retained the ComfyUI skill but had previously removed this batch entry point; restore the official BOM-tolerant implementation."
+    },
+    {
       "pattern": "skills/devops/kanban-worker/SKILL.md",
       "action": "upstream",
       "note": "Official new devops skill; no fork-local counterpart exists."
