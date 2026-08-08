@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import stat
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -90,6 +89,7 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     assert Path(exec_line.split(" ")[0]).is_absolute()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privileges on Windows")
 def test_exec_falls_back_to_unresolved_venv_interpreter_path(tmp_path, xdg_home, monkeypatch):
     """The interpreter fallback must keep the invocation path Python was
     actually started with, not resolve through a ``venv/bin/python ->
@@ -102,33 +102,27 @@ def test_exec_falls_back_to_unresolved_venv_interpreter_path(tmp_path, xdg_home,
     packaged app in another directory) needs to survive.
     """
     root = _make_project(tmp_path)
+    base_interpreter = tmp_path / "base-python"
+    base_interpreter.write_bytes(b"")
+    venv_interpreter = tmp_path / "venv with spaces" / "bin" / "python"
+    venv_interpreter.parent.mkdir(parents=True)
+    venv_interpreter.symlink_to(base_interpreter)
+    monkeypatch.setattr(lde.sys, "executable", str(venv_interpreter))
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
-    interpreter = exec_line.split(" ")[0]
+    expected_interpreter = os.path.abspath(lde.sys.executable)
 
-    # Must be made absolute WITHOUT dereferencing a symlink.
-    assert interpreter == os.path.abspath(lde.sys.executable)
-
-    resolved = os.path.realpath(lde.sys.executable)
-    if resolved == interpreter:
-        pytest.skip("current interpreter is not a symlinked venv python; "
-                     "the environment-safe probe needs a real symlink to be meaningful")
-
-    # Environment-safe probe: the retained (unresolved) interpreter path
-    # must still be able to import hermes_cli from a cwd that has nothing
-    # to do with the checkout -- the resolved symlink target could not.
-    unrelated_cwd = tmp_path / "unrelated-cwd"
-    unrelated_cwd.mkdir()
-    probe = subprocess.run(
-        [interpreter, "-c", "import hermes_cli"],
-        cwd=unrelated_cwd,
-        capture_output=True,
-        timeout=30,
+    # Compare the full, correctly quoted Exec command. Whitespace splitting
+    # would misparse supported interpreter paths containing spaces.
+    assert exec_line == (
+        f'{lde._quote_exec_arg(expected_interpreter)} '
+        "-m hermes_cli.main desktop"
     )
-    assert probe.returncode == 0, probe.stderr.decode("utf-8", "replace")
+    assert Path(expected_interpreter).is_symlink()
+    assert os.path.realpath(expected_interpreter) != expected_interpreter
 
 
 def test_exec_does_not_persist_env_python_source_wrapper(tmp_path, xdg_home, monkeypatch):
