@@ -104,6 +104,59 @@ class TestEstimateMessagesTokensRough:
         # substituted (which would undercount the real request).
         assert result >= (len(big_sidecar) // 4) * 0.9
 
+    def test_identical_reasoning_fields_counted_once(self):
+        """``reasoning`` and ``reasoning_content`` are byte-identical duplicates
+        of the same thinking text (chat_completion_helpers promotes the same
+        reasoning_text to both keys).  The preflight estimator must charge the
+        text once, not twice — double-charging inflated estimates ~2x on
+        reasoning-heavy Kimi sessions and fired compression early (#81481).
+        """
+        think = "reasoning text here " * 500
+        dup_msg = {"role": "assistant", "content": "ok",
+                   "reasoning": think, "reasoning_content": think}
+        single_msg = {"role": "assistant", "content": "ok", "reasoning": think}
+
+        assert estimate_messages_tokens_rough([dup_msg]) == \
+            estimate_messages_tokens_rough([single_msg])
+
+    def test_reasoning_dedup_preserves_larger_field(self):
+        """When the two reasoning fields differ, the larger one must still be
+        charged — dropping it would undercount the real request."""
+        think = "reasoning text here " * 500
+        short = think[:100]
+        dup_msg = {"role": "assistant", "content": "ok",
+                   "reasoning": think, "reasoning_content": short}
+        single_msg = {"role": "assistant", "content": "ok", "reasoning": think}
+
+        assert estimate_messages_tokens_rough([dup_msg]) == \
+            estimate_messages_tokens_rough([single_msg])
+
+    def test_reasoning_dedup_is_insertion_order_independent(self):
+        """The dedup must keep one key deterministically regardless of which
+        reasoning field appears first in the stored message dict."""
+        think = "reasoning text here " * 500
+        msg_fwd = {"role": "assistant", "content": "ok",
+                   "reasoning": think, "reasoning_content": think}
+        msg_rev = {"role": "assistant", "content": "ok",
+                   "reasoning_content": think, "reasoning": think}
+
+        assert estimate_messages_tokens_rough([msg_fwd]) == \
+            estimate_messages_tokens_rough([msg_rev])
+
+    def test_reasoning_content_alone_still_counted(self):
+        """A message carrying only ``reasoning_content`` (no ``reasoning``)
+        must keep charging it — it is the only copy of the thinking text."""
+        think = "reasoning text here " * 500
+        rc_only = {"role": "assistant", "content": "ok", "reasoning_content": think}
+        reasoning_only = {"role": "assistant", "content": "ok", "reasoning": think}
+
+        # The two field names differ in length (8 chars), so the estimates
+        # differ by the key-name overhead — the thinking TEXT must be charged
+        # in full either way.
+        diff = abs(estimate_messages_tokens_rough([rc_only]) -
+                   estimate_messages_tokens_rough([reasoning_only]))
+        assert diff <= 4
+
     def test_non_string_api_content_does_not_displace_content(self):
         """Only a sidecar shape the wire actually substitutes may displace content.
 

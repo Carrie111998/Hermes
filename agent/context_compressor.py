@@ -890,7 +890,16 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
         if isinstance(tc, dict):
             tokens += estimate_tokens_rough(str(tc))
     for key in _REPLAY_BUDGET_KEYS:
+        if key in ("reasoning", "reasoning_content"):
+            # The two keys are byte-identical duplicates of the same
+            # thinking text on every wire that writes both (#81481);
+            # charge the larger once so the budget does not double-count
+            # the prose. Handled inline here so the loop stays flat.
+            continue
         tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    reasoning_dup = _serialized_length_for_budget(msg.get("reasoning"))
+    reasoning_content_dup = _serialized_length_for_budget(msg.get("reasoning_content"))
+    tokens += max(reasoning_dup, reasoning_content_dup) // _CHARS_PER_TOKEN
     # reasoning_details: charge only the thinking TEXT, never the signed /
     # base64 envelope (#73298 second site; mirrors the preflight estimator's
     # exclusion in model_metadata).  When the same thinking text already rides

@@ -3220,6 +3220,23 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details"):
             continue
+        if k in ("reasoning", "reasoning_content") and isinstance(v, str):
+            # ``reasoning`` and ``reasoning_content`` are byte-identical
+            # duplicates of the same thinking text on every wire that writes
+            # both (chat_completion_helpers promotes the same reasoning_text
+            # to both keys).  Charging both inflated preflight estimates on
+            # reasoning-heavy sessions by ~2x (#81481).  Keep only the
+            # larger of the two; the other key is skipped.
+            other_key = "reasoning_content" if k == "reasoning" else "reasoning"
+            other = msg.get(other_key)
+            if isinstance(other, str):
+                if len(other) > len(v):
+                    continue
+                if len(other) == len(v) and k == "reasoning_content":
+                    # Equal length: keep the key that appears FIRST in the
+                    # message (``reasoning``) so the result is deterministic
+                    # regardless of insertion order.
+                    continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
             # actually replaces ``content``.

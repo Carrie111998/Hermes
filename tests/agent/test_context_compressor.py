@@ -447,6 +447,72 @@ class TestTailBudgetCodexReplayFields:
         assert c._find_tail_cut_by_tokens(messages, head_end=1, token_budget=150) == 5
 
 
+class TestTailBudgetReasoningDedup:
+    """``reasoning`` and ``reasoning_content`` are byte-identical duplicates
+    of the same thinking text (chat_completion_helpers promotes the same
+    reasoning_text to both keys).  The tail-budget walk must charge the
+    larger of the two once — charging both inflated the budget ~2x on
+    reasoning-heavy sessions and shrank the protected tail (#81481)."""
+
+    def test_identical_reasoning_fields_counted_once(self):
+        from agent.context_compressor import _estimate_msg_budget_tokens
+
+        think = "reasoning text here " * 500
+        dup_msg = {"role": "assistant", "content": "ok",
+                   "reasoning": think, "reasoning_content": think}
+        single_msg = {"role": "assistant", "content": "ok", "reasoning": think}
+
+        assert _estimate_msg_budget_tokens(dup_msg) == \
+            _estimate_msg_budget_tokens(single_msg)
+
+    def test_larger_reasoning_field_still_charged(self):
+        from agent.context_compressor import _estimate_msg_budget_tokens
+
+        think = "reasoning text here " * 500
+        dup_msg = {"role": "assistant", "content": "ok",
+                   "reasoning": think, "reasoning_content": think[:100]}
+        single_msg = {"role": "assistant", "content": "ok", "reasoning": think}
+
+        assert _estimate_msg_budget_tokens(dup_msg) == \
+            _estimate_msg_budget_tokens(single_msg)
+
+    def test_tail_cut_not_skewed_by_duplicate_reasoning(self):
+        """A message with byte-identical reasoning fields must produce the
+        same tail cut as one with a single reasoning field — otherwise the
+        double charge pushes the cut earlier than the real budget justifies."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=1,
+                quiet_mode=True,
+            )
+
+        think = "x" * 8_000
+        base_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "initial ask"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "older follow-up"},
+            {"role": "assistant", "content": "thinking-heavy turn",
+             "reasoning": think, "reasoning_content": think},
+        ]
+        base_messages.extend(
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"tail visible message {i}",
+            }
+            for i in range(14)
+        )
+        messages_single = [dict(m) for m in base_messages]
+        messages_single[4] = {"role": "assistant", "content": "thinking-heavy turn",
+                              "reasoning": think}
+
+        cut_dup = c._find_tail_cut_by_tokens(base_messages, head_end=1, token_budget=250)
+        cut_single = c._find_tail_cut_by_tokens(messages_single, head_end=1, token_budget=250)
+        assert cut_dup == cut_single
+
+
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 
