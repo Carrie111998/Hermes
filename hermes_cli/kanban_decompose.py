@@ -566,7 +566,13 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return dispatchable task ids currently in the triage column.
+
+    GitHub draft-ingestion cards are intentionally parked in triage until the
+    PR is ready for review.  They are untrusted producer records, not
+    decomposition requests, so keep them out of the list consumed by the
+    gateway's auto-decompose tick (and by manual decomposition callers).
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -574,4 +580,12 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id
+        for row in rows
+        if not (
+            isinstance(row.metadata, dict)
+            and row.metadata.get("source") == "github_pull_request"
+            and row.metadata.get("draft") is True
+        )
+    ]

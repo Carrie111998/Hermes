@@ -359,10 +359,39 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_allows_requeued_review_card_with_existing_pr(kanban_home):
+    """Review/remediation cards must not be stranded by active-PR protection."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review card", assignee="dev")
+        implementation = kb.claim_task(conn, tid, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn,
+            tid,
+            reviewer="reviewer",
+            summary="PR opened",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "repo": "acme/repo",
+                "number": 42,
+                "head_sha": "a" * 40,
+                "verification_evidence": {"tests_passed": 1},
+            },
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, tid, summary="Fix requested", expected_run_id=review.current_run_id
+        ) == tid
+        kb.add_comment(
+            conn,
+            tid,
+            author="dev",
+            body="Updating existing PR https://github.com/acme/repo/pull/42",
+        )
 
-
-
-
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
 # ---------------------------------------------------------------------------
