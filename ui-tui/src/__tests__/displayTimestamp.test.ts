@@ -26,7 +26,9 @@ describe('formatDisplayTimestamp', () => {
   })
 
   it('treats numeric message timestamps as Unix seconds', () => {
-    expect(formatDisplayTimestamp(1786165445, { enabled: true, format: '%Y-%m-%d %H:%M:%S' })).toBe(
+    const local = new Date(2026, 7, 8, 15, 4, 5)
+
+    expect(formatDisplayTimestamp(local.getTime() / 1000, { enabled: true, format: '%Y-%m-%d %H:%M:%S' })).toBe(
       '2026-08-08 15:04:05'
     )
   })
