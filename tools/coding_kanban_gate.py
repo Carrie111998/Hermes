@@ -785,6 +785,17 @@ def _task_is_review_lane(task) -> bool:
     metadata = task.metadata if isinstance(task.metadata, dict) else {}
     if _text(metadata.get("review_identity")):
         return True
+    # Auto-decomposed GitHub review cards may arrive without native review
+    # metadata. Their durable title/assignee still identifies the review lane;
+    # otherwise the coding gate rejects the reviewer before it can inspect the
+    # PR and the card becomes a capability-block loop.
+    title = _text(getattr(task, "title", "")).lower()
+    body = _text(getattr(task, "body", "")).lower()
+    if task.assignee == "orion" and re.search(
+        r"\b(?:review|audit|inspect|evaluate)\b.*\bpr\s*#?\d+",
+        f"{title} {body}",
+    ):
+        return True
     try:
         from hermes_cli import kanban_db
 

@@ -746,7 +746,7 @@ def test_associated_session_cannot_unlock_unrelated_targets(monkeypatch, tmp_pat
     assert calls == []
 
 
-def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata=None) -> str:
+def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata=None, title="Review task") -> str:
     """Create a task, move it into the review column, and claim it the way the
     dispatcher does for a review worker (``claim_review_task``). Returns the
     task id with ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` set to the
@@ -757,7 +757,7 @@ def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata
 
     with kanban_db.connect_closing() as conn:
         task_id = kanban_db.create_task(
-            conn, title="Review task", assignee=assignee, session_id="origin",
+            conn, title=title, assignee=assignee, session_id="origin",
             workspace_kind="dir", workspace_path=str(tmp_path),
             metadata=metadata,
         )
@@ -792,6 +792,17 @@ def test_review_lane_worker_can_run_sdlc_terminal_mutations(monkeypatch, tmp_pat
         "terminal", {"command": command}, session_id="review-worker", user_message="Execute the SDLC review step",
     ))
 
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_worker_can_run_terminal_via_review_title_without_metadata(monkeypatch, tmp_path):
+    _claim_review_lane_task(monkeypatch, tmp_path, title="Audit PR #99 authorization boundaries")
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "git status --short"}, session_id="review-worker", user_message="Inspect the PR",
+    ))
     assert result == {"ok": True}
     assert calls == ["terminal"]
 
