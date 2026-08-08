@@ -2723,11 +2723,18 @@ def list_authenticated_providers(
             # See section 4: when live probing is suppressed for latency, a
             # warm same-fingerprint cache entry still serves the full catalog
             # with no network round-trip.
-            _discovery_allowed = bool(api_url) and discover and (
-                bool(api_key) or not has_explicit_models
-            )
-            _probe_live = _discovery_allowed and _can_probe_custom_provider(
-                row_is_current=_ep_is_current
+            #
+            # ``has_explicit_models`` gates the *probe*, not the cache read:
+            # it exists so a keyless endpoint with a declared catalog is not
+            # hammered over the network (5f00f36ba, 1039e90b5). Reading a
+            # catalog an earlier probe already paid for costs nothing, and
+            # applying the probe gate to it re-pins the endpoint — see
+            # ``_discovery_allowed`` in section 4 for the full rationale.
+            _discovery_allowed = bool(api_url) and discover
+            _probe_live = (
+                _discovery_allowed
+                and (bool(api_key) or not has_explicit_models)
+                and _can_probe_custom_provider(row_is_current=_ep_is_current)
             )
             if _discovery_allowed:
                 try:
@@ -3046,13 +3053,26 @@ def list_authenticated_providers(
             # already-discovered catalog on disk still answers the question
             # without a round-trip — skipping it too is what collapsed a
             # multi-model endpoint to its config-declared subset.
-            _discovery_allowed = (
-                bool(api_url)
+            #
+            # ``has_explicit_models`` belongs on the probe side of that line.
+            # It is a network-cost gate: don't hammer a keyless endpoint that
+            # already declares its catalog (5f00f36ba, 1039e90b5). It is not a
+            # user pin — ``discover_models: false`` is the documented way to
+            # pin, and it is honored above.
+            #
+            # Keeping it on the discovery side re-pins the endpoint it was
+            # meant to spare, because a successful probe calls
+            # ``_save_discovered_models_to_config()``, which writes a plain
+            # list — the exact shape ``_models_config_is_allowlist()`` reads
+            # back as an explicit allowlist. A keyless local server therefore
+            # self-pins on its first probe and can never widen again. f66319097
+            # already carved the dict shape out of that trap for the same
+            # reason; the list shape is the other door into it.
+            _discovery_allowed = bool(api_url) and grp.get("discover_models", True)
+            _probe_live = (
+                _discovery_allowed
                 and (bool(api_key) or not grp.get("has_explicit_models"))
-                and grp.get("discover_models", True)
-            )
-            _probe_live = _discovery_allowed and _can_probe_custom_provider(
-                row_is_current=_grp_is_current
+                and _can_probe_custom_provider(row_is_current=_grp_is_current)
             )
             if _discovery_allowed:
                 try:
