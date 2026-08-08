@@ -4165,10 +4165,11 @@ def _save_custom_provider(
             elif "api_mode" in entry:
                 entry.pop("api_mode", None)
                 changed = True
-            if key_env and (entry.get("key_env") != key_env or entry.get("api_key")):
-                entry["key_env"] = key_env
-                entry.pop("api_key", None)
-                changed = True
+            if key_env:
+                if entry.get("key_env") != key_env or entry.get("api_key"):
+                    entry["key_env"] = key_env
+                    entry.pop("api_key", None)
+                    changed = True
             elif api_key and (entry.get("api_key") != api_key or entry.get("key_env")):
                 entry["api_key"] = api_key
                 entry.pop("key_env", None)
