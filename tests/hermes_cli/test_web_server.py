@@ -1827,6 +1827,183 @@ class TestWebServerEndpoints:
         assert resp.json()["pagination"]["limit"] == 500
 
 
+    def test_compression_lineage_routes_preserve_exact_historical_segment(self):
+        """Lineage reads must not reuse the normal resume-resolving endpoint."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="lineage-root", source="desktop")
+            db.append_message(
+                session_id="lineage-root", role="user", content="before compression"
+            )
+            db.end_session("lineage-root", "compression")
+            db.create_session(
+                session_id="lineage-tip",
+                source="desktop",
+                parent_session_id="lineage-root",
+            )
+            db.append_message(
+                session_id="lineage-tip", role="assistant", content="after compression"
+            )
+        finally:
+            db.close()
+
+        lineage = self.client.get("/api/sessions/lineage-tip/compression-lineage")
+        assert lineage.status_code == 200
+        assert [entry["id"] for entry in lineage.json()["segments"]] == [
+            "lineage-root",
+            "lineage-tip",
+        ]
+        assert lineage.json()["tip_session_id"] == "lineage-tip"
+
+        historical = self.client.get(
+            "/api/sessions/lineage-tip/compression-lineage/lineage-root/messages"
+        )
+        assert historical.status_code == 200
+        assert historical.json()["session_id"] == "lineage-root"
+        assert historical.json()["messages"][0]["content"] == "before compression"
+
+    def test_compression_lineage_routes_fail_closed_on_ambiguous_children(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="ambiguous-root", source="desktop")
+            db.end_session("ambiguous-root", "compression")
+            for child in ("ambiguous-a", "ambiguous-b"):
+                db.create_session(
+                    session_id=child,
+                    source="desktop",
+                    parent_session_id="ambiguous-root",
+                )
+                db.append_message(session_id=child, role="user", content=child)
+        finally:
+            db.close()
+
+        lineage = self.client.get("/api/sessions/ambiguous-root/compression-lineage")
+        assert lineage.status_code == 200
+        assert lineage.json()["tip_session_id"] == "ambiguous-root"
+        assert lineage.json()["integrity"]["ok"] is False
+        assert lineage.json()["integrity"]["reason"] == "ambiguous_continuation"
+
+        exact_child = self.client.get(
+            "/api/sessions/ambiguous-root/compression-lineage/ambiguous-a/messages"
+        )
+        assert exact_child.status_code == 404
+
+
+    def test_compression_lineage_routes_page_past_100_and_accept_the_real_tip(self):
+        from hermes_state import SessionDB
+
+        segment_ids = [f"long-lineage-{index:03d}" for index in range(102)]
+        db = SessionDB()
+        try:
+            for index, segment_id in enumerate(segment_ids):
+                db.create_session(
+                    session_id=segment_id,
+                    source="desktop",
+                    parent_session_id=segment_ids[index - 1] if index else None,
+                )
+                db.append_message(
+                    session_id=segment_id, role="user", content=segment_id
+                )
+                if index < len(segment_ids) - 1:
+                    db.end_session(segment_id, "compression")
+        finally:
+            db.close()
+
+        lineage = self.client.get(
+            f"/api/sessions/{segment_ids[-1]}/compression-lineage?offset=100&limit=2"
+        )
+        assert lineage.status_code == 200
+        assert lineage.json()["root_session_id"] == segment_ids[0]
+        assert lineage.json()["tip_session_id"] == segment_ids[-1]
+        assert [entry["id"] for entry in lineage.json()["segments"]] == segment_ids[
+            100:
+        ]
+
+        exact_tip = self.client.get(
+            f"/api/sessions/{segment_ids[0]}/compression-lineage/{segment_ids[-1]}/messages"
+        )
+        assert exact_tip.status_code == 200
+        assert exact_tip.json()["session_id"] == segment_ids[-1]
+
+    def test_compression_segment_messages_are_bounded_and_pageable_by_default(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="large-segment", source="desktop")
+            for index in range(501):
+                db.append_message(
+                    session_id="large-segment",
+                    role="user",
+                    content=f"message-{index:03d}",
+                )
+        finally:
+            db.close()
+
+        first = self.client.get(
+            "/api/sessions/large-segment/compression-lineage/large-segment/messages"
+        )
+        assert first.status_code == 200
+        assert len(first.json()["messages"]) == 500
+        assert first.json()["pagination"] == {
+            "has_more": True,
+            "limit": 500,
+            "offset": 0,
+            "returned": 500,
+            "total": 501,
+        }
+
+        last = self.client.get(
+            "/api/sessions/large-segment/compression-lineage/large-segment/messages"
+            "?limit=500&offset=500"
+        )
+        assert last.status_code == 200
+        assert [message["content"] for message in last.json()["messages"]] == [
+            "message-500"
+        ]
+        assert last.json()["pagination"]["has_more"] is False
+        assert last.json()["pagination"]["total"] == 501
+
+    def test_compression_segment_pagination_counts_only_active_messages(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="rewound-segment", source="desktop")
+            for index in range(501):
+                db.append_message(
+                    session_id="rewound-segment",
+                    role="user",
+                    content=f"message-{index:03d}",
+                )
+            db._conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ? AND id IN ("
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 101)",
+                ("rewound-segment", "rewound-segment"),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/sessions/rewound-segment/compression-lineage/rewound-segment/messages"
+        )
+
+        assert response.status_code == 200
+        assert len(response.json()["messages"]) == 400
+        assert response.json()["pagination"] == {
+            "has_more": False,
+            "limit": 500,
+            "offset": 0,
+            "returned": 400,
+            "total": 400,
+        }
+
+
 
 
 

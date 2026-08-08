@@ -571,6 +571,45 @@ export interface SessionMessage {
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
   session_id: string
+  pagination?: {
+    has_more?: boolean
+    limit: null | number
+    offset: number
+    returned: number
+    total?: number
+  }
+}
+
+/** A durable segment created by automatic context compression. */
+export interface CompressionLineageSegment {
+  id: string
+  index: number
+  is_tip: boolean
+  message_count: number
+  started_at: number
+  ended_at?: null | number
+  end_reason?: null | string
+  last_active?: number
+  source?: null | string
+  title?: null | string
+}
+
+/** Compression-only lineage for a logical conversation, ordered root to tip. */
+export interface CompressionLineage {
+  integrity?: {
+    candidate_ids?: string[]
+    ok: boolean
+    reason?: 'ambiguous_continuation' | 'cycle' | 'invalid_closed_child' | string
+    session_id?: string
+  }
+  root_session_id: string
+  segments: CompressionLineageSegment[]
+  tip_session_id: string
+  pagination?: {
+    limit: number
+    offset: number
+    returned: number
+  }
 }
 
 export interface SessionResumeResponse {

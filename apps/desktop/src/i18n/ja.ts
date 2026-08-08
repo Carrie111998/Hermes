@@ -1767,6 +1767,17 @@ export const ja = defineLocale({
     loading: '読み込み中…',
     loadMore: 'さらに読み込む',
     loadCount: step => `さらに ${step} 件を読み込む`,
+    lineage: {
+      all: 'すべてのセグメントを表示',
+      branch: 'このセグメントから分岐',
+      current: '現在のセグメント',
+      error: 'このセグメントを読み込めませんでした。',
+      loading: 'セグメントを読み込み中…',
+      readOnly: '読み取り専用の履歴セグメント',
+      segment: index => `セグメント ${index}`,
+      segments: count => `${count} セグメント`,
+      title: '会話コンテキスト'
+    },
     row: {
       pin: 'ピン留め',
       unpin: 'ピン留めを解除',

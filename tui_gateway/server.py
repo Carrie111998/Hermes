@@ -2841,6 +2841,7 @@ def _persist_branch_seed(session: dict) -> None:
                     {
                         "role": msg.get("role", "user"),
                         "content": msg.get("content"),
+                        "display_kind": msg.get("display_kind"),
                         # Preserve the parent's original message timestamps —
                         # append_message would otherwise stamp time.time() and the
                         # branch's copied history would all appear authored "now".
@@ -7151,7 +7152,12 @@ def _coerce_seed_history(value: Any) -> list[dict]:
         if not isinstance(content, str) or not content.strip():
             continue
 
-        history.append({"role": role, "content": content})
+        message = {"role": role, "content": content}
+        # Seed callers may hide an internal compaction checkpoint, but must not
+        # be able to forge arbitrary timeline event kinds.
+        if item.get("display_kind") == "hidden":
+            message["display_kind"] = "hidden"
+        history.append(message)
 
     return history
 

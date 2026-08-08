@@ -1,6 +1,6 @@
 import type { useSensors } from '@dnd-kit/core'
 import type * as React from 'react'
-import { useCallback, useMemo } from 'react'
+import { Fragment, useCallback, useMemo } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import { SelectedContextLineage } from './context-lineage'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -95,7 +96,7 @@ interface SidebarSessionsSectionProps {
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
-  onBranchSession?: (sessionId: string, profile?: string) => void
+  onBranchSession?: (sessionId: string, profile?: string, lineageSessionId?: string) => void
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
@@ -232,26 +233,46 @@ export function SidebarSessionsSection({
 
   const renderRow = useCallback(
     (session: SessionInfo, draggable: boolean, branchStem?: string) => {
-      const rowProps = {
-        branchStem,
-        isPinned: pinned,
-        isSelected: session.id === activeSessionId,
-        isWorking: workingSessionIdSet.has(session.id),
-        onArchive: () => onArchiveSession(session.id),
-        onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-        onDelete: () => onDeleteSession(session.id),
-        onPin: () => onTogglePin(sessionPinId(session)),
-        onResume: () => onResumeSession(session.id),
-        reorderable: draggable && !branchStem,
-        session,
-        showProfile: showProfileTags
+      const renderSessionRow = (lineageControl?: React.ReactNode, lineageContent?: React.ReactNode) => {
+        const rowProps = {
+          branchStem,
+          isPinned: pinned,
+          isSelected: session.id === activeSessionId,
+          isWorking: workingSessionIdSet.has(session.id),
+          lineageControl,
+          onArchive: () => onArchiveSession(session.id),
+          onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+          onDelete: () => onDeleteSession(session.id),
+          onPin: () => onTogglePin(sessionPinId(session)),
+          onResume: () => onResumeSession(session.id),
+          reorderable: draggable && !branchStem,
+          session,
+          showProfile: showProfileTags
+        }
+
+        return draggable && !branchStem ? (
+          <SortableSidebarSessionRow {...rowProps} lineageContent={lineageContent} />
+        ) : (
+          <>
+            <SidebarSessionRow {...rowProps} />
+            {lineageContent}
+          </>
+        )
       }
 
-      return draggable && !branchStem ? (
-        <SortableSidebarSessionRow key={session.id} {...rowProps} />
-      ) : (
-        <SidebarSessionRow key={session.id} {...rowProps} />
-      )
+      if (session.id === activeSessionId) {
+        return (
+          <SelectedContextLineage
+            compact
+            key={session.id}
+            onBranch={onBranchSession}
+            renderContent={renderSessionRow}
+            session={session}
+          />
+        )
+      }
+
+      return <Fragment key={session.id}>{renderSessionRow()}</Fragment>
     },
     [
       activeSessionId,
@@ -470,19 +491,19 @@ export function SidebarSessionsSection({
   )
 }
 
-interface SortableSessionRowProps {
-  session: SessionInfo
-  isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
-  onArchive: () => void
-  onDelete: () => void
-  onPin: () => void
-  onResume: () => void
+interface SortableSessionRowProps extends Omit<React.ComponentProps<typeof SidebarSessionRow>, 'ref' | 'style'> {
+  lineageContent?: React.ReactNode
 }
 
-function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+function SortableSidebarSessionRow({ lineageContent, ...props }: SortableSessionRowProps) {
+  const { ref, style, ...rowBindings } = useSortableBindings(props.session.id)
+
+  return (
+    <div ref={ref} style={style}>
+      <SidebarSessionRow {...props} {...rowBindings} />
+      {!rowBindings.dragging && lineageContent}
+    </div>
+  )
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {

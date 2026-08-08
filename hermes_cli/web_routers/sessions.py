@@ -595,6 +595,100 @@ async def get_session_latest_descendant(
     }
 
 
+@manage_router.get("/api/sessions/{session_id}/compression-lineage")
+async def get_compression_lineage(
+    session_id: str,
+    profile: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Read compression-only lineage metadata without resolving a resume target."""
+
+    def _read():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                return None
+            lineage = db.get_compression_lineage_metadata(sid)
+            segments = lineage["segments"]
+            page = segments[offset : offset + limit]
+            return lineage, page
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_read)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    lineage, page = result
+    return {
+        **lineage,
+        "segments": page,
+        "pagination": {"limit": limit, "offset": offset, "returned": len(page)},
+    }
+
+
+@manage_router.get(
+    "/api/sessions/{session_id}/compression-lineage/{segment_id}/messages"
+)
+async def get_compression_lineage_segment_messages(
+    session_id: str,
+    segment_id: str,
+    profile: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Read exactly one historical compression segment, never its resume tip."""
+
+    def _read():
+        db = _open_session_db_for_profile(profile, read_only=True)
+        try:
+            sid = db.resolve_session_id(session_id)
+            segment = db.resolve_session_id(segment_id)
+            if not sid or not segment:
+                return None
+            lineage = db.get_compression_lineage_metadata(sid)
+            segment_info = next(
+                (entry for entry in lineage["segments"] if entry["id"] == segment),
+                None,
+            )
+            if segment_info is None:
+                return False
+            _limit = min(limit, 500)
+            # Deliberately do not call resolve_resume_session_id(): a lineage
+            # viewer must show this durable segment, not redirect to the live tip.
+            return (
+                segment,
+                _limit,
+                db.message_count(segment, include_inactive=False),
+                db.get_messages(segment, limit=_limit, offset=offset),
+            )
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_read)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if result is False:
+        raise HTTPException(
+            status_code=404, detail="Segment is not in this compression lineage"
+        )
+    segment, _limit, total, messages = result
+    returned = len(messages)
+    return {
+        "session_id": segment,
+        "messages": messages,
+        "pagination": {
+            "limit": _limit,
+            "offset": offset,
+            "returned": returned,
+            "total": total,
+            "has_more": offset + returned < total,
+        },
+    }
+
+
+
 @manage_router.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str,

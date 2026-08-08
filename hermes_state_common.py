@@ -80,10 +80,22 @@ def _shape_preview(raw: Any) -> str:
     return text
 
 
+# Historical databases can contain malformed model_config JSON. Every listing
+# predicate must therefore validate before json_extract; invalid values behave
+# like an empty object rather than aborting the whole SQLite query.
+_SAFE_MODEL_CONFIG_SQL = (
+    "CASE WHEN json_valid(COALESCE({a}.model_config, '{{}}')) "
+    "THEN COALESCE({a}.model_config, '{{}}') ELSE '{{}}' END"
+)
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
-# it carries the stable marker OR the legacy end_reason heuristic holds.
+# its stable marker points to its immediate parent OR the legacy end_reason
+# heuristic holds. Compression continuations inherit model_config, so marker
+# presence alone would incorrectly surface a continuation as a second branch.
 _BRANCH_CHILD_SQL = (
-    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NOT NULL"
+    "json_extract((" + _SAFE_MODEL_CONFIG_SQL + "), '$._branched_from') "
+    "= {a}.parent_session_id"
     " OR EXISTS (SELECT 1 FROM sessions p"
     "            WHERE p.id = {a}.parent_session_id"
     "            AND p.end_reason = 'branched'"
@@ -100,7 +112,9 @@ _COMPRESSION_CHILD_SQL = (
 
 # Rows that surface in pickers: roots + branch children (subagent runs and
 # compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
@@ -150,8 +164,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"WHERE _act_s.id = {session_id_expr})"
     )
     started = (
-        f"(SELECT started_at FROM sessions _act_s "
-        f"WHERE _act_s.id = {session_id_expr})"
+        f"(SELECT started_at FROM sessions _act_s WHERE _act_s.id = {session_id_expr})"
     )
     return (
         f"COALESCE("

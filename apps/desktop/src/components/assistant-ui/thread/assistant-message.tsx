@@ -47,12 +47,14 @@ interface MessageActionProps {
    *  was a large slice of per-token script time on long transcripts. */
   getMessageText: () => string
   onBranchInNewChat?: (messageId: string) => void
+  readOnly: boolean
 }
 
 export const AssistantMessage: FC<{
   onBranchInNewChat?: (messageId: string) => void
   onDismissError?: (messageId: string) => void
-}> = ({ onBranchInNewChat, onDismissError }) => {
+  readOnly?: boolean
+}> = ({ onBranchInNewChat, onDismissError, readOnly = false }) => {
   const messageId = useAuiState(s => s.message.id)
   const messageRuntime = useMessageRuntime()
   const { t } = useI18n()
@@ -114,7 +116,8 @@ export const AssistantMessage: FC<{
 
   // Double-click the reply to heart it (iMessage). Undefined while reactions
   // are off, so the root carries no listener at all.
-  const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
+  const tapbackDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
+  const onDoubleClick = readOnly ? undefined : tapbackDoubleClick
 
   return (
     <MessagePrimitive.Root
@@ -159,7 +162,12 @@ export const AssistantMessage: FC<{
         </MessagePrimitive.Error>
       </div>
       {hasVisibleText && !isInterim && (
-        <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
+        <AssistantFooter
+          getMessageText={getMessageText}
+          messageId={messageId}
+          onBranchInNewChat={onBranchInNewChat}
+          readOnly={readOnly}
+        />
       )}
       {/* Last thing in the turn — under the action bar, the way Cursor ends a
           turn on its summary rather than burying it above the controls. */}
@@ -168,7 +176,7 @@ export const AssistantMessage: FC<{
   )
 }
 
-const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText, onBranchInNewChat }) => {
+const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText, onBranchInNewChat, readOnly }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
 
@@ -212,11 +220,13 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
         )}
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
         <ReadAloudButton getText={getMessageText} messageId={messageId} />
-        <ActionBarPrimitive.Reload asChild>
-          <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
-            <RefreshCwIcon className="size-3.5" />
-          </TooltipIconButton>
-        </ActionBarPrimitive.Reload>
+        {!readOnly && (
+          <ActionBarPrimitive.Reload asChild>
+            <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
+              <RefreshCwIcon className="size-3.5" />
+            </TooltipIconButton>
+          </ActionBarPrimitive.Reload>
+        )}
       </ActionBarPrimitive.Root>
       {/* ONE slot, Slack-style: the picker trigger and the landed reaction are
           the same element, so reacting never shifts layout. Empty → ☺, hidden
@@ -226,7 +236,7 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
           clicking it reopens the picker to switch or retract. Outside
           ActionBarPrimitive.Root so a landed reaction doesn't ride the bar's
           hover opacity. */}
-      {(reactionsEnabled || shownReactions.length > 0) && (
+      {!readOnly && (reactionsEnabled || shownReactions.length > 0) && (
         <ReactionPicker
           onOpenChange={setPickerOpen}
           onSelect={pickEmoji}

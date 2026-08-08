@@ -2,6 +2,7 @@ import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { type FC, useCallback, useRef } from 'react'
+import type * as React from 'react'
 
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -11,6 +12,7 @@ import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
 import { SidebarDateDivider } from './chrome'
+import { SelectedContextLineage } from './context-lineage'
 import { SidebarSessionRow } from './session-row'
 
 interface SessionRowCommonProps {
@@ -25,6 +27,7 @@ interface SessionRowCommonProps {
   onResume: () => void
   reorderable?: boolean
   showProfile?: boolean
+  lineageControl?: React.ReactNode
 }
 
 export interface VirtualSessionListProps {
@@ -32,7 +35,7 @@ export interface VirtualSessionListProps {
   className?: string
   rows: SidebarListRow[]
   onArchiveSession: (sessionId: string) => void
-  onBranchSession?: (sessionId: string, profile?: string) => void
+  onBranchSession?: (sessionId: string, profile?: string, lineageSessionId?: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string) => void
   onTogglePin: (sessionId: string) => void
@@ -104,36 +107,48 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const { branchStem, session } = row.entry
     const reorderable = sortable && !branchStem
 
-    const commonProps: SessionRowCommonProps = {
-      branchStem,
-      isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      onArchive: () => onArchiveSession(session.id),
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id),
-      reorderable,
-      showProfile: showProfileTags
+    const renderSession = (lineageControl?: React.ReactNode, lineageContent?: React.ReactNode) => {
+      const commonProps: SessionRowCommonProps = {
+        branchStem,
+        isPinned: pinned,
+        isSelected: session.id === activeSessionId,
+        isWorking: workingSessionIdSet.has(session.id),
+        onArchive: () => onArchiveSession(session.id),
+        onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+        onDelete: () => onDeleteSession(session.id),
+        onPin: () => onTogglePin(sessionPinId(session)),
+        onResume: () => onResumeSession(session.id),
+        reorderable,
+        showProfile: showProfileTags,
+        lineageControl
+      }
+
+      return reorderable ? (
+        <VirtualSortableRow
+          index={virtualItem.index}
+          lineageContent={lineageContent}
+          measureRef={virtualizer.measureElement}
+          rowProps={commonProps}
+          session={session}
+        />
+      ) : (
+        <div data-index={virtualItem.index} ref={virtualizer.measureElement}>
+          <SidebarSessionRow {...commonProps} session={session} />
+          {lineageContent}
+        </div>
+      )
     }
 
-    return reorderable ? (
-      <VirtualSortableRow
-        index={virtualItem.index}
+    return session.id === activeSessionId ? (
+      <SelectedContextLineage
+        compact
         key={session.id}
-        measureRef={virtualizer.measureElement}
-        rowProps={commonProps}
+        onBranch={onBranchSession}
+        renderContent={renderSession}
         session={session}
       />
     ) : (
-      <SidebarSessionRow
-        {...commonProps}
-        data-index={virtualItem.index}
-        key={session.id}
-        ref={virtualizer.measureElement}
-        session={session}
-      />
+      <div key={session.id}>{renderSession()}</div>
     )
   })
 
@@ -154,12 +169,13 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
 interface VirtualSortableRowProps {
   index: number
+  lineageContent?: React.ReactNode
   measureRef: (node: Element | null) => void
   rowProps: SessionRowCommonProps
   session: SessionInfo
 }
 
-function VirtualSortableRow({ index, measureRef, rowProps, session }: VirtualSortableRowProps) {
+function VirtualSortableRow({ index, lineageContent, measureRef, rowProps, session }: VirtualSortableRowProps) {
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
 
   // Merge dnd-kit's setNodeRef with the virtualizer's measureElement so
@@ -174,15 +190,15 @@ function VirtualSortableRow({ index, measureRef, rowProps, session }: VirtualSor
   )
 
   return (
-    <SidebarSessionRow
-      {...rowProps}
-      data-index={index}
-      dragging={isDragging}
-      dragHandleProps={{ ...attributes, ...listeners }}
-      ref={refMerged}
-      reorderable
-      session={session}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-    />
+    <div data-index={index} ref={refMerged} style={{ transform: CSS.Transform.toString(transform), transition }}>
+      <SidebarSessionRow
+        {...rowProps}
+        dragging={isDragging}
+        dragHandleProps={{ ...attributes, ...listeners }}
+        reorderable
+        session={session}
+      />
+      {!isDragging && lineageContent}
+    </div>
   )
 }

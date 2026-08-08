@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import subprocess
@@ -36,6 +37,56 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
         return
     monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
     yield
+
+
+def test_coerce_seed_history_preserves_hidden_display_kind():
+    history = server._coerce_seed_history([
+        {
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns.",
+            "display_kind": "hidden",
+        }
+    ])
+
+    assert history == [
+        {
+            "role": "user",
+            "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns.",
+            "display_kind": "hidden",
+        }
+    ]
+
+
+def test_persist_branch_seed_preserves_hidden_display_kind(monkeypatch):
+    captured = []
+
+    class FakeDB:
+        def append_messages_batch(self, _session_id, messages, **_kwargs):
+            captured.extend(messages)
+            return len(messages)
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield FakeDB()
+
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    session = {
+        "history": [
+            {
+                "role": "user",
+                "content": "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns.",
+                "display_kind": "hidden",
+            }
+        ],
+        "history_lock": threading.Lock(),
+        "parent_session_id": "root",
+        "session_key": "branch",
+    }
+
+    server._persist_branch_seed(session)
+
+    assert captured[0]["display_kind"] == "hidden"
+
 
 
 def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):

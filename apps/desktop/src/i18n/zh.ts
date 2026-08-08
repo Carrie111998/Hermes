@@ -2125,6 +2125,17 @@ export const zh: Translations = {
     loading: '加载中…',
     loadMore: '加载更多',
     loadCount: step => `再加载 ${step} 个`,
+    lineage: {
+      all: '查看全部上下文段',
+      branch: '从此上下文段创建分支',
+      current: '当前上下文段',
+      error: '无法加载此上下文段。',
+      loading: '正在加载上下文段…',
+      readOnly: '只读历史上下文段',
+      segment: index => `上下文段 ${index}`,
+      segments: count => `${count} 个上下文段`,
+      title: '会话上下文'
+    },
     row: {
       pin: '置顶',
       unpin: '取消置顶',

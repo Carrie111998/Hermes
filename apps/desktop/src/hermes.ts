@@ -10,6 +10,7 @@ import type {
   AutomationBlueprint,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  CompressionLineage,
   ComputerUseStatus,
   ConfigSchemaResponse,
   CronDeliveryTarget,
@@ -140,6 +141,7 @@ export type {
   AutomationBlueprintField,
   AuxiliaryModelsResponse,
   BackendUpdateCheckResponse,
+  CompressionLineage,
   ComputerUseCheck,
   ComputerUsePermissionSource,
   ComputerUseStatus,
@@ -662,6 +664,90 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
   })
+}
+
+/** Read compression-only lineage metadata. Missing on older backends by design. */
+export async function getCompressionLineage(id: string, profile?: string | null): Promise<CompressionLineage> {
+  const encodedId = encodeURIComponent(id)
+  const profileQuery = profile ? `profile=${encodeURIComponent(profile)}` : ''
+
+  const requestPage = (offset?: number, limit?: number) => {
+    const query = [
+      profileQuery,
+      offset === undefined ? '' : `offset=${offset}`,
+      limit === undefined ? '' : `limit=${limit}`
+    ]
+      .filter(Boolean)
+      .join('&')
+
+    return window.hermesDesktop.api<CompressionLineage>({
+      ...(profile ? { profile } : {}),
+      path: `/api/sessions/${encodedId}/compression-lineage${query ? `?${query}` : ''}`
+    })
+  }
+
+  let latest = await requestPage()
+  const segments = [...latest.segments]
+  let page = latest.pagination
+
+  while (page && page.returned > 0 && page.returned === page.limit) {
+    const offset = page.offset + page.returned
+
+    latest = await requestPage(offset, page.limit)
+    segments.push(...latest.segments)
+    page = latest.pagination
+  }
+
+  return {
+    ...latest,
+    pagination: latest.pagination ? { limit: segments.length, offset: 0, returned: segments.length } : undefined,
+    segments
+  }
+}
+
+/**
+ * Read one exact lineage segment. Unlike getSessionMessages, this endpoint
+ * never resolves the request forward to a compression continuation.
+ */
+export async function getCompressionSegmentMessages(
+  lineageSessionId: string,
+  segmentId: string,
+  profile?: string | null
+): Promise<SessionMessagesResponse> {
+  const pageSize = 500
+  const messages: SessionMessagesResponse['messages'] = []
+  let offset = 0
+
+  while (true) {
+    const profileSuffix = profile ? `&profile=${encodeURIComponent(profile)}` : ''
+
+    const page = await window.hermesDesktop.api<SessionMessagesResponse>({
+      ...(profile ? { profile } : {}),
+      path:
+        `/api/sessions/${encodeURIComponent(lineageSessionId)}/compression-lineage/` +
+        `${encodeURIComponent(segmentId)}/messages?limit=${pageSize}&offset=${offset}${profileSuffix}`
+    })
+
+    messages.push(...page.messages)
+
+    const pagination = page.pagination
+
+    if (!pagination?.has_more) {
+      return {
+        ...page,
+        messages,
+        pagination: pagination ? { ...pagination, offset: 0, returned: messages.length } : pagination
+      }
+    }
+
+    const nextOffset = pagination.offset + pagination.returned
+
+    if (pagination.returned <= 0 || nextOffset <= offset) {
+      throw new Error('Compression segment pagination did not advance')
+    }
+
+    offset = nextOffset
+  }
 }
 
 export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {

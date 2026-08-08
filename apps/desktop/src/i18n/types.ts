@@ -1627,6 +1627,17 @@ export interface Translations {
     loading: string
     loadMore: string
     loadCount: (step: number) => string
+    lineage: {
+      all: string
+      branch: string
+      current: string
+      error: string
+      loading: string
+      readOnly: string
+      segment: (index: number) => string
+      segments: (count: number) => string
+      title: string
+    }
     row: {
       pin: string
       unpin: string

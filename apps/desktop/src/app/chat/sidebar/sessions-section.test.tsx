@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -42,6 +42,12 @@ vi.mock('./session-row', () => ({
   )
 }))
 
+vi.mock('./context-lineage', () => ({
+  SelectedContextLineage: ({ session }: { session: SessionInfo }) => (
+    <div data-testid={`compact-context-lineage-${session.id}`} />
+  )
+}))
+
 function makeSession(id: string, startedAt = 1000): SessionInfo {
   return {
     handoff_platform: null,
@@ -60,6 +66,35 @@ function generateSessions(count: number): SessionInfo[] {
 const noop = () => {}
 
 describe('SidebarSessionsSection memoization & virtualizer stability', () => {
+  it('shows compression lineage for a selected branch in a non-virtual list', () => {
+    const root = makeSession('root', 1000)
+
+    const branch = {
+      ...makeSession('branch', 900),
+      model_config: { _branched_from: 'root' },
+      parent_session_id: 'root'
+    } as SessionInfo
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId="branch"
+        emptyState={<div>Empty</div>}
+        label="Sessions"
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        open={true}
+        pinned={false}
+        sessions={[root, branch]}
+        workingSessionIdSet={new Set()}
+      />
+    )
+
+    expect(screen.getByTestId('compact-context-lineage-branch')).toBeTruthy()
+  })
+
   it('memoizes flatRows and passes the exact same rows array reference across parent re-renders', () => {
     mockVirtualListPropsHistory.length = 0
 
