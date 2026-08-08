@@ -2510,6 +2510,28 @@ class SessionStore:
         if callable(callback):
             callback(stage)
 
+    def _promote_prior_sqlite_session(self, session_id: str, reason: str) -> None:
+        """Require a durable reset promotion, including a retry's prior commit."""
+        if self._db is None:
+            return
+        promote = getattr(self._db, "promote_to_session_reset", None)
+        if not callable(promote):
+            self._db.end_session(session_id, reason)
+            return
+        if promote(session_id, reason) is True:
+            return
+        # ``False`` is normally a failed/declined promotion, but is also the
+        # idempotent result after a crash between promotion and publication.
+        # Only the exact already-durable boundary may resume that retry.
+        row = self._db.get_session(session_id)
+        if (
+            row is not None
+            and row.get("ended_at") is not None
+            and row.get("end_reason") == reason
+        ):
+            return
+        raise RuntimeError("prior SQLite session promotion was not confirmed")
+
     def _arm_route_terminal_transition(
         self,
         session_key: str,
@@ -3111,11 +3133,9 @@ class SessionStore:
                 # (agent_close / ws_orphan_reap), which first-reason-wins
                 # end_session would preserve — leaving the reset session
                 # resurrectable by stale-route recovery (#61220, #61993).
-                _promote = getattr(self._db, "promote_to_session_reset", None)
-                if callable(_promote):
-                    _promote(db_end_session_id, _db_end_reason)
-                else:
-                    self._db.end_session(db_end_session_id, _db_end_reason)
+                self._promote_prior_sqlite_session(
+                    db_end_session_id, _db_end_reason
+                )
                 if was_auto_reset:
                     self._lifecycle_failpoint(
                         "gateway.auto_reset.after_old_promoted"
@@ -3701,11 +3721,9 @@ class SessionStore:
                 # agent_close/ws_orphan_reap end must not survive an explicit
                 # user reset, or recovery resurrects the reset session
                 # (#61993 — the user's /new was silently undone).
-                _promote = getattr(self._db, "promote_to_session_reset", None)
-                if callable(_promote):
-                    _promote(db_end_session_id, "session_reset")
-                else:
-                    self._db.end_session(db_end_session_id, "session_reset")
+                self._promote_prior_sqlite_session(
+                    db_end_session_id, "session_reset"
+                )
                 self._lifecycle_failpoint("gateway.reset.after_old_promoted")
             except Exception as e:
                 raise RuntimeError(
@@ -3852,11 +3870,9 @@ class SessionStore:
 
         if self._db:
             try:
-                _promote = getattr(self._db, "promote_to_session_reset", None)
-                if callable(_promote):
-                    _promote(db_end_session_id, "session_switch")
-                else:
-                    self._db.end_session(db_end_session_id, "session_switch")
+                self._promote_prior_sqlite_session(
+                    db_end_session_id, "session_switch"
+                )
                 self._lifecycle_failpoint("gateway.switch.after_old_promoted")
                 self._db.reopen_session(target_session_id)
                 self._lifecycle_failpoint("gateway.switch.after_target_reopened")

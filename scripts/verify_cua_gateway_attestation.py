@@ -16,12 +16,14 @@ from typing import Any
 MODULES = (
     "tools/computer_use/tool.py", "tools/computer_use/cua_backend.py",
     "tools/computer_use/browser_route.py", "gateway/run.py", "gateway/session.py",
+    "hermes_state.py",
     "tools/approval.py",
 )
 CALLABLES = (
     "tools.computer_use.tool:set_computer_use_session_validator", "tools.computer_use.tool:_validate_managed_publication", "tools.computer_use.tool:publish_computer_use_session", "tools.computer_use.tool:unpublish_computer_use_session", "tools.computer_use.tool:begin_computer_use_terminal_transition", "tools.computer_use.tool:end_computer_use_terminal_transition", "tools.computer_use.tool:_cua_permission_mode", "tools.computer_use.tool:_get_backend", "tools.computer_use.tool:_acquire_backend_for_call", "tools.computer_use.tool:release_computer_use_session_result", "tools.computer_use.tool:handle_computer_use", "tools.computer_use.tool:_dispatch",
     "tools.computer_use.cua_backend:_AsyncBridge.run", "tools.computer_use.cua_backend:_CuaDriverSession._lifecycle_coro", "tools.computer_use.cua_backend:_CuaDriverSession.call_tool", "tools.computer_use.cua_backend:_CuaDriverSession._call_tool_via_cli", "tools.computer_use.cua_backend:_CuaDriverSession._restart_session_locked", "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.start", "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.stop", "tools.computer_use.cua_backend:CuaDriverBackend.start", "tools.computer_use.cua_backend:CuaDriverBackend.stop", "tools.computer_use.cua_backend:CuaDriverBackend.capture", "tools.computer_use.cua_backend:CuaDriverBackend._apply_delivery", "tools.computer_use.cua_backend:CuaDriverBackend._run_input_action", "tools.computer_use.cua_backend:CuaDriverBackend._action", "tools.computer_use.cua_backend:CuaDriverBackend._maybe_attach_element_token", "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_state", "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_prepare", "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_action",
     "gateway.run:GatewayRunner._run_agent", "gateway.session:SessionStore.route_matches", "gateway.session:SessionStore._run_route_transition", "gateway.session:SessionStore.prune_old_entries", "tools.approval:get_current_session_key", "tools.approval:is_approval_bypass_active_for_session",
+    "hermes_state:SessionDB._execute_write", "hermes_state:SessionDB.publish_compression_child", "hermes_state:SessionDB.promote_to_session_reset",
 )
 
 
@@ -69,6 +71,16 @@ def _verify_process(receipt: dict[str, Any]) -> None:
         process = psutil.Process(int(receipt["pid"]))
         if abs(process.create_time() - float(receipt["process_create_time"])) > 0.001: raise VerificationError("live process create time mismatch")
         if Path(process.exe()).resolve() != Path(str(receipt["executable"])).resolve(): raise VerificationError("live process executable mismatch")
+        if Path(sys.executable).resolve() != Path(str(receipt["launcher"])).resolve(): raise VerificationError("live process launcher mismatch")
+        parent = receipt["parent"]
+        live_parent = process.parent()
+        if (
+            not isinstance(parent, dict)
+            or live_parent is None
+            or live_parent.pid != int(parent["pid"])
+            or abs(live_parent.create_time() - float(parent["process_create_time"])) > 0.001
+            or Path(live_parent.exe()).resolve() != Path(str(parent["executable"])).resolve()
+        ): raise VerificationError("live parent process identity mismatch")
     except VerificationError: raise
     except Exception as exc: raise VerificationError("cannot determine live process identity") from exc
 
@@ -107,6 +119,9 @@ def verify(
             raise VerificationError(f"deployed source path escapes root: {relative}")
         if not isinstance(receipt_source, str) or Path(receipt_source).resolve() != canonical_deployed:
             raise VerificationError(f"receipt deployed source path mismatch: {relative}")
+        deployed_raw = canonical_deployed.read_bytes()
+        if len(deployed_raw) != row.get("size") or hashlib.sha256(deployed_raw).hexdigest() != row.get("sha256"):
+            raise VerificationError(f"deployed module hash mismatch: {relative}")
         code = compile(
             raw,
             str(canonical_deployed),
@@ -162,20 +177,58 @@ def verify(
     return "verified reviewed content identity (dirty/unversioned source; no commit identity claimed)"
 
 
+def _write_verification_receipt(
+    path: Path,
+    args: argparse.Namespace,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    """Persist the exact verifier invocation and its complete result."""
+    payload = {
+        "schema": 1,
+        "command": list(sys.argv),
+        "receipt_path": str(args.receipt),
+        "review_root": str(args.review_root),
+        "deployed_root": str(args.deployed_root),
+        "expected_commit": args.expected_commit,
+        "verifier_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--review-root", type=Path, required=True)
     parser.add_argument("--deployed-root", type=Path, required=True)
     parser.add_argument("--expected-commit")
+    parser.add_argument("--verification-receipt", type=Path)
     args = parser.parse_args()
+    stdout = ""
+    stderr = ""
     try:
         receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
-        print(verify(receipt, args.review_root, args.deployed_root, args.expected_commit))
-        return 0
-    except (OSError, ValueError, VerificationError) as exc:
-        print(f"CUA attestation verification failed: {exc}", file=sys.stderr)
-        return 1
+        stdout = verify(receipt, args.review_root, args.deployed_root, args.expected_commit)
+        exit_code = 0
+    except (OSError, ValueError, KeyError, VerificationError) as exc:
+        stderr = f"CUA attestation verification failed: {exc}"
+        exit_code = 1
+    if stdout:
+        print(stdout)
+        stdout += "\n"
+    if stderr:
+        print(stderr, file=sys.stderr)
+        stderr += "\n"
+    if args.verification_receipt is not None:
+        _write_verification_receipt(args.verification_receipt, args, exit_code, stdout, stderr)
+    return exit_code
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -1266,6 +1266,7 @@ class TestAutoResetPreRotationBoundary:
         original.suspended = True
         store._save_entries()
         db = MagicMock()
+        db.promote_to_session_reset.return_value = True
         store._db = db
         store._compression_tip_for_session_id = MagicMock(
             return_value=original.session_id
@@ -1300,6 +1301,88 @@ class TestAutoResetPreRotationBoundary:
             original.session_id, "suspended"
         )
         db.create_session.assert_called_once()
+
+    def test_auto_reset_promotion_false_retains_fence_until_retry_succeeds(
+        self, tmp_path
+    ):
+        store, source, original, db = self._store(tmp_path, lambda *_args: None)
+        db.promote_to_session_reset.return_value = False
+
+        with pytest.raises(RuntimeError, match="could not close prior SQLite session"):
+            store.get_or_create_session(source)
+
+        retained = store._entries[original.session_key]
+        assert retained.session_id == original.session_id
+        assert retained.metadata.get("terminal_transition")
+        db.create_session.assert_not_called()
+
+        db.promote_to_session_reset.return_value = True
+        replacement = store.get_or_create_session(source)
+        assert replacement.session_id != original.session_id
+        assert not replacement.metadata.get("terminal_transition")
+
+    def test_explicit_reset_promotion_false_retains_fence_until_retry_succeeds(
+        self, tmp_path
+    ):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        db = MagicMock()
+        db.promote_to_session_reset.return_value = False
+        store._db = db
+
+        with pytest.raises(RuntimeError, match="could not close prior SQLite session"):
+            store.reset_session(original.session_key)
+
+        retained = store._entries[original.session_key]
+        assert retained.session_id == original.session_id
+        assert retained.metadata.get("terminal_transition")
+        db.create_session.assert_not_called()
+
+        db.promote_to_session_reset.return_value = True
+        replacement = store.reset_session(original.session_key)
+        assert replacement.session_id != original.session_id
+        assert not replacement.metadata.get("terminal_transition")
+
+    def test_explicit_reset_promotion_non_boolean_is_not_success(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        db = MagicMock()
+        db.promote_to_session_reset.return_value = None
+        store._db = db
+
+        with pytest.raises(RuntimeError, match="could not close prior SQLite session"):
+            store.reset_session(original.session_key)
+
+        retained = store._entries[original.session_key]
+        assert retained.session_id == original.session_id
+        assert retained.metadata.get("terminal_transition")
+        db.create_session.assert_not_called()
+
+    def test_switch_promotion_false_retains_fence_until_retry_succeeds(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        db = MagicMock()
+        db.promote_to_session_reset.return_value = False
+        store._db = db
+
+        with pytest.raises(RuntimeError, match="SQLite publication failed"):
+            store.switch_session(original.session_key, "retry-switch-target")
+
+        retained = store._entries[original.session_key]
+        assert retained.session_id == original.session_id
+        assert retained.metadata.get("terminal_transition")
+        db.reopen_session.assert_not_called()
+
+        db.promote_to_session_reset.return_value = True
+        replacement = store.switch_session(original.session_key, "retry-switch-target")
+        assert replacement.session_id == "retry-switch-target"
+        assert not replacement.metadata.get("terminal_transition")
 
     def test_auto_reset_release_failure_keeps_old_route_and_persistence(
         self, tmp_path
@@ -1615,7 +1698,7 @@ class TestAutoResetPreRotationBoundary:
         fake_db.save_gateway_routing_entry.return_value = None
         fake_db.replace_gateway_routing_entries.return_value = None
         fake_db.promote_to_session_reset.side_effect = (
-            lambda *_args, **_kwargs: events.append("sqlite:end")
+            lambda *_args, **_kwargs: events.append("sqlite:end") or True
         )
         fake_db.create_session.side_effect = (
             lambda *_args, **_kwargs: events.append("sqlite:create")

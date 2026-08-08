@@ -836,6 +836,7 @@ _CUA_ATTESTATION_MODULES = (
     "tools/computer_use/browser_route.py",
     "gateway/run.py",
     "gateway/session.py",
+    "hermes_state.py",
     "tools/approval.py",
 )
 _CUA_ATTESTATION_CALLABLES = (
@@ -872,6 +873,9 @@ _CUA_ATTESTATION_CALLABLES = (
     "gateway.session:SessionStore.route_matches",
     "gateway.session:SessionStore._run_route_transition",
     "gateway.session:SessionStore.prune_old_entries",
+    "hermes_state:SessionDB._execute_write",
+    "hermes_state:SessionDB.publish_compression_child",
+    "hermes_state:SessionDB.promote_to_session_reset",
     "tools.approval:get_current_session_key",
     "tools.approval:is_approval_bypass_active_for_session",
 )
@@ -987,15 +991,21 @@ def write_computer_use_runtime_attestation(extra_callables: Optional[Dict[str, A
     try:
         import psutil
         process = psutil.Process(os.getpid())
+        parent = process.parent()
         process_create_time, process_executable = process.create_time(), process.exe()
-        if not process_executable:
-            raise RuntimeError("live gateway process executable is unavailable")
+        parent_identity = {
+            "pid": parent.pid,
+            "process_create_time": parent.create_time(),
+            "executable": parent.exe(),
+        }
+        if not process_executable or not parent_identity["executable"]:
+            raise RuntimeError("live gateway process identity is unavailable")
     except Exception as exc:
         raise RuntimeError("could not attest live gateway process identity") from exc
     output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
     archive_dir = output.parent / "cua_gateway_attestations"
     archive = archive_dir / f"{os.getpid()}-{int(process_create_time * 1_000_000)}.json"
-    receipt = {"schema": 3, "captured_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
+    receipt = {"schema": 3, "captured_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "parent": parent_identity, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
     output.parent.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(receipt, indent=2)

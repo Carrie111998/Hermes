@@ -1104,6 +1104,7 @@ def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
         "tools/computer_use/browser_route.py",
         "gateway/run.py",
         "gateway/session.py",
+        "hermes_state.py",
         "tools/approval.py",
     }
     assert set(persisted["modules"]) == expected_modules
@@ -1119,6 +1120,12 @@ def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
         assert row["source_relative_path"] in expected_modules
     assert "tools.computer_use.cua_backend:CuaDriverBackend._run_input_action" in persisted["callables"]
     assert "tools.computer_use.cua_backend:_CuaDriverSession.call_tool" in persisted["callables"]
+    assert "hermes_state:SessionDB.promote_to_session_reset" in persisted["callables"]
+    assert "hermes_state:SessionDB.publish_compression_child" in persisted["callables"]
+    assert "hermes_state:SessionDB._execute_write" in persisted["callables"]
+    assert persisted["parent"]["pid"] == os.getppid()
+    assert persisted["parent"]["process_create_time"] > 0
+    assert persisted["parent"]["executable"]
 
 
 def test_runtime_attestation_fails_closed_when_process_identity_is_unavailable(

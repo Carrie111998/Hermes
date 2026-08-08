@@ -559,6 +559,7 @@ def test_auto_reset_sqlite_failure_retains_fence_and_retry_recovers(
     runner.session_store._save_entries()
 
     fake_db = MagicMock()
+    fake_db.promote_to_session_reset.return_value = True
     fake_db.save_gateway_routing_entry.return_value = None
     fake_db.replace_gateway_routing_entries.return_value = None
     fake_db.record_gateway_session_peer.return_value = None
@@ -623,6 +624,7 @@ def test_terminal_sqlite_failure_retains_fence_and_retry_recovers(
     )
     original = runner.session_store.get_or_create_session(source)
     fake_db = MagicMock()
+    fake_db.promote_to_session_reset.return_value = True
     fake_db.save_gateway_routing_entry.return_value = None
     fake_db.replace_gateway_routing_entries.return_value = None
     fake_db.record_gateway_session_peer.return_value = None
