@@ -4,9 +4,11 @@ Proves the Honcho client is constructed exactly once even when many threads
 race the first call, by stubbing the SDK constructor and counting invocations.
 """
 
+import asyncio
 import sys
 import threading
 import types
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -96,6 +98,59 @@ def test_reset_allows_rebuild(monkeypatch):
     c2 = get_honcho_client(config)
     assert build_count["n"] == 2
     assert c2 is not c1
+
+
+def test_reset_closes_sync_and_async_http_clients():
+    client = types.SimpleNamespace(
+        _http=types.SimpleNamespace(close=Mock()),
+        _async_http=types.SimpleNamespace(close=AsyncMock()),
+    )
+    honcho_client._honcho_client_slot.get(lambda: client)
+
+    reset_honcho_client()
+
+    client._http.close.assert_called_once_with()
+    client._async_http.close.assert_awaited_once_with()
+    assert honcho_client._honcho_client_slot.peek() is None
+
+
+def test_reset_schedules_async_close_when_event_loop_is_running():
+    async def exercise_reset():
+        client = types.SimpleNamespace(
+            _http=types.SimpleNamespace(close=Mock()),
+            _async_http=types.SimpleNamespace(close=AsyncMock()),
+        )
+        honcho_client._honcho_client_slot.get(lambda: client)
+
+        reset_honcho_client()
+        await asyncio.sleep(0)
+
+        client._http.close.assert_called_once_with()
+        client._async_http.close.assert_awaited_once_with()
+
+    asyncio.run(exercise_reset())
+
+
+def test_oauth_reset_rebuilds_instead_of_returning_closed_client(monkeypatch):
+    build_count = {"n": 0}
+    build_lock = threading.Lock()
+    _install_fake_honcho_sdk(monkeypatch, build_count, build_lock)
+    config = HonchoClientConfig(
+        api_key="test-key", workspace_id="ws", environment="production"
+    )
+
+    first = get_honcho_client(config)
+
+    def force_oauth_reset(*_args):
+        reset_honcho_client()
+        return True
+
+    monkeypatch.setattr(honcho_client, "_refresh_cached_oauth", force_oauth_reset)
+
+    second = get_honcho_client(config)
+
+    assert second is not first
+    assert build_count["n"] == 2
 
 
 def test_missing_credentials_still_raises_before_build(monkeypatch):

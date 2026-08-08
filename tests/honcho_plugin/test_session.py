@@ -80,6 +80,27 @@ class TestSanitizeId:
         assert "!" not in result
 
 
+class TestClientRebuild:
+    def test_rebuilt_client_invalidates_sdk_object_caches(self):
+        old_client = MagicMock(name="old_client")
+        new_client = MagicMock(name="new_client")
+        new_peer = MagicMock(name="new_peer")
+        new_client.peer.return_value = new_peer
+        mgr = HonchoSessionManager(honcho=old_client)
+        mgr._peers_cache["user"] = MagicMock(name="stale_peer")
+        mgr._sessions_cache["session"] = MagicMock(name="stale_session")
+
+        with patch(
+            "plugins.memory.honcho.session.get_honcho_client",
+            return_value=new_client,
+        ):
+            peer = mgr._get_or_create_peer("user")
+
+        assert peer is new_peer
+        new_client.peer.assert_called_once_with("user")
+        assert mgr._sessions_cache == {}
+
+
 # ---------------------------------------------------------------------------
 # HonchoSessionManager._format_migration_transcript
 # ---------------------------------------------------------------------------

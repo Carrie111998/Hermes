@@ -93,6 +93,16 @@ def test_slot_caches_first_value():
     assert v1 == v2 == "first"
 
 
+def test_slot_reset_returns_detached_value():
+    slot: SingletonSlot = SingletonSlot()
+    value = object()
+    slot.get(lambda: value)
+
+    assert slot.reset() is value
+    assert slot.peek() is None
+    assert slot.reset() is None
+
+
 
 
 def test_slot_factory_exception_not_cached():

@@ -13,6 +13,9 @@ Resolution order for host-specific settings:
 
 from __future__ import annotations
 
+import atexit
+import asyncio
+import inspect
 import json
 import os
 import logging
@@ -26,7 +29,7 @@ from agent.secret_scope import get_secret
 from hermes_constants import get_hermes_home
 from hermes_cli.profiles import _get_default_hermes_home
 from plugins.plugin_utils import SingletonSlot
-from typing import Any, TYPE_CHECKING
+from typing import Any, Awaitable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -947,11 +950,12 @@ def _apply_fresh_oauth_token(config: HonchoClientConfig) -> None:
         logger.warning("Honcho OAuth pre-build refresh failed", exc_info=True)
 
 
-def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> None:
+def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -> bool:
     """Rotate the cached client's Bearer in place when its OAuth token is stale.
 
     If the SDK shape changed and the in-place rotation can't apply, the slot is
-    reset so the next acquisition rebuilds with the fresh token.
+    reset so the current acquisition rebuilds with the fresh token. Returns
+    whether the cached client was reset.
     """
     try:
         from plugins.memory.honcho import oauth
@@ -959,9 +963,11 @@ def _refresh_cached_oauth(client: "Honcho", config: HonchoClientConfig | None) -
         host = config.host if config is not None else resolve_active_host()
         token, refreshed = oauth.ensure_fresh_token(resolve_config_path(), host)
         if refreshed and token and not oauth.apply_token_to_client(client, token):
-            _honcho_client_slot.reset()
+            reset_honcho_client()
+            return True
     except Exception:
         logger.warning("Honcho OAuth cached refresh failed", exc_info=True)
+    return False
 
 
 def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
@@ -982,12 +988,13 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
         # built, rebuild with the new value.
         new_timeout = _resolve_timeout_from_sources(config)
         if new_timeout != _cached_timeout:
-            _honcho_client_slot.reset()
-            _cached_timeout = None
+            reset_honcho_client()
             cached = None
         else:
-            _refresh_cached_oauth(cached, config)
-            return cached
+            if _refresh_cached_oauth(cached, config):
+                cached = None
+            else:
+                return cached
 
     if config is None:
         config = HonchoClientConfig.from_global_config()
@@ -1105,9 +1112,71 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
     return _honcho_client_slot.get(_build)
 
 
+async def _await_async_close(close_result: Awaitable[Any]) -> None:
+    """Wrap a generic awaitable as the coroutine asyncio runners require."""
+    await close_result
+
+
+def _consume_async_close_result(task: "asyncio.Task[Any]") -> None:
+    """Observe a scheduled async close so cleanup failures are not orphaned."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.debug("Honcho async HTTP client close failed", exc_info=True)
+
+
+def _close_honcho_client(client: Any) -> None:
+    """Best-effort disposal for the sync and lazy async Honcho SDK pools.
+
+    Honcho SDK 2.x exposes ``close`` on its internal HTTP wrappers but not on
+    the top-level ``Honcho`` object. Keep this defensive so a future SDK shape
+    change cannot turn cache invalidation or interpreter shutdown into a crash.
+    """
+    sync_http = getattr(client, "_http", None)
+    sync_close = getattr(sync_http, "close", None)
+    if callable(sync_close):
+        try:
+            sync_close()
+        except Exception:
+            logger.debug("Honcho sync HTTP client close failed", exc_info=True)
+
+    async_http = getattr(client, "_async_http", None)
+    async_close = getattr(async_http, "close", None)
+    if not callable(async_close):
+        return
+
+    try:
+        close_result = async_close()
+    except Exception:
+        logger.debug("Honcho async HTTP client close failed", exc_info=True)
+        return
+    if not inspect.isawaitable(close_result):
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(_await_async_close(close_result))
+        except Exception:
+            logger.debug("Honcho async HTTP client close failed", exc_info=True)
+    else:
+        task = loop.create_task(_await_async_close(close_result))
+        task.add_done_callback(_consume_async_close_result)
+
+
 def reset_honcho_client() -> None:
-    """Reset the Honcho client singleton (useful for testing)."""
+    """Atomically reset and dispose of the process-wide Honcho client."""
     global _cached_timeout, _honcho_json_timeout_memo
-    _honcho_client_slot.reset()
+    client = _honcho_client_slot.reset()
     _cached_timeout = None
     _honcho_json_timeout_memo = (None, None)
+    if client is not None:
+        _close_honcho_client(client)
+
+
+# Session-level providers share this singleton, so they must not close it when
+# one conversation ends. Process exit is the safe common lifecycle boundary.
+atexit.register(reset_honcho_client)
