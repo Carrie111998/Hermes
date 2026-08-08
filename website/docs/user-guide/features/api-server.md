@@ -387,7 +387,7 @@ are high-volume UI noise; use the per-child live transcript files for
 play-by-play.
 
 When the run uses a mixture-of-agents preset, the stream also carries the MoA
-fan-out so a council run is not silent while the references work.
+fan-out so a MoA run is not silent while the references work.
 `moa.reference` fires once per reference model, before the aggregator acts, and
 carries `label` (the reference model slot), `text` (that reference's output —
 a reference that failed still emits a frame), and `index` / `count` (its
@@ -493,7 +493,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `moa.progress`, `moa.reference`, `moa.phase`, `moa.aggregating`, `run.completed` events |
 
 On a mixture-of-agents run this stream carries the same four fan-out events the
-`/v1/runs` stream does, so an external UI shows the council working instead of a
+`/v1/runs` stream does, so an external UI shows the fan-out working instead of a
 silent pause. `moa.progress` ticks as each reference completes, with `label` and
 `refs_done` / `refs_total`; `moa.reference` fires once per reference model
 attempted, with `label`, `text`, `index` and `count`; `moa.phase` marks the

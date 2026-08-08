@@ -820,7 +820,7 @@ class TestChatCompletionsEndpoint:
 
         ``build_moa_facade`` (``agent/moa_loop.py``) relays all four MoA events
         onto ``tool_progress_callback``. The session stream used to match only
-        ``reasoning.available`` and the ``tool.*`` family, so a council run went
+        ``reasoning.available`` and the ``tool.*`` family, so a MoA run went
         silent between ``message.started`` and ``run.completed``. Assert on the
         serialized SSE frames — a mock-level check would pass even if nothing
         were written to the wire.
@@ -858,7 +858,7 @@ class TestChatCompletionsEndpoint:
             ):
                 resp = await cli.post(
                     "/api/sessions/s1/chat/stream",
-                    json={"message": "ask the council"},
+                    json={"message": "run this through the preset"},
                 )
                 assert resp.status == 200
                 body = await resp.text()
