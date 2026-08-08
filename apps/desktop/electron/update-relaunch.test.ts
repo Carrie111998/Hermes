@@ -177,7 +177,7 @@ test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-
     HERMES_DESKTOP_APP_NAME: 'HermesSandbox',
     ELECTRON_DISABLE_SANDBOX: '1'
   })
-  assert.equal(collectRelaunchEnv(env).HERMES_DESKTOP_REMOTE_TOKEN, undefined)
+  assert.equal('HERMES_DESKTOP_REMOTE_TOKEN' in collectRelaunchEnv(env), false)
   assert.deepEqual(collectRelaunchEnv(null), {})
 })
 
