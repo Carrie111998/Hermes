@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextlib
 import contextvars
 import json
 import logging
@@ -2345,8 +2346,18 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent.session_write_policy import (
+                SessionWritePolicy,
+                session_write_policy_scope,
+            )
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            child_policy = getattr(child, "session_write_policy", None)
+            policy_scope = (
+                session_write_policy_scope(child_policy)
+                if isinstance(child_policy, SessionWritePolicy)
+                else contextlib.nullcontext()
+            )
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")), policy_scope:
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
