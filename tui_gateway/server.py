@@ -1348,6 +1348,34 @@ def _db_for_profile(profile: str | None = None):
         return None, False
 
 
+def _transfer_db_to_agent(agent, db) -> bool:
+    """Hand a DEDICATED profile handle to *agent*, which closes it on teardown.
+
+    The build sites open a per-profile ``state.db`` handle, pass it to
+    ``_make_agent``, and own it until the built agent is the one that will be
+    torn down. This marks that transfer: from here ``AIAgent.close()`` (reached
+    via :func:`_teardown_session`) releases the handle, so the caller must stop
+    closing it.
+
+    Returns True only when the transfer actually happened. It is refused when
+    *agent* is not holding *this* handle — the build failed before
+    ``_make_agent``, or the agent was given a different db — because a False
+    return is what tells the caller the handle is still its own to close.
+    Never called for the shared launch handle: that one is opened by
+    ``_get_db()``, outlives every agent, and stays at ``_owns_session_db``
+    False.
+    """
+    if agent is None or db is None:
+        return False
+    try:
+        if getattr(agent, "_session_db", None) is not db:
+            return False
+        agent._owns_session_db = True
+        return True
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _profile_db(params: dict | None = None):
     """Yield the SessionDB for ``params['profile']`` (app-global remote mode).
@@ -2139,6 +2167,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        session_db = None
+        owns_db = False
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -2157,7 +2187,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from hermes_state import SessionDB
 
+                    # DEDICATED handle — ours until _transfer_db_to_agent hands
+                    # it to the built agent in the finally below. Every path
+                    # that leaves this build without that transfer (the except
+                    # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    owns_db = True
                 except Exception:
                     session_db = None
 
@@ -2293,6 +2328,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            # Dedicated profile handle: hand it to the agent that will actually
+            # be torn down, or close it here when no such agent exists. Both
+            # non-transfer cases are real: the except above (build raised, so
+            # nothing holds the handle) and `replaced` (the session was reaped
+            # mid-build, so this agent is discarded and _teardown_session will
+            # never reach it). Transferring to a discarded agent would leak the
+            # handle exactly as before.
+            if owns_db and session_db is not None:
+                built = None if replaced else current.get("agent")
+                if not _transfer_db_to_agent(built, session_db):
+                    with contextlib.suppress(Exception):
+                        session_db.close()
             ready.set()
 
     build_thread = threading.Thread(target=_build, daemon=True)
@@ -2392,6 +2439,8 @@ def _terminal_task_cwd(session: dict | None) -> str:
                 raw = ""
         if raw and raw not in {".", "auto", "cwd"}:
             return raw
+        if backend == "ssh":
+            return "~"
 
     return _session_cwd(session)
 
@@ -2476,6 +2525,27 @@ def _heal_dead_cwd(cwd: str) -> str:
 def _is_local_terminal_backend() -> bool:
     backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
     return not backend or backend == "local"
+
+
+def _effective_terminal_backend() -> str:
+    """Active terminal backend name (``local``, ``docker``, ``ssh``, ...).
+
+    ``TERMINAL_ENV`` is authoritative when set (launchers bridge
+    ``terminal.backend`` into env at startup). Desktop/TUI in-process gateways
+    skip that bridge, so fall back to the ``terminal.backend`` config key —
+    the same rule ``_terminal_task_cwd`` uses.
+    """
+    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    if not backend or backend == "local":
+        try:
+            terminal_cfg = _load_cfg().get("terminal", {})
+            if isinstance(terminal_cfg, dict):
+                cfg_backend = str(terminal_cfg.get("backend") or "").strip().lower()
+                if cfg_backend and cfg_backend != "local":
+                    backend = cfg_backend
+        except Exception:
+            pass
+    return backend or "local"
 
 
 def _display_session_cwd(session: dict | None) -> str:
@@ -3170,6 +3240,7 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         "clarify.request",
         "terminal.read.request",
         "preview.read.request",
+        "window.read.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -4086,7 +4157,29 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _load_enabled_toolsets() -> list[str] | None:
+def _gui_surface_toolsets(platform: str) -> set[str]:
+    """Toolsets that exist because of the CLIENT on the other end, not the host.
+
+    Both entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
+    platform would carry their schema for nothing — so this resolver is the one
+    gate that exposes them.
+
+    ``platform`` is the SESSION's source (``session.create``'s ``source``
+    field), never a process env var. The desktop app is a client: it can be
+    driving a local, SSH, URL, or cloud backend, and only the local/SSH spawn
+    paths run with ``HERMES_DESKTOP=1``. Keying GUI capability off that env var
+    silently stripped every pane/browser tool from URL and cloud gateways while
+    the same backend told the model it was "chatting inside the Hermes desktop
+    app". See the surface-capability rule in AGENTS.md.
+    """
+    surfaces = {"project"}
+    if platform == "desktop":
+        surfaces.add("desktop_ui")
+    return surfaces
+
+
+def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+    session_platform = platform or _resolve_session_platform()
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -4105,13 +4198,13 @@ def _load_enabled_toolsets() -> list[str] | None:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=_resolve_session_platform())
+            selection = coding_selection(platform=session_platform)
             if selection is not None:
-                # Fold in `project` here too: this is a GUI-only resolver, and
-                # the focus-mode coding posture returns before the fallback path
-                # that normally adds it — without this the desktop loses the
-                # project tools exactly when sitting in a repo (see below).
-                return sorted({*selection, "project"})
+                # Fold in the client-surface toolsets here too: the focus-mode
+                # coding posture returns before the fallback path that normally
+                # adds them — without this the desktop loses its pane/project
+                # tools exactly when sitting in a repo (see below).
+                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
         except Exception:
             pass
 
@@ -4222,13 +4315,13 @@ def _load_enabled_toolsets() -> list[str] | None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
             return None
-        # The desktop Project tools are off _HERMES_CORE_TOOLS (every other
+        # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
         # platform would carry their schema for nothing), so the platform
         # recovery above — which keys off hermes-cli's tool universe — can't
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
-        # folding in the `project` toolset here is the gate that exposes them on
-        # exactly the surface that can follow a project move.
-        return sorted(enabled | {"project"})
+        # folding them in here is the gate that exposes them on exactly the
+        # surface that can answer them.
+        return sorted(enabled | _gui_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -5100,6 +5193,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
+        "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
@@ -5716,6 +5810,16 @@ def _agent_cbs(sid: str) -> dict:
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=45,
         ),
+        # read_window_below tool (desktop GUI): the renderer asks its main
+        # process (which owns native window enumeration) which OS window sits
+        # directly underneath the Hermes window, and answers
+        # window.read.respond with the serialized metadata.
+        "read_window_below_callback": lambda: _block(
+            "window.read.request",
+            sid,
+            {},
+            timeout=30,
+        ),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted
@@ -5990,7 +6094,11 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        # Detached background tasks declare platform="tui" below: they have no
+        # UI session id, so a renderer-routed event has nowhere to land. Resolve
+        # their toolsets against that same platform rather than the gateway
+        # process's, so they never carry GUI schema they cannot use.
+        or _load_enabled_toolsets("tui"),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -6485,7 +6593,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -7657,6 +7765,22 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     _emit("message.complete", sid, payload)
 
 
+def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
+    """Keep a failed turn's working transcript in the gateway session.
+
+    ``AIAgent`` persists its working messages independently of the gateway's
+    history snapshot. If the turn raises after that persistence, the next
+    prompt must see the working transcript instead of the pre-turn snapshot.
+    """
+    agent_messages = getattr(agent, "_session_messages", None)
+    if not isinstance(agent_messages, list):
+        return False
+    with session["history_lock"]:
+        session["history"] = list(agent_messages)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    return True
+
+
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -7879,9 +8003,17 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
-    cwd = _default_session_cwd()
+    # The SESSION's own workspace, not the gateway's launch directory. Reporting
+    # `_default_session_cwd()` here told a lazily-resumed session's client that
+    # its workspace was wherever the gateway process happened to start, so the
+    # desktop Files pane painted the wrong project even after the renderer
+    # rebound correctly (#71254). `branch` is always emitted ("" outside a git
+    # repo) so a client can clear a stale label instead of retaining it — the
+    # same contract `_lazy_session_info` above already follows.
+    cwd = _session_cwd(session)
     return {
         "cwd": cwd,
+        "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),
@@ -10065,6 +10197,12 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            # The agent persists its working transcript on normal finalization,
+            # but an exception in that finalizer can otherwise leave the
+            # gateway's separate in-memory history at the turn-start snapshot.
+            # Keep the partial turn available to the next prompt; the durable
+            # inflight record still carries the recoverable error state.
+            _restore_agent_history_after_turn_error(session, agent)
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -10387,7 +10525,19 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
 
 
 def _desktop_attachment_dir(session: dict) -> Path:
-    root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
+    """Resolve the file-attachment staging dir against the session's effective home.
+
+    Anchored on the session profile's ``attachments/`` dir (same rule as
+    ``_session_images_dir``): ``file.attach`` runs BEFORE ``prompt.submit``
+    installs the session's profile HERMES_HOME override, while the docker/ssh
+    sandbox mounts are resolved against the *session profile's* home at run
+    time — so the staged file must land where the bind mount points, or the
+    container can never see it (#76577). ``attachments/`` is registered in
+    ``tools.credential_files._CACHE_DIRS`` and auto-mounted into containers.
+    """
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else _hermes_home
+    root = base / "attachments"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -10467,10 +10617,11 @@ def _stage_session_file_attachment(
       1. The path resolves to a file already INSIDE the session workspace — use
          it as-is (no copy, ``uploaded=False``).
       2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into ``.hermes/desktop-attachments/`` so the ``@file:`` ref resolves.
+         it into the session home's ``attachments/`` dir (bind-mounted into
+         container backends) so the ``@file:`` ref resolves inside the sandbox.
       3. The path doesn't exist on the gateway (the common remote case: it's a
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into ``.hermes/desktop-attachments/``.
+         write them into the session home's ``attachments/`` dir.
 
     Returns ``(stored_path, uploaded)``.
     """
@@ -11870,6 +12021,7 @@ def _rank_slash_completions(
     origin_of,
     *,
     browsing: bool,
+    score_of=None,
 ) -> list[dict]:
     """Rank and bound slash completions the way the menu should read.
 
@@ -11878,6 +12030,12 @@ def _rank_slash_completions(
     block is reordered, most-used first and A-Z within a tie, so the handful
     of skills someone invokes daily lead the ones that shipped with Hermes
     and were never opened.
+
+    ``score_of`` (optional) is the fuzzy-match scorer from
+    :func:`tui_gateway.slash_fuzzy.fuzzy_rank_slash_items` — when a typed
+    query produced scores, they lead the skill sort so a name match beats a
+    description match before usage breaks ties. Commands arrive already
+    score-sorted and keep their order either way.
 
     The limit is spent PER KIND rather than on one flat truncation. A flat
     cut is positional, not editorial: the completer emits every registry
@@ -11905,7 +12063,12 @@ def _rank_slash_completions(
             if origin_of(name_of(item)) != "bundled" or usage(name_of(item)) > 0
         ]
 
-    skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
+    if score_of is not None:
+        skills.sort(
+            key=lambda item: (score_of(item), -usage(name_of(item)), name_of(item))
+        )
+    else:
+        skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
 
     return commands[:_SLASH_COMPLETION_LIMIT] + skills[:_SLASH_COMPLETION_LIMIT]
 
