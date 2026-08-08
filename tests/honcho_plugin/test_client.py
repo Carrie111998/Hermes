@@ -328,6 +328,7 @@ class TestGetHonchoClient:
         assert client3 is fake_honcho_2  # rebuilt
         mock_h3.assert_called_once()
         assert mock_h3.call_args.kwargs["timeout"] == 300.0
+        fake_honcho_1._http.close.assert_called_once_with()
 
     @pytest.mark.skipif(
         not importlib.util.find_spec("honcho"),

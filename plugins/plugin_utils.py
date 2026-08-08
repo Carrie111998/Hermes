@@ -128,8 +128,15 @@ class SingletonSlot(Generic[T]):
         """Return the cached instance without building it (None if unset)."""
         return self._value if self._set else None
 
-    def reset(self) -> None:
-        """Drop the cached instance so the next ``get()`` rebuilds it."""
+    def reset(self) -> Optional[T]:
+        """Atomically detach and return the cached instance, if any.
+
+        Returning the old value lets callers release resources after the slot
+        is clear without racing a concurrent ``get()``. Existing callers that
+        only need to invalidate the cache may continue to ignore the result.
+        """
         with self._lock:
+            value = self._value if self._set else None
             self._value = None
             self._set = False
+            return value

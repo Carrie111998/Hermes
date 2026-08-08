@@ -158,8 +158,17 @@ class HonchoSessionManager:
         Routes every access through ``get_honcho_client`` (which returns the same
         cached singleton) so a long session can't outlive its 1h access token.
         """
-        self._honcho = get_honcho_client()
-        return self._honcho
+        client = get_honcho_client()
+        if client is not self._honcho:
+            # SDK Peer/Session objects retain their parent Honcho client. A
+            # timeout or OAuth rebuild disposes that client's HTTP pools, so
+            # cached SDK objects must be recreated against the replacement.
+            with self._cache_lock:
+                if client is not self._honcho:
+                    self._peers_cache.clear()
+                    self._sessions_cache.clear()
+                    self._honcho = client
+        return client
 
     def _get_or_create_peer(self, peer_id: str) -> Any:
         """
@@ -168,11 +177,12 @@ class HonchoSessionManager:
         Peers are lazy -- no API call until first use.
         Observation settings are controlled per-session via SessionPeerConfig.
         """
+        client = self.honcho
         with self._cache_lock:
             if peer_id in self._peers_cache:
                 return self._peers_cache[peer_id]
 
-        peer = self.honcho.peer(peer_id)
+        peer = client.peer(peer_id)
         with self._cache_lock:
             self._peers_cache[peer_id] = peer
         return peer
@@ -186,12 +196,13 @@ class HonchoSessionManager:
         Returns:
             Tuple of (honcho_session, existing_messages).
         """
+        client = self.honcho
         with self._cache_lock:
             if session_id in self._sessions_cache:
                 logger.debug("Honcho session '%s' retrieved from cache", session_id)
                 return self._sessions_cache[session_id], []
 
-        session = self.honcho.session(session_id)
+        session = client.session(session_id)
 
         # Configure per-peer observation from granular booleans.
         # These map 1:1 to Honcho's SessionPeerConfig toggles.
