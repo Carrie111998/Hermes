@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { $connection } from '@/store/session'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
 
-import { artifactImageSrc, collectArtifactsForSession } from './artifact-utils'
+import { artifactImageSrc, collectArtifactsForSession, isEditableTextArtifact } from './artifact-utils'
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -83,9 +83,30 @@ describe('collectArtifactsForSession', () => {
     const downloadHref = `https://gw/api/files/download?path=${encodeURIComponent(path)}&token=secret`
 
     await expect(artifactImageSrc(path, downloadHref)).resolves.toBe('data:image/jpeg;base64,cmVtb3Rl')
-
     expect(api).toHaveBeenCalledWith({
       path: '/api/fs/read-data-url?path=%2FUsers%2Fme%2F.hermes%2Fskills%2Fwork-esab%2Freferences%2Fimages%2Fmanual-step03.jpeg'
     })
   })
 })
+
+  describe('isEditableTextArtifact', () => {
+    it('is true for a .md file artifact', () => {
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/docs/plan.md' })).toBe(true)
+    })
+
+    it('is true for other text extensions', () => {
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/src/main.py' })).toBe(true)
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/config.json' })).toBe(true)
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/notes.txt' })).toBe(true)
+    })
+
+    it('is false for a file artifact with a non-text extension', () => {
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/bundle.zip' })).toBe(false)
+      expect(isEditableTextArtifact({ kind: 'file', value: '/repo/doc.pdf' })).toBe(false)
+    })
+
+    it('is false for non-file artifacts regardless of value', () => {
+      expect(isEditableTextArtifact({ kind: 'link', value: 'https://example.com/a.md' })).toBe(false)
+      expect(isEditableTextArtifact({ kind: 'image', value: '/repo/photo.jpeg' })).toBe(false)
+    })
+  })

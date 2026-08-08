@@ -24,6 +24,17 @@ const PATH_RE = /(^|[\s("'`])((?:\/|~\/|\.\.?\/)[^\s"'`<>]+(?:\.[a-z0-9]{1,8})?)
 const IMAGE_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp)(?:\?.*)?$/i
 const FILE_EXT_RE = /\.(?:png|jpe?g|gif|webp|svg|bmp|pdf|txt|json|md|csv|zip|tar|gz|mp3|wav|mp4|mov)(?:\?.*)?$/i
 const KEY_HINT_RE = /(path|file|url|image|artifact|output|download|result|target)/i
+// Text file extensions that open in the in-app editor (LocalFilePreview) when
+// clicked from the Artifacts tab — including on a remote gateway, where they
+// are fetched over /api/fs/read-text instead of downloaded to the local disk.
+const TEXT_EDIT_EXT_RE = /\.(?:txt|text|md|markdown|json|json5|jsonc|yaml|yml|toml|ini|cfg|conf|env|log|csv|tsv|py|pyw|js|cjs|mjs|jsx|ts|tsx|sh|bash|zsh|fish|rb|php|go|rs|java|kt|c|h|cpp|hpp|cc|cs|swift|sql|html|htm|xml|css|scss|sass|less|svg|lua|pl|r|scala|groovy|gradle|lock|gitignore|editorconfig|babelrc|eslintrc|prettierrc|gitattributes)(?:\?.*)?$/i
+
+// Whether an artifact record resolves to a text file the in-app editor can
+// open (view/read/edit). Pure extension/kind check — the actual read may still
+// be binary/large, which LocalFilePreview guards at load time.
+export function isEditableTextArtifact(artifact: Pick<ArtifactRecord, 'kind' | 'value'>): boolean {
+  return artifact.kind === 'file' && TEXT_EDIT_EXT_RE.test(artifact.value)
+}
 
 function artifactSessionTitle(session: SessionInfo): string {
   return session.title?.trim() || session.preview?.trim() || 'Untitled session'
