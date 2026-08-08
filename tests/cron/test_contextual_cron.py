@@ -888,7 +888,7 @@ def test_legacy_isolated_update_keeps_contextual_fields_absent_on_disk(
     )
 
     jobs.update_job("legacy-update", {"name": "still isolated"})
-    raw = json.loads(jobs.JOBS_FILE.read_text())["jobs"][0]
+    raw = json.loads(jobs.JOBS_FILE.read_text(encoding="utf-8"))["jobs"][0]
 
     assert raw["name"] == "still isolated"
     assert "session_target" not in raw
@@ -1041,7 +1041,7 @@ def test_new_isolated_job_omits_contextual_fields_on_disk(monkeypatch, tmp_path)
     jobs = _point_store(monkeypatch, tmp_path)
     created = jobs.create_job(prompt="standalone", schedule="every 1h")
 
-    raw = json.loads(jobs.JOBS_FILE.read_text())["jobs"][0]
+    raw = json.loads(jobs.JOBS_FILE.read_text(encoding="utf-8"))["jobs"][0]
     assert raw["id"] == created["id"]
     assert "session_target" not in raw
     assert "session_key" not in raw

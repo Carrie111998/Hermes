@@ -5742,7 +5742,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     )
     assert resp_on["result"]["value"] == "1"
     assert resp_on["result"]["scope"] == "global"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
     resp_off = server.handle_request(
         {
@@ -5752,7 +5752,7 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
         }
     )
     assert resp_off["result"]["value"] == "0"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "manual"
 
 
 def test_config_get_approval_mode_uses_smart_default_when_key_is_missing(
@@ -5839,7 +5839,7 @@ def test_config_set_approval_mode_persists_three_way_value_and_emits_live_status
         server._sessions.clear()
 
     assert resp["result"] == {"key": "approvals.mode", "value": "manual"}
-    assert yaml.safe_load((tmp_path / "config.yaml").read_text())["approvals"]["mode"] == "manual"
+    assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["approvals"]["mode"] == "manual"
     assert emitted and emitted[0][0:2] == ("session.info", "sid")
     assert emitted[0][2]["approval_mode"] == "manual"
 
@@ -5878,7 +5878,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
     # Setting it on again is idempotent — stays off.
     resp_again = server.handle_request(
@@ -5889,7 +5889,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
         }
     )
     assert resp_again["result"]["value"] == "1"
-    assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
+    assert yaml.safe_load(cfg_path.read_text(encoding="utf-8"))["approvals"]["mode"] == "off"
 
 
 def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):

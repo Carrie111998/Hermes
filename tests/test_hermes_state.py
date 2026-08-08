@@ -2653,7 +2653,9 @@ class TestAutoMaintenance:
         (sessions_dir / "request_dump_old1_001.json").write_text(
             "{}", encoding="utf-8"
         )
-        (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
+        (sessions_dir / "new.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )  # active, must survive
 
         result = db.maybe_auto_prune_and_vacuum(
             retention_days=90, sessions_dir=sessions_dir

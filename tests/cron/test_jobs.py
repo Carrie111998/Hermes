@@ -1017,7 +1017,7 @@ class TestSaveJobOutput:
     def test_creates_output_file(self, tmp_cron_dir):
         output_file = save_job_output("test123", "# Results\nEverything ok.")
         assert output_file.exists()
-        assert output_file.read_text() == "# Results\nEverything ok."
+        assert output_file.read_text(encoding="utf-8") == "# Results\nEverything ok."
         assert "test123" in str(output_file)
 
 
