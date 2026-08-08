@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_sensitive_text, redact_terminal_output
 from hermes_constants import get_hermes_home
 
 
@@ -337,8 +337,16 @@ def _find_ad_hoc_match(command: str, root: str | Path | None) -> Optional[list[s
     return None
 
 
-def _summarize_output(output: str) -> str:
-    text = (output or "").strip()
+def _summarize_output(output: str, command: str | None = None) -> str:
+    # Redact BEFORE truncating: a secret sitting across the head/tail split
+    # (or inside the omitted middle) needs the full text for pattern context,
+    # and running redaction on an already-truncated string can mask a secret
+    # only partially. force=True — this durably persists to
+    # verification_evidence.db and is served verbatim by the
+    # verification.status gateway RPC to TUI/desktop clients, the same
+    # persist-and-serve boundary record_terminal_result's command field is
+    # redacted for (see its own construction site below).
+    text = redact_terminal_output(output or "", command, force=True).strip()
     if len(text) <= _MAX_OUTPUT_SUMMARY_CHARS:
         return text
     head = _MAX_OUTPUT_SUMMARY_CHARS // 3
@@ -461,7 +469,7 @@ def classify_verification_command(
         cwd=str(Path(cwd or ".").resolve()),
         root=str(facts.get("root") or Path(cwd or ".").resolve()),
         session_id=str(session_id or "default"),
-        output_summary=_summarize_output(output),
+        output_summary=_summarize_output(output, command),
     )
 
 
@@ -527,7 +535,7 @@ def record_verify_run(
         cwd=resolved,
         root=str((facts or {}).get("root") or resolved),
         session_id=str(session_id or "default"),
-        output_summary=_summarize_output(output),
+        output_summary=_summarize_output(output, command),
     )
     return _insert_evidence(evidence)
 
