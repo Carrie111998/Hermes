@@ -1487,6 +1487,59 @@ def test_v2_delivery_recovery_rejects_incomplete_creator_authority(monkeypatch):
     ]
 
 
+def test_v2_delivery_recovery_passes_sealed_route_authority_to_gateway(monkeypatch):
+    import json
+
+    import cron.scheduler as scheduler
+
+    seen = []
+    monkeypatch.setattr(
+        scheduler,
+        "_CONTEXTUAL_AUTHORIZER",
+        lambda target: seen.append(target) or False,
+    )
+    monkeypatch.setattr(
+        scheduler, "suppress_contextual_delivery", lambda *_a, **_k: {}
+    )
+    monkeypatch.setattr(
+        scheduler, "_account_contextual_job_run", lambda **_k: True
+    )
+
+    assert scheduler._resume_contextual_delivery_record(
+        {"id": "job"},
+        {
+            "id": "execution",
+            "session_key": "telegram:dm:42",
+            "admitted_binding_version": 2,
+            "admitted_route_instance_id": "route-instance-a",
+            "admitted_session_id": "session-a",
+            "admitted_routing_revision": 7,
+            "result_json": json.dumps({"final_response": "notify"}),
+            "delivery_target_json": json.dumps(
+                {
+                    "id": "job",
+                    "deliver": "origin",
+                    "origin": {
+                        "platform": "telegram",
+                        "chat_type": "dm",
+                        "chat_id": "42",
+                        "user_id": "42",
+                    },
+                }
+            ),
+        },
+    ) is False
+
+    assert seen[0]["_contextual_authority"] == {
+        "execution_id": "execution",
+        "session_key": "telegram:dm:42",
+        "binding_version": 2,
+        "route_instance_id": "route-instance-a",
+        "session_id": "session-a",
+        "routing_revision": 7,
+    }
+
+
 def test_contextual_delivery_exception_is_persisted_unknown_without_retry(monkeypatch):
     import cron.scheduler as scheduler
     from gateway.contextual_cron import ContextualCronOutcome

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from dataclasses import replace
 import inspect
 import logging
+import threading
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -13,8 +14,84 @@ from gateway.contextual_cron import (
     ContextualCronGateway,
     ContextualCronOutcome,
 )
-from gateway.session import Platform, SessionEntry, SessionSource
+from gateway.session import Platform, SessionEntry, SessionSource, SessionStore
 from gateway.run import GatewayRunner, TurnRunner
+
+
+def test_delivery_authorizer_rejects_a_deleted_sealed_route():
+    runner = object.__new__(GatewayRunner)
+    cast(Any, runner).session_store = SimpleNamespace(
+        peek_session_entry=lambda _key: None
+    )
+    cast(Any, runner)._is_user_authorized = lambda source: True
+
+    assert runner._authorize_contextual_delivery_from_scheduler(
+        {
+            "origin": {
+                "platform": "telegram",
+                "chat_type": "dm",
+                "chat_id": "42",
+                "user_id": "42",
+            },
+            "_contextual_authority": {
+                "execution_id": "execution",
+                "session_key": "telegram:dm:42",
+                "binding_version": 2,
+                "route_instance_id": "route-instance-a",
+                "session_id": "session-a",
+                "routing_revision": 7,
+            },
+        }
+    ) is False
+
+
+def test_delivery_authority_claim_is_linearized_with_the_route():
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        chat_id="42",
+        user_id="42",
+    )
+    now = datetime.now(timezone.utc)
+    entry = SessionEntry(
+        session_key="telegram:dm:42",
+        session_id="session-a",
+        route_instance_id="route-instance-a",
+        routing_revision=7,
+        created_at=now,
+        updated_at=now,
+        origin=source,
+    )
+    store = object.__new__(SessionStore)
+    cast(Any, store)._lock = threading.RLock()
+    cast(Any, store)._entries = {entry.session_key: entry}
+    cast(Any, store)._ensure_loaded_locked = lambda: None
+    events = []
+
+    assert store.claim_contextual_delivery_authority(
+        entry.session_key,
+        source=source,
+        binding_version=2,
+        expected_route_instance_id=entry.route_instance_id,
+        expected_session_id=entry.session_id,
+        expected_routing_revision=entry.routing_revision,
+        authorize=lambda: events.append("authorized") or True,
+        claim=lambda: events.append("claimed") or True,
+    ) == (True, True)
+    assert events == ["authorized", "claimed"]
+
+    events.clear()
+    assert store.claim_contextual_delivery_authority(
+        entry.session_key,
+        source=source,
+        binding_version=2,
+        expected_route_instance_id="recreated-route",
+        expected_session_id=entry.session_id,
+        expected_routing_revision=entry.routing_revision,
+        authorize=lambda: events.append("authorized") or True,
+        claim=lambda: events.append("claimed") or True,
+    ) == (False, False)
+    assert events == []
 
 
 class _LiveStore:

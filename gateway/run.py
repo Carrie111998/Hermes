@@ -16774,17 +16774,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _authorize_contextual_delivery_from_scheduler(self, target) -> bool:
-        """Reconstruct and reauthorize the immutable delivery principal."""
+        """Reauthorize and claim delivery under the live routing fence."""
         from gateway.session import SessionSource
 
         origin = target.get("origin") if isinstance(target, dict) else None
-        if not isinstance(origin, dict):
+        authority = (
+            target.get("_contextual_authority")
+            if isinstance(target, dict)
+            else None
+        )
+        if not isinstance(origin, dict) or not isinstance(authority, dict):
             return False
         try:
             source = SessionSource.from_dict(origin)
+            execution_id = str(authority.get("execution_id") or "").strip()
+            session_key = str(authority.get("session_key") or "").strip()
+            binding_version = int(authority.get("binding_version") or 0)
+            route_instance_id = str(
+                authority.get("route_instance_id") or ""
+            ).strip()
+            session_id = str(authority.get("session_id") or "").strip()
+            routing_revision = int(authority.get("routing_revision") or 0)
         except (KeyError, TypeError, ValueError):
             return False
-        return bool(self._is_user_authorized(source))
+        if (
+            not execution_id
+            or not session_key
+            or binding_version not in (1, 2)
+            or not session_id
+            or (binding_version == 2 and not route_instance_id)
+        ):
+            return False
+        claim_authority = getattr(
+            self.session_store, "claim_contextual_delivery_authority", None
+        )
+        if not callable(claim_authority):
+            return False
+
+        from cron.executions import claim_contextual_delivery
+
+        authorization_result = claim_authority(
+            session_key,
+            source=source,
+            binding_version=binding_version,
+            expected_route_instance_id=(route_instance_id or None),
+            expected_session_id=session_id,
+            expected_routing_revision=routing_revision,
+            authorize=lambda: bool(self._is_user_authorized(source)),
+            claim=lambda: claim_contextual_delivery(execution_id) is not None,
+        )
+        if (
+            not isinstance(authorization_result, tuple)
+            or len(authorization_result) != 2
+        ):
+            return False
+        authorized, claimed = authorization_result
+        if claimed:
+            target["_contextual_delivery_claimed"] = True
+        return bool(authorized)
 
     async def _write_or_stage_transcript_entry(
         self,

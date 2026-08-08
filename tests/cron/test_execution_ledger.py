@@ -22,6 +22,18 @@ def _point_ledger(monkeypatch, tmp_path):
     return executions
 
 
+def test_owner_liveness_fails_safe_when_start_time_is_unavailable(monkeypatch):
+    """A live PID with unprovable birth time must never be recovered as dead."""
+    import cron.executions as executions
+    import gateway.status as status
+
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: None)
+
+    assert executions._owner_is_live(424242, None) is True
+    assert executions._owner_is_live(424242, 123456) is True
+
+
 def test_schema_v8_migrates_every_legacy_version_without_pending_side_effects(
     monkeypatch, tmp_path
 ):

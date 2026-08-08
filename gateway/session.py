@@ -3596,6 +3596,46 @@ class SessionStore:
                 return None
             origin = replace(entry.origin)
             return replace(entry, origin=origin, metadata=dict(entry.metadata))
+
+    def claim_contextual_delivery_authority(
+        self,
+        session_key: str,
+        *,
+        source: SessionSource,
+        binding_version: int,
+        expected_route_instance_id: Optional[str],
+        expected_session_id: str,
+        expected_routing_revision: int,
+        authorize: Callable[[], bool],
+        claim: Callable[[], bool],
+    ) -> tuple[bool, bool]:
+        """Linearize destination authorization and the durable send claim.
+
+        Route deletion/reset/rebind takes the same lock, so a successful claim
+        is ordered before any later mutation. The transport may run after the
+        lock is released without reopening a check-then-send race.
+        """
+        if not session_key or binding_version not in (1, 2):
+            return False, False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.origin is None:
+                return False, False
+            if not _same_route_identity(entry.origin, source):
+                return False, False
+            if entry.session_id != expected_session_id:
+                return False, False
+            if int(entry.routing_revision) != int(expected_routing_revision):
+                return False, False
+            if (
+                binding_version == 2
+                and entry.route_instance_id != expected_route_instance_id
+            ):
+                return False, False
+            if not authorize():
+                return False, False
+            return True, bool(claim())
     
     def append_to_transcript(self, session_id: str, message: Dict[str, Any], skip_db: bool = False) -> None:
         """Serialize transcript draining across queue migration boundaries."""

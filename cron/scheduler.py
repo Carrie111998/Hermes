@@ -4695,6 +4695,20 @@ def _account_contextual_job_run(
         return False
 
 
+def _contextual_authorization_target(delivery_job: dict, record: dict) -> dict:
+    """Attach sealed admission authority for the gateway-only auth callback."""
+    target = dict(delivery_job)
+    target["_contextual_authority"] = {
+        "execution_id": str(record.get("id") or ""),
+        "session_key": str(record.get("session_key") or ""),
+        "binding_version": record.get("admitted_binding_version"),
+        "route_instance_id": str(record.get("admitted_route_instance_id") or ""),
+        "session_id": str(record.get("admitted_session_id") or ""),
+        "routing_revision": record.get("admitted_routing_revision"),
+    }
+    return target
+
+
 def _resume_contextual_delivery_record(
     job: dict,
     record: dict,
@@ -4757,9 +4771,12 @@ def _resume_contextual_delivery_record(
             )
             return False
     authorizer = get_contextual_authorizer()
+    authorization_target = _contextual_authorization_target(
+        immutable_delivery_job, record
+    )
     try:
         authorized = bool(
-            callable(authorizer) and authorizer(immutable_delivery_job)
+            callable(authorizer) and authorizer(authorization_target)
         )
     except Exception as auth_exc:
         authorized = False
@@ -4779,7 +4796,10 @@ def _resume_contextual_delivery_record(
             delivery_error=authorization_error,
         )
         return False
-    if claim_contextual_delivery(execution_id) is None:
+    delivery_claimed = bool(
+        authorization_target.get("_contextual_delivery_claimed")
+    )
+    if not delivery_claimed and claim_contextual_delivery(execution_id) is None:
         return False
     try:
         try:
@@ -5198,6 +5218,7 @@ def run_one_job(
         # claim. The live gateway normally writes this immediately before
         # resolving its future; this idempotent scheduler acknowledgement also
         # covers injected providers/test lanes.
+        persisted_contextual = None
         if contextual_outcome is not None:
             persisted_contextual = persist_contextual_agent_result(
                 execution_id,
@@ -5288,10 +5309,14 @@ def run_one_job(
             if contextual_kind == "notify":
                 authorizer = get_contextual_authorizer()
                 authorization_error = None
+                authorization_record = persisted_contextual or {}
+                authorization_target = _contextual_authorization_target(
+                    contextual_delivery_job or {}, authorization_record
+                )
                 try:
                     authorized = bool(
                         callable(authorizer)
-                        and authorizer(contextual_delivery_job or {})
+                        and authorizer(authorization_target)
                     )
                 except Exception as auth_exc:
                     authorized = False
@@ -5308,9 +5333,9 @@ def run_one_job(
                     error = authorization_error
                     delivery_error = authorization_error
                 else:
-                    contextual_delivery_claimed = (
-                        claim_contextual_delivery(execution_id) is not None
-                    )
+                    contextual_delivery_claimed = bool(
+                        authorization_target.get("_contextual_delivery_claimed")
+                    ) or (claim_contextual_delivery(execution_id) is not None)
                     if not contextual_delivery_claimed:
                         # A concurrent/replayed scheduler does not own delivery.
                         should_deliver = False

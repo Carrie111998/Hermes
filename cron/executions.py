@@ -224,9 +224,14 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        # The PID exists, but the durable owner fingerprint was unavailable.
+        # Treat that ambiguity as live; recovery may rewrite state only after
+        # proving owner death or PID reuse.
+        return True
     current = _process_start_time(pid)
-    return current is not None and current == started_at
+    if current is None:
+        return True
+    return current == started_at
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
