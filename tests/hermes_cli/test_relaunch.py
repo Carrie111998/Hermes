@@ -304,6 +304,38 @@ class TestResolveHermesBinWindowsPyGuard:
         monkeypatch.setattr(relaunch_mod.shutil, "which", lambda name: None)
         assert relaunch_mod.resolve_hermes_bin() == str(script)
 
+    def test_posix_rejects_env_shebang_path_lookup(self, monkeypatch, tmp_path):
+        """Defense-in-depth: a PATH-resolved ``hermes`` whose shebang is
+        env-resolved python must be rejected just like an argv0 candidate —
+        not returned, and not demoted to nothing (falls through to the
+        python -m fallback)."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX semantics")
+        script = tmp_path / "hermes"
+        script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["-c"])  # not a real path
+        monkeypatch.setattr(
+            relaunch_mod.shutil, "which",
+            lambda name: str(script) if name == "hermes" else None,
+        )
+        assert relaunch_mod.resolve_hermes_bin() is None
+
+    def test_posix_accepts_pinned_shebang_path_lookup(self, monkeypatch, tmp_path):
+        """A PATH-resolved ``hermes`` with a pinned interpreter is trusted —
+        the guard must not overblock non-env shebangs."""
+        if sys.platform == "win32":
+            pytest.skip("POSIX semantics")
+        script = tmp_path / "hermes"
+        script.write_text("#!/opt/venv/bin/python\n")
+        script.chmod(0o755)
+        monkeypatch.setattr(relaunch_mod.sys, "argv", ["-c"])  # not a real path
+        monkeypatch.setattr(
+            relaunch_mod.shutil, "which",
+            lambda name: str(script) if name == "hermes" else None,
+        )
+        assert relaunch_mod.resolve_hermes_bin() == str(script)
+
     def test_windows_py_argv0_with_no_hermes_on_path_returns_none(self, monkeypatch, tmp_path):
         """Bulletproof fallback: if argv0 is .py on Windows AND hermes.exe
         isn't on PATH, return None so the caller falls back to

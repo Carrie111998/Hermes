@@ -132,7 +132,8 @@ def resolve_hermes_bin() -> Optional[str]:
       1. ``sys.argv[0]`` if it resolves to a real executable — unless it is
          a script with an ``env`` shebang (interpreter re-resolved from PATH
          at exec time), in which case it is demoted to the PATH lookup.
-      2. ``shutil.which("hermes")`` on PATH.
+      2. ``shutil.which("hermes")`` on PATH — the same ``env``-shebang
+         rejection applies here for defense-in-depth.
       3. ``None`` → caller should fall back to ``python -m hermes_cli.main``.
 
     Windows note: ``os.access(path, os.X_OK)`` returns True for ``.py`` and
@@ -165,7 +166,7 @@ def resolve_hermes_bin() -> Optional[str]:
 
     # PATH lookup
     path_bin = shutil.which("hermes")
-    if path_bin:
+    if path_bin and not _is_env_python_script(path_bin):
         return path_bin
 
     return None
