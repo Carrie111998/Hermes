@@ -2268,6 +2268,15 @@ def _deliver_result(
                     )
 
         if not delivered:
+            if at_most_once:
+                detail = "; ".join(target_errors) or (
+                    f"no confirmed live adapter delivery path for "
+                    f"{platform_name}:{chat_id}"
+                )
+                raise ContextualDeliveryUnknown(
+                    f"Contextual delivery requires the gateway-owned live "
+                    f"transport; standalone fallback is forbidden: {detail}"
+                )
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery

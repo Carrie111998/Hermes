@@ -1611,16 +1611,16 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         assert result is None
         standalone_send.assert_not_awaited()
 
-    def test_contextual_standalone_requires_explicit_positive_ack(self):
+    def test_contextual_never_uses_standalone_transport(self):
         from gateway.config import Platform
 
         pconfig = MagicMock()
         pconfig.enabled = True
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        standalone_send = AsyncMock(return_value=None)
+        standalone_send = AsyncMock(return_value={"success": True})
         job = {
-            "id": "standalone-unacknowledged",
+            "id": "standalone-forbidden",
             "deliver": "origin",
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
@@ -1628,7 +1628,9 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
-            with pytest.raises(ContextualDeliveryUnknown, match="unconfirmed result"):
+            with pytest.raises(
+                ContextualDeliveryUnknown, match="standalone fallback is forbidden"
+            ):
                 _deliver_result(
                     job,
                     "Hello world",
@@ -1636,7 +1638,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
                     at_most_once=True,
                 )
 
-        standalone_send.assert_awaited_once()
+        standalone_send.assert_not_awaited()
 
 
 class TestDeliverOriginUnresolvableIsLocal:

@@ -149,8 +149,14 @@ async def test_builtin_current_session_composes_scheduler_gateway_transcript_and
         "gateway.config.load_gateway_config",
         lambda: SimpleNamespace(platforms={ConfigPlatform.TELEGRAM: platform_cfg}),
     )
-    send = AsyncMock(return_value={"success": True})
-    monkeypatch.setattr("tools.send_message_tool._send_to_platform", send)
+    standalone_send = AsyncMock(return_value={"success": True})
+    monkeypatch.setattr(
+        "tools.send_message_tool._send_to_platform", standalone_send
+    )
+    live_adapter = AsyncMock()
+    live_adapter.send.return_value = SimpleNamespace(
+        success=True, raw_response=None
+    )
     monkeypatch.setattr(
         scheduler,
         "_CONTEXTUAL_AUTHORIZER",
@@ -168,6 +174,7 @@ async def test_builtin_current_session_composes_scheduler_gateway_transcript_and
     assert await asyncio.to_thread(
         scheduler.run_one_job,
         job,
+        adapters={ConfigPlatform.TELEGRAM: live_adapter},
         loop=loop,
         contextual_dispatch=dispatch,
     )
@@ -192,15 +199,18 @@ async def test_builtin_current_session_composes_scheduler_gateway_transcript_and
     refreshed_entry = store.peek_session_entry(entry.session_key)
     assert refreshed_entry is not None
     assert refreshed_entry.last_prompt_tokens == 23
-    assert send.await_count == 1
-    assert "nougat" in str(send.await_args)
+    assert live_adapter.send.await_count == 1
+    assert "nougat" in str(live_adapter.send.await_args)
+    standalone_send.assert_not_awaited()
 
     replay = dict(job, execution_id=record["id"])
     assert await asyncio.to_thread(
         scheduler.run_one_job,
         replay,
+        adapters={ConfigPlatform.TELEGRAM: live_adapter},
         loop=loop,
         contextual_dispatch=dispatch,
     )
-    assert send.await_count == 1
+    assert live_adapter.send.await_count == 1
+    standalone_send.assert_not_awaited()
     assert len(store.load_transcript_strict(reset_entry.session_id)) == 3
