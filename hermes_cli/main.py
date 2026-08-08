@@ -7245,17 +7245,19 @@ def cmd_gui(args: argparse.Namespace):
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
 
-    # Linux: register the app in the desktop launcher, so Hermes shows up
-    # in the application menu with its icon. Best-effort and idempotent.
-    # A failure must never stop the app from launching.
-    _register_linux_desktop_entry()
-
     # --build-only: produce the artifact but do NOT launch. The installer's
     # --update flow drives the rebuild headlessly and then launches the desktop
     # itself (detached, after the old exe has exited), so the launch must NOT
     # happen here — it would block the installer and, on Windows, the old exe
     # is still being replaced. Verify the expected artifact exists so a silent
     # "built nothing" can't slip past, then return success.
+    #
+    # Also skip launcher registration here: this is a headless updater rebuild
+    # (Desktop self-update → `hermes update` → `hermes desktop --build-only`),
+    # not an interactive launch, and its environment can differ from a real
+    # desktop session's. Registering here risks persisting an Exec= command
+    # that only works in the updater's environment into a launcher a desktop
+    # session later double-clicks.
     if getattr(args, "build_only", False):
         if source_mode:
             if not _desktop_dist_exists(desktop_dir):
@@ -7269,6 +7271,11 @@ def cmd_gui(args: argparse.Namespace):
         else:
             print(f"✓ Desktop packaged app ready: {packaged_executable} (not launching; --build-only)")
         return
+
+    # Linux: register the app in the desktop launcher, so Hermes shows up
+    # in the application menu with its icon. Best-effort and idempotent.
+    # A failure must never stop the app from launching.
+    _register_linux_desktop_entry()
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")

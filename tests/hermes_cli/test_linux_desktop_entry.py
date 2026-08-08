@@ -88,6 +88,31 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     assert Path(exec_line.split(" ")[0]).is_absolute()
 
 
+def test_exec_does_not_persist_env_python_source_wrapper(tmp_path, xdg_home, monkeypatch):
+    """A raw ``#!/usr/bin/env python3`` source-tree wrapper (e.g. repo-root
+    ``hermes``) resolves whatever ``python3`` is first on PATH. A desktop
+    session's PATH can differ from wherever ``hermes desktop`` was invoked
+    from, so persisting that wrapper into ``Exec=`` risks a launcher that
+    only works in one environment. Fall back to the current interpreter,
+    already resolved absolute, instead.
+    """
+    root = _make_project(tmp_path)
+    wrapper = tmp_path / "repo" / "hermes"
+    wrapper.parent.mkdir()
+    wrapper.write_text(
+        "#!/usr/bin/env python3\nfrom hermes_cli.main import main\nmain()\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(wrapper))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{Path(lde.sys.executable).resolve()} -m hermes_cli.main desktop"
+
+
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: "/usr/bin/hermes")
