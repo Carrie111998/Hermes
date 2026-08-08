@@ -19,6 +19,7 @@ import { readOsc52Clipboard } from '../lib/osc52.js'
 import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 import { shouldCollapsePaste } from '../lib/pasteCollapse.js'
+import { stripTerminalControlFragments } from '../lib/terminalInputSanitize.js'
 
 import type {
   ComposerPasteResult,
@@ -233,7 +234,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
   const handleResolvedPaste = useCallback(
     async ({ bracketed, cursor, text, value }: Omit<PasteEvent, 'hotkey'>): Promise<ComposerPasteResult | null> => {
-      const cleanedText = stripTrailingPasteNewlines(text)
+      const cleanedText = stripTerminalControlFragments(stripTrailingPasteNewlines(text))
 
       if (!cleanedText || !/[^\n]/.test(cleanedText)) {
         return bracketed ? pasteClipboardImage(value, cursor, true) : null
