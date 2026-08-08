@@ -388,7 +388,10 @@ $NodeVersion = "22"
 # when install.ps1 is piped straight from the web).  Get-NpmRange prefers the
 # manifest whenever it does exist, so a drifted constant self-corrects on any
 # run against an existing checkout.
-$NpmRange = ">=12.0.0"
+# Keep in sync with root package.json engines.npm. npm 11.10-11.16 honor
+# min-release-age but ignore min-release-age-exclude (see .npmrc), so that
+# band is excluded. Node 22's bundled npm 10.x satisfies the left arm.
+$NpmRange = "<11.10.0 || >=11.17.0"
 
 # Stage-protocol version.  Bumped only for genuinely breaking changes to the
 # manifest schema, stage-name set semantics, or stdout JSON shape.  Adding a
@@ -818,12 +821,12 @@ function Get-NpmRange {
 
 # Upgrade the Hermes-managed Node tree's bundled npm into $NpmRange.
 #
-# The nodejs.org zip ships whatever npm that Node major bundles -- Node 26.5.1
-# bundles npm 11.17.0, one minor below the root package.json's own
-# `engines.npm` floor of >=12.  The repo .npmrc sets `engine-strict=true`, so
-# that is fatal rather than a warning and a brand-new install dies at the first
-# `npm ci` with EBADENGINE.  Provision the right npm here instead of reacting
-# to the failure later.
+# The nodejs.org zip ships whatever npm that Node major bundles.  Node 24.x
+# currently ships npm 11.16.x, which sits inside the engines.npm exclusion
+# band.  The repo .npmrc sets `engine-strict=true`, so that is fatal rather
+# than a warning and a brand-new install dies at the first `npm ci` with
+# EBADENGINE.  Provision the right npm here instead of reacting to the
+# failure later.
 #
 # Three details are load-bearing, mirroring _nb_ensure_bundled_npm_range in
 # scripts/lib/node-bootstrap.sh and upgrade_managed_npm in
@@ -844,18 +847,22 @@ function Update-ManagedNpm {
 
     $range = Get-NpmRange
 
-    # Skip the network round-trip when the bundled npm already satisfies the
-    # range.  Only the ">=N" shape we actually author is parsed; anything more
-    # exotic falls through to letting npm itself decide.
-    if ($range -match '^>=(\d+)') {
-        $want = [int]$Matches[1]
-        try {
-            $have = (& $npmCmd --version 2>$null)
-            if ($have -match '^(\d+)') {
-                if ([int]$Matches[1] -ge $want) { return $true }
+    # Skip the network round-trip when the bundled npm already works with this
+    # repo's .npmrc / engines.npm.  Test-NpmSupportsNpmrc covers the compound
+    # range we author; a plain ">=N" floor is still enforced numerically.
+    try {
+        $have = (& $npmCmd --version 2>$null)
+        if (Test-NpmSupportsNpmrc $have) {
+            if ($range -match '^>=(\d+)') {
+                $want = [int]$Matches[1]
+                if ($have -match '^(\d+)' -and [int]$Matches[1] -ge $want) {
+                    return $true
+                }
+            } else {
+                return $true
             }
-        } catch { }
-    }
+        }
+    } catch { }
 
     Write-Info "Upgrading bundled npm to satisfy $range ..."
 
@@ -1437,18 +1444,79 @@ function Test-NodeVersionOk {
     return ($v.Major -gt 22)
 }
 
+# Mirror of install.sh's npm_supports_npmrc.  npm 11.10.0-11.16.x honor
+# `min-release-age` but ignore `min-release-age-exclude`, both of which
+# `.npmrc` sets.  That combination applies the 14-day age gate to packages
+# we deliberately exempted, so every install fails ETARGET (or EBADENGINE
+# under engine-strict) on a freshly published dependency.  Returns $true
+# when the npm is usable with this repo.
+function Test-NpmSupportsNpmrc {
+    param([string]$Version)
+    if (-not $Version) { return $false }
+    try {
+        $v = [version]($Version -replace '^v', '' -replace '-.*$', '')
+    } catch {
+        return $false
+    }
+    # The bad band is 11.10.0 through 11.16.x.
+    if ($v.Major -eq 11 -and $v.Minor -ge 10 -and $v.Minor -le 16) {
+        return $false
+    }
+    return $true
+}
+
+# Resolve a runnable npm and return its --version string, or $null.
+# Prefer npm.cmd so PowerShell execution policy cannot reject npm.ps1.
+function Get-NpmVersion {
+    $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npmCmd) {
+        $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+    }
+    if (-not $npmCmd) { return $null }
+
+    $prevEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $ver = & $npmCmd.Source --version 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $ver = [string]$ver
+        if ([string]::IsNullOrWhiteSpace($ver)) { return $null }
+        return $ver.Trim()
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
+
 function Test-Node {
     Write-Info "Checking Node.js (for browser tools)..."
 
+    # The system toolchain is only usable when BOTH halves work: a Node new
+    # enough for the desktop build AND an npm that can read our .npmrc.  A
+    # bad-band npm (see Test-NpmSupportsNpmrc) fails `npm ci` with EBADENGINE
+    # under engine-strict -- the exact Windows desktop-install failure when
+    # Node 24.x ships with npm 11.16.x.  Fall through to Hermes-managed Node
+    # (which bundles a good npm, then Update-ManagedNpm keeps it in range).
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
         if (Test-NodeVersionOk $version) {
             Ensure-NodeExeOnPath | Out-Null
-            Write-Success "Node.js $version found"
-            $script:HasNode = $true
-            return $true
+            $npmVersion = Get-NpmVersion
+            if ($npmVersion -and (Test-NpmSupportsNpmrc $npmVersion)) {
+                Write-Success "Node.js $version found"
+                $script:HasNode = $true
+                return $true
+            }
+            if ($npmVersion) {
+                Write-Warn "npm $npmVersion cannot honor this repo's .npmrc (npm 11.10-11.16 ignore"
+                Write-Warn "min-release-age-exclude) -- installing Hermes-managed Node $NodeVersion instead..."
+            } else {
+                Write-Warn "Node.js $version has no usable npm on PATH -- installing Hermes-managed Node $NodeVersion instead..."
+            }
+        } else {
+            Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
         }
-        Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
     }
 
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
