@@ -51,6 +51,26 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    def test_truncated_multibyte_tail_is_not_binary(self, ops):
+        """`head -c 1000` cuts on a byte boundary, so the sample's last char is
+        routinely a half-written multi-byte sequence decoded as U+FFFD. That is
+        our own truncation artifact — a 3-bytes-per-char script would otherwise
+        have ~2 of every 3 files misread as binary and become unreadable."""
+        sample = "가" * 333 + "�"  # 999 bytes of Hangul + a cut char
+        assert ops._is_likely_binary("note.md", content_sample=sample) is False
+
+    def test_replacement_char_survives_when_sample_is_whole_file(self, ops):
+        """A short sample is the entire file, so a trailing U+FFFD there is real
+        corruption rather than truncation — it must still read as binary."""
+        sample = "short note�"
+        assert ops._is_likely_binary("note.md", content_sample=sample) is True
+
+    def test_replacement_char_mid_sample_still_binary(self, ops):
+        """Genuine mojibake carries U+FFFD away from the cut, so the tail
+        exemption must not swallow it."""
+        sample = "title\n�" + "body " * 200
+        assert ops._is_likely_binary("note.md", content_sample=sample) is True
+
 
 # =========================================================================
 # _check_lint edge cases

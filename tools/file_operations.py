@@ -890,7 +890,7 @@ class ShellFileOperations(FileOperations):
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
-        
+
         Uses extension check (fast) + content analysis (fallback).
         """
         ext = os.path.splitext(path)[1].lower()
@@ -908,11 +908,32 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # ...except at the tail. The sample comes from `head -c N`, which
+            # cuts on a BYTE boundary, so the last character is routinely a
+            # half-written multi-byte sequence that decodes to U+FFFD. That is
+            # a truncation artifact of our own probe, not evidence about the
+            # file. Left unstripped it misreads dense non-ASCII text as binary:
+            # in a 3-bytes-per-char script (Korean/Japanese/Chinese) roughly
+            # two of every three files land mid-character and become
+            # permanently unreadable. Real mojibake still trips the check
+            # because it carries U+FFFD throughout, not only in the last char.
+            # Only the truncated case earns the exemption: a sample that came
+            # back short is the whole file, so a U+FFFD at its end is real
+            # corruption, not our cut. `head -c 1000` returns exactly 1000
+            # bytes whenever the file is at least that big, and replacing a
+            # 1-2 byte remnant with U+FFFD (3 bytes) can only push the
+            # re-encoded length to >= 1000 \u2014 so that length is the signal.
+            probe = content_sample[:1000]
+            if len(probe.encode("utf-8", "replace")) >= 1000:
+                probe = probe.rstrip("\ufffd")
+            if not probe:
+                # Sample was nothing but replacement chars \u2014 genuinely binary.
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            if "\ufffd" in probe:
+                return True
+            non_printable = sum(1 for c in probe
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / max(len(probe), 1) > 0.30
         
         return False
     
