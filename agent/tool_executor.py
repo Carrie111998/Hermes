@@ -890,6 +890,24 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         batch_mutation_lock = threading.Lock()
         agent._turn_file_mutation_state_lock = batch_mutation_lock
     recorded_mutation_indices: set[int] = set()
+    mutation_completion_events = [
+        (
+            threading.Event()
+            if name in {"write_file", "patch"} and parse_error is None
+            else None
+        )
+        for _tc, name, _args, _trace, parse_error, _scope_block in parsed_calls
+    ]
+
+    def _wait_for_prior_file_mutations(index: int) -> bool:
+        """Keep later tool side effects behind earlier mutation snapshots."""
+        for event in mutation_completion_events[:index]:
+            if event is None:
+                continue
+            while not event.wait(timeout=0.05):
+                if batch_abandoned.is_set():
+                    return False
+        return not batch_abandoned.is_set()
 
     def _record_batch_file_mutation(
         index: int,
@@ -1060,6 +1078,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 # Batch already abandoned: the turn synthesized this tool's
                 # result and moved on. Abort instead of dispatching late.
                 raise _BatchAbandoned(function_name)
+            if not _wait_for_prior_file_mutations(index):
+                raise _BatchAbandoned(function_name)
 
         try:
             try:
@@ -1167,6 +1187,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace,
             )
         finally:
+            mutation_event = mutation_completion_events[index]
+            if mutation_event is not None:
+                # Release later tools only after this call's result (including
+                # its post-failure fingerprint) has been recorded.
+                mutation_event.set()
             # Teardown advance: keep the counter moving for any later-ordered
             # worker. Never let the abandonment signal escape from here — the
             # worker is already unwinding and the turn owns the result.

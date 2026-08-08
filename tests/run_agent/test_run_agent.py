@@ -2137,7 +2137,8 @@ class TestConcurrentToolExecution:
         """A sibling terminal recovery must occur after the failed-call baseline."""
         target = tmp_path / "recovered.txt"
         target.write_text("before\n", encoding="utf-8")
-        baseline_captured = threading.Event()
+        snapshot_started = threading.Event()
+        recovery_started = threading.Event()
         agent._turn_failed_file_mutations = {}
         agent._turn_file_mutation_paths = set()
         agent._turn_file_mutation_fingerprint_bytes = 0
@@ -2148,8 +2149,15 @@ class TestConcurrentToolExecution:
         original_snapshot = agent._snapshot_file_mutation_target
 
         def snapshot(*args, **kwargs):
+            first_snapshot = not snapshot_started.is_set()
+            if first_snapshot:
+                snapshot_started.set()
+                # Without the executor fence, the later terminal tool starts
+                # during this window and its write becomes the failed call's
+                # baseline. With the fence it cannot start until this snapshot
+                # returns, so the baseline remains the post-failure state.
+                recovery_started.wait(timeout=0.15)
             result = original_snapshot(*args, **kwargs)
-            baseline_captured.set()
             return result
 
         monkeypatch.setattr(agent, "_snapshot_file_mutation_target", snapshot)
@@ -2158,7 +2166,7 @@ class TestConcurrentToolExecution:
             if name == "patch":
                 return json.dumps({"error": "Could not find old_string"})
             assert name == "terminal"
-            assert baseline_captured.wait(timeout=2)
+            recovery_started.set()
             target.write_text("after\n", encoding="utf-8")
             return json.dumps({"success": True})
 
