@@ -532,7 +532,9 @@ class SubagentLifecycleService:
             actual = frozenset(valid) if isinstance(valid, (set, frozenset)) else None
             if actual is None or actual != profile.expected_tool_names:
                 missing = sorted(profile.expected_tool_names - (actual or frozenset()))
-                unexpected = sorted((actual or frozenset()) - profile.expected_tool_names)
+                unexpected = sorted(
+                    (actual or frozenset()) - profile.expected_tool_names
+                )
                 raise SubagentLifecycleError(
                     f"Profile {profile.profile_id!r} exact tool contract violated: "
                     f"missing={missing} unexpected={unexpected}."
@@ -555,12 +557,15 @@ class SubagentLifecycleService:
 
             unsafe = set(actual & UNSAFE_EXACT_PROFILE_TOOL_NAMES)
             unsafe.update(
-                actual & set(getattr(child, "_context_engine_tool_names", set()) or set())
+                actual
+                & set(getattr(child, "_context_engine_tool_names", set()) or set())
             )
             memory_manager = getattr(child, "_memory_manager", None)
             if memory_manager is not None:
                 try:
-                    unsafe.update(name for name in actual if memory_manager.has_tool(name))
+                    unsafe.update(
+                        name for name in actual if memory_manager.has_tool(name)
+                    )
                 except Exception as exc:
                     raise SubagentLifecycleError(
                         "Could not verify external-memory tool routing for exact profile."
@@ -941,10 +946,15 @@ class SubagentLifecycleService:
             ProcessRunSpec,
             run_owned_process,
         )
-        from agent.subagent_tool_boundary import EvoToolBoundaryError, classify_evo_tools
+        from agent.subagent_tool_boundary import (
+            EvoToolBoundaryError,
+            classify_evo_tools,
+        )
 
         if record.receipt is None or profile.workspace_root is None:
-            raise SubagentLifecycleError("process profile lacks pinned launch authority")
+            raise SubagentLifecycleError(
+                "process profile lacks pinned launch authority"
+            )
         try:
             classify_evo_tools(record.agent._delegate_frozen_dispatch_entries)
         except EvoToolBoundaryError as exc:
@@ -953,7 +963,11 @@ class SubagentLifecycleService:
         broker = SubagentBroker(
             launch_receipt_digest=digest,
             grant=BrokerGrant(
-                operations=frozenset({"session.start", "model.complete", "tool.execute"}),
+                operations=frozenset({
+                    "session.start",
+                    "model.complete",
+                    "tool.execute",
+                }),
                 workspace_root=profile.workspace_root,
             ),
         )
@@ -980,16 +994,42 @@ class SubagentLifecycleService:
                 record.execution_receipt = recorder.mark_started(root_pid=root_pid)
 
             def on_terminal(self, *, state: str, result: Any) -> None:
+                observed_cleanup = [
+                    f"root_reaped={result.cleanup.root_reaped}",
+                    f"process_group_empty={result.cleanup.process_group_empty}",
+                ]
+                if result.cleanup.cgroup_empty is not None:
+                    observed_cleanup.append(
+                        f"cgroup_empty={result.cleanup.cgroup_empty}"
+                    )
+                if result.cleanup.cgroup_removed is not None:
+                    observed_cleanup.append(
+                        f"cgroup_removed={result.cleanup.cgroup_removed}"
+                    )
+                diagnostics = [result.diagnostic] if result.diagnostic else []
+                if result.stderr:
+                    stderr_lines = [
+                        line.strip()
+                        for line in result.stderr.decode(
+                            "utf-8", errors="replace"
+                        ).splitlines()
+                        if line.strip()
+                    ]
+                    if stderr_lines:
+                        diagnostic = "".join(
+                            character if character.isprintable() else " "
+                            for character in stderr_lines[-1]
+                        )
+                        diagnostics.append(
+                            f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
+                        )
                 evidence = {
                     "exit_code": result.exit_code,
                     "term_signal": result.signal,
                     "broker_transcript_digest": broker.transcript_digest(),
-                    "observed_cleanup": (
-                        f"root_reaped={result.cleanup.root_reaped}",
-                        f"process_group_empty={result.cleanup.process_group_empty}",
-                    ),
+                    "observed_cleanup": tuple(observed_cleanup),
                     "containment_evidence": (result.confinement,),
-                    "diagnostics": (result.diagnostic,) if result.diagnostic else (),
+                    "diagnostics": tuple(diagnostics),
                 }
                 marker = getattr(recorder, f"mark_{state.lower()}")
                 record.execution_receipt = marker(**evidence)
@@ -1001,8 +1041,12 @@ class SubagentLifecycleService:
             task=goal,
         )
         workspace = Path(profile.workspace_root)
-        backend = "portable" if profile.execution_backend == "portable" else "linux-strict"
-        worker_path = Path(__file__).with_name("subagent_worker_main.py").resolve(strict=True)
+        backend = (
+            "portable" if profile.execution_backend == "portable" else "linux-strict"
+        )
+        worker_path = (
+            Path(__file__).with_name("subagent_worker_main.py").resolve(strict=True)
+        )
         runtime_mounts = ()
         if backend == "linux-strict":
             runtime_mounts = strict_worker_runtime_mounts()
@@ -1031,17 +1075,39 @@ class SubagentLifecycleService:
         result = run_owned_process(spec)
         broker.close("owned process completed")
         if result.state != "SUCCEEDED":
+            worker_errors = [result.diagnostic] if result.diagnostic else []
+            if result.stderr:
+                stderr_lines = [
+                    line.strip()
+                    for line in result.stderr.decode(
+                        "utf-8", errors="replace"
+                    ).splitlines()
+                    if line.strip()
+                ]
+                if stderr_lines:
+                    diagnostic = "".join(
+                        character if character.isprintable() else " "
+                        for character in stderr_lines[-1]
+                    )
+                    worker_errors.append(
+                        f"worker stderr: {' '.join(diagnostic.split())[:1000]}"
+                    )
             return {
                 "status": "error",
-                "error": result.diagnostic or result.state,
+                "error": "; ".join(worker_errors) or result.state,
                 "api_calls": 0,
                 "duration_seconds": 0,
             }
         try:
             payload = json.loads(result.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise SubagentLifecycleError("worker returned malformed bounded JSON") from exc
-        if not isinstance(payload, Mapping) or set(payload) != {"summary", "iterations"}:
+            raise SubagentLifecycleError(
+                "worker returned malformed bounded JSON"
+            ) from exc
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "summary",
+            "iterations",
+        }:
             raise SubagentLifecycleError("worker result has an invalid shape")
         return {
             "status": "completed",

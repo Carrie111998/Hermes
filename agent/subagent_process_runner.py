@@ -34,6 +34,14 @@ LINUX_STRICT_CONFINEMENT = "linux-strict-bwrap-cgroup-v2"
 _VALID_BACKENDS = frozenset({"portable", "linux-strict"})
 _MAX_ARG_BYTES = 128_000
 _DEFAULT_OUTPUT_BYTES = 1_048_576
+_STRICT_WORKER_HOME = Path("/tmp/hermes-worker-home")
+
+
+def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
+    printable = "".join(
+        character if character.isprintable() else " " for character in str(value)
+    )
+    return " ".join(printable.split())[:limit]
 
 
 class BrokerCallbacks(Protocol):
@@ -428,6 +436,7 @@ def _build_linux_strict_argv(
         explicit=spec.environment,
         ambient_allowlist=spec.ambient_env_allowlist,
     )
+    environment["HOME"] = str(_STRICT_WORKER_HOME)
     argv = [
         bwrap_path,
         # Bubblewrap passes otherwise-unreferenced inherited descriptors to the
@@ -446,13 +455,17 @@ def _build_linux_strict_argv(
         argv.append("--unshare-net")
     for name, value in sorted(environment.items()):
         argv.extend(("--setenv", name, value))
+    argv.extend(("--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"))
     argv.extend(
-        _mount_parent_directives([mount.target for mount in spec.runtime_mounts])
+        _mount_parent_directives(
+            [mount.target for mount in spec.runtime_mounts] + [sandbox_workspace]
+        )
     )
+    argv.extend(("--dir", str(_STRICT_WORKER_HOME)))
+    argv.extend(("--dir", str(sandbox_workspace)))
     for mount in spec.runtime_mounts:
         argv.extend(("--ro-bind", str(mount.source), str(mount.target)))
     argv.extend(("--bind", str(spec.workspace), str(sandbox_workspace)))
-    argv.extend(("--tmpfs", "/tmp", "--proc", "/proc", "--dev", "/dev"))
     relative_cwd = spec.cwd.resolve(strict=True).relative_to(
         spec.workspace.resolve(strict=True)
     )
@@ -764,7 +777,9 @@ def _terminal_result(
     except Exception as exc:
         result = dataclasses.replace(
             result,
-            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            state=(
+                "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
+            ),
             diagnostic=f"receipt callback failed: {type(exc).__name__}",
         )
     return result
@@ -806,7 +821,9 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
         return ProcessRunResult(
             backend=spec.backend,
             confinement=confinement,
-            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            state=(
+                "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
+            ),
             root_pid=None,
             returncode=None,
             exit_code=None,
@@ -941,7 +958,12 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
                         stop_requested=stop_requested,
                     )
                 except Exception as exc:
-                    broker_errors.append(type(exc).__name__)
+                    detail = _bounded_diagnostic_text(exc, limit=300)
+                    broker_errors.append(
+                        f"{type(exc).__name__}: {detail}"
+                        if detail
+                        else type(exc).__name__
+                    )
 
             broker_thread = threading.Thread(
                 target=serve_broker,
@@ -1047,11 +1069,25 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
         return ProcessRunResult(
             backend=spec.backend,
             confinement=confinement,
-            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            state=(
+                "CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"
+            ),
             root_pid=process.pid if process is not None else None,
             returncode=process.returncode if process is not None else None,
-            exit_code=(process.returncode if process is not None and process.returncode is not None and process.returncode >= 0 else None),
-            signal=(-process.returncode if process is not None and process.returncode is not None and process.returncode < 0 else None),
+            exit_code=(
+                process.returncode
+                if process is not None
+                and process.returncode is not None
+                and process.returncode >= 0
+                else None
+            ),
+            signal=(
+                -process.returncode
+                if process is not None
+                and process.returncode is not None
+                and process.returncode < 0
+                else None
+            ),
             timed_out=False,
             stdout=b"",
             stderr=b"",

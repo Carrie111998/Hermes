@@ -9,6 +9,7 @@ import struct
 
 import pytest
 
+import agent.subagent_worker_main as worker_main_module
 from agent.subagent_worker_main import (
     BrokerFrameError,
     _enter_cgroup_and_exec,
@@ -133,3 +134,39 @@ def test_cgroup_launcher_enters_before_exec_and_preserves_argv(monkeypatch):
         "argv": ["/usr/bin/bwrap", "--", "/runtime/python", "worker.py"],
         "env": {"LANG": "C.UTF-8"},
     }
+
+
+def test_cgroup_launcher_parser_preserves_bwrap_separator(monkeypatch):
+    captured = {}
+
+    def fake_enter(fd, argv, environment):
+        captured.update(fd=fd, argv=argv, environment=environment)
+        raise RuntimeError("exec intercepted")
+
+    monkeypatch.setattr(worker_main_module, "_enter_cgroup_and_exec", fake_enter)
+    with pytest.raises(RuntimeError, match="intercepted"):
+        worker_main_module.main([
+            "--enter-cgroup-fd",
+            "7",
+            "--exec",
+            "/usr/bin/bwrap",
+            "--chdir",
+            "/workspace",
+            "--",
+            "/runtime/python",
+            "worker.py",
+            "--capability-fd",
+            "8",
+        ])
+
+    assert captured["fd"] == 7
+    assert captured["argv"] == [
+        "/usr/bin/bwrap",
+        "--chdir",
+        "/workspace",
+        "--",
+        "/runtime/python",
+        "worker.py",
+        "--capability-fd",
+        "8",
+    ]

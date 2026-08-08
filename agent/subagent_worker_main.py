@@ -64,7 +64,11 @@ class _EnvelopeSigner:
     def sign(self, operation: str, body: Mapping[str, Any]) -> dict[str, Any]:
         self.sequence += 1
         canonical_body = json.dumps(
-            body, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+            body,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
         )
         authority = {
             "protocol_version": _BROKER_PROTOCOL_VERSION,
@@ -75,7 +79,11 @@ class _EnvelopeSigner:
             "body_digest": hashlib.sha256(canonical_body.encode("utf-8")).hexdigest(),
         }
         mac_payload = json.dumps(
-            authority, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+            authority,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
         ).encode("utf-8")
         return {
             **authority,
@@ -240,7 +248,12 @@ def _broker_call(
     if not isinstance(response["body"], Mapping):
         raise BrokerFrameError("broker response body must be an object")
     if not response["ok"]:
-        raise BrokerFrameError("broker rejected operation")
+        error_class = response["body"].get("error")
+        if not isinstance(error_class, str) or not error_class:
+            error_class = "unknown-error"
+        raise BrokerFrameError(
+            f"broker rejected {operation} operation: {error_class[:1000]}"
+        )
     return response["body"]
 
 
@@ -251,7 +264,11 @@ def _schema_map(tools: list[Any]) -> dict[str, dict[str, Any]]:
             raise BrokerFrameError("session tool schema has an invalid shape")
         function = tool.get("function")
         name = function.get("name") if isinstance(function, dict) else None
-        if tool.get("type") != "function" or not isinstance(name, str) or name in result:
+        if (
+            tool.get("type") != "function"
+            or not isinstance(name, str)
+            or name in result
+        ):
             raise BrokerFrameError("session tool schema has an invalid name")
         result[name] = function
     return result
@@ -302,8 +319,14 @@ def run_worker_loop(
     signer = _EnvelopeSigner(capability_id, secret, launch_receipt_digest)
     session = _broker_call(channel, secret, signer, "session.start", {})
     required = {
-        "protocol", "task", "tools", "tool_schema_digest", "local_tool_names",
-        "brokered_tool_names", "model", "max_iterations",
+        "protocol",
+        "task",
+        "tools",
+        "tool_schema_digest",
+        "local_tool_names",
+        "brokered_tool_names",
+        "model",
+        "max_iterations",
     }
     if set(session) != required:
         raise BrokerFrameError("session.start response has an invalid shape")
@@ -313,17 +336,25 @@ def run_worker_loop(
         raise BrokerFrameError("session tools/model are malformed")
     schemas = _schema_map(session["tools"])
     digest = session["tool_schema_digest"]
-    if not isinstance(digest, str) or digest != exact_tool_schema_digest(session["tools"]):
+    if not isinstance(digest, str) or digest != exact_tool_schema_digest(
+        session["tools"]
+    ):
         raise BrokerFrameError("session tool schema digest mismatch")
     local_raw = session["local_tool_names"]
     brokered_raw = session["brokered_tool_names"]
-    if not isinstance(local_raw, list) or not all(isinstance(v, str) for v in local_raw):
+    if not isinstance(local_raw, list) or not all(
+        isinstance(v, str) for v in local_raw
+    ):
         raise BrokerFrameError("session local tool classification is malformed")
-    if not isinstance(brokered_raw, list) or not all(isinstance(v, str) for v in brokered_raw):
+    if not isinstance(brokered_raw, list) or not all(
+        isinstance(v, str) for v in brokered_raw
+    ):
         raise BrokerFrameError("session brokered tool classification is malformed")
     local_names, brokered_names = classify_evo_tools(schemas)
     if local_raw != sorted(local_names) or brokered_raw != sorted(brokered_names):
-        raise BrokerFrameError("session tool classification does not match exact schemas")
+        raise BrokerFrameError(
+            "session tool classification does not match exact schemas"
+        )
     local_handlers = _freeze_local_handlers(local_names, schemas)
     limit = session["max_iterations"]
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32:
@@ -350,7 +381,39 @@ def run_worker_loop(
             raise BrokerFrameError("model content must be text or null")
         assistant: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
-            assistant["tool_calls"] = tool_calls
+            wire_tool_calls = []
+            for call in tool_calls:
+                if not isinstance(call, Mapping) or set(call) != {
+                    "id",
+                    "name",
+                    "arguments",
+                }:
+                    raise BrokerFrameError("tool call has an invalid shape")
+                call_id, name, arguments = call["id"], call["name"], call["arguments"]
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or call_id in seen_call_ids
+                ):
+                    raise BrokerFrameError("tool call id is missing or duplicated")
+                if not isinstance(name, str) or not isinstance(arguments, Mapping):
+                    raise BrokerFrameError("tool call name/arguments are malformed")
+                seen_call_ids.add(call_id)
+                wire_tool_calls.append({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            arguments,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                    },
+                })
+            assistant["tool_calls"] = wire_tool_calls
         messages.append(assistant)
         if finish == "stop":
             if tool_calls:
@@ -359,14 +422,7 @@ def run_worker_loop(
         if not tool_calls:
             raise BrokerFrameError("tool_calls finish requires tool calls")
         for call in tool_calls:
-            if not isinstance(call, Mapping) or set(call) != {"id", "name", "arguments"}:
-                raise BrokerFrameError("tool call has an invalid shape")
             call_id, name, arguments = call["id"], call["name"], call["arguments"]
-            if not isinstance(call_id, str) or not call_id or call_id in seen_call_ids:
-                raise BrokerFrameError("tool call id is missing or duplicated")
-            if not isinstance(name, str) or not isinstance(arguments, Mapping):
-                raise BrokerFrameError("tool call name/arguments are malformed")
-            seen_call_ids.add(call_id)
             if name in local_names:
                 result = {"result": _dispatch_local(local_handlers, name, arguments)}
             elif name in brokered_names:
@@ -379,11 +435,24 @@ def run_worker_loop(
                 )
             else:
                 raise BrokerFrameError("model requested a tool outside exact authority")
-            if set(result) != {"result"} or not isinstance(result["result"], (str, list, dict)):
+            if set(result) != {"result"} or not isinstance(
+                result["result"], (str, list, dict)
+            ):
                 raise BrokerFrameError("tool result is malformed")
-            messages.append(
-                {"role": "tool", "tool_call_id": call_id, "content": result["result"]}
-            )
+            tool_content = result["result"]
+            if not isinstance(tool_content, str):
+                tool_content = json.dumps(
+                    tool_content,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": tool_content,
+            })
     raise BrokerFrameError("worker iteration bound exhausted")
 
 
@@ -434,17 +503,18 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--capability-fd", type=int)
     parser.add_argument("--enter-cgroup-fd", type=int)
-    parser.add_argument("--exec", dest="exec_argv", nargs=argparse.REMAINDER)
+    parser.add_argument("--exec", dest="exec_mode", action="store_true")
+    parser.add_argument("exec_argv", nargs=argparse.REMAINDER)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.enter_cgroup_fd is not None:
-        if not args.exec_argv:
+        if not args.exec_mode or not args.exec_argv:
             raise SystemExit("--enter-cgroup-fd requires --exec argv")
         _enter_cgroup_and_exec(args.enter_cgroup_fd, args.exec_argv, os.environ)
-    if args.capability_fd is None or args.exec_argv:
+    if args.capability_fd is None or args.exec_mode or args.exec_argv:
         raise SystemExit("exactly one worker mode is required")
     with socket.socket(fileno=args.capability_fd) as channel:
         secret, capability_id, launch_digest = read_worker_bootstrap(channel)

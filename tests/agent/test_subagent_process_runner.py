@@ -17,6 +17,7 @@ from agent.subagent_process_runner import (
     RuntimeMount,
     StrictPrerequisiteResult,
     _build_linux_strict_argv,
+    _bounded_diagnostic_text,
     _classify_terminal_state,
     _minimal_environment,
     cleanup_cgroup,
@@ -31,6 +32,13 @@ from agent.subagent_worker_main import (
 
 PYTHON = sys.executable
 SECRET = b"c" * 32
+
+
+def test_bounded_diagnostic_text_strips_control_characters():
+    assert (
+        _bounded_diagnostic_text("provider\r\n\x1b[31merror\x00", limit=100)
+        == "provider [31merror"
+    )
 
 
 def _portable_spec(tmp_path: Path, *argv: str, **overrides: Any) -> ProcessRunSpec:
@@ -328,7 +336,9 @@ def test_linux_bwrap_inherits_passed_capability_fd_without_fake_option(tmp_path)
         backend="linux-strict",
         strict=LinuxStrictConfig(cgroup_parent=tmp_path),
     )
-    argv = runner_module._build_linux_strict_argv(spec, "/usr/bin/bwrap", capability_fd=9)
+    argv = runner_module._build_linux_strict_argv(
+        spec, "/usr/bin/bwrap", capability_fd=9
+    )
     assert "--preserve-fds" not in argv
     assert argv[-2:] == ["--capability-fd", "9"]
 
@@ -345,7 +355,9 @@ def test_pre_spawn_receipt_callback_failure_refuses_spawn(monkeypatch, tmp_path)
         spawned = True
 
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
-    result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", receipt=Receipt()))
+    result = run_owned_process(
+        _portable_spec(tmp_path, "-c", "pass", receipt=Receipt())
+    )
     assert result.state == "FAILED"
     assert result.root_pid is None
     assert spawned is False
@@ -370,12 +382,16 @@ def test_post_spawn_receipt_callback_failure_reaps_owned_process(tmp_path, monke
         def poll(self):
             return self.returncode
 
-    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(
+        runner_module.subprocess, "Popen", lambda *a, **k: FakeProcess()
+    )
     monkeypatch.setattr(
         runner_module,
         "_cleanup_process_group",
-        lambda process, **kwargs: reaped.append(process.pid)
-        or runner_module.CleanupEvidence(root_reaped=True, process_group_empty=True),
+        lambda process, **kwargs: (
+            reaped.append(process.pid)
+            or runner_module.CleanupEvidence(root_reaped=True, process_group_empty=True)
+        ),
     )
     result = run_owned_process(
         _portable_spec(tmp_path, "-c", "import time; time.sleep(30)", receipt=Receipt())
@@ -553,6 +569,27 @@ def test_strict_argv_mounts_only_declarations_and_unshares_network(tmp_path):
         "/workspace",
     ]
     assert "--tmpfs" in argv and "/tmp" in argv
+    assert argv.index("--tmpfs") < bind_index
+    home_setenv_index = argv.index("HOME") - 1
+    assert argv[home_setenv_index : home_setenv_index + 3] == [
+        "--setenv",
+        "HOME",
+        "/tmp/hermes-worker-home",
+    ]
+    assert any(
+        argv[index : index + 2] == ["--dir", "/tmp/hermes-worker-home"]
+        for index in range(len(argv) - 1)
+    )
+    workspace_dir_index = next(
+        index
+        for index in range(len(argv) - 1)
+        if argv[index : index + 2] == ["--dir", "/workspace"]
+    )
+    assert argv[workspace_dir_index : workspace_dir_index + 2] == [
+        "--dir",
+        "/workspace",
+    ]
+    assert workspace_dir_index < bind_index
     assert "--proc" in argv and "/proc" in argv
     assert "--dev" in argv and "/dev" in argv
     assert argv[-4:] == [

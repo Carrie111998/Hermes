@@ -14,7 +14,11 @@ from agent.subagent_process_integration import (
     ProcessIntegrationError,
     strict_worker_runtime_mounts,
 )
-from agent.subagent_worker_main import BrokerFrameError, _dispatch_local, run_worker_loop
+from agent.subagent_worker_main import (
+    BrokerFrameError,
+    _dispatch_local,
+    run_worker_loop,
+)
 from agent.subagent_process_runner import ProcessRunSpec, run_owned_process
 
 
@@ -35,7 +39,12 @@ def _fixture(tmp_path: Path, responses):
 
     completions = Completions()
     child = SimpleNamespace(
-        tools=[{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}],
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {"type": "object"}},
+            }
+        ],
         model="test-model",
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
         _delegate_frozen_dispatch_entries={"read_file": object()},
@@ -122,9 +131,10 @@ def test_worker_loop_executes_exact_tool_call_then_finishes(tmp_path, monkeypatc
     local_calls = []
     monkeypatch.setattr(
         "agent.subagent_worker_main._dispatch_local",
-        lambda snapshot, name, arguments: local_calls.append(
-            (snapshot, name, arguments, __import__("os").getpid())
-        ) or "file contents",
+        lambda snapshot, name, arguments: (
+            local_calls.append((snapshot, name, arguments, __import__("os").getpid()))
+            or "file contents"
+        ),
     )
     monkeypatch.setattr(
         "agent.subagent_process_integration.registry.dispatch_snapshot",
@@ -202,7 +212,9 @@ def test_unknown_tool_classification_refuses_before_runner_spawn(tmp_path):
             broker=broker,
             child=child,
             profile=SimpleNamespace(
-                protocol_text="strict", max_process_iterations=2, workspace_root=str(tmp_path)
+                protocol_text="strict",
+                max_process_iterations=2,
+                workspace_root=str(tmp_path),
             ),
             task="task",
         )
@@ -210,14 +222,20 @@ def test_unknown_tool_classification_refuses_before_runner_spawn(tmp_path):
 
 def test_normalized_usage_wins_over_raw_provider_usage(tmp_path):
     normalized = SimpleNamespace(
-        content="ok", finish_reason="stop", reasoning=None, tool_calls=[], usage={"total": 7}
+        content="ok",
+        finish_reason="stop",
+        reasoning=None,
+        tool_calls=[],
+        usage={"total": 7},
     )
     _broker, adapter, _child, _completions, _digest = _fixture(tmp_path, [normalized])
     body = adapter._dispatch("model.complete", {"messages": []})
     assert body["usage"] == {"total": 7}
 
 
-def test_real_worker_terminal_executes_below_worker_not_parent_broker(tmp_path, monkeypatch):
+def test_real_worker_terminal_executes_below_worker_not_parent_broker(
+    tmp_path, monkeypatch
+):
     call = SimpleNamespace(
         id="call-terminal",
         function=SimpleNamespace(name="terminal", arguments='{"command":"echo $PPID"}'),
@@ -226,11 +244,16 @@ def test_real_worker_terminal_executes_below_worker_not_parent_broker(tmp_path, 
         SimpleNamespace(
             content=None, finish_reason="tool_calls", reasoning=None, tool_calls=[call]
         ),
-        SimpleNamespace(content="done", finish_reason="stop", reasoning=None, tool_calls=[]),
+        SimpleNamespace(
+            content="done", finish_reason="stop", reasoning=None, tool_calls=[]
+        ),
     ]
     broker, adapter, child, completions, digest = _fixture(tmp_path, responses)
     child.tools = [
-        {"type": "function", "function": {"name": "terminal", "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {"name": "terminal", "parameters": {"type": "object"}},
+        }
     ]
     child._delegate_frozen_dispatch_entries = {"terminal": object()}
     adapter = ParentBrokerAdapter(
@@ -271,7 +294,10 @@ def test_nested_dispatch_is_parent_brokered_from_frozen_entry(tmp_path, monkeypa
     broker, old_adapter, child, _completions, _digest = _fixture(tmp_path, [])
     name = "scaffolde_evo_agent_dispatch"
     child.tools = [
-        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
     ]
     child._delegate_frozen_dispatch_entries = {name: object()}
     frozen_entry = object()
@@ -281,7 +307,13 @@ def test_nested_dispatch_is_parent_brokered_from_frozen_entry(tmp_path, monkeypa
     def dispatch(snapshot, tool_name, args, **kwargs):
         from agent.subagent_lifecycle import get_active_subagent_parent
 
-        observed.append((snapshot, tool_name, args, get_active_subagent_parent(), kwargs))
+        observed.append((
+            snapshot,
+            tool_name,
+            args,
+            get_active_subagent_parent(),
+            kwargs,
+        ))
         return "nested"
 
     monkeypatch.setattr(
@@ -291,7 +323,8 @@ def test_nested_dispatch_is_parent_brokered_from_frozen_entry(tmp_path, monkeypa
         broker=broker, child=child, profile=old_adapter.profile, task="nested task"
     )
     assert adapter._dispatch(
-        "tool.execute", {"id": "nested-1", "name": name, "arguments": {"agent": "reviewer"}}
+        "tool.execute",
+        {"id": "nested-1", "name": name, "arguments": {"agent": "reviewer"}},
     ) == {"result": "nested"}
     assert dict(observed[0][0]) == {name: frozen_entry}
     assert observed[0][1:4] == (name, {"agent": "reviewer"}, child)
@@ -310,8 +343,14 @@ def test_worker_local_dispatch_cannot_broaden_to_ambient_registry(monkeypatch):
 def test_strict_runtime_mounts_include_importable_worker_handler_modules():
     mounts = strict_worker_runtime_mounts()
     roots = {mount.source for mount in mounts}
+    targets = {mount.target for mount in mounts}
     repository_root = Path(__file__).parents[2].resolve()
     assert repository_root in roots
+    assert Path(sys.prefix).resolve() in roots
+    assert Path(sys.base_prefix).resolve() in roots
+    for system_root in (Path("/lib"), Path("/lib64"), Path("/usr/lib")):
+        if system_root.exists():
+            assert system_root in targets
     assert (repository_root / "tools" / "terminal_tool.py").is_file()
     assert (repository_root / "tools" / "file_tools.py").is_file()
 
@@ -329,7 +368,10 @@ def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeyp
     ]
     broker, old_adapter, child, _completions, digest = _fixture(tmp_path, responses)
     child.tools = [
-        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
     ]
     child._delegate_frozen_dispatch_entries = {name: object()}
     monkeypatch.setattr(
@@ -342,10 +384,14 @@ def test_parent_dispatch_error_returns_authenticated_rejection(tmp_path, monkeyp
     host, worker = socket.socketpair()
     stop = threading.Event()
     thread = threading.Thread(
-        target=lambda: adapter.serve(host, root_pid=123, stop_requested=stop), daemon=True
+        target=lambda: adapter.serve(host, root_pid=123, stop_requested=stop),
+        daemon=True,
     )
     thread.start()
-    with pytest.raises(BrokerFrameError, match="broker rejected operation"):
+    with pytest.raises(
+        BrokerFrameError,
+        match="broker rejected tool.execute operation: RuntimeError",
+    ):
         run_worker_loop(
             worker,
             broker.reveal_secret_for_transport(),
