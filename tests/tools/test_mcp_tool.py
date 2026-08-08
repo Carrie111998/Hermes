@@ -478,7 +478,12 @@ class TestToolHandler:
         return patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run)
 
     def test_successful_call(self):
-        from tools.mcp_tool import _make_tool_handler, _servers
+        from tools.mcp_tool import (
+            _make_tool_handler,
+            _record_tool_approval_metadata,
+            _servers,
+            _tool_read_only_hints,
+        )
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(
@@ -486,6 +491,10 @@ class TestToolHandler:
         )
         server = _make_mock_server("test_srv", session=mock_session)
         _servers["test_srv"] = server
+        _record_tool_approval_metadata(
+            "test_srv",
+            [SimpleNamespace(name="greet", annotations={"readOnlyHint": True})],
+        )
 
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
@@ -495,10 +504,16 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+            _tool_read_only_hints.pop("test_srv", None)
 
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
-        from tools.mcp_tool import _make_tool_handler, _servers
+        from tools.mcp_tool import (
+            _make_tool_handler,
+            _record_tool_approval_metadata,
+            _servers,
+            _tool_read_only_hints,
+        )
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(
@@ -508,6 +523,10 @@ class TestToolHandler:
         server._config = {"command": "npx"}
         server._recycled_reason = "idle_timeout_seconds"
         _servers["test_srv"] = server
+        _record_tool_approval_metadata(
+            "test_srv",
+            [SimpleNamespace(name="greet", annotations={"readOnlyHint": True})],
+        )
 
         def fake_lazy_reconnect(server_name, srv):
             assert server_name == "test_srv"
@@ -526,6 +545,7 @@ class TestToolHandler:
             mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
         finally:
             _servers.pop("test_srv", None)
+            _tool_read_only_hints.pop("test_srv", None)
 
 
 class TestRunOnMCPLoopInterrupts:
@@ -1345,7 +1365,12 @@ class TestConfigurableTimeouts:
 
     def test_timeout_passed_to_handler(self):
         """The tool handler uses the server's configured timeout."""
-        from tools.mcp_tool import _make_tool_handler, _servers
+        from tools.mcp_tool import (
+            _make_tool_handler,
+            _record_tool_approval_metadata,
+            _servers,
+            _tool_read_only_hints,
+        )
 
         mock_session = MagicMock()
         mock_session.call_tool = AsyncMock(
@@ -1354,6 +1379,10 @@ class TestConfigurableTimeouts:
         server = _make_mock_server("test_srv", session=mock_session)
         server.tool_timeout = 180
         _servers["test_srv"] = server
+        _record_tool_approval_metadata(
+            "test_srv",
+            [SimpleNamespace(name="my_tool", annotations={"readOnlyHint": True})],
+        )
 
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
@@ -1371,6 +1400,7 @@ class TestConfigurableTimeouts:
                        call_kwargs[1].get("timeout") == 180
         finally:
             _servers.pop("test_srv", None)
+            _tool_read_only_hints.pop("test_srv", None)
 
 
 # ---------------------------------------------------------------------------

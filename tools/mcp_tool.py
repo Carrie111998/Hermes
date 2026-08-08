@@ -42,6 +42,9 @@ Example config::
                               # Streamable HTTP endpoint that answers HEAD/GET
                               # with a non-MCP content type but serves real
                               # MCP over POST. Default: false.
+      pipedream_google_sheets:
+        auth: evaos_lease     # managed in-memory evaOS lease; no static URL
+        app_slug: google_sheets
       searxng:
         url: "http://localhost:8000/sse"
         transport: sse       # use SSE transport instead of Streamable HTTP
@@ -1840,6 +1843,7 @@ class MCPServerTask:
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
+        "_evaos_lease_manager", "_evaos_lease_auth",
     )
 
     def __init__(self, name: str):
@@ -1875,6 +1879,11 @@ class MCPServerTask:
         # parked→revived transition exactly once.
         self._was_parked: bool = False
         self._auth_type: str = ""
+        # Managed Pipedream credentials remain in this in-memory lease manager
+        # across transport reconnects.  Neither the broker secret nor provider
+        # grant is retained here; the source rereads them only for a mint.
+        self._evaos_lease_manager: Optional[Any] = None
+        self._evaos_lease_auth: Optional[Any] = None
         self._refresh_lock = asyncio.Lock()
         # MCP stdio sessions are a single JSON-RPC stream. Some servers emit
         # list_changed notifications during startup; if the notification
@@ -1915,7 +1924,37 @@ class MCPServerTask:
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
-        return "url" in self._config
+        return "url" in self._config or self._auth_type == "evaos_lease"
+
+    def _validate_evaos_lease_config(self, config: dict) -> None:
+        """Reject connection or credential overrides for managed MCP auth."""
+        if self._auth_type != "evaos_lease":
+            return
+        conflicting = {
+            "url",
+            "headers",
+            "command",
+            "args",
+            "env",
+            "transport",
+            "oauth",
+            "client_cert",
+        } & set(config)
+        if conflicting or config.get("ssl_verify") is False:
+            from tools.evaos_mcp_lease import EvaosLeaseError
+
+            raise EvaosLeaseError(
+                "managed MCP config may specify only app identity and "
+                "non-credential runtime options"
+            )
+        app_slug = config.get("app_slug")
+        if (
+            not isinstance(app_slug, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", app_slug) is None
+        ):
+            from tools.evaos_mcp_lease import EvaosLeaseError
+
+            raise EvaosLeaseError("managed MCP app slug is invalid")
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -2758,8 +2797,32 @@ class MCPServerTask:
                 "Upgrade the mcp package to get HTTP support."
             )
 
-        url = config["url"]
-        headers = dict(config.get("headers") or {})
+        _lease_auth = None
+        if self._auth_type == "evaos_lease":
+            from hermes_constants import get_hermes_home
+            from tools.evaos_mcp_lease import (
+                EvaosLeaseHttpAuth,
+                EvaosLeaseManager,
+                EvaosLeaseSource,
+            )
+
+            if self._evaos_lease_manager is None:
+                profile_key = str(get_hermes_home().expanduser().resolve())
+                source = EvaosLeaseSource(
+                    profile_key=profile_key,
+                    app_slug=config["app_slug"],
+                )
+                self._evaos_lease_manager = EvaosLeaseManager(source=source)
+                self._evaos_lease_auth = EvaosLeaseHttpAuth(
+                    self._evaos_lease_manager
+                )
+            lease = await self._evaos_lease_manager.get_lease()
+            url = lease.mcp_url
+            headers = dict(lease.headers)
+            _lease_auth = self._evaos_lease_auth
+        else:
+            url = config["url"]
+            headers = dict(config.get("headers") or {})
         # Some MCP servers require MCP-Protocol-Version on the initial
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
@@ -2915,6 +2978,11 @@ class MCPServerTask:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
+            elif _lease_auth is not None:
+                client_kwargs["auth"] = _lease_auth
+                # A managed lease is valid only for the server-issued origin.
+                # Redirects must never forward its bearer or x-pd headers.
+                client_kwargs["follow_redirects"] = False
             if client_cert is not None:
                 client_kwargs["cert"] = client_cert
 
@@ -2959,6 +3027,8 @@ class MCPServerTask:
             }
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
+            elif _lease_auth is not None:
+                _http_kwargs["auth"] = _lease_auth
             try:
                 async with streamablehttp_client(url, **_http_kwargs) as (
                     read_stream, write_stream, _get_session_id,
@@ -3078,6 +3148,14 @@ class MCPServerTask:
         else:
             self._elicitation = None
 
+        try:
+            self._validate_evaos_lease_config(config)
+        except Exception as exc:
+            logger.warning("MCP server '%s': %s", self.name, exc)
+            self._error = exc
+            self._ready.set()
+            return
+
         # Validate: warn if both url and command are present
         if "url" in config and "command" in config:
             logger.warning(
@@ -3092,7 +3170,7 @@ class MCPServerTask:
         # means a typo in config.yaml fails fast with a clear error — and
         # critically, no reconnect-backoff burn.  (Ported from
         # anomalyco/opencode#25019.)
-        if self._is_http():
+        if self._is_http() and self._auth_type != "evaos_lease":
             try:
                 _validate_remote_mcp_url(self.name, config.get("url"))
             except InvalidMcpUrlError as exc:
@@ -3622,6 +3700,155 @@ _server_breaker_opened_at: Dict[str, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
+# MCP tool approval metadata captured at discovery time.  The MCP annotation
+# is only a classification hint: exactly ``readOnlyHint=True`` bypasses the
+# native Hermes approval path.  Missing, malformed, or false annotations are
+# write-capable and therefore require the approval mode selected for the
+# current Hermes session.
+_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+
+
+def _annotation_read_only_hint(mcp_tool: Any) -> bool:
+    """Return True only for an exact MCP ``readOnlyHint=True`` annotation."""
+    annotations = getattr(mcp_tool, "annotations", None)
+    if isinstance(annotations, dict):
+        hint = annotations.get("readOnlyHint")
+    else:
+        hint = getattr(annotations, "readOnlyHint", None)
+    return hint is True
+
+
+def _record_tool_approval_metadata(
+    server_name: str,
+    tools: List[Any],
+) -> None:
+    """Replace one server's discovery-time read-only classification."""
+    hints = {
+        tool.name: _annotation_read_only_hint(tool)
+        for tool in tools
+        if isinstance(getattr(tool, "name", None), str) and tool.name
+    }
+    with _lock:
+        _tool_read_only_hints[server_name] = hints
+
+
+def _mcp_tool_approval_check(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+) -> Optional[str]:
+    """Apply native Hermes approval semantics to one MCP tool call.
+
+    Read-only tools bypass the prompt.  Every other tool uses the existing
+    Hermes approval mode and session-yolo state; there is no MCP-specific
+    trust tier, allowlist, or second policy control.  The returned string is
+    an LLM-facing ``tool_error`` when the call must be blocked.
+    """
+    with _lock:
+        read_only = (
+            _tool_read_only_hints.get(server_name, {}).get(tool_name) is True
+        )
+    if read_only:
+        return None
+
+    from agent.redact import redact_sensitive_text
+    from tools import approval
+
+    # ``is_approval_bypass_active`` is the canonical union of mode=off,
+    # process --yolo, and the exact session's /yolo state.
+    if approval.is_approval_bypass_active():
+        return None
+
+    sensitive_keys = {
+        "authorization",
+        "proxy-authorization",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "token",
+        "api_key",
+        "apikey",
+        "client_secret",
+        "password",
+        "passwd",
+        "auth",
+        "jwt",
+        "secret",
+        "private_key",
+        "key",
+        "credential",
+        "credentials",
+    }
+    normalized_sensitive_keys = {
+        item.replace("-", "_") for item in sensitive_keys
+    }
+
+    def _approval_safe(value: Any, key: str = "") -> Any:
+        normalized_key = key.strip().lower().replace("-", "_")
+        if (
+            normalized_key in normalized_sensitive_keys
+            or normalized_key.endswith(("_token", "_secret", "_password", "_credential"))
+        ):
+            return "«redacted-secret»"
+        if isinstance(value, dict):
+            return {
+                str(child_key): _approval_safe(child_value, str(child_key))
+                for child_key, child_value in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [_approval_safe(item) for item in value]
+        if isinstance(value, str):
+            return redact_sensitive_text(
+                value,
+                force=True,
+                redact_url_credentials=True,
+            )
+        return value
+
+    try:
+        encoded_args = json.dumps(
+            _approval_safe(args if isinstance(args, dict) else {}),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:
+        encoded_args = "{}"
+    display_target = redact_sensitive_text(
+        f"MCP {server_name}.{tool_name}\narguments: {encoded_args}",
+        force=True,
+        redact_url_credentials=True,
+    )
+    description = (
+        f"MCP tool '{tool_name}' on server '{server_name}' can modify "
+        "external state because readOnlyHint=true was not supplied."
+    )
+
+    if approval._get_approval_mode() == "smart":
+        verdict = approval._smart_approve(display_target, description)
+        if verdict == "approve":
+            return None
+        if verdict == "deny":
+            return tool_error(
+                f"MCP tool '{tool_name}' on server '{server_name}' was "
+                "BLOCKED by smart approval. The RPC was NOT sent. Do not "
+                "retry without explicit user direction."
+            )
+        # ESCALATE uses the normal human approval surface below.
+
+    answer = approval.request_elicitation_consent(
+        display_target,
+        description,
+        surface=f"mcp-tool/{server_name}",
+    )
+    if answer == "accept":
+        return None
+    return tool_error(
+        f"The user did not approve MCP tool '{tool_name}' on server "
+        f"'{server_name}'. The RPC was NOT sent. Do not retry without "
+        "explicit user direction."
+    )
+
 
 def _bump_server_error(server_name: str) -> None:
     """Increment the consecutive-failure count for ``server_name``.
@@ -3872,6 +4099,25 @@ def _handle_auth_error_and_retry(
     """
     if not _is_auth_error(exc):
         return None
+
+    # EvaOS lease auth already refreshed the per-app grant and replayed the
+    # HTTP request once inside EvaosLeaseHttpAuth.  A second 401 is terminal
+    # for this tool call; routing it through OAuth recovery would add another
+    # credential control and violate the exactly-once retry contract.
+    with _lock:
+        lease_server = _servers.get(server_name)
+    if (
+        lease_server is not None
+        and getattr(lease_server, "_auth_type", None) == "evaos_lease"
+    ):
+        _bump_server_error(server_name)
+        return tool_error(
+            f"MCP server '{server_name}' rejected managed authorization "
+            "after one lease refresh. Do NOT retry this tool; the managed "
+            "provider grant or profile authority must be repaired.",
+            needs_reauth=True,
+            server=server_name,
+        )
 
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
@@ -4883,6 +5129,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Approval must run before lazy first-use connection or any transport
+        # work.  A denial therefore cannot spawn the server or send an RPC.
+        approval_error = _mcp_tool_approval_check(
+            server_name,
+            tool_name,
+            args,
+        )
+        if approval_error is not None:
+            return approval_error
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5854,6 +6110,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     check_fn = _make_check_fn(name)
     candidates: List[dict] = []
 
+    _record_tool_approval_metadata(name, server._tools)
+
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
             logger.debug(
@@ -6006,6 +6264,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     "name": mcp_tool.name,
                     "description": mcp_tool.description or "",
                     "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
+                    "annotations": {
+                        "readOnlyHint": _annotation_read_only_hint(mcp_tool),
+                    },
                 })
             utility_payload = [
                 {"schema": entry["schema"], "handler_key": entry["handler_key"]}
@@ -6026,12 +6287,19 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 class _CachedMCPTool:
     """Minimal stand-in for MCP Tool objects loaded from the schema cache."""
 
-    __slots__ = ("name", "description", "inputSchema")
+    __slots__ = ("name", "description", "inputSchema", "annotations")
 
-    def __init__(self, name: str, description: str, inputSchema: dict):
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        inputSchema: dict,
+        annotations: Optional[dict] = None,
+    ):
         self.name = name
         self.description = description
         self.inputSchema = inputSchema or {}
+        self.annotations = annotations if isinstance(annotations, dict) else None
 
 
 def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]:
@@ -6068,9 +6336,27 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         return True
 
     check_fn = _make_check_fn(name)
-    for raw in tools_from_cache_entry(entry):
-        if not isinstance(raw, dict):
-            continue
+    cached_tools = [
+        raw
+        for raw in tools_from_cache_entry(entry)
+        if isinstance(raw, dict)
+    ]
+    _record_tool_approval_metadata(
+        name,
+        [
+            _CachedMCPTool(
+                raw.get("name") or "",
+                raw.get("description") or "",
+                raw.get("inputSchema")
+                if isinstance(raw.get("inputSchema"), dict)
+                else {},
+                annotations=raw.get("annotations"),
+            )
+            for raw in cached_tools
+            if raw.get("name")
+        ],
+    )
+    for raw in cached_tools:
         raw_name = raw.get("name")
         if not raw_name or not _should_register(raw_name):
             continue
@@ -6079,6 +6365,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             raw_name,
             raw.get("description") or "",
             raw_schema if isinstance(raw_schema, dict) else {},
+            annotations=raw.get("annotations"),
         )
         # Defense-in-depth: the cache file is user-writable JSON, so run the
         # same injection scan the eager discovery path applies.
@@ -6205,7 +6492,12 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
 
-    transport_type = "HTTP" if "url" in config else "stdio"
+    transport_type = (
+        "HTTP"
+        if "url" in config
+        or (config.get("auth") or "").lower().strip() == "evaos_lease"
+        else "stdio"
+    )
     logger.info(
         "MCP server '%s' (%s): registered %d tool(s): %s",
         name, transport_type, len(registered_names),
@@ -6928,6 +7220,7 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _tool_read_only_hints.clear()
         _stop_mcp_loop()
         return
 
@@ -6948,6 +7241,7 @@ def shutdown_mcp_servers():
             # stale per-server backoff from before the restart (#50394).
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _tool_read_only_hints.clear()
 
     with _lock:
         loop = _mcp_loop

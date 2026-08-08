@@ -114,6 +114,12 @@ _GLOBAL_ENV_EXACT = frozenset({
     # profile-scoped.
     "API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT",
     "API_SERVER_CORS_ORIGINS",
+    # Managed evaOS desktop broker location.  The endpoint, shared broker
+    # secret path, and systemd credential directory are deployment-level; the
+    # per-profile provider grant pointer intentionally remains scoped.
+    "EVAOS_DESKTOP_RUNTIME_SESSION_URL",
+    "PIPEDREAM_AGENT_BROKER_SECRET_FILE",
+    "CREDENTIALS_DIRECTORY",
 })
 _GLOBAL_ENV_PREFIXES = (
     "HERMES_KANBAN_",
@@ -270,11 +276,12 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build a profile's secret mapping from user and managed sources.
 
     Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
+    The active profile's root-owned managed ``.env`` is applied last and wins.
     """
     home = Path(hermes_home)
     secrets = load_env_file(home / ".env")
@@ -286,6 +293,30 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
         external_secrets = {}
 
     for key, value in external_secrets.items():
+        if _is_global_env(key):
+            continue
+        secrets[key] = value
+
+    # The shared gateway has one process environment, so distinct managed
+    # per-profile capability pointers cannot arrive through systemd
+    # Environment=. Resolve the managed profile directory under the exact home
+    # passed by the router, and merge its root-owned .env into this scope.
+    try:
+        from hermes_cli.managed_scope import load_managed_env
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_token = set_hermes_home_override(home)
+        try:
+            managed_secrets = load_managed_env()
+        finally:
+            reset_hermes_home_override(home_token)
+    except Exception:
+        managed_secrets = {}
+
+    for key, value in managed_secrets.items():
         if _is_global_env(key):
             continue
         secrets[key] = value

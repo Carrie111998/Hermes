@@ -251,6 +251,82 @@ class TestEnvFileParsing:
 
         assert ss.build_profile_secret_scope(profile) == {}
 
+    def test_managed_profile_env_wins_without_cross_profile_leakage(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        from hermes_cli import managed_scope
+
+        profile_root = tmp_path / "managed-profiles"
+        alpha_home = tmp_path / "profiles" / "alpha"
+        beta_home = tmp_path / "profiles" / "beta"
+        alpha_managed = profile_root / "alpha"
+        beta_managed = profile_root / "beta"
+        alpha_home.mkdir(parents=True)
+        beta_home.mkdir()
+        alpha_managed.mkdir(parents=True)
+        beta_managed.mkdir()
+        (alpha_home / ".env").write_text(
+            "PIPEDREAM_PROVIDER_GRANT_FILE=/user/alpha\n",
+            encoding="utf-8",
+        )
+        (beta_home / ".env").write_text(
+            "PIPEDREAM_PROVIDER_GRANT_FILE=/user/beta\n",
+            encoding="utf-8",
+        )
+        (alpha_managed / ".env").write_text(
+            "PIPEDREAM_PROVIDER_GRANT_FILE=%d/provider-alpha\n"
+            "CREDENTIALS_DIRECTORY=/wrong/managed-alpha\n",
+            encoding="utf-8",
+        )
+        (beta_managed / ".env").write_text(
+            "PIPEDREAM_PROVIDER_GRANT_FILE=%d/provider-beta\n"
+            "CREDENTIALS_DIRECTORY=/wrong/managed-beta\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(
+            "EVAOS_HERMES_MANAGED_PROFILE_ROOT",
+            str(profile_root),
+        )
+        monkeypatch.setenv(
+            "CREDENTIALS_DIRECTORY",
+            "/run/credentials/evaos-shared-gateway.service",
+        )
+        managed_scope.invalidate_managed_cache()
+
+        alpha_scope = ss.build_profile_secret_scope(alpha_home)
+        beta_scope = ss.build_profile_secret_scope(beta_home)
+
+        assert alpha_scope["PIPEDREAM_PROVIDER_GRANT_FILE"] == (
+            "%d/provider-alpha"
+        )
+        assert beta_scope["PIPEDREAM_PROVIDER_GRANT_FILE"] == (
+            "%d/provider-beta"
+        )
+        assert "CREDENTIALS_DIRECTORY" not in alpha_scope
+        assert "CREDENTIALS_DIRECTORY" not in beta_scope
+
+        ss.set_multiplex_active(True)
+        alpha_token = ss.set_secret_scope(alpha_scope)
+        try:
+            assert ss.get_secret("PIPEDREAM_PROVIDER_GRANT_FILE") == (
+                "%d/provider-alpha"
+            )
+            assert ss.get_secret("CREDENTIALS_DIRECTORY") == (
+                "/run/credentials/evaos-shared-gateway.service"
+            )
+        finally:
+            ss.reset_secret_scope(alpha_token)
+
+        beta_token = ss.set_secret_scope(beta_scope)
+        try:
+            assert ss.get_secret("PIPEDREAM_PROVIDER_GRANT_FILE") == (
+                "%d/provider-beta"
+            )
+        finally:
+            ss.reset_secret_scope(beta_token)
+
 
 class TestApiServerListenerGlobals:
     """API_SERVER listener settings are deployment config (#69379), not
