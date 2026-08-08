@@ -1618,7 +1618,37 @@ def _merge_disk_cooldown_state(
             _parse_absolute_timestamp,
         )
 
+        # An explicit `hermes auth reset` persists a clear marker. It is
+        # authoritative over cooldown snapshots created before the reset, but
+        # never over a provider failure observed afterward. This also prevents
+        # a stale long-running process from resurrecting the old cooldown.
+        entry_clear_at = (
+            _parse_absolute_timestamp(entry.get("status_cleared_at")) or 0.0
+        )
+        disk_clear_at = (
+            _parse_absolute_timestamp(disk_entry.get("status_cleared_at")) or 0.0
+        )
+        disk_status_at = (
+            _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
+        )
+        entry_status_at = (
+            _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
+        )
         disk_status = disk_entry.get("last_status")
+        if (
+            disk_status in (STATUS_DEAD, STATUS_EXHAUSTED)
+            and entry_clear_at > disk_status_at
+        ):
+            return entry
+        if disk_clear_at >= entry_status_at and entry.get("last_status"):
+            cleared_entry = dict(entry)
+            for status_field in _POOL_STATUS_FIELDS:
+                cleared_entry[status_field] = None
+            cleared_entry["status_cleared_at"] = disk_entry.get("status_cleared_at")
+            return cleared_entry
+        if disk_clear_at > entry_clear_at:
+            entry = {**entry, "status_cleared_at": disk_entry.get("status_cleared_at")}
+
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):
             return entry
         # A token change means the caller re-authed/refreshed this entry and

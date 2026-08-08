@@ -168,6 +168,7 @@ _EXTRA_KEYS = frozenset({
     # with the entry so a restart doesn't downgrade a billing bench back to a
     # 60s transient cooldown.
     "failure_reason",
+    "status_cleared_at",
 })
 
 
@@ -2284,6 +2285,7 @@ class CredentialPool:
         with self._lock:
             count = 0
             new_entries = []
+            cleared_at = time.time()
             for entry in self._entries:
                 if entry.last_status or entry.last_status_at or entry.last_error_code:
                     new_entries.append(
@@ -2295,6 +2297,7 @@ class CredentialPool:
                             last_error_reason=None,
                             last_error_message=None,
                             last_error_reset_at=None,
+                            extra={**entry.extra, "status_cleared_at": cleared_at},
                         )
                     )
                     count += 1

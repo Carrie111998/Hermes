@@ -288,3 +288,50 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_explicit_pool_reset_beats_old_cooldown_but_not_new_failure(classic_env):
+    """Reset is authoritative over old state, without masking later failures."""
+    from agent.credential_pool import load_pool
+    from hermes_cli.auth import write_credential_pool
+
+    old_status_at = time.time() - 60
+    original = _pool_entry(
+        auth_type="oauth",
+        source="manual:device_code",
+        last_status="exhausted",
+        last_status_at=old_status_at,
+        last_error_code=None,
+        last_error_reason=None,
+        last_error_message=None,
+        last_error_reset_at=None,
+    )
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openai-codex": [original],
+    }))
+
+    pool = load_pool("openai-codex")
+    assert pool.reset_statuses() == 1
+    reset_entry = json.loads((classic_env / "auth.json").read_text())[
+        "credential_pool"
+    ]["openai-codex"][0]
+    assert reset_entry["last_status"] is None
+    cleared_at = reset_entry["status_cleared_at"]
+    assert cleared_at > old_status_at
+
+    # A stale process cannot resurrect the pre-reset cooldown.
+    write_credential_pool("openai-codex", [original])
+    after_stale = json.loads((classic_env / "auth.json").read_text())[
+        "credential_pool"
+    ]["openai-codex"][0]
+    assert after_stale["last_status"] is None
+    assert after_stale["status_cleared_at"] == cleared_at
+
+    # A genuinely newer provider failure remains authoritative.
+    newer = {**original, "last_status_at": cleared_at + 1, "last_error_code": 429}
+    write_credential_pool("openai-codex", [newer])
+    after_new_failure = json.loads((classic_env / "auth.json").read_text())[
+        "credential_pool"
+    ]["openai-codex"][0]
+    assert after_new_failure["last_status"] == "exhausted"
+    assert after_new_failure["last_error_code"] == 429
