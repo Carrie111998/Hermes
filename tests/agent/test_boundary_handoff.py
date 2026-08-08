@@ -1,8 +1,7 @@
 """Regression coverage for incomplete-task boundary handoffs (#80772).
 
-Covers both implementation and planning shapes: remaining todos + a vague
-progress summary is an invalid terminal state; a self-contained handoff or
-clear completion claim is allowed.
+Structured evidence only: remaining todos + whether ``clarify`` ran this
+turn. Freeform English (or any language) summaries are not a valid pause.
 """
 
 from __future__ import annotations
@@ -17,8 +16,6 @@ from agent.boundary_handoff import (
     has_remaining_work,
     is_valid_terminal_for_remaining_work,
     remaining_todo_items,
-    response_has_blocker_or_clarification,
-    response_has_completion_claim,
     turn_called_clarify,
 )
 from tools.todo_tool import TodoStore
@@ -33,6 +30,20 @@ def _store(*items):
         ]
     )
     return store
+
+
+def _clarify_assistant():
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "1",
+                "type": "function",
+                "function": {"name": "clarify", "arguments": "{}"},
+            }
+        ],
+    }
 
 
 # ── Policy unit tests ────────────────────────────────────────────────
@@ -53,61 +64,18 @@ def test_remaining_work_from_active_todos_only():
 def test_no_remaining_work_when_todos_settled():
     store = _store(("a", "completed"), ("b", "cancelled"))
     assert has_remaining_work(store) is False
-    assert build_boundary_handoff_nudge(todo_store=store, final_response="summary") is None
+    assert is_valid_terminal_for_remaining_work(todo_store=store) is True
+    assert build_boundary_handoff_nudge(todo_store=store) is None
 
 
-def test_partial_progress_summary_is_invalid_terminal():
-    text = (
-        "I finished the skill-local gate and verified the unit tests. "
-        "The scheduler integration is next."
-    )
-    assert response_has_completion_claim(text) is False
-    assert response_has_blocker_or_clarification(text) is False
-    assert is_valid_terminal_for_remaining_work(text) is False
+def test_partial_progress_summary_is_invalid_when_todos_remain():
+    store = _store(("scheduler scripts write", "pending"))
+    assert is_valid_terminal_for_remaining_work(todo_store=store, messages=[]) is False
 
 
-def test_implementation_boundary_handoff_is_valid_terminal():
-    text = (
-        "Completed and verified the skill-local gate. Remaining work is the "
-        "scripts-tree scheduler write outside this workspace boundary. No live "
-        "or external state changed. Should I proceed with that write?"
-    )
-    assert response_has_blocker_or_clarification(text) is True
-    assert is_valid_terminal_for_remaining_work(text) is True
-
-
-def test_clear_completion_claim_is_valid_terminal():
-    text = "The implementation is complete. All requested work is done."
-    assert response_has_completion_claim(text) is True
-    assert is_valid_terminal_for_remaining_work(text) is True
-
-
-def test_planning_partial_summary_nudges():
-    store = _store(
-        ("outline API shape", "completed"),
-        ("choose storage backend", "pending"),
-        ("write rollout plan", "pending"),
-    )
-    partial = (
-        "I outlined the API shape. Next I will choose a storage backend and "
-        "draft the rollout plan."
-    )
-    nudge = build_boundary_handoff_nudge(
-        todo_store=store,
-        final_response=partial,
-        attempts=0,
-    )
-    assert nudge is not None
-    assert "Outstanding items" in nudge
-    assert "choose storage backend" in nudge
-    assert "decision or authorization" in nudge
-
-
-def test_planning_valid_pause_does_not_nudge():
-    store = _store(
-        ("outline API shape", "completed"),
-        ("choose storage backend", "pending"),
-    )
+def test_english_handoff_prose_alone_is_not_valid_terminal():
+    """Prose handoffs are ignored — language-agnostic structured gate."""
+    store = _store(("choose storage backend", "pending"))
     handoff = (
         "Completed the API outline. Remaining work is choosing the storage "
         "backend — that needs your approval before I continue. No external "
@@ -116,74 +84,85 @@ def test_planning_valid_pause_does_not_nudge():
     assert (
         build_boundary_handoff_nudge(
             todo_store=store,
-            final_response=handoff,
+            messages=[{"role": "assistant", "content": handoff}],
             attempts=0,
         )
-        is None
+        is not None
     )
 
 
-def test_implementation_partial_summary_nudges():
-    store = _store(
-        ("skill-local gate", "completed"),
-        ("scheduler scripts write", "pending"),
-    )
-    partial = (
-        "Implemented and tested the skill-local gate. Stopping here for now."
-    )
+def test_non_english_summary_also_nudges():
+    store = _store(("scheduler scripts write", "pending"))
     nudge = build_boundary_handoff_nudge(
         todo_store=store,
-        final_response=partial,
+        messages=[{"role": "assistant", "content": "技能侧门已完成，调度脚本待定。"}],
         attempts=0,
     )
     assert nudge is not None
+    assert "clarify" in nudge
     assert "scheduler scripts write" in nudge
-    assert "self-contained" in nudge.lower() or "actionable" in nudge.lower()
 
 
-def test_clarify_tool_already_asked_skips_nudge():
+def test_planning_partial_summary_nudges():
+    store = _store(
+        ("outline API shape", "completed"),
+        ("choose storage backend", "pending"),
+        ("write rollout plan", "pending"),
+    )
+    nudge = build_boundary_handoff_nudge(
+        todo_store=store,
+        messages=[{"role": "assistant", "content": "Outlined the API. Next steps later."}],
+        attempts=0,
+    )
+    assert nudge is not None
+    assert "Outstanding items" in nudge
+    assert "choose storage backend" in nudge
+    assert "`clarify`" in nudge
+
+
+def test_clarify_in_same_turn_skips_nudge_even_after_text_reply():
     store = _store(("remaining step", "pending"))
     messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "1",
-                    "type": "function",
-                    "function": {"name": "clarify", "arguments": "{}"},
-                }
-            ],
-        }
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {"role": "tool", "name": "clarify", "content": '{"user_response":"wait"}'},
+        {"role": "assistant", "content": "Paused pending your decision."},
     ]
     assert turn_called_clarify(messages) is True
-    assert (
-        build_boundary_handoff_nudge(
-            todo_store=store,
-            final_response="Waiting.",
-            messages=messages,
-        )
-        is None
-    )
+    assert is_valid_terminal_for_remaining_work(todo_store=store, messages=messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
 
 
-def test_nudge_budget_and_disable_gates():
+def test_synthetic_nudge_does_not_reset_clarify_window():
     store = _store(("remaining step", "pending"))
-    partial = "Finished the first half."
+    messages = [
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {
+            "role": "user",
+            "content": "[System: nudge]",
+            "_boundary_handoff_synthetic": True,
+        },
+        {"role": "assistant", "content": "Still waiting."},
+    ]
+    assert turn_called_clarify(messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
+
+
+def test_nudge_budget_disable_and_clarify_unavailable():
+    store = _store(("remaining step", "pending"))
     assert (
-        build_boundary_handoff_nudge(
-            todo_store=store,
-            final_response=partial,
-            attempts=2,
-        )
+        build_boundary_handoff_nudge(todo_store=store, attempts=2) is None
+    )
+    assert (
+        build_boundary_handoff_nudge(todo_store=store, attempts=0, enabled=False)
         is None
     )
     assert (
         build_boundary_handoff_nudge(
             todo_store=store,
-            final_response=partial,
             attempts=0,
-            enabled=False,
+            clarify_available=False,
         )
         is None
     )
@@ -231,6 +210,8 @@ def agent(tmp_path, monkeypatch):
     instance._task_completion_guidance = True
     instance._cleanup_task_resources = lambda *_a, **_kw: None
     instance._save_trajectory = lambda *_a, **_kw: None
+    # Guard only fires when clarify is in the live toolset.
+    instance.valid_tool_names = {"clarify", "todo"}
     instance._todo_store = _store(
         ("skill-local gate", "completed"),
         ("scheduler scripts write", "pending"),
@@ -238,20 +219,25 @@ def agent(tmp_path, monkeypatch):
     return instance
 
 
-def test_loop_rejects_ambiguous_stop_then_accepts_handoff(agent):
+def test_loop_rejects_ambiguous_stop_then_accepts_when_todos_settled(agent):
     partial = (
         "I finished the skill-local gate and verified tests. "
         "Scheduler integration is still pending."
     )
-    handoff = (
-        "Completed and verified the skill-local gate. Remaining work is the "
-        "scheduler scripts write outside this repository boundary. No live or "
-        "external state changed. Should I proceed with that write?"
-    )
-    replies = [_response(partial), _response(handoff)]
+    done = "All outstanding todos are complete."
 
     def model_call(_api_kwargs):
-        return replies.pop(0)
+        if not hasattr(model_call, "n"):
+            model_call.n = 0
+        model_call.n += 1
+        if model_call.n == 1:
+            return _response(partial)
+        # After the nudge, settle todos then stop — structured completion.
+        agent._todo_store = _store(
+            ("skill-local gate", "completed"),
+            ("scheduler scripts write", "completed"),
+        )
+        return _response(done)
 
     agent._interruptible_api_call = model_call
 
@@ -261,24 +247,49 @@ def test_loop_rejects_ambiguous_stop_then_accepts_handoff(agent):
     ):
         result = agent.run_conversation("implement the dual-repo plan")
 
-    assert result["final_response"] == handoff
+    assert result["final_response"] == done
     assert agent._boundary_handoff_nudges == 1
-    # Synthetic nudge stripped from returned history; assistant handoff remains.
-    roles = [message["role"] for message in result["messages"]]
-    assert roles[0] == "user"
-    assert "assistant" in roles
     assert not any(
         isinstance(message, dict) and message.get("_boundary_handoff_synthetic")
         for message in result["messages"]
     )
 
 
-def test_loop_accepts_valid_boundary_pause_without_nudge(agent):
+def test_loop_english_handoff_without_clarify_still_nudges(agent):
     handoff = (
         "Completed and verified the skill-local gate. Remaining work is the "
         "scheduler scripts write at a workspace boundary. No external state "
         "changed. Do you want me to continue with that write?"
     )
+    settled = "Marked remaining todos complete after your go-ahead path."
+
+    def model_call(_api_kwargs):
+        if not hasattr(model_call, "n"):
+            model_call.n = 0
+        model_call.n += 1
+        if model_call.n == 1:
+            return _response(handoff)
+        agent._todo_store = _store(
+            ("skill-local gate", "completed"),
+            ("scheduler scripts write", "completed"),
+        )
+        return _response(settled)
+
+    agent._interruptible_api_call = model_call
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("implement the dual-repo plan")
+
+    assert result["final_response"] == settled
+    assert agent._boundary_handoff_nudges == 1
+
+
+def test_loop_skips_guard_when_clarify_not_in_toolset(agent):
+    agent.valid_tool_names = {"todo"}
+    handoff = "Stopped at the workspace boundary without calling clarify."
     agent._interruptible_api_call = lambda _kwargs: _response(handoff)
 
     with (

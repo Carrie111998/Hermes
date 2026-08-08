@@ -338,8 +338,7 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 #      the blocker.  (Observed on DeepSeek v4-flash on the same task:
 #      pushed through PEP-668 wall, then returned fabricated listings.)
 #   3. Ending with a partial-progress summary at a legitimate implementation
-#      boundary without identifying the unfinished scope or asking for the
-#      decision needed to continue.
+#      boundary without calling `clarify` (or clearing remaining todos).
 #
 # Short on purpose.  This block is shipped to every user, every session,
 # in the cached system prompt — token cost is paid once at install and
@@ -359,10 +358,10 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result.\n"
     "If work must pause at a permission, safety, workspace, repository, or "
     "external-system boundary, do not end with a partial-progress summary alone. "
-    "Give a self-contained handoff stating what you completed and verified, what "
-    "remains, the exact boundary or blocker, whether any live or external state "
-    "changed, and the decision or authorization needed to continue. Ask for that "
-    "decision explicitly."
+    "Call `clarify` with a self-contained question stating what you completed "
+    "and verified, what remains, the exact boundary or blocker, whether any live "
+    "or external state changed, and the decision or authorization needed to "
+    "continue. Otherwise finish the remaining work and mark those todos completed."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.

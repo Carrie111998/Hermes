@@ -55,14 +55,16 @@ class TestGuidanceConstants:
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
-    def test_task_completion_guidance_requires_actionable_boundary_handoff(self):
+    def test_task_completion_guidance_requires_clarify_at_boundary(self):
         guidance = TASK_COMPLETION_GUIDANCE.lower()
 
+        assert "`clarify`" in TASK_COMPLETION_GUIDANCE
         assert "completed and verified" in guidance
         assert "what remains" in guidance
         assert "exact boundary or blocker" in guidance
         assert "live or external state" in guidance
         assert "decision or authorization" in guidance
+        assert "mark those todos completed" in guidance
 
 
 # =========================================================================

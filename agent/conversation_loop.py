@@ -7156,21 +7156,22 @@ def run_conversation(
                     continue
 
                 # ── Incomplete-task boundary handoff guard (#80772) ────
-                # When todos still show remaining work, a final reply that is
-                # neither a completion claim nor a blocker/clarification
-                # handoff is an invalid terminal state. Nudge for an
-                # actionable pause instead of accepting a vague summary.
+                # When todos still show remaining work, a text-only stop
+                # without `clarify` this turn is an invalid terminal state.
+                # Structured evidence only (todo store + clarify tool call) —
+                # do not parse freeform prose.
                 try:
                     from agent.boundary_handoff import build_boundary_handoff_nudge
 
+                    _valid_tools = getattr(agent, "valid_tool_names", None) or ()
                     _handoff_nudge = build_boundary_handoff_nudge(
                         todo_store=getattr(agent, "_todo_store", None),
-                        final_response=final_response,
                         messages=messages + [final_msg],
                         attempts=getattr(agent, "_boundary_handoff_nudges", 0),
                         enabled=bool(
                             getattr(agent, "_task_completion_guidance", True)
                         ),
+                        clarify_available="clarify" in _valid_tools,
                     )
                 except Exception:
                     logger.debug("boundary handoff stop-loop check failed", exc_info=True)
