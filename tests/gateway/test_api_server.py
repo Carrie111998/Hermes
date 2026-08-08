@@ -816,14 +816,14 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_session_chat_stream_forwards_moa_fanout_events(self, adapter):
-        """MoA fan-out must reach the session SSE client as real frames.
+        """The whole MoA family must reach the session SSE client as real frames.
 
-        ``build_moa_facade`` (``agent/moa_loop.py``) relays ``moa.reference`` /
-        ``moa.aggregating`` onto ``tool_progress_callback``. The session stream
-        used to match only ``reasoning.available`` and the ``tool.*`` family, so
-        a council run went silent between ``message.started`` and
-        ``run.completed``. Assert on the serialized SSE frames — a mock-level
-        check would pass even if nothing were written to the wire.
+        ``build_moa_facade`` (``agent/moa_loop.py``) relays all four MoA events
+        onto ``tool_progress_callback``. The session stream used to match only
+        ``reasoning.available`` and the ``tool.*`` family, so a council run went
+        silent between ``message.started`` and ``run.completed``. Assert on the
+        serialized SSE frames — a mock-level check would pass even if nothing
+        were written to the wire.
         """
         app = _create_app(adapter)
 
@@ -832,8 +832,18 @@ class TestChatCompletionsEndpoint:
             assert cb is not None, "session stream must pass tool_progress_callback"
             # Positional signature is fixed by the relay in agent/moa_loop.py:
             # (event, label, text, args, **kwargs).
+            #
+            # Emission ORDER is fixed there too, and is not interleaved: every
+            # moa.progress fires from the progress_callback while
+            # _run_references_parallel is still running, and the moa.reference
+            # blocks are only emitted once it returns. Then the phase
+            # transition, then moa.aggregating. Mirrored here so the ordering
+            # assertion below tests the real contract.
+            cb("moa.progress", "openrouter:ref-a", None, None, moa_refs_done=1, moa_refs_total=2)
+            cb("moa.progress", "openrouter:ref-b", None, None, moa_refs_done=2, moa_refs_total=2)
             cb("moa.reference", "openrouter:ref-a", "Answer A.", None, moa_index=1, moa_count=2)
             cb("moa.reference", "openrouter:ref-b", "Answer B.", None, moa_index=2, moa_count=2)
+            cb("moa.phase", "nous:aggregator", None, None, moa_phase="aggregator", moa_refs_done=2, moa_refs_total=2)
             cb("moa.aggregating", "nous:aggregator", None, None, moa_ref_count=2)
             return (
                 {"final_response": "merged", "messages": [], "api_calls": 1},
@@ -867,11 +877,19 @@ class TestChatCompletionsEndpoint:
                 frames.append((name, json.loads(data)))
 
         names = [name for name, _ in frames]
-        assert names.count("moa.reference") == 2, names
-        assert names.count("moa.aggregating") == 1, names
+        # One assertion for counts AND relative order: a subsequence check
+        # catches a dropped event and a reordered one, which two separate
+        # index() comparisons would not.
+        assert [n for n in names if n.startswith("moa.")] == [
+            "moa.progress",
+            "moa.progress",
+            "moa.reference",
+            "moa.reference",
+            "moa.phase",
+            "moa.aggregating",
+        ], names
         # Fan-out lands after the message opens and before the turn closes.
-        assert names.index("message.started") < names.index("moa.reference")
-        assert names.index("moa.reference") < names.index("moa.aggregating")
+        assert names.index("message.started") < names.index("moa.progress")
         assert names.index("moa.aggregating") < names.index("run.completed")
 
         started = next(p for n, p in frames if n == "message.started")
@@ -882,15 +900,28 @@ class TestChatCompletionsEndpoint:
         assert [r["text"] for r in refs] == ["Answer A.", "Answer B."]
         assert [r["index"] for r in refs] == [1, 2]
         assert [r["count"] for r in refs] == [2, 2]
-        for ref in refs:
-            assert ref["message_id"] == message_id
-            assert ref["session_id"] == "s1"
+
+        progress = [p for n, p in frames if n == "moa.progress"]
+        assert [p["label"] for p in progress] == ["openrouter:ref-a", "openrouter:ref-b"]
+        assert [p["refs_done"] for p in progress] == [1, 2]
+        assert [p["refs_total"] for p in progress] == [2, 2]
+
+        phase = next(p for n, p in frames if n == "moa.phase")
+        assert phase["phase"] == "aggregator"
+        assert phase["aggregator"] == "nous:aggregator"
+        assert phase["refs_done"] == 2
+        assert phase["refs_total"] == 2
 
         agg = next(p for n, p in frames if n == "moa.aggregating")
         assert agg["aggregator"] == "nous:aggregator"
         assert agg["ref_count"] == 2
-        assert agg["message_id"] == message_id
-        assert agg["session_id"] == "s1"
+
+        # Every MoA frame is attributable to the turn that produced it.
+        for _name, payload in frames:
+            if not _name.startswith("moa."):
+                continue
+            assert payload["message_id"] == message_id, _name
+            assert payload["session_id"] == "s1", _name
 
 
     @pytest.mark.asyncio

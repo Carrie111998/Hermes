@@ -648,10 +648,10 @@ class TestRunCallbackMoAEvents:
     """MoA progress events must reach /v1/runs SSE clients.
 
     The relay ``build_moa_facade`` installs (``agent/moa_loop.py``) forwards
-    ``moa.reference`` / ``moa.aggregating`` onto the agent's
-    ``tool_progress_callback`` — the same callback the CLI and TUI already
-    consume. The run callback must forward them rather than drop them on the
-    closed match set.
+    all four MoA events — ``moa.progress``, ``moa.reference``, ``moa.phase``
+    and ``moa.aggregating`` — onto the agent's ``tool_progress_callback``, the
+    same callback the CLI and TUI already consume. The run callback must
+    forward them rather than drop them on the closed match set.
     """
 
     @pytest.mark.asyncio
@@ -688,6 +688,54 @@ class TestRunCallbackMoAEvents:
         assert event["run_id"] == run_id
         assert event["aggregator"] == "aggregator-model"
         assert event["ref_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_run_callback_forwards_moa_progress(self, adapter):
+        """The tick that lets a client show N/M during the fan-out."""
+        run_id = "run_moa_progress"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._run_streams[run_id] = q
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+
+        # Relay puts the finished slot label in tool_name, counters in kwargs.
+        callback("moa.progress", "reference-1", None, None, moa_refs_done=1, moa_refs_total=3)
+        await asyncio.sleep(0.05)
+
+        event = q.get_nowait()
+        assert event["event"] == "moa.progress"
+        assert event["run_id"] == run_id
+        assert event["label"] == "reference-1"
+        assert event["refs_done"] == 1
+        assert event["refs_total"] == 3
+
+    @pytest.mark.asyncio
+    async def test_run_callback_forwards_moa_phase(self, adapter):
+        """The aggregator transition, for clients tracking one event family."""
+        run_id = "run_moa_phase"
+        q: asyncio.Queue = asyncio.Queue()
+        adapter._run_streams[run_id] = q
+        callback = adapter._make_run_event_callback(run_id, asyncio.get_running_loop())
+
+        # Here the second positional carries the AGGREGATOR slot, not a
+        # reference label — the relay reuses the same argument for both events.
+        callback(
+            "moa.phase",
+            "aggregator-model",
+            None,
+            None,
+            moa_phase="aggregator",
+            moa_refs_done=3,
+            moa_refs_total=3,
+        )
+        await asyncio.sleep(0.05)
+
+        event = q.get_nowait()
+        assert event["event"] == "moa.phase"
+        assert event["run_id"] == run_id
+        assert event["phase"] == "aggregator"
+        assert event["aggregator"] == "aggregator-model"
+        assert event["refs_done"] == 3
+        assert event["refs_total"] == 3
 
     @pytest.mark.asyncio
     async def test_run_callback_ignores_unknown_event_types(self, adapter):
