@@ -4021,7 +4021,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
         )
         assert ("on_session_reset", "session-key") in hooks
     finally:
-        server._sessions.pop(sid, None)
+        server._teardown_session(server._sessions.pop(sid, None))
 
 
 def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypatch):
