@@ -11,11 +11,24 @@ import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
-import { persistentAtom } from '@/lib/persisted'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
+import { requestFreshSession } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  normalizeProfileKey
+} from '@/store/profile-identity'
+import {
+  $activeProjectId,
+  $projects,
+  $projectScope,
+  $projectTree,
+  $projectTreeLoading,
+  ALL_PROJECTS,
+  exitProjectScope
+} from '@/store/projects-cache-state'
 import {
   $currentCwd,
   $selectedStoredSessionId,
@@ -28,20 +41,21 @@ import {
 import { $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
+// Re-export cache atoms so existing `@/store/projects` imports keep working.
+export {
+  $activeProjectId,
+  $projects,
+  $projectScope,
+  $projectTree,
+  $projectTreeLoading,
+  ALL_PROJECTS,
+  exitProjectScope
+}
+
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
 // served by the live gateway's `projects.*` JSON-RPC methods, which wrap the
 // per-profile projects.db store. The sidebar groups sessions by project folder
 // membership; these atoms are the renderer's cached view.
-
-export const $projects = atom<ProjectInfo[]>([])
-export const $activeProjectId = atom<null | string>(null)
-
-// The authoritative project -> repo -> lane tree (overview), served by
-// `projects.tree`. Lanes carry counts + structure; per-project session rows are
-// fetched lazily on drill-in via `fetchProjectSessions`. This is the single
-// source of project membership — the desktop no longer derives it.
-export const $projectTree = atom<SidebarProjectTree[]>([])
-export const $projectTreeLoading = atom(false)
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -136,22 +150,6 @@ export const endSessionMutation = (ids: Array<null | string | undefined>): void 
 // True while the disk scan is in flight (drives the "finding repos" hint).
 export const $reposScanning = atom(false)
 
-// ── Project scope (the "you're inside a project" view, mirroring profile scope)─
-// The sidebar's grouped view is a project switcher: ALL_PROJECTS shows the
-// project overview (a list you drill into), and a concrete id means you've
-// "entered" that project so only its worktrees/branches/sessions show. This is
-// pure view state (localStorage), distinct from the durable active-project
-// pointer in projects.db — though entering a project also makes it active so new
-// chats land there, exactly as selecting a profile does.
-export const ALL_PROJECTS = '__all_projects__'
-
-const PROJECT_SCOPE_KEY = 'hermes.desktop.projectScope'
-
-export const $projectScope = persistentAtom<string>(PROJECT_SCOPE_KEY, ALL_PROJECTS, {
-  decode: raw => raw || ALL_PROJECTS,
-  encode: value => value || ALL_PROJECTS
-})
-
 // Enter a project: scope the sidebar to it and make it the active project
 // (best-effort — the durable pointer is nice-to-have, the view scope is the
 // point). Never opens a session.
@@ -164,10 +162,6 @@ export function enterProject(id: string): void {
   if (id.startsWith('p_')) {
     void setActiveProject(id).catch(() => undefined)
   }
-}
-
-export function exitProjectScope(): void {
-  $projectScope.set(ALL_PROJECTS)
 }
 
 // A project's working root: its primary folder, else the first repo that has
@@ -200,13 +194,43 @@ export function goToProject(id: string, options?: { newSession?: boolean }): voi
   }
 }
 
+/** Profile that owns the next new chat (switcher may set $newChatProfile first). */
+function targetProfileForNewSession(): string {
+  return normalizeProfileKey($newChatProfile.get() || $activeGatewayProfile.get() || 'default')
+}
+
+function sessionProfileKey(session: { profile?: null | string } | undefined): string {
+  return normalizeProfileKey((session?.profile ?? '').trim() || 'default')
+}
+
+/** Primary path of this profile's durable active project (projects.db). */
+export function activeProjectPrimaryPath(): string {
+  const id = $activeProjectId.get()
+
+  if (!id) {
+    return ''
+  }
+
+  const fromTree = projectRootCwd($projectTree.get().find(node => node.id === id))
+
+  if (fromTree) {
+    return fromTree
+  }
+
+  const project = $projects.get().find(p => p.id === id)
+
+  return (project?.primary_path ?? project?.folders?.[0]?.path ?? '').trim()
+}
+
 // The cwd a NEW chat should start in.
 //
 // Priority (first hit wins):
 //   1. Explicit sidebar project scope (drilled into a project / Home bucket)
-//   2. The FOCUSED session's workspace — so ⌘N / ⌘T from a chat that's already
-//      in a project/worktree stay there without requiring a sidebar drill-in
-//   3. Configured default project dir / remote remembered cwd (detached otherwise)
+//      — only when that id still exists on the CURRENT profile's tree
+//   2. The FOCUSED session's workspace — only when that session belongs to
+//      the target profile (never cross-profile; #79406)
+//   3. This profile's durable active project primary_path (projects.db)
+//   4. Configured default project dir / remote remembered cwd (detached otherwise)
 //
 // The "active project" is just an atom ($projectScope) — so when you're inside
 // a project, a new session (cmd-n, the trunk "+") starts at that project's root
@@ -223,6 +247,8 @@ export function resolveNewSessionCwd(): string {
   }
 
   if (scope !== ALL_PROJECTS) {
+    // Stale scope ids from another profile must not win after a switch —
+    // the previous tree can still be in memory until projects.tree returns.
     const cwd = projectRootCwd($projectTree.get().find(node => node.id === scope))
 
     if (cwd) {
@@ -230,13 +256,23 @@ export function resolveNewSessionCwd(): string {
     }
   }
 
-  // Inherit the focused chat's workspace. ⌘N/⌘T from a session that already
-  // has a project/pwd should stay there — drilling into the sidebar project
-  // is the uncommon path, not the requirement.
+  // Inherit the focused chat's workspace only when it belongs to the profile
+  // that will own the new session. Cross-profile inheritance is what loads the
+  // wrong AGENTS.md after a profile switch (#79406).
   const focusedCwd = focusedSessionWorkspaceCwd()
 
   if (focusedCwd) {
     return focusedCwd
+  }
+
+  // Prefer this profile's projects.db active project before the configured
+  // default — the durable pin survives the switch once the new gateway's
+  // projects.tree lands (and clearProjectsCacheForProfileSwitch avoids the
+  // previous profile's active_id leaking in the meantime).
+  const activePath = activeProjectPrimaryPath()
+
+  if (activePath) {
+    return activePath
   }
 
   return workspaceCwdForNewSession()
@@ -246,6 +282,8 @@ export function resolveNewSessionCwd(): string {
 function focusedSessionWorkspaceCwd(): string {
   const focusedStoredId = $focusedStoredSessionId.get()
   const state = $focusedSessionState.get()
+  const targetProfile = targetProfileForNewSession()
+  const sessions = $sessions.get()
 
   // Prefer the live runtime slice when it belongs to the focused chat
   // (agent can relocate mid-turn). Cold tabs / mid-switch lag fall through
@@ -258,28 +296,55 @@ function focusedSessionWorkspaceCwd(): string {
     (!focusedStoredId ||
       !stateStoredId ||
       stateStoredId === focusedStoredId ||
-      idsShareLineage(focusedStoredId, stateStoredId, $sessions.get()))
+      idsShareLineage(focusedStoredId, stateStoredId, sessions))
   ) {
-    return stateCwd
+    // Gate by profile: a still-focused row from the previous profile must not
+    // seed the next chat after selectProfile (#79406).
+    const owner =
+      sessions.find(s => sessionMatchesStoredId(s, focusedStoredId || stateStoredId || '')) ??
+      sessions.find(s => sessionMatchesStoredId(s, stateStoredId || focusedStoredId || ''))
+
+    if (!owner || sessionProfileKey(owner) === targetProfile) {
+      // No row yet (draft) — only accept state cwd when we are not mid
+      // profile-switch to a different profile than the live gateway.
+      if (!owner) {
+        const liveProfile = normalizeProfileKey($activeGatewayProfile.get() || 'default')
+
+        if (liveProfile === targetProfile) {
+          return stateCwd
+        }
+      } else {
+        return stateCwd
+      }
+    }
   }
 
   if (focusedStoredId) {
-    const row = $sessions.get().find(s => sessionMatchesStoredId(s, focusedStoredId))
+    const row = sessions.find(s => sessionMatchesStoredId(s, focusedStoredId))
     const rowCwd = row?.cwd?.trim() || ''
 
-    if (rowCwd) {
+    if (rowCwd && sessionProfileKey(row) === targetProfile) {
       return rowCwd
     }
 
-    // Focused a real session with no workspace → stay detached. Do NOT fall
-    // through to `$currentCwd` (it may still hold a remembered path from an
-    // earlier chat and would re-attach a project the user left).
+    // Focused a real session with no workspace, or a foreign-profile session
+    // still in the list mid-switch → do not fall through to `$currentCwd`
+    // (it may still hold a remembered path from the previous profile).
+    if (row) {
+      return ''
+    }
+
     return ''
   }
 
   // No focused stored session: primary draft. The composer atom is the draft's
-  // workspace target (set by startFreshSession / startSessionInWorkspace).
-  return $currentCwd.get().trim()
+  // workspace target (set by startFreshSession / startSessionInWorkspace) —
+  // only trust it for the target profile.
+  if (normalizeProfileKey($activeGatewayProfile.get() || 'default') === targetProfile) {
+    return $currentCwd.get().trim()
+  }
+
+  return ''
 }
 
 const underPath = (parent: string, child: string): boolean =>

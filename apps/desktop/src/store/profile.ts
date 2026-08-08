@@ -12,17 +12,18 @@ import {
   storedStringRecord
 } from '@/lib/storage'
 import { $gateway, ensureGatewayForProfile, openGatewayForProfile } from '@/store/gateway'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  normalizeProfileKey
+} from '@/store/profile-identity'
+import { clearProjectsCacheForProfileSwitch } from '@/store/profile-projects-boundary'
 import { setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
-// Canonical key for a profile: trimmed, empty → "default". Used everywhere we
-// compare a session's owning profile against the live gateway's profile.
-export function normalizeProfileKey(name: string | null | undefined): string {
-  const value = (name ?? '').trim()
-
-  return value || 'default'
-}
+// Re-export identity helpers so existing `@/store/profile` imports keep working.
+export { $activeGatewayProfile, $newChatProfile, normalizeProfileKey }
 
 // The profile the running local backend is actually scoped to (mirrors
 // /api/profiles/active `current`). "default" is the root ~/.hermes. This is the
@@ -145,14 +146,6 @@ export async function switchProfile(name: string): Promise<void> {
 // differs from the gateway's current profile, we lazily reconnect the single
 // gateway to that profile's backend (spawned on demand by the Electron pool).
 // A single-profile user never triggers a swap, so their path is unchanged.
-
-// The profile the live gateway WebSocket is currently connected to. Initialized
-// to the primary (window) backend's profile on boot.
-export const $activeGatewayProfile = atom<string>('default')
-
-// Profile for the NEXT new chat (chosen via the new-chat picker). null = primary
-// / default, so single-profile users are unaffected.
-export const $newChatProfile = atom<string | null>(null)
 
 // Bumped whenever the open session should be dropped for a fresh new-session
 // draft: a profile switch/create (below), or deleting the project that owns the
@@ -342,6 +335,10 @@ export function selectProfile(name: string): void {
   $newChatProfile.set(target)
 
   if (switching) {
+    // Drop the previous profile's project scope/tree before the fresh draft
+    // resolves cwd — otherwise resolveNewSessionCwd can still see the old
+    // projects.db snapshot and attach the wrong AGENTS.md (#79406).
+    clearProjectsCacheForProfileSwitch()
     requestFreshSession()
   }
 
@@ -356,7 +353,13 @@ export function selectProfile(name: string): void {
 // message lands in the right place.
 export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  const switching = target !== normalizeProfileKey($activeGatewayProfile.get())
   $newChatProfile.set(target)
+
+  if (switching) {
+    clearProjectsCacheForProfileSwitch()
+  }
+
   requestFreshSession()
   void ensureGatewayProfile(target)
 }

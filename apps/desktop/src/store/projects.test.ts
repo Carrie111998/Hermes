@@ -3,11 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $sidebarAgentsGrouped } from '@/store/layout'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
 import {
   $activeProjectId,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
@@ -119,6 +120,9 @@ describe('resolveNewSessionCwd', () => {
     $currentCwd.set('')
     $selectedStoredSessionId.set(null)
     $sessions.set([])
+    $activeProjectId.set(null)
+    $projectTree.set([])
+    $projects.set([])
     // Reset focused-session projections by clearing the inputs they read.
     // $focusedStoredSessionId falls back to $selectedStoredSessionId.
     // $focusedSessionState needs a runtime — leave it empty via no session states.
@@ -130,6 +134,9 @@ describe('resolveNewSessionCwd', () => {
     $currentCwd.set('')
     $selectedStoredSessionId.set(null)
     $sessions.set([])
+    $activeProjectId.set(null)
+    $projectTree.set([])
+    $projects.set([])
   })
 
   it('starts a chat detached inside Home, ignoring the configured default dir', () => {
@@ -191,6 +198,63 @@ describe('resolveNewSessionCwd', () => {
 
     // Focused session has no workspace → fall through to configured default,
     // not the stale $currentCwd from an earlier chat.
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
+  })
+
+  it('does not inherit a focused session cwd from another profile (#79406)', () => {
+    // Profile A session still selected/listed while new chats target profile B
+    // (selectProfile sets $newChatProfile before gateway/projects refresh).
+    $activeGatewayProfile.set('profile-a')
+    $newChatProfile.set('profile-b')
+    $selectedStoredSessionId.set('sess-a')
+    $sessions.set([
+      {
+        archived: false,
+        cwd: '/workspace/domain/subproject',
+        ended_at: null,
+        id: 'sess-a',
+        input_tokens: 0,
+        is_active: true,
+        last_active: 0,
+        message_count: 1,
+        model: null,
+        output_tokens: 0,
+        profile: 'profile-a',
+        started_at: 0,
+        title: 'A work'
+      } as never
+    ])
+    $currentCwd.set('/workspace/domain/subproject')
+
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
+
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+  })
+
+  it('uses this profile active project primary_path before configured default (#79406)', () => {
+    $activeProjectId.set('p_b')
+    $projectTree.set([
+      {
+        color: null,
+        icon: null,
+        id: 'p_b',
+        isAuto: false,
+        label: 'Project B',
+        path: '/workspace',
+        previewSessions: [],
+        repos: [],
+        sessionCount: 0
+      }
+    ])
+
+    expect(resolveNewSessionCwd()).toBe('/workspace')
+  })
+
+  it('ignores a project scope id that is not on the current tree (stale after profile switch)', () => {
+    enterProject('p_from_profile_a')
+    $projectTree.set([]) // new profile tree not loaded yet / cleared
+
     expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 })
