@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$HermesRoot = "",
     [string]$Cwd = "",
     [string]$HermesHome = ""
@@ -44,11 +44,18 @@ foreach ($proc in $staleDesktopProcesses) {
     Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-$sourceElectronPattern = [regex]::Escape((Join-Path $HermesRoot "node_modules\electron\dist\electron.exe"))
-$sourceDesktopRunning = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -and $_.CommandLine -match $sourceElectronPattern
+# Resolve packaged EXE (LOCALAPPDATA install takes priority over repo release dir).
+$PackagedExe = Join-Path $env:LOCALAPPDATA "hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe"
+if (-not (Test-Path -LiteralPath $PackagedExe)) {
+    $PackagedExe = Join-Path $HermesRoot "apps\desktop\release\win-unpacked\Hermes.exe"
+}
+
+# Guard: skip if a packaged Hermes.exe is already running from the resolved path.
+$packagedRunning = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -and $_.CommandLine -match [regex]::Escape($PackagedExe)
 } | Select-Object -First 1
-if ($sourceDesktopRunning) {
+if ($packagedRunning) {
+    Write-Host "[start-hermes-desktop] Packaged Hermes.exe already running (pid=$($packagedRunning.ProcessId)) — skipping launch."
     exit 0
 }
 
@@ -59,6 +66,21 @@ if ($normalizedRoot -match '(?i)[\\/]\.worktrees[\\/]') {
     throw "Refusing Hermes Desktop launch from worktree: $normalizedRoot`nUse canonical repo: C:\Users\downl\Documents\New project\hermes-agent"
 }
 Set-Location -LiteralPath $HermesRoot
-# Never pass --skip-build here: stale/missing install-stamp and wrong-root launches fail closed.
-& $PythonExe -m hermes_cli.main desktop --source --hermes-root $HermesRoot --cwd $Cwd
-exit $LASTEXITCODE
+
+# Launch packaged Hermes.exe — never use --source or node_modules/electron.
+# If the EXE is missing, build first: hermes desktop --build-only --force-build
+if (-not (Test-Path -LiteralPath $PackagedExe)) {
+    throw (
+        "Packaged Hermes.exe not found. Build it first:`n" +
+        "  hermes desktop --build-only --force-build`n" +
+        "Searched:`n" +
+        "  $env:LOCALAPPDATA\hermes\hermes-agent\apps\desktop\release\win-unpacked\Hermes.exe`n" +
+        "  $HermesRoot\apps\desktop\release\win-unpacked\Hermes.exe"
+    )
+}
+
+$WorkDir = Split-Path -Parent $PackagedExe
+Write-Host "[start-hermes-desktop] Launching: $PackagedExe"
+Write-Host "[start-hermes-desktop] HERMES_DESKTOP_HERMES_ROOT=$env:HERMES_DESKTOP_HERMES_ROOT"
+Start-Process -FilePath $PackagedExe -WorkingDirectory $WorkDir
+exit 0
