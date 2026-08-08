@@ -700,18 +700,25 @@ export function excludeProjectSessions(
 export function overlayLiveLanes(
   project: SidebarProjectTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED
+  removed: ReadonlySet<string> = NO_REMOVED,
+  manualProjectIds: Readonly<Record<string, string>> = {}
 ): SidebarProjectTree {
+  const movedElsewhere = Object.entries(manualProjectIds)
+    .filter(([, projectId]) => projectId !== project.id)
+    .map(([sessionId]) => sessionId)
+  const excluded = movedElsewhere.length ? new Set([...removed, ...movedElsewhere]) : removed
+  const projectLive = live.filter(session => !manualProjectIds[session.id] || manualProjectIds[session.id] === project.id)
+
   if (project.isNoProject) {
-    return overlayHomeLane(project, live, removed)
+    return overlayHomeLane(project, projectLive, excluded)
   }
 
   let changed = false
   const groupedIds = new Set((project.conversationGroups ?? []).flatMap(group => group.sessions.map(session => session.id)))
-  const repoLive = groupedIds.size ? live.filter(session => !groupedIds.has(session.id)) : live
+  const repoLive = groupedIds.size ? projectLive.filter(session => !groupedIds.has(session.id)) : projectLive
 
   const repos = project.repos.map(repo => {
-    const next = overlayRepoLanes(repo, repoLive, removed)
+    const next = overlayRepoLanes(repo, repoLive, excluded)
 
     changed ||= next !== repo
 
@@ -737,7 +744,8 @@ export function overlayLivePreviews(
   live: SessionInfo[],
   explicitProjects: ProjectInfo[],
   limit: number,
-  removed: ReadonlySet<string> = new Set()
+  removed: ReadonlySet<string> = new Set(),
+  manualProjectIds: Readonly<Record<string, string>> = {}
 ): Record<string, SessionInfo[]> {
   const byProject = new Map<string, SessionInfo[]>()
 
@@ -747,7 +755,9 @@ export function overlayLivePreviews(
     }
 
     const projectId =
-      liveSessionProjectId(session, explicitProjects) ?? (isDetachedSession(session) ? NO_PROJECT_ID : null)
+      manualProjectIds[session.id] ??
+      liveSessionProjectId(session, explicitProjects) ??
+      (isDetachedSession(session) ? NO_PROJECT_ID : null)
 
     if (!projectId) {
       continue
@@ -762,7 +772,9 @@ export function overlayLivePreviews(
 
   for (const node of projects) {
     const liveRows = byProject.get(node.id) ?? []
-    const base = (node.previewSessions ?? []).filter(session => !removed.has(session.id))
+    const base = (node.previewSessions ?? []).filter(
+      session => !removed.has(session.id) && (!manualProjectIds[session.id] || manualProjectIds[session.id] === node.id)
+    )
 
     if (!liveRows.length && !base.length) {
       continue

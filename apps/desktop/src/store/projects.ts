@@ -42,6 +42,7 @@ export const $activeProjectId = atom<null | string>(null)
 // source of project membership — the desktop no longer derives it.
 export const $projectTree = atom<SidebarProjectTree[]>([])
 export const $projectTreeLoading = atom(false)
+export const $manualSessionProjectIds = atom<Record<string, string>>({})
 
 // False when the connected backend predates the projects.* JSON-RPC surface
 // (same semver label, older install). Null until the first probe.
@@ -445,6 +446,7 @@ interface ProjectTreePayload {
   projects: SidebarProjectTree[]
   active_id: null | string
   scoped_session_ids: string[]
+  manual_session_project_ids?: Record<string, string>
 }
 
 let projectTreeRefreshGeneration = 0
@@ -467,6 +469,7 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
 
     const scoped = new Set(res.scoped_session_ids ?? [])
     $projectTree.set(res.projects ?? [])
+    $manualSessionProjectIds.set(res.manual_session_project_ids ?? {})
     $activeProjectId.set(res.active_id ?? null)
     const tombstones = $removedSessionIds.get()
 

@@ -565,7 +565,10 @@ def build_tree(
     a scratch dir under /tmp) doesn't get promoted to a phantom AUTO project;
     omit it (remote backends) to keep every candidate.
 
-    Returns ``{"projects": [...], "scoped_session_ids": [...]}``. When
+    Returns ``{"projects": [...], "scoped_session_ids": [...],
+    "manual_session_project_ids": {...}}``. The manual ownership map lets
+    renderer live overlays preserve an explicit project move instead of
+    reclassifying the running session from its unchanged cwd. When
     ``hydrate`` is False (overview), lane ``sessions`` arrays are emptied but
     every count is preserved and each project carries up to ``preview_limit``
     ``previewSessions``. When True (drill-in), lanes carry full session rows.
@@ -585,6 +588,7 @@ def build_tree(
         groups.sort(key=lambda group: (int(group.get("position") or 0), str(group.get("name") or "")))
 
     assignments = session_assignments or {}
+    manual_session_project_ids: dict[str, str] = {}
     _junk = is_junk_root or (lambda _root: False)
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     _exists = exists or (lambda _path: True)
@@ -598,6 +602,8 @@ def build_tree(
         session_id = str(session.get("id") or "")
         assignment = assignments.get(session_id) or {}
         assigned_project = active_by_id.get(str(assignment.get("project_id") or ""))
+        if assigned_project and session_id:
+            manual_session_project_ids[session_id] = assigned_project["id"]
         owner = assigned_project or _project_for_session(session, folder_index, resolve)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
@@ -808,4 +814,8 @@ def build_tree(
             ),
         )
 
-    return {"projects": result, "scoped_session_ids": scoped_ids}
+    return {
+        "projects": result,
+        "scoped_session_ids": scoped_ids,
+        "manual_session_project_ids": manual_session_project_ids,
+    }

@@ -381,6 +381,7 @@ def test_manual_assignment_overrides_cwd_and_places_session_in_conversation_grou
             "sessions": [session],
         }
     ]
+    assert tree["manual_session_project_ids"] == {session["id"]: "p_sk"}
 
 
 def test_scoped_session_ids_is_union_of_placed_sessions():
