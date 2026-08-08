@@ -269,6 +269,26 @@ def test_macos_arm64_prefers_tflite_on_this_host():
     ) == "tflite"
 
 
+def test_default_framework_is_tflite_on_macos_intel(monkeypatch):
+    # onnxruntime==1.27.0 has no x86_64 macOS wheel (#81560), so the tflite
+    # backend is the only installable openWakeWord backend on Intel Macs.
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    assert ww._is_macos_intel() is True
+    assert ww.default_inference_framework() == "tflite"
+
+
+def test_explicit_onnx_coerced_on_macos_intel(monkeypatch):
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    assert (
+        ww.resolve_inference_framework(
+            {"openwakeword": {"inference_framework": "onnx"}}
+        )
+        == "tflite"
+    )
+
+
 def test_explicit_framework_kept_where_onnx_works(monkeypatch):
     # An operator who pins a backend keeps it everywhere ONNX actually works.
     calls = _install_fake_openwakeword(monkeypatch)

@@ -162,12 +162,21 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # It lives in its own feature because lazy-dep specs cannot carry PEP 508
     # environment markers (_spec_is_safe rejects ";"), so the platform gate is
     # applied by the caller instead.
+    #
+    # ``wake.openwakeword.slim`` is the same stack minus onnxruntime, which
+    # has no x86_64 macOS wheel (#81560). Intel Macs use tflite (which has
+    # wheels for both arches), so they must not install onnxruntime at all.
     "wake.openwakeword.tflite": (
         "ai-edge-litert==2.1.6",
     ),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
         "onnxruntime==1.27.0",
+        "sounddevice==0.5.5",
+        "numpy==2.4.3",
+    ),
+    "wake.openwakeword.slim": (
+        "openwakeword==0.6.0",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),
