@@ -12,6 +12,7 @@ loop, so the desktop WS never received gateway.ready and boot escalated to the
 import threading
 import time
 
+from hermes_cli import web_gateway_topology
 from hermes_cli import web_server
 
 
@@ -34,7 +35,7 @@ def _fake_topology(calls, delay=0.0):
 def test_topology_cache_returns_cached_result_within_ttl(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        web_server, "_collect_profile_gateway_topology", _fake_topology(calls)
+        web_gateway_topology, "_collect_profile_gateway_topology", _fake_topology(calls)
     )
     _reset_cache()
     try:
@@ -50,7 +51,7 @@ def test_topology_cache_returns_cached_result_within_ttl(monkeypatch):
 def test_topology_cache_rescans_after_ttl(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        web_server, "_collect_profile_gateway_topology", _fake_topology(calls)
+        web_gateway_topology, "_collect_profile_gateway_topology", _fake_topology(calls)
     )
     _reset_cache()
     try:
@@ -69,7 +70,7 @@ def test_topology_cache_collapses_concurrent_scans(monkeypatch):
     is exactly the GIL storm the cache exists to prevent."""
     calls = []
     monkeypatch.setattr(
-        web_server,
+        web_gateway_topology,
         "_collect_profile_gateway_topology",
         _fake_topology(calls, delay=0.05),
     )
@@ -100,13 +101,13 @@ def test_topology_cache_misses_when_collector_is_swapped(monkeypatch):
     collector never leaks across the swap."""
     calls_a, calls_b = [], []
     monkeypatch.setattr(
-        web_server, "_collect_profile_gateway_topology", _fake_topology(calls_a)
+        web_gateway_topology, "_collect_profile_gateway_topology", _fake_topology(calls_a)
     )
     _reset_cache()
     try:
         first = web_server._collect_profile_gateway_topology_cached()
         monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology", _fake_topology(calls_b)
+            web_gateway_topology, "_collect_profile_gateway_topology", _fake_topology(calls_b)
         )
         second = web_server._collect_profile_gateway_topology_cached()
     finally:
