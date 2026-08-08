@@ -2197,15 +2197,10 @@ class TestGetSessionContextFallback:
         from plugins.memory.honcho.client import HonchoClientConfig
         from plugins.memory.honcho.session import HonchoSessionManager
 
-        cfg = HonchoClientConfig(api_key="test-key", enabled=True)
-        mgr = HonchoSessionManager.__new__(HonchoSessionManager)
-        mgr._cache = {}
-        mgr._sessions_cache = {}
-        mgr._config = cfg
-        mgr._dialectic_dynamic = True
-        mgr._dialectic_reasoning_level = "low"
-        mgr._dialectic_max_input_chars = 10000
-        mgr._ai_observe_others = True
+        cfg = HonchoClientConfig(
+            api_key="test-key", enabled=True, write_frequency="turn"
+        )
+        mgr = HonchoSessionManager(honcho=MagicMock(), config=cfg)
 
         session = HonchoSession(
             key="test",

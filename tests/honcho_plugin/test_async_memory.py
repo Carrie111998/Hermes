@@ -41,9 +41,7 @@ def _make_manager(write_frequency="turn") -> HonchoSessionManager:
         api_key="test-key",
         enabled=True,
     )
-    mgr = HonchoSessionManager(config=cfg)
-    mgr._honcho = MagicMock()
-    return mgr
+    return HonchoSessionManager(honcho=MagicMock(), config=cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -428,9 +426,12 @@ class TestMemoryFileMigrationTargets:
         ai_peer = MagicMock(name="ai-peer")
         mgr._peers_cache[session.user_peer_id] = user_peer
         mgr._peers_cache[session.assistant_peer_id] = ai_peer
+        mgr._peer_cache_owners[session.user_peer_id] = mgr._honcho
+        mgr._peer_cache_owners[session.assistant_peer_id] = mgr._honcho
 
         honcho_session = MagicMock()
         mgr._sessions_cache[session.honcho_session_id] = honcho_session
+        mgr._session_cache_owners[session.honcho_session_id] = mgr._honcho
 
         (tmp_path / "MEMORY.md").write_text("memory facts", encoding="utf-8")
         (tmp_path / "USER.md").write_text("user profile", encoding="utf-8")

@@ -128,6 +128,11 @@ class SingletonSlot(Generic[T]):
         """Return the cached instance without building it (None if unset)."""
         return self._value if self._set else None
 
+    def contains(self, value: T) -> bool:
+        """Return whether *value* is still cached, synchronized with reset()."""
+        with self._lock:
+            return self._set and self._value is value
+
     def reset(self) -> None:
         """Drop the cached instance so the next ``get()`` rebuilds it."""
         with self._lock:

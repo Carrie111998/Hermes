@@ -24,6 +24,23 @@ _PEER_ID_HASH_LEN = 8
 _PEER_ID_HASH_ESCALATION_LENGTHS = (_PEER_ID_HASH_LEN, 12, 16, 24, 32, 64)
 
 
+_UNKNOWN_SDK_OWNER = object()
+
+
+def _sdk_owner(value: Any, default: Any = _UNKNOWN_SDK_OWNER) -> Any:
+    """Read the SDK's eager parent link without invoking dynamic attributes."""
+    try:
+        private_attrs = object.__getattribute__(value, "__pydantic_private__")
+    except (AttributeError, TypeError):
+        private_attrs = None
+    if isinstance(private_attrs, dict) and "_honcho" in private_attrs:
+        return private_attrs["_honcho"]
+    try:
+        return vars(value).get("_honcho", default)
+    except TypeError:
+        return default
+
+
 @dataclass
 class HonchoSession:
     """
@@ -96,14 +113,19 @@ class HonchoSessionManager:
             runtime_user_peer_name_alt: Optional stable alternate gateway identity.
         """
         self._honcho = honcho
+        self._managed_honcho = honcho is None
         self._context_tokens = context_tokens
         self._config = config
         self._runtime_user_peer_name = runtime_user_peer_name
         self._runtime_user_peer_name_alt = runtime_user_peer_name_alt
         self._cache: dict[str, HonchoSession] = {}
         self._cache_lock = threading.RLock()
+        self._client_refresh_lock = threading.Lock()
+        self._session_rotation_lock = threading.Lock()
         self._peers_cache: dict[str, Any] = {}
         self._sessions_cache: dict[str, Any] = {}
+        self._peer_cache_owners: dict[str, Any] = {}
+        self._session_cache_owners: dict[str, Any] = {}
 
         # Write frequency state
         write_frequency = (config.write_frequency if config else "async")
@@ -154,32 +176,75 @@ class HonchoSessionManager:
 
     @property
     def honcho(self) -> Honcho:
-        """Get the Honcho client, refreshing a near-expiry OAuth token in place.
+        """Get the configured client and invalidate displaced SDK caches."""
+        if not self._managed_honcho:
+            return self._honcho
 
-        Routes every access through ``get_honcho_client`` (which returns the same
-        cached singleton) so a long session can't outlive its 1h access token.
-        """
-        self._honcho = get_honcho_client()
-        return self._honcho
+        # Serialize acquisitions separately from cache mutation.  This prevents
+        # an older acquisition from publishing after a newer refresh without
+        # holding ``_cache_lock`` across a potentially blocking client build.
+        with self._client_refresh_lock:
+            current = get_honcho_client(self._config)
+            with self._cache_lock:
+                if current is not self._honcho:
+                    self._honcho = current
+                    self._peers_cache.clear()
+                    self._sessions_cache.clear()
+                    self._peer_cache_owners.clear()
+                    self._session_cache_owners.clear()
+                return self._honcho
 
-    def _get_or_create_peer(self, peer_id: str) -> Any:
+    def _cached_session_for_current_client(
+        self, session_id: str, owner: Any | None = None
+    ) -> Any | None:
+        """Return only a session owned by the operation's client snapshot."""
+        current = owner if owner is not None else self.honcho
+        with self._cache_lock:
+            cached = self._sessions_cache.get(session_id)
+            if cached is None:
+                return None
+            owner = self._session_cache_owners.get(
+                session_id, _sdk_owner(cached)
+            )
+            if owner is current:
+                return cached
+            self._sessions_cache.pop(session_id, None)
+            self._session_cache_owners.pop(session_id, None)
+            return None
+
+    def _get_or_create_peer(
+        self, peer_id: str, owner: Any | None = None
+    ) -> Any:
         """
         Get or create a Honcho peer.
 
         Peers are lazy -- no API call until first use.
         Observation settings are controlled per-session via SessionPeerConfig.
         """
+        owner = owner if owner is not None else self.honcho
+        assert owner is not None
         with self._cache_lock:
             if peer_id in self._peers_cache:
-                return self._peers_cache[peer_id]
+                cached = self._peers_cache[peer_id]
+                cached_owner = self._peer_cache_owners.get(
+                    peer_id, _sdk_owner(cached)
+                )
+                if cached_owner is owner:
+                    return cached
 
-        peer = self.honcho.peer(peer_id)
+        peer = owner.peer(peer_id)
         with self._cache_lock:
-            self._peers_cache[peer_id] = peer
+            if self._honcho is owner:
+                self._peers_cache[peer_id] = peer
+                self._peer_cache_owners[peer_id] = owner
         return peer
 
     def _get_or_create_honcho_session(
-        self, session_id: str, user_peer: Any, assistant_peer: Any
+        self,
+        session_id: str,
+        user_peer: Any,
+        assistant_peer: Any,
+        owner: Any | None = None,
     ) -> tuple[Any, list]:
         """
         Get or create a Honcho session with peers configured.
@@ -187,12 +252,14 @@ class HonchoSessionManager:
         Returns:
             Tuple of (honcho_session, existing_messages).
         """
-        with self._cache_lock:
-            if session_id in self._sessions_cache:
-                logger.debug("Honcho session '%s' retrieved from cache", session_id)
-                return self._sessions_cache[session_id], []
+        owner = owner if owner is not None else self.honcho
+        assert owner is not None
+        cached = self._cached_session_for_current_client(session_id, owner)
+        if cached is not None:
+            logger.debug("Honcho session '%s' retrieved from cache", session_id)
+            return cached, []
 
-        session = self.honcho.session(session_id)
+        session = owner.session(session_id)
 
         # Configure per-peer observation from granular booleans.
         # These map 1:1 to Honcho's SessionPeerConfig toggles.
@@ -269,7 +336,10 @@ class HonchoSessionManager:
                 session_id, e,
             )
 
-        self._sessions_cache[session_id] = session
+        with self._cache_lock:
+            if self._honcho is owner:
+                self._sessions_cache[session_id] = session
+                self._session_cache_owners[session_id] = owner
         return session, existing_messages
 
     def _sanitize_id(self, id_str: str) -> str:
@@ -390,10 +460,11 @@ class HonchoSessionManager:
 
         # All expensive I/O outside the lock — Honcho's persistence is source of truth
         honcho_session_id = self._sanitize_id(key)
-        user_peer = self._get_or_create_peer(user_peer_id)
-        assistant_peer = self._get_or_create_peer(assistant_peer_id)
+        owner = self.honcho
+        user_peer = self._get_or_create_peer(user_peer_id, owner)
+        assistant_peer = self._get_or_create_peer(assistant_peer_id, owner)
         honcho_session, existing_messages = self._get_or_create_honcho_session(
-            honcho_session_id, user_peer, assistant_peer
+            honcho_session_id, user_peer, assistant_peer, owner
         )
 
         local_messages = []
@@ -414,8 +485,13 @@ class HonchoSessionManager:
             messages=local_messages,
         )
 
-        # Write to cache under lock — only one writer wins
+        # Publish only if no concurrent creator won while this candidate was
+        # being built. Returning the winner prevents late candidates from
+        # replacing a session that may already contain unsynced messages.
         with self._cache_lock:
+            existing = self._cache.get(key)
+            if existing is not None:
+                return existing
             self._cache[key] = session
         return session
 
@@ -424,13 +500,16 @@ class HonchoSessionManager:
         if not session.messages:
             return True
 
-        user_peer = self._get_or_create_peer(session.user_peer_id)
-        assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
-        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        owner = self.honcho
+        user_peer = self._get_or_create_peer(session.user_peer_id, owner)
+        assistant_peer = self._get_or_create_peer(session.assistant_peer_id, owner)
+        honcho_session = self._cached_session_for_current_client(
+            session.honcho_session_id, owner
+        )
 
         if not honcho_session:
             honcho_session, _ = self._get_or_create_honcho_session(
-                session.honcho_session_id, user_peer, assistant_peer
+                session.honcho_session_id, user_peer, assistant_peer, owner
             )
 
         new_messages = [m for m in session.messages if not m.get("_synced")]
@@ -448,14 +527,16 @@ class HonchoSessionManager:
                 msg["_synced"] = True
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
             with self._cache_lock:
-                self._cache[session.key] = session
+                if self._cache.get(session.key) is session:
+                    self._cache[session.key] = session
             return True
         except Exception as e:
             for msg in new_messages:
                 msg["_synced"] = False
             logger.error("Failed to sync messages to Honcho: %s", e)
             with self._cache_lock:
-                self._cache[session.key] = session
+                if self._cache.get(session.key) is session:
+                    self._cache[session.key] = session
             return False
 
     def _async_writer_loop(self) -> None:
@@ -569,25 +650,28 @@ class HonchoSessionManager:
         """
         import time
 
-        # Hold the reentrant lock across get_or_create so a concurrent caller
-        # can't observe the (old-popped, new-not-yet-inserted) gap and create
-        # its own session under the raw key.  `_cache_lock` is an RLock so
-        # nested reacquisition inside get_or_create is safe.
-        with self._cache_lock:
-            # Remove old session from caches (but don't delete from Honcho)
-            old_session = self._cache.pop(key, None)
-            if old_session:
-                self._sessions_cache.pop(old_session.honcho_session_id, None)
+        # Serialize rotations without holding the cache lock across Honcho I/O.
+        # The old session remains available under ``key`` until the replacement
+        # is complete, so concurrent readers cannot observe a missing-key gap.
+        with self._session_rotation_lock:
+            with self._cache_lock:
+                old_session = self._cache.get(key)
 
-            # Create new session with timestamp suffix
-            timestamp = int(time.time())
-            new_key = f"{key}:{timestamp}"
-
-            # get_or_create will create a fresh session
+            suffix = time.time_ns()
+            with self._cache_lock:
+                new_key = f"{key}:{suffix}"
+                while new_key in self._cache:
+                    suffix += 1
+                    new_key = f"{key}:{suffix}"
             session = self.get_or_create(new_key)
 
-            # Cache under the original key so callers find it by the expected name
-            self._cache[key] = session
+            with self._cache_lock:
+                if old_session:
+                    self._sessions_cache.pop(old_session.honcho_session_id, None)
+                    self._session_cache_owners.pop(
+                        old_session.honcho_session_id, None
+                    )
+                self._cache[key] = session
 
         logger.info("Created new session for %s (honcho: %s)", key, session.honcho_session_id)
         return session
@@ -733,7 +817,7 @@ class HonchoSessionManager:
         # return null summary — the guard below handles that gracefully.
         # Per-directory returning sessions get their accumulated summary.
         try:
-            honcho_session = self._sessions_cache.get(session.honcho_session_id)
+            honcho_session = self._cached_session_for_current_client(session.honcho_session_id)
             if honcho_session:
                 ctx = honcho_session.context(summary=True)
                 if ctx.summary and getattr(ctx.summary, "content", None):
@@ -777,12 +861,15 @@ class HonchoSessionManager:
             logger.warning("No local session cached for '%s', skipping migration", session_key)
             return False
 
-        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        owner = self.honcho
+        honcho_session = self._cached_session_for_current_client(
+            session.honcho_session_id, owner
+        )
         if not honcho_session:
             logger.warning("No Honcho session cached for '%s', skipping migration", session_key)
             return False
 
-        user_peer = self._get_or_create_peer(session.user_peer_id)
+        user_peer = self._get_or_create_peer(session.user_peer_id, owner)
 
         content_bytes = self._format_migration_transcript(session_key, messages)
         first_ts = messages[0].get("timestamp") if messages else None
@@ -856,13 +943,16 @@ class HonchoSessionManager:
             logger.warning("No local session cached for '%s', skipping memory migration", session_key)
             return False
 
-        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        owner = self.honcho
+        honcho_session = self._cached_session_for_current_client(
+            session.honcho_session_id, owner
+        )
         if not honcho_session:
             logger.warning("No Honcho session cached for '%s', skipping memory migration", session_key)
             return False
 
-        user_peer = self._get_or_create_peer(session.user_peer_id)
-        assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
+        user_peer = self._get_or_create_peer(session.user_peer_id, owner)
+        assistant_peer = self._get_or_create_peer(session.assistant_peer_id, owner)
 
         uploaded = False
         files = [
@@ -1011,7 +1101,7 @@ class HonchoSessionManager:
         if not session:
             return {}
 
-        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        honcho_session = self._cached_session_for_current_client(session.honcho_session_id)
         if not honcho_session:
             # Fall back to peer-level context, respecting the requested peer
             peer_id = self._resolve_peer_id(session, peer)
@@ -1378,8 +1468,13 @@ class HonchoSessionManager:
             logger.warning("No session cached for '%s', skipping AI seed", session_key)
             return False
 
-        assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
-        honcho_session = self._sessions_cache.get(session.honcho_session_id)
+        owner = self.honcho
+        assistant_peer = self._get_or_create_peer(
+            session.assistant_peer_id, owner
+        )
+        honcho_session = self._cached_session_for_current_client(
+            session.honcho_session_id, owner
+        )
         if not honcho_session:
             logger.warning("No Honcho session cached for '%s', skipping AI seed", session_key)
             return False

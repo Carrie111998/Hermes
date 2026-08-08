@@ -115,6 +115,17 @@ def test_slot_reset():
     assert slot.get(lambda: "b") == "b"
 
 
+def test_slot_contains_tracks_identity_across_reset():
+    slot: SingletonSlot = SingletonSlot()
+    first = object()
+    other = object()
+    slot.get(lambda: first)
+    assert slot.contains(first)
+    assert not slot.contains(other)
+    slot.reset()
+    assert not slot.contains(first)
+
+
 def test_slot_factory_exception_not_cached():
     slot: SingletonSlot = SingletonSlot()
 

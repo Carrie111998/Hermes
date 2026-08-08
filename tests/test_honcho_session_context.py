@@ -49,6 +49,7 @@ def _manager_with_cached_session(*, ai_observe_others=True):
     fake_honcho_session = _RecordingHonchoSession()
     mgr._cache[session.key] = session
     mgr._sessions_cache[session.honcho_session_id] = fake_honcho_session
+    mgr._session_cache_owners[session.honcho_session_id] = mgr._honcho
     return mgr, fake_honcho_session
 
 

@@ -15,6 +15,8 @@ Config: Uses the existing Honcho config chain:
 
 from __future__ import annotations
 
+import contextvars
+
 import json
 import logging
 import re
@@ -351,7 +353,7 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._cron_skipped = True
                 return
 
-            from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+            from plugins.memory.honcho.client import HonchoClientConfig
             from plugins.memory.honcho.session import HonchoSessionManager
 
             cfg = HonchoClientConfig.from_global_config()
@@ -443,6 +445,7 @@ class HonchoMemoryProvider(MemoryProvider):
             cfg = self._config
             init_kwargs = dict(self._lazy_init_kwargs)
             init_session_id = self._lazy_init_session_id or "hermes-default"
+            init_context = contextvars.copy_context()
 
             def _run() -> None:
                 try:
@@ -456,7 +459,7 @@ class HonchoMemoryProvider(MemoryProvider):
                     logger.warning("Honcho background session init failed: %s", e)
 
             self._init_thread = threading.Thread(
-                target=_run,
+                target=lambda: init_context.run(_run),
                 daemon=True,
                 name="honcho-session-init",
             )
@@ -466,12 +469,9 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
         """Shared session initialization logic for both eager and lazy paths."""
-        from plugins.memory.honcho.client import get_honcho_client
         from plugins.memory.honcho.session import HonchoSessionManager
 
-        client = get_honcho_client(cfg)
         self._manager = HonchoSessionManager(
-            honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
             runtime_user_peer_name=kwargs.get("user_id") or None,

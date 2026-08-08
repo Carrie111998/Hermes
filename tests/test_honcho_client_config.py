@@ -25,6 +25,7 @@ class TestHonchoClientConfigAutoEnable:
         cfg = HonchoClientConfig.from_global_config(config_path=config_path)
 
         assert cfg.api_key == "test-api-key-12345"
+        assert cfg.config_path == config_path
         assert cfg.enabled is True  # Auto-enabled because API key exists
 
     def test_respects_explicit_enabled_false(self, tmp_path):
