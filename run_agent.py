@@ -3277,11 +3277,38 @@ class AIAgent:
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            # Once the conversation loop has atomically committed its final
+            # assistant response, this agent no longer owns a live turn. Do not
+            # accept text into a slot that can only replay as a later user turn.
+            if getattr(self, "_accepting_steer", True) is False:
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
+
+    def _drain_pending_steer_or_close(self) -> Optional[str]:
+        """Drain a final-call steer, or atomically close steer intake.
+
+        The final assistant response and ``steer()`` race on the same lock.
+        If the steer wins, the loop continues the current run. If finalization
+        wins, later steers are rejected rather than accepted and replayed as a
+        new turn.
+        """
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            if not text:
+                self._accepting_steer = False
+            return text
+        with _lock:
+            text = self._pending_steer
+            self._pending_steer = None
+            if not text:
+                self._accepting_steer = False
+        return text
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.

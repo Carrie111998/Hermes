@@ -278,6 +278,30 @@ def _is_copilot_provider(agent: Any) -> bool:
         }
 
 
+def _append_late_steer_continuation(
+    agent: Any,
+    messages: list,
+    final_msg: dict,
+) -> Optional[str]:
+    """Keep a steer from the final model call inside the active run.
+
+    Returns the drained steer text when the loop must continue, otherwise
+    atomically closes steer intake and returns ``None``.
+    """
+    late_steer = agent._drain_pending_steer_or_close()
+    if not late_steer:
+        return None
+    agent._emit_interim_assistant_message(final_msg)
+    messages.append(final_msg)
+    messages.append({"role": "user", "content": late_steer})
+    agent._session_messages = messages
+    # The would-be final call may have consumed the ordinary iteration budget.
+    # Reserve Hermes' existing one-call grace path so the model is guaranteed
+    # one chance to answer the accepted steer inside this same run.
+    agent._budget_grace_call = True
+    return late_steer
+
+
 def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
     """Detect a Copilot 400 that is really a STALE / DEGRADED credential.
 
@@ -1472,6 +1496,14 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    # Cached gateway agents are reused across turns. Re-open steer intake for
+    # this run; the previous final response closed only its own turn.
+    _steer_lock = getattr(agent, "_pending_steer_lock", None)
+    if _steer_lock is None:
+        agent._accepting_steer = True
+    else:
+        with _steer_lock:
+            agent._accepting_steer = True
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -7393,6 +7425,25 @@ def run_conversation(
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
+                    continue
+
+                # A steer can arrive while the model is composing what would
+                # otherwise be the final assistant response. Keep it in this
+                # run: commit that response as interim context, append the
+                # correction as a real user message, and continue. The atomic
+                # drain/close shares steer()'s lock, eliminating the old
+                # accepted-here/replayed-next-turn teardown race.
+                _late_steer = _append_late_steer_continuation(
+                    agent, messages, final_msg
+                )
+                if _late_steer:
+                    if isinstance(original_user_message, str):
+                        original_user_message = (
+                            f"{original_user_message}\n\n"
+                            f"User steering during the turn: {_late_steer}"
+                        )
+                    final_response = None
+                    logger.info("Late steer continued inside active turn")
                     continue
 
                 messages.append(final_msg)
