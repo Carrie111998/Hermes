@@ -62,6 +62,16 @@ describe('kanban card ref preprocessing', () => {
     )
   })
 
+  it('does not let an unrelated later link suppress a bracket-adjacent card ref', () => {
+    expect(linkifyKanbanCardRefs('[t_deadbeef] and [docs](https://example.com)')).toBe(
+      '[t_deadbeef](#kanban/t_deadbeef) and [docs](https://example.com)'
+    )
+  })
+
+  it('does not nest a card ref inside a standalone bracket pair', () => {
+    expect(linkifyKanbanCardRefs('[t_deadbeef]')).toBe('[t_deadbeef](#kanban/t_deadbeef)')
+  })
+
   it('round-trips a canonical card id through the markdown href', () => {
     const href = kanbanCardMarkdownHref('t_deadbeef')
 
