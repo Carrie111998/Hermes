@@ -3,8 +3,8 @@
 Both use per-model api_mode routing:
   - OpenCode Zen: Claude → anthropic_messages, GPT-5/Codex → codex_responses,
     everything else → chat_completions (this profile)
-  - OpenCode Go: MiniMax → anthropic_messages, GLM/Kimi → chat_completions
-    (this profile)
+  - OpenCode Go: GPT → codex_responses, MiniMax/Qwen → anthropic_messages,
+    GLM/Kimi/DeepSeek/MiMo → chat_completions (this profile)
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ class OpenCodeGoProfile(ProviderProfile):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if not effort or effort == "none":
                 return extra_body, top_level
-            top_level["reasoning_effort"] = "max" if effort in {"xhigh", "max"} else "high"
+            top_level["reasoning_effort"] = "max" if effort in {"xhigh", "max", "ultra"} else "high"
             return extra_body, top_level
 
         if _is_kimi_k2_model(model):
@@ -90,7 +90,7 @@ class OpenCodeGoProfile(ProviderProfile):
                 return extra_body, top_level
 
             effort = (reasoning_config.get("effort") or "").strip().lower()
-            if effort in {"xhigh", "max"}:
+            if effort in {"xhigh", "max", "ultra"}:
                 top_level["reasoning_effort"] = "high"
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
@@ -114,7 +114,7 @@ class OpenCodeGoProfile(ProviderProfile):
 
         if isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
-            if effort in {"xhigh", "max"}:
+            if effort in {"xhigh", "max", "ultra"}:
                 top_level["reasoning_effort"] = "max"
             elif effort in {"low", "medium", "high"}:
                 top_level["reasoning_effort"] = effort
