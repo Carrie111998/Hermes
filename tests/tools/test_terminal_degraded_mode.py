@@ -220,7 +220,9 @@ class TestCachedBackendFailures:
         assert env.execute.call_count == 1
         assert cache_key not in isolated_env._active_environments
         assert cache_key not in file_tools._file_ops_cache
-        env.cleanup.assert_called_once_with()
+        # Normal remote cleanup can perform multi-minute sync-back retries.
+        # A backend known to be unreachable must be discarded without it.
+        env.cleanup.assert_not_called()
 
     def test_background_connection_error_reaches_degraded_handler(
         self, isolated_env, monkeypatch

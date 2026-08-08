@@ -3382,13 +3382,10 @@ def _evict_environment_for_task(task_id: Optional[str]) -> None:
     keys = {_resolve_container_task_id(task_id)}
     if task_id:
         keys.add(task_id)
-    evicted = []
     with _env_lock:
         for key in keys:
-            env = _active_environments.pop(key, None)
+            _active_environments.pop(key, None)
             _last_activity.pop(key, None)
-            if env is not None:
-                evicted.append(env)
     # ShellFileOperations stores the environment object, not just its key. If
     # a terminal retry creates a new environment before the next file-tool
     # call, a stale cache entry would otherwise pass file_tools' key-presence
@@ -3400,11 +3397,10 @@ def _evict_environment_for_task(task_id: Optional[str]) -> None:
             clear_file_ops_cache(key)
     except Exception:
         logger.debug("file-ops cache eviction failed", exc_info=True)
-    for env in evicted:
-        try:
-            env.cleanup()
-        except Exception:
-            logger.debug("cleanup of degraded environment failed", exc_info=True)
+    # Do not call normal backend cleanup here. Remote cleanup can perform
+    # networked sync-back and retry for minutes, but this path is reached only
+    # after that connection is known to be unavailable. Dropping references is
+    # intentional; normal lifecycle cleanup remains unchanged.
 
 
 def check_terminal_requirements() -> bool:
