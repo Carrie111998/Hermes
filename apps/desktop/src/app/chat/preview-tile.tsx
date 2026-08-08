@@ -72,6 +72,13 @@ function PreviewTabLead({ tabId }: { tabId: string }) {
 
 const PREVIEW_TILE_PREFIX = 'preview-tile'
 
+function urlPreviewIds(): string[] {
+  return $previewTabs
+    .get()
+    .filter(tab => tab.target.kind === 'url')
+    .map(tab => tab.id)
+}
+
 /** Keep pane contributions mirroring `$previewTabs`, keep the store's selection
  *  and the tree's active pane agreeing, and front a tile when its tab is
  *  selected. Call once from the root. */
@@ -120,15 +127,29 @@ export function watchPreviewTiles(): void {
   $activeTreeGroup.listen(follow)
 }
 
-const watchPreviewTileMirror = paneMirror<{ id: string }>({
+const watchPreviewTileMirror = paneMirror<{ id: string; target: PreviewTarget }>({
   source: $previewTabs,
   key: tab => tab.id,
   prefix: PREVIEW_TILE_PREFIX,
-  // Identical to route (page) tiles: its own zone docked beside main, sized by
-  // the split weights. NOT anchored to the file tree — the old rail was a
-  // files-adjacent strip, and carrying that over welded preview into the file
-  // browser's zone, so ⌘J (toggle file browser) took the preview with it.
-  dir: () => 'right',
+  // URL previews are independent browser panes. The first URL opens beside the
+  // conversation; the second docks below it, which gives YouTube + X a real
+  // vertical split while preserving the existing file/artifact behavior.
+  dir: tile => {
+    if (tile.target.kind !== 'url') {
+      return 'right'
+    }
+
+    return tile.id === urlPreviewIds()[0] ? 'right' : 'bottom'
+  },
+  anchor: tile => {
+    if (tile.target.kind !== 'url') {
+      return 'workspace'
+    }
+
+    const firstUrlId = urlPreviewIds()[0]
+
+    return tile.id === firstUrlId ? 'workspace' : `${PREVIEW_TILE_PREFIX}:${firstUrlId}`
+  },
   minWidth: '22rem',
   title: previewTitle,
   tabLead: tabId => <PreviewTabLead tabId={tabId} />,

@@ -6,13 +6,13 @@ import { normalize } from '@/lib/text'
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from './layout'
 
 /**
- * PREVIEW RAIL — one list of tabs, one way in.
+ * PREVIEW TABS — one list of tabs, one way in.
  *
- * Everything the rail can show is a `PreviewTarget` in `$previewTabs`: a file
- * on disk, a live URL, or a generated artifact. There is no privileged "live
- * preview" slot alongside the tabs; `openPreview` is the only entry point, so
- * a tool result, a file-browser click, and an artifact card all travel the
- * same road and behave identically once open.
+ * Everything the preview surface can show is a `PreviewTarget` in
+ * `$previewTabs`: a file on disk, a live URL, or a generated artifact. There is
+ * no privileged live-preview slot alongside the tabs; `openPreview` is the only
+ * entry point, so a tool result, a file-browser click, and an artifact card all
+ * travel the same road and behave identically once open.
  *
  * Tabs are global and outlive the session that created them, like tabs
  * anywhere else — they close when you close them.
@@ -124,14 +124,7 @@ export function decodePreviewTabs(raw: string): PreviewTab[] {
       : tab
   )
 
-  // One Browser: rekey restored URL tabs onto the singleton id (rows written
-  // before the id existed carried one id per address) and keep only the
-  // LAST — the most recently opened page is the one the browser shows.
-  const lastUrl = tabs.findLast(tab => tab.target.kind === 'url')
-
-  return tabs
-    .filter(tab => tab.target.kind !== 'url' || tab === lastUrl)
-    .map(tab => (tab.target.kind === 'url' ? { ...tab, id: previewTabId(tab.target) } : tab))
+  return tabs.map(tab => (tab.target.kind === 'url' ? { ...tab, id: previewTabId(tab.target) } : tab))
 }
 
 export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
@@ -187,15 +180,8 @@ export const $previewReloadRequest = atom(0)
 export const $previewServerRestart = atom<PreviewServerRestart | null>(null)
 export const $previewServerRestartStatus = computed($previewServerRestart, restart => restart?.status ?? 'idle')
 
-/** The one Browser tab's id. URL targets all share it: the tab names the
- *  SURFACE (Browser), not the page, so opening a second URL navigates the
- *  browser it already has — re-front the tab, swap its target, and the pane
- *  rebuilds its webview against the new url. Files and artifacts stay keyed
- *  by identity; only the web surface is a singleton. */
-const BROWSER_TAB_ID: RightRailTabId = 'url:browser'
-
 export function previewTabId(target: PreviewTarget): RightRailTabId {
-  return target.kind === 'url' ? BROWSER_TAB_ID : `${target.kind}:${target.url}`
+  return `${target.kind}:${target.url}`
 }
 
 // Browsing files is "peek at the source"; a tool or an explicit link handing

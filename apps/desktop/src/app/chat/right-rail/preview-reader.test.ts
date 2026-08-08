@@ -14,8 +14,8 @@ function fileTarget(path: string): PreviewTarget {
 }
 
 describe('readActivePreview (read_preview tool)', () => {
-  // All URL targets share the singleton Browser tab id, so a reader registered
-  // in one test would answer the next — unregister whatever a test installed.
+  // Readers are keyed by URL preview tab id, so unregister whatever a test
+  // installed before the next case.
   let cleanups: Array<() => void> = []
 
   const register = (tabId: string, reader: Parameters<typeof registerPreviewPageReader>[1]) => {
