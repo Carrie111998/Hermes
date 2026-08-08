@@ -616,6 +616,18 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     #     bare id that matches exactly one curated entry.  Unknown names (a
     #     local NIM container, a proxied model) pass through untouched. ---
     if provider in _CATALOGUE_PREFIX_REPAIR_PROVIDERS:
+        # ``_repair_prefix_from_catalogue`` returns early on any ``/``, which
+        # is what keeps a genuine ``nvidia/nemotron-…`` slug -- and a
+        # self-hosted ``nvidia/my-local-nim`` -- untouched.  A ``nvidia:``
+        # colon prefix carries no slash, so it skips that guard and is then
+        # compared *whole* against the catalogue's post-slash suffixes,
+        # matches nothing, and reaches the API with the prefix still
+        # attached.  Strip the matching prefix first, exactly as the four
+        # branches above do; the separator check is what preserves the
+        # slash form's pass-through.
+        _, separator, _ = _split_provider_prefix(name)
+        if separator == ":":
+            name = _strip_matching_provider_prefix(name, provider)
         return _repair_prefix_from_catalogue(name, provider)
 
     # --- Authoritative native providers: preserve user-facing slugs as-is ---

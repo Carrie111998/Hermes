@@ -219,6 +219,14 @@ _COLON_PREFIX_CASES = [
     ("opencode-go", "minimax-m2.7", "minimax-m2.7"),
     # DeepSeek canonicalisation
     ("deepseek", "deepseek-v4-pro", "deepseek-v4-pro"),
+    # _CATALOGUE_PREFIX_REPAIR_PROVIDERS.  The odd one out: here ``nvidia/``
+    # is the *canonical* prefix the API serves, not a redundant one, so both
+    # spellings settle on the catalogue entry rather than on a bare id.
+    (
+        "nvidia",
+        "nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+    ),
 ]
 
 
@@ -258,6 +266,57 @@ class TestIssue64787ColonProviderPrefix:
         assert normalize_model_for_provider("deepseek:deepseek-v4-pro", "deepseek") == "deepseek-v4-pro"
         # Control: the reasoner-keyword path is unaffected by prefix stripping.
         assert normalize_model_for_provider("deepseek:deepseek-r1", "deepseek") == "deepseek-v4-flash"
+
+    def test_nvidia_colon_prefix_reaches_the_catalogue_repair(self):
+        """``nvidia:<bare>`` used to reach the API with the prefix attached.
+
+        ``_repair_prefix_from_catalogue`` short-circuits on ``/`` and then
+        compares the *whole* name against each catalogue entry's post-slash
+        suffix.  A colon-prefixed id has no slash, so it cleared the
+        short-circuit and then matched nothing — the one dispatch branch that
+        never stripped a matching prefix first, so ``nvidia:nemotron-…``
+        reached build.nvidia.com verbatim and drew the same content-free
+        ``404 page not found`` that #78796 set out to eliminate.
+        """
+        assert (
+            normalize_model_for_provider("nvidia:nemotron-3-super-120b-a12b", "nvidia")
+            == "nvidia/nemotron-3-super-120b-a12b"
+        )
+        # Alias-aware, like every other branch: ``nim`` resolves to ``nvidia``.
+        assert (
+            normalize_model_for_provider("nim:nemotron-3-super-120b-a12b", "nvidia")
+            == "nvidia/nemotron-3-super-120b-a12b"
+        )
+        # The repaired prefix is the catalogue's, not a hardcoded ``nvidia/``.
+        assert normalize_model_for_provider("nvidia:glm-5.2", "nvidia") == "z-ai/glm-5.2"
+
+    @pytest.mark.parametrize("model", [
+        # Slash form: the catalogue short-circuit is the only thing keeping a
+        # self-hosted id addressable, so stripping must NOT reach it.
+        "nvidia/my-local-nim-container",
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "z-ai/glm-5.2",
+        # Bare unknown name: a lookup miss stays a miss.
+        "my-local-nim-container",
+        # A colon that is not a provider prefix is left for the catalogue to
+        # match verbatim, exactly as before.
+        "nemotron-3-ultra-550b-a55b:beta",
+    ])
+    def test_nvidia_non_colon_prefixed_forms_are_untouched(self, model):
+        """The #78796 pass-through guarantees survive the colon strip."""
+        assert normalize_model_for_provider(model, "nvidia") == model
+
+    def test_nvidia_colon_prefixed_unknown_name_stays_unrepaired(self):
+        """Strip the redundant prefix, but never invent a catalogue entry.
+
+        ``nvidia:my-local-nim`` names a self-hosted container behind the NVIDIA
+        provider id; the prefix is redundant, the model is not in the
+        catalogue, so the result is the bare id the local NIM actually serves.
+        """
+        assert (
+            normalize_model_for_provider("nvidia:my-local-nim", "nvidia")
+            == "my-local-nim"
+        )
 
     def test_non_matching_colon_prefix_is_preserved(self):
         """A colon that is not a matching provider prefix must survive.
