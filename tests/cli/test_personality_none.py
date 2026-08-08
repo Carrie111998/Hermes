@@ -26,7 +26,9 @@ class TestCLIPersonalityNone:
         cli = self._make_cli()
         with patch("cli.save_config_value", return_value=True):
             cli._handle_personality_command("/personality neutral")
-        assert cli.system_prompt == ""
+        # Clearing the overlay restores the manual/base prompt rather than
+        # deleting it.
+        assert cli.system_prompt == "You are kawaii~"
 
 
 
@@ -133,11 +135,14 @@ class TestPersonalityDictFormat:
             cli._handle_personality_command("/personality coder")
         assert "Style: use code examples" in cli.system_prompt
 
-    def test_string_personality_still_works(self):
+    def test_personality_preserves_manual_prompt_and_persists_selection(self):
         cli = self._make_cli({"helper": "You are helpful."})
-        with patch("cli.save_config_value", return_value=True):
+        cli.system_prompt = "Be concise."
+        with patch("cli.save_config_value", return_value=True) as save:
             cli._handle_personality_command("/personality helper")
-        assert cli.system_prompt == "You are helpful."
+        assert "Be concise." in cli.system_prompt
+        assert "You are helpful." in cli.system_prompt
+        save.assert_called_once_with("display.personality", "helper")
 
     def test_resolve_prompt_dict_no_tone_no_style(self):
         from cli import HermesCLI

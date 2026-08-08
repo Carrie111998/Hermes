@@ -11325,8 +11325,10 @@ def _(rid, params: dict) -> dict:
             elif key == "personality":
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
+                # Personality text is an in-session overlay.  Keep the
+                # user-owned global system prompt intact so changing a
+                # personality cannot destroy manual configuration.
                 _write_config_key("display.personality", pname)
-                _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
                     sid_key, session, new_prompt, pname
