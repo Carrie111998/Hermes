@@ -1150,8 +1150,14 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     # so their forever-unset agent_ready must not make them immortal.
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
-    if not _transport_is_dead(session.get("transport")):
-        return False
+    # Drop the ``_transport_is_dead()`` gate: a shared WebSocket is a
+    # gateway-level liveness signal, not a per-session one, and ``last_active``
+    # is the correct per-session activity metric the TTL already checks.
+    # Without this, idle sessions behind a long-lived client (desktop app)
+    # are immortal and never reach ``_finalize_session`` — so the
+    # ``on_session_end`` plugin hook / ``commit_memory_session`` never fire
+    # for memory providers (#81837). Reopening re-resumes from SQLite, so
+    # eviction is safe.
     last_active = float(session.get("last_active") or 0.0)
     created_at = float(session.get("created_at") or 0.0)
     return (now - last_active) > _SESSION_TTL_S and (now - created_at) > _SESSION_TTL_S
