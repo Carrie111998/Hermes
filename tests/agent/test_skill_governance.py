@@ -168,7 +168,7 @@ def test_auto_mode_filter_keeps_only_current_entries_for_protected_task_class(tm
     ]
 
 
-def test_retrieval_ranking_prefers_current_entries_for_protected_task_class(tmp_path, monkeypatch):
+def test_retrieval_ranking_filters_denied_entries_for_protected_task_class(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _configure_governance(tmp_path)
 
@@ -200,6 +200,44 @@ def test_retrieval_ranking_prefers_current_entries_for_protected_task_class(tmp_
             ),
         ],
         context=governance_context(mode="retrieval"),
+    )
+
+    assert [item.name for item in ranked] == ["ModernCurrent"]
+    assert ranked[0].extra["governance"]["classification"] == "CURRENT"
+
+
+def test_retrieval_ranking_preserves_unprotected_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _configure_governance(tmp_path)
+
+    ranked = rank_skill_search_results(
+        [
+            _SearchResult(
+                name="PREMP",
+                description="Legacy stale entry",
+                source="github",
+                identifier="github/premp",
+                trust_level="trusted",
+                extra={},
+            ),
+            _SearchResult(
+                name="ModernCurrent",
+                description="Qualified current entry",
+                source="official",
+                identifier="official/modern-current",
+                trust_level="builtin",
+                extra={},
+            ),
+            _SearchResult(
+                name="ToolTrust",
+                description="Compatibility-only legacy entry",
+                source="github",
+                identifier="github/tooltrust",
+                trust_level="trusted",
+                extra={},
+            ),
+        ],
+        context=governance_context(mode="retrieval", task_class="general"),
     )
 
     assert [item.name for item in ranked] == ["ModernCurrent", "ToolTrust", "PREMP"]

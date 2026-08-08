@@ -340,6 +340,88 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert "Searching for:" not in sink.getvalue()
 
 
+def test_do_search_filters_governance_blocked_results_when_protected(monkeypatch, tmp_path):
+    from hermes_cli.skills_hub import do_search
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _write_governance_config(home, task_class="medical", protected=["medical"])
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: blocked
+    classification: COMPATIBILITY_ONLY
+  - name: allowed
+    classification: CURRENT
+""",
+        encoding="utf-8",
+    )
+
+    blocked = type("R", (), {
+        "name": "blocked",
+        "description": "Blocked",
+        "source": "github",
+        "trust_level": "trusted",
+        "identifier": "github/blocked",
+        "extra": {},
+    })()
+    allowed = type("R", (), {
+        "name": "allowed",
+        "description": "Allowed",
+        "source": "github",
+        "trust_level": "trusted",
+        "identifier": "github/allowed",
+        "extra": {},
+    })()
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=120)
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "tools.skills_hub.unified_search",
+        lambda *_a, **_k: [blocked, allowed],
+    )
+
+    do_search("skill", console=console)
+
+    rendered = sink.getvalue()
+    assert "allowed" in rendered
+    assert "blocked" not in rendered
+
+
+def test_do_search_keeps_results_when_unprotected_governance_eval_fails(monkeypatch, tmp_path):
+    from hermes_cli.skills_hub import do_search
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    result = type("R", (), {
+        "name": "visible",
+        "description": "Visible",
+        "source": "github",
+        "trust_level": "trusted",
+        "identifier": "github/visible",
+        "extra": {},
+    })()
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None, width=120)
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr("tools.skills_hub.unified_search", lambda *_a, **_k: [result])
+    monkeypatch.setattr(
+        "agent.skill_governance.rank_skill_search_results",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+    )
+
+    do_search("skill", console=console)
+
+    rendered = sink.getvalue()
+    assert "No skills found matching your query." not in rendered
+    assert "visible" in rendered
+
+
 def test_do_browse_fail_closes_when_protected_governance_ranking_fails(monkeypatch, tmp_path):
     from hermes_cli.skills_hub import do_browse
 

@@ -554,6 +554,8 @@ def rank_skill_search_results(
                     "protected_task": decision.protected_task,
                 }
             )
+        if protected and not decision.allowed:
+            continue
         decorated.append(
             (
                 governance_sort_tuple(result, context=context),

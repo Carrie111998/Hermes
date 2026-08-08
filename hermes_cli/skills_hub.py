@@ -302,7 +302,14 @@ def do_search(query: str, source: str = "all", limit: int = 10,
     if as_json:
         # Avoid Rich status spinner contaminating stdout — JSON consumers
         # expect a clean parseable stream.
-        results = unified_search(query, sources, source_filter=source, limit=limit)
+        results = _rank_retrieval_results(
+            unified_search(query, sources, source_filter=source, limit=limit),
+            fallback_key=lambda r: (
+                {"builtin": 2, "trusted": 1, "community": 0}.get(r.trust_level, 0) * -1,
+                r.source != "official",
+                r.name.lower(),
+            ),
+        )
         payload = [
             {
                 "name": r.name,
@@ -318,7 +325,14 @@ def do_search(query: str, source: str = "all", limit: int = 10,
 
     c.print(f"\n[bold]Searching for:[/] {query}")
     with c.status("[bold]Searching registries..."):
-        results = unified_search(query, sources, source_filter=source, limit=limit)
+        results = _rank_retrieval_results(
+            unified_search(query, sources, source_filter=source, limit=limit),
+            fallback_key=lambda r: (
+                {"builtin": 2, "trusted": 1, "community": 0}.get(r.trust_level, 0) * -1,
+                r.source != "official",
+                r.name.lower(),
+            ),
+        )
 
     if not results:
         c.print("[dim]No skills found matching your query.[/]\n")
