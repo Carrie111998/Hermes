@@ -9562,7 +9562,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
 
     async def _notify_active_sessions_of_shutdown(self) -> None:
-        """Send shutdown/restart notifications to active chats and home channels.
+        """Notify active chats and, only while work is active, home channels.
 
         Called at the very start of stop() — adapters are still connected so
         messages can be delivered. Best-effort: individual send failures are
@@ -9676,6 +9676,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._restart_requested and restart_source is not None:
             logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+            return
+
+        if not active:
+            logger.info("Skipping home-channel shutdown notifications: no active sessions")
             return
 
         # Suppress ONLY the home-channel broadcast when the drain that is ending

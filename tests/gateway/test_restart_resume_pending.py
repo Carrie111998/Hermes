@@ -734,7 +734,7 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+async def test_restart_skips_home_channel_without_active_sessions(caplog):
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
@@ -743,12 +743,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
         name="Ops Home",
     )
 
-    await runner._notify_active_sessions_of_shutdown()
+    with caplog.at_level("INFO", logger="gateway.run"):
+        await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent == []
+    assert "Skipping home-channel shutdown notifications: no active sessions" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1038,5 +1037,4 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
 
