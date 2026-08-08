@@ -3682,6 +3682,8 @@ class AIAgent:
         result: Any,
         is_error: bool,
         task_id: Optional[str] = None,
+        expected_state: Optional[Dict[str, Dict[str, Any]]] = None,
+        fingerprint_failures: bool = True,
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
@@ -3698,6 +3700,8 @@ class AIAgent:
             return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+        if expected_state is not None and state is not expected_state:
             return
         if not self._file_mutation_verifier_enabled():
             return
@@ -3721,10 +3725,31 @@ class AIAgent:
                         pass
         if is_error and not landed:
             preview = _extract_error_preview(result)
-            for path in targets:
-                resolved_path, fingerprint = self._snapshot_file_mutation_target(
+            reported_paths: List[str] = []
+            try:
+                result_data = json.loads(result) if isinstance(result, str) else result
+                if isinstance(result_data, dict):
+                    raw_paths = result_data.get("resolved_paths")
+                    if isinstance(raw_paths, list):
+                        reported_paths = [str(item) for item in raw_paths]
+                    elif isinstance(result_data.get("resolved_path"), str):
+                        reported_paths = [result_data["resolved_path"]]
+            except (TypeError, ValueError):
+                pass
+            for index, path in enumerate(targets):
+                reported_path = (
+                    reported_paths[index] if index < len(reported_paths) else None
+                )
+                resolved_path = reported_path or self._resolve_file_mutation_target(
                     path, task_id=task_id,
                 )
+                fingerprint = None
+                if fingerprint_failures and resolved_path:
+                    _, fingerprint = self._snapshot_file_mutation_target(
+                        resolved_path,
+                        task_id=task_id,
+                        resolved_path=resolved_path,
+                    )
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.  The
@@ -3786,6 +3811,7 @@ class AIAgent:
         path: str,
         *,
         task_id: Optional[str] = None,
+        resolved_path: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[tuple]]:
         """Return a canonical target and, when local and budgeted, its fingerprint.
 
@@ -3800,7 +3826,9 @@ class AIAgent:
         fingerprinting stops for the turn; that target and every later target
         remain conservatively unresolved.
         """
-        resolved_text = self._resolve_file_mutation_target(path, task_id=task_id)
+        resolved_text = resolved_path or self._resolve_file_mutation_target(
+            path, task_id=task_id,
+        )
         if not resolved_text:
             return None, None
         try:
