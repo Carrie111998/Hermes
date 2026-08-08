@@ -1421,6 +1421,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Peer adapters registry: Platform -> BasePlatformAdapter instance.
         # Set by GatewayRunner at startup; used by /api/weixin/send.
         self._peer_adapters: Dict[str, Any] = {}
+        # GatewayRunner weak ref for profile adapter lookup (avoids
+        # strong reference cycle: adapter -> runner -> adapters).
+        self._runner_ref: Any = None
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -5850,6 +5853,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        if not isinstance(body, dict):
+            return web.json_response(
+                {"success": False, "error": "JSON body must be an object"},
+                status=400,
+            )
+
         chat_id = (body.get("chat_id") or "").strip()
         message = (body.get("message") or "").strip()
 
@@ -5870,7 +5879,18 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         from gateway.config import Platform as _Plat
-        weixin_adapter = self._peer_adapters.get(_Plat.WEIXIN)
+        # Check profile-specific adapters first (named-profile support),
+        # then fall back to default adapters.
+        weixin_adapter = None
+        profile = _api_request_profile.get()
+        if profile and self._runner_ref is not None:
+            runner = self._runner_ref()  # dereference weakref
+            if runner is not None:
+                profile_adapters = getattr(runner, "_profile_adapters", {})
+                profile_map = profile_adapters.get(profile, {})
+                weixin_adapter = profile_map.get(_Plat.WEIXIN)
+        if weixin_adapter is None:
+            weixin_adapter = self._peer_adapters.get(_Plat.WEIXIN)
         if weixin_adapter is None:
             logger.info(
                 "[weixin-send-audit] ts=%s caller=%s chat=%s len=%d result=adapter_unavailable",

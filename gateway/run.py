@@ -11512,6 +11512,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Wire peer adapters into API server for /api/weixin/send proxy
         if Platform.API_SERVER in self.adapters:
             self.adapters[Platform.API_SERVER]._peer_adapters = self.adapters
+            import weakref
+            self.adapters[Platform.API_SERVER]._runner_ref = weakref.ref(self)
 
         self._running = True
         self._update_runtime_status("running")
