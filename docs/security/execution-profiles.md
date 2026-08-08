@@ -7,9 +7,9 @@ the child, verifies the effective policy, and returns an immutable launch receip
 
 ## Security boundary
 
-Execution profiles are **in-process policy pinning**, not process isolation.
+The default `in_process` execution backend is policy pinning, not process isolation.
 
-They provide:
+All profiles provide:
 
 - host-owned protocol, role, toolset, transition, and deadline policy;
 - fail-closed exact-tool verification after child construction;
@@ -20,7 +20,7 @@ They provide:
 - protocol, task, tool-schema, provider, model, role, and child-session evidence in
   an immutable launch receipt.
 
-They do not provide:
+The default in-process backend does not provide:
 
 - filesystem or workspace confinement;
 - environment, credential, network, memory, or Python-module isolation;
@@ -149,6 +149,44 @@ launches. It records:
 The receipt is also attached to the terminal `SubagentResult` and included in its
 canonical result hash. It is host evidence about observed launch state, not an OS
 sandbox attestation.
+
+## Phase 2 process backends
+
+`execution_backend` defaults to `in_process`, preserving the Phase 1 behavior and
+receipt labels. A process profile selects `portable` or `linux_strict` and must
+declare an absolute, existing, non-root `workspace_root`; the host resolves
+symlinks and pins the canonical directory. `max_process_iterations` defaults to 8
+and is restricted to 1–32.
+
+Portable execution is labeled `portable-process-unconfined`. It owns and reaps a
+separate POSIX process group and scrubs its environment, but it does not claim
+filesystem or network confinement. Linux strict
+execution is labeled `linux-strict-bwrap-cgroup-v2` and refuses to spawn unless
+Linux, bubblewrap namespace support, and delegated cgroup v2 are available. A
+Linux strict profile must declare an absolute, existing, non-root
+`cgroup_parent` that the host service has already delegated; Hermes never falls
+back to the cgroup-v2 root. Python `Popen(pass_fds=...)` admits only the
+capability socket and cgroup-launcher descriptor. The launcher closes the
+cgroup descriptor before `exec` and Bubblewrap passes the remaining inherited
+capability socket to the sandbox command without a nonexistent compatibility
+flag.
+
+The worker receives the secret, capability id, and launch digest only through an
+inherited Unix socket bootstrap. It has no provider credential or ambient tool
+registry. `session.start` supplies the exact schemas, their digest, and host-owned
+local-versus-brokered classifications. Evo v1 initializes only `terminal`,
+`read_file`, `write_file`, `patch`, and `search_files` inside the worker, freezes
+those handlers at startup, and executes them under the selected process boundary.
+Only `scaffolde_evo_agent_dispatch` is host brokered; its frozen parent handler is
+invoked with the strict child bound as lifecycle parent so nested profile transitions
+remain enforced. Unclassified tools, including process, GUI, browser, network,
+credential, and arbitrary plugin tools, fail before spawn. Provider calls remain in
+the parent. Process profiles currently support only `api_mode: chat_completions`;
+other modes fail before spawn.
+
+`describe_execution(handle)` returns a separate immutable process execution
+receipt. Terminal process results bind both its canonical hash and the unchanged
+Phase 1 launch receipt; launch receipts are never relabeled as containment proof.
 
 ## Rollout rule
 

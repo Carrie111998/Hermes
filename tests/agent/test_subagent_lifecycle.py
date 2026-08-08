@@ -30,6 +30,7 @@ class FakeChild:
         self._delegate_depth = 1
         self.provider = "test"
         self.model = "test-model"
+        self.api_mode = "chat_completions"
         self.interrupted = False
         self.interrupt_kind = None
         self.session_id = f"session-{ident}"
@@ -72,6 +73,35 @@ def _profile(**overrides):
         timeout_seconds=None,
     )
     return dataclasses.replace(profile, **overrides)
+
+
+def test_process_profile_refuses_unsupported_api_mode_before_spawn(
+    monkeypatch, tmp_path
+):
+    parent = SimpleNamespace(session_id="process-refusal", enabled_toolsets=["file"])
+    child = FakeChild("unsupported-mode")
+    child.api_mode = "codex_responses"
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _id: _profile(
+            execution_backend="portable", workspace_root=str(tmp_path)
+        ),
+    )
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    spawned = Mock()
+    monkeypatch.setattr("agent.subagent_process_runner.run_owned_process", spawned)
+
+    service = SubagentLifecycleService(lambda: parent)
+    with pytest.raises(SubagentLifecycleError, match="only api_mode 'chat_completions'"):
+        service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert child.closed is True
+    spawned.assert_not_called()
 
 
 @pytest.fixture

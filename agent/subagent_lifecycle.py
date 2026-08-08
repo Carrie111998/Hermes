@@ -15,6 +15,7 @@ import hmac
 import json
 import math
 import secrets
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -26,8 +27,12 @@ from agent.subagent_execution_profiles import (
     AMBIENT_POLICY_LABEL,
     CLEANUP_POLICY_LABEL,
     DEADLINE_SEMANTICS_COOPERATIVE,
+    DEADLINE_SEMANTICS_HARD,
     DEADLINE_SEMANTICS_NONE,
     MCP_POLICY_LABEL,
+    PORTABLE_AMBIENT_POLICY_LABEL,
+    PROCESS_CLEANUP_POLICY_LABEL,
+    STRICT_AMBIENT_POLICY_LABEL,
     ExecutionProfileError,
     ResolvedExecutionProfile,
     SubagentLaunchReceipt,
@@ -36,6 +41,10 @@ from agent.subagent_execution_profiles import (
     resolve_execution_profile,
     sha256_text,
     tool_schema_digest,
+)
+from agent.subagent_execution_receipts import (
+    SubagentExecutionReceipt,
+    SubagentExecutionRecorder,
 )
 
 PUBLIC_CONTRACT_VERSION = 1
@@ -150,6 +159,8 @@ class SubagentResult:
     # unchanged).  Frozen dataclass keeps the public snapshot immutable;
     # dataclasses.asdict still makes result hashing/serialization deterministic.
     launch_receipt: Optional[SubagentLaunchReceipt] = None
+    execution_receipt: Optional[SubagentExecutionReceipt] = None
+    execution_receipt_hash: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -170,6 +181,8 @@ class _Record:
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
     receipt: Optional[SubagentLaunchReceipt] = None
+    execution_profile: Optional[ResolvedExecutionProfile] = None
+    execution_receipt: Optional[SubagentExecutionReceipt] = None
     timeout_override: Optional[float] = None
     start_gate: Optional[threading.Event] = None
     launch_committed: bool = True
@@ -333,6 +346,16 @@ class SubagentLifecycleService:
                     self._abort_child_launch(child, parent)
                     child = None
                     raise
+                if (
+                    profile.execution_backend != "in_process"
+                    and getattr(child, "api_mode", None) != "chat_completions"
+                ):
+                    self._abort_child_launch(child, parent)
+                    child = None
+                    raise SubagentLifecycleError(
+                        "Process execution profiles support only api_mode "
+                        "'chat_completions'; refusing before process spawn."
+                    )
             handle = SubagentHandle(
                 PUBLIC_CONTRACT_VERSION,
                 subagent_id,
@@ -351,6 +374,7 @@ class SubagentLifecycleService:
                 created,
                 agent=child,
                 receipt=receipt,
+                execution_profile=profile,
                 timeout_override=(
                     profile.timeout_seconds if profile is not None else None
                 ),
@@ -420,6 +444,13 @@ class SubagentLifecycleService:
         """
         record = self._record(handle)
         return record.receipt if record is not None else None
+
+    def describe_execution(
+        self, handle: SubagentHandle
+    ) -> Optional[SubagentExecutionReceipt]:
+        """Return the separate immutable process execution receipt."""
+        record = self._record(handle)
+        return record.execution_receipt if record is not None else None
 
     @staticmethod
     def _resolve_profile_for_launch(
@@ -583,14 +614,30 @@ class SubagentLifecycleService:
             role=effective_role,
             depth=int(getattr(child, "_delegate_depth", 1) or 1),
             child_session_id=(str(getattr(child, "session_id", "") or "") or None),
-            ambient_policy=AMBIENT_POLICY_LABEL,
-            cleanup_policy=CLEANUP_POLICY_LABEL,
+            ambient_policy=(
+                AMBIENT_POLICY_LABEL
+                if profile.execution_backend == "in_process"
+                else (
+                    PORTABLE_AMBIENT_POLICY_LABEL
+                    if profile.execution_backend == "portable"
+                    else STRICT_AMBIENT_POLICY_LABEL
+                )
+            ),
+            cleanup_policy=(
+                CLEANUP_POLICY_LABEL
+                if profile.execution_backend == "in_process"
+                else PROCESS_CLEANUP_POLICY_LABEL
+            ),
             mcp_policy=MCP_POLICY_LABEL,
             deadline_seconds=profile.timeout_seconds,
             deadline_semantics=(
-                DEADLINE_SEMANTICS_COOPERATIVE
-                if profile.timeout_seconds is not None
-                else DEADLINE_SEMANTICS_NONE
+                DEADLINE_SEMANTICS_NONE
+                if profile.timeout_seconds is None
+                else (
+                    DEADLINE_SEMANTICS_COOPERATIVE
+                    if profile.execution_backend == "in_process"
+                    else DEADLINE_SEMANTICS_HARD
+                )
             ),
             created_at=created,
         )
@@ -777,18 +824,22 @@ class SubagentLifecycleService:
             record.updated_at = record.started_at
         receipt_payload = record.receipt
         try:
-            from tools.delegate_tool import _run_child_lifecycle
-
-            if record.timeout_override is not None:
-                raw = _run_child_lifecycle(
-                    0,
-                    goal,
-                    record.agent,
-                    parent,
-                    timeout_override=record.timeout_override,
-                )
+            profile = record.execution_profile
+            if profile is not None and profile.execution_backend != "in_process":
+                raw = self._run_process_child(record, goal, profile)
             else:
-                raw = _run_child_lifecycle(0, goal, record.agent, parent)
+                from tools.delegate_tool import _run_child_lifecycle
+
+                if record.timeout_override is not None:
+                    raw = _run_child_lifecycle(
+                        0,
+                        goal,
+                        record.agent,
+                        parent,
+                        timeout_override=record.timeout_override,
+                    )
+                else:
+                    raw = _run_child_lifecycle(0, goal, record.agent, parent)
             status = (
                 str(raw.get("status", "error")) if isinstance(raw, dict) else "error"
             )
@@ -825,6 +876,12 @@ class SubagentLifecycleService:
                 if isinstance(raw, dict)
                 else {},
                 launch_receipt=receipt_payload,
+                execution_receipt=record.execution_receipt,
+                execution_receipt_hash=(
+                    record.execution_receipt.canonical_hash()
+                    if record.execution_receipt is not None
+                    else None
+                ),
             )
         except Exception as exc:
             result = SubagentResult(
@@ -836,6 +893,12 @@ class SubagentLifecycleService:
                 error_classification=type(exc).__name__,
                 error_message=str(exc)[:_MAX_RESULT_CHARS],
                 launch_receipt=receipt_payload,
+                execution_receipt=record.execution_receipt,
+                execution_receipt_hash=(
+                    record.execution_receipt.canonical_hash()
+                    if record.execution_receipt is not None
+                    else None
+                ),
             )
         payload = dataclasses.asdict(result)
         payload.pop("result_hash", None)
@@ -843,6 +906,9 @@ class SubagentLifecycleService:
             # Legacy launches keep their pre-profile hash input byte-for-byte;
             # profile launches fold the receipt into the result hash.
             payload.pop("launch_receipt", None)
+        if payload.get("execution_receipt") is None:
+            payload.pop("execution_receipt", None)
+            payload.pop("execution_receipt_hash", None)
         result = dataclasses.replace(
             result,
             result_hash=hashlib.sha256(
@@ -855,6 +921,134 @@ class SubagentLifecycleService:
             record.state = result.terminal_state
             record.completed_at = result.completed_at
             record.updated_at = result.completed_at or time.time()
+
+    @staticmethod
+    def _run_process_child(
+        record: _Record,
+        goal: str,
+        profile: ResolvedExecutionProfile,
+    ) -> Mapping[str, Any]:
+        from pathlib import Path
+
+        from agent.subagent_broker_protocol import BrokerGrant, SubagentBroker
+        from agent.subagent_process_integration import (
+            ParentBrokerAdapter,
+            launch_receipt_digest,
+            strict_worker_runtime_mounts,
+        )
+        from agent.subagent_process_runner import (
+            LinuxStrictConfig,
+            ProcessRunSpec,
+            run_owned_process,
+        )
+        from agent.subagent_tool_boundary import EvoToolBoundaryError, classify_evo_tools
+
+        if record.receipt is None or profile.workspace_root is None:
+            raise SubagentLifecycleError("process profile lacks pinned launch authority")
+        try:
+            classify_evo_tools(record.agent._delegate_frozen_dispatch_entries)
+        except EvoToolBoundaryError as exc:
+            raise SubagentLifecycleError(str(exc)) from exc
+        digest = launch_receipt_digest(record.receipt)
+        broker = SubagentBroker(
+            launch_receipt_digest=digest,
+            grant=BrokerGrant(
+                operations=frozenset({"session.start", "model.complete", "tool.execute"}),
+                workspace_root=profile.workspace_root,
+            ),
+        )
+        recorder = SubagentExecutionRecorder(
+            launch_receipt_digest=digest,
+            backend=profile.execution_backend,
+            containment_mode=(
+                "portable-process-unconfined"
+                if profile.execution_backend == "portable"
+                else "linux-strict-bwrap-cgroup-v2"
+            ),
+            requested_cleanup=(
+                ("process-group-reap", "cgroup-v2-kill-and-empty")
+                if profile.execution_backend == "linux_strict"
+                else ("process-group-reap",)
+            ),
+        )
+
+        class ReceiptAdapter:
+            def on_created(self, *, backend: str, confinement: str) -> None:
+                del backend, confinement
+
+            def on_started(self, *, root_pid: int) -> None:
+                record.execution_receipt = recorder.mark_started(root_pid=root_pid)
+
+            def on_terminal(self, *, state: str, result: Any) -> None:
+                evidence = {
+                    "exit_code": result.exit_code,
+                    "term_signal": result.signal,
+                    "broker_transcript_digest": broker.transcript_digest(),
+                    "observed_cleanup": (
+                        f"root_reaped={result.cleanup.root_reaped}",
+                        f"process_group_empty={result.cleanup.process_group_empty}",
+                    ),
+                    "containment_evidence": (result.confinement,),
+                    "diagnostics": (result.diagnostic,) if result.diagnostic else (),
+                }
+                marker = getattr(recorder, f"mark_{state.lower()}")
+                record.execution_receipt = marker(**evidence)
+
+        adapter = ParentBrokerAdapter(
+            broker=broker,
+            child=record.agent,
+            profile=profile,
+            task=goal,
+        )
+        workspace = Path(profile.workspace_root)
+        backend = "portable" if profile.execution_backend == "portable" else "linux-strict"
+        worker_path = Path(__file__).with_name("subagent_worker_main.py").resolve(strict=True)
+        runtime_mounts = ()
+        if backend == "linux-strict":
+            runtime_mounts = strict_worker_runtime_mounts()
+        spec = ProcessRunSpec(
+            executable=sys.executable,
+            argv=(str(worker_path),),
+            cwd=workspace,
+            workspace=workspace,
+            capability_secret=broker.reveal_secret_for_transport(),
+            capability_id=broker.capability_id,
+            launch_receipt_digest=digest,
+            backend=backend,
+            timeout_seconds=profile.timeout_seconds or 300.0,
+            broker=adapter,
+            receipt=ReceiptAdapter(),
+            runtime_mounts=runtime_mounts,
+            strict=(
+                LinuxStrictConfig(
+                    cgroup_parent=Path(profile.cgroup_parent or ""),
+                    sandbox_workspace=workspace,
+                )
+                if backend == "linux-strict"
+                else None
+            ),
+        )
+        result = run_owned_process(spec)
+        broker.close("owned process completed")
+        if result.state != "SUCCEEDED":
+            return {
+                "status": "error",
+                "error": result.diagnostic or result.state,
+                "api_calls": 0,
+                "duration_seconds": 0,
+            }
+        try:
+            payload = json.loads(result.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise SubagentLifecycleError("worker returned malformed bounded JSON") from exc
+        if not isinstance(payload, Mapping) or set(payload) != {"summary", "iterations"}:
+            raise SubagentLifecycleError("worker result has an invalid shape")
+        return {
+            "status": "completed",
+            "summary": payload["summary"],
+            "api_calls": payload["iterations"],
+            "duration_seconds": 0,
+        }
 
     @staticmethod
     def _capability(

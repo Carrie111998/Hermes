@@ -6,12 +6,13 @@ launch time.  Plugin callers only ever supply a symbolic ``profile_id`` on
 ``SubagentLaunchRequest``; they never register or receive resolved profile
 objects.
 
-Security framing (deliberate, do not soften): a resolved profile is an
-IN-PROCESS pinned policy plus a launch receipt.  It is NOT workspace,
-environment, or process confinement; the child shares the parent process,
-filesystem, network, and environment.  Deadlines and cancellation are
-cooperative interrupt requests only — termination and cleanup are not
-confirmed.  Remote named-agent attestation is out of scope.
+Security framing (deliberate, do not soften): ``in_process`` profiles pin
+policy but provide no containment. ``portable`` profiles move the conversation
+loop and exact local tools into an owned, scrubbed child process but remain
+filesystem/network unconfined. ``linux_strict`` additionally requires a
+host-delegated cgroup-v2 parent and Bubblewrap namespaces. The immutable launch
+receipt records accepted policy; a separate execution receipt records observed
+process/containment state. Remote named-agent attestation is out of scope.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ from typing import Any, Mapping, Optional
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _MAX_PROTOCOL_BYTES = 32_000  # Must fit the lifecycle context budget.
 _MAX_TIMEOUT_SECONDS = 86_400.0
+_MAX_PROCESS_ITERATIONS = 32
+_VALID_EXECUTION_BACKENDS = frozenset({"in_process", "portable", "linux_strict"})
 _VALID_ROLES = frozenset({"leaf", "orchestrator"})
 UNSAFE_EXACT_PROFILE_TOOL_NAMES = frozenset(
     {
@@ -53,6 +56,10 @@ _PROFILE_KEYS = frozenset({
     "allow_root",
     "allowed_child_profiles",
     "timeout_seconds",
+    "execution_backend",
+    "workspace_root",
+    "cgroup_parent",
+    "max_process_iterations",
 })
 
 # Honest, host-owned policy labels stamped into every profile launch receipt.
@@ -80,6 +87,25 @@ DEADLINE_SEMANTICS_NONE = (
     "none: no per-launch deadline; global delegation timeout config applies."
 )
 
+PORTABLE_AMBIENT_POLICY_LABEL = (
+    "owned-process-scrubbed-unconfined: the conversation loop and exact local "
+    "tools run in a separate process with a scrubbed environment; provider "
+    "credentials stay in the parent, but filesystem and network are not OS-confined."
+)
+STRICT_AMBIENT_POLICY_LABEL = (
+    "owned-process-linux-strict: the conversation loop and exact local tools run "
+    "inside Bubblewrap filesystem/network namespaces and a host-delegated cgroup-v2; "
+    "provider credentials stay in the parent."
+)
+PROCESS_CLEANUP_POLICY_LABEL = (
+    "owned-confirmed: the execution receipt records process-group and, for Linux "
+    "strict mode, cgroup cleanup evidence."
+)
+DEADLINE_SEMANTICS_HARD = (
+    "hard-owned-process: timeout terminates and reaps the owned process group; "
+    "Linux strict mode also kills and verifies the dedicated cgroup."
+)
+
 
 class ExecutionProfileError(ValueError):
     """A profile cannot be resolved or a profile launch must be refused."""
@@ -105,6 +131,10 @@ class ResolvedExecutionProfile:
     allow_root: bool
     allowed_child_profiles: tuple[str, ...]
     timeout_seconds: Optional[float]
+    execution_backend: str = "in_process"
+    workspace_root: Optional[str] = None
+    cgroup_parent: Optional[str] = None
+    max_process_iterations: int = 8
     blocked_tools: frozenset[str] = frozenset()
 
 
@@ -467,6 +497,67 @@ def resolve_execution_profile(
             )
         timeout_seconds = float(timeout_seconds)
 
+    execution_backend = raw.get("execution_backend", "in_process")
+    if execution_backend not in _VALID_EXECUTION_BACKENDS:
+        raise ExecutionProfileError(
+            "execution_backend must be 'in_process', 'portable', or 'linux_strict'."
+        )
+    workspace_root = raw.get("workspace_root")
+    cgroup_parent = raw.get("cgroup_parent")
+    if execution_backend == "in_process":
+        if workspace_root is not None or cgroup_parent is not None:
+            raise ExecutionProfileError(
+                "workspace_root/cgroup_parent are only valid for process execution backends."
+            )
+    else:
+        if not isinstance(workspace_root, str) or not os.path.isabs(workspace_root):
+            raise ExecutionProfileError(
+                "process execution backends require an absolute workspace_root."
+            )
+        try:
+            resolved_workspace = Path(workspace_root).resolve(strict=True)
+        except OSError as exc:
+            raise ExecutionProfileError(
+                "workspace_root must be an existing directory."
+            ) from exc
+        if not resolved_workspace.is_dir() or resolved_workspace == Path(resolved_workspace.anchor):
+            raise ExecutionProfileError(
+                "workspace_root must be an existing non-root directory."
+            )
+        workspace_root = str(resolved_workspace)
+    if execution_backend == "linux_strict":
+        if not isinstance(cgroup_parent, str) or not os.path.isabs(cgroup_parent):
+            raise ExecutionProfileError(
+                "linux_strict execution requires an absolute host-delegated cgroup_parent."
+            )
+        try:
+            resolved_cgroup_parent = Path(cgroup_parent).resolve(strict=True)
+        except OSError as exc:
+            raise ExecutionProfileError(
+                "cgroup_parent must be an existing directory."
+            ) from exc
+        if (
+            not resolved_cgroup_parent.is_dir()
+            or resolved_cgroup_parent == Path(resolved_cgroup_parent.anchor)
+        ):
+            raise ExecutionProfileError(
+                "cgroup_parent must be an existing non-root directory."
+            )
+        cgroup_parent = str(resolved_cgroup_parent)
+    elif cgroup_parent is not None:
+        raise ExecutionProfileError(
+            "cgroup_parent is only valid for linux_strict execution."
+        )
+    max_process_iterations = raw.get("max_process_iterations", 8)
+    if (
+        isinstance(max_process_iterations, bool)
+        or not isinstance(max_process_iterations, int)
+        or not 1 <= max_process_iterations <= _MAX_PROCESS_ITERATIONS
+    ):
+        raise ExecutionProfileError(
+            f"max_process_iterations must be an integer in [1, {_MAX_PROCESS_ITERATIONS}]."
+        )
+
     return ResolvedExecutionProfile(
         profile_id=profile_id,
         role=role,
@@ -478,6 +569,10 @@ def resolve_execution_profile(
         allow_root=allow_root,
         allowed_child_profiles=allowed_child_profiles,
         timeout_seconds=timeout_seconds,
+        execution_backend=execution_backend,
+        workspace_root=workspace_root,
+        cgroup_parent=cgroup_parent,
+        max_process_iterations=max_process_iterations,
         blocked_tools=blocked_tools,
     )
 

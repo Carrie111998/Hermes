@@ -238,6 +238,11 @@ class BrokerEnvelopeSigner:
         envelope["mac"] = _envelope_mac(self._secret, authority)
         return envelope
 
+    @property
+    def sequence(self) -> int:
+        with self._lock:
+            return self._sequence
+
     def __repr__(self) -> str:
         return (
             f"<BrokerEnvelopeSigner capability_id={self._capability_id!r} "
@@ -308,6 +313,10 @@ class SubagentBroker:
             launch_receipt_digest=self._launch_receipt_digest,
         )
 
+    @property
+    def capability_id(self) -> str:
+        return self._capability_id
+
     def reveal_secret_for_transport(self) -> bytes:
         """Host-only accessor for pipe/socketpair transport to the worker.
 
@@ -365,7 +374,7 @@ class SubagentBroker:
             body_digest = _sha256_hex(canonical_json(parsed["body"]))
             if not hmac.compare_digest(parsed["body_digest"], body_digest):
                 self._reject_locked("body-digest-mismatch")
-            if parsed["sequence"] <= self._last_sequence:
+            if parsed["sequence"] != self._last_sequence + 1:
                 self._reject_locked("sequence-rejected")
             if parsed["operation"] not in self._grant.operations:
                 self._reject_locked("operation-not-granted")

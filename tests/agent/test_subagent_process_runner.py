@@ -284,6 +284,7 @@ def test_portable_spawn_is_argv_only_new_session_closed_fds(monkeypatch, tmp_pat
 
     monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(runner_module, "send_capability_secret", lambda *a: None)
+    monkeypatch.setattr(runner_module, "send_authenticated_frame", lambda *a, **k: None)
     monkeypatch.setattr(
         runner_module,
         "_monitor_process",
@@ -313,6 +314,77 @@ def test_portable_spawn_is_argv_only_new_session_closed_fds(monkeypatch, tmp_pat
     assert all(
         rendered_secret not in value for value in captured["kwargs"]["env"].values()
     )
+
+
+def test_linux_bwrap_inherits_passed_capability_fd_without_fake_option(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = ProcessRunSpec(
+        executable=sys.executable,
+        argv=("-c", "pass"),
+        cwd=workspace,
+        workspace=workspace,
+        capability_secret=SECRET,
+        backend="linux-strict",
+        strict=LinuxStrictConfig(cgroup_parent=tmp_path),
+    )
+    argv = runner_module._build_linux_strict_argv(spec, "/usr/bin/bwrap", capability_fd=9)
+    assert "--preserve-fds" not in argv
+    assert argv[-2:] == ["--capability-fd", "9"]
+
+
+def test_pre_spawn_receipt_callback_failure_refuses_spawn(monkeypatch, tmp_path):
+    class Receipt:
+        def on_created(self, **_kwargs):
+            raise RuntimeError("recorder unavailable")
+
+    spawned = False
+
+    def fake_popen(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", fake_popen)
+    result = run_owned_process(_portable_spec(tmp_path, "-c", "pass", receipt=Receipt()))
+    assert result.state == "FAILED"
+    assert result.root_pid is None
+    assert spawned is False
+
+
+def test_post_spawn_receipt_callback_failure_reaps_owned_process(tmp_path, monkeypatch):
+    class Receipt:
+        def on_created(self, **_kwargs):
+            pass
+
+        def on_started(self, **_kwargs):
+            raise RuntimeError("recorder unavailable")
+
+    reaped = []
+
+    class FakeProcess:
+        pid = 43211
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    monkeypatch.setattr(
+        runner_module,
+        "_cleanup_process_group",
+        lambda process, **kwargs: reaped.append(process.pid)
+        or runner_module.CleanupEvidence(root_reaped=True, process_group_empty=True),
+    )
+    result = run_owned_process(
+        _portable_spec(tmp_path, "-c", "import time; time.sleep(30)", receipt=Receipt())
+    )
+    assert result.state == "FAILED"
+    assert result.root_pid is not None
+    assert result.cleanup.root_reaped is True
+    assert result.cleanup.process_group_empty is True
+    assert reaped == [43211]
 
 
 def test_linux_strict_probe_fails_closed_before_worker_spawn(monkeypatch, tmp_path):

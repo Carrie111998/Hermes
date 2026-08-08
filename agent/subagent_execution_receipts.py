@@ -249,6 +249,8 @@ class SubagentExecutionRecorder:
                     f"Cannot mark STARTED from {self._state.value}; only a "
                     "CREATED execution may start."
                 )
+            if stamp < self._created_at:
+                raise ExecutionReceiptError("started_at must be after created_at.")
             self._state = SubagentExecutionState.STARTED
             self._root_pid = pid
             self._started_at = stamp
@@ -267,7 +269,11 @@ class SubagentExecutionRecorder:
         return self._complete(SubagentExecutionState.TIMED_OUT, **evidence)
 
     def mark_containment_failed(self, **evidence: Any) -> SubagentExecutionReceipt:
-        return self._complete(SubagentExecutionState.CONTAINMENT_FAILED, **evidence)
+        return self._complete(
+            SubagentExecutionState.CONTAINMENT_FAILED,
+            allow_created=True,
+            **evidence,
+        )
 
     def _complete(
         self,
@@ -280,6 +286,7 @@ class SubagentExecutionRecorder:
         containment_evidence: Any = (),
         diagnostics: Any = (),
         completed_at: Optional[float] = None,
+        allow_created: bool = False,
     ) -> SubagentExecutionReceipt:
         # Validate every field before taking the lock: a rejected transition
         # must leave the recorder byte-for-byte unchanged.
@@ -307,10 +314,18 @@ class SubagentExecutionRecorder:
                     f"Execution is terminal ({self._state.value}); receipts "
                     "admit no further transitions."
                 )
-            if self._state is not SubagentExecutionState.STARTED:
+            if self._state is SubagentExecutionState.CREATED and allow_created:
+                pass
+            elif self._state is not SubagentExecutionState.STARTED:
                 raise ExecutionReceiptError(
                     f"Cannot mark {state.value} from {self._state.value}; the "
                     "STARTED transition cannot be skipped."
+                )
+            if stamp < self._created_at or (
+                self._started_at is not None and stamp < self._started_at
+            ):
+                raise ExecutionReceiptError(
+                    "completed_at must be after created_at and started_at."
                 )
             self._state = state
             self._completed_at = stamp

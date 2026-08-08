@@ -205,7 +205,10 @@ def test_lower_sequence_after_higher_is_rejected():
     signer = broker.client_signer()
     first = signer.sign("read_file", None)
     second = signer.sign("read_file", None)
-    broker.validate(second)
+    with pytest.raises(BrokerEnvelopeRejected) as excinfo:
+        broker.validate(second)
+    assert _reason(excinfo) == "sequence-rejected"
+    broker.validate(first)
     with pytest.raises(BrokerEnvelopeRejected) as excinfo:
         broker.validate(first)
     assert _reason(excinfo) == "sequence-rejected"

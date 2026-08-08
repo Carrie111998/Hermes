@@ -27,7 +27,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from agent.subagent_worker_main import send_capability_secret
+from agent.subagent_worker_main import send_capability_secret, send_authenticated_frame
 
 PORTABLE_CONFINEMENT = "portable-process-unconfined"
 LINUX_STRICT_CONFINEMENT = "linux-strict-bwrap-cgroup-v2"
@@ -118,6 +118,8 @@ class ProcessRunSpec:
     cwd: Path
     workspace: Path
     capability_secret: bytes = dataclasses.field(repr=False)
+    capability_id: str = dataclasses.field(default="runner-capability", repr=False)
+    launch_receipt_digest: str = dataclasses.field(default="0" * 64, repr=False)
     backend: Literal["portable", "linux-strict"] = "portable"
     capability_fd_arg: str | None = "--capability-fd"
     environment: Mapping[str, str] = dataclasses.field(default_factory=dict)
@@ -238,6 +240,8 @@ def _validate_spec(spec: ProcessRunSpec) -> None:
         or not 32 <= len(spec.capability_secret) <= 128
     ):
         raise ValueError("capability_secret must contain 32-128 bytes")
+    if not spec.capability_id or not spec.launch_receipt_digest:
+        raise ValueError("capability bootstrap authority is required")
     if spec.capability_fd_arg is not None and (
         not spec.capability_fd_arg or "\x00" in spec.capability_fd_arg
     ):
@@ -426,6 +430,9 @@ def _build_linux_strict_argv(
     )
     argv = [
         bwrap_path,
+        # Bubblewrap passes otherwise-unreferenced inherited descriptors to the
+        # sandbox command. Popen.pass_fds constrains that set to the capability
+        # socket (the cgroup launcher fd is closed before bwrap is exec'd).
         "--die-with-parent",
         "--new-session",
         "--unshare-user",
@@ -716,11 +723,7 @@ def _cleanup_process_group(
 def _notify(callback: ReceiptCallbacks | None, method: str, **kwargs: Any) -> None:
     if callback is None:
         return
-    try:
-        getattr(callback, method)(**kwargs)
-    except Exception:
-        # Receipt integration must not strand an already-owned child process.
-        pass
+    getattr(callback, method)(**kwargs)
 
 
 def _terminal_result(
@@ -756,7 +759,14 @@ def _terminal_result(
         cleanup=cleanup or CleanupEvidence(requested=False),
         diagnostic=diagnostic,
     )
-    _notify(spec.receipt, "on_terminal", state=state, result=result)
+    try:
+        _notify(spec.receipt, "on_terminal", state=state, result=result)
+    except Exception as exc:
+        result = dataclasses.replace(
+            result,
+            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            diagnostic=f"receipt callback failed: {type(exc).__name__}",
+        )
     return result
 
 
@@ -785,12 +795,30 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
     confinement = (
         PORTABLE_CONFINEMENT if spec.backend == "portable" else LINUX_STRICT_CONFINEMENT
     )
-    _notify(
-        spec.receipt,
-        "on_created",
-        backend=spec.backend,
-        confinement=confinement,
-    )
+    try:
+        _notify(
+            spec.receipt,
+            "on_created",
+            backend=spec.backend,
+            confinement=confinement,
+        )
+    except Exception as exc:
+        return ProcessRunResult(
+            backend=spec.backend,
+            confinement=confinement,
+            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            root_pid=None,
+            returncode=None,
+            exit_code=None,
+            signal=None,
+            timed_out=False,
+            stdout=b"",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            cleanup=CleanupEvidence(requested=False),
+            diagnostic=f"pre-spawn receipt callback failed: {type(exc).__name__}",
+        )
     strict_probe: StrictPrerequisiteResult | None = None
     cgroup: Path | None = None
     cgroup_fd: int | None = None
@@ -893,6 +921,14 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             os.close(cgroup_fd)
             cgroup_fd = None
         send_capability_secret(host_channel, spec.capability_secret)
+        send_authenticated_frame(
+            host_channel,
+            {
+                "capability_id": spec.capability_id,
+                "launch_receipt_digest": spec.launch_receipt_digest,
+            },
+            spec.capability_secret,
+        )
 
         if spec.broker is not None:
             broker = spec.broker
@@ -999,6 +1035,30 @@ def run_owned_process(spec: ProcessRunSpec) -> ProcessRunResult:
             timed_out=False,
             cleanup=cleanup,
             diagnostic=f"owned process spawn/bootstrap failed: errno={exc.errno}",
+        )
+    except Exception as exc:
+        cleanup = CleanupEvidence(requested=False)
+        if process is not None:
+            cleanup = _cleanup_process_group(
+                process,
+                term_grace_seconds=spec.term_grace_seconds,
+                kill_grace_seconds=spec.kill_grace_seconds,
+            )
+        return ProcessRunResult(
+            backend=spec.backend,
+            confinement=confinement,
+            state=("CONTAINMENT_FAILED" if spec.backend == "linux-strict" else "FAILED"),
+            root_pid=process.pid if process is not None else None,
+            returncode=process.returncode if process is not None else None,
+            exit_code=(process.returncode if process is not None and process.returncode is not None and process.returncode >= 0 else None),
+            signal=(-process.returncode if process is not None and process.returncode is not None and process.returncode < 0 else None),
+            timed_out=False,
+            stdout=b"",
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            cleanup=cleanup,
+            diagnostic=f"post-spawn callback/bootstrap failed: {type(exc).__name__}",
         )
     finally:
         stop_requested.set()

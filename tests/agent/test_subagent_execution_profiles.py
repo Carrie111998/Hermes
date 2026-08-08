@@ -66,6 +66,80 @@ def test_valid_profile_resolves_with_pinned_protocol_hash(hermes_home):
     assert profile.allow_root is True
     assert profile.allowed_child_profiles == ()
     assert profile.timeout_seconds is None
+    assert profile.execution_backend == "in_process"
+    assert profile.workspace_root is None
+    assert profile.cgroup_parent is None
+    assert profile.max_process_iterations == 8
+
+
+def test_process_profile_requires_canonical_non_root_workspace(hermes_home, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = resolve_execution_profile(
+        "reviewer",
+        config=_profile_config(
+            execution_backend="portable",
+            workspace_root=str(workspace),
+            max_process_iterations=3,
+        ),
+    )
+    assert profile.execution_backend == "portable"
+    assert profile.workspace_root == str(workspace.resolve())
+    assert profile.max_process_iterations == 3
+
+    with pytest.raises(ExecutionProfileError, match="require an absolute"):
+        resolve_execution_profile(
+            "reviewer",
+            config=_profile_config(execution_backend="portable", workspace_root="relative"),
+        )
+    with pytest.raises(ExecutionProfileError, match="non-root"):
+        resolve_execution_profile(
+            "reviewer",
+            config=_profile_config(execution_backend="portable", workspace_root="/"),
+        )
+
+
+def test_linux_strict_profile_requires_host_delegated_cgroup_parent(
+    hermes_home, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with pytest.raises(ExecutionProfileError, match="cgroup_parent"):
+        resolve_execution_profile(
+            "reviewer",
+            config=_profile_config(
+                execution_backend="linux_strict",
+                workspace_root=str(workspace),
+            ),
+        )
+
+    delegated = tmp_path / "delegated-cgroup"
+    delegated.mkdir()
+    profile = resolve_execution_profile(
+        "reviewer",
+        config=_profile_config(
+            execution_backend="linux_strict",
+            workspace_root=str(workspace),
+            cgroup_parent=str(delegated),
+        ),
+    )
+    assert profile.cgroup_parent == str(delegated.resolve())
+
+
+def test_portable_profile_rejects_cgroup_parent(hermes_home, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    delegated = tmp_path / "delegated-cgroup"
+    delegated.mkdir()
+    with pytest.raises(ExecutionProfileError, match="only valid for linux_strict"):
+        resolve_execution_profile(
+            "reviewer",
+            config=_profile_config(
+                execution_backend="portable",
+                workspace_root=str(workspace),
+                cgroup_parent=str(delegated),
+            ),
+        )
 
 
 def test_profile_resolves_host_owned_blocked_tools(hermes_home):

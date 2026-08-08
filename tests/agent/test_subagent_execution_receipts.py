@@ -149,12 +149,25 @@ def test_success_records_exit_code_and_failure_records_signal():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mark", sorted(_TERMINAL_MARKS.values()))
+@pytest.mark.parametrize(
+    "mark",
+    sorted(set(_TERMINAL_MARKS.values()) - {"mark_containment_failed"}),
+)
 def test_started_cannot_be_skipped(mark):
     recorder = _recorder()
     with pytest.raises(ExecutionReceiptError):
         getattr(recorder, mark)()
     assert recorder.snapshot().state is SubagentExecutionState.CREATED
+
+
+def test_pre_spawn_containment_failure_has_no_fake_pid():
+    receipt = _recorder().mark_containment_failed(
+        diagnostics=("strict prerequisites unavailable",)
+    )
+    assert receipt.state is SubagentExecutionState.CONTAINMENT_FAILED
+    assert receipt.root_pid is None
+    assert receipt.started_at is None
+    assert receipt.completed_at >= receipt.created_at
 
 
 def test_started_cannot_be_marked_twice():
