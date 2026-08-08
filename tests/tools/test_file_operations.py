@@ -682,6 +682,24 @@ class TestReadNonUtf8IsBinary:
 class TestReadUtf8SampleBoundary:
     """A byte sample must not split a valid UTF-8 character."""
 
+    @pytest.mark.parametrize("reader", ["read_file", "read_file_raw"])
+    def test_read_paths_accept_dense_cjk_at_sample_boundary(
+        self, tmp_path, reader
+    ):
+        """Dense CJK text remains readable when the 1000-byte cut splits a glyph."""
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), errors="replace")
+        )
+        path = tmp_path / "cjk-boundary.md"
+        prefix = "界" * 333  # 999 UTF-8 bytes: the next glyph starts at byte 1000.
+        path.write_bytes((prefix + "語\ntext\n").encode("utf-8"))
+
+        result = getattr(ops, reader)(str(path))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "語" in result.content
+
     def test_read_file_accepts_multibyte_character_at_sample_boundary(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path), errors="replace"))
         path = tmp_path / "boundary.md"
