@@ -1250,35 +1250,43 @@ class TestBuildJobPromptBumpUse:
             '[Loaded as part of the "demo" skill bundle.]\n\nStable bundle body.'
         )
 
-        with patch("agent.skill_bundles.resolve_bundle_command_key", return_value="/demo"), \
+        def _bundle_key(name: str):
+            return "/demo" if name == "demo" else None
+
+        def _skill_view(_name: str) -> str:
+            return json.dumps({"success": False, "error": "missing"})
+
+        with patch("agent.skill_bundles.resolve_bundle_command_key", side_effect=_bundle_key), \
              patch(
                  "agent.skill_bundles.build_bundle_invocation_message",
                  return_value=(bundle_message, ["alpha"], []),
              ), \
+             patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
              patch("tools.skill_usage.bump_use"):
-            first = _build_job_prompt({
-                "id": "cron-task",
-                "skills": ["demo"],
-                "prompt": "ticket=A/time=1",
-            })
-            second = _build_job_prompt({
-                "id": "cron-task",
-                "skills": ["demo"],
-                "prompt": "ticket=B/time=2",
-            })
+            for configured_skills in (["demo"], ["missing", "demo"]):
+                first = _build_job_prompt({
+                    "id": "cron-task",
+                    "skills": configured_skills,
+                    "prompt": "ticket=A/time=1",
+                })
+                second = _build_job_prompt({
+                    "id": "cron-task",
+                    "skills": configured_skills,
+                    "prompt": "ticket=B/time=2",
+                })
 
-        first_wire = apply_anthropic_cache_control(
-            [{"role": "user", "content": first}], native_anthropic=True
-        )[0]["content"]
-        second_wire = apply_anthropic_cache_control(
-            [{"role": "user", "content": second}], native_anthropic=True
-        )[0]["content"]
+                first_wire = apply_anthropic_cache_control(
+                    [{"role": "user", "content": first}], native_anthropic=True
+                )[0]["content"]
+                second_wire = apply_anthropic_cache_control(
+                    [{"role": "user", "content": second}], native_anthropic=True
+                )[0]["content"]
 
-        assert first_wire[0] == second_wire[0]
-        assert first_wire[0]["cache_control"] == {"type": "ephemeral"}
-        assert "cache_control" not in first_wire[1]
-        assert first_wire[1]["text"].endswith("ticket=A/time=1")
-        assert second_wire[1]["text"].endswith("ticket=B/time=2")
+                assert first_wire[0] == second_wire[0]
+                assert first_wire[0]["cache_control"] == {"type": "ephemeral"}
+                assert "cache_control" not in first_wire[1]
+                assert first_wire[1]["text"].endswith("ticket=A/time=1")
+                assert second_wire[1]["text"].endswith("ticket=B/time=2")
 
     def test_missing_skill_notice_remains_in_the_cacheable_prefix(self):
         from agent.prompt_caching import apply_anthropic_cache_control

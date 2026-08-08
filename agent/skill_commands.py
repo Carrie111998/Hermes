@@ -132,9 +132,7 @@ def split_skill_message_for_cache(content: Any) -> Optional[tuple[str, str]]:
         activation_end = len(content)
     activation_note = content[activation_index:activation_end]
     is_single_skill_scaffold = _SINGLE_SKILL_MARKER in activation_note
-    is_bundle_scaffold = (
-        activation_index == 0 and _BUNDLE_MARKER in activation_note
-    )
+    is_bundle_scaffold = _BUNDLE_MARKER in activation_note
 
     instruction_boundary = f"\n\n{_SINGLE_SKILL_INSTRUCTION}"
     boundary_index = content.rfind(instruction_boundary)
@@ -146,7 +144,9 @@ def split_skill_message_for_cache(content: Any) -> Optional[tuple[str, str]]:
         # bundle caller that appends a second, outer instruction after all
         # stable blocks; its suffix always begins with the execution hint.
         if not is_single_skill_scaffold and not (
-            is_bundle_scaffold and suffix.startswith(_CRON_EXECUTION_PREFIX)
+            is_bundle_scaffold
+            and 0 <= content.rfind(_BUNDLE_FIRST_SKILL_BLOCK) < boundary_index
+            and suffix.startswith(_CRON_EXECUTION_PREFIX)
         ):
             return None
     else:
