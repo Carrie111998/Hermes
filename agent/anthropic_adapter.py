@@ -436,10 +436,18 @@ def _build_claude_code_billing_header(
     """Build Claude Code's message-dependent subscription billing marker."""
     first_user_text = _extract_first_user_message_text(messages)
     resolved_version = version or _get_claude_code_version()
-    suffix_chars = "".join(
-        first_user_text[index] if index < len(first_user_text) else "0"
-        for index in (4, 7, 20)
-    )
+    # Claude Code's JavaScript implementation indexes UTF-16 code units, not
+    # Unicode code points. Select from the encoded units so astral characters
+    # before an index do not shift the signed positions.
+    utf16 = first_user_text.encode("utf-16-le", errors="surrogatepass")
+    selected_units = bytearray()
+    zero_unit = "0".encode("utf-16-le")
+    for index in (4, 7, 20):
+        start = index * 2
+        selected_units.extend(
+            utf16[start:start + 2] if start + 2 <= len(utf16) else zero_unit
+        )
+    suffix_chars = selected_units.decode("utf-16-le", errors="replace")
     version_suffix = hashlib.sha256(
         f"{_CLAUDE_CODE_BILLING_SALT}{suffix_chars}{resolved_version}".encode()
     ).hexdigest()[:3]

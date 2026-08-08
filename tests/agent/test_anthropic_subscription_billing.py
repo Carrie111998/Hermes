@@ -1,5 +1,6 @@
 """Behavioral coverage for Claude subscription billing request shaping."""
 
+import hashlib
 from unittest.mock import patch
 
 from agent.anthropic_adapter import (
@@ -58,6 +59,20 @@ def test_billing_header_uses_first_text_block_from_multimodal_user_turn():
     assert _build_claude_code_billing_header(
         multimodal, version="2.1.112"
     ) == _build_claude_code_billing_header(text_only, version="2.1.112")
+
+
+def test_billing_header_matches_javascript_utf16_indexing():
+    text = "🙂12345678901234567890"
+    expected_suffix = hashlib.sha256(
+        "59cf53e54c783692.1.112".encode()
+    ).hexdigest()[:3]
+
+    header = _build_claude_code_billing_header(
+        [{"role": "user", "content": text}],
+        version="2.1.112",
+    )
+
+    assert f"cc_version=2.1.112.{expected_suffix};" in header
 
 
 def test_oauth_kwargs_prefix_billing_identity_and_preserve_cache_marker():
