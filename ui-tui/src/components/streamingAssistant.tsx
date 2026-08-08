@@ -37,6 +37,7 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   const streaming = useTurnSelector(state => state.streaming)
   const activeTools = useTurnSelector(state => state.tools)
   const showStreamingArea = Boolean(streaming)
+
   const streamingTimestamp = useRef<number | undefined>(undefined)
 
   if (showStreamingArea && streamingTimestamp.current === undefined) {
