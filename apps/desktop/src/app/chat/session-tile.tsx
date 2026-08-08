@@ -17,7 +17,7 @@
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
 import { atom, computed } from 'nanostores'
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
@@ -29,13 +29,17 @@ import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { findGroupOfPane } from '@/components/pane-shell/tree/model'
 import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { sessionTitle } from '@/lib/chat-runtime'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { cn } from '@/lib/utils'
 import { createComposerAttachmentScope } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
@@ -67,6 +71,16 @@ import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
+import {
+  ComponentsResizeSeam,
+  PREVIEW_DEFAULT_WIDTH,
+  PREVIEW_MAX_WIDTH,
+  PREVIEW_MIN_WIDTH,
+  useComponentsWidth,
+  useResizableWidth
+} from './tile/components-area'
+import { PreviewTabs, usePreviewTabs } from './tile/preview-tabs'
+import { TileFiles } from './tile/tile-files'
 
 import { ChatView } from '.'
 
@@ -230,6 +244,44 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
   const resumingRef = useRef(false)
   const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
 
+  // Per-tile file browser drawer: expanded by default (the pre-toggle
+  // behavior). The panel-header collapse button and the collapsed rail button
+  // toggle it. While collapsed the tree stays MOUNTED at width 0 so its
+  // expand/scroll state survives.
+  const [filesExpanded, setFilesExpanded] = useState(true)
+  const { t } = useI18n()
+
+  // In-tile preview tabs: clicking a file in THIS tile's tree adds a tab here
+  // (chat | preview tabs | tree), NOT the global preview rail. Multiple files
+  // can be open at once, switched and closed from the strip above the preview —
+  // the same pattern as session tiles switching sessions.
+  const {
+    activeUrl: activePreviewUrl,
+    close: closePreviewTab,
+    closeAll: closeAllPreviewTabs,
+    closeOthers: closeOtherPreviewTabs,
+    closeToRight: closePreviewTabsToRight,
+    open: openPreviewTab,
+    setActiveUrl: setActivePreviewUrl,
+    tabs: previewTabs
+  } = usePreviewTabs()
+
+  // Preview strip width, drag-resizable like the tree (seam on its left).
+  const { startResize: startPreviewResize, width: previewWidth } = useResizableWidth(
+    PREVIEW_DEFAULT_WIDTH,
+    PREVIEW_MIN_WIDTH,
+    PREVIEW_MAX_WIDTH
+  )
+
+  // Components-area width (px), drag-resizable via the seam between chat and
+  // tree. Per-tile component state: separate tiles keep independent widths.
+  const { componentsWidth, startResize } = useComponentsWidth()
+
+  // Must run before any early return (rules-of-hooks): the tile's live runtime
+  // cwd, feeding the components area's file tree. '' while unresolved — the
+  // stored-row fallback below covers cold tiles.
+  const liveCwd = useStore(view.$cwd).trim()
+
   // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
   // $sessions (no sidebar clutter) until it's actually used, so the tab shows
   // "New session". The moment this tile has a message, pull its row into
@@ -350,7 +402,81 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     )
   }
 
-  return <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+  // Per-tile components area: the workspace file tree (and later the preview
+  // port) lives INSIDE the tile, keyed to THIS tile's cwd — not the global
+  // `$currentCwd`. Live runtime cwd first (agent may relocate mid-turn), the
+  // stored row's cwd/git root as the cold-tile fallback.
+  const storedRow = tileStoredRow(storedSessionId)
+  const tileCwd = liveCwd || storedRow?.cwd?.trim() || storedRow?.git_repo_root?.trim() || ''
+
+  const openTileFilePreview = async (path: string) => {
+    try {
+      const preview = await normalizeOrLocalPreviewTarget(path, tileCwd || undefined)
+
+      if (!preview) {
+        throw new Error('Could not preview')
+      }
+
+      openPreviewTab(preview)
+    } catch (error) {
+      notifyError(error, 'Preview unavailable')
+    }
+  }
+
+  return (
+    <div className="flex h-full min-w-0">
+      <div className="min-w-0 flex-1">
+        <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+      </div>
+      {previewTabs.length > 0 && (
+        <>
+          <ComponentsResizeSeam onPointerDown={startPreviewResize} />
+          <div
+            className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background)"
+            style={{ width: previewWidth }}
+          >
+            <PreviewTabs
+              activeUrl={activePreviewUrl}
+              onActivate={setActivePreviewUrl}
+              onClose={closePreviewTab}
+              onCloseAll={closeAllPreviewTabs}
+              onCloseOthers={closeOtherPreviewTabs}
+              onCloseToRight={closePreviewTabsToRight}
+              scopeId={`tile-preview:${storedSessionId}`}
+              tabs={previewTabs}
+            />
+          </div>
+        </>
+      )}
+      {filesExpanded && <ComponentsResizeSeam onPointerDown={startResize} />}
+      <div
+        className={cn(
+          'flex shrink-0 flex-col overflow-hidden border-l transition-[width] duration-150',
+          filesExpanded ? 'border-(--ui-stroke-secondary)' : 'border-transparent'
+        )}
+        style={{ width: filesExpanded ? componentsWidth : 0 }}
+      >
+        <TileFiles
+          cwd={tileCwd}
+          onActivateFile={openTileFilePreview}
+          onActivateFolder={openTileFilePreview}
+          onFilesCollapse={() => setFilesExpanded(false)}
+          onPreviewTarget={openPreviewTab}
+        />
+      </div>
+      {!filesExpanded && (
+        <button
+          aria-label={t.titlebar.showRightSidebar}
+          className="flex w-7 shrink-0 cursor-pointer flex-col items-center border-l border-(--ui-stroke-secondary) bg-(--ui-sidebar-surface-background) pt-1.5 text-(--ui-text-tertiary) transition-colors hover:text-foreground"
+          onClick={() => setFilesExpanded(true)}
+          title={t.titlebar.showRightSidebar}
+          type="button"
+        >
+          <Codicon name="files" size="1rem" />
+        </button>
+      )}
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------

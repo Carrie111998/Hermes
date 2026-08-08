@@ -42,13 +42,11 @@ import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { setYoloEnabled } from '@/lib/yolo-session'
 import { pruneComposerPopoutZones } from '@/store/composer-popout'
 import {
-  $fileBrowserOpen,
   $panesFlipped,
   $sidebarOpen,
   FILE_BROWSER_DEFAULT_WIDTH,
   FILE_BROWSER_MAX_WIDTH,
   FILE_BROWSER_MIN_WIDTH,
-  setFileBrowserOpen,
   setSidebarOpen,
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
@@ -72,7 +70,7 @@ import {
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
-import { FilesPane, LogsPane, ReviewPaneContent } from './panes'
+import { LogsPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
 
 /**
@@ -182,22 +180,6 @@ registry.registerMany([
     // its rail there). A real floor left a sliver of unusable terminal.
     data: { placement: 'bottom', height: '20vh', maxHeight: '80vh', revealOnPreset: true },
     render: () => <WiredPane part="terminal" />
-  },
-  {
-    id: 'files',
-    area: 'panes',
-    title: 'files',
-    // dock: re-adoption target after a stale dismissal (see sessions).
-    data: {
-      placement: 'right',
-      collapsible: true,
-      dock: { pane: 'workspace', pos: 'right' },
-      revealAliases: ['file-browser'],
-      width: FILE_BROWSER_DEFAULT_WIDTH,
-      minWidth: FILE_BROWSER_MIN_WIDTH,
-      maxWidth: FILE_BROWSER_MAX_WIDTH
-    },
-    render: () => idle(<FilesPane />)
   },
   {
     id: 'review',
@@ -327,45 +309,26 @@ registry.registerMany([
 // Layout presets — CHAT (main) always dominates.
 // ---------------------------------------------------------------------------
 
-// The REAL default: sessions left, chat main, and the right sidebars in column
-// order main | … | review | file-browser (files outermost). Each is its OWN
-// zone. Review collapses to nothing while its pane is hidden (⌘G off).
+// The REAL default: sessions left, chat main. The file tree and the preview
+// tabs live INSIDE the workspace pane (per-surface, not layout panes), so the
+// layout tree is just sessions | workspace — and the right rail (review /
+// terminal) is COLLAPSED by default: nothing occupies the side until a pane
+// opens on demand (⌘G review, ⌃` terminal), which un-collapses it.
 //
 // Preview tiles are DYNAMIC panes (like session tiles), so no preset names one:
-// they're registered by watchPreviewTiles as tabs open, and dockPaneBeside lands
-// each one directly beside the file tree wherever that currently lives — so a
-// file double-click still slides a preview open as its own pane next to the
-// tree, never as a tab stacked into the files sidebar.
+// they're registered by watchPreviewTiles as tabs open, and dockPaneBeside
+// lands each one beside the pane that spawned it.
 const DEFAULT_TREE = split(
   'row',
-  [
-    group(['sessions'], { id: 'grp-sessions' }),
-    group(['workspace'], { id: 'grp-main' }),
-    split(
-      'column',
-      [
-        split(
-          'row',
-          [group(['review'], { id: 'grp-review' }), group(['files'], { id: 'grp-files' })],
-          [1, 1.2],
-          'spl-rail'
-        ),
-        group(['terminal'], { id: 'grp-terminal' })
-      ],
-      [1.6, 1],
-      'spl-right'
-    )
-  ],
-  [1, 3.4, 1.25],
+  [group(['sessions'], { id: 'grp-sessions' }), group(['workspace'], { id: 'grp-main' })],
+  [1, 3.4],
   'spl-root'
 )
-
-const FOCUS_TREE = split('row', [group(['sessions']), group(['workspace', 'files', 'review', 'terminal'])], [1, 4.6])
 
 const TERMINAL_TREE = split(
   'column',
   [
-    split('row', [group(['sessions']), group(['workspace']), group(['files', 'review'])], [1, 3.2, 1.2]),
+    split('row', [group(['sessions']), group(['workspace']), group(['review'])], [1, 3.2, 1.2]),
     group(['terminal'])
   ],
   [3, 1]
@@ -374,7 +337,7 @@ const TERMINAL_TREE = split(
 const QUAD_TREE = split(
   'column',
   [
-    split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
+    split('row', [group(['sessions']), group(['workspace'])], [1, 3]),
     split('row', [group(['terminal']), group(['review'])], [1.4, 1])
   ],
   [3, 1]
@@ -382,9 +345,8 @@ const QUAD_TREE = split(
 
 registry.registerMany([
   { id: 'default', area: 'layouts', title: 'Default', order: 0, data: DEFAULT_TREE },
-  { id: 'focus', area: 'layouts', title: 'Focus', order: 10, data: FOCUS_TREE },
-  { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 20, data: TERMINAL_TREE },
-  { id: 'quad', area: 'layouts', title: 'Quad', order: 30, data: QUAD_TREE }
+  { id: 'terminal-deck', area: 'layouts', title: 'Terminal deck', order: 10, data: TERMINAL_TREE },
+  { id: 'quad', area: 'layouts', title: 'Quad', order: 20, data: QUAD_TREE }
 ])
 
 declareDefaultTree(DEFAULT_TREE)
@@ -504,11 +466,13 @@ $panesFlipped.listen(flipped => {
   }
 })
 
-// POSITIONAL side toggles (titlebar buttons, ⌘B / ⌘J): $sidebarOpen ≙ the
-// LEFT side of the main zone, $fileBrowserOpen ≙ the RIGHT — everything on
-// that side hides together, whatever panes have been rearranged there.
+// POSITIONAL side toggles (titlebar buttons, ⌘B): $sidebarOpen ≙ the LEFT
+// side of the main zone. The RIGHT side is deliberately NOT bound to a store —
+// the file browser lives inside the workspace pane now ($fileBrowserOpen
+// toggles it THERE), and review/terminal open on demand, un-collapsing the
+// right rail through revealTreePane. Binding the rail to the file-tree toggle
+// would drag review/terminal open every time the user opens the file tree.
 bindTreeSideVisibility('left', $sidebarOpen, setSidebarOpen)
-bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 
 // Workspace-scoped surfaces: the file tree and git diff only mean something
 // inside a project. A detached chat (no cwd) hides them — their zones
@@ -527,13 +491,6 @@ const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
 // writes the store too. Without the opener the boolean went stale the moment
 // anything but the toggle showed the pane — the divergence this whole change
 // is about.
-bindPaneVisibility(
-  'files',
-  computed([$hasWorkspace, $fileBrowserOpen], (workspace, open) => workspace && open),
-  () => setFileBrowserOpen(false),
-  () => setFileBrowserOpen(true)
-)
-// ⌘G — the review sidebar appears/disappears (and comes to the front).
 bindPaneVisibility(
   'review',
   computed([$reviewOpen, $hasWorkspace], (open, workspace) => open && workspace),
@@ -657,9 +614,6 @@ registry.register(
 // otherwise ⌘W/Close silently no-op.
 registerPaneCloser('sessions', () =>
   paneRootSide('sessions') === 'left' ? setSidebarOpen(false) : dismissTreePane('sessions')
-)
-registerPaneCloser('files', () =>
-  paneRootSide('files') === 'right' ? setFileBrowserOpen(false) : dismissTreePane('files')
 )
 
 // ---------------------------------------------------------------------------

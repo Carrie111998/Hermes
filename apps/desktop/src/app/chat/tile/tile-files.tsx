@@ -1,4 +1,3 @@
-import { useStore } from '@nanostores/react'
 import type { ComponentProps } from 'react'
 
 import { TreeSkeleton } from '@/components/chat/skeletons'
@@ -10,31 +9,45 @@ import { useDelayedTrue } from '@/hooks/use-delayed-true'
 import { useI18n } from '@/i18n'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
-import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
-import { openPreview } from '@/store/preview'
-import { $currentCwd } from '@/store/session'
+import { openPreview, type PreviewTarget } from '@/store/preview'
 
-import { SidebarPanelLabel } from '../shell/sidebar-label'
+import { SidebarPanelLabel } from '../../shell/sidebar-label'
 
 import { ProjectTree } from './files/tree'
 import { useProjectTree } from './files/use-project-tree'
 
-interface RightSidebarPaneProps {
+interface TileFilesProps {
+  /** The workspace directory this tile's tree browses. '' = detached chat. */
+  cwd: string
   onActivateFile: (path: string) => void
   onActivateFolder: (path: string) => void
+  /** Collapse this panel (tile drawer) — provided by tiles; the workspace
+   *  pane collapses via the chat header button instead. */
+  onFilesCollapse?: () => void
+  /** Route file PREVIEWS (tree click/dblclick/Enter activation) to an
+   *  embedded preview instead of the global preview rail. Absent → the rail. */
+  onPreviewTarget?: (preview: PreviewTarget) => void
 }
 
-export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSidebarPaneProps) {
+/**
+ * A session tile's file tree — the workspace browser embedded in the tile's
+ * components area. Per-tile: `cwd` comes from THIS tile's session (not the
+ * global `$currentCwd`), and `useProjectTree` keeps per-directory state, so
+ * two tiles browsing different workspaces never clobber each other.
+ *
+ * Moved from the global right sidebar (right-sidebar/index.tsx): the panel is
+ * identical, minus the app-chrome chrome (titlebar padding, flip borders).
+ */
+export function TileFiles({ cwd, onActivateFile, onActivateFolder, onFilesCollapse, onPreviewTarget }: TileFilesProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
-  const panesFlipped = useStore($panesFlipped)
-  const currentCwd = useStore($currentCwd).trim()
+  const currentCwd = cwd.trim()
 
   // The file tree is simply "browse the session's working directory". If the
   // session has a cwd — a repo, a sibling worktree, or any folder — show it. A
-  // bare/detached chat (resolveNewSessionCwd → '') has none, so it shows the
-  // empty hint instead of whatever dir Hermes happens to run from.
+  // bare/detached chat has none, so it shows the empty hint instead of
+  // whatever dir Hermes happens to run from.
   const hasWorkspace = Boolean(currentCwd)
 
   const {
@@ -66,7 +79,11 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
         throw new Error(r.couldNotPreview(path))
       }
 
-      openPreview(preview, 'file-browser')
+      if (onPreviewTarget) {
+        onPreviewTarget(preview)
+      } else {
+        openPreview(preview, 'file-browser')
+      }
     } catch (error) {
       notifyError(error, r.previewUnavailable)
     }
@@ -75,12 +92,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   return (
     <aside
       aria-label={r.aria}
-      className={cn(
-        'before:pointer-events-none relative flex h-full w-full min-w-0 flex-col overflow-hidden border-(--ui-stroke-secondary) bg-(--ui-sidebar-surface-background) pt-(--titlebar-height) text-(--ui-text-tertiary)',
-        panesFlipped
-          ? 'border-r shadow-[inset_-0.0625rem_0_0_color-mix(in_srgb,white_18%,transparent)]'
-          : 'border-l shadow-[inset_0.0625rem_0_0_color-mix(in_srgb,white_18%,transparent)]'
-      )}
+      className="relative flex h-full w-full min-w-0 flex-col overflow-hidden border-(--ui-stroke-secondary) bg-(--ui-sidebar-surface-background) text-(--ui-text-tertiary)"
     >
       <FilesystemTab
         canCollapse={canCollapse}
@@ -94,6 +106,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
         onActivateFile={onActivateFile}
         onActivateFolder={onActivateFolder}
         onCollapseAll={collapseAll}
+        onFilesCollapse={onFilesCollapse}
         onLoadChildren={loadChildren}
         onNodeOpenChange={setNodeOpen}
         onPreviewFile={previewFile}
@@ -109,6 +122,7 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   cwdName: string
   hasWorkspace: boolean
   onCollapseAll: () => void
+  onFilesCollapse?: () => void
   onRefresh: () => void
 }
 
@@ -131,6 +145,7 @@ function FilesystemTab({
   onActivateFile,
   onActivateFolder,
   onCollapseAll,
+  onFilesCollapse,
   onLoadChildren,
   onNodeOpenChange,
   onPreviewFile,
@@ -176,6 +191,19 @@ function FilesystemTab({
             <Codicon name="collapse-all" size="0.8125rem" />
           </Button>
         </Tip>
+        {onFilesCollapse && (
+          <Tip label={t.titlebar.hideRightSidebar}>
+            <Button
+              aria-label={t.titlebar.hideRightSidebar}
+              className={HEADER_ACTION_CLASS}
+              onClick={onFilesCollapse}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name="chevron-right" size="0.8125rem" />
+            </Button>
+          </Tip>
+        )}
       </RightSidebarSectionHeader>
       <FileTreeBody
         collapseNonce={collapseNonce}

@@ -13,11 +13,25 @@ import { Navigate, Route, Routes, useParams } from 'react-router'
 
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { cn } from '@/lib/utils'
+import { $fileBrowserOpen } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $freshDraftReady, $gatewayState } from '@/store/session'
+import { $currentCwd, $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
+import {
+  ComponentsResizeSeam,
+  PREVIEW_DEFAULT_WIDTH,
+  PREVIEW_MAX_WIDTH,
+  PREVIEW_MIN_WIDTH,
+  useComponentsWidth,
+  useResizableWidth
+} from '../chat/tile/components-area'
+import { PreviewTabs, usePreviewTabs } from '../chat/tile/preview-tabs'
+import { TileFiles } from '../chat/tile/tile-files'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
@@ -142,13 +156,100 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
   const chatActions = useMemo(() => latestChatActions(actions), [actions])
 
+  // The workspace pane's components area: the same per-tile file tree the
+  // session tiles carry, rooted at the primary session's cwd. Full-page views
+  // (messaging/artifacts/…) skip it — it's a chat-surface component.
+  const workspaceCwd = useStore($currentCwd).trim()
+  const { componentsWidth, startResize } = useComponentsWidth()
+
+  // The workspace pane's file browser is driven by the SAME $fileBrowserOpen
+  // the titlebar button and ⌘J toggle — one source of truth for "file browser
+  // visible". Collapsed keeps the tree MOUNTED at width 0 so its expand/scroll
+  // state survives a hide/show cycle.
+  const fileBrowserOpen = useStore($fileBrowserOpen)
+
+  // In-workspace preview tabs: a file click adds a tab between chat and tree
+  // (chat | preview tabs | files), mirroring the per-tile behavior — the
+  // preview rail is a layout-tree surface, this one keeps its own embedded
+  // tabs. Multiple files stay open at once, switched from the strip above.
+  const {
+    activeUrl: activePreviewUrl,
+    close: closePreviewTab,
+    closeAll: closeAllPreviewTabs,
+    closeOthers: closeOtherPreviewTabs,
+    closeToRight: closePreviewTabsToRight,
+    open: openPreviewTab,
+    setActiveUrl: setActivePreviewUrl,
+    tabs: previewTabs
+  } = usePreviewTabs()
+
+  // Preview strip width, drag-resizable like the tree (seam on its left).
+  const { startResize: startPreviewResize, width: previewWidth } = useResizableWidth(
+    PREVIEW_DEFAULT_WIDTH,
+    PREVIEW_MIN_WIDTH,
+    PREVIEW_MAX_WIDTH
+  )
+
+  const openFilePreview = async (path: string) => {
+    try {
+      const preview = await normalizeOrLocalPreviewTarget(path, workspaceCwd || undefined)
+
+      if (!preview) {
+        throw new Error('Could not preview')
+      }
+
+      openPreviewTab(preview)
+    } catch (error) {
+      notifyError(error, 'Preview unavailable')
+    }
+  }
+
   const chatView = (
-    <ChatView
-      gateway={gateway}
-      maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
-      modelMenuContent={modelMenuContent}
-      {...chatActions}
-    />
+    <div className="flex h-full min-w-0">
+      <div className="min-w-0 flex-1">
+        <ChatView
+          gateway={gateway}
+          maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
+          modelMenuContent={modelMenuContent}
+          {...chatActions}
+        />
+      </div>
+      {previewTabs.length > 0 && (
+        <>
+          <ComponentsResizeSeam onPointerDown={startPreviewResize} />
+          <div
+            className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background)"
+            style={{ width: previewWidth }}
+          >
+            <PreviewTabs
+              activeUrl={activePreviewUrl}
+              onActivate={setActivePreviewUrl}
+              onClose={closePreviewTab}
+              onCloseAll={closeAllPreviewTabs}
+              onCloseOthers={closeOtherPreviewTabs}
+              onCloseToRight={closePreviewTabsToRight}
+              scopeId="workspace-preview"
+              tabs={previewTabs}
+            />
+          </div>
+        </>
+      )}
+      {fileBrowserOpen && <ComponentsResizeSeam onPointerDown={startResize} />}
+      <div
+        className={cn(
+          'flex shrink-0 flex-col overflow-hidden border-l transition-[width] duration-150',
+          fileBrowserOpen ? 'border-(--ui-stroke-secondary)' : 'border-transparent'
+        )}
+        style={{ width: fileBrowserOpen ? componentsWidth : 0 }}
+      >
+        <TileFiles
+          cwd={workspaceCwd}
+          onActivateFile={openFilePreview}
+          onActivateFolder={openFilePreview}
+          onPreviewTarget={openPreviewTab}
+        />
+      </div>
+    </div>
   )
 
   // FULL-PAGE views (not chat) mark the zone body `data-zone-no-header`: a
