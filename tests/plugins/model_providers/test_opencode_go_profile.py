@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -168,6 +170,79 @@ class TestOpenCodeGoSessionAffinityHeader:
         )
         assert top_level["reasoning_effort"] == "high"
         assert top_level["extra_headers"]["x-opencode-session"] == "sess-xyz"
+
+
+class TestOpenCodeGoSessionHeaderOtherTransports:
+    """MiniMax/Qwen on OpenCode Go route through anthropic_messages, and (for
+    parity) codex_responses is covered too — build_api_kwargs_extras is only
+    consulted by the chat_completions transport, so build_api_kwargs must
+    merge the header itself on those other routes (#81584)."""
+
+    def _build_anthropic_kwargs(self, session_id="sess-abc123"):
+        from agent.chat_completion_helpers import build_api_kwargs
+        from agent.transports.anthropic import AnthropicTransport
+
+        transport = AnthropicTransport()
+        agent = SimpleNamespace(
+            api_mode="anthropic_messages",
+            provider="opencode-go",
+            model="minimax-m2.7",
+            session_id=session_id,
+            tools=None,
+            max_tokens=1024,
+            reasoning_config=None,
+            request_overrides={},
+            context_compressor=None,
+            _ephemeral_max_output_tokens=None,
+            _is_anthropic_oauth=False,
+            _anthropic_base_url="https://opencode.ai/zen/go/v1",
+            _oauth_1m_beta_disabled=False,
+            _get_transport=lambda: transport,
+            _prepare_anthropic_messages_for_api=lambda msgs: msgs,
+            _anthropic_preserve_dots=lambda: False,
+        )
+        return build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
+
+    def _build_codex_kwargs(self, session_id="sess-abc123"):
+        from agent.chat_completion_helpers import build_api_kwargs
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        agent = SimpleNamespace(
+            api_mode="codex_responses",
+            provider="opencode-go",
+            model="glm-5",
+            session_id=session_id,
+            tools=None,
+            base_url="https://opencode.ai/zen/go/v1",
+            _base_url_hostname="opencode.ai",
+            _base_url_lower="https://opencode.ai/zen/go/v1",
+            max_tokens=1024,
+            reasoning_config=None,
+            request_overrides={},
+            _get_transport=lambda: transport,
+            _prepare_messages_for_non_vision_model=lambda msgs: msgs,
+            _resolved_api_call_timeout=lambda: 30.0,
+            _github_models_reasoning_extra_body=lambda: None,
+            _codex_reasoning_replay_enabled=True,
+        )
+        return build_api_kwargs(agent, [{"role": "user", "content": "hi"}])
+
+    def test_anthropic_messages_route_gets_the_affinity_header(self):
+        kwargs = self._build_anthropic_kwargs(session_id="sess-abc123")
+        assert kwargs["extra_headers"]["x-opencode-session"] == "sess-abc123"
+
+    def test_codex_responses_route_gets_the_affinity_header(self):
+        kwargs = self._build_codex_kwargs(session_id="sess-abc123")
+        assert kwargs["extra_headers"]["x-opencode-session"] == "sess-abc123"
+
+    def test_non_opencode_go_provider_is_untouched_on_anthropic_messages(self):
+        from agent.chat_completion_helpers import _merge_opencode_go_session_header
+
+        kwargs = {"model": "claude-opus-4-8"}
+        agent = SimpleNamespace(provider="nous", model="claude-opus-4-8", session_id="s")
+        assert _merge_opencode_go_session_header(agent, kwargs) is kwargs
+        assert "extra_headers" not in kwargs
 
 
 class TestOpenCodeGoFullKwargsIntegration:
