@@ -17,7 +17,7 @@ import pytest
 
 import agent.redact as redact_module
 from hermes_cli._scan_venv_blockers import (
-    _is_pausable_gateway,
+    _is_pausable_hermes_process,
     _redact_sensitive_cmdline,
     main,
 )
@@ -97,13 +97,15 @@ def test_redact_short_flags_not_redacted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _is_pausable_gateway — the gateway exemption
+# _is_pausable_hermes_process — the updater-stoppable backend exemption
 #
 # `hermes-setup` always invokes `hermes update --yes --gateway`, whose
-# `_pause_windows_gateways_for_update()` stops running gateways itself. The
-# Desktop preflight must therefore not report gateway launcher/worker chains
-# as blockers — doing so aborts the handoff before the component that can
-# handle them ever runs.
+# `_pause_windows_gateways_for_update()` stops running gateways itself, and
+# the update flow reaps stale `serve` / `dashboard` backends
+# (`_kill_stale_dashboard_processes`). The Desktop preflight must therefore
+# not report those process classes as blockers — doing so aborts the handoff
+# before the component that can handle them ever runs (#81774: a secondary
+# profile's `serve` backend was left out and dead-ended the update forever).
 # ---------------------------------------------------------------------------
 
 
@@ -126,29 +128,37 @@ def test_redact_short_flags_not_redacted() -> None:
         "python.exe -m hermes_cli.main gateway",
         # case variations survive
         "PYTHON.EXE -m hermes_cli.main GATEWAY RUN",
+        # headless serve backends — the #81774 gap
+        "python.exe -m hermes_cli.main serve --host 127.0.0.1 --port 8756",
+        "python.exe -m hermes_cli.main --profile work serve",
+        "python.exe -m hermes_cli.main --profile secondary serve --host 0.0.0.0",
+        "python.exe -m hermes_cli.main dashboard --port 9119",
     ],
 )
-def test_is_pausable_gateway_accepts_gateway_run_chains(cmdline: str) -> None:
-    assert _is_pausable_gateway(cmdline) is True
+def test_is_pausable_hermes_process_accepts_updater_stoppable_backends(
+    cmdline: str,
+) -> None:
+    assert _is_pausable_hermes_process(cmdline) is True
 
 
 @pytest.mark.parametrize(
     "cmdline",
     [
-        # desktop backend: no pause machinery downstream, must keep blocking
-        "python.exe -m hermes_cli.main serve --host 127.0.0.1 --port 8756",
         # other gateway subcommands are not running gateways
         "python.exe -m hermes_cli.main gateway stop",
         "python.exe -m hermes_cli.main gateway status",
         "python.exe -m hermes_cli.main gateway install",
+        # a nested `serve` token is NOT a serve backend (mcp serve etc.)
+        "python.exe -m hermes_cli.main mcp serve",
         # operator REPL / stray script
         "python.exe",
         "python.exe myscript.py gateway run",  # not a hermes_cli.main invocation
+        "python.exe myscript.py serve",
         "",
     ],
 )
-def test_is_pausable_gateway_rejects_everything_else(cmdline: str) -> None:
-    assert _is_pausable_gateway(cmdline) is False
+def test_is_pausable_hermes_process_rejects_everything_else(cmdline: str) -> None:
+    assert _is_pausable_hermes_process(cmdline) is False
 
 
 def _run_main_with_detector(monkeypatch, capsys, matches):
@@ -199,47 +209,28 @@ def test_main_exempts_gateway_chain_but_keeps_other_holders(monkeypatch, capsys)
     assert data["pausable_gateways"] == 2
 
 
-def test_main_desktop_serve_backend_still_blocks(monkeypatch, capsys):
-    """The desktop's own `serve` backend has no downstream pause — it must
-    keep blocking exactly as before the exemption."""
+def test_main_exempts_serve_backend_but_keeps_other_holders(monkeypatch, capsys):
+    """A `serve` backend alone must scan clear; a non-pausable holder
+    alongside it must still block (and be the only reported PID)."""
     serve = (
         78,
         "python.exe",
         r"C:\x\venv\Scripts\python.exe -m hermes_cli.main serve --host 127.0.0.1",
     )
+    stray_repl = (56, "python.exe", r"C:\x\venv\Scripts\python.exe")
+
+    # Serve backend only → clear (the updater reaps it via
+    # _kill_stale_dashboard_processes, so it must not dead-end the handoff)
     code, data = _run_main_with_detector(monkeypatch, capsys, [serve])
     assert code == 0
-    assert data["blocked"] is True
-    assert [p["pid"] for p in data["processes"]] == [78]
-    assert data["pausable_gateways"] == 0
-
-def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, capsys):
-    """Regression: the detector must hand the FULL cmdline to the exemption.
-
-    Gateways launched via the managed-runtime interpreter carry a >120-char
-    exe path (`.hermes-runtime\python\generation-...\cpython-3.11-...`).
-    The old `cmdline_raw[:120]` truncation in the detector cut the cmdline
-    before `-m hermes_cli.main gateway run`, so the exemption never matched
-    and every Desktop update aborted with 'Update didn't finish'.
-    Here the detector returns full cmdlines (post-fix contract); the scan
-    must exempt the gateway and truncate only the *displayed* cmdline.
-    """
-    long_exe = (
-        r'"C:\Users\u\AppData\Local\hermes\hermes-agent\.hermes-runtime\python'
-        r"\generation-1785095035-66720-be29ea9c\cpython-3.11-windows-x86_64-none"
-        r'\python.exe"'
-    )
-    assert len(long_exe) > 120  # the truncation point was inside the exe path
-    gateway = (91, "python.exe", long_exe + "  -m hermes_cli.main gateway run --replace")
-    code, data = _run_main_with_detector(monkeypatch, capsys, [gateway])
-    assert code == 0
+    assert data["ok"] is True
     assert data["blocked"] is False
     assert data["processes"] == []
     assert data["pausable_gateways"] == 1
 
-    # A long-path NON-gateway holder still blocks, with cmdline truncated for display.
-    stray = (92, "python.exe", long_exe + "  -m some_other_module --serve-forever")
-    code, data = _run_main_with_detector(monkeypatch, capsys, [gateway, stray])
+    # Serve backend + stray REPL → blocked, reporting only the REPL
+    code, data = _run_main_with_detector(monkeypatch, capsys, [serve, stray_repl])
+    assert code == 0
     assert data["blocked"] is True
-    assert [p["pid"] for p in data["processes"]] == [92]
-    assert len(data["processes"][0]["cmdline"]) <= 120
+    assert [p["pid"] for p in data["processes"]] == [56]
+    assert data["pausable_gateways"] == 1
