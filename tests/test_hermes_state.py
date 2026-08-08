@@ -4469,6 +4469,7 @@ class TestPerformancePragmasEndToEnd:
         )
         db_path = home / "state.db"
         db = SessionDB(db_path=db_path)
+        rconn = None
         try:
             # Writer connection.
             assert self._read(db._conn) == self.CONFIGURED
@@ -4477,6 +4478,8 @@ class TestPerformancePragmasEndToEnd:
             assert rconn is not None, "WAL reader expected on local filesystem"
             assert self._read(rconn) == self.CONFIGURED
         finally:
+            if rconn is not None:
+                db._close_read_conn(rconn)
             db.close()
 
         # Read-only cross-profile attach.
@@ -4494,12 +4497,15 @@ class TestPerformancePragmasEndToEnd:
         home = self._fresh_home(tmp_path, monkeypatch, config_text=None)
         db_path = home / "state.db"
         db = SessionDB(db_path=db_path)
+        rconn = None
         try:
             assert self._read(db._conn) == defaults
             rconn = db._get_read_conn()
             if rconn is not None:
                 assert self._read(rconn) == defaults
         finally:
+            if rconn is not None:
+                db._close_read_conn(rconn)
             db.close()
 
         ro = SessionDB(db_path=db_path, read_only=True)

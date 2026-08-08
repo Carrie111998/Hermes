@@ -230,6 +230,91 @@ def test_close_waits_for_checked_out_reader_before_returning(db, monkeypatch):
     assert _live_count(db.db_path) == 0
 
 
+@pytest.mark.requires_wal
+def test_close_waits_for_post_shutdown_open_to_physically_close(db, monkeypatch):
+    """An opener losing to close remains counted until conn.close finishes."""
+    import hermes_state as _hs
+
+    real_connect = _hs._connect_tracked_db
+    real_close = db._close_read_conn
+    open_started = threading.Event()
+    allow_open = threading.Event()
+    physical_close_started = threading.Event()
+    allow_physical_close = threading.Event()
+
+    def blocked_connect(*args, **kwargs):
+        open_started.set()
+        assert allow_open.wait(timeout=10)
+        return real_connect(*args, **kwargs)
+
+    def blocked_close(conn):
+        physical_close_started.set()
+        assert allow_physical_close.wait(timeout=10)
+        real_close(conn)
+
+    monkeypatch.setattr(_hs, "_connect_tracked_db", blocked_connect)
+    monkeypatch.setattr(db, "_close_read_conn", blocked_close)
+
+    worker = threading.Thread(target=db._get_read_conn)
+    worker.start()
+    assert open_started.wait(timeout=10)
+    close_returned = threading.Event()
+    closer = threading.Thread(target=lambda: (db.close(), close_returned.set()))
+    closer.start()
+    allow_open.set()
+    assert physical_close_started.wait(timeout=10)
+
+    returned_before_physical_close = close_returned.wait(timeout=2)
+    allow_physical_close.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert not returned_before_physical_close
+    assert not worker.is_alive() and not closer.is_alive()
+    assert _live_count(db.db_path) == 0
+
+
+@pytest.mark.requires_wal
+def test_close_waits_for_returned_reader_to_physically_close(db, monkeypatch):
+    """A checked-out reader stays active through its shutdown-path close."""
+    real_close = db._close_read_conn
+    reader_active = threading.Event()
+    leave_context = threading.Event()
+    physical_close_started = threading.Event()
+    allow_physical_close = threading.Event()
+
+    def blocked_close(conn):
+        physical_close_started.set()
+        assert allow_physical_close.wait(timeout=10)
+        real_close(conn)
+
+    monkeypatch.setattr(db, "_close_read_conn", blocked_close)
+
+    def reader():
+        with db._read_ctx() as conn:
+            conn.execute("SELECT 1").fetchone()
+            reader_active.set()
+            assert leave_context.wait(timeout=10)
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+    assert reader_active.wait(timeout=10)
+    close_returned = threading.Event()
+    closer = threading.Thread(target=lambda: (db.close(), close_returned.set()))
+    closer.start()
+    leave_context.set()
+    assert physical_close_started.wait(timeout=10)
+
+    returned_before_physical_close = close_returned.wait(timeout=2)
+    allow_physical_close.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert not returned_before_physical_close
+    assert not worker.is_alive() and not closer.is_alive()
+    assert _live_count(db.db_path) == 0
+
+
 def test_reads_are_still_correct_under_concurrency(db):
     """Pooling must not corrupt results when threads share connections."""
     results = []

@@ -2926,15 +2926,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._read_conns_lock.notify_all()
             raise
         with self._read_conns_lock:
-            self._read_opening -= 1
             if self._read_conns_closed:
                 discard = True
             else:
+                self._read_opening -= 1
                 self._read_active.add(conn)
                 discard = False
-            self._read_conns_lock.notify_all()
+                self._read_conns_lock.notify_all()
         if discard:
-            self._close_read_conn(conn)
+            try:
+                self._close_read_conn(conn)
+            finally:
+                with self._read_conns_lock:
+                    self._read_opening -= 1
+                    self._read_conns_lock.notify_all()
             return None
         return conn
 
@@ -3020,14 +3025,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Return an active reader to the idle pool or close it after shutdown."""
         returned = False
         with self._read_conns_lock:
-            self._read_active.discard(conn)
             if not self._read_conns_closed:
                 try:
                     self._read_pool.put_nowait(conn)
+                    self._read_active.discard(conn)
                     returned = True
                 except queue.Full:
                     pass
-            self._read_conns_lock.notify_all()
+                self._read_conns_lock.notify_all()
         if not returned:
             self._close_read_conn(conn)
 

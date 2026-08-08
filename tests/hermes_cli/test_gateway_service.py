@@ -295,6 +295,15 @@ class TestGeneratedSystemdUnits:
         )
         assert gateway_cli._launchd_nofile_soft_limit() == 4096
 
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="maxfiles 256 1024\n", stderr=""
+            ),
+        )
+        assert gateway_cli._launchd_nofile_soft_limit() == 1024
+
     def test_launchd_limit_omits_absolute_override_when_domain_is_unknown(self, monkeypatch):
         """Failing to inspect inheritance must not risk lowering a higher limit."""
         import hermes_cli.resource_limits as resource_limits

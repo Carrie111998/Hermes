@@ -4118,10 +4118,18 @@ def _launchd_nofile_soft_limit() -> int | None:
         inherited_soft = int(fields[1])
         if inherited_soft <= 0:
             return None
+        inherited_hard = None
+        if fields[2].lower() != "unlimited":
+            inherited_hard = int(fields[2])
+            if inherited_hard <= 0 or inherited_hard < inherited_soft:
+                return None
     except (OSError, ValueError, subprocess.SubprocessError):
         logger.debug("Could not inspect launchd maxfiles inheritance", exc_info=True)
         return None
-    return max(target, DEFAULT_NOFILE_SOFT_LIMIT, inherited_soft)
+    resolved = max(target, DEFAULT_NOFILE_SOFT_LIMIT, inherited_soft)
+    if inherited_hard is not None:
+        resolved = min(resolved, inherited_hard)
+    return resolved
 
 
 def generate_launchd_plist() -> str:
