@@ -294,6 +294,32 @@ class TestShellFileOpsHelpers:
             "C:/Users/alice/notes.txt"
         ) == "'/c/Users/alice/notes.txt'"
 
+    def test_shell_quote_raw_preserves_regex_backslashes(self, file_ops):
+        # Regression: _bash_safe_path rewrites every backslash to "/",
+        # corrupting regex patterns on Windows (\.env -> /.env).
+        assert file_ops._shell_quote_raw(r"\.env") == "'\\.env'"
+        assert file_ops._shell_quote_raw(r"\d+") == "'\\d+'"
+        assert file_ops._shell_quote_raw(r"a\\nb") == "'a\\\\nb'"
+        assert file_ops._shell_quote_raw("it's") == "'it'\"'\"'s'"
+
+    def test_rg_path_arg_emits_native_windows_form(self, monkeypatch, file_ops):
+        # Regression: native rg.exe cannot read Git-Bash paths (/c/Users/x)
+        # when MSYS argument conversion is disabled (os error 3). The rg
+        # path arg must be in native C:/... form, understood by both
+        # native and MSYS builds of ripgrep.
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._rg_path_arg("C:/Users/alice/notes.txt") == "'C:/Users/alice/notes.txt'"
+        assert file_ops._rg_path_arg("C:\\Users\\alice\\notes.txt") == "'C:/Users/alice/notes.txt'"
+        assert file_ops._rg_path_arg("/c/Users/alice/notes.txt") == "'C:/Users/alice/notes.txt'"
+
+    def test_rg_path_arg_noop_off_windows(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        assert file_ops._rg_path_arg("/home/alice/notes.txt") == "'/home/alice/notes.txt'"
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 
