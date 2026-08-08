@@ -17,6 +17,7 @@ metadata:
 - Node.js 18+ (for the MCP server)
 
 ## When to Use
+
 Use this skill when you need to:
 - Give the agent its own dedicated email address
 - Send emails autonomously on behalf of the agent
@@ -31,21 +32,62 @@ AgentMail gives the agent its own identity and inbox.
 ## Setup
 
 ### 1. Get an API Key
+
 - Go to https://console.agentmail.to
 - Create an account and generate an API key (starts with `am_`)
 
-### 2. Configure MCP Server
-Add to `~/.hermes/config.yaml` (paste your actual key — MCP env vars are not expanded from .env):
+### 2. Store Your API Key Securely
+
+**Recommended: macOS Keychain** (most secure — never stored in .env or config):
+```bash
+# Store the key in Keychain (service name MUST match what the tool looks up)
+security add-generic-password -a "$USER" -s "AGENTMAIL_API_KEY" -w "«your_api_key_here»"
+
+# Verify it was stored
+security find-generic-password -a "$USER" -s "AGENTMAIL_API_KEY" -w
+```
+
+The `email_send` tool automatically checks macOS Keychain using the service name `AGENTMAIL_API_KEY`. For MCP servers, you need to explicitly pass the key — see MCP server config below.
+
+**Alternative: .env file**
+```bash
+echo 'AGENTMAIL_API_KEY=«your_api_key_here»' >> ~/.hermes/.env
+```
+
+### 3. Configure MCP Server (for advanced features: reply, forward, delete, list threads)
+
+Choose one approach:
+
+**Option A: Keychain lookup (macOS only, most secure)**
+```yaml
+mcp_servers:
+  agentmail:
+    command: "npx"
+    args: ["-y", "agentmail-mcp"]
+```
+The MCP server will automatically resolve the key from macOS Keychain.
+
+**Option B: Environment variable**
 ```yaml
 mcp_servers:
   agentmail:
     command: "npx"
     args: ["-y", "agentmail-mcp"]
     env:
-      AGENTMAIL_API_KEY: "am_your_key_here"
+      AGENTMAIL_API_KEY: "«your_key_from_keychain»"
 ```
+Get your key from Keychain: `security find-generic-password -a "$USER" -s "AGENTMAIL_API_KEY" -w`
 
-### 3. Restart Hermes
+**Option C: .env file (not recommended for secrets)**
+```yaml
+mcp_servers:
+  agentmail:
+    command: "npx"
+    args: ["-y", "agentmail-mcp"]
+```
+Ensure `AGENTMAIL_API_KEY` is set in `~/.hermes/.env`.
+
+### 4. Restart Hermes
 ```bash
 hermes
 ```
@@ -106,13 +148,19 @@ All 11 AgentMail tools are now available automatically.
 ```
 
 ## Pitfalls
+
+- Store API keys in macOS Keychain (not .env) for best security — the `email_send` tool auto-checks keychain
+- For MCP server env vars: use `security find-generic-password -a "$USER" -s "AGENTMAIL_API_KEY" -w` to get the key for config injection, never hardcode
 - Free tier limited to 3 inboxes and 3,000 emails/month
 - Emails come from `@agentmail.to` domain on free tier (custom domains on paid plans)
 - Node.js (18+) is required for the MCP server (`npx -y agentmail-mcp`)
 - The `mcp` Python package must be installed: `pip install mcp`
 - Real-time inbound email (webhooks) requires a public server — use `list_threads` polling via cronjob instead for personal use
+- **Config YAML format bug**: `hermes config set` can store complex values (like `mcp_servers` dicts) as JSON strings instead of proper YAML, causing `AttributeError: 'str' object has no attribute 'items'`. Edit `config.yaml` directly to ensure `mcp_servers` is a proper YAML mapping
+- **MCP server Keychain**: If MCP env vars are empty strings in config, the MCP server may fail to start. Use Option A or C from MCP server config above, or pass the key via Option B
 
 ## Verification
+
 After setup, test with:
 ```
 hermes --toolsets mcp -q "Create an AgentMail inbox called test-agent and tell me its email address"
@@ -120,6 +168,7 @@ hermes --toolsets mcp -q "Create an AgentMail inbox called test-agent and tell m
 You should see the new inbox address returned.
 
 ## References
+
 - AgentMail docs: https://docs.agentmail.to/
 - AgentMail console: https://console.agentmail.to
 - AgentMail MCP repo: https://github.com/agentmail-to/agentmail-mcp
