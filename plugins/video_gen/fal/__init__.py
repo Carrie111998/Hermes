@@ -7,23 +7,32 @@ called without ``image_url``, and to its image-to-video endpoint when
 ``image_url`` is provided. The agent never sees the routing — it just
 calls ``video_generate(prompt=..., image_url=...)``.
 
-Model families (each with t2v + i2v endpoints):
+Model families (most expose both t2v + i2v; a few are image-to-video only):
 
   Cheap tier:
-    ltx-2.3       fal-ai/ltx-2.3-22b/text-to-video               /  fal-ai/ltx-2.3-22b/image-to-video
-    pixverse-v6   fal-ai/pixverse/v6/text-to-video               /  fal-ai/pixverse/v6/image-to-video
+    ltx-2.3            fal-ai/ltx-2.3-22b/text-to-video           /  fal-ai/ltx-2.3-22b/image-to-video
+    pixverse-v6        fal-ai/pixverse/v6/text-to-video           /  fal-ai/pixverse/v6/image-to-video
+    seedance-2.0-mini  bytedance/seedance-2.0/mini/text-to-video  /  bytedance/seedance-2.0/mini/image-to-video
 
   Premium tier:
-    veo3.1        fal-ai/veo3.1                                  /  fal-ai/veo3.1/image-to-video
-    seedance-2.0  bytedance/seedance-2.0/text-to-video           /  bytedance/seedance-2.0/image-to-video
-    kling-v3-4k   fal-ai/kling-video/v3/4k/text-to-video         /  fal-ai/kling-video/v3/4k/image-to-video
-    happy-horse   alibaba/happy-horse/text-to-video              /  alibaba/happy-horse/image-to-video
+    veo3.1             fal-ai/veo3.1                              /  fal-ai/veo3.1/image-to-video
+    seedance-2.0       bytedance/seedance-2.0/text-to-video       /  bytedance/seedance-2.0/image-to-video
+    seedance-2.5       bytedance/seedance-2.5/text-to-video       /  bytedance/seedance-2.5/image-to-video
+    minimax-h3         minimax/h3/text-to-video                   /  minimax/h3/image-to-video
+    flux-3             blackforestlabs/flux-3/text-to-video       /  blackforestlabs/flux-3/image-to-video
+    kling-v3-4k        fal-ai/kling-video/v3/4k/text-to-video     /  fal-ai/kling-video/v3/4k/image-to-video
+    happy-horse        alibaba/happy-horse/text-to-video          /  alibaba/happy-horse/image-to-video
+
+  Image-to-video only (no text_endpoint):
+    grok-imagine-1.5   xai/grok-imagine-video/v1.5/image-to-video
+    gemini-omni-flash  google/gemini-omni-flash/image-to-video
 
 Selection precedence for the active family:
     1. ``model=`` arg from the tool call
     2. ``FAL_VIDEO_MODEL`` env var
     3. ``video_gen.fal.model`` in ``config.yaml``
-    4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs)
+    4. ``video_gen.model`` in ``config.yaml`` (when it's one of our family IDs
+       or a full endpoint path that contains a family ID)
     5. ``DEFAULT_MODEL``
 
 Authentication via ``FAL_KEY`` or the managed Nous gateway. Output is an
@@ -63,6 +72,10 @@ logger = logging.getLogger(__name__)
 #                    (heuristic: 2-element with gap > 1 is a range)
 #   audio          : True if generate_audio is supported
 #   negative       : True if negative_prompt is supported
+#   seed           : False when the endpoint declares no `seed` field
+#                    (absent = True, so existing families keep sending it)
+#   duration_numeric : True when FAL types duration as an integer rather than
+#                    the usual queue-API string
 
 FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
     # ─── Cheap / fast tier ─────────────────────────────────────────────
@@ -96,6 +109,21 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "audio": True,
         "negative": True,
     },
+    "seedance-2.0-mini": {
+        "display": "Seedance 2.0 Mini",
+        "speed": "~30-90s",
+        "price": "cheap",
+        "strengths": "ByteDance. Cheapest Seedance tier, synchronized audio, 4-15s.",
+        "tier": "cheap",
+        "text_endpoint": "bytedance/seedance-2.0/mini/text-to-video",
+        "image_endpoint": "bytedance/seedance-2.0/mini/image-to-video",
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p"),
+        "durations": (4, 15),
+        "audio": True,
+        "negative": False,
+        "seed": False,
+    },
     # ─── Expensive / premium tier ──────────────────────────────────────
     "veo3.1": {
         "display": "Veo 3.1",
@@ -127,6 +155,55 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "durations": (4, 15),
         "audio": True,
         "negative": False,
+    },
+    "seedance-2.5": {
+        "display": "Seedance 2.5",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "ByteDance. Native 30s generation, synchronized audio, 4-30s, better prompt adherence.",
+        "tier": "premium",
+        "text_endpoint": "bytedance/seedance-2.5/text-to-video",
+        "image_endpoint": "bytedance/seedance-2.5/image-to-video",
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p"),
+        "durations": (4, 30),
+        "audio": True,
+        "negative": False,
+        "seed": False,
+    },
+    "minimax-h3": {
+        "display": "MiniMax H3",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "MiniMax. Up to 4K output, 5-15s. No audio track.",
+        "tier": "premium",
+        "text_endpoint": "minimax/h3/text-to-video",
+        "image_endpoint": "minimax/h3/image-to-video",
+        "aspect_ratios": ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        # FAL spells these with a capital P ("768P", not "768p"); a mismatch
+        # here silently drops the key and the endpoint falls back to 2K.
+        "resolutions": ("768P", "2K", "4K"),
+        "durations": (5, 15),
+        "duration_numeric": True,
+        "audio": False,
+        "negative": False,
+        "seed": False,
+    },
+    "flux-3": {
+        "display": "FLUX 3 Video",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "Black Forest Labs. Native synced audio, up to 20s, 720p/1080p.",
+        "tier": "premium",
+        "text_endpoint": "blackforestlabs/flux-3/text-to-video",
+        "image_endpoint": "blackforestlabs/flux-3/image-to-video",
+        "aspect_ratios": ("21:9", "2:1", "16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("720p", "1080p"),
+        "durations": (5, 20),
+        "duration_numeric": True,
+        "audio": True,
+        "negative": False,
+        "seed": False,
     },
     "kling-v3-4k": {
         "display": "Kling v3 4K",
@@ -160,6 +237,41 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "durations": None,
         "audio": False,
         "negative": False,
+    },
+    # ─── Image-to-video only ───────────────────────────────────────────
+    # These have no text_endpoint: calling them without an image_url returns
+    # the "no text-to-video endpoint" error from generate().
+    "grok-imagine-1.5": {
+        "display": "Grok Imagine 1.5",
+        "speed": "~30-90s",
+        "price": "premium",
+        "strengths": "xAI. Image-to-video only, 1-15s, up to 1080p.",
+        "tier": "premium",
+        "image_endpoint": "xai/grok-imagine-video/v1.5/image-to-video",
+        # FAL's schema exposes no aspect_ratio for this endpoint.
+        "aspect_ratios": None,
+        "resolutions": ("480p", "720p", "1080p"),
+        "durations": (1, 15),
+        "duration_numeric": True,
+        "audio": False,
+        "negative": False,
+        "seed": False,
+    },
+    "gemini-omni-flash": {
+        "display": "Gemini Omni Flash",
+        "speed": "~30-90s",
+        "price": "premium",
+        "strengths": "Google. Image-to-video only, 3-10s, 16:9 or 9:16.",
+        "tier": "premium",
+        "image_endpoint": "google/gemini-omni-flash/image-to-video",
+        "aspect_ratios": ("16:9", "9:16"),
+        # FAL's schema exposes no resolution knob for this endpoint.
+        "resolutions": None,
+        "durations": (3, 10),
+        "duration_numeric": True,
+        "audio": False,
+        "negative": False,
+        "seed": False,
     },
 }
 
@@ -211,6 +323,36 @@ def _load_video_gen_section() -> Dict[str, Any]:
         return {}
 
 
+def _normalize_family_key(c: str) -> Optional[str]:
+    """Try to extract a known family ID from a model string.
+
+    Handles bare IDs (``seedance-2.5``), full endpoint paths
+    (``bytedance/seedance-2.5/text-to-video``), and provider-prefixed
+    names (``bytedance/seedance-2.5``).
+    """
+    c = c.strip()
+    if c in FAL_FAMILIES:
+        return c
+    # A declared endpoint is unambiguous, so it wins over the segment scan
+    # below — which would otherwise see the "seedance-2.0" segment inside
+    # ".../seedance-2.0/mini/..." and route the cheap Mini tier to the
+    # full-price family, and which misses ids that aren't a path segment
+    # at all ("minimax-h3" in "minimax/h3/...").
+    for fid, meta in FAL_FAMILIES.items():
+        if c in (meta.get("text_endpoint"), meta.get("image_endpoint")):
+            return fid
+    # Try matching the first path segment(s) against family IDs.
+    parts = c.split("/")
+    for fid in FAL_FAMILIES:
+        if c == fid or parts[-1] == fid or (len(parts) >= 2 and parts[-2] == fid):
+            return fid
+        # Handle "bytedance/seedance-2.5/text-to-video" → "seedance-2.5"
+        for p in parts:
+            if p == fid:
+                return fid
+    return None
+
+
 def _resolve_family(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
     """Decide which FAL family to use. Returns ``(family_id, meta)``."""
     candidates: List[Optional[str]] = []
@@ -226,9 +368,10 @@ def _resolve_family(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
         candidates.append(top)
 
     for c in candidates:
-        if isinstance(c, str) and c.strip() and c.strip() in FAL_FAMILIES:
-            fid = c.strip()
-            return fid, FAL_FAMILIES[fid]
+        if isinstance(c, str) and c.strip():
+            fid = _normalize_family_key(c)
+            if fid:
+                return fid, FAL_FAMILIES[fid]
 
     return DEFAULT_MODEL, FAL_FAMILIES[DEFAULT_MODEL]
 
@@ -261,7 +404,10 @@ def _build_payload(
         # declare an override.
         key = family.get("image_param_key") or "image_url"
         payload[key] = image_url
-    if seed is not None:
+    # Several newer endpoints (seedance 2.x, minimax h3, flux-3, grok, gemini)
+    # declare no `seed` field, and the managed gateway forwards whatever we
+    # send — so gate it on the family rather than leaking an unknown key.
+    if seed is not None and family.get("seed", True):
         payload["seed"] = seed
 
     if family.get("aspect_ratios"):
@@ -276,10 +422,17 @@ def _build_payload(
 
     clamped = _clamp_duration(family, duration)
     if clamped is not None and family.get("durations"):
-        # FAL exposes duration as a string in the queue API ("8" not 8).
-        # Some families (e.g. veo3.1) require a unit suffix ("4s" not "4").
-        suffix = family.get("duration_suffix", "")
-        payload["duration"] = f"{clamped}{suffix}"
+        if family.get("duration_numeric"):
+            # These schemas type duration as an integer, and flux-3 validates
+            # it against a mixed ["auto", 5, 6, ...] literal enum where a
+            # numeric string is not guaranteed to coerce. The managed gateway
+            # accepts either form, so this only matters on direct FAL_KEY.
+            payload["duration"] = clamped
+        else:
+            # FAL exposes duration as a string in the queue API ("8" not 8).
+            # Some families (e.g. veo3.1) require a unit suffix ("4s" not "4").
+            suffix = family.get("duration_suffix", "")
+            payload["duration"] = f"{clamped}{suffix}"
 
     if family.get("audio") and audio is not None:
         payload["generate_audio"] = bool(audio)
@@ -456,7 +609,7 @@ class FALVideoGenProvider(VideoGenProvider):
         return {
             "name": "FAL",
             "badge": "paid",
-            "tag": "LTX, Pixverse, Veo 3.1, Seedance 2.0, Kling 4K, Happy Horse — text-to-video & image-to-video",
+            "tag": "LTX, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 4K, Happy Horse, Grok Imagine, Gemini Omni — text-to-video & image-to-video",
             "env_vars": [
                 {
                     "key": "FAL_KEY",

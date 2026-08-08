@@ -146,6 +146,28 @@ class TestFamilyRouting:
         assert with_fake_fal["arguments"]["image_url"] == "https://example.com/dog.png"
 
 
+class TestFamilyKeyNormalization:
+    def test_full_endpoint_paths_resolve_to_their_own_family(self):
+        """A configured endpoint path must resolve to the family that declares
+        it. The segment scan alone reads the "seedance-2.0" in
+        ".../seedance-2.0/mini/..." and bills the full-price family."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _normalize_family_key
+
+        for fid, meta in FAL_FAMILIES.items():
+            for key in ("text_endpoint", "image_endpoint"):
+                endpoint = meta.get(key)
+                if endpoint:
+                    assert _normalize_family_key(endpoint) == fid, endpoint
+
+    def test_bare_and_prefixed_ids_still_resolve(self):
+        from plugins.video_gen.fal import _normalize_family_key
+
+        assert _normalize_family_key("seedance-2.5") == "seedance-2.5"
+        assert _normalize_family_key("bytedance/seedance-2.5") == "seedance-2.5"
+        assert _normalize_family_key("  pixverse-v6  ") == "pixverse-v6"
+        assert _normalize_family_key("nonsense/thing") is None
+
+
 class TestPayloadBuilder:
     def test_drops_unsupported_keys(self):
         """Veo enum-clamps duration, supports aspect+resolution+audio+neg."""
@@ -188,6 +210,100 @@ class TestPayloadBuilder:
         )
         assert p["duration"] == "15"
 
+    @pytest.mark.parametrize(
+        "family_id",
+        [
+            "seedance-2.0-mini",
+            "seedance-2.5",
+            "minimax-h3",
+            "flux-3",
+            "grok-imagine-1.5",
+            "gemini-omni-flash",
+        ],
+    )
+    def test_seed_dropped_for_families_without_seed_support(self, family_id):
+        """These FAL endpoints declare no `seed`; the gateway forwards whatever
+        we send, so an unknown key would reach the vendor."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        p = _build_payload(
+            FAL_FAMILIES[family_id],
+            prompt="x",
+            image_url="https://i.png",
+            duration=None,
+            aspect_ratio="16:9",
+            resolution="720p",
+            negative_prompt=None,
+            audio=None,
+            seed=42,
+        )
+        assert "seed" not in p
+
+    def test_minimax_h3_uses_uppercase_resolution_enum(self):
+        """FAL spells MiniMax H3 resolutions "768P"/"2K"/"4K"; a lowercase
+        "720p" isn't in the enum and must be dropped, not passed through."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        meta = FAL_FAMILIES["minimax-h3"]
+        accepted = _build_payload(
+            meta, prompt="x", image_url=None, duration=7, aspect_ratio="16:9",
+            resolution="2K", negative_prompt=None, audio=None, seed=None,
+        )
+        assert accepted["resolution"] == "2K"
+        assert accepted["duration"] == 7
+
+        dropped = _build_payload(
+            meta, prompt="x", image_url=None, duration=7, aspect_ratio="16:9",
+            resolution="720p", negative_prompt=None, audio=None, seed=None,
+        )
+        assert "resolution" not in dropped
+
+    def test_audio_only_sent_for_families_that_declare_it(self):
+        """minimax-h3 and the i2v-only families have no generate_audio field."""
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        for family_id in ("minimax-h3", "grok-imagine-1.5", "gemini-omni-flash"):
+            p = _build_payload(
+                FAL_FAMILIES[family_id],
+                prompt="x", image_url="https://i.png", duration=None,
+                aspect_ratio="16:9", resolution="720p", negative_prompt="ugly",
+                audio=True, seed=None,
+            )
+            assert "generate_audio" not in p, family_id
+            assert "negative_prompt" not in p, family_id
+
+    @pytest.mark.parametrize(
+        "family_id,expected",
+        [
+            ("minimax-h3", 7),          # FAL types duration as an integer
+            ("flux-3", 7),              # mixed ["auto", 5, 6, ...] literal enum
+            ("grok-imagine-1.5", 7),
+            ("gemini-omni-flash", 7),
+            ("seedance-2.5", "7"),      # FAL enum is strings: "auto","4",...
+            ("seedance-2.0-mini", "7"),
+            ("pixverse-v6", "7"),       # unchanged legacy string form
+            ("veo3.1", "6s"),           # unchanged suffix form (7 snaps to 6)
+        ],
+    )
+    def test_duration_is_emitted_in_the_form_fal_declares(self, family_id, expected):
+        from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+        p = _build_payload(
+            FAL_FAMILIES[family_id],
+            prompt="x", image_url=None, duration=7, aspect_ratio="16:9",
+            resolution="720p", negative_prompt=None, audio=None, seed=None,
+        )
+        assert p["duration"] == expected
+        assert type(p["duration"]) is type(expected)
+
+    def test_i2v_only_families_declare_no_text_endpoint(self):
+        """Catalog invariant: these animate an existing image only."""
+        from plugins.video_gen.fal import FAL_FAMILIES
+
+        for family_id in ("grok-imagine-1.5", "gemini-omni-flash"):
+            meta = FAL_FAMILIES[family_id]
+            assert meta.get("text_endpoint") is None, family_id
+            assert meta["image_endpoint"]
 
     def test_ltx_omits_duration_aspect_resolution(self):
         """LTX 2.3 doesn't declare duration/aspect/resolution enums —
