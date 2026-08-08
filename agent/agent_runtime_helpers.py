@@ -1293,13 +1293,19 @@ def recover_with_credential_pool(
         rotate_status = status_code if status_code is not None else 401
         next_entry = _rotate_failed_credential(rotate_status)
         if next_entry is not None:
-            _ra().logger.info(
-                "Credential %s (auth refresh failed) — rotated to pool entry %s",
-                rotate_status,
-                getattr(next_entry, "id", "?"),
+            is_different = (
+                (current_entry is not None and next_entry.id != current_entry.id)
+                or (current_entry is None and getattr(next_entry, "runtime_api_key", None) != _api_key_hint and len(pool.entries()) > 1)
             )
-            agent._swap_credential(next_entry)
-            return True, False
+            if is_different:
+                _ra().logger.info(
+                    "Credential %s (auth refresh failed) — rotated to pool entry %s",
+                    rotate_status,
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, False
+            return False, has_retried_429
 
     return False, has_retried_429
 
