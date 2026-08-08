@@ -33,6 +33,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    _WINDOWS_BASH_SHELL_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -43,6 +44,12 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_windows_hint_switches_from_broken_search_path(self):
+        text = _WINDOWS_BASH_SHELL_HINT.lower()
+        assert "do not retry" in text
+        assert "git grep" in text
+        assert "read_file" in text
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE

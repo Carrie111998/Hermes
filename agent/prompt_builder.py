@@ -1037,7 +1037,10 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`). After a `search_files` path "
+    "error on a native Windows or MSYS repository path, do not retry the same "
+    "call: use `read_file` with the native path or run `git grep` from the "
+    "repository root instead."
 )
 
 
