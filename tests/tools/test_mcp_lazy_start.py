@@ -22,6 +22,7 @@ def _reset_mcp_state():
     old_fps = dict(mcp._lazy_server_fingerprints)
     old_names = dict(mcp._lazy_server_tool_names)
     old_connecting = set(mcp._server_connecting)
+    old_hints = dict(mcp._tool_read_only_hints)
     yield
     mcp._servers.clear()
     mcp._servers.update(old_servers)
@@ -33,6 +34,8 @@ def _reset_mcp_state():
     mcp._lazy_server_tool_names.update(old_names)
     mcp._server_connecting.clear()
     mcp._server_connecting.update(old_connecting)
+    mcp._tool_read_only_hints.clear()
+    mcp._tool_read_only_hints.update(old_hints)
 
 
 def _fake_cache_entry():
@@ -158,6 +161,15 @@ class TestLazyFirstUseConnect:
 
         with patch.object(mcp, "_ensure_lazy_server_connected", side_effect=_connect) as mock_connect, \
              patch.object(mcp, "_run_on_mcp_loop", side_effect=self._run_on_loop):
+            mcp._record_tool_approval_metadata(
+                "playwright",
+                [
+                    SimpleNamespace(
+                        name="browser_navigate",
+                        annotations={"readOnlyHint": True},
+                    )
+                ],
+            )
             handler = mcp._make_tool_handler("playwright", "browser_navigate", 5)
             out = handler({}, task_id="t1")
 

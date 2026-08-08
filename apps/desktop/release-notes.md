@@ -1,6 +1,5 @@
-# evaOS Agent 2026.7.20-es.11
+# evaOS Agent 2026.7.20-es.12
 
-- Restores **Check for Updates…** in the evaOS Agent app and Help menus.
-- Adds **Check now** to About and restores the **Updates** command-palette action.
-- Keeps managed remote installations on the signed Electric Sheep client update feed.
-- Preserves the managed sign-in, assignment, provider, chat, voice, plugin, and preference behavior from es.10.
+- Adds short-lived, profile-authoritative authentication for Pipedream's native MCP without placing developer or provider credentials on customer VMs.
+- Runs tools annotated exactly `readOnlyHint: true` directly and routes every write-capable or unannotated MCP call through Hermes' existing approval mode before any connection or RPC.
+- Preserves the shared customer gateway, distinct profile homes and LCM databases, per-profile Desktop controls, and the signed Electric Sheep update path.

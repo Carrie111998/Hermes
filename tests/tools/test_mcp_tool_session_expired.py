@@ -14,6 +14,7 @@ import asyncio
 import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -190,6 +191,15 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
 
     try:
         assert transport_ready.wait(3), "server lifecycle did not establish transport"
+        mcp_tool._record_tool_approval_metadata(
+            "resumed",
+            [
+                SimpleNamespace(
+                    name="health",
+                    annotations={"readOnlyHint": True},
+                )
+            ],
+        )
         handler = _make_tool_handler("resumed", "health", 10.0)
         parsed = json.loads(handler({}))
 
@@ -205,6 +215,7 @@ def test_call_tool_handler_rebuilds_configured_server_transport(
         mcp_tool._servers.pop("resumed", None)
         mcp_tool._server_error_counts.pop("resumed", None)
         mcp_tool._server_breaker_opened_at.pop("resumed", None)
+        mcp_tool._tool_read_only_hints.pop("resumed", None)
 
 
 def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
@@ -274,6 +285,15 @@ def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
     )
 
     try:
+        mcp_tool._record_tool_approval_metadata(
+            "hindsight",
+            [
+                SimpleNamespace(
+                    name="get_bank",
+                    annotations={"readOnlyHint": True},
+                )
+            ],
+        )
         handler = _make_tool_handler("hindsight", "get_bank", 10.0)
         parsed = json.loads(handler({}))
         assert parsed.get("result") == "bank ok", parsed
@@ -283,6 +303,7 @@ def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
         mcp_tool._servers.pop("hindsight", None)
         mcp_tool._server_error_counts.pop("hindsight", None)
         mcp_tool._server_breaker_opened_at.pop("hindsight", None)
+        mcp_tool._tool_read_only_hints.pop("hindsight", None)
 
 
 def test_session_expired_handler_returns_none_without_loop(monkeypatch):
