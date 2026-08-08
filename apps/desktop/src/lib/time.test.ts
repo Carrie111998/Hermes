@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { calendarBucket, DAY, fmtMonth, fmtMonthYear, formatAgo, HOUR, MINUTE, nominalDayStart, SECOND, sessionBucketLabel } from './time'
+import { calendarBucket, DAY, fmtMonth, fmtMonthYear, formatAgo, HOUR, MINUTE, nominalDayStart, normalizeTimestampMs, SECOND, sessionBucketLabel } from './time'
 
 const labels = {
   ageNow: 'now',
