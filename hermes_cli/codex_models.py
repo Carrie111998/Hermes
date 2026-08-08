@@ -5,12 +5,150 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import os
 
 logger = logging.getLogger(__name__)
+
+# Last-known ChatGPT Codex gate for GPT-5.6 models. Used only when discovery
+# has not yet supplied a per-model ``minimal_client_version``. Not a forever
+# pin — live /models + local models_cache are preferred.
+_CODEX_CLI_COMPAT_FLOOR = "0.144.0"
+
+# Process cache populated from live /models probes and ~/.codex/models_cache.json.
+_minimal_client_versions: Dict[str, str] = {}
+# Top-level ``client_version`` from the local Codex CLI models cache (the CLI
+# that fetched the cache), used when per-model mins are absent.
+_local_codex_cli_version: Optional[str] = None
+_hydrated_from_local_cache = False
+_live_min_version_probe_done = False
+
+
+def _parse_semver_tuple(value: str) -> Optional[Tuple[int, int, int]]:
+    """Parse a dotted semver prefix into (major, minor, patch)."""
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _max_semver(*versions: str) -> str:
+    """Return the highest parseable semver among ``versions`` (floor on empty)."""
+    best = _CODEX_CLI_COMPAT_FLOOR
+    best_tuple = _parse_semver_tuple(best) or (0, 0, 0)
+    for raw in versions:
+        parsed = _parse_semver_tuple(raw or "")
+        if parsed is None:
+            continue
+        if parsed > best_tuple:
+            best_tuple = parsed
+            best = ".".join(str(part) for part in parsed)
+    return best
+
+
+def remember_codex_minimal_client_versions(entries: Iterable[object]) -> None:
+    """Update the process cache from Codex /models (or models_cache) entries."""
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        min_ver = item.get("minimal_client_version")
+        if not isinstance(min_ver, str) or not min_ver.strip():
+            continue
+        if _parse_semver_tuple(min_ver) is None:
+            continue
+        _minimal_client_versions[slug.strip()] = min_ver.strip()
+
+
+def remember_local_codex_cli_version(version: Optional[str]) -> None:
+    """Remember the Codex CLI version that produced a local models cache."""
+    global _local_codex_cli_version
+    if not isinstance(version, str) or not version.strip():
+        return
+    if _parse_semver_tuple(version) is None:
+        return
+    _local_codex_cli_version = version.strip()
+
+
+def _hydrate_minimal_versions_from_local_cache() -> None:
+    """Load per-model mins + CLI version from ``~/.codex/models_cache.json`` once."""
+    global _hydrated_from_local_cache
+    if _hydrated_from_local_cache:
+        return
+    _hydrated_from_local_cache = True
+    codex_home_str = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+    cache_path = Path(codex_home_str).expanduser() / "models_cache.json"
+    if not cache_path.exists():
+        return
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    remember_local_codex_cli_version(raw.get("client_version"))
+    entries = raw.get("models")
+    if isinstance(entries, list):
+        remember_codex_minimal_client_versions(entries)
+
+
+def ensure_codex_minimal_client_versions(access_token: Optional[str] = None) -> None:
+    """Best-effort warm of the minimal-client-version cache before inference.
+
+    Order: already-warm process cache → local models_cache.json → one live
+    /models probe when a token is provided and no per-model mins are known yet
+    (local CLI ``client_version`` alone is only a resolve fallback). Failures
+    are non-fatal; callers fall back to ``_CODEX_CLI_COMPAT_FLOOR``.
+    """
+    global _live_min_version_probe_done
+    if _minimal_client_versions:
+        return
+    _hydrate_minimal_versions_from_local_cache()
+    if _minimal_client_versions:
+        return
+    if _live_min_version_probe_done:
+        return
+    if access_token and isinstance(access_token, str) and access_token.strip():
+        _live_min_version_probe_done = True
+        _fetch_models_from_api(access_token)
+
+
+def resolve_codex_compat_client_version(model: Optional[str] = None) -> str:
+    """CLI-compat version to advertise on Codex inference requests.
+
+    Prefer the selected model's catalog ``minimal_client_version``. When the
+    model is unknown, use the max across cached models, then the local Codex
+    CLI cache's ``client_version``, then the known GPT-5.6 floor. Always at
+    least the floor.
+    """
+    _hydrate_minimal_versions_from_local_cache()
+    if isinstance(model, str) and model.strip():
+        known = _minimal_client_versions.get(model.strip())
+        if known:
+            return _max_semver(_CODEX_CLI_COMPAT_FLOOR, known)
+
+    candidates: List[str] = [_CODEX_CLI_COMPAT_FLOOR]
+    if _minimal_client_versions:
+        candidates.extend(_minimal_client_versions.values())
+    if _local_codex_cli_version:
+        candidates.append(_local_codex_cli_version)
+    return _max_semver(*candidates)
+
+
+def reset_codex_compat_version_cache_for_tests() -> None:
+    """Clear process caches (tests only)."""
+    global _local_codex_cli_version, _hydrated_from_local_cache, _live_min_version_probe_done
+    _minimal_client_versions.clear()
+    _local_codex_cli_version = None
+    _hydrated_from_local_cache = False
+    _live_min_version_probe_done = False
 
 DEFAULT_CODEX_MODELS: List[str] = [
     # GPT-5.6 series (Sol/Terra/Luna + -pro high-effort modes) — GA 2026-07-09
@@ -145,6 +283,13 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
         logger.debug("Failed to fetch Codex models from API: %s", exc)
         return []
 
+    # Remember mins from the same payload used for slug discovery so inference
+    # headers track OpenAI's per-model gate instead of a hardcoded CLI release.
+    if isinstance(entries, list):
+        remember_codex_minimal_client_versions(entries)
+    if isinstance(data, dict):
+        remember_local_codex_cli_version(data.get("client_version"))
+
     sortable = []
     for item in entries:
         if not isinstance(item, dict):
@@ -195,9 +340,13 @@ def _read_cache_models(codex_home: Path) -> List[str]:
     except Exception:
         return []
 
+    if isinstance(raw, dict):
+        remember_local_codex_cli_version(raw.get("client_version"))
+
     entries = raw.get("models") if isinstance(raw, dict) else None
     sortable = []
     if isinstance(entries, list):
+        remember_codex_minimal_client_versions(entries)
         for item in entries:
             if not isinstance(item, dict):
                 continue

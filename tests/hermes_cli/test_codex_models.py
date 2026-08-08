@@ -44,12 +44,90 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
             return _FakeResp()
 
     monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    codex_models.reset_codex_compat_version_cache_for_tests()
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
     assert "gpt-5.5" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models
+
+
+def test_fetch_from_api_remembers_minimal_client_versions(monkeypatch, tmp_path):
+    """Live /models payloads must seed the inference-header version cache."""
+    import sys
+    from hermes_cli import codex_models
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "client_version": "0.147.0",
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "priority": 0,
+                        "minimal_client_version": "0.144.0",
+                    },
+                    {
+                        "slug": "gpt-5.4",
+                        "priority": 1,
+                        "minimal_client_version": "0.130.0",
+                    },
+                ],
+            }
+
+    class _FakeHttpx:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            return _FakeResp()
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    (tmp_path / "codex").mkdir()
+    codex_models.reset_codex_compat_version_cache_for_tests()
+
+    models = codex_models._fetch_models_from_api(access_token="tok")
+    assert "gpt-5.6-sol" in models
+    assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.144.0"
+    # Unknown / missing model still meets the max known gate (and floor).
+    assert codex_models.resolve_codex_compat_client_version("gpt-unknown") == "0.147.0"
+
+
+def test_resolve_codex_compat_client_version_prefers_selected_model(tmp_path, monkeypatch):
+    from hermes_cli import codex_models
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    (tmp_path / "codex").mkdir()
+    codex_models.reset_codex_compat_version_cache_for_tests()
+    codex_models.remember_codex_minimal_client_versions(
+        [
+            {"slug": "gpt-5.6-sol", "minimal_client_version": "0.150.0"},
+            {"slug": "gpt-5.4", "minimal_client_version": "0.130.0"},
+        ]
+    )
+    assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.150.0"
+    assert codex_models.resolve_codex_compat_client_version("gpt-5.4") == "0.144.0"
+
+
+def test_resolve_falls_back_to_local_cli_cache_version(tmp_path, monkeypatch):
+    from hermes_cli import codex_models
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    cache_dir = tmp_path / "codex"
+    cache_dir.mkdir()
+    (cache_dir / "models_cache.json").write_text(
+        json.dumps(
+            {
+                "client_version": "0.147.0",
+                "models": [{"slug": "gpt-5.6-sol", "priority": 0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_models.reset_codex_compat_version_cache_for_tests()
+    assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.147.0"
 
 
 

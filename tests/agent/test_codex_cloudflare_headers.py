@@ -15,7 +15,7 @@ all emit the same headers.
 
 These tests pin:
 - the originator value (must be ``codex_cli_rs`` — the whitelisted one)
-- the User-Agent shape (codex_cli_rs-prefixed)
+- User-Agent / ``version`` tracking catalog ``minimal_client_version``
 - ``ChatGPT-Account-ID`` extraction from the OAuth JWT (canonical casing,
   from codex-rs ``auth.rs``)
 - graceful handling of malformed tokens (drop the account-ID header, don't
@@ -29,6 +29,7 @@ import base64
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -53,17 +54,59 @@ def _make_codex_jwt(account_id: str = "acct-test-123") -> str:
     return f"{header}.{payload}.{sig}"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codex_compat_cache(tmp_path, monkeypatch):
+    """Keep header tests hermetic from the developer's real ~/.codex cache."""
+    from hermes_cli.codex_models import reset_codex_compat_version_cache_for_tests
+
+    reset_codex_compat_version_cache_for_tests()
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda access_token: [],
+    )
+    yield
+    reset_codex_compat_version_cache_for_tests()
+
+
+def _assert_codex_compat_headers(headers: dict, *, model: str | None = None) -> None:
+    from hermes_cli.codex_models import resolve_codex_compat_client_version
+
+    ver = resolve_codex_compat_client_version(model)
+    assert headers.get("originator") == "codex_cli_rs"
+    assert headers.get("version") == ver
+    assert headers.get("User-Agent") == f"codex_cli_rs/{ver} (Hermes Agent)"
+
+
 # ---------------------------------------------------------------------------
 # _codex_cloudflare_headers — the shared helper
 # ---------------------------------------------------------------------------
 
 class TestCodexCloudflareHeaders:
 
-    def test_user_agent_advertises_codex_cli_rs(self):
+    def test_user_agent_and_version_follow_catalog_minimal_client_version(self):
         from agent.auxiliary_client import _codex_cloudflare_headers
-        headers = _codex_cloudflare_headers(_make_codex_jwt())
-        assert headers["User-Agent"].startswith("codex_cli_rs/")
+        from hermes_cli.codex_models import remember_codex_minimal_client_versions
 
+        remember_codex_minimal_client_versions(
+            [
+                {"slug": "gpt-5.6-sol", "minimal_client_version": "0.144.0"},
+                {"slug": "gpt-5.4", "minimal_client_version": "0.130.0"},
+            ]
+        )
+        headers = _codex_cloudflare_headers(_make_codex_jwt(), model="gpt-5.6-sol")
+        _assert_codex_compat_headers(headers, model="gpt-5.6-sol")
+        assert headers["version"] == "0.144.0"
+
+    def test_falls_back_to_floor_without_catalog(self):
+        from agent.auxiliary_client import _codex_cloudflare_headers
+        from hermes_cli.codex_models import _CODEX_CLI_COMPAT_FLOOR
+
+        headers = _codex_cloudflare_headers(_make_codex_jwt())
+        assert headers["version"] == _CODEX_CLI_COMPAT_FLOOR
+        _assert_codex_compat_headers(headers)
 
     def test_canonical_header_casing(self):
         """Upstream codex-rs uses PascalCase with trailing -ID. Match exactly."""
@@ -112,14 +155,14 @@ class TestPrimaryClientWiring:
                 skip_memory=True,
             )
             # Simulate rotation into a Codex credential
+            agent.model = "gpt-5.6-sol"
             agent._client_kwargs["api_key"] = token
             agent._apply_client_headers_for_base_url(
                 "https://chatgpt.com/backend-api/codex"
             )
             headers = agent._client_kwargs.get("default_headers") or {}
-            assert headers.get("originator") == "codex_cli_rs"
             assert headers.get("ChatGPT-Account-ID") == "acct-rotation"
-            assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
+            _assert_codex_compat_headers(headers, model="gpt-5.6-sol")
 
     def test_apply_client_headers_clears_codex_headers_off_chatgpt(self):
         """Switching AWAY from chatgpt.com must drop the codex headers."""
@@ -173,9 +216,8 @@ class TestAuxiliaryClientWiring:
             client, model = auxiliary_client._build_codex_client("gpt-5.4")
             assert client is not None
             headers = mock_openai.call_args.kwargs.get("default_headers") or {}
-            assert headers.get("originator") == "codex_cli_rs"
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-try-codex"
-            assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
+            _assert_codex_compat_headers(headers, model="gpt-5.4")
 
     def test_resolve_provider_client_raw_codex_passes_codex_headers(self, monkeypatch):
         """The ``raw_codex=True`` branch (used by the main agent loop for direct
@@ -193,6 +235,5 @@ class TestAuxiliaryClientWiring:
             )
             assert client is not None
             headers = mock_openai.call_args.kwargs.get("default_headers") or {}
-            assert headers.get("originator") == "codex_cli_rs"
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-raw-codex"
-            assert headers.get("User-Agent", "").startswith("codex_cli_rs/")
+            _assert_codex_compat_headers(headers, model="gpt-5.4")
