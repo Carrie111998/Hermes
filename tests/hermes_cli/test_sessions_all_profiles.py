@@ -51,6 +51,22 @@ def _seed_session(db_path, sid, profile=None, started=1000.0, title=None):
         db.close()
 
 
+def _seed_activity_only(db_path, sid, started, last_active):
+    """Create a session with controlled started_at / last_activity_at and no
+    messages, so last_active = last_activity_at (freshest of the two)."""
+    db = hermes_state.SessionDB(db_path=db_path)
+    try:
+        db.create_session(sid, source="cli", model="test/model")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, last_activity_at=? WHERE id=?",
+                (started, last_active, sid),
+            )
+            db._conn.commit()
+    finally:
+        db.close()
+
+
 def _patch_list_profiles(tmp_path, dirs):
     profiles = []
     for name, d in dirs.items():
@@ -112,6 +128,63 @@ class TestCollectAllProfileSessions:
             )
 
         assert [r["id"] for r in rows] == ["def_1"]
+
+    def test_includes_custom_hermes_home(self, tmp_path):
+        # Named profiles in the standard tree…
+        dirs = _make_profile_dirs(tmp_path, ["default", "red"])
+        _seed_session(dirs["red"] / "state.db", "red_1", profile="red", started=2000.0)
+        # …plus a custom HERMES_HOME that list_profiles() cannot enumerate.
+        custom_home = tmp_path / "custom_home"
+        custom_home.mkdir(parents=True)
+        _seed_session(custom_home / "state.db", "custom_1", profile=None, started=1500.0)
+
+        with _patch_list_profiles(tmp_path, dirs), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="custom"), \
+             patch("hermes_constants.get_hermes_home", return_value=custom_home):
+            rows = _collect_all_profile_sessions(
+                source=None, exclude_sources=["tool"], limit=20
+            )
+
+        by_id = {r["id"]: r for r in rows}
+        assert "custom_1" in by_id
+        # Tagged with the active profile's resolved name, not the column.
+        assert by_id["custom_1"]["profile_name"] == "custom"
+        assert by_id["red_1"]["profile_name"] == "red"
+
+    def test_custom_home_covered_by_enumeration_is_not_duplicated(self, tmp_path):
+        # When list_profiles() already enumerates the active home (named
+        # profile / default), the custom-home fallback must not double-add.
+        dirs = _make_profile_dirs(tmp_path, ["default", "red"])
+        _seed_session(dirs["red"] / "state.db", "red_1", profile="red")
+
+        with _patch_list_profiles(tmp_path, dirs), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="red"), \
+             patch("hermes_constants.get_hermes_home", return_value=dirs["red"]):
+            rows = _collect_all_profile_sessions(
+                source=None, exclude_sources=["tool"], limit=20
+            )
+
+        assert [r["id"] for r in rows] == ["red_1"]
+
+    def test_per_profile_slice_uses_last_active_not_started(self, tmp_path):
+        # The per-profile limit-N slice must be by most-recent activity, or a
+        # recently-active older session gets dropped before the cross-profile
+        # last_active merge. Two sessions in ONE profile with diverging
+        # started_at vs last_activity_at; limit=1 must surface the recent one.
+        dirs = _make_profile_dirs(tmp_path, ["red"])
+        _seed_activity_only(
+            dirs["red"] / "state.db", "red_recent", started=1000.0, last_active=5000.0
+        )
+        _seed_activity_only(
+            dirs["red"] / "state.db", "red_newer_start", started=3000.0, last_active=4000.0
+        )
+
+        with _patch_list_profiles(tmp_path, dirs):
+            rows = _collect_all_profile_sessions(
+                source=None, exclude_sources=["tool"], limit=1
+            )
+
+        assert [r["id"] for r in rows] == ["red_recent"]
 
 
 # ─── cmd_sessions list --all rendering ────────────────────────────────────
@@ -202,7 +275,11 @@ class TestSessionsBrowseAll:
 
     def test_cross_profile_resume_passes_profile_flag(self):
         mock_relaunch = self._run_browse("s2", "red", current="default")
-        mock_relaunch.assert_called_once_with(["-p", "red", "--resume", "s2"])
+        # The inherited -p/--profile from the original argv must be excluded
+        # so the explicit -p red is the only profile flag in the relaunch.
+        mock_relaunch.assert_called_once_with(
+            ["-p", "red", "--resume", "s2"], exclude_options={"-p", "--profile"}
+        )
 
     def test_same_profile_resume_stays_plain(self):
         mock_relaunch = self._run_browse("s1", "default", current="default")
@@ -247,6 +324,57 @@ class TestSessionsListAllArgparse:
         assert args.all is True
         args = parser.parse_args(["browse"])
         assert args.all is False
+
+
+# ─── cross-profile resume argv (Issue #1 regression) ───────────────────────
+
+class TestRelaunchProfileExclusion:
+    """build_relaunch_argv must be able to drop an inherited -p/--profile.
+
+    Scenario: ``hermes -p red sessions browse --all`` picks a session owned
+    by profile "green". The relaunch argv is built from the ORIGINAL argv
+    (which carries ``-p red``) plus an explicit ``-p green``.  Without
+    exclusion the inherited ``-p red`` precedes the explicit ``-p green``
+    and _apply_profile_override stops at the FIRST -p — the resume would
+    target the wrong profile.
+    """
+
+    def test_excluded_profile_is_not_inherited(self):
+        from hermes_cli.relaunch import build_relaunch_argv
+
+        original = ["-p", "red", "sessions", "browse", "--all"]
+        argv = build_relaunch_argv(
+            ["-p", "green", "--resume", "s2"],
+            original_argv=original,
+            exclude_options={"-p", "--profile"},
+        )
+        # Exactly one -p: the explicit one from extra_args.
+        assert argv.count("-p") == 1
+        assert "--profile" not in argv
+        assert argv[-4:] == ["-p", "green", "--resume", "s2"]
+
+    def test_profile_equals_form_is_excluded_too(self):
+        from hermes_cli.relaunch import build_relaunch_argv
+
+        original = ["--profile=red", "sessions", "browse", "--all"]
+        argv = build_relaunch_argv(
+            ["-p", "green", "--resume", "s2"],
+            original_argv=original,
+            exclude_options={"-p", "--profile"},
+        )
+        assert "--profile=red" not in argv
+        assert argv.count("-p") == 1
+
+    def test_without_exclusion_the_bug_reproduces(self):
+        # Sanity anchor: today's default behaviour (no exclusion) carries
+        # BOTH -p flags, which is exactly the collision Issue #1 fixes.
+        from hermes_cli.relaunch import build_relaunch_argv
+
+        original = ["-p", "red", "sessions", "browse", "--all"]
+        argv = build_relaunch_argv(
+            ["-p", "green", "--resume", "s2"], original_argv=original
+        )
+        assert argv.count("-p") == 2
 
 
 class _nullctx:

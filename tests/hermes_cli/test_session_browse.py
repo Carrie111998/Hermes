@@ -9,8 +9,23 @@ Covers:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from hermes_cli.main import _session_browse_picker
+
+
+# curses (and its _curses C extension) is Unix-only; the curses-based picker
+# classes can't run where the module is missing, so skip them there. The
+# fallback (numbered list) tests keep running everywhere.
+try:
+    import curses  # noqa: F401
+    _HAS_CURSES = True
+except ImportError:  # pragma: no cover - platform without _curses
+    _HAS_CURSES = False
+
+curses_unavailable = pytest.mark.skipif(
+    not _HAS_CURSES, reason="curses is not available on this platform"
+)
 
 
 # ─── Sample session data ──────────────────────────────────────────────────────
@@ -95,6 +110,7 @@ class TestSessionBrowsePicker:
 
 # ─── Curses-based picker (mocked curses) ────────────────────────────────────
 
+@curses_unavailable
 class TestCursesBrowse:
     """Tests for the curses-based interactive picker via simulated key sequences."""
 
@@ -141,6 +157,7 @@ class TestCursesBrowse:
         assert result == "s2"
 
 
+@curses_unavailable
 class TestCursesBrowseProfile:
     """Curses picker with include_profile=True shows the profile column."""
 

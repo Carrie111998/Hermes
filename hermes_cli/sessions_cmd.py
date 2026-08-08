@@ -74,15 +74,21 @@ def _collect_all_profile_sessions(
     sessions.profile_name column is NULL (default profile stamps NULL).
 
     Returns up to ``limit`` sessions per profile, merged and ordered by most
-    recent activity. Profiles without a state.db are skipped.
+    recent activity. Profiles without a state.db are skipped. A custom
+    HERMES_HOME that ``list_profiles()`` cannot enumerate (the active profile
+    resolves to ``"custom"``) is appended under that label so --all still
+    shows the active profile's own sessions.
     """
     from pathlib import Path
 
-    from hermes_cli.profiles import list_profiles
+    from hermes_cli.profiles import get_active_profile_name, list_profiles
+    from hermes_constants import get_hermes_home
     from hermes_state import SessionDB
 
+    profiles = list_profiles()
+
     merged: list = []
-    for profile in list_profiles():
+    for profile in profiles:
         db_path = Path(profile.path) / "state.db"
         if not db_path.exists():
             continue
@@ -94,7 +100,10 @@ def _collect_all_profile_sessions(
             continue
         try:
             rows = db.list_sessions_rich(
-                source=source, exclude_sources=exclude_sources, limit=limit
+                source=source,
+                exclude_sources=exclude_sources,
+                limit=limit,
+                order_by_last_active=True,
             )
         except Exception:
             rows = []
@@ -103,6 +112,37 @@ def _collect_all_profile_sessions(
         for s in rows:
             s["profile_name"] = profile.name
             merged.append(s)
+
+    # list_profiles() only enumerates the default home plus named profile
+    # dirs.  A custom HERMES_HOME (get_active_profile_name() -> "custom")
+    # is not in that set, so its sessions would silently vanish from
+    # --all.  Surface the active profile's own store when it isn't already
+    # covered by the enumeration above.
+    active_name = get_active_profile_name() or "default"
+    active_home = Path(get_hermes_home()).resolve()
+    covered_homes = {Path(p.path).resolve() for p in profiles}
+    if active_name == "custom" and active_home not in covered_homes:
+        db_path = active_home / "state.db"
+        if db_path.exists():
+            try:
+                db = SessionDB(db_path=db_path, read_only=True)
+            except Exception:
+                db = None
+            if db is not None:
+                try:
+                    rows = db.list_sessions_rich(
+                        source=source,
+                        exclude_sources=exclude_sources,
+                        limit=limit,
+                        order_by_last_active=True,
+                    )
+                except Exception:
+                    rows = []
+                finally:
+                    db.close()
+                for s in rows:
+                    s["profile_name"] = active_name
+                    merged.append(s)
 
     # Most-recent activity first, matching the desktop sidebar's cross-profile
     # ordering (list_sessions_rich sorts within one DB; we sort the merge).
@@ -1101,7 +1141,16 @@ def cmd_sessions(args, sessions_parser=None):
 
             _current_profile = get_active_profile_name() or "default"
             if _selected_profile != _current_profile:
-                relaunch(["-p", _selected_profile, "--resume", selected_id])
+                # The user launched with -p <current>; that flag is inherited
+                # from the original argv and would precede the explicit -p
+                # <selected> below, and _apply_profile_override stops at the
+                # FIRST -p — so the resume would target the wrong profile.
+                # Exclude the inherited profile flags so only the explicit
+                # -p <selected> survives.
+                relaunch(
+                    ["-p", _selected_profile, "--resume", selected_id],
+                    exclude_options={"-p", "--profile"},
+                )
                 return  # won't reach here after execvp
 
         relaunch(["--resume", selected_id])
