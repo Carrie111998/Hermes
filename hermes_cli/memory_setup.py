@@ -201,6 +201,18 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
             missing.append(dep)
 
     if not missing:
+        # Even when every slim dep already imports, the configured local
+        # runtime on Intel macOS may still be stale — the missing-dep
+        # probe above would happily skip reinstall, leaving an ancient
+        # shadowing release of ``hindsight_api`` that no longer exposes
+        # ``LocalSTEmbeddings`` in place (#81421). The post-install
+        # smoke check below catches this case regardless of whether we
+        # ran an install or not, so it must run even on the early-return
+        # path. It is gated to Intel macOS + local_embedded inside
+        # ``_maybe_run_intel_macos_local_embedded_smoke_check``, so it
+        # costs nothing for every other code path.
+        if provider_name == "hindsight":
+            _maybe_run_intel_macos_local_embedded_smoke_check(get_hermes_home)
         return
 
     print(f"\n  Installing dependencies: {', '.join(missing)}")
@@ -212,7 +224,6 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
-    outcome = None
     try:
         outcome = install_specs(missing, timeout=120)
         if outcome.ok:
@@ -251,51 +262,74 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     # releases whose files shadow the working slim runtime — pip reports
     # success while the daemon crashes with
     # `Unknown embeddings provider: onnx`. Verify the configured local
-    # runtime is actually usable before claiming the heal succeeded. We
-    # only smoke-check on the affected code path (Intel macOS +
-    # local_embedded) so non-Intel installs and cloud modes don't pay a
-    # new import cost on every refresh.
-    if (
-        provider_name == "hindsight"
-        and outcome is not None
-        and outcome.ok
-    ):
-        import json
-        try:
-            cfg_path = get_hermes_home() / "hindsight" / "config.json"
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-        except Exception:
-            cfg = {}
-        if cfg.get("mode", "") in {"local", "local_embedded"}:
-            is_intel_macos = (
-                platform.system() == "Darwin"
-                and platform.machine() == "x86_64"
-            )
-            if is_intel_macos:
-                smoke_errors = _smoke_import_hindsight_local()
-                if smoke_errors:
-                    print(
-                        "  ✗ Hindsight slim runtime installed but smoke validation failed "
-                        "(#81421). The daemon will not start with this stack; "
-                        "re-running the install will not help until the resolver "
-                        "stops backtracking. Check `pip show hindsight-api-slim` "
-                        "and `pip show hindsight-embed` for overlapping API files."
-                    )
-                    for err in smoke_errors:
-                        print(f"    {err}")
-                    # Surface the failure to callers as well — printing a
-                    # warning alone lets `hermes update` report success
-                    # while leaving the user with a broken daemon. This
-                    # only fires on the Intel-macOS local_embedded code
-                    # path, so non-Intel installs and cloud modes are
-                    # unaffected.
-                    raise RuntimeError(
-                        "Hindsight slim runtime smoke validation failed after "
-                        "install on Intel macOS — pip reported success but the "
-                        "configured local runtime is not usable. See the "
-                        "warnings printed above; the heal is NOT considered "
-                        "successful. (#81421)"
-                    )
+    # runtime is actually usable before claiming the heal succeeded, and
+    # surface failure to callers (via RuntimeError) so ``hermes update``
+    # can't report success while leaving the user with a broken daemon.
+    #
+    # Two trigger paths, both gated on (Intel macOS + local_embedded):
+    #
+    #   * Fresh install (this branch): smoke runs after a successful pip
+    #     install. Catches the resolver-backtrack case directly.
+    #   * Non-force refresh where every slim dep already imports: smoke
+    #     runs in the ``if not missing:`` early-return branch above.
+    #     Catches the "pre-existing broken environment" case where an
+    #     ancient shadowing release of hindsight_api / hindsight_embed
+    #     is still importable in the host venv — the missing-dep probe
+    #     above would see them as present, skip reinstall, and never
+    #     detect the unusable provider class without this run.
+    #
+    # Non-Intel installs and cloud modes are unaffected: the smoke check
+    # only fires on the (Intel macOS + local_embedded) path.
+    if provider_name == "hindsight":
+        _maybe_run_intel_macos_local_embedded_smoke_check(get_hermes_home)
+
+
+def _maybe_run_intel_macos_local_embedded_smoke_check(
+    hermes_home_callable,
+) -> None:
+    """Run the post-install smoke check on Intel macOS local_embedded.
+
+    Extracted so the smoke check is reachable both after a successful
+    pip install (``outcome.ok``) and after a non-force refresh where
+    every slim dep already imports — the latter case is what catches
+    pre-existing broken environments where ancient shadowing releases
+    of hindsight_api / hindsight_embed are still importable. The check
+    only fires on (Intel macOS + local_embedded); every other path
+    returns immediately.
+    """
+    import json as _json
+
+    try:
+        cfg_path = hermes_home_callable() / "hindsight" / "config.json"
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    if cfg.get("mode", "") not in {"local", "local_embedded"}:
+        return
+    is_intel_macos = (
+        platform.system() == "Darwin"
+        and platform.machine() == "x86_64"
+    )
+    if not is_intel_macos:
+        return
+    smoke_errors = _smoke_import_hindsight_local()
+    if not smoke_errors:
+        return
+    print(
+        "  ✗ Hindsight slim runtime smoke validation failed (#81421). The "
+        "daemon will not start with this stack; re-running the install "
+        "will not help until the resolver stops backtracking. Check `pip "
+        "show hindsight-api-slim` and `pip show hindsight-embed` for "
+        "overlapping API files."
+    )
+    for err in smoke_errors:
+        print(f"    {err}")
+    raise RuntimeError(
+        "Hindsight slim runtime smoke validation failed on Intel macOS "
+        "— pip (or an existing importable release) reports success but "
+        "the configured local runtime is not usable. See the warnings "
+        "printed above; the heal is NOT considered successful. (#81421)"
+    )
 
 
 def _smoke_import_hindsight_local() -> list[str]:
@@ -323,17 +357,23 @@ def _smoke_import_hindsight_local() -> list[str]:
     errors: list[str] = []
     # Module imports first — catches the most obvious "pip backtracked
     # to a release that doesn't ship the module at all" failure mode.
-    # Use inline imports so the missing-module case falls into our
-    # except branch (and the class probe below is gated on the module
-    # having imported at all).
+    # Track only the API module — the helper checks for the configured
+    # provider *class* on the API module specifically, not on the embed
+    # manager. Overwriting a single variable in a loop would let the
+    # final iteration's value (the embed manager) replace the API
+    # module reference, which makes the class probe check the wrong
+    # module — a healthy slim install where ``hindsight_api`` exposes
+    # ``LocalSTEmbeddings`` but ``hindsight_embed`` doesn't would be
+    # wrongly rejected (#81421 round-3 review).
     hindsight_api_module = None
     for smoke_module in ("hindsight_api", "hindsight_embed"):
         try:
-            hindsight_api_module = __import__(
-                smoke_module
-            ) if smoke_module == "hindsight_api" else __import__(smoke_module)
+            imported = __import__(smoke_module)
         except Exception as e:  # ImportError + anything else
             errors.append(f"{smoke_module}: {type(e).__name__}: {e}")
+            continue
+        if smoke_module == "hindsight_api":
+            hindsight_api_module = imported
     # Symbol probe — catches the subtle backtrack where the module
     # imports but the configured provider class is gone (this is the
     # exact regression from #81421: the slim runtime was shadowed by
