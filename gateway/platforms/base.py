@@ -2579,6 +2579,14 @@ def resolve_channel_skills(
     Returns a deduplicated list of skill names (order preserved), or None if
     no match is found.
     """
+    try:
+        from agent.skill_governance import filter_allowed_skill_names, governance_context
+
+        _governance_context = governance_context(mode="auto")
+    except Exception:
+        filter_allowed_skill_names = None
+        _governance_context = None
+
     bindings = config_extra.get("channel_skill_bindings") or []
     if not isinstance(bindings, list) or not bindings:
         return None
@@ -2597,7 +2605,17 @@ def resolve_channel_skills(
             skills = entry.get("skills") or entry.get("skill")
             if isinstance(skills, str):
                 s = skills.strip()
-                return [s] if s else None
+                resolved = [s] if s else None
+                if (
+                    resolved
+                    and filter_allowed_skill_names is not None
+                    and _governance_context is not None
+                ):
+                    resolved, _decisions = filter_allowed_skill_names(
+                        resolved,
+                        context=_governance_context,
+                    )
+                return resolved or None
             if isinstance(skills, list) and skills:
                 seen: list[str] = []
                 for name in skills:
@@ -2606,6 +2624,15 @@ def resolve_channel_skills(
                     nm = name.strip()
                     if nm and nm not in seen:
                         seen.append(nm)
+                if (
+                    seen
+                    and filter_allowed_skill_names is not None
+                    and _governance_context is not None
+                ):
+                    seen, _decisions = filter_allowed_skill_names(
+                        seen,
+                        context=_governance_context,
+                    )
                 return seen or None
     return None
 

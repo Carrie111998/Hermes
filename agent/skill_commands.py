@@ -762,12 +762,20 @@ def build_preloaded_skills_prompt(
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
     missing: list[str] = []
+    rejected: set[str] = set()
 
     try:
         from agent.skill_utils import get_disabled_skill_names
         disabled_names = get_disabled_skill_names()
     except Exception:
         disabled_names = set()
+    try:
+        from agent.skill_governance import evaluate_skill_selection, governance_context
+
+        _governance_context = governance_context(mode="preload")
+    except Exception:
+        evaluate_skill_selection = None
+        _governance_context = None
 
     seen: set[str] = set()
     for raw_identifier in skill_identifiers:
@@ -786,6 +794,13 @@ def build_preloaded_skills_prompt(
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)
             continue
+
+        if evaluate_skill_selection is not None and _governance_context is not None:
+            decision = evaluate_skill_selection(skill_name, context=_governance_context)
+            if not decision.allowed:
+                rejected.add(identifier)
+                missing.append(identifier)
+                continue
 
         # Track active usage for Curator lifecycle management (#17782)
         try:
@@ -808,5 +823,11 @@ def build_preloaded_skills_prompt(
             )
         )
         loaded_names.append(skill_name)
+
+    if rejected:
+        logger.warning(
+            "Skill preload rejected by governance: %s",
+            sorted(rejected),
+        )
 
     return "\n\n".join(prompt_parts), loaded_names, missing

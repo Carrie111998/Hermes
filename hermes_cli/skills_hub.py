@@ -402,12 +402,22 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
             seen[r.identifier] = r
     deduped = list(seen.values())
 
-    # Sort: official first, then by trust level (desc), then alphabetically
-    deduped.sort(key=lambda r: (
-        -_TRUST_RANK.get(r.trust_level, 0),
-        r.source != "official",
-        r.name.lower(),
-    ))
+    try:
+        from agent.skill_governance import governance_context, governance_sort_tuple
+
+        _governance_context = governance_context(mode="retrieval")
+        deduped.sort(key=lambda r: (
+            *governance_sort_tuple(r, context=_governance_context),
+            -_TRUST_RANK.get(r.trust_level, 0),
+            r.source != "official",
+            r.name.lower(),
+        ))
+    except Exception:
+        deduped.sort(key=lambda r: (
+            -_TRUST_RANK.get(r.trust_level, 0),
+            r.source != "official",
+            r.name.lower(),
+        ))
 
     # Paginate
     total = len(deduped)
@@ -877,7 +887,20 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
         if r.identifier not in seen or rank > _TRUST_RANK.get(seen[r.identifier].trust_level, 0):
             seen[r.identifier] = r
     deduped = list(seen.values())
-    deduped.sort(key=lambda r: (-_TRUST_RANK.get(r.trust_level, 0), r.source != "official", r.name.lower()))
+    try:
+        from agent.skill_governance import governance_context, governance_sort_tuple
+
+        _governance_context = governance_context(mode="retrieval")
+        deduped.sort(
+            key=lambda r: (
+                *governance_sort_tuple(r, context=_governance_context),
+                -_TRUST_RANK.get(r.trust_level, 0),
+                r.source != "official",
+                r.name.lower(),
+            )
+        )
+    except Exception:
+        deduped.sort(key=lambda r: (-_TRUST_RANK.get(r.trust_level, 0), r.source != "official", r.name.lower()))
     total = len(deduped)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))

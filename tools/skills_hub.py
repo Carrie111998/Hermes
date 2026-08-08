@@ -4428,5 +4428,14 @@ def unified_search(query: str, sources: List[SkillSource],
         elif _TRUST_RANK.get(r.trust_level, 0) > _TRUST_RANK.get(seen[r.identifier].trust_level, 0):
             seen[r.identifier] = r
     deduped = list(seen.values())
+    try:
+        from agent.skill_governance import governance_context, rank_skill_search_results
+
+        deduped = rank_skill_search_results(
+            deduped,
+            context=governance_context(mode="retrieval"),
+        )
+    except Exception:
+        logger.debug("Governance-aware ranking unavailable", exc_info=True)
 
     return deduped[:limit]
