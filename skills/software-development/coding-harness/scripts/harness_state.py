@@ -15,6 +15,9 @@ Usage:
     harness_state.py status
     harness_state.py --self-test
 
+Only a `pass` verification may end in the `keep` verdict — a failed or partial
+increment stays pending until it passes or is reverted.
+
 State file defaults to ./.hermes/coding-harness/state.json
 (override with --state PATH or env CODING_HARNESS_STATE).
 """
@@ -32,6 +35,14 @@ from pathlib import Path
 MANIFEST_VERSION = "1.0"
 DEFAULT_REL_PATH = Path(".hermes") / "coding-harness" / "state.json"
 DEFAULT_VERDICT = {"pass": "keep", "fail": "revert", "partial": "partial"}
+# Only a passing verification may end in "keep" — that is what marks an increment
+# complete in _render(). A failed or partial increment stays pending until it passes
+# or is reverted, so a known-bad change can never be counted as done.
+ALLOWED_VERDICTS = {
+    "pass": ("keep", "partial", "revert"),
+    "fail": ("revert", "partial"),
+    "partial": ("partial", "revert"),
+}
 
 
 def _now() -> str:
@@ -126,6 +137,13 @@ def cmd_record_verification(args: argparse.Namespace) -> None:
     state = _load(path)
     inc = _find(state, args.change_id)
     verdict = args.verdict or DEFAULT_VERDICT[args.status]
+    allowed = ALLOWED_VERDICTS[args.status]
+    if verdict not in allowed:
+        sys.exit(
+            f"error: verdict {verdict!r} is not valid for status {args.status!r}. "
+            f"Allowed: {', '.join(allowed)}. Root-cause the failure and revert (or "
+            f"fix forward and re-verify) instead of keeping a known-bad increment."
+        )
     inc["verification"] = {
         "status": args.status,
         "note": args.note or "",
@@ -138,12 +156,22 @@ def cmd_record_verification(args: argparse.Namespace) -> None:
     print(f"{args.change_id}: {args.status} -> {verdict}")
 
 
+def _is_complete(inc: dict) -> bool:
+    """An increment counts as done only when reality agreed AND we kept it.
+
+    Checked here as well as at write time so a hand-edited state file cannot
+    smuggle a failed increment past the pending list.
+    """
+    v = inc["verification"]
+    return v.get("status") == "pass" and v.get("verdict") == "keep"
+
+
 def _render(state: dict) -> str:
     lines = []
     lines.append(f"GOAL: {state['goal']}")
     lines.append(f"created: {state.get('created_at', '?')}")
     incs = state["increments"]
-    done = sum(1 for i in incs if i["verification"]["verdict"] == "keep")
+    done = sum(1 for i in incs if _is_complete(i))
     lines.append(f"increments: {len(incs)} ({done} kept)")
     lines.append("")
     for inc in incs:
@@ -158,7 +186,7 @@ def _render(state: dict) -> str:
             lines.append(f"    risk:   {pi['at_risk']}")
         if v.get("note"):
             lines.append(f"    proof:  {v['note']}")
-    pending = [i["change_id"] for i in incs if i["verification"]["verdict"] != "keep"]
+    pending = [i["change_id"] for i in incs if not _is_complete(i)]
     lines.append("")
     if pending:
         lines.append(f"NEXT: resume at {pending[0]} (not yet kept)")
@@ -203,6 +231,26 @@ def cmd_self_test(_args: argparse.Namespace) -> None:
         reloaded = json.loads(sp.read_text())
         assert reloaded == state, "state not stable across reload"
 
+        # failure path: a failed increment must not be keepable, and must stay pending
+        cmd_add_increment(ns(state=str(sp), summary="second increment", predict=None, risk=None))
+        try:
+            cmd_record_verification(
+                ns(state=str(sp), change_id="ch_002", status="fail", note="", verdict="keep")
+            )
+        except SystemExit as exc:
+            assert "not valid for status" in str(exc), f"unexpected exit: {exc}"
+        else:  # pragma: no cover - guarded by the assert below
+            raise AssertionError("fail --verdict keep was accepted")
+
+        cmd_record_verification(
+            ns(state=str(sp), change_id="ch_002", status="fail", note="pytest: 1 failed", verdict=None)
+        )
+        state = json.loads(sp.read_text())
+        assert state["increments"][1]["verification"]["verdict"] == "revert", "fail should revert"
+        out = _render(state)
+        assert "increments: 2 (1 kept)" in out, out
+        assert "NEXT: resume at ch_002" in out, out
+
     print("self-test OK")
 
 
@@ -230,7 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("change_id")
     pr.add_argument("status", choices=["pass", "fail", "partial"])
     pr.add_argument("--note", help="actual command + outcome (the external proof)")
-    pr.add_argument("--verdict", choices=["keep", "revert", "partial"], help="override derived verdict")
+    pr.add_argument(
+        "--verdict",
+        choices=["keep", "revert", "partial"],
+        help="override derived verdict (only a `pass` may be kept)",
+    )
     pr.set_defaults(func=cmd_record_verification)
 
     ps = sub.add_parser("status", help="print goal, increments, and next step")

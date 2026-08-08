@@ -1,8 +1,8 @@
 ---
 name: coding-harness
-description: "Use when a coding task spans many steps, files, or a long session: imposes a phased execution loop, evidence-driven verification, and tracked falsifiable progress so long-horizon work doesn't drift, stall, or silently regress."
+description: Run long multi-step work as verified increments.
 version: 1.0.0
-author: Teddy Tennant
+author: Teddy Tennant (@teddytennant)
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -74,7 +74,8 @@ Full phase spec, transitions, and termination rules: `references/execution-loop.
 
 The loop's memory lives in `.hermes/coding-harness/state.json` in the workspace, managed by
 the helper script. It is the single source of truth that survives context compaction — re-read
-it (`status`) whenever you lose the thread or resume after an interruption.
+it (`status`) whenever you lose the thread or resume after an interruption. Drive the script
+with the `terminal` tool:
 
 ```bash
 HS="python3 skills/software-development/coding-harness/scripts/harness_state.py"
@@ -117,15 +118,19 @@ should get better) and the at-risk regression (what might break). After VERIFY, 
 - **revert** — change was ineffective or caused a regression; undo it, log the lesson.
 - **partial** — partially worked; refine and re-verify.
 
+Only a `pass` verification may end in `keep`. `record-verification` rejects `fail --verdict
+keep` (and `partial --verdict keep`), so a failed increment can never be counted as complete
+or dropped from the pending list — it stays next in line until it passes or is reverted.
+
 This makes regressions visible immediately and stops the agent from accreting changes it can't
 account for. Verdicts are recorded in state and form the audit trail of the whole task.
 
 ## Tool Orchestration
 
-- **Parallel vs. sequential:** independent read-only ops (reading several files, separate
-  greps) → fire concurrently in one turn. Edits/commands touching the **same path** → run
-  sequentially to avoid races (matches Hermes's own `tool_executor.py` heuristic). Never
-  parallelize two writes to the same file.
+- **Parallel vs. sequential:** independent read-only ops (several `read_file` calls, separate
+  `search_files` queries) → fire concurrently in one turn. `patch` / `terminal` calls touching
+  the **same path** → run sequentially to avoid races (matches Hermes's own
+  `tool_executor.py` heuristic). Never parallelize two writes to the same file.
 - **Delegate** large, independent sub-investigations or fan-out work to subagents
   (`subagent-driven-development`) — keep the main context focused on the loop, not on raw
   search output.
