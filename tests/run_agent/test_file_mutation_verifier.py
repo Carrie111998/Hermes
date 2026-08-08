@@ -227,6 +227,43 @@ class TestRecordFileMutationResult:
         assert result["resolved_path"] == str(target)
         assert result["resolved_paths"] == [str(target)]
 
+    def test_v4a_failure_maps_exact_targets_when_optional_path_is_present(self, tmp_path):
+        from tools.file_tools import patch_tool
+
+        target = tmp_path / "target.txt"
+        unrelated = tmp_path / "unrelated.txt"
+        target.write_text("actual content\n", encoding="utf-8")
+        unrelated.write_text("unrelated\n", encoding="utf-8")
+        patch_body = (
+            "*** Begin Patch\n"
+            f"*** Update File: {target}\n"
+            "@@\n"
+            "-missing content\n"
+            "+replacement\n"
+            "*** End Patch"
+        )
+
+        result = patch_tool(
+            mode="patch",
+            path=str(unrelated),
+            patch=patch_body,
+            task_id="mutation-verifier-test",
+        )
+        result_data = json.loads(result)
+        assert result_data.get("error")
+        assert result_data["resolved_path_map"][str(target)] == str(target)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "patch", "path": str(unrelated), "patch": patch_body},
+            result,
+            is_error=True,
+        )
+
+        assert list(agent._turn_failed_file_mutations) == [str(target)]
+        assert agent._turn_failed_file_mutations[str(target)]["resolved_path"] == str(target)
+
     def test_stale_expected_state_cannot_mutate_next_turn(self):
         agent = _bare_agent()
         old_state = agent._turn_failed_file_mutations

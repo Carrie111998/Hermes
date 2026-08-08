@@ -3458,9 +3458,17 @@ class AIAgent:
         if is_error and not landed:
             preview = _extract_error_preview(result)
             reported_paths: List[str] = []
+            reported_path_map: Dict[str, str] = {}
             try:
                 result_data = json.loads(result) if isinstance(result, str) else result
                 if isinstance(result_data, dict):
+                    raw_path_map = result_data.get("resolved_path_map")
+                    if isinstance(raw_path_map, dict):
+                        reported_path_map = {
+                            str(key): str(value)
+                            for key, value in raw_path_map.items()
+                            if isinstance(value, str)
+                        }
                     raw_paths = result_data.get("resolved_paths")
                     if isinstance(raw_paths, list):
                         reported_paths = [str(item) for item in raw_paths]
@@ -3470,7 +3478,8 @@ class AIAgent:
                 pass
             for index, path in enumerate(targets):
                 reported_path = (
-                    reported_paths[index] if index < len(reported_paths) else None
+                    reported_path_map.get(path)
+                    or (reported_paths[index] if index < len(reported_paths) else None)
                 )
                 resolved_path = reported_path or self._resolve_file_mutation_target(
                     path, task_id=task_id,
