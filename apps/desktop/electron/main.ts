@@ -209,6 +209,7 @@ import {
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import { applyWebviewHardening, shouldBlockWebviewAttach } from './webview-hardening'
 import {
   computeWindowOptions,
   debounce,
@@ -11823,6 +11824,25 @@ if (!_gotSingleInstanceLock) {
     })
   })
 }
+
+// Chat windows enable `webviewTag`, so any script in the renderer can create a
+// <webview> and ask for its own webPreferences via element attributes. The
+// preview pane sets safe ones; this makes them mandatory for every guest,
+// however it was created. Registered at module scope (not inside whenReady) so
+// no window can attach a guest before the guard is listening. See
+// electron/webview-hardening.ts for why this belongs here rather than in markup.
+app.on('web-contents-created', (_event, contents) => {
+  contents.on('will-attach-webview', (event, webPreferences, params) => {
+    if (shouldBlockWebviewAttach(params)) {
+      rememberLog(`[webview] blocked guest carrying its own preload: ${params.preload}`)
+      event.preventDefault()
+
+      return
+    }
+
+    applyWebviewHardening(webPreferences)
+  })
+})
 
 // macOS delivers deep links via 'open-url' — register early (can fire before
 // whenReady; handleDeepLink queues until the renderer is ready).
