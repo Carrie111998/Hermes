@@ -972,3 +972,85 @@ def test_custom_provider_dict_models_pin_requires_discover_false(monkeypatch):
     row = next(p for p in providers if p["name"] == "Local Ollama")
     assert calls == []
     assert row["models"] == ["llama3"]
+
+
+def test_local_custom_provider_allowlist_is_live_probed(monkeypatch):
+    """A local (localhost) custom_providers entry with an allowlist-shaped
+    ``models:`` list and NO api_key must still be live-probed.
+
+    Regression: the allowlist + missing-key gate skipped discovery, so models
+    pulled after config was written (deepseek-r1:14b, deepseek-coder-en:latest,
+    dagbs/deepseek-coder-v2-lite-instruct:Q4_K_M) never appeared in the picker.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.model_switch._save_discovered_models_to_config",
+        lambda *a, **k: None,
+    )
+    calls = []
+
+    def fetch(api_key, base_url, **kwargs):
+        calls.append((api_key, base_url))
+        return ["deepseek-r1:14b", "deepseek-coder-en:latest",
+                "dagbs/deepseek-coder-v2-lite-instruct:Q4_K_M",
+                "qwen2.5-coder:7b", "llama3.1:latest", "qwen2.5:14b"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fetch)
+
+    providers = list_authenticated_providers(
+        current_provider="custom:groq",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "ollama",
+                "base_url": "http://localhost:11434/v1",
+                "models": ["qwen2.5-coder:7b", "llama3.1:latest", "qwen2.5:14b"],
+            }
+        ],
+        # GUI path with the endpoint neither current nor probe-flagged.
+        probe_custom_providers=False,
+        probe_current_custom_provider=False,
+    )
+
+    assert len(calls) == 1
+    assert calls[0] == ("", "http://localhost:11434/v1")
+    row = next(p for p in providers if p["name"] == "ollama")
+    assert row["models"] == [
+        "deepseek-r1:14b", "deepseek-coder-en:latest",
+        "dagbs/deepseek-coder-v2-lite-instruct:Q4_K_M",
+        "qwen2.5-coder:7b", "llama3.1:latest", "qwen2.5:14b",
+    ]
+
+
+def test_remote_custom_provider_allowlist_without_key_is_not_probed(monkeypatch):
+    """A public remote endpoint with an allowlist and no api_key must keep its
+    allowlist — live /models is not probed, so the picker preserves the user's
+    curated narrowing instead of replacing it."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    calls = []
+
+    def fetch(*args, **kwargs):
+        calls.append(args)
+        return ["llama-4-maverick"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fetch)
+
+    providers = list_authenticated_providers(
+        current_provider="openai-codex",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "groq",
+                "base_url": "https://api.groq.com/openai/v1",
+                "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+            }
+        ],
+        probe_custom_providers=False,
+        probe_current_custom_provider=False,
+    )
+
+    assert calls == []
+    row = next(p for p in providers if p["name"] == "groq")
+    assert row["models"] == ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]

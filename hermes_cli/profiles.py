@@ -2212,6 +2212,13 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         _cleanup_gateway_service(old_canon, old_dir)
         _stop_gateway_process(old_dir)
 
+    # 1b. Stop any other backends bound to this profile (Desktop-spawned
+    # serve/dashboard processes the gateway.pid file never names). They hold
+    # the profile's SQLite connection open and keep writing files, which makes
+    # the directory rename below fail with PermissionError [WinError 5] (and,
+    # on POSIX, EBUSY/ENOTEMPTY). Mirrors the delete path.
+    _stop_profile_backends(old_canon, old_dir)
+
     # 2. Rename directory
     old_dir.rename(new_dir)
     print(f"✓ Renamed {old_dir.name} → {new_dir.name}")
