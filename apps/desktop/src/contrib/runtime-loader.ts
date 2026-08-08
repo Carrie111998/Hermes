@@ -140,14 +140,16 @@ export async function loadRuntimePlugin(
       id: plugin.id,
       name: plugin.name ?? plugin.id,
       kind: options.kind ?? 'disk',
-      file: options.file
+      file: options.file,
+      provides: plugin.provides,
+      requires: plugin.requires
     }
 
     const activate = () => {
       // Reload = dispose the previous incarnation, then register fresh.
       unloadRuntimePlugin(plugin.id)
       const disposers: (() => void)[] = []
-      plugin.register(createPluginContext(plugin.id, dispose => disposers.push(dispose)))
+      plugin.register(createPluginContext(plugin.id, dispose => disposers.push(dispose), plugin.requires))
       loaded.set(plugin.id, disposers)
       publishPlugin({ ...record, status: 'loaded' })
     }

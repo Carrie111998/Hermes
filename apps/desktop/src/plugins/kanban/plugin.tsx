@@ -81,6 +81,9 @@ const plugin: HermesPlugin = {
   id: 'kanban',
   name: 'Kanban',
   defaultEnabled: false,
+  provides: {
+    rest: [{ id: 'read-model', methods: ['GET'], paths: ['/boards', '/board'] }]
+  },
   register(ctx) {
     ctx.i18n.register(KANBAN_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket))

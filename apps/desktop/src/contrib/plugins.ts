@@ -40,7 +40,13 @@ export function discoverBundledPlugins(): void {
     // Same inventory + live-toggle contract as runtime plugins: each bundled
     // plugin publishes a record with activate/deactivate handles, and a
     // persisted disable survives boots by skipping registration here.
-    const record = { id: plugin.id, name: plugin.name ?? plugin.id, kind: 'bundled' as const }
+    const record = {
+      id: plugin.id,
+      name: plugin.name ?? plugin.id,
+      kind: 'bundled' as const,
+      provides: plugin.provides,
+      requires: plugin.requires
+    }
     let disposers: (() => void)[] = []
 
     const activate = () => {
@@ -48,7 +54,7 @@ export function discoverBundledPlugins(): void {
       disposers = []
 
       try {
-        plugin.register(createPluginContext(plugin.id, dispose => disposers.push(dispose)))
+        plugin.register(createPluginContext(plugin.id, dispose => disposers.push(dispose), plugin.requires))
         publishPlugin({ ...record, status: 'loaded' })
       } catch (error) {
         console.error(`[plugins] ${plugin.id} failed to register`, error)
