@@ -1140,6 +1140,35 @@ export interface ActionStatusResponse {
   status: ActionRunStatus | null
 }
 
+/** Verdict a durable action's preflight check settles on — see
+ *  hermes_cli/web_server.py's `_preflight_durable_action`. "blocked" means
+ *  the action would refuse outright (see `reason` for the specific cause);
+ *  "will_stage" means it would be accepted but deferred behind the
+ *  update-approval gate instead of applied immediately; "will_apply" means
+ *  nothing stands in the way. */
+export type ActionPreflightVerdict = 'blocked' | 'will_stage' | 'will_apply'
+
+/** Response shape for `GET /api/actions/{name}/preflight` — a read-only
+ *  precheck of a durable action's likely outcome, meant to be fetched
+ *  before offering the action so a button's label/disabled-state can
+ *  reflect it up front instead of only surfacing the outcome after the
+ *  action is spawned. */
+export interface ActionPreflightResponse {
+  name: string
+  lock_held: boolean
+  will_stage: boolean
+  /** Informational only — a dirty checkout does not by itself block the
+   *  action, so this can be true even when verdict is 'will_apply'. */
+  checkout_dirty: boolean
+  pending_exists: boolean
+  install_method: string
+  verdict: ActionPreflightVerdict
+  /** Human-readable explanation that differs by cause — distinguishes
+   *  "managed via docker/nix" from "an update is already running" from
+   *  "a pending request needs review first", not just a generic label. */
+  reason: string
+}
+
 export interface BackendUpdateCommit {
   sha: string
   summary: string

@@ -59,6 +59,7 @@ import type {
   PortalStatus,
   DebugShareResponse,
   ActionRunStatus,
+  ActionPreflightResponse,
 } from "@/lib/api";
 
 function formatBytes(n: number): string {
@@ -270,6 +271,18 @@ export default function SystemPage() {
   );
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateConfirmOpen, setUpdateConfirmOpen] = useState(false);
+  // Pre-click check (see hermes_cli/web_server.py's _preflight_durable_action)
+  // — loaded alongside the cached update check so the button can already
+  // show "will stage" / "blocked" / running before the user clicks it,
+  // instead of only learning the outcome from the POST response.
+  const [updatePreflight, setUpdatePreflight] =
+    useState<ActionPreflightResponse | null>(null);
+  const refreshUpdatePreflight = useCallback(() => {
+    api
+      .getActionPreflight("hermes-update")
+      .then(setUpdatePreflight)
+      .catch(() => {});
+  }, []);
 
   const loadAll = useCallback(() => {
     Promise.allSettled([
@@ -284,8 +297,12 @@ export default function SystemPage() {
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
+      // Same reasoning as the cached update check above: load the preflight
+      // verdict up front so the "Update now" button's label/disabled-state
+      // is right the first time it renders, not just after a click.
+      api.getActionPreflight("hermes-update"),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, upd, pre]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -295,6 +312,7 @@ export default function SystemPage() {
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
+        if (pre.status === "fulfilled") setUpdatePreflight(pre.value);
       })
       .finally(() => setLoading(false));
   }, []);
@@ -431,8 +449,11 @@ export default function SystemPage() {
           setPendingBackupArchive(null);
         }
       }
+      if (action === "hermes-update") {
+        refreshUpdatePreflight();
+      }
     },
-    [pendingBackupArchive, showToast],
+    [pendingBackupArchive, showToast, refreshUpdatePreflight],
   );
 
   const downloadBackup = async () => {
@@ -950,10 +971,23 @@ export default function SystemPage() {
                   <Button
                     size="sm"
                     prefix={<Download className="h-3.5 w-3.5" />}
+                    disabled={updatePreflight?.verdict === "blocked"}
+                    title={updatePreflight?.reason}
                     onClick={() => setUpdateConfirmOpen(true)}
                   >
-                    Update now
+                    {updatePreflight?.verdict === "blocked"
+                      ? updatePreflight.lock_held
+                        ? "Update running…"
+                        : "Update (blocked)"
+                      : updatePreflight?.verdict === "will_stage"
+                        ? "Update (will stage for approval)"
+                        : "Update now"}
                   </Button>
+                )}
+                {updatePreflight?.verdict === "blocked" && (
+                  <span className="text-xs text-muted-foreground">
+                    {updatePreflight.reason}
+                  </span>
                 )}
                 {updateInfo &&
                   !updateInfo.can_apply &&

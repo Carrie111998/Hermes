@@ -2,7 +2,7 @@ import { atom } from 'nanostores'
 
 import { sessionTitle } from '@/lib/chat-runtime'
 import type { PreviewServerRestart } from '@/store/preview'
-import type { ActionStatusResponse, SessionInfo } from '@/types/hermes'
+import type { ActionPreflightResponse, ActionStatusResponse, SessionInfo } from '@/types/hermes'
 
 const HISTORY_LIMIT = 8
 const COMPLETED_TTL_MS = 5 * 60 * 1000
@@ -109,4 +109,28 @@ function prune(tasks: Record<string, DesktopActionTask>): Record<string, Desktop
       .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
       .slice(0, HISTORY_LIMIT)
   )
+}
+
+/** Button copy for a durable action's pre-click preflight check (see
+ *  `getActionPreflight` in `@/hermes` / hermes_cli/web_server.py's
+ *  `_preflight_durable_action`). Mirrors `actionStatus`/`actionDetail`
+ *  above: a small pure mapping any desktop surface offering the action
+ *  (e.g. the update button) can reuse instead of re-deriving this itself.
+ *  Read-only — this never triggers the action or changes its status. */
+export function preflightButtonLabel(preflight: ActionPreflightResponse, defaultLabel: string): string {
+  if (preflight.verdict === 'blocked') {
+    return preflight.lock_held ? 'Update running…' : `${defaultLabel} (blocked)`
+  }
+
+  if (preflight.verdict === 'will_stage') {
+    return `${defaultLabel} (will stage for approval)`
+  }
+
+  return defaultLabel
+}
+
+/** True when a durable action's preflight check says clicking it would be
+ *  refused outright — callers use this to disable the button. */
+export function preflightBlocksAction(preflight: ActionPreflightResponse): boolean {
+  return preflight.verdict === 'blocked'
 }
