@@ -890,6 +890,12 @@ class TestOpenAIModelExecutionGuidance:
 
 
 
+    def test_guidance_forbids_identical_tool_retries(self):
+        text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
+        assert "do not resend the same tool call" in text
+        assert "change the arguments, selector, path, or strategy" in text
+
+
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
