@@ -491,6 +491,8 @@ def _fixture(tmp_path: Path) -> Fixture:
     host_receipt = dict(
         host_test._observe(host_test._harness()).receipt
     )
+    host_receipt["observed_at_unix_ns"] = NOW * 1_000_000_000
+    input_test._rehash(host_receipt, "receipt_sha256")  # noqa: SLF001
     consumer_set = update_inputs.build_release_consumer_set(
         predecessor_revision=PREDECESSOR,
         release_revision=TARGET,
@@ -499,6 +501,10 @@ def _fixture(tmp_path: Path) -> Fixture:
         payload,
         unit_plan,
         unit_approval,
+    )
+    host_mutation_authority = input_test._host_mutation_authority(
+        host_manifest,
+        host_receipt,
     )
     cron_index = input_test._cron_index()
     alias_index = input_test._alias_index()
@@ -509,6 +515,9 @@ def _fixture(tmp_path: Path) -> Fixture:
         ],
         "host_artifact_manifest_sha256": host_manifest[
             "manifest_sha256"
+        ],
+        "host_mutation_authority_sha256": host_mutation_authority[
+            "receipt_sha256"
         ],
         "cron_artifact_index_sha256": cron_index[
             "artifact_index_sha256"
@@ -532,6 +541,7 @@ def _fixture(tmp_path: Path) -> Fixture:
         "host_inventory_sha256": host_receipt,
         "release_consumer_set_sha256": consumer_set,
         "host_artifact_manifest_sha256": host_manifest,
+        "host_mutation_authority_sha256": host_mutation_authority,
         "cron_artifact_index_sha256": cron_index,
         "alias_artifact_index_sha256": alias_index,
         "successor_unit_input_publication_sha256": unit_publication,

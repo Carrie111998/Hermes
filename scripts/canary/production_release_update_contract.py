@@ -19,7 +19,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
-PLAN_SCHEMA = "muncho-production-release-update-plan.v5"
+PLAN_SCHEMA = "muncho-production-release-update-plan.v6"
 APPROVAL_SCHEMA = "muncho-production-release-update-approval.v1"
 PUBLICATION_SCHEMA = "muncho-production-release-update-publication.v1"
 PREDECESSOR_TRUST_SCHEMA = (
@@ -70,6 +70,7 @@ _PLAN_FIELDS = frozenset(
         "host_inventory_sha256",
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
+        "host_mutation_authority_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -401,6 +402,7 @@ def validate_plan(
         "host_inventory_sha256",
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
+        "host_mutation_authority_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",

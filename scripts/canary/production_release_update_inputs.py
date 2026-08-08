@@ -36,8 +36,8 @@ from scripts.canary import production_release_update_runtime as update_runtime
 RELEASE_CONSUMER_SET_SCHEMA = (
     "muncho-production-release-consumer-set.v1"
 )
-ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v2"
-ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v2"
+ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v3"
+ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v3"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -46,6 +46,7 @@ _DOCUMENT_FIELDS = frozenset(
         "host_inventory_sha256",
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
+        "host_mutation_authority_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -58,6 +59,7 @@ _ARTIFACT_IDENTITY_FIELDS = frozenset(
         "host_inventory_sha256",
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
+        "host_mutation_authority_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -154,6 +156,30 @@ _HOST_MANIFEST_FIELDS = frozenset(
         "plan_bindings",
         "secret_material_recorded",
         "manifest_sha256",
+    }
+)
+_HOST_MUTATION_AUTHORITY_FIELDS = frozenset(
+    {
+        "schema",
+        "release_revision",
+        "request_sha256",
+        "initial_collector_receipt_sha256",
+        "release_manifest_sha256",
+        "host_artifact_contract_sha256",
+        "gateway_target_identity",
+        "writer_target_identity",
+        "connector_target_identity",
+        "host_transition",
+        "capability_topology",
+        "cron_continuity_plan",
+        "readback_file_count",
+        "readback_files",
+        "readback_set_sha256",
+        "observed_at_unix",
+        "source_boot_id_sha256",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "receipt_sha256",
     }
 )
 _HOST_SOURCE_FIELDS = frozenset(
@@ -933,6 +959,176 @@ def validate_host_artifact_manifest(
     return raw
 
 
+def _valid_host_target_prestate(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "state",
+        "sha256",
+        "uid",
+        "gid",
+        "mode",
+    }:
+        return False
+    if value.get("state") == "absent":
+        return all(
+            value.get(name) is None
+            for name in ("sha256", "uid", "gid", "mode")
+        )
+    return (
+        value.get("state") == "present"
+        and isinstance(value.get("sha256"), str)
+        and _SHA256.fullmatch(value["sha256"]) is not None
+        and type(value.get("uid")) is int
+        and value["uid"] >= 0
+        and type(value.get("gid")) is int
+        and value["gid"] >= 0
+        and type(value.get("mode")) is int
+        and 0 <= value["mode"] <= 0o7777
+    )
+
+
+def validate_host_mutation_authority(
+    value: Any,
+    *,
+    release_revision: str,
+    host_artifact_manifest: Mapping[str, Any],
+    host_inventory: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate the signed-plan-bound root host readback authority.
+
+    The owner signature on the Stage-C plan supplies durable authority.  This
+    receipt supplies exact staged bytes and target prestates for package
+    entries whose digest is intentionally dynamic.  It interprets no task or
+    truth-mode semantics.
+    """
+
+    code = "release_update_inputs_host_mutation_authority_invalid"
+    revision = _revision(release_revision, code)
+    raw = _self_hashed(
+        value,
+        fields=_HOST_MUTATION_AUTHORITY_FIELDS,
+        digest_field="receipt_sha256",
+        code=code,
+    )
+    manifest = _plain(host_artifact_manifest)
+    inventory_receipt = _plain(host_inventory)
+    contract = manifest.get("host_artifact_contract")
+    transition = raw.get("host_transition")
+    transition_files = (
+        transition.get("files") if isinstance(transition, Mapping) else None
+    )
+    readback = raw.get("readback_files")
+    inventory_processes = inventory_receipt.get("processes")
+    boot_id = (
+        inventory_processes.get("boot_id")
+        if isinstance(inventory_processes, Mapping)
+        else None
+    )
+    if (
+        raw.get("schema")
+        != "muncho-production-cutover-host-authority.v1"
+        or raw.get("release_revision") != revision
+        or not isinstance(contract, Mapping)
+        or raw.get("release_manifest_sha256")
+        != manifest.get("manifest_sha256")
+        or raw.get("host_artifact_contract_sha256")
+        != contract.get("contract_sha256")
+        or not isinstance(transition_files, Mapping)
+        or set(transition_files) != set(host_package.HOST_ARTIFACT_TARGETS)
+        or not isinstance(readback, list)
+        or raw.get("readback_file_count") != len(readback)
+        or len(readback) != len(host_package.HOST_ARTIFACT_TARGETS)
+        or type(raw.get("observed_at_unix")) is not int
+        or raw["observed_at_unix"] <= 0
+        or type(inventory_receipt.get("observed_at_unix_ns")) is not int
+        or abs(
+            raw["observed_at_unix"]
+            - inventory_receipt["observed_at_unix_ns"] // 1_000_000_000
+        )
+        > 900
+        or not isinstance(boot_id, str)
+        or raw.get("source_boot_id_sha256")
+        != sha256_bytes(boot_id.encode("ascii", errors="strict"))
+        or raw.get("secret_material_recorded") is not False
+        or raw.get("secret_digest_recorded") is not False
+    ):
+        _fail(code)
+    contract_files = contract.get("files")
+    if not isinstance(contract_files, Mapping):
+        _fail(code)
+    expected_names = sorted(host_package.HOST_ARTIFACT_TARGETS)
+    for expected_name, observed in zip(
+        expected_names,
+        readback,
+        strict=True,
+    ):
+        transition_item = transition_files.get(expected_name)
+        contract_item = contract_files.get(expected_name)
+        if (
+            not isinstance(transition_item, Mapping)
+            or set(transition_item)
+            != {
+                "staged_path",
+                "target_path",
+                "sha256",
+                "uid",
+                "gid",
+                "mode",
+                "pre",
+            }
+            or not isinstance(contract_item, Mapping)
+            or transition_item.get("staged_path")
+            != contract_item.get("staged_path")
+            or transition_item.get("target_path")
+            != contract_item.get("target_path")
+            or _SHA256.fullmatch(
+                str(transition_item.get("sha256", ""))
+            )
+            is None
+            or (
+                contract_item.get("package_sha256") is not None
+                and transition_item.get("sha256")
+                != contract_item.get("package_sha256")
+            )
+            or contract_item.get("actual_sha256_bound_by")
+            != raw.get("schema")
+            or contract_item.get("required_readback") is not True
+            or type(transition_item.get("uid")) is not int
+            or transition_item["uid"] < 0
+            or type(transition_item.get("gid")) is not int
+            or transition_item["gid"] < 0
+            or type(transition_item.get("mode")) is not int
+            or not 0 <= transition_item["mode"] <= 0o7777
+            or not _valid_host_target_prestate(transition_item.get("pre"))
+            or not isinstance(observed, Mapping)
+            or set(observed)
+            != {
+                "name",
+                "sha256",
+                "size",
+                "staged_uid",
+                "staged_gid",
+                "staged_mode",
+                "target_pre",
+            }
+            or observed.get("name") != expected_name
+            or observed.get("sha256") != transition_item.get("sha256")
+            or type(observed.get("size")) is not int
+            or observed["size"] <= 0
+            or type(observed.get("staged_uid")) is not int
+            or observed["staged_uid"] < 0
+            or type(observed.get("staged_gid")) is not int
+            or observed["staged_gid"] < 0
+            or observed.get("staged_mode") != 0o400
+            or observed.get("target_pre") != transition_item.get("pre")
+        ):
+            _fail(code)
+    if raw.get("readback_set_sha256") != sha256_bytes(
+        canonical_bytes({"files": readback})
+    ):
+        _fail(code)
+    return raw
+
+
 def _expected_cron_rows() -> Mapping[str, tuple[int, bool]]:
     rows: dict[str, tuple[int, bool]] = {
         str(trusted_cron.PLAN_RELATIVE_PATH): (0o640, False),
@@ -1256,6 +1452,12 @@ def validate_stage0_inputs(
             "runtime_dependency_manifest_sha256"
         ],
     )
+    host_mutation_authority = validate_host_mutation_authority(
+        documents["host_mutation_authority_sha256"],
+        release_revision=release,
+        host_artifact_manifest=host_manifest,
+        host_inventory=host_receipt,
+    )
     cron_index = validate_cron_artifact_index(
         documents["cron_artifact_index_sha256"],
         release_revision=release,
@@ -1271,6 +1473,9 @@ def validate_stage0_inputs(
         ],
         "host_artifact_manifest_sha256": host_manifest[
             "manifest_sha256"
+        ],
+        "host_mutation_authority_sha256": host_mutation_authority[
+            "receipt_sha256"
         ],
         "cron_artifact_index_sha256": cron_index[
             "artifact_index_sha256"
@@ -1315,6 +1520,7 @@ def validate_stage0_inputs(
         "host_inventory_sha256": host_receipt,
         "release_consumer_set_sha256": consumer_set,
         "host_artifact_manifest_sha256": host_manifest,
+        "host_mutation_authority_sha256": host_mutation_authority,
         "cron_artifact_index_sha256": cron_index,
         "alias_artifact_index_sha256": alias_index,
         "successor_unit_input_publication_sha256": _plain(successor),
@@ -1343,6 +1549,7 @@ __all__ = [
     "validate_alias_artifact_index",
     "validate_cron_artifact_index",
     "validate_host_artifact_manifest",
+    "validate_host_mutation_authority",
     "validate_release_consumer_set",
     "validate_rollback_plan",
     "validate_stage0_inputs",

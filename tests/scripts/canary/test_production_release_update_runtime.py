@@ -53,7 +53,7 @@ def test_signed_publication_deterministically_defines_transaction_identity() -> 
     assert first_intent == replayed_intent
     assert first_record == replayed_record
     assert first_record["intent"] == first_intent
-    assert first_intent["schema"] == "muncho-production-release-update-intent.v4"
+    assert first_intent["schema"] == "muncho-production-release-update-intent.v5"
     assert first_intent["transaction_nonce_sha256"] == approval["nonce_sha256"]
     assert first_intent["created_at_unix"] == approval["issued_at_unix"]
     assert first_intent["created_at_unix"] == first_intent["approval_issued_at_unix"]
@@ -162,6 +162,9 @@ def _phase_evidence(
             "activation_plan_sha256": intent["activation_plan_sha256"],
             "rollback_plan_sha256": intent["rollback_plan_sha256"],
             "host_artifact_manifest_sha256": intent["host_artifact_manifest_sha256"],
+            "host_mutation_authority_sha256": intent[
+                "host_mutation_authority_sha256"
+            ],
             "archived_target_set_sha256": _digest("archived-target-set"),
             "archived_target_count": 89,
             "archive_fsynced": True,
@@ -247,6 +250,9 @@ def _phase_evidence(
         archived = receipts["prestate_archived"]
         return {
             "host_payload_manifest_sha256": intent["host_artifact_manifest_sha256"],
+            "host_mutation_authority_sha256": intent[
+                "host_mutation_authority_sha256"
+            ],
             "applied_target_set_sha256": archived["archived_target_set_sha256"],
             "applied_target_count": archived["archived_target_count"],
             "applied_revision": release,
@@ -435,6 +441,9 @@ def _phase_evidence(
         archived = receipts["prestate_archived"]
         return {
             "prestate_archive_sha256": archived["prestate_archive_sha256"],
+            "host_mutation_authority_sha256": intent[
+                "host_mutation_authority_sha256"
+            ],
             "restored_target_set_sha256": archived["archived_target_set_sha256"],
             "restored_target_count": archived["archived_target_count"],
             "restored_revision": predecessor,

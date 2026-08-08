@@ -171,6 +171,86 @@ def _host_manifest(
     }
 
 
+def _host_mutation_authority(
+    host_manifest: Mapping[str, Any],
+    host_receipt: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    contract = host_manifest["host_artifact_contract"]
+    transition_files: dict[str, Mapping[str, Any]] = {}
+    readback: list[Mapping[str, Any]] = []
+    for name in sorted(host_package.HOST_ARTIFACT_TARGETS):
+        bound = contract["files"][name]
+        digest = bound["package_sha256"] or _digest(
+            f"host-readback:{name}"
+        )
+        pre = {
+            "state": "absent",
+            "sha256": None,
+            "uid": None,
+            "gid": None,
+            "mode": None,
+        }
+        transition_files[name] = {
+            "staged_path": bound["staged_path"],
+            "target_path": bound["target_path"],
+            "sha256": digest,
+            "uid": 0,
+            "gid": 0,
+            "mode": 0o644,
+            "pre": pre,
+        }
+        readback.append({
+            "name": name,
+            "sha256": digest,
+            "size": 100 + len(readback),
+            "staged_uid": 0,
+            "staged_gid": 0,
+            "staged_mode": 0o400,
+            "target_pre": pre,
+        })
+    unsigned = {
+        "schema": "muncho-production-cutover-host-authority.v1",
+        "release_revision": TARGET,
+        "request_sha256": _digest("host-authority-request"),
+        "initial_collector_receipt_sha256": _digest("initial-collector"),
+        "release_manifest_sha256": host_manifest["manifest_sha256"],
+        "host_artifact_contract_sha256": contract["contract_sha256"],
+        "gateway_target_identity": {
+            "unit": "muncho-hermes-gateway.service"
+        },
+        "writer_target_identity": {
+            "unit": "muncho-canonical-writer.service"
+        },
+        "connector_target_identity": {
+            "unit": "muncho-discord-connector.service"
+        },
+        "host_transition": {"files": transition_files},
+        "capability_topology": {
+            "identity": _digest("capability-topology")
+        },
+        "cron_continuity_plan": {
+            "identity": _digest("cron-continuity")
+        },
+        "readback_file_count": len(readback),
+        "readback_files": readback,
+        "readback_set_sha256": inputs.sha256_bytes(
+            inputs.canonical_bytes({"files": readback})
+        ),
+        "observed_at_unix": NOW,
+        "source_boot_id_sha256": inputs.sha256_bytes(
+            host_receipt["processes"]["boot_id"].encode("ascii")
+        ),
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    return {
+        **unsigned,
+        "receipt_sha256": inputs.sha256_bytes(
+            inputs.canonical_bytes(unsigned)
+        ),
+    }
+
+
 def _cron_index() -> Mapping[str, Any]:
     rows = [
         {
@@ -264,11 +344,17 @@ def _fixture() -> Fixture:
     host_receipt = dict(
         host_test._observe(host_test._harness()).receipt
     )
+    host_receipt["observed_at_unix_ns"] = NOW * 1_000_000_000
+    _rehash(host_receipt, "receipt_sha256")
     consumer_set = inputs.build_release_consumer_set(
         predecessor_revision=PREDECESSOR,
         release_revision=TARGET,
     )
     host_manifest = _host_manifest(payload, unit_plan, unit_approval)
+    host_mutation_authority = _host_mutation_authority(
+        host_manifest,
+        host_receipt,
+    )
     cron_index = _cron_index()
     alias_index = _alias_index()
     artifact_identities = {
@@ -278,6 +364,9 @@ def _fixture() -> Fixture:
         ],
         "host_artifact_manifest_sha256": host_manifest[
             "manifest_sha256"
+        ],
+        "host_mutation_authority_sha256": host_mutation_authority[
+            "receipt_sha256"
         ],
         "cron_artifact_index_sha256": cron_index[
             "artifact_index_sha256"
@@ -317,6 +406,7 @@ def _fixture() -> Fixture:
         "host_inventory_sha256": host_receipt,
         "release_consumer_set_sha256": consumer_set,
         "host_artifact_manifest_sha256": host_manifest,
+        "host_mutation_authority_sha256": host_mutation_authority,
         "cron_artifact_index_sha256": cron_index,
         "alias_artifact_index_sha256": alias_index,
         "successor_unit_input_publication_sha256": unit_publication,
@@ -355,6 +445,77 @@ def test_all_remaining_inputs_bind_internal_identities_and_v4_fixed_inputs() -> 
     assert validated.documents["host_inventory_sha256"]["phase"] == (
         "predecessor_active"
     )
+    authority = validated.documents["host_mutation_authority_sha256"]
+    assert authority["release_manifest_sha256"] == validated.documents[
+        "host_artifact_manifest_sha256"
+    ]["manifest_sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "downgrade", "wrong_manifest", "wrong_boot", "readback_drift"),
+)
+def test_host_mutation_authority_rejects_omission_downgrade_and_drift(
+    mutation: str,
+) -> None:
+    fixture = _fixture()
+    authority = deepcopy(
+        fixture.documents["host_mutation_authority_sha256"]
+    )
+    if mutation == "missing":
+        authority.pop("readback_set_sha256")
+    elif mutation == "downgrade":
+        authority["schema"] = "muncho-production-cutover-host-authority.v0"
+        _rehash(authority, "receipt_sha256")
+    elif mutation == "wrong_manifest":
+        authority["release_manifest_sha256"] = "f" * 64
+        _rehash(authority, "receipt_sha256")
+    elif mutation == "wrong_boot":
+        authority["source_boot_id_sha256"] = "f" * 64
+        _rehash(authority, "receipt_sha256")
+    else:
+        dynamic_name = next(
+            name
+            for name, item in fixture.documents[
+                "host_artifact_manifest_sha256"
+            ]["host_artifact_contract"]["files"].items()
+            if item["package_sha256"] is None
+        )
+        authority["host_transition"]["files"][dynamic_name]["sha256"] = (
+            "f" * 64
+        )
+        _rehash(authority, "receipt_sha256")
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match="release_update_inputs_host_mutation_authority_invalid",
+    ):
+        inputs.validate_host_mutation_authority(
+            authority,
+            release_revision=TARGET,
+            host_artifact_manifest=fixture.documents[
+                "host_artifact_manifest_sha256"
+            ],
+            host_inventory=fixture.documents["host_inventory_sha256"],
+        )
+
+
+def test_signed_plan_rejects_substituted_valid_host_mutation_authority() -> None:
+    fixture = _fixture()
+    authority = deepcopy(
+        fixture.documents["host_mutation_authority_sha256"]
+    )
+    authority["request_sha256"] = "f" * 64
+    _rehash(authority, "receipt_sha256")
+    fixture.documents["host_mutation_authority_sha256"] = authority
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match=(
+            "release_update_inputs_(?:activation_plan|plan_binding)_invalid"
+        ),
+    ):
+        _validate(fixture)
 
 
 def test_successor_plan_field_is_internal_publication_hash_not_file_hash() -> None:
@@ -626,7 +787,7 @@ def test_plans_partition_every_allowed_mutation_path_without_active_claim() -> N
         assert "service_unit_count" not in plan
 
     assert activation["schema"] == (
-        "muncho-production-release-activation-plan.v2"
+        "muncho-production-release-activation-plan.v3"
     )
     assert activation["forward_phase_order"] == list(
         inputs.update_runtime.FORWARD_PHASES
@@ -648,7 +809,7 @@ def test_plans_partition_every_allowed_mutation_path_without_active_claim() -> N
     )
 
     assert rollback["schema"] == (
-        "muncho-production-release-rollback-plan.v2"
+        "muncho-production-release-rollback-plan.v3"
     )
     assert rollback["rollback_phase_order"] == list(
         inputs.update_runtime.ROLLBACK_PHASES

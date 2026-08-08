@@ -20,8 +20,8 @@ from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_release_update_contract as authority
 
 
-INTENT_SCHEMA = "muncho-production-release-update-intent.v4"
-AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v2"
+INTENT_SCHEMA = "muncho-production-release-update-intent.v5"
+AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v3"
 EVENT_SCHEMA = "muncho-production-release-update-event.v2"
 ZERO_SHA256 = "0" * 64
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -90,6 +90,9 @@ REVALIDATION_PHASES = frozenset({
 })
 ACTION_RECEIPT_PHASES = ACTION_PHASES | REVALIDATION_PHASES
 _ACTION_RECEIPT_SCHEMA_VERSIONS: Mapping[str, int] = {
+    "host_payloads_applied": 2,
+    "host_prestate_restored": 2,
+    "prestate_archived": 2,
     "unit_inputs_prepared": 2,
     "unit_inputs_finalized": 2,
 }
@@ -164,6 +167,7 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "activation_plan_sha256",
         "rollback_plan_sha256",
         "host_artifact_manifest_sha256",
+        "host_mutation_authority_sha256",
         "archived_target_set_sha256",
         "archived_target_count",
         "archive_fsynced",
@@ -212,6 +216,7 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "all_release_consumers_zeroed",
     }),
     "host_payloads_applied": frozenset({
+        "host_mutation_authority_sha256",
         "host_payload_manifest_sha256",
         "applied_target_set_sha256",
         "applied_target_count",
@@ -326,6 +331,7 @@ _ACTION_RECEIPT_EVIDENCE_FIELDS: Mapping[str, frozenset[str]] = {
         "authoritative_inputs_unchanged",
     }),
     "host_prestate_restored": frozenset({
+        "host_mutation_authority_sha256",
         "prestate_archive_sha256",
         "restored_target_set_sha256",
         "restored_target_count",
@@ -424,6 +430,7 @@ _PLAN_PROJECTION_FIELDS = (
     "host_inventory_sha256",
     "release_consumer_set_sha256",
     "host_artifact_manifest_sha256",
+    "host_mutation_authority_sha256",
     "cron_artifact_index_sha256",
     "alias_artifact_index_sha256",
     "successor_unit_input_publication_sha256",
@@ -924,6 +931,8 @@ def _validate_action_evidence(
             == intent["rollback_plan_sha256"]
             and _sha_field(receipt, "host_artifact_manifest_sha256")
             == intent["host_artifact_manifest_sha256"]
+            and _sha_field(receipt, "host_mutation_authority_sha256")
+            == intent["host_mutation_authority_sha256"]
         )
         _sha_field(receipt, "archived_target_set_sha256")
         _count_field(receipt, "archived_target_count", positive=True)
@@ -1123,6 +1132,8 @@ def _validate_action_evidence(
         _require_action(
             _sha_field(receipt, "host_payload_manifest_sha256")
             == intent["host_artifact_manifest_sha256"]
+            and _sha_field(receipt, "host_mutation_authority_sha256")
+            == intent["host_mutation_authority_sha256"]
             and _sha_field(receipt, "applied_target_set_sha256")
             == archived.get("archived_target_set_sha256")
             and _count_field(receipt, "applied_target_count")
@@ -1475,6 +1486,8 @@ def _validate_action_evidence(
         _require_action(
             _sha_field(receipt, "prestate_archive_sha256")
             == archived.get("prestate_archive_sha256")
+            and _sha_field(receipt, "host_mutation_authority_sha256")
+            == intent["host_mutation_authority_sha256"]
             and _sha_field(receipt, "restored_target_set_sha256")
             == archived.get("archived_target_set_sha256")
             and _count_field(receipt, "restored_target_count")
