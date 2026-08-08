@@ -3476,12 +3476,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
-                    except Exception:
-                        pass
+                else:
+                    # Keep inline-reasoning accounting independent of the
+                    # presentation callback.  This content intentionally
+                    # bypasses _fire_stream_delta once a tool call is active,
+                    # but the shared think scrubber still owns split-tag state
+                    # and the reasoning-budget sink.
+                    think_scrubber = getattr(
+                        agent, "_stream_think_scrubber", None
+                    )
+                    if think_scrubber is not None:
+                        think_scrubber.feed(delta.content)
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(delta.content)
+                            agent._record_streamed_assistant_text(delta.content)
+                        except Exception:
+                            pass
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:
