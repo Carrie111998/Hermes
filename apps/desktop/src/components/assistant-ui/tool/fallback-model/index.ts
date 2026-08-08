@@ -608,15 +608,25 @@ export function firstStringField(record: Record<string, unknown>, keys: readonly
 }
 
 /**
- * Extract embedded HTML from an MCP tool result that follows the MCP Apps
- * extension: a `content` array containing a `{ type: 'resource', resource:
- * { mimeType: 'text/html', text: string } }` item. Returns the HTML string
- * when found, empty string otherwise.
+ * Extract embedded HTML from an MCP tool result. Checks two sources:
+ * 1. `_embedded_html` field — set by the MCP tool handler when a content
+ *    block has type=resource with mimeType=text/html. This is the
+ *    primary path for MCP Apps cards.
+ * 2. `content` array — the standard MCP content array with a resource
+ *    item of mimeType text/html. This handles results that preserve
+ *    the full content array (e.g. from local MCP servers).
  */
 export function extractEmbeddedHtml(result: unknown): string {
   const record = parseMaybeObject(result)
   if (!record) return ''
 
+  // Check _embedded_html field (set by the MCP tool handler)
+  const embeddedField = record._embedded_html
+  if (typeof embeddedField === 'string' && embeddedField.trim()) {
+    return embeddedField
+  }
+
+  // Check content array for resource items
   const content = record.content
   if (!Array.isArray(content)) return ''
 

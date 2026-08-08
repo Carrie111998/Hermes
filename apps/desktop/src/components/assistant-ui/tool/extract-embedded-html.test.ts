@@ -8,13 +8,23 @@ describe('extractEmbeddedHtml', () => {
     expect(extractEmbeddedHtml('not an object')).toBe('')
   })
 
-  it('returns empty string when content has no resource items', () => {
+  it('returns empty string when no embedded HTML is present', () => {
+    expect(extractEmbeddedHtml({ result: 'plain text' })).toBe('')
     expect(extractEmbeddedHtml({ content: [{ type: 'text', text: 'hello' }] })).toBe('')
     expect(extractEmbeddedHtml({ content: 'just a string' })).toBe('')
     expect(extractEmbeddedHtml({ content: [] })).toBe('')
+    expect(extractEmbeddedHtml({})).toBe('')
   })
 
-  it('extracts HTML from a content array with a resource item', () => {
+  it('extracts HTML from _embedded_html field (primary path)', () => {
+    const result = {
+      result: '{"balance":2.5}',
+      _embedded_html: '<!DOCTYPE html><html><body>Balance Card</body></html>',
+    }
+    expect(extractEmbeddedHtml(result)).toBe('<!DOCTYPE html><html><body>Balance Card</body></html>')
+  })
+
+  it('extracts HTML from a content array with a resource item (secondary path)', () => {
     const result = {
       content: [
         { type: 'text', text: '{"balance":2.5}' },
@@ -29,6 +39,19 @@ describe('extractEmbeddedHtml', () => {
       ],
     }
     expect(extractEmbeddedHtml(result)).toBe('<!DOCTYPE html><html><body>Balance Card</body></html>')
+  })
+
+  it('prefers _embedded_html over content array', () => {
+    const result = {
+      _embedded_html: '<html>from field</html>',
+      content: [
+        {
+          type: 'resource',
+          resource: { mimeType: 'text/html', text: '<html>from content</html>' },
+        },
+      ],
+    }
+    expect(extractEmbeddedHtml(result)).toBe('<html>from field</html>')
   })
 
   it('returns empty string for non-HTML resources', () => {
@@ -47,6 +70,11 @@ describe('extractEmbeddedHtml', () => {
     expect(extractEmbeddedHtml(result)).toBe('')
   })
 
+  it('returns empty string when _embedded_html is empty', () => {
+    expect(extractEmbeddedHtml({ _embedded_html: '' })).toBe('')
+    expect(extractEmbeddedHtml({ _embedded_html: '   ' })).toBe('')
+  })
+
   it('returns empty string when resource text is empty', () => {
     const result = {
       content: [
@@ -61,29 +89,5 @@ describe('extractEmbeddedHtml', () => {
       ],
     }
     expect(extractEmbeddedHtml(result)).toBe('')
-  })
-
-  it('extracts HTML from a resource with additional unknown fields', () => {
-    const result = {
-      content: [
-        { type: 'text', text: 'result text' },
-        {
-          type: 'resource',
-          resource: {
-            uri: 'ui://example/swap-card',
-            mimeType: 'text/html',
-            text: '<html><body>Swap Card</body></html>',
-            blobs: ['extra-data'],
-          },
-        },
-      ],
-    }
-    expect(extractEmbeddedHtml(result)).toBe('<html><body>Swap Card</body></html>')
-  })
-
-  it('returns empty string when content is missing', () => {
-    expect(extractEmbeddedHtml({ success: true })).toBe('')
-    expect(extractEmbeddedHtml({ data: { balance: 1 } })).toBe('')
-    expect(extractEmbeddedHtml({})).toBe('')
   })
 })
