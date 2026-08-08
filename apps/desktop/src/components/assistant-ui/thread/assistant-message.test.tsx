@@ -6,9 +6,10 @@
 // supplied, matching how onDismissError/onRestoreToMessage already behave.
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
 import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { Thread } from '.'
+import { setDisplayTimestampOptions } from '@/store/session'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
 
@@ -73,6 +74,8 @@ function Harness({ onBranchInNewChat }: { onBranchInNewChat?: (messageId: string
 }
 
 describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
+  beforeEach(() => setDisplayTimestampOptions({ enabled: false, format: '%H:%M' }))
+
   it('shows the Branch in new chat button when a handler is provided (open chat)', async () => {
     render(<Harness onBranchInNewChat={() => undefined} />)
 
@@ -88,5 +91,12 @@ describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
     await screen.findByText('done')
 
     expect(screen.queryByRole('button', { name: 'Branch in new chat' })).toBeNull()
+  })
+
+  it('uses the configured timestamp format for settled assistant messages', async () => {
+    setDisplayTimestampOptions({ enabled: true, format: 'at %Y' })
+    render(<Harness onBranchInNewChat={() => undefined} />)
+
+    expect(await screen.findAllByText('at 2026')).toHaveLength(2)
   })
 })

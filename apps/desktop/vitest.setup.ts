@@ -1,4 +1,16 @@
 import { configure } from '@testing-library/react'
+import { TransformStream as NodeTransformStream } from 'node:stream/web'
+
+// Vitest's vmThreads pool does not inherit Node's Web Streams globals even
+// though the default fork pool does. assistant-stream imports TransformStream
+// during module initialization, so provide the equivalent Node implementation.
+if (typeof globalThis.TransformStream === 'undefined') {
+  Object.defineProperty(globalThis, 'TransformStream', {
+    configurable: true,
+    value: NodeTransformStream,
+    writable: true
+  })
+}
 
 // Node 26 defines its own `localStorage` accessor on the global object, which
 // returns `undefined` unless the process was started with --localstorage-file

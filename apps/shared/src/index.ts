@@ -3,7 +3,7 @@ export {
   type BillingRecovery,
   type BillingRefusalPolicy,
   refusalPolicy
-} from './billing-policy'
+} from './billing-policy.js'
 export type {
   BillingAutoReload,
   BillingBlock,
@@ -25,7 +25,7 @@ export type {
   SubscriptionUpgradeResponse,
   UsageBarData,
   UsageModelData
-} from './billing-types'
+} from './billing-types.js'
 export {
   driveChargeSettlement,
   SETTLEMENT_MAX_RETRY_AFTER_MS,
@@ -33,7 +33,11 @@ export {
   SETTLEMENT_POLL_INTERVAL_MS,
   type SettlementDeps,
   type SettlementOutcome
-} from './charge-settlement'
+} from './charge-settlement.js'
+export {
+  type DisplayTimestampOptions,
+  formatDisplayTimestamp
+} from './display-timestamp.js'
 export {
   type ConnectionState,
   type GatewayClientOptions,
@@ -43,8 +47,8 @@ export {
   type JsonRpcFrame,
   JsonRpcGatewayClient,
   type WebSocketLike
-} from './json-rpc-gateway'
-export { skillInvocationText } from './skill-scaffold'
+} from './json-rpc-gateway.js'
+export { skillInvocationText } from './skill-scaffold.js'
 export {
   type HermesSkin,
   SKIN_BRANDING_TOKENS,
@@ -53,7 +57,7 @@ export {
   type SkinBrandingToken,
   type SkinColors,
   type SkinColorToken
-} from './skin'
+} from './skin.js'
 export {
   buildHermesWebSocketUrl,
   type GatewayAuthMode,
@@ -65,4 +69,4 @@ export {
   resolveGatewayWsUrl,
   type ResolveGatewayWsUrlDeps,
   type WebSocketAuthParam
-} from './websocket-url'
+} from './websocket-url.js'
