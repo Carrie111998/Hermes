@@ -10533,6 +10533,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Repair stale leases and service bounded policy-fallback storage on
+        # every gateway start. Failures are non-fatal to messaging startup.
+        try:
+            from agent.policy_fallback import Store as _PolicyStore, cleanup as _policy_cleanup
+            _policy_store = _PolicyStore()
+            stale = _policy_store.fail_stale()
+            _policy_cleanup(_policy_store, force=True)
+            if stale:
+                logger.warning("Policy fallback recovery marked %d stale worker(s) failed", stale)
+        except Exception:
+            logger.warning("Policy fallback startup cleanup failed", exc_info=True)
         # Enable faulthandler for stack dumps on freezes/crashes (#70344).
         # Falls back to a log file when sys.stderr is None (Windows VBS /
         # pythonw / detached service) — otherwise the gateway would die
@@ -25833,6 +25844,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
+    POLICY_FALLBACK_EVERY = 60  # ticks — bounded artifacts/rows + WAL checkpoint
     MEMORY_TRIM_EVERY = 1    # shared helper cooldown bounds actual allocator work
 
     # Every platform media cache prunes on the same hourly cadence — one loop
@@ -25887,6 +25899,13 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     )
             except Exception as e:
                 logger.debug("Paste sweep error: %s", e)
+
+        if tick_count % POLICY_FALLBACK_EVERY == 0:
+            try:
+                from agent.policy_fallback import cleanup as _policy_cleanup
+                _policy_cleanup(force=True)
+            except Exception as e:
+                logger.debug("Policy fallback cleanup error: %s", e)
 
         # Curator — piggy-back on the housekeeping loop so long-running
         # gateways get weekly skill maintenance without needing restarts.

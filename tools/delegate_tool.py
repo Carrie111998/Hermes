@@ -100,6 +100,24 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     return "once"
 
 
+_POLICY_PROXMOX_PATTERNS = (
+    "10.50.50.", ":8006", "/api2/json", "/api2/extjs", "/pve2/",
+    "pveapitoken", "pveauthcookie", "proxmox", " porx", "porx.",
+    " qm ", " pct ", " pvesh ", " pvecm ", " pvesm ",
+    "proxmox-backup-client",
+)
+def _policy_subagent_approval(command: str, description: str, **kwargs) -> str:
+    """Approve isolated-VM work and fail closed for infra-sensitive work."""
+    haystack = f" {command} {description} ".casefold()
+    if any(pattern in haystack for pattern in _POLICY_PROXMOX_PATTERNS):
+        logger.error("Policy fallback denied Proxmox/out-of-VM action: %s", command)
+        return "deny"
+    # Confirmation categories were already gated by policy_tool_policy before
+    # terminal dispatch. Reaching this callback means that gate approved them.
+    logger.warning("Policy fallback auto-approved isolated-VM action: %s", command)
+    return "once"
+
+
 def _get_subagent_approval_callback():
     """Return the callback to install into subagent worker threads.
 
@@ -1315,6 +1333,20 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
+    # Only internal policy workers receive this host-owned toolset.  It never
+    # enters the parent GPT schema or ordinary delegated children.
+    _policy_context = getattr(parent_agent, "_policy_fallback_context", None)
+    if (
+        isinstance(_policy_context, dict)
+        and _policy_context.get("fallback_id")
+        and "policy_consultation" not in child_toolsets
+    ):
+        child_toolsets.append("policy_consultation")
+        child_disabled_toolsets = [
+            name for name in child_disabled_toolsets
+            if name != "policy_consultation"
+        ]
+
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
         goal,
@@ -1558,6 +1590,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._policy_fallback_context = _policy_context
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2157,7 +2190,11 @@ def _run_single_child(
             # input() and deadlock the parent's prompt_toolkit TUI.
             # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
             initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
+            initargs=((
+                _policy_subagent_approval
+                if getattr(child, "_policy_fallback_context", None)
+                else _get_subagent_approval_callback()
+            ),),
         )
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
@@ -2178,12 +2215,20 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+            def _invoke():
+                with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                    return child.run_conversation(
+                        user_message=goal,
+                        task_id=child_task_id,
+                        stream_callback=_relay_child_text,
+                    )
+
+            policy_context = getattr(child, "_policy_fallback_context", None)
+            if not policy_context:
+                return _invoke()
+            from agent.policy_fallback import runtime_scope
+            with runtime_scope(policy_context):
+                return _invoke()
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -2838,6 +2883,13 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    # Policy fallback has an independent provider/model budget. This avoids
+    # silently rerouting ordinary model-requested delegation to the local
+    # policy worker (or vice versa).
+    if isinstance(getattr(parent_agent, "_policy_fallback_context", None), dict):
+        policy_cfg = cfg.get("policy_fallback")
+        if isinstance(policy_cfg, dict):
+            cfg = {**cfg, **policy_cfg}
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers

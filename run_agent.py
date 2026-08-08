@@ -7638,6 +7638,15 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
+            # Policy-only recovery is post-turn and never runs for subagents or
+            # technical failures; the classifier enforces both invariants.
+            from agent.policy_fallback import maybe_run as _maybe_policy_fallback
+            result = _maybe_policy_fallback(
+                self,
+                result,
+                user_message=user_message,
+                task_id=effective_task_id,
+            )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"

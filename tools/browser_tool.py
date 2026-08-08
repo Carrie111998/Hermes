@@ -3014,10 +3014,16 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "error": "Blocked: URL targets a cloud metadata endpoint",
         })
 
+    try:
+        from agent.policy_fallback import runtime as _policy_runtime
+        policy_network_guard = _policy_runtime() is not None
+    except Exception:
+        policy_network_guard = False
+
     if (
-        not _is_local_backend()
-        and not auto_local_this_nav
-        and not _allow_private_urls()
+        (policy_network_guard or not _is_local_backend())
+        and (policy_network_guard or not auto_local_this_nav)
+        and (policy_network_guard or not _allow_private_urls())
         and not _is_safe_url(url)
     ):
         return json.dumps({
@@ -3091,9 +3097,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             })
 
         if (
-            not _is_local_backend()
-            and not auto_local_this_nav
-            and not _allow_private_urls()
+            (policy_network_guard or not _is_local_backend())
+            and (policy_network_guard or not auto_local_this_nav)
+            and (policy_network_guard or not _allow_private_urls())
             and final_url and final_url != url and not _is_safe_url(final_url)
         ):
             # Navigate away to a blank page to prevent snapshot leaks
@@ -3604,6 +3610,12 @@ def _eval_ssrf_guard_active(effective_task_id: str) -> bool:
     can reach internal networks the terminal can't), and is skipped for local
     sidecar sessions and when ``allow_private_urls`` is set.
     """
+    try:
+        from agent.policy_fallback import runtime as _policy_runtime
+        if _policy_runtime() is not None:
+            return True
+    except Exception:
+        pass
     return (
         not _is_local_backend()
         and not _is_local_sidecar_key(effective_task_id)

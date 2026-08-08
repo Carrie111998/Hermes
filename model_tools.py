@@ -1243,6 +1243,14 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
+        # This host-owned guard is independent of plugin hooks and therefore
+        # still executes when the agent loop already fired pre_tool_call and
+        # passed skip_pre_tool_call_hook=True.
+        from agent.policy_tool_policy import enforce as _enforce_policy_worker
+        policy_block = _enforce_policy_worker(function_name, function_args)
+        if policy_block:
+            return tool_error(policy_block)
+
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).

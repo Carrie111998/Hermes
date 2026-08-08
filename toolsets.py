@@ -99,6 +99,11 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
 TOOLSETS = {
+    "policy_consultation": {
+        "description": "Host-owned GPT consultation tools for policy fallback workers",
+        "tools": ["ask_gpt", "record_gpt_verification"],
+        "includes": [],
+    },
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
