@@ -1,9 +1,14 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { setRuntimeI18nLocale } from '@/i18n/runtime'
+
 import { PaneTab, PaneTabLabel } from './pane-tab'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  setRuntimeI18nLocale('en')
+})
 
 describe('PaneTab close gestures', () => {
   it('middle-click closes — pointer events only, no auxclick', () => {
@@ -102,6 +107,37 @@ describe('PaneTab close button', () => {
     )
 
     expect(screen.getByRole('button', { name: 'Close tab' })).toBeTruthy()
+  })
+
+  it('uses the active locale for the close button label', () => {
+    setRuntimeI18nLocale('zh')
+    render(
+      <PaneTab onClose={vi.fn()}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(screen.getByRole('button', { name: '关闭标签' })).toBeTruthy()
+  })
+
+  it('reveals the close button when keyboard focus reaches it', () => {
+    render(
+      <PaneTab onClose={vi.fn()}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(screen.getByRole('button', { name: 'Close tab' }).className).toContain('focus-visible:opacity-100')
+  })
+
+  it('keeps the dirty indicator until hover reveals the close glyph', () => {
+    const { container } = render(
+      <PaneTab dirty onClose={vi.fn()}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(container.querySelector('[data-slot="pane-tab-dirty-indicator"]')).toBeTruthy()
   })
 
   it('clicking the close button calls onClose and stops propagation', () => {

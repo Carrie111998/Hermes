@@ -142,17 +142,9 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
     >
       {children}
       {onClose && !vertical && (
-        <button
-          aria-label="Close tab"
-          className={cn(
-            'grid size-4 shrink-0 place-items-center self-center rounded-sm text-(--ui-text-tertiary) transition-opacity',
-            // Always reserve the slot; visible on hover. The dirty dot
-            // (below) yields to the X on hover so the two never overlap.
-            // Opacity transitions keep the layout stable (no width shift
-            // when the X appears).
-            'mr-1.5 opacity-0 group-hover/tab:opacity-100',
-            'hover:bg-(--ui-control-hover-background) hover:text-foreground'
-          )}
+        <Button
+          aria-label={translateNow('zones.closeTab')}
+          className="group/close relative mr-0.5 self-center text-(--ui-text-tertiary) focus-visible:opacity-100"
           onClick={event => {
             event.preventDefault()
             event.stopPropagation()
@@ -164,18 +156,35 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
             event.preventDefault()
             event.stopPropagation()
           }}
+          size="icon-xs"
           type="button"
+          variant="ghost"
         >
-          <Codicon name="close" size="0.625rem" />
-        </button>
+          {dirty && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-0 grid place-items-center transition-opacity group-hover/tab:opacity-0 group-focus-visible/close:opacity-0"
+              data-slot="pane-tab-dirty-indicator"
+            >
+              <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
+            </span>
+          )}
+          <Codicon
+            className="opacity-0 transition-opacity group-hover/tab:opacity-100 group-focus-visible/close:opacity-100"
+            data-slot="pane-tab-close-icon"
+            name="close"
+            size="0.625rem"
+          />
+        </Button>
       )}
-      {dirty && !(onClose && !vertical) && (
+      {dirty && (!onClose || vertical) && (
         <span
           aria-hidden
           className={cn(
             'pointer-events-none absolute grid size-4 place-items-center',
             vertical ? 'bottom-1.5 left-1/2 -translate-x-1/2' : 'right-1.5 top-1/2 -translate-y-1/2'
           )}
+          data-slot="pane-tab-dirty-indicator"
         >
           <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
         </span>
