@@ -1913,6 +1913,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_intent_ack_synthetic",
     "_length_continuation_synthetic",
     "_codex_incomplete_synthetic",
+    "_kanban_stop_synthetic",
     "_dropped_toolcall_nudge",
 )
 

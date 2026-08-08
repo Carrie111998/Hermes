@@ -245,6 +245,21 @@ def test_codex_incomplete_nudge_does_not_reset_clarify_window():
     assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
 
 
+def test_kanban_stop_nudge_is_not_real_user_for_compression():
+    from agent.conversation_compression import _is_real_user_message
+
+    assert (
+        _is_real_user_message(
+            {
+                "role": "user",
+                "content": "[System: You are a Hermes kanban worker.]",
+                "_kanban_stop_synthetic": True,
+            }
+        )
+        is False
+    )
+
+
 def test_nudge_budget_disable_and_clarify_unavailable():
     store = _store(("remaining step", "pending"))
     assert (

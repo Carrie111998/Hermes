@@ -243,6 +243,13 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # incomplete-task boundary handoff nudge (#80772)
+    "_boundary_handoff_synthetic",
+    # intent-ack / length / Codex incomplete recovery continues — drive the
+    # next API call only; must not durable-persist as human turns on resume.
+    "_intent_ack_synthetic",
+    "_length_continuation_synthetic",
+    "_codex_incomplete_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
