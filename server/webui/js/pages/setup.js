@@ -5,6 +5,7 @@ import {
   toast, setBusy, modal, icon, fmt, tabs, chipSelect, passwordField, runSentence,
 } from '../ui.js';
 import { call } from '../api.js';
+import { startEmailOAuth } from '../oauth-popup.js';
 import { db } from '../mocks/db.js';
 import { COUNTRY_NAMES } from '../catalog.js';
 import {
@@ -67,8 +68,9 @@ const DOC_TYPES = Object.freeze([
 ]);
 
 const EMAIL_PROVIDERS = Object.freeze([
-  { key: 'google', title: 'Google Workspace', route: 'emailIntegrations.connectGoogle', mark: 'G' },
-  { key: 'microsoft', title: 'Microsoft 365', route: 'emailIntegrations.connectMicrosoft', mark: 'M' },
+  // Hosted mailboxes are OAuth-only server-side; the direct connect routes answer 409.
+  { key: 'google', title: 'Google Workspace', oauth: true, mark: 'G' },
+  { key: 'microsoft', title: 'Microsoft 365', oauth: true, mark: 'M' },
   { key: 'smtp', title: 'Any email service', route: 'emailIntegrations.connectSmtp', mark: '@', credentials: 'smtp' },
   { key: 'browser', title: 'Webmail in a browser', route: 'emailIntegrations.connectBrowser', mark: 'W', credentials: 'browser' },
 ]);
@@ -1845,6 +1847,11 @@ export async function mount(root, ctx) {
             openBrowserConnection(provider);
             return;
           }
+          if (provider.oauth) {
+            dialog.close();
+            connectOauthMailbox(provider);
+            return;
+          }
           connectDirectMailbox(provider, event.currentTarget, dialog);
         },
       }));
@@ -1855,6 +1862,39 @@ export async function mount(root, ctx) {
         choices),
       actions: button('Cancel', { onClick: () => dialog.close() }),
     });
+  }
+
+  const oauthAttempts = new Map();
+
+  function connectOauthMailbox(provider) {
+    oauthAttempts.get(provider.key)?.cancel();
+    const attempt = startEmailOAuth({
+      provider: provider.key,
+      startOAuth: key => call('emailIntegrations.startOAuth', { params: { provider: key } }),
+      listIntegrations: () => call('emailIntegrations.list'),
+      onConnected: async () => {
+        oauthAttempts.delete(provider.key);
+        await markOptional('onboarding.updateIntegrations', {
+          email_provider: provider.key,
+          connected: true,
+        });
+        await load({ soft: true });
+        toast(`${provider.title} connected.`, 'success');
+      },
+      onStatus: ({ status, error }) => {
+        oauthAttempts.delete(provider.key);
+        const messages = {
+          blocked: ['Allow popups for this site, then try Connect again.', 'warning'],
+          start_failed: [error?.message || `${provider.title} sign-in could not start.`, 'error'],
+          cancelled: [`${provider.title} sign-in was cancelled.`, 'warning'],
+          failed: [`${provider.title} sign-in failed. Read the popup, then try again.`, 'error'],
+          expired: [`${provider.title} sign-in expired. Start again.`, 'warning'],
+        };
+        const [message, kind] = messages[status] || [`${provider.title} sign-in stopped.`, 'warning'];
+        toast(message, kind);
+      },
+    });
+    if (attempt) oauthAttempts.set(provider.key, attempt);
   }
 
   async function connectDirectMailbox(provider, control, dialog) {
@@ -2217,6 +2257,8 @@ export async function mount(root, ctx) {
   await load();
   return () => {
     disposed = true;
+    for (const attempt of oauthAttempts.values()) attempt.cancel();
+    oauthAttempts.clear();
     pageEl.classList.remove('ifz-page--setup');
   };
 }

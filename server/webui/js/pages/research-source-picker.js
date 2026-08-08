@@ -17,6 +17,8 @@ export function renderSourcePicker(sources, selected, { onChange } = {}) {
   const selection = new Set(selected);
   const groups = new Map();
   for (const source of sources) {
+    // ponytail: licensed databases are hidden, not disabled — no deal, nothing to configure.
+    if (source.access_tier === 'licensed' || source.categories?.[0] === 'licensed') continue;
     const group = source.categories?.[0] || 'other';
     if (!groups.has(group)) groups.set(group, []);
     groups.get(group).push(source);

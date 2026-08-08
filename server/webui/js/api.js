@@ -242,6 +242,7 @@ export const routes = {
 
   // 7.18 Email integrations
   'emailIntegrations.list':          ['GET',    '/integrations/email'],
+  'emailIntegrations.startOAuth':    ['POST',   '/integrations/email/oauth/:provider/start'],
   'emailIntegrations.connectGoogle': ['POST',   '/integrations/email/connect/google'],
   'emailIntegrations.connectMicrosoft': ['POST','/integrations/email/connect/microsoft'],
   'emailIntegrations.connectZoho':   ['POST',   '/integrations/email/connect/zoho'],

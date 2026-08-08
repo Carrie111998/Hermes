@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import html
 import json
 import secrets
 import time
@@ -32,6 +33,7 @@ from ..db import json_dump, new_id, now
 router = APIRouter(tags=["integrations"])
 
 STATE_TTL_SECONDS = 600
+CALLBACK_STATUSES = frozenset({"connected", "cancelled", "failed"})
 
 # scope choices: send + read for reply polling, and the minimum beyond that.
 PROVIDERS = {
@@ -138,6 +140,48 @@ def start_oauth(provider: str, request: Request,
             "redirect_uri": params["redirect_uri"], "expires_in": STATE_TTL_SECONDS}
 
 
+def _page(title: str, body: str, *, provider: str, status: str,
+          status_code: int = 200, close: bool = False) -> HTMLResponse:
+    if provider not in PROVIDERS or status not in CALLBACK_STATUSES:
+        raise ValueError("invalid OAuth callback message")
+    message = json.dumps({
+        "type": "interfaze:oauth",
+        "provider": provider,
+        "status": status,
+    }).replace("</", "<\\/")
+    close_script = "window.close();" if close else ""
+    return HTMLResponse(
+        f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:14vh auto;padding:0 1.5rem}}</style>
+</head><body><h1>{html.escape(title)}</h1><p>{html.escape(body)}</p>
+<script>(()=>{{const message={message};if(window.opener&&!window.opener.closed){{window.opener.postMessage(message,window.location.origin);}}{close_script}}})();</script>
+</body></html>""",
+        status_code=status_code,
+    )
+
+
+def _failure_page(provider: str, status_code: int, body: str) -> HTMLResponse:
+    return _page("Authorization failed", body, provider=provider,
+                 status="failed", status_code=status_code)
+
+
+def _invalid_request_page(provider: str) -> HTMLResponse:
+    return _failure_page(
+        provider,
+        400,
+        "This authorization request is invalid or expired. Return to Interfaze and start again.",
+    )
+
+
+def _exchange_failure_page(provider: str) -> HTMLResponse:
+    return _failure_page(
+        provider,
+        502,
+        "The provider could not complete the connection. Return to Interfaze and try again.",
+    )
+
+
 @router.get("/integrations/email/oauth/{provider}/callback", response_class=HTMLResponse)
 def oauth_callback(provider: str, request: Request,
                    code: str | None = Query(default=None),
@@ -147,34 +191,62 @@ def oauth_callback(provider: str, request: Request,
     if not spec:
         raise HTTPException(404, f"Unsupported OAuth provider: {provider}")
     settings = request.app.state.settings
+    try:
+        company_id = verify_state(_secret(settings), state or "", provider)
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            return _failure_page(provider, 503, "OAuth is not configured on this server.")
+        return _invalid_request_page(provider)
     if error:
-        # The provider reports denial in a query param, not an HTTP error.
-        return _page("Authorization cancelled", f"The provider returned: {error}")
+        return _page(
+            "Authorization cancelled",
+            "The provider authorization was cancelled. Return to Interfaze to try again.",
+            provider=provider,
+            status="cancelled",
+        )
     if not code:
-        raise HTTPException(400, "Missing authorization code")
-    company_id = verify_state(_secret(settings), state or "", provider)
-    client_id, client_secret = _app_credentials(settings, provider)
+        return _invalid_request_page(provider)
+    try:
+        client_id, client_secret = _app_credentials(settings, provider)
+    except HTTPException:
+        return _failure_page(provider, 503, "OAuth is not configured on this server.")
     token_url = spec["token"].format(tenant=settings.microsoft_oauth_tenant)
-    response = httpx.post(token_url, timeout=30, data={
-        "grant_type": "authorization_code", "code": code,
-        "client_id": client_id, "client_secret": client_secret,
-        "redirect_uri": _redirect_uri(settings, provider),
-    })
+    try:
+        response = httpx.post(token_url, timeout=30, data={
+            "grant_type": "authorization_code", "code": code,
+            "client_id": client_id, "client_secret": client_secret,
+            "redirect_uri": _redirect_uri(settings, provider),
+        })
+    except httpx.HTTPError:
+        return _exchange_failure_page(provider)
     if response.status_code >= 400:
-        raise HTTPException(502, f"Token exchange failed: {response.text[:300]}")
-    tokens = response.json()
+        return _exchange_failure_page(provider)
+    try:
+        tokens = response.json()
+    except ValueError:
+        return _exchange_failure_page(provider)
+    if not isinstance(tokens, dict):
+        return _exchange_failure_page(provider)
     refresh = tokens.get("refresh_token")
     if not refresh:
-        # Without a refresh token the connection dies in an hour. For Google
-        # this means the account had already granted consent; prompt=consent in
-        # the start params is what forces a new one.
-        raise HTTPException(502, "Provider did not return a refresh token; revoke "
-                                 "the app's access and authorize again")
+        return _exchange_failure_page(provider)
     credentials = {"refresh_token": refresh, "access_token": tokens.get("access_token", ""),
                    "client_id": client_id, "client_secret": client_secret}
-    _store(request, company_id, spec["kind"], credentials)
-    return _page("Mailbox connected",
-                 "You can close this tab and return to interfaze-agent.")
+    try:
+        _store(request, company_id, spec["kind"], credentials)
+    except HTTPException as exc:
+        return _failure_page(
+            provider,
+            exc.status_code,
+            "Credential encryption is not configured on this server.",
+        )
+    return _page(
+        "Mailbox connected",
+        "Your mailbox is connected. Return to Interfaze if this window does not close.",
+        provider=provider,
+        status="connected",
+        close=True,
+    )
 
 
 def _store(request: Request, company_id: str, provider_kind: str, credentials: dict) -> None:
@@ -202,12 +274,3 @@ def _store(request: Request, company_id: str, provider_kind: str, credentials: d
         )
     db.activity(company_id, None, "email_integration_connected", "integration", integration_id,
                 {"provider": provider_kind, "via": "oauth"})
-
-
-def _page(title: str, body: str) -> HTMLResponse:
-    return HTMLResponse(
-        f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>
-<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:32rem;margin:14vh auto;padding:0 1.5rem}}</style>
-</head><body><h1>{title}</h1><p>{body}</p></body></html>"""
-    )

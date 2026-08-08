@@ -94,6 +94,14 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/server -q
 
+      - name: Run WebUI OAuth popup tests
+        run: |
+          set -euo pipefail
+          node --test tests/server/webui/test_oauth_popup.mjs
+          node --input-type=module --check < server/webui/js/oauth-popup.js
+          node --input-type=module --check < server/webui/js/pages/integrations.js
+          node --input-type=module --check < server/webui/js/api.js
+
       - name: Boot smoke test (interfaze-api + /health)
         run: |
           set -euo pipefail

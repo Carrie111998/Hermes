@@ -50,6 +50,13 @@ def _integration(row) -> dict:
             "updated_at": row["updated_at"]}
 
 
+def _oauth_connect_required(provider: str) -> None:
+    raise HTTPException(409, {
+        "message": f"Connect {provider} mailboxes with OAuth",
+        "oauth_start": f"/api/v1/integrations/email/oauth/{provider}/start",
+    })
+
+
 def _connect(kind: str, provider: str, body: IntegrationConnect, request: Request,
              principal: Principal, company_header: str | None):
     company_id, stamp = _scope(principal, company_header), now()
@@ -71,23 +78,27 @@ def _connect(kind: str, provider: str, body: IntegrationConnect, request: Reques
 def email_integrations(request: Request, principal: Principal = Depends(current_principal),
                        x_company_id: str | None = Header(default=None)):
     return [_integration(row) for row in request.app.state.db.all(
-        "SELECT * FROM integrations WHERE company_id=? AND kind='email' ORDER BY created_at DESC",
+        "SELECT * FROM integrations WHERE company_id=? AND kind='email' "
+        "AND (provider NOT IN ('google','microsoft') "
+        "OR COALESCE(encrypted_credentials,'')<>'') ORDER BY created_at DESC",
         (_scope(principal, x_company_id),),
     )]
 
 
 @router.post("/integrations/email/connect/google", status_code=201)
-def connect_google(body: IntegrationConnect, request: Request,
+def connect_google(request: Request, body: IntegrationConnect | None = None,
                    principal: Principal = Depends(current_principal),
                    x_company_id: str | None = Header(default=None)):
-    return _connect("email", "google", body, request, principal, x_company_id)
+    _scope(principal, x_company_id)
+    _oauth_connect_required("google")
 
 
 @router.post("/integrations/email/connect/microsoft", status_code=201)
-def connect_microsoft(body: IntegrationConnect, request: Request,
+def connect_microsoft(request: Request, body: IntegrationConnect | None = None,
                       principal: Principal = Depends(current_principal),
                       x_company_id: str | None = Header(default=None)):
-    return _connect("email", "microsoft", body, request, principal, x_company_id)
+    _scope(principal, x_company_id)
+    _oauth_connect_required("microsoft")
 
 
 @router.post("/integrations/email/connect/smtp", status_code=201)
