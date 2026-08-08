@@ -12018,7 +12018,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # conversation with the CLI's, making the old history unreachable
         # from the platform. Only proceed when the destination is unbound,
         # bound to the CLI session itself (Case B — already gateway-owned),
-        # or bound to a session that is closed or an empty fresh reset.
+        # or bound to a session that is confirmed closed or an empty fresh
+        # reset. The check FAILS CLOSED: if the bound session's state
+        # cannot be verified (DB unavailable / read error), the handoff is
+        # refused rather than risking a live-session hijack.
         await self.async_session_store._ensure_loaded()
         existing_entry = self.session_store._entries.get(session_key)  # noqa: SLF001
         if existing_entry is not None:
@@ -12028,18 +12031,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"session {cli_session_id} is already the gateway session "
                     f"for {session_key}; nothing to hand off"
                 )
+            bound_row: Optional[Dict[str, Any]] = None
+            verified = False
             try:
-                bound_row = (
-                    None
-                    if self._session_db is None
-                    else await self._session_db.get_session(bound_session_id)
-                )
+                if self._session_db is not None:
+                    bound_row = cast(
+                        Optional[Dict[str, Any]],
+                        await self._session_db.get_session(bound_session_id),
+                    )
+                    verified = True
             except Exception:
-                bound_row = None
+                verified = False
+            if not verified:
+                raise RuntimeError(
+                    f"cannot verify session state for destination {session_key} "
+                    f"(bound to {bound_session_id}); refusing handoff"
+                )
+            # Live = session row not ended AND (has conversation content OR
+            # the gateway has active agent work on the key). An empty fresh
+            # /new session (0 messages, no active work) is safe to replace.
+            has_active_work = self.session_store._has_active_processes_safe(
+                session_key, context="handoff"
+            )
             if (
                 bound_row is not None
                 and bound_row.get("ended_at") is None
-                and (bound_row.get("message_count") or 0) > 0
+                and (
+                    (bound_row.get("message_count") or 0) > 0
+                    or has_active_work
+                )
             ):
                 raise RuntimeError(
                     f"destination {session_key} is already bound to live gateway "

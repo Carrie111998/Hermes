@@ -29,12 +29,14 @@ from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
-def _make_qq_runner(session_db, *, prebound_entries=None):
+def _make_qq_runner(session_db, *, prebound_entries=None, active_processes=False):
     """Build a GatewayRunner stand-in wired for qqbot handoff.
 
     ``prebound_entries`` maps session_key → session_id and is seeded into
     the fake session store's routing index so the ownership check sees an
     existing binding (as the real gateway would after a QQ conversation).
+    ``active_processes`` makes the store report in-flight agent work on
+    every key (mirrors process_registry.has_active_for_session).
     """
     from gateway.run import GatewayRunner
 
@@ -75,6 +77,9 @@ def _make_qq_runner(session_db, *, prebound_entries=None):
 
         def _ensure_loaded(self):
             return None
+
+        def _has_active_processes_safe(self, session_key, *, context):
+            return active_processes
 
         def _generate_session_key(self, source):
             return build_session_key(
@@ -238,3 +243,52 @@ async def test_handoff_allows_unbound_destination(tmp_path):
 
     assert runner.session_store.switch_calls == [(key, "cli-session")]
     runner._handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_handoff_rejects_when_dest_has_active_agent_work(tmp_path):
+    """In-flight agent work on the destination key counts as live, even with
+    zero persisted messages (first turn still running)."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    key = _dest_key()
+    _seed_live_session(db, "gw-busy", message_count=0)
+    runner = _make_qq_runner(
+        db,
+        prebound_entries={key: "gw-busy"},
+        active_processes=True,
+    )
+
+    with pytest.raises(RuntimeError, match="already bound to live gateway session"):
+        await runner._process_handoff({
+            "id": "cli-session",
+            "title": "CLI work",
+            "handoff_platform": "qqbot",
+        })
+
+    assert runner.session_store.switch_calls == []
+    runner._handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handoff_fails_closed_when_bound_session_state_unverifiable(tmp_path):
+    """If the bound session's state cannot be read, refuse the handoff rather
+    than risk hijacking a live conversation (fail-closed)."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    key = _dest_key()
+    _seed_live_session(db, "gw-unknown", message_count=1)
+    runner = _make_qq_runner(db, prebound_entries={key: "gw-unknown"})
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("db exploded")
+
+    runner._session_db.get_session = _boom
+
+    with pytest.raises(RuntimeError, match="cannot verify session state"):
+        await runner._process_handoff({
+            "id": "cli-session",
+            "title": "CLI work",
+            "handoff_platform": "qqbot",
+        })
+
+    assert runner.session_store.switch_calls == []
+    runner._handle_message.assert_not_called()
