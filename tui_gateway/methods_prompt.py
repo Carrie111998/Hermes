@@ -124,10 +124,16 @@ def _(rid, params: dict) -> dict:
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
+    # Track every WS transport that has touched this session so two frontends
+    # (Web Dashboard + Desktop) attached to the same session both keep
+    # receiving live stream events after either one submits (#81286).
+    # ``session["transport"]`` is kept in sync for backward compatibility
+    # with the many readers that consult it (busy_transport, transport_token,
+    # _transport_is_dead, etc.); the authoritative fan-out set is
+    # ``session["transports"]``, consumed by ``server.write_json``.
     if (t := current_transport()) is not None:
         session["transport"] = t
+        session.setdefault("transports", set()).add(t)
     while True:
         busy_transport = None
         with session["history_lock"]:

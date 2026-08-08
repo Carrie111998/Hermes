@@ -528,6 +528,10 @@ class ComputeHost:
         session = server._sessions.get(sid)
         if session is not None:
             session["transport"] = self._transport
+            # Keep the multi-frontend fan-out set in sync so an already-open
+            # session on another transport keeps receiving events after a
+            # second frontend attaches (#81286).
+            session.setdefault("transports", set()).add(self._transport)
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
             if frame.get("cwd"):
@@ -630,6 +634,7 @@ class ComputeHost:
             }
         session = server._sessions[sid]
         session["transport"] = self._transport
+        session.setdefault("transports", set()).add(self._transport)
         session["profile_home"] = profile_home or session.get("profile_home")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])

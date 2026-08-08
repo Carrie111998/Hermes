@@ -1547,9 +1547,12 @@ def write_json(obj: dict) -> bool:
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → every transport registered for that
+       session, so two frontends viewing the same session (e.g. Web Dashboard
+       and Desktop) both receive the live stream instead of one freezing when
+       the other submits (#81286). A legacy ``session["transport"]`` is also
+       included as a fallback for any code path that has not been migrated to
+       the ``session["transports"]`` set yet.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1557,8 +1560,18 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid:
+            session = _sessions.get(sid) or {}
+            transports = session.get("transports")
+            legacy = session.get("transport")
+            targets: list = []
+            if isinstance(transports, set):
+                targets.extend(transports)
+            if legacy is not None and legacy not in targets:
+                targets.append(legacy)
+            if targets:
+                results = [t.write(obj) for t in targets]
+                return any(results)
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1594,6 +1607,15 @@ def unregister_live_transport(transport: Transport | None) -> None:
     """Stop tracking a transport (call on disconnect). Idempotent."""
     with _live_transports_lock:
         _live_transports.discard(transport)
+    # Remove this transport from every per-session fan-out set so a closed
+    # socket does not keep receiving frames and a future submit on a fresh
+    # transport is not silently appended alongside a dead peer (#81286).
+    if transport is None:
+        return
+    for session in _sessions.values():
+        transports = session.get("transports")
+        if isinstance(transports, set):
+            transports.discard(transport)
 
 
 def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
@@ -8074,6 +8096,10 @@ def _live_session_payload(
             session["cols"] = cols
         if transport is not None:
             session["transport"] = transport
+            # Mirror the transport into the multi-frontend fan-out set so
+            # concurrent frontends sharing a resumed session both receive
+            # events (#81286).
+            session.setdefault("transports", set()).add(transport)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
