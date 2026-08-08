@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fnmatch
 import os
+import re
 from typing import Any, Iterable
 
 
@@ -28,10 +29,10 @@ class DenyPolicyError(ValueError):
 
 
 def load_user_config() -> dict[str, Any]:
-    """Load user config lazily so importing this module has no config side effects."""
-    from hermes_cli.config import load_config
+    """Load explicit user policy without config migrations or write side effects."""
+    from hermes_cli.config import read_user_config_raw
 
-    loaded = load_config()
+    loaded = read_user_config_raw()
     if not isinstance(loaded, dict):
         raise DenyPolicyError("Hermes config must be a mapping")
     return loaded
@@ -132,6 +133,26 @@ def _normalize_slash_path(path: str) -> str:
     return normalized.casefold()
 
 
+def _adapt_local_windows_drive(path: str) -> str:
+    """Map MSYS/Cygwin/WSL drive spellings to the native Windows dialect.
+
+    This adapter is only used for explicitly local matching. Remote backends
+    keep ``/c/...`` lexical because it may be a legitimate remote POSIX path.
+    """
+    if os.name != "nt":
+        return path
+    slash_path = path.replace("\\", "/")
+    match = re.match(
+        r"^/(?:cygdrive/|mnt/)?([A-Za-z])(?:/|$)",
+        slash_path,
+    )
+    if match is None:
+        return path
+    suffix = slash_path[match.end():]
+    drive = match.group(1).upper()
+    return f"{drive}:/{suffix}" if suffix else f"{drive}:/"
+
+
 def _normalize_path_variants(path: str, *, canonicalize: bool = True) -> tuple[str, ...]:
     """Return lexical and canonical identities for stable deny matching.
 
@@ -141,6 +162,8 @@ def _normalize_path_variants(path: str, *, canonicalize: bool = True) -> tuple[s
     resolution; canonical identity catches aliases to an otherwise denied path.
     """
     expanded = _expand_tilde(str(path))
+    if canonicalize:
+        expanded = _adapt_local_windows_drive(expanded)
     lexical = _normalize_slash_path(expanded)
     if not canonicalize:
         return (lexical,)
@@ -151,9 +174,15 @@ def _normalize_path_variants(path: str, *, canonicalize: bool = True) -> tuple[s
     return tuple(dict.fromkeys((lexical, canonical)))
 
 
-def _normalize_pattern_lexical(pattern: str) -> str:
+def _normalize_pattern_lexical(
+    pattern: str,
+    *,
+    adapt_local_windows: bool = False,
+) -> str:
     """Normalize a deny glob without losing case or glob characters."""
     expanded = _expand_tilde(pattern.strip()).replace("\\", "/")
+    if adapt_local_windows:
+        expanded = _adapt_local_windows_drive(expanded)
     normalized = os.path.normpath(expanded).replace("\\", "/")
     if pattern.rstrip().endswith("/") and not normalized.endswith("/"):
         normalized += "/"
@@ -162,7 +191,10 @@ def _normalize_pattern_lexical(pattern: str) -> str:
 
 def _normalize_pattern_for_match(pattern: str) -> str:
     """Normalize and case-fold a user-supplied deny glob for comparison."""
-    return _normalize_pattern_lexical(pattern).casefold()
+    return _normalize_pattern_lexical(
+        pattern,
+        adapt_local_windows=True,
+    ).casefold()
 
 
 def _normalize_pattern_variants(
@@ -171,7 +203,10 @@ def _normalize_pattern_variants(
     canonicalize: bool = True,
 ) -> tuple[str, ...]:
     """Return lexical and safely canonicalized identities for a deny glob."""
-    lexical_original_case = _normalize_pattern_lexical(pattern)
+    lexical_original_case = _normalize_pattern_lexical(
+        pattern,
+        adapt_local_windows=canonicalize,
+    )
     lexical = lexical_original_case.casefold()
     if not canonicalize:
         return (lexical,)

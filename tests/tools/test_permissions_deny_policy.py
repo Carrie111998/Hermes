@@ -26,6 +26,22 @@ def _install_permissions_config(monkeypatch, *, paths=None, commands=None):
     return config
 
 
+def test_default_config_declares_permissions_deny_namespace():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["permissions"] == {
+        "deny": {"paths": [], "commands": []},
+    }
+
+
+def test_policy_read_does_not_seed_or_migrate_missing_config(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    assert deny_policy.permissions_deny_paths() == []
+    assert not (hermes_home / "config.yaml").exists()
+
+
 class TestPermissionsDenyPathMatching:
     def test_glob_matches_path_case_insensitively(self):
         match = deny_policy.match_permissions_deny_path(
@@ -53,6 +69,23 @@ class TestPermissionsDenyPathMatching:
             patterns=["*/Users/*/obsidian/Daedalus/**"],
         )
         assert match is not None
+
+    def test_local_msys_drive_path_matches_windows_drive_rule(self):
+        match = deny_policy.match_permissions_deny_path(
+            "/c/Users/alice/obsidian/Daedalus/capsule.md",
+            patterns=["C:/Users/alice/obsidian/Daedalus/**"],
+        )
+
+        assert match is not None
+
+    def test_remote_msys_spelling_is_not_rewritten_as_windows_drive(self):
+        match = deny_policy.match_permissions_deny_path(
+            "/c/Users/alice/secret/file.txt",
+            patterns=["C:/Users/alice/secret/**"],
+            canonicalize=False,
+        )
+
+        assert match is None
 
     def test_non_matching_path_is_allowed(self, tmp_path):
         match = deny_policy.match_permissions_deny_path(
@@ -177,6 +210,51 @@ class TestPermissionsDenyPathMatching:
 
 
 class TestPermissionsDenyFileTools:
+    def test_vercel_sandbox_uses_remote_path_semantics(self, monkeypatch):
+        from tools import terminal_tool
+
+        env = type("VercelSandboxEnvironment", (), {})()
+        monkeypatch.setattr(terminal_tool, "_active_environments", {"task": env})
+        monkeypatch.setattr(
+            terminal_tool,
+            "_resolve_container_task_id",
+            lambda task_id: task_id,
+        )
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {"env_type": "local"},
+        )
+
+        assert file_tools._terminal_env_type_for_task("task") == "vercel_sandbox"
+        assert file_tools._uses_container_paths("task") is True
+
+    def test_absolute_candidate_matches_task_anchored_relative_rule(self, monkeypatch):
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        def resolve_for_task(value, task_id):
+            if value == "secret/**":
+                return Path("C:/workspace/secret/**")
+            return Path(value)
+
+        with (
+            patch(
+                "tools.file_tools._resolve_path_for_task",
+                side_effect=resolve_for_task,
+            ),
+            patch(
+                "tools.file_tools._terminal_env_type_for_task",
+                return_value="local",
+            ),
+        ):
+            error = file_tools._check_permissions_deny_path(
+                "C:/workspace/secret/file.txt",
+                task_id="task",
+            )
+
+        assert error is not None
+        assert "permissions.deny.paths" in error
+
     def test_read_file_denied_before_file_ops(self, monkeypatch, tmp_path):
         secret = tmp_path / "secret.txt"
         secret.write_text("do not read\n", encoding="utf-8")
@@ -354,6 +432,42 @@ class TestPermissionsDenyFileTools:
         mock_get.assert_not_called()
         assert secret.read_text(encoding="utf-8") == "old\n"
 
+    @pytest.mark.parametrize(
+        "header_template",
+        [
+            "*** Add File: {denied}\n+new content\n",
+            "*** Delete File: {denied}\n",
+            "*** Move File: {denied} -> {allowed}\n",
+            "*** Move File: {allowed} -> {denied}\n",
+        ],
+        ids=["add", "delete", "move-source", "move-destination"],
+    )
+    def test_v4a_all_path_endpoints_deny_before_backend(
+        self,
+        monkeypatch,
+        tmp_path,
+        header_template,
+    ):
+        denied = tmp_path / "secret.txt"
+        allowed = tmp_path / "allowed.txt"
+        _install_permissions_config(monkeypatch, paths=[str(denied)])
+        patch_text = (
+            "*** Begin Patch\n"
+            + header_template.format(denied=denied, allowed=allowed)
+            + "*** End Patch\n"
+        )
+
+        with patch("tools.file_tools._get_file_ops") as mock_get:
+            result = json.loads(file_tools.patch_tool(
+                mode="patch",
+                patch=patch_text,
+                task_id="deny-v4a-endpoint",
+            ))
+
+        assert "error" in result
+        assert "permissions.deny.paths" in result["error"]
+        mock_get.assert_not_called()
+
     def test_search_denied_root_before_file_ops(self, monkeypatch, tmp_path):
         secret_dir = tmp_path / "secret"
         secret_dir.mkdir()
@@ -362,6 +476,30 @@ class TestPermissionsDenyFileTools:
 
         with patch("tools.file_tools._get_file_ops") as mock_get:
             result = json.loads(file_tools.search_tool("needle", path=str(secret_dir), task_id="deny-search"))
+
+        assert "error" in result
+        assert "permissions.deny.paths" in result["error"]
+        mock_get.assert_not_called()
+
+    @pytest.mark.parametrize("separator", [" ", ","])
+    def test_multi_path_search_denies_each_root_before_backend(
+        self,
+        monkeypatch,
+        separator,
+    ):
+        public = "C:/workspace/public"
+        secret = "C:/workspace/secret"
+        _install_permissions_config(
+            monkeypatch,
+            paths=["C:/workspace/secret/**"],
+        )
+
+        with patch("tools.file_tools._get_file_ops") as mock_get:
+            result = json.loads(file_tools.search_tool(
+                "needle",
+                path=f"{public}{separator}{secret}",
+                task_id="deny-multi-search",
+            ))
 
         assert "error" in result
         assert "permissions.deny.paths" in result["error"]
