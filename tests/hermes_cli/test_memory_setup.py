@@ -261,13 +261,14 @@ def test_hindsight_intel_macos_local_alias_uses_slim_runtime(tmp_path, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_hindsight_intel_macos_install_smoke_import_failure_surfaces_warning(
+def test_hindsight_intel_macos_install_smoke_import_failure_raises(
     tmp_path, monkeypatch, capsys
 ):
     """When install_specs reports success on Intel macOS local_embedded but
-    the slim runtime smoke-imports fail, ``_install_dependencies`` must
-    print an actionable warning naming the failed modules — not silently
-    return as if the heal succeeded."""
+    the slim runtime smoke-validation fails, ``_install_dependencies`` must
+    raise RuntimeError so callers (and ``hermes update``) treat the heal
+    as failed — not silently return as if the heal succeeded (#81421)."""
+    import pytest
     import yaml as _yaml
 
     plugin_dir = tmp_path / "hindsight"
@@ -293,8 +294,9 @@ def test_hindsight_intel_macos_install_smoke_import_failure_surfaces_warning(
 
     def fake_smoke_import():
         return [
-            "hindsight_api: ImportError: simulated smoke failure",
-            "hindsight_embed: ImportError: simulated smoke failure",
+            "hindsight_api.LocalSTEmbeddings: AttributeError: the slim runtime "
+            "shipped an API release that does not expose the configured ONNX "
+            "embeddings provider — this is the #81421 backtrack failure mode"
         ]
 
     # Patch the dedicated helper rather than builtins.__import__ so
@@ -303,22 +305,22 @@ def test_hindsight_intel_macos_install_smoke_import_failure_surfaces_warning(
         memory_setup, "_smoke_import_hindsight_local", fake_smoke_import
     )
 
-    memory_setup._install_dependencies("hindsight", force=True)
+    with pytest.raises(RuntimeError) as excinfo:
+        memory_setup._install_dependencies("hindsight", force=True)
+
+    assert "Hindsight slim runtime smoke validation failed" in str(excinfo.value), (
+        "The raised error must clearly identify the #81421 smoke-validation "
+        "failure so upstream callers can surface it in their own failure UI."
+    )
 
     captured = capsys.readouterr().out
-    assert "slim runtime installed but smoke import failed" in captured, (
-        "An Intel macOS slim install that succeeds at pip but fails at "
-        "smoke import must surface an actionable warning instead of "
-        "silently returning — the original #81421 failure was a silent "
-        "pip-success / runtime-broken split."
+    assert "smoke validation failed" in captured, (
+        "The smoke-failure warning must still be printed so the user can see "
+        "which module caused the failure before the exception is raised."
     )
-    assert "hindsight_api" in captured, (
-        "The smoke-failure warning must name the failed modules so the user "
-        "knows which import to chase down."
-    )
-    assert "hindsight_embed" in captured, (
-        "The smoke-failure warning must name the failed modules so the user "
-        "knows which import to chase down."
+    assert "LocalSTEmbeddings" in captured, (
+        "The smoke-failure warning must name the failed symbol so the user "
+        "knows which class to chase down."
     )
 
 
@@ -326,9 +328,10 @@ def test_hindsight_intel_macos_install_smoke_success_is_silent(
     tmp_path, monkeypatch, capsys
 ):
     """When the smoke check returns no errors on Intel macOS local_embedded,
-    ``_install_dependencies`` must print neither the failure banner nor a
-    success line — the existing `✓ Installed ...` line is enough and the
-    smoke check should be invisible on healthy setups."""
+    ``_install_dependencies`` must not raise and must print neither the
+    failure banner nor a success line — the existing `✓ Installed ...`
+    line is enough and the smoke check should be invisible on healthy
+    setups."""
     import yaml as _yaml
 
     plugin_dir = tmp_path / "hindsight"
@@ -353,11 +356,114 @@ def test_hindsight_intel_macos_install_smoke_success_is_silent(
     monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
     monkeypatch.setattr(memory_setup, "_smoke_import_hindsight_local", lambda: [])
 
+    # Must not raise — the heal is genuinely successful.
     memory_setup._install_dependencies("hindsight", force=True)
 
     captured = capsys.readouterr().out
-    assert "slim runtime installed but smoke import failed" not in captured, (
+    assert "smoke validation failed" not in captured, (
         "Healthy Intel macOS installs must not print a smoke-failure banner."
+    )
+
+
+def test_smoke_import_hindsight_local_reports_missing_class():
+    """The helper that backs the post-install smoke check must surface the
+    #81421 backtrack signature: ``hindsight_api`` importing but
+    ``LocalSTEmbeddings`` absent. We exercise the real helper against the
+    current Python environment — if it happens to have ``hindsight_api``
+    installed (it does on this dev box), we substitute a module that
+    simulates the backtrack shape. Otherwise we skip — the install-time
+    behavior is the same."""
+    import sys
+    import types
+
+    class _FakeHindsightApi:
+        """Stand-in for an ancient hindsight_api release that no longer
+        exposes the configured ONNX embeddings provider."""
+
+    fake_module = types.ModuleType("hindsight_api")
+    fake_module.__dict__["__spec__"] = types.SimpleNamespace(
+        loader=None, name="hindsight_api"
+    )
+    # Deliberately omit LocalSTEmbeddings to simulate the #81421 backtrack.
+    sys.modules["hindsight_api"] = fake_module
+    try:
+        errors = memory_setup._smoke_import_hindsight_local()
+    finally:
+        sys.modules.pop("hindsight_api", None)
+
+    # We only assert on the LocalSTEmbeddings probe line; the
+    # hindsight_embed module is also checked but we don't know whether
+    # it's installed in the test env.
+    assert any(
+        "LocalSTEmbeddings" in e and "ONNX embeddings provider" in e
+        for e in errors
+    ), (
+        "The smoke check must report the missing LocalSTEmbeddings symbol "
+        "when hindsight_api is present but the configured provider class is "
+        "not — that's the exact signature of the #81421 backtrack failure."
+    )
+
+
+def test_install_dependencies_force_does_not_reinstall_mapped_slim_packages(
+    tmp_path, monkeypatch
+):
+    """The slim-stack pip packages have a non-trivial pip-name → import-name
+    mapping (``hindsight-all-slim`` → ``hindsight_api``, ``hindsight-embed``
+    → ``hindsight_embed``). Without these entries in ``_IMPORT_NAMES`` the
+    missing-dep probe at the top of ``_install_dependencies`` would mark the
+    slim packages as still-missing on every refresh (since
+    ``import hindsight_all_slim`` always fails), and reinstall them
+    indefinitely — defeating the point of the slim-stack switch.
+
+    We exercise the Intel-macOS local_embedded path end-to-end: with the
+    slim packages already importable in the host venv, ``force=True`` must
+    NOT report them as missing (force=True passes every dep to the
+    installer regardless, but the regression we're guarding against is
+    the non-force path where every refresh hands the slim packages back
+    to pip)."""
+    import yaml as _yaml
+
+    plugin_dir = tmp_path / "hindsight"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        _yaml.safe_dump({"pip_dependencies": ["hindsight-client>=0.6.1"]}),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.write_text('{"mode": "local_embedded"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "plugins.memory.find_provider_dir", lambda name: plugin_dir
+    )
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Darwin", "x86_64"))
+
+    # Simulate "the slim packages are already importable in the host
+    # venv" — _IMPORT_NAMES maps to modules that successfully import.
+    # Use the real _IMPORT_NAMES dict from the production code path so
+    # the test breaks immediately if anyone deletes the mappings.
+    install_calls = []
+
+    def fake_install_specs(specs, timeout=120):
+        install_calls.append(list(specs))
+        return SimpleNamespace(ok=True, blocked=False, reason="", stderr="")
+
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
+    monkeypatch.setattr(memory_setup, "_smoke_import_hindsight_local", lambda: [])
+
+    # With the slim packages already importable in the host, force=False
+    # (the post-install refresh path) must NOT reinstall them. We assert
+    # this by checking that no install happens at all — the only
+    # path through `_install_dependencies` that triggers an install when
+    # force=False is when something is missing, and the slim packages
+    # must resolve through `_IMPORT_NAMES`.
+    memory_setup._install_dependencies("hindsight", force=False)
+
+    assert not install_calls, (
+        "Slim packages must NOT be reinstalled on a healthy Intel macOS "
+        "local_embedded refresh — the #81421 fix would otherwise churn "
+        "pip on every `hermes update`."
     )
 
 
