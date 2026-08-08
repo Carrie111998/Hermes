@@ -180,12 +180,14 @@ export async function selectDesktopPaths(options?: HermesSelectPathsOptions): Pr
   const desktop = bridge()
 
   if (!isDesktopFsRemoteMode()) {
-    return desktop.selectPaths(options)
+    return (await desktop.selectPaths(options)) || []
   }
 
   if (!options?.directories) {
-    return desktop.selectPaths(options)
+    return (await desktop.selectPaths(options)) || []
   }
 
-  return remotePicker ? remotePicker.selectPaths({ ...options, multiple: false }) : []
+  const paths = remotePicker ? await remotePicker.selectPaths(options) : []
+
+  return paths || []
 }

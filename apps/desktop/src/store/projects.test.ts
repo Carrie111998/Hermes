@@ -22,6 +22,7 @@ import {
   exitProjectScope,
   openProjectCreate,
   pickProjectFolder,
+  pickProjectFolders,
   projectNameForCwd,
   refreshProjects,
   refreshProjectTree,
@@ -542,5 +543,57 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('pickProjectFolders', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    // pickProjectFolders always calls desktopDefaultCwd; reset to no-cwd default
+    // so tests that don't care about the seed path see defaultPath: undefined.
+    desktopDefaultCwd.mockResolvedValue(undefined)
+  })
+
+  it('returns all selected directories from the multi-select picker', async () => {
+    selectDesktopPaths.mockResolvedValue(['/work/a', '/work/b', '/work/c'])
+
+    const result = await pickProjectFolders()
+
+    expect(result).toEqual(['/work/a', '/work/b', '/work/c'])
+    expect(selectDesktopPaths).toHaveBeenCalledWith({
+      defaultPath: undefined,
+      directories: true,
+      multiple: true
+    })
+  })
+
+  it('seeds the picker with the backend cwd', async () => {
+    desktopDefaultCwd.mockResolvedValue({ branch: 'main', cwd: '/backend/projects' })
+    selectDesktopPaths.mockResolvedValue(['/backend/projects/repo1', '/backend/projects/repo2'])
+
+    const result = await pickProjectFolders()
+
+    expect(result).toEqual(['/backend/projects/repo1', '/backend/projects/repo2'])
+    expect(selectDesktopPaths).toHaveBeenCalledWith({
+      defaultPath: '/backend/projects',
+      directories: true,
+      multiple: true
+    })
+  })
+
+  it('returns an empty array when the picker is dismissed', async () => {
+    selectDesktopPaths.mockResolvedValue([])
+
+    const result = await pickProjectFolders()
+
+    expect(result).toEqual([])
+  })
+
+  it('filters out any falsy values from the picker result', async () => {
+    selectDesktopPaths.mockResolvedValue(['/work/a', '', '/work/b'])
+
+    const result = await pickProjectFolders()
+
+    expect(result).toEqual(['/work/a', '/work/b'])
   })
 })

@@ -1590,6 +1590,7 @@ export const ar = defineLocale({
       copyPath: 'نسخ المسار',
       removeFromSidebar: 'إخفاء من الشريط الجانبي',
       createFailed: 'تعذّر إنشاء المشروع',
+      addFolderFailed: (count: number) => `تعذّر إضافة ${count === 1 ? 'مجلد واحد' : `${count} مجلدات`}`,
       deleteConfirm: 'هذا يزيل المشروع المحفوظ من Hermes. تبقى الملفات ومستودعات git وأشجار العمل دون تغيير.',
       startWork: 'شجرة عمل جديدة',
       newWorktreeTitle: 'شجرة عمل جديدة',

@@ -204,14 +204,49 @@ describe('desktop filesystem facade', () => {
     expect(remoteSelect).not.toHaveBeenCalled()
   })
 
-  it('limits the remote picker to single-directory selection', async () => {
+  it('forwards caller options unchanged to the remote directory picker', async () => {
     const remoteSelect = vi.fn(async () => ['/remote/project'])
     $connection.set({ mode: 'remote' } as never)
     setDesktopFsRemotePicker({ selectPaths: remoteSelect })
 
     await expect(selectDesktopPaths({ directories: true })).resolves.toEqual(['/remote/project'])
 
-    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: false })
+    // Options must be forwarded as-is — no hard-coded multiple: false override.
+    expect(remoteSelect).toHaveBeenCalledWith({ directories: true })
+    expect(selectPaths).not.toHaveBeenCalled()
+  })
+
+  it('forwards multiple: true to the remote directory picker for multi-select', async () => {
+    const remoteSelect = vi.fn(async () => ['/remote/a', '/remote/b', '/remote/c'])
+    $connection.set({ mode: 'remote' } as never)
+    setDesktopFsRemotePicker({ selectPaths: remoteSelect })
+
+    const result = await selectDesktopPaths({ directories: true, multiple: true })
+
+    expect(result).toEqual(['/remote/a', '/remote/b', '/remote/c'])
+    expect(remoteSelect).toHaveBeenCalledWith({ directories: true, multiple: true })
+    expect(selectPaths).not.toHaveBeenCalled()
+  })
+
+  it('returns an empty array when the remote picker is dismissed without a selection', async () => {
+    const remoteSelect = vi.fn(async () => [])
+    $connection.set({ mode: 'remote' } as never)
+    setDesktopFsRemotePicker({ selectPaths: remoteSelect })
+
+    const result = await selectDesktopPaths({ directories: true, multiple: true })
+
+    expect(result).toEqual([])
+    expect(remoteSelect).toHaveBeenCalledOnce()
+    expect(selectPaths).not.toHaveBeenCalled()
+  })
+
+  it('falls back to an empty array when no remote picker is registered', async () => {
+    $connection.set({ mode: 'remote' } as never)
+    // No setDesktopFsRemotePicker call — picker is null.
+
+    const result = await selectDesktopPaths({ directories: true, multiple: true })
+
+    expect(result).toEqual([])
     expect(selectPaths).not.toHaveBeenCalled()
   })
 })

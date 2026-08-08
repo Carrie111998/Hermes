@@ -26,6 +26,7 @@ import {
   createProject,
   generateProjectIdea,
   pickProjectFolder,
+  pickProjectFolders,
   renameProject
 } from '@/store/projects'
 
@@ -89,17 +90,42 @@ export function ProjectDialog() {
 
   const pickFolder = async () => {
     try {
-      const dir = await pickProjectFolder()
-
-      if (!dir) {
-        return
-      }
-
       const projectId = state?.projectId
 
       if (mode === 'add-folder' && projectId) {
-        await runSubmit(() => addProjectFolder(projectId, dir))
+        // Use multi-select so the user can pick several folders in one shot.
+        const dirs = await pickProjectFolders()
 
+        if (!dirs.length) {
+          return
+        }
+
+        await runSubmit(async () => {
+          const failures: string[] = []
+
+          for (const dir of dirs) {
+            try {
+              await addProjectFolder(projectId, dir)
+            } catch (err) {
+              console.error(`Failed to add folder ${dir}:`, err)
+              failures.push(dir)
+            }
+          }
+
+          if (failures.length > 0) {
+            notifyError(
+              new Error(failures.join(', ')),
+              p.addFolderFailed(failures.length)
+            )
+          }
+        })
+
+        return
+      }
+
+      const dir = await pickProjectFolder()
+
+      if (!dir) {
         return
       }
 
