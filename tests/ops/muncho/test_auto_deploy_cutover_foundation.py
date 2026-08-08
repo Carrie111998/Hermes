@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -8,9 +9,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from gateway.operational_edge_catalog import CREDENTIALS_BY_DOMAIN
 from tests.gateway.test_canonical_writer_production_cutover import (
     _runtime_attestation,
+)
+from tests.scripts.canary import (
+    test_production_release_unit_inputs_v4 as v4_test,
 )
 
 
@@ -177,6 +183,55 @@ def _run_shell(
     )
 
 
+def _cutover_guard_settings(
+    tmp_path: Path,
+    *,
+    audit_root: Path | None = None,
+) -> str:
+    lock_parent = (tmp_path / "activation-lock-parent").resolve()
+    lock_parent.mkdir(mode=0o755, exist_ok=True)
+    lock_path = lock_parent / "activation.lock"
+    selected_audit_root = audit_root or (
+        tmp_path / "absent-release-rotation-audit"
+    ).resolve()
+    return f"""
+SYSTEM_PYTHON={json.dumps(sys.executable)}
+CUTOVER_ACTIVATION_LOCK_PARENT={json.dumps(str(lock_parent))}
+CUTOVER_ACTIVATION_LOCK_PATH={json.dumps(str(lock_path))}
+CUTOVER_ACTIVATION_LOCK_TRUSTED_UID={os.getuid()}
+CUTOVER_ACTIVATION_LOCK_TRUSTED_GID={os.getgid()}
+CUTOVER_RELEASE_ROTATION_AUDIT_ROOT={json.dumps(str(selected_audit_root))}
+"""
+
+
+def _activation_begin_audit(tmp_path: Path) -> Path:
+    audit_root = (tmp_path / "release-unit-input-authority-rotations-v5").resolve()
+    audit_root.mkdir(mode=0o700)
+    successor_publication_sha256 = "b" * 64
+    transaction = audit_root / f"{'a' * 64}-{successor_publication_sha256}"
+    transaction.mkdir(mode=0o700)
+    unsigned = {
+        "schema": (
+            "muncho-production-release-unit-input-rotation-activation-begin.v1"
+        ),
+        "transaction_sha256": "c" * 64,
+        "mutation_begin_sha256": "d" * 64,
+        "successor_publication_sha256": successor_publication_sha256,
+        "release_update_publication_sha256": "e" * 64,
+        "successor_fixed_inputs_sha256": "f" * 64,
+        "live_activation_write_ahead_committed": True,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    marker = _hashed(unsigned, "activation_begin_sha256")
+    marker_path = transaction / "activation-begin.json"
+    marker_path.write_bytes(_canonical(marker))
+    marker_path.chmod(0o400)
+    for path in (audit_root, transaction, marker_path):
+        os.chown(path, os.geteuid(), os.getegid())
+    return audit_root
+
+
 def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
     tmp_path: Path,
 ) -> None:
@@ -187,6 +242,8 @@ def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
         "#!/usr/bin/env python3\n"
         "import os\n"
         "from pathlib import Path\n"
+        "descriptor = int(os.environ['MUNCHO_WRITER_ACTIVATION_LOCK_FD'])\n"
+        "os.fstat(descriptor)\n"
         "path = Path(os.environ['TEST_UNIT_INPUT_OUTPUT'])\n"
         "path.chmod(0o444)\n"
         'print(\'{"schema":"target-blob-bootstrap-test.v1"}\')\n',
@@ -237,6 +294,9 @@ def test_target_blob_bootstrap_does_not_depend_on_active_old_command(
     chown.chmod(0o755)
     runtime = (tmp_path / "run").resolve()
     runtime.mkdir()
+    activation_lock = runtime / "activation.lock"
+    activation_lock.write_bytes(b"")
+    activation_lock.chmod(0o600)
     owner = subprocess.check_output(["id", "-un"], text=True).strip()
     body = f"""
 OWNER={json.dumps(owner)}
@@ -248,7 +308,9 @@ CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(approval_path))}
 CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(output_path))}
 CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
 CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
-bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision}
+exec 8<> {json.dumps(str(activation_lock))}
+bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision} 8
+exec 8>&-
 """
 
     completed = _run_shell(
@@ -265,6 +327,334 @@ bootstrap_cutover_unit_inputs_from_target {json.dumps(str(source))} {revision}
     # There is deliberately no active release or active-side bootstrap command
     # in this fixture; success proves the reviewed target Git blob is sufficient.
     assert not (tmp_path / "active").exists()
+
+
+@pytest.mark.parametrize(
+    "stage_c_document",
+    ("all", "fixed", "plan", "approval"),
+)
+def test_legacy_deploy_never_downgrades_stage_c_v4_authority(
+    tmp_path: Path,
+    stage_c_document: str,
+) -> None:
+    original = v4_test._documents()
+    documents = {
+        "fixed": original["fixed"],
+        "plan": original["unit_plan"],
+        "approval": original["unit_approval"],
+    }
+    revision = v4_test.TARGET
+    staged = (tmp_path / "staged-v4").resolve()
+    staged.mkdir(mode=0o700)
+    plan_path = staged / "unit-input-plan.json"
+    approval_path = staged / "unit-input-approval.json"
+    output_path = staged / "production-unit-inputs.json"
+    paths = {
+        "fixed": output_path,
+        "plan": plan_path,
+        "approval": approval_path,
+    }
+    modes = {"fixed": 0o444, "plan": 0o400, "approval": 0o400}
+    selected_names = paths if stage_c_document == "all" else (stage_c_document,)
+    for name in selected_names:
+        suffix = b"\n" if name == "fixed" else b""
+        paths[name].write_bytes(_canonical(documents[name]) + suffix)
+        paths[name].chmod(modes[name])
+    for path in (staged, *paths.values()):
+        if not path.exists():
+            continue
+        os.chown(path, os.geteuid(), os.getegid())
+
+    bootstrap_marker = (tmp_path / "legacy-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(plan_path))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(approval_path))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(output_path))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {revision}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "42"
+    assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+@pytest.mark.parametrize("stage_c_document", ("fixed", "plan", "approval"))
+def test_legacy_deploy_detects_validation_unreadable_stage_c_fragment(
+    tmp_path: Path,
+    stage_c_document: str,
+) -> None:
+    original = v4_test._documents()
+    documents = {
+        "fixed": original["fixed"],
+        "plan": original["unit_plan"],
+        "approval": original["unit_approval"],
+    }
+    staged = (tmp_path / "staged-v4-wrong-mode").resolve()
+    staged.mkdir(mode=0o700)
+    paths = {
+        "fixed": staged / "production-unit-inputs.json",
+        "plan": staged / "unit-input-plan.json",
+        "approval": staged / "unit-input-approval.json",
+    }
+    selected = paths[stage_c_document]
+    suffix = b"\n" if stage_c_document == "fixed" else b""
+    selected.write_bytes(_canonical(documents[stage_c_document]) + suffix)
+    selected.chmod(0o600)
+    for path in (staged, selected):
+        os.chown(path, os.geteuid(), os.getegid())
+
+    bootstrap_marker = (tmp_path / "wrong-mode-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(paths['plan']))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(paths['approval']))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(paths['fixed']))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "42"
+    assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+@pytest.mark.parametrize("opaque_document", ("fixed", "plan", "approval"))
+def test_legacy_deploy_never_bootstraps_over_unreadable_authority_fragment(
+    tmp_path: Path,
+    opaque_document: str,
+) -> None:
+    staged = (tmp_path / "staged-opaque-fragment").resolve()
+    staged.mkdir(mode=0o700)
+    paths = {
+        "fixed": staged / "production-unit-inputs.json",
+        "plan": staged / "unit-input-plan.json",
+        "approval": staged / "unit-input-approval.json",
+    }
+    paths[opaque_document].mkdir(mode=0o700)
+
+    bootstrap_marker = (tmp_path / "opaque-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(paths['plan']))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(paths['approval']))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(paths['fixed']))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "43"
+    assert "BLOCKED_CUTOVER_AUTHORITY_AMBIGUOUS" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+@pytest.mark.parametrize(
+    "early_crash_state",
+    ("v3_plan_and_approval", "v3_plan_only", "live_triplet_absent"),
+)
+def test_legacy_deploy_uses_activation_journal_before_early_crash_bootstrap(
+    tmp_path: Path,
+    early_crash_state: str,
+) -> None:
+    revision = v4_test.TARGET
+    plan, approval, _unit_inputs = _unit_input_authority(revision)
+    staged = (tmp_path / "staged-early-crash").resolve()
+    staged.mkdir(mode=0o700)
+    plan_path = staged / "unit-input-plan.json"
+    approval_path = staged / "unit-input-approval.json"
+    output_path = staged / "production-unit-inputs.json"
+    if early_crash_state in {"v3_plan_and_approval", "v3_plan_only"}:
+        plan_path.write_bytes(_canonical(plan))
+        plan_path.chmod(0o400)
+    if early_crash_state == "v3_plan_and_approval":
+        approval_path.write_bytes(_canonical(approval))
+        approval_path.chmod(0o400)
+    for path in (staged, plan_path, approval_path):
+        if path.exists():
+            os.chown(path, os.geteuid(), os.getegid())
+
+    audit_root = _activation_begin_audit(tmp_path)
+    bootstrap_marker = (tmp_path / "early-crash-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path, audit_root=audit_root) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(plan_path))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(approval_path))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(output_path))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {revision}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "42"
+    assert "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+def test_legacy_deploy_rejects_invalid_activation_journal_before_bootstrap(
+    tmp_path: Path,
+) -> None:
+    audit_root = _activation_begin_audit(tmp_path)
+    transaction = next(audit_root.iterdir())
+    marker = transaction / "activation-begin.json"
+    value = json.loads(marker.read_bytes())
+    value["activation_begin_sha256"] = "0" * 64
+    marker.chmod(0o600)
+    marker.write_bytes(_canonical(value))
+    marker.chmod(0o400)
+    staged = (tmp_path / "staged-invalid-audit").resolve()
+    staged.mkdir(mode=0o700)
+    bootstrap_marker = (tmp_path / "invalid-audit-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path, audit_root=audit_root) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(staged / 'unit-input-plan.json'))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(staged / 'unit-input-approval.json'))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(staged / 'production-unit-inputs.json'))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "43"
+    assert "BLOCKED_CUTOVER_AUTHORITY_AMBIGUOUS" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+def test_legacy_deploy_holds_shared_activation_lock_before_bootstrap(
+    tmp_path: Path,
+) -> None:
+    settings = _cutover_guard_settings(tmp_path)
+    lock_path = tmp_path / "activation-lock-parent" / "activation.lock"
+    lock_path.write_bytes(b"")
+    lock_path.chmod(0o600)
+    os.chown(lock_path, os.geteuid(), os.getegid())
+    staged = (tmp_path / "staged-concurrent-rotation").resolve()
+    staged.mkdir(mode=0o700)
+    bootstrap_marker = (tmp_path / "concurrent-bootstrap-called").resolve()
+    body = settings + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(staged / 'unit-input-plan.json'))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(staged / 'unit-input-approval.json'))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(staged / 'production-unit-inputs.json'))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+set +e
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+rc=$?
+set -e
+printf '%s\n' "$rc"
+"""
+
+    descriptor = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        completed = _run_shell(body, {})
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "44"
+    assert "BLOCKED_CUTOVER_ACTIVATION_LOCK_UNAVAILABLE" in completed.stderr
+    assert not bootstrap_marker.exists()
+
+
+def test_legacy_deploy_bootstraps_missing_legacy_authority_under_shared_lock(
+    tmp_path: Path,
+) -> None:
+    staged = (tmp_path / "staged-missing-legacy-authority").resolve()
+    staged.mkdir(mode=0o700)
+    bootstrap_marker = (tmp_path / "serialized-bootstrap-called").resolve()
+    body = _cutover_guard_settings(tmp_path) + f"""
+CUTOVER_UNIT_INPUT_PLAN_PATH={json.dumps(str(staged / 'unit-input-plan.json'))}
+CUTOVER_UNIT_INPUT_APPROVAL_PATH={json.dumps(str(staged / 'unit-input-approval.json'))}
+CUTOVER_UNIT_INPUTS_PATH={json.dumps(str(staged / 'production-unit-inputs.json'))}
+CUTOVER_STAGED_TRUSTED_UID={os.getuid()}
+CUTOVER_STAGED_TRUSTED_GID={os.getgid()}
+bootstrap_cutover_unit_inputs_from_target() {{
+  [ "$3" = 8 ]
+  [ -e /dev/fd/8 ]
+  "$SYSTEM_PYTHON" -c '
+import fcntl
+import os
+import sys
+descriptor = os.open(sys.argv[1], os.O_RDWR)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit("activation lock was released before bootstrap")
+finally:
+    os.close(descriptor)
+' "$CUTOVER_ACTIVATION_LOCK_PATH"
+  : > {json.dumps(str(bootstrap_marker))}
+  return 0
+}}
+prepare_legacy_cutover_unit_inputs /unused/target {v4_test.TARGET}
+"""
+
+    completed = _run_shell(body, {})
+
+    assert completed.returncode == 0, completed.stderr
+    assert bootstrap_marker.exists()
 
 
 def test_root_config_seal_rejects_owner_payload_drift_before_chown(

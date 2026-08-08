@@ -44,14 +44,14 @@ def _rehash(value: dict[str, Any], field: str) -> None:
     value[field] = inputs.sha256_bytes(inputs.canonical_bytes(unsigned))
 
 
-def _v3_unit_inputs(
+def _cutover_v4_unit_inputs(
     payload: Mapping[str, Any],
     unit_plan: Mapping[str, Any],
     unit_approval: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    projected = v4_test.unit_v4.project_payload_to_v3(payload)
+    projected = v4_test.unit_v4.project_payload_to_cutover_v4(payload)
     return {
-        "schema": host_package.UNIT_INPUT_SCHEMA,
+        "schema": host_package.UNIT_INPUT_SCHEMA_V4,
         "release_revision": TARGET,
         "authority_plan_sha256": unit_plan["plan_sha256"],
         "authority_approval_sha256": unit_approval["approval_sha256"],
@@ -68,7 +68,7 @@ def _host_manifest(
     unit_plan: Mapping[str, Any],
     unit_approval: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    unit_inputs = _v3_unit_inputs(payload, unit_plan, unit_approval)
+    unit_inputs = _cutover_v4_unit_inputs(payload, unit_plan, unit_approval)
     sealed_names = {
         name
         for name, (_target, binding) in (
@@ -500,13 +500,16 @@ def test_host_manifest_artifact_plan_binding_drift_is_rejected() -> None:
 @pytest.mark.parametrize(
     ("field", "replacement"),
     (
+        ("schema", host_package.UNIT_INPUT_SCHEMA),
         ("authority_plan_sha256", "d" * 64),
         ("authority_approval_sha256", "e" * 64),
+        ("owner_gate_receipt_public_key_id", "f" * 64),
+        ("release_owner_uid", 1001),
     ),
 )
 def test_host_manifest_unit_inputs_must_be_exact_v4_projection(
     field: str,
-    replacement: str,
+    replacement: str | int,
 ) -> None:
     fixture = _fixture()
     manifest = deepcopy(

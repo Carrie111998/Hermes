@@ -223,6 +223,17 @@ def _unit_inputs() -> dict:
     }
 
 
+def _unit_inputs_v4(owner_gate_receipt_public_key_id: str) -> dict:
+    value = _unit_inputs()
+    return {
+        **value,
+        "schema": package.UNIT_INPUT_SCHEMA_V4,
+        "owner_gate_receipt_public_key_id": owner_gate_receipt_public_key_id,
+        "release_owner_uid": 0,
+        "release_owner_gid": 0,
+    }
+
+
 def _unit_input_payload() -> dict:
     value = _unit_inputs()
     return {
@@ -1448,8 +1459,9 @@ def test_packager_main_passes_exact_inherited_descriptor_to_loader(
     descriptor = os.open(fixed_path, os.O_RDONLY)
     observed = {}
 
-    def load_inputs(path, *, inherited_descriptor):
+    def load_inputs(path, *, revision, inherited_descriptor):
         observed["path"] = path
+        observed["loaded_revision"] = revision
         observed["descriptor"] = inherited_descriptor
         return {"release_revision": REVISION}
 
@@ -1494,6 +1506,7 @@ def test_packager_main_passes_exact_inherited_descriptor_to_loader(
     assert json.loads(capsys.readouterr().out) == {"ok": True}
     assert observed == {
         "path": fixed_path,
+        "loaded_revision": REVISION,
         "descriptor": descriptor,
         "release_root": release,
         "revision": REVISION,
@@ -1750,6 +1763,9 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert package.OWNER_GATE_SOURCE_RECEIPT_PUBLIC_KEY == Path(
+        "/etc/muncho-owner-gate/public/authority-receipt-public.pem"
+    )
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
     public_raw = public_key.public_bytes_raw()
@@ -1800,7 +1816,7 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
     request, descriptor = package._sealed_runtime_artifact_request(
         revision=REVISION,
         runtime_dependency=_runtime_dependency_for_units(),
-        unit_inputs=_unit_inputs(),
+        unit_inputs=_unit_inputs_v4(key_id),
         operational_asset_verification=nonroot_release_assets,
         owner_gate_receipt_public_key_id=key_id,
         owner_gate_receipt_public_key_path=public_path,
@@ -1828,42 +1844,16 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
 
     with pytest.raises(
         package.PackagingError,
-        match="cutover_owner_gate_receipt_public_key_invalid",
+        match="cutover_owner_gate_receipt_public_key_authority_invalid",
     ):
         package._sealed_runtime_artifact_request(
             revision=REVISION,
             runtime_dependency=_runtime_dependency_for_units(),
-            unit_inputs=_unit_inputs(),
+            unit_inputs=_unit_inputs_v4(key_id),
             operational_asset_verification=(
                 _operational_asset_verification()
             ),
             owner_gate_receipt_public_key_id="f" * 64,
-            owner_gate_receipt_public_key_path=public_path,
-        )
-
-    release = _release((tmp_path / "v4-release").resolve())
-    manifest = package.build_release_artifacts(
-        release,
-        REVISION,
-        unit_inputs=_unit_inputs(),
-        owner_gate_receipt_public_key_id=key_id,
-        owner_gate_receipt_public_key_path=public_path,
-    )
-    assert package.verify_release_artifacts(
-        release,
-        REVISION,
-        unit_inputs=_unit_inputs(),
-        owner_gate_receipt_public_key_id=key_id,
-        owner_gate_receipt_public_key_path=public_path,
-    ) == manifest
-    with pytest.raises(
-        package.PackagingError,
-        match="cutover_packaging_manifest_invalid",
-    ):
-        package.verify_release_artifacts(
-            release,
-            REVISION,
-            unit_inputs=_unit_inputs(),
             owner_gate_receipt_public_key_path=public_path,
         )
 
@@ -1891,7 +1881,7 @@ def test_v4_operational_edges_bind_signed_owner_gate_key_to_staged_pem(
         package._sealed_runtime_artifact_request(
             revision=REVISION,
             runtime_dependency=_runtime_dependency_for_units(),
-            unit_inputs=_unit_inputs(),
+            unit_inputs=_unit_inputs_v4(key_id),
             operational_asset_verification=(
                 _operational_asset_verification()
             ),
@@ -1925,6 +1915,21 @@ def test_legacy_v3_operational_edges_cannot_borrow_host_owner_gate_key(
         )
         assert config["owner_gate_receipt_public_key_id"] is None
         assert config["owner_gate_receipt_public_key_file"] is None
+
+    with pytest.raises(
+        package.PackagingError,
+        match="cutover_owner_gate_receipt_public_key_authority_invalid",
+    ):
+        package._sealed_runtime_artifact_request(
+            revision=REVISION,
+            runtime_dependency=_runtime_dependency_for_units(),
+            unit_inputs=_unit_inputs(),
+            operational_asset_verification=(
+                _operational_asset_verification()
+            ),
+            owner_gate_receipt_public_key_id="f" * 64,
+            owner_gate_receipt_public_key_path=public_path,
+        )
 
 
 def test_generated_runtime_projects_both_public_trust_anchors_create_only(
@@ -3582,7 +3587,7 @@ def test_deploy_packages_and_verifies_before_release_activation():
     cutover_attest = run_deploy.index('cutover_artifacts_match "$new" "$sha"')
     activate = run_deploy.index('ln -sfn "$new" "$ACTIVE_LINK.next"')
     bootstrap = run_deploy.index(
-        'bootstrap_cutover_unit_inputs_from_target "$tmp" "$sha"'
+        'prepare_legacy_cutover_unit_inputs "$tmp" "$sha"'
     )
     require_inputs = run_deploy.index(
         'require_cutover_unit_inputs "$sha" "$pr"',

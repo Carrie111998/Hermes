@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import json
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Mapping
 
 import pytest
@@ -424,6 +427,138 @@ def test_v3_projection_is_exact_and_fixed_inputs_cross_bind_authorities() -> Non
     assert fixed["whole_tree_manifest_sha256"] == "08" * 32
     assert fixed["candidate_seal_receipt_sha256"] == "09" * 32
     assert fixed["runtime_dependency_manifest_sha256"] == "0a" * 32
+
+
+def test_fixed_projection_preserves_two_anchor_v4_cutover_contract() -> None:
+    documents = _documents()
+
+    projected = unit_v4.project_fixed_inputs_to_cutover_v4(
+        documents["fixed"]
+    )
+
+    assert projected["schema"] == v3.UNIT_INPUT_SCHEMA_V4
+    assert projected["release_revision"] == TARGET
+    assert projected["authority_plan_sha256"] == (
+        documents["unit_plan"]["plan_sha256"]
+    )
+    assert projected["authority_approval_sha256"] == (
+        documents["unit_approval"]["approval_sha256"]
+    )
+    assert projected["writer_capability_public_key_id"] == "a" * 64
+    assert projected["owner_gate_receipt_public_key_id"] == "0b" * 32
+    assert projected["release_owner_uid"] == 0
+    assert projected["release_owner_gid"] == 0
+
+
+def test_cutover_cli_uses_v4_fixed_authority_without_anchor_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    documents = _documents()
+    encoded = unit_v4.canonical_bytes(documents["fixed"]) + b"\n"
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        v3,
+        "_read_trusted_staged_file",
+        lambda *_args, **_kwargs: encoded,
+    )
+    monkeypatch.setattr(
+        "scripts.canary.production_cutover_activation_lock.authority_activation_lock",
+        lambda **_kwargs: contextlib.nullcontext(),
+    )
+
+    def capture_build(
+        release_root: Path,
+        revision: str,
+        **kwargs: Any,
+    ) -> Mapping[str, Any]:
+        captured.update(
+            release_root=release_root,
+            revision=revision,
+            unit_inputs=kwargs["unit_inputs"],
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(v3, "build_release_artifacts", capture_build)
+
+    result = v3.main(
+        [
+            "build",
+            "--release-root",
+            str(tmp_path / "release"),
+            "--revision",
+            TARGET,
+            "--unit-inputs",
+            str(v3.FIXED_UNIT_INPUTS_PATH),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert captured["revision"] == TARGET
+    assert captured["unit_inputs"]["schema"] == v3.UNIT_INPUT_SCHEMA_V4
+    assert captured["unit_inputs"]["writer_capability_public_key_id"] == (
+        "a" * 64
+    )
+    assert captured["unit_inputs"]["owner_gate_receipt_public_key_id"] == (
+        "0b" * 32
+    )
+    assert captured["unit_inputs"]["release_owner_uid"] == 0
+    assert captured["unit_inputs"]["release_owner_gid"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("omit_owner_anchor", "replay_other_release"),
+)
+def test_cutover_cli_rejects_v4_anchor_omission_or_release_replay(
+    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    documents = _documents()
+    fixed = deepcopy(documents["fixed"])
+    revision = TARGET
+    if mutation == "omit_owner_anchor":
+        del fixed["owner_gate_receipt_public_key_id"]
+        _rehash(fixed, "fixed_inputs_sha256")
+    else:
+        revision = "4" * 40
+    encoded = unit_v4.canonical_bytes(fixed) + b"\n"
+    monkeypatch.setattr(
+        v3,
+        "_read_trusted_staged_file",
+        lambda *_args, **_kwargs: encoded,
+    )
+    monkeypatch.setattr(
+        "scripts.canary.production_cutover_activation_lock.authority_activation_lock",
+        lambda **_kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        v3,
+        "build_release_artifacts",
+        lambda *_args, **_kwargs: pytest.fail("invalid inputs reached build"),
+    )
+
+    result = v3.main(
+        [
+            "build",
+            "--release-root",
+            "/tmp/not-created",
+            "--revision",
+            revision,
+            "--unit-inputs",
+            str(v3.FIXED_UNIT_INPUTS_PATH),
+        ]
+    )
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "error_code": "production_cutover_packaging_failed",
+        "ok": False,
+    }
 
 
 @pytest.mark.parametrize(

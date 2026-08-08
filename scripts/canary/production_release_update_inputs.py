@@ -842,11 +842,11 @@ def validate_host_artifact_manifest(
     try:
         successor_plan = successor_unit_input_publication["plan"]
         successor_approval = successor_unit_input_publication["approval"]
-        projected = unit_inputs_v4.project_payload_to_v3(
+        projected = unit_inputs_v4.project_payload_to_cutover_v4(
             successor_plan["unit_inputs"]
         )
         expected_unit_inputs = {
-            "schema": host_package.UNIT_INPUT_SCHEMA,
+            "schema": host_package.UNIT_INPUT_SCHEMA_V4,
             "release_revision": revision,
             "authority_plan_sha256": successor_plan["plan_sha256"],
             "authority_approval_sha256": successor_approval[

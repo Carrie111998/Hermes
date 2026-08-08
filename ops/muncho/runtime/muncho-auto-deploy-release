@@ -14,6 +14,7 @@ CUTOVER_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/cutover-plan
 CUTOVER_UNIT_INPUT_PLAN_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-plan.json"
 CUTOVER_UNIT_INPUT_APPROVAL_PATH="/var/lib/muncho-production-legacy-cutover/staged/unit-input-approval.json"
 CUTOVER_UNIT_INPUTS_PATH="/var/lib/muncho-production-legacy-cutover/staged/production-unit-inputs.json"
+CUTOVER_RELEASE_ROTATION_AUDIT_ROOT="/var/lib/muncho-production-legacy-cutover/release-unit-input-authority-rotations-v5"
 CUTOVER_STAGED_TRUSTED_UID=0
 CUTOVER_STAGED_TRUSTED_GID=0
 GATEWAY_FRAGMENT_TRUSTED_UID=0
@@ -28,9 +29,15 @@ SYSTEM_SETPRIV="/usr/bin/setpriv"
 SYSTEMD_UNIT_ROOTS="/etc/systemd/system:/run/systemd/system:/usr/lib/systemd/system"
 DEPLOY_LOCK_PATH="/run/muncho-auto-deploy-release.lock"
 CUTOVER_ACTIVATION_LOCK_PATH="/run/muncho-writer-activation.lock"
+CUTOVER_ACTIVATION_LOCK_PARENT="/run"
+CUTOVER_ACTIVATION_LOCK_TRUSTED_UID=0
+CUTOVER_ACTIVATION_LOCK_TRUSTED_GID=0
 CUTOVER_ACTIVATION_LOCK_FD_ENV="MUNCHO_WRITER_ACTIVATION_LOCK_FD"
 CUTOVER_UNIT_INPUTS_FD_ENV="MUNCHO_PRODUCTION_UNIT_INPUTS_FD"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
+CUTOVER_STAGE_C_INTERLOCK_RC=42
+CUTOVER_AUTHORITY_AMBIGUOUS_RC=43
+CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC=44
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
 AGENT_BROWSER_CONFIG_RELATIVE_PATH="ops/muncho/runtime/dependencies/agent-browser.json"
 RELEASE_RETENTION_HELPER_RELATIVE_PATH="ops/muncho/runtime/release_retention.py"
@@ -382,6 +389,176 @@ PY
 
 acquire_deploy_lock() {
   acquire_deploy_lock_at "$1" "$2" "$DEPLOY_LOCK_PATH" "/run" 0 0
+}
+
+acquire_cutover_activation_lock() {
+  local lock_path="$CUTOVER_ACTIVATION_LOCK_PATH"
+  local lock_parent="$CUTOVER_ACTIVATION_LOCK_PARENT"
+  local trusted_uid="$CUTOVER_ACTIVATION_LOCK_TRUSTED_UID"
+  local trusted_gid="$CUTOVER_ACTIVATION_LOCK_TRUSTED_GID"
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$lock_path" "$lock_parent" "$trusted_uid" "$trusted_gid" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+parent = Path(sys.argv[2])
+trusted_uid = int(sys.argv[3])
+trusted_gid = int(sys.argv[4])
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+    )
+
+
+def xattrs(value):
+    try:
+        return tuple(os.listxattr(value, follow_symlinks=False))
+    except AttributeError:
+        return ()
+
+
+if (
+    not path.is_absolute()
+    or not parent.is_absolute()
+    or path.parent != parent
+    or parent.resolve(strict=True) != parent
+):
+    raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_PATH_INVALID")
+directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+directory_flags |= getattr(os, "O_DIRECTORY", 0)
+directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+directory = os.open(parent, directory_flags)
+try:
+    parent_opened = os.fstat(directory)
+    parent_reachable = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_opened.st_mode)
+        or parent_opened.st_uid != trusted_uid
+        or parent_opened.st_gid != trusted_gid
+        or stat.S_IMODE(parent_opened.st_mode) & 0o022
+        or identity(parent_opened) != identity(parent_reachable)
+        or xattrs(parent)
+    ):
+        raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_PARENT_INVALID")
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        descriptor = os.open(
+            path.name,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory,
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(path.name, flags, dir_fd=directory)
+    try:
+        if created:
+            os.fchown(descriptor, trusted_uid, trusted_gid)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(directory)
+        opened = os.fstat(descriptor)
+        reachable = os.stat(
+            path.name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != trusted_uid
+            or opened.st_gid != trusted_gid
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or identity(opened) != identity(reachable)
+            or xattrs(path)
+        ):
+            raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_IDENTITY_INVALID")
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory)
+PY
+  then
+    return "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC"
+  fi
+  if ! exec 8<>"$lock_path"; then
+    return "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC"
+  fi
+  if ! "$SYSTEM_PYTHON" -I -S - \
+    "$lock_path" "$trusted_uid" "$trusted_gid" 8 <<'PY'
+import fcntl
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+trusted_uid = int(sys.argv[2])
+trusted_gid = int(sys.argv[3])
+descriptor = int(sys.argv[4])
+
+
+def identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_uid,
+        value.st_gid,
+    )
+
+
+def xattrs(value):
+    try:
+        return tuple(os.listxattr(value, follow_symlinks=False))
+    except AttributeError:
+        return ()
+
+
+opened = os.fstat(descriptor)
+reachable = path.lstat()
+if (
+    stat.S_ISLNK(reachable.st_mode)
+    or not stat.S_ISREG(opened.st_mode)
+    or opened.st_nlink != 1
+    or opened.st_uid != trusted_uid
+    or opened.st_gid != trusted_gid
+    or stat.S_IMODE(opened.st_mode) != 0o600
+    or identity(opened) != identity(reachable)
+    or xattrs(path)
+):
+    raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_OPEN_IDENTITY_INVALID")
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError, ValueError) as exc:
+    raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_UNAVAILABLE") from exc
+opened_after = os.fstat(descriptor)
+reachable_after = path.lstat()
+if (
+    identity(opened) != identity(opened_after)
+    or identity(opened) != identity(reachable_after)
+    or xattrs(path)
+):
+    raise SystemExit("BLOCKED_CUTOVER_ACTIVATION_LOCK_DRIFTED")
+PY
+  then
+    exec 8>&-
+    return "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC"
+  fi
+  return 0
 }
 
 run_cutover_artifact_step() {
@@ -1317,6 +1494,347 @@ require_legacy_deploy_topology() {
   esac
 }
 
+probe_cutover_stage_c_authority() {
+  "$SYSTEM_PYTHON" -I -S - \
+    "$CUTOVER_UNIT_INPUTS_PATH" \
+    "$CUTOVER_UNIT_INPUT_PLAN_PATH" \
+    "$CUTOVER_UNIT_INPUT_APPROVAL_PATH" \
+    "$CUTOVER_RELEASE_ROTATION_AUDIT_ROOT" \
+    "$CUTOVER_STAGED_TRUSTED_UID" \
+    "$CUTOVER_STAGED_TRUSTED_GID" \
+    "$CUTOVER_STAGE_C_INTERLOCK_RC" \
+    "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" <<'PY'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+STAGE_C_SCHEMAS = {
+    "muncho-production-release-unit-inputs.v4",
+    "muncho-production-release-unit-input-plan.v4",
+    "muncho-production-release-unit-input-approval.v4",
+}
+ACTIVATION_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-activation-begin.v1"
+)
+ACTIVATION_FIELDS = {
+    "schema",
+    "transaction_sha256",
+    "mutation_begin_sha256",
+    "successor_publication_sha256",
+    "release_update_publication_sha256",
+    "successor_fixed_inputs_sha256",
+    "live_activation_write_ahead_committed",
+    "secret_material_recorded",
+    "secret_digest_recorded",
+    "activation_begin_sha256",
+}
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+TRANSACTION_DIRECTORY = re.compile(r"^([0-9a-f]{64})-([0-9a-f]{64})$")
+audit_root = Path(sys.argv[4])
+trusted_uid = int(sys.argv[5])
+trusted_gid = int(sys.argv[6])
+stage_c_interlock_rc = int(sys.argv[7])
+authority_ambiguous_rc = int(sys.argv[8])
+members = (
+    (Path(sys.argv[1]), True, 128 * 1024),
+    (Path(sys.argv[2]), False, 1024 * 1024),
+    (Path(sys.argv[3]), False, 1024 * 1024),
+)
+
+
+def identity(item):
+    return (
+        item.st_dev, item.st_ino, item.st_mode, item.st_nlink,
+        item.st_uid, item.st_gid, item.st_size, item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def canonical(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", errors="strict")
+
+
+def pairs(items):
+    value = {}
+    for name, item in items:
+        if name in value:
+            raise ValueError("duplicate authority member key")
+        value[name] = item
+    return value
+
+
+def constant(_value):
+    raise ValueError("non-finite authority member value")
+
+
+def xattrs(path):
+    try:
+        return tuple(os.listxattr(path, follow_symlinks=False))
+    except AttributeError:
+        return ()
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+
+
+def probe(path, *, newline, maximum):
+    descriptor = None
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or not 0 < before.st_size <= maximum
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, maximum + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        reachable = path.lstat()
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or len(raw) > maximum
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or identity(before) != identity(reachable)
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        value = json.loads(
+            bytes(raw).decode("utf-8", errors="strict"),
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(authority_ambiguous_rc)
+    expected = canonical(value) + (b"\n" if newline else b"")
+    if not isinstance(value, dict) or bytes(raw) != expected:
+        raise SystemExit(authority_ambiguous_rc)
+    return value.get("schema")
+
+
+def read_activation_marker(directory_fd, transaction_path, name):
+    descriptor = None
+    maximum = 128 * 1024
+    marker_path = transaction_path / name
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != trusted_uid
+        or before.st_gid != trusted_gid
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or not 0 < before.st_size <= maximum
+        or xattrs(marker_path)
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, maximum + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        reachable = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or len(raw) > maximum
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or identity(before) != identity(reachable)
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        value = json.loads(
+            bytes(raw).decode("utf-8", errors="strict"),
+            object_pairs_hook=pairs,
+            parse_constant=constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise SystemExit(authority_ambiguous_rc)
+    if (
+        not isinstance(value, dict)
+        or set(value) != ACTIVATION_FIELDS
+        or bytes(raw) != canonical(value)
+        or value.get("schema") != ACTIVATION_SCHEMA
+        or value.get("live_activation_write_ahead_committed") is not True
+        or value.get("secret_material_recorded") is not False
+        or value.get("secret_digest_recorded") is not False
+    ):
+        raise SystemExit(authority_ambiguous_rc)
+    for field in (
+        "transaction_sha256",
+        "mutation_begin_sha256",
+        "successor_publication_sha256",
+        "release_update_publication_sha256",
+        "successor_fixed_inputs_sha256",
+        "activation_begin_sha256",
+    ):
+        if SHA256.fullmatch(str(value.get(field, ""))) is None:
+            raise SystemExit(authority_ambiguous_rc)
+    unsigned = {
+        field: item
+        for field, item in value.items()
+        if field != "activation_begin_sha256"
+    }
+    if value["activation_begin_sha256"] != hashlib.sha256(
+        canonical(unsigned)
+    ).hexdigest():
+        raise SystemExit(authority_ambiguous_rc)
+    return value
+
+
+def trusted_activation_began():
+    try:
+        before = audit_root.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        if (
+            not audit_root.is_absolute()
+            or audit_root.resolve(strict=True) != audit_root
+            or not stat.S_ISDIR(before.st_mode)
+            or before.st_uid != trusted_uid
+            or before.st_gid != trusted_gid
+            or stat.S_IMODE(before.st_mode) != 0o700
+            or xattrs(audit_root)
+        ):
+            raise SystemExit(authority_ambiguous_rc)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        root_fd = os.open(audit_root, flags)
+    except SystemExit:
+        raise
+    except OSError:
+        raise SystemExit(authority_ambiguous_rc)
+    try:
+        opened = os.fstat(root_fd)
+        reachable = audit_root.lstat()
+        if (
+            identity(before) != identity(opened)
+            or identity(before) != identity(reachable)
+        ):
+            raise SystemExit(authority_ambiguous_rc)
+        try:
+            names = sorted(os.listdir(root_fd))
+        except OSError:
+            raise SystemExit(authority_ambiguous_rc)
+        activation_found = False
+        for name in names:
+            matched = TRANSACTION_DIRECTORY.fullmatch(name)
+            if matched is None:
+                raise SystemExit(authority_ambiguous_rc)
+            transaction_path = audit_root / name
+            try:
+                directory_before = os.stat(
+                    name,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+                child_fd = os.open(name, flags, dir_fd=root_fd)
+            except OSError:
+                raise SystemExit(authority_ambiguous_rc)
+            try:
+                directory_opened = os.fstat(child_fd)
+                directory_reached = os.stat(
+                    name,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(directory_opened.st_mode)
+                    or directory_opened.st_uid != trusted_uid
+                    or directory_opened.st_gid != trusted_gid
+                    or stat.S_IMODE(directory_opened.st_mode) != 0o700
+                    or identity(directory_before) != identity(directory_opened)
+                    or identity(directory_before) != identity(directory_reached)
+                    or xattrs(transaction_path)
+                ):
+                    raise SystemExit(authority_ambiguous_rc)
+                marker = read_activation_marker(
+                    child_fd,
+                    transaction_path,
+                    "activation-begin.json",
+                )
+                if marker is not None:
+                    if marker["successor_publication_sha256"] != matched.group(2):
+                        raise SystemExit(authority_ambiguous_rc)
+                    activation_found = True
+            finally:
+                os.close(child_fd)
+        reached_after = audit_root.lstat()
+        if identity(before) != identity(reached_after):
+            raise SystemExit(authority_ambiguous_rc)
+        return activation_found
+    finally:
+        os.close(root_fd)
+
+
+if trusted_activation_began():
+    raise SystemExit(stage_c_interlock_rc)
+
+for member_path, member_newline, member_maximum in members:
+    if probe(
+        member_path,
+        newline=member_newline,
+        maximum=member_maximum,
+    ) in STAGE_C_SCHEMAS:
+        raise SystemExit(stage_c_interlock_rc)
+PY
+}
+
 validate_cutover_unit_inputs() {
   local expected_revision="$1"
   python3 - \
@@ -1325,7 +1843,8 @@ validate_cutover_unit_inputs() {
     "$CUTOVER_UNIT_INPUT_APPROVAL_PATH" \
     "$CUTOVER_STAGED_TRUSTED_UID" \
     "$CUTOVER_STAGED_TRUSTED_GID" \
-    "$expected_revision" <<'PY'
+    "$expected_revision" \
+    "$CUTOVER_STAGE_C_INTERLOCK_RC" <<'PY'
 import hashlib
 import ipaddress
 import json
@@ -1339,6 +1858,9 @@ UNIT_SCHEMA = "muncho-production-cutover-unit-inputs.v3"
 PLAN_SCHEMA = "muncho-production-cutover-unit-input-plan.v3"
 PAYLOAD_SCHEMA = "muncho-production-cutover-unit-input-payload.v3"
 APPROVAL_SCHEMA = "muncho-production-cutover-unit-input-approval.v3"
+STAGE_C_UNIT_SCHEMA = "muncho-production-release-unit-inputs.v4"
+STAGE_C_PLAN_SCHEMA = "muncho-production-release-unit-input-plan.v4"
+STAGE_C_APPROVAL_SCHEMA = "muncho-production-release-unit-input-approval.v4"
 RECONCILIATION_SCHEMA = "muncho-production-discord-reconciliation-intent.v1"
 RECONCILIATION_PURPOSE = "production_discord_policy_reconciliation"
 REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -1411,6 +1933,7 @@ approval_path = Path(sys.argv[3])
 trusted_uid = int(sys.argv[4])
 trusted_gid = int(sys.argv[5])
 expected_revision = sys.argv[6]
+stage_c_interlock_rc = int(sys.argv[7])
 
 
 class GateError(RuntimeError):
@@ -1528,6 +2051,20 @@ approval_raw = read_exact(approval_path, mode=0o400, maximum=1024 * 1024)
 unit = decode(unit_raw, newline=True)
 plan = decode(plan_raw, newline=False)
 approval = decode(approval_raw, newline=False)
+if any(
+    observed == stage_c
+    for observed, stage_c in (
+        (unit.get("schema"), STAGE_C_UNIT_SCHEMA),
+        (plan.get("schema"), STAGE_C_PLAN_SCHEMA),
+        (approval.get("schema"), STAGE_C_APPROVAL_SCHEMA),
+    )
+):
+    # The legacy deploy publishes an ai-platform-brain-owned release and runs
+    # target packaging code as that unprivileged identity.  Stage C v4 instead
+    # authorizes a root-owned release produced by the still-inert pinned
+    # release-updater boundary.  Never reinterpret or replace that authority
+    # with the target's legacy v3 bootstrap.
+    raise SystemExit(stage_c_interlock_rc)
 plan_sha256 = self_digest(plan, "plan_sha256")
 approval_sha256 = self_digest(approval, "approval_sha256")
 runtime_attestation = plan.get("owner_runtime_attestation")
@@ -1784,6 +2321,47 @@ print(json.dumps({
 PY
 }
 
+prepare_legacy_cutover_unit_inputs_locked() {
+  local target_release="$1"
+  local expected_revision="$2"
+  local probe_rc=0
+  local validation_rc=0
+  probe_cutover_stage_c_authority || probe_rc=$?
+  if [ "$probe_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
+    echo "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER: a root-owned Stage C v4 authority cannot be consumed by the legacy symlink deploy." >&2
+    return "$CUTOVER_STAGE_C_INTERLOCK_RC"
+  fi
+  if [ "$probe_rc" -ne 0 ]; then
+    echo "BLOCKED_CUTOVER_AUTHORITY_AMBIGUOUS: the staged authority cannot be safely classified before legacy bootstrap." >&2
+    return "$CUTOVER_AUTHORITY_AMBIGUOUS_RC"
+  fi
+  if validate_cutover_unit_inputs "$expected_revision" >/dev/null 2>&1; then
+    return 0
+  else
+    validation_rc=$?
+  fi
+  if [ "$validation_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
+    echo "BLOCKED_STAGE_C_REQUIRES_PINNED_UPDATER: a root-owned Stage C v4 authority cannot be consumed by the legacy symlink deploy." >&2
+    return "$CUTOVER_STAGE_C_INTERLOCK_RC"
+  fi
+  bootstrap_cutover_unit_inputs_from_target \
+    "$target_release" "$expected_revision" 8 >/dev/null
+}
+
+prepare_legacy_cutover_unit_inputs() {
+  local target_release="$1"
+  local expected_revision="$2"
+  local prepare_rc=0
+  if ! acquire_cutover_activation_lock; then
+    echo "BLOCKED_CUTOVER_ACTIVATION_LOCK_UNAVAILABLE: the unit-input authority decision cannot be serialized with Stage C rotation." >&2
+    return "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC"
+  fi
+  prepare_legacy_cutover_unit_inputs_locked \
+    "$target_release" "$expected_revision" || prepare_rc=$?
+  exec 8>&-
+  return "$prepare_rc"
+}
+
 require_cutover_unit_inputs() {
   local sha="$1"
   local pr="$2"
@@ -1800,6 +2378,7 @@ require_cutover_unit_inputs() {
 bootstrap_cutover_unit_inputs_from_target() {
   local source="$1"
   local revision="$2"
+  local activation_lock_fd="${3:-}"
   local expected_blob=""
   local observed_blob=""
   local temporary=""
@@ -1832,7 +2411,22 @@ bootstrap_cutover_unit_inputs_from_target() {
     echo "BLOCKED_CUTOVER_UNIT_INPUT_BOOTSTRAP: extracted bootstrap digest drifted." >&2
     return 4
   fi
-  if ! receipt="$("$SYSTEM_PYTHON" -I "$temporary")"; then
+  if [ -n "$activation_lock_fd" ]; then
+    if [[ ! "$activation_lock_fd" =~ ^([3-9]|[1-9][0-9]+)$ ]]; then
+      rm -f -- "$temporary"
+      echo "BLOCKED_CUTOVER_UNIT_INPUT_BOOTSTRAP: inherited activation lock descriptor is invalid." >&2
+      return 4
+    fi
+    receipt="$(
+      "$SYSTEM_ENV" \
+        "$CUTOVER_ACTIVATION_LOCK_FD_ENV=$activation_lock_fd" \
+        "$SYSTEM_PYTHON" -I "$temporary"
+    )" || {
+      rm -f -- "$temporary"
+      echo "BLOCKED_CUTOVER_UNIT_INPUT_BOOTSTRAP: signed unit-input bootstrap failed." >&2
+      return 11
+    }
+  elif ! receipt="$("$SYSTEM_PYTHON" -I "$temporary")"; then
     rm -f -- "$temporary"
     echo "BLOCKED_CUTOVER_UNIT_INPUT_BOOTSTRAP: signed unit-input bootstrap failed." >&2
     return 11
@@ -3101,8 +3695,26 @@ run_deploy() {
     fi
     sudo -n -u "$OWNER" cp -a "$active/.venv" "$tmp/.venv"
     sudo -n -u "$OWNER" bash -lc "printf '%s\n' '$sha' > '$tmp/.codex-source-commit'"
-    if ! validate_cutover_unit_inputs "$sha" >/dev/null 2>&1; then
-      if ! bootstrap_cutover_unit_inputs_from_target "$tmp" "$sha" >/dev/null; then
+    local unit_input_prepare_rc=0
+    prepare_legacy_cutover_unit_inputs "$tmp" "$sha" \
+      || unit_input_prepare_rc=$?
+    if [ "$unit_input_prepare_rc" -ne 0 ]; then
+      if [ "$unit_input_prepare_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
+        rm -rf "$tmp"
+        write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
+          "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+        exit 11
+      elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" ]; then
+        rm -rf "$tmp"
+        write_status "blocked_cutover_authority_ambiguous" "$sha" "$pr" \
+          "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+        exit 11
+      elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC" ]; then
+        rm -rf "$tmp"
+        write_status "blocked_cutover_activation_lock_unavailable" "$sha" "$pr" \
+          "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+        exit 11
+      else
         rm -rf "$tmp"
         write_status "blocked_cutover_unit_input_bootstrap_failed" "$sha" "$pr" \
           "{\"stage\": \"pre_release_packaging\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
@@ -3170,12 +3782,27 @@ run_deploy() {
       exit 5
     fi
   fi
-  if ! validate_cutover_unit_inputs "$sha" >/dev/null 2>&1; then
-    bootstrap_cutover_unit_inputs_from_target "$new" "$sha" >/dev/null || {
+  local unit_input_prepare_rc=0
+  prepare_legacy_cutover_unit_inputs "$new" "$sha" \
+    || unit_input_prepare_rc=$?
+  if [ "$unit_input_prepare_rc" -ne 0 ]; then
+    if [ "$unit_input_prepare_rc" -eq "$CUTOVER_STAGE_C_INTERLOCK_RC" ]; then
+      write_status "blocked_stage_c_requires_pinned_updater" "$sha" "$pr" \
+        "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+      exit 11
+    elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_AUTHORITY_AMBIGUOUS_RC" ]; then
+      write_status "blocked_cutover_authority_ambiguous" "$sha" "$pr" \
+        "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+      exit 11
+    elif [ "$unit_input_prepare_rc" -eq "$CUTOVER_ACTIVATION_LOCK_UNAVAILABLE_RC" ]; then
+      write_status "blocked_cutover_activation_lock_unavailable" "$sha" "$pr" \
+        "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
+      exit 11
+    else
       write_status "blocked_cutover_unit_input_bootstrap_failed" "$sha" "$pr" \
         "{\"stage\": \"existing_release_preflight\", \"unit_inputs_path\": \"$CUTOVER_UNIT_INPUTS_PATH\"}"
       exit 11
-    }
+    fi
   fi
   require_cutover_unit_inputs "$sha" "$pr" >/dev/null || return $?
   if ! release_identity_matches "$new" "$sha"; then
