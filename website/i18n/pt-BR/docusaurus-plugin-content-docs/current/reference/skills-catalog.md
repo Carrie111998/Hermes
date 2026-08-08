@@ -128,6 +128,7 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Cria, lê, edita documentos e templates do Word .docx. | `productivity/docx` |
 | [`google-workspace`](/docs/user-guide/skills/bundled/productivity/productivity-google-workspace) | Gmail, Calendar, Drive, Docs, Sheets via CLI gws ou Python. | `productivity/google-workspace` |
 | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocodificação, POIs, rotas, timezones via OpenStreetMap/OSRM. | `productivity/maps` |
+| [`meeting-action-items`](/docs/user-guide/skills/bundled/productivity/productivity-meeting-action-items) | Transforma notas de reunião em decisões citadas, responsáveis e tickets. | `productivity/meeting-action-items` |
 | [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edita texto/erros de digitação/títulos de PDF via CLI nano-pdf (prompts em linguagem natural). | `productivity/nano-pdf` |
 | [`notion`](/docs/user-guide/skills/bundled/productivity/productivity-notion) | API do Notion + CLI ntn: páginas, bases de dados, markdown, Workers. | `productivity/notion` |
 | [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extrai texto de PDFs/digitalizações (pymupdf, marker-pdf). | `productivity/ocr-and-documents` |
