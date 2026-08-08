@@ -225,3 +225,39 @@ def test_workspace_sensitive_check_stays_available_without_primary_transport():
         with mcp_tool._lock:
             mcp_tool._workspace_server_configs.pop(name, None)
             mcp_tool._workspace_servers.pop(scope_key, None)
+
+
+def test_probe_cleanup_keeps_loop_for_workspace_scoped_server():
+    import tools.mcp_tool as mcp_tool
+
+    scope_key = ("filesystem_probe", "/projects/alpha")
+    scoped = MagicMock(session=object())
+    with mcp_tool._lock:
+        mcp_tool._servers.clear()
+        mcp_tool._server_connecting.clear()
+        mcp_tool._workspace_servers[scope_key] = scoped
+        mcp_tool._workspace_server_connecting.clear()
+
+    try:
+        mcp_tool._ensure_mcp_loop()
+        with mcp_tool._lock:
+            loop = mcp_tool._mcp_loop
+
+        assert mcp_tool._stop_mcp_loop_if_idle() is False
+
+        with mcp_tool._lock:
+            assert mcp_tool._mcp_loop is loop
+        assert loop is not None
+        assert loop.is_running()
+
+        with mcp_tool._lock:
+            mcp_tool._workspace_servers.pop(scope_key, None)
+            mcp_tool._workspace_server_connecting[scope_key] = MagicMock()
+
+        assert mcp_tool._stop_mcp_loop_if_idle() is False
+        assert loop.is_running()
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._workspace_servers.pop(scope_key, None)
+            mcp_tool._workspace_server_connecting.pop(scope_key, None)
+        mcp_tool._stop_mcp_loop()
