@@ -2056,6 +2056,9 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
+        from agent.reasoning_budget import set_reasoning_prompt_tokens
+
+        set_reasoning_prompt_tokens(agent, request_pressure_tokens)
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)

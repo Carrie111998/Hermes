@@ -56,7 +56,7 @@ intentional, bounded construct.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Callable, Tuple
 
 __all__ = ["StreamingThinkScrubber"]
 
@@ -92,10 +92,14 @@ class StreamingThinkScrubber:
     # Pre-compute the longest tag (for partial-tag hold-back bound).
     _MAX_TAG_LEN: int = max(len(tag) for tag in _OPEN_TAGS + _CLOSE_TAGS)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_reasoning_delta: Callable[[str], None] | None = None,
+    ) -> None:
         self._in_block: bool = False
         self._buf: str = ""
         self._last_emitted_ended_newline: bool = True
+        self._on_reasoning_delta = on_reasoning_delta
 
     def reset(self) -> None:
         """Reset all state.  Call at the top of every new turn."""
@@ -126,9 +130,11 @@ class StreamingThinkScrubber:
                     # No close yet — hold back a potential partial
                     # close-tag prefix; discard everything else.
                     held = self._max_partial_suffix(buf, self._CLOSE_TAGS)
+                    self._emit_reasoning(buf[:-held] if held else buf)
                     self._buf = buf[-held:] if held else ""
                     return "".join(out)
                 # Found close: discard block content + tag, continue.
+                self._emit_reasoning(buf[:close_idx])
                 buf = buf[close_idx + close_len:]
                 self._in_block = False
             else:
@@ -149,7 +155,7 @@ class StreamingThinkScrubber:
                 if pair is not None and (
                     open_idx == -1 or pair[0] <= open_idx
                 ):
-                    start_idx, end_idx = pair
+                    start_idx, end_idx, content_start, content_end = pair
                     preceding = buf[:start_idx]
                     if preceding:
                         preceding = self._strip_orphan_close_tags(preceding)
@@ -158,6 +164,7 @@ class StreamingThinkScrubber:
                             self._last_emitted_ended_newline = (
                                 preceding.endswith("\n")
                             )
+                    self._emit_reasoning(buf[content_start:content_end])
                     buf = buf[end_idx:]
                     continue
 
@@ -253,7 +260,7 @@ class StreamingThinkScrubber:
         return best_idx, best_len
 
     def _find_earliest_closed_pair(self, buf: str):
-        """Return (start_idx, end_idx) of the earliest closed pair, else None.
+        """Return bounds for the earliest closed pair, else None.
 
         A closed pair is ``<tag>...</tag>`` of any variant.  Matches are
         case-insensitive and non-greedy (the closest close tag after
@@ -263,7 +270,7 @@ class StreamingThinkScrubber:
         earlier wins.
         """
         buf_lower = buf.lower()
-        best: "tuple[int, int] | None" = None
+        best: "tuple[int, int, int, int] | None" = None
         for open_tag, close_tag in zip(self._OPEN_TAGS, self._CLOSE_TAGS):
             open_lower = open_tag.lower()
             close_lower = close_tag.lower()
@@ -277,8 +284,24 @@ class StreamingThinkScrubber:
                 continue
             end_idx = close_idx + len(close_lower)
             if best is None or open_idx < best[0]:
-                best = (open_idx, end_idx)
+                best = (
+                    open_idx,
+                    end_idx,
+                    open_idx + len(open_lower),
+                    close_idx,
+                )
         return best
+
+    def _emit_reasoning(self, text: str) -> None:
+        """Report suppressed reasoning without affecting visible output."""
+        if not text or self._on_reasoning_delta is None:
+            return
+        try:
+            self._on_reasoning_delta(text)
+        except Exception:
+            # Display scrubbing is a privacy boundary. A telemetry consumer
+            # must never make suppressed reasoning leak into visible output.
+            pass
 
     def _find_open_at_boundary(
         self, buf: str, already_emitted: list[str],

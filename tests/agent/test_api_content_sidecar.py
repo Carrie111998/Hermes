@@ -269,6 +269,23 @@ class TestPrologueStamping:
         assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
         assert agent.api_content_at_persist is None
 
+    def test_reasoning_budget_nudge_is_a_one_shot_sidecar(self):
+        agent = _FakeAgent()
+        agent._pending_reasoning_budget_nudge = True
+
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"
+        assert "previous model response used an unusually large" in msg["api_content"]
+        assert agent.api_content_at_persist == msg["api_content"]
+        assert agent._pending_reasoning_budget_nudge is False
+
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            next_ctx = _build(agent)
+        assert "api_content" not in next_ctx.messages[next_ctx.current_turn_user_idx]
+
     def test_no_stamp_for_codex_app_server(self):
         """codex_app_server turns bypass the api_messages build, so the
         injected bytes are never sent — stamping would persist a lie."""
