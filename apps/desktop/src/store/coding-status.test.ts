@@ -15,8 +15,8 @@ import {
   resolveWorktreeRepoPath
 } from './coding-status'
 import { $connection, $currentCwd, $selectedStoredSessionId } from './session'
-import { $sessionStates, $focusedStoredSessionId } from './session-states'
-import { $activeSessionId } from './session'
+import { $sessionStates } from './session-states'
+import { setActiveSessionId } from './session'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
@@ -300,8 +300,7 @@ describe('resolveWorktreeRepoPath (#81724)', () => {
     // into the next case (the `desktopGit().repoStatus` cache and session
     // runtime map both outlast a single test when not cleared here).
     $sessionStates.set({})
-    $activeSessionId.set(null)
-    $focusedStoredSessionId.set(null)
+    setActiveSessionId(null)
   })
 
   afterEach(() => {
