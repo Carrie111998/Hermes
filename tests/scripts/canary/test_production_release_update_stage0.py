@@ -35,10 +35,10 @@ from tests.scripts.canary import (
 
 NOW = 1_900_000_000
 PREDECESSOR = "1" * 40
-TARGET = "2" * 40
+TARGET = input_test.TARGET
 BUILDER_UID = 29104
 BUILDER_GID = 29104
-_BASE_V4_PAYLOAD = v4_test._payload()
+_BASE_V4_PAYLOAD = input_test._payload()  # noqa: SLF001
 RUNTIME_UIDS = tuple(_BASE_V4_PAYLOAD["reserved_runtime_uids"])
 RESERVED_GIDS = list(_BASE_V4_PAYLOAD["reserved_runtime_gids"])
 
@@ -472,7 +472,7 @@ def _fixture(tmp_path: Path) -> Fixture:
     private, trust = _authority()
     payload = dict(
         unit_v4.build_payload(
-            v3_payload=v4_test._v3_payload(),
+            v3_payload=input_test._v3_payload(),  # noqa: SLF001
             builder_identity=builder_identity,
             builder_terminal_receipt_sha256=terminal["receipt_sha256"],
             whole_tree_manifest_sha256=manifest["manifest_sha256"],
@@ -483,7 +483,7 @@ def _fixture(tmp_path: Path) -> Fixture:
             owner_gate_receipt_public_key_id="0b" * 32,
         )
     )
-    unit_plan, unit_approval, unit_publication = v4_test._unit_documents(
+    unit_plan, unit_approval, unit_publication = input_test._unit_documents(  # noqa: SLF001
         private,
         trust,
         payload,
@@ -491,14 +491,29 @@ def _fixture(tmp_path: Path) -> Fixture:
     host_receipt = dict(
         host_test._observe(host_test._harness()).receipt
     )
+    host_receipt["observed_at_unix_ns"] = NOW * 1_000_000_000
+    host_receipt["target_revision"] = TARGET
+    input_test._rehash(host_receipt, "receipt_sha256")  # noqa: SLF001
     consumer_set = update_inputs.build_release_consumer_set(
         predecessor_revision=PREDECESSOR,
         release_revision=TARGET,
+    )
+    full_collector = input_test.owner_test._collector_receipt(  # noqa: SLF001
+        NOW,
+        input_test.owner_test.Services(),
     )
     host_manifest = input_test._host_manifest(
         payload,
         unit_plan,
         unit_approval,
+        full_collector["host_transition"],
+    )
+    initial_collector, host_mutation_authority = (
+        input_test._host_mutation_authority(  # noqa: SLF001
+        host_manifest,
+        host_receipt,
+        full_collector,
+        )
     )
     cron_index = input_test._cron_index()
     alias_index = input_test._alias_index()
@@ -509,6 +524,12 @@ def _fixture(tmp_path: Path) -> Fixture:
         ],
         "host_artifact_manifest_sha256": host_manifest[
             "manifest_sha256"
+        ],
+        "host_mutation_authority_sha256": host_mutation_authority[
+            "receipt_sha256"
+        ],
+        "host_mutation_initial_collector_receipt_sha256": initial_collector[
+            "receipt_sha256"
         ],
         "cron_artifact_index_sha256": cron_index[
             "artifact_index_sha256"
@@ -532,6 +553,8 @@ def _fixture(tmp_path: Path) -> Fixture:
         "host_inventory_sha256": host_receipt,
         "release_consumer_set_sha256": consumer_set,
         "host_artifact_manifest_sha256": host_manifest,
+        "host_mutation_authority_sha256": host_mutation_authority,
+        "host_mutation_initial_collector_receipt_sha256": initial_collector,
         "cron_artifact_index_sha256": cron_index,
         "alias_artifact_index_sha256": alias_index,
         "successor_unit_input_publication_sha256": unit_publication,

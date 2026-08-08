@@ -95,7 +95,7 @@ RELEASE_UNIT_APPROVAL_SCHEMA = (
 RELEASE_UNIT_PUBLICATION_SCHEMA = (
     "muncho-production-release-unit-input-publication.v4"
 )
-RELEASE_UPDATE_PLAN_SCHEMA = "muncho-production-release-update-plan.v5"
+RELEASE_UPDATE_PLAN_SCHEMA = "muncho-production-release-update-plan.v7"
 RELEASE_UPDATE_APPROVAL_SCHEMA = (
     "muncho-production-release-update-approval.v1"
 )

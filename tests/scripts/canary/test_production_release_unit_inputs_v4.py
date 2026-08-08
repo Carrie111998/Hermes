@@ -255,6 +255,8 @@ def _release_update_values(
         "host_inventory_sha256": "0e" * 32,
         "release_consumer_set_sha256": "0f" * 32,
         "host_artifact_manifest_sha256": "10" * 32,
+        "host_mutation_authority_sha256": "16" * 32,
+        "host_mutation_initial_collector_receipt_sha256": "17" * 32,
         "cron_artifact_index_sha256": "12" * 32,
         "alias_artifact_index_sha256": "13" * 32,
         "successor_unit_input_publication_sha256": (
