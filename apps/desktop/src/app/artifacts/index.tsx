@@ -50,7 +50,12 @@ import {
 } from './artifact-utils'
 
 function formatArtifactTime(timestamp: number): string {
-  return fmtDayTime.format(new Date(timestamp))
+  // Session and message timestamps are epoch seconds, while Date expects
+  // epoch milliseconds. Keep accepting millisecond values for compatibility
+  // with any newer backend that may already normalize them.
+  const milliseconds = timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
+
+  return fmtDayTime.format(new Date(milliseconds))
 }
 
 function pageRangeLabel(total: number, page: number, pageSize: number, a: Translations['artifacts']): string {
