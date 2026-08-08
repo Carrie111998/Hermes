@@ -3315,12 +3315,17 @@ def run_job(
         with cron_jobs.use_cron_store(owner_home):
             with _cron_profile_context(job):
                 return _run_job_unscoped(
-                    job, defer_agent_teardown=defer_agent_teardown
+                    job,
+                    defer_agent_teardown=defer_agent_teardown,
+                    extra_prompt=extra_prompt,
                 )
 
 
 def _run_job_unscoped(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    extra_prompt: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")

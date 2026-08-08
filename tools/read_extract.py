@@ -35,6 +35,10 @@ ANYDOC_EXTENSIONS = frozenset({
     ".rtf", ".epub", ".pdf",
 })
 MAX_XLSX_BYTES = 50 * 1024 * 1024
+MAX_OFFICE_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_OFFICE_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_OFFICE_MEMBER_COUNT = 1024
+MAX_OFFICE_COMPRESSION_RATIO = 200
 # Refuse to convert huge documents. anydoc loads the whole file through its
 # Rust core with no streaming, and the read_file char budget only applies
 # after conversion, so an unbounded input can pin a tool turn and spike RAM.

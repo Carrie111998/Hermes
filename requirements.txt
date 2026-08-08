@@ -30,8 +30,9 @@ concurrent-log-handler==0.9.29
     # via hermes-agent (pyproject.toml)
 croniter==6.0.0
     # via hermes-agent (pyproject.toml)
-cryptography==48.0.1
+cryptography==50.0.0
     # via
+    #   --override (workspace)
     #   hermes-agent (pyproject.toml)
     #   pyjwt
 distro==1.9.0
@@ -69,7 +70,7 @@ markupsafe==3.0.3
     # via jinja2
 mdurl==0.1.2
     # via markdown-it-py
-nemo-relay==0.6.0
+nemo-relay==0.7.2
     # via hermes-agent (pyproject.toml)
 openai==2.24.0
     # via hermes-agent (pyproject.toml)
@@ -142,12 +143,10 @@ tqdm==4.69.0
     # via openai
 typing-extensions==4.16.0
     # via
-    #   anyio
     #   fastapi
     #   openai
     #   pydantic
     #   pydantic-core
-    #   starlette
     #   typing-inspection
 typing-inspection==0.4.2
     # via

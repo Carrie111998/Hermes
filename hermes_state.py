@@ -5940,16 +5940,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         last_active = session_row.get("last_active") or session_row.get("started_at")
         return float(last_active or 0) > float(last_read)
 
-    def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
-        """Look up a session by exact title. Returns session dict or None."""
-        with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.title = ?",
-                (title,),
+    def get_session_by_title(
+        self,
+        title: str,
+        source: str = None,
+        user_id: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a session by exact title, optionally scoped to its owner."""
+        where_clauses = ["s.title = ?"]
+        params: list[Any] = [title]
+        order_clause = ""
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if user_id is not None:
+            where_clauses.append("(s.user_id = ? OR s.user_id IS NULL)")
+            params.append(user_id)
+            order_clause = (
+                " ORDER BY CASE WHEN s.user_id = ? THEN 0 ELSE 1 END, "
+                "s.started_at DESC"
             )
             params.append(user_id)
         query = (
@@ -5984,6 +5993,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = _escape_like(title)
+        where_clauses = ["title LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [f"{escaped} #%"]
+        order_prefix = ""
+        if source:
+            where_clauses.append("source = ?")
+            params.append(source)
+        if user_id is not None:
+            where_clauses.append("(user_id = ? OR user_id IS NULL)")
+            params.append(user_id)
+            order_prefix = "CASE WHEN user_id = ? THEN 0 ELSE 1 END, "
+            params.append(user_id)
+        query = (
+            "SELECT id, title, started_at FROM sessions "
+            f"WHERE {' AND '.join(where_clauses)} "
+            f"ORDER BY {order_prefix}started_at DESC"
+        )
         with self._read_ctx() as conn:
             cursor = conn.execute(query, params)
             numbered = cursor.fetchall()

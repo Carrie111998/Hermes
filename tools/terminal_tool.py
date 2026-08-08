@@ -1410,6 +1410,13 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
 
+def _normalize_docker_host_cwd(cwd: str) -> str:
+    expanded = os.path.expanduser(cwd)
+    if expanded.startswith(("/Users/", "/home/")):
+        return expanded
+    return os.path.abspath(expanded)
+
+
 def _is_unusable_container_cwd(cwd: str) -> bool:
     """Return True if *cwd* is a host/relative path that won't work as the
     working directory inside a container sandbox.
