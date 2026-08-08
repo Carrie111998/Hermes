@@ -149,6 +149,13 @@ def _(rid, params: dict) -> dict:
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
 
+    # A warm desktop/TUI record can outlive writes from another gateway
+    # process. Refresh before claiming the turn so both the inline snapshot and
+    # the compute-host frame receive the authoritative durable model rows while
+    # retaining any newer live-only tail. Best-effort: storage failures leave
+    # the current in-memory history untouched.
+    _refresh_live_model_history(session)
+
     with session["history_lock"]:
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
