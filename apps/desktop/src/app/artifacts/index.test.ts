@@ -80,8 +80,30 @@ describe('collectArtifactsForSession', () => {
     expect(artifacts[0]).toMatchObject({
       href: 'file:///C:/Work/a.md',
       kind: 'file',
+      label: 'a.md',
       value: 'C:\\Work\\a.md'
     })
+  })
+
+  it('labels forward-slash and backslash Windows paths identically', () => {
+    const backslash = collectArtifactsForSession(makeSession(), [
+      {
+        content: 'Report saved to C:\\Work\\a.md for review.',
+        role: 'assistant',
+        timestamp: 2000
+      }
+    ])
+
+    const forwardSlash = collectArtifactsForSession(makeSession(), [
+      {
+        content: 'Report saved to C:/Work/a.md for review.',
+        role: 'assistant',
+        timestamp: 2000
+      }
+    ])
+
+    expect(backslash[0]?.label).toBe('a.md')
+    expect(forwardSlash[0]?.label).toBe('a.md')
   })
 
   it('resolves remote image artifact thumbnails through the desktop fs bridge', async () => {

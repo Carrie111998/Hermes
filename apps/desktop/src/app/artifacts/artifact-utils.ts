@@ -119,6 +119,14 @@ export async function artifactImageSrc(value: string, href = artifactHref(value)
 }
 
 function artifactLabel(value: string): string {
+  // Windows drive-letter paths parse `C:` as a scheme (protocol "c:") with a
+  // backslash pathname that split('/') cannot reduce — C:\Work\a.md would
+  // label as \Work\a.md (drive letter swallowed). Split on both separators
+  // up front so backslash and forward-slash forms label identically.
+  if (/^[a-zA-Z]:[\\/]/.test(value)) {
+    return value.split(/[\\/]/).filter(Boolean).pop() || value
+  }
+
   try {
     const url = new URL(value)
     const item = url.pathname.split('/').filter(Boolean).pop()
