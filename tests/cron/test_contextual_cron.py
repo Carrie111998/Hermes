@@ -1540,6 +1540,53 @@ def test_v2_delivery_recovery_passes_sealed_route_authority_to_gateway(monkeypat
     }
 
 
+def test_recovery_never_retries_a_lost_route_locked_delivery_claim(monkeypatch):
+    import json
+
+    import cron.scheduler as scheduler
+
+    def authorize(target):
+        target["_contextual_delivery_claim_attempted"] = True
+        return True
+
+    monkeypatch.setattr(scheduler, "_CONTEXTUAL_AUTHORIZER", authorize)
+    monkeypatch.setattr(
+        scheduler,
+        "claim_contextual_delivery",
+        lambda *_a, **_k: pytest.fail("claim retried outside the route lock"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_a, **_k: pytest.fail("lost claim must not deliver"),
+    )
+
+    assert scheduler._resume_contextual_delivery_record(
+        {"id": "job"},
+        {
+            "id": "execution",
+            "session_key": "telegram:dm:42",
+            "admitted_binding_version": 2,
+            "admitted_route_instance_id": "route-instance-a",
+            "admitted_session_id": "session-a",
+            "admitted_routing_revision": 7,
+            "result_json": json.dumps({"final_response": "notify"}),
+            "delivery_target_json": json.dumps(
+                {
+                    "id": "job",
+                    "deliver": "origin",
+                    "origin": {
+                        "platform": "telegram",
+                        "chat_type": "dm",
+                        "chat_id": "42",
+                        "user_id": "42",
+                    },
+                }
+            ),
+        },
+    ) is False
+
+
 def test_contextual_delivery_exception_is_persisted_unknown_without_retry(monkeypatch):
     import cron.scheduler as scheduler
     from gateway.contextual_cron import ContextualCronOutcome

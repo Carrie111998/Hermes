@@ -45,6 +45,34 @@ def test_delivery_authorizer_rejects_a_deleted_sealed_route():
     ) is False
 
 
+def test_delivery_authorizer_marks_a_lost_locked_claim_as_attempted():
+    runner = object.__new__(GatewayRunner)
+    cast(Any, runner).session_store = SimpleNamespace(
+        claim_contextual_delivery_authority=lambda *_a, **_k: (True, False)
+    )
+    cast(Any, runner)._is_user_authorized = lambda source: True
+    target = {
+        "origin": {
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "42",
+            "user_id": "42",
+        },
+        "_contextual_authority": {
+            "execution_id": "execution",
+            "session_key": "telegram:dm:42",
+            "binding_version": 2,
+            "route_instance_id": "route-instance-a",
+            "session_id": "session-a",
+            "routing_revision": 7,
+        },
+    }
+
+    assert runner._authorize_contextual_delivery_from_scheduler(target) is True
+    assert target["_contextual_delivery_claim_attempted"] is True
+    assert "_contextual_delivery_claimed" not in target
+
+
 def test_delivery_authority_claim_is_linearized_with_the_route():
     source = SessionSource(
         platform=Platform.TELEGRAM,

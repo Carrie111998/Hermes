@@ -4808,7 +4808,16 @@ def _resume_contextual_delivery_record(
     delivery_claimed = bool(
         authorization_target.get("_contextual_delivery_claimed")
     )
-    if not delivery_claimed and claim_contextual_delivery(execution_id) is None:
+    delivery_claim_attempted = bool(
+        authorization_target.get("_contextual_delivery_claim_attempted")
+    )
+    if (
+        not delivery_claimed
+        and not delivery_claim_attempted
+        and claim_contextual_delivery(execution_id) is None
+    ):
+        return False
+    if not delivery_claimed and delivery_claim_attempted:
         return False
     try:
         try:
@@ -5344,7 +5353,19 @@ def run_one_job(
                 else:
                     contextual_delivery_claimed = bool(
                         authorization_target.get("_contextual_delivery_claimed")
-                    ) or (claim_contextual_delivery(execution_id) is not None)
+                    )
+                    contextual_delivery_claim_attempted = bool(
+                        authorization_target.get(
+                            "_contextual_delivery_claim_attempted"
+                        )
+                    )
+                    if (
+                        not contextual_delivery_claimed
+                        and not contextual_delivery_claim_attempted
+                    ):
+                        contextual_delivery_claimed = (
+                            claim_contextual_delivery(execution_id) is not None
+                        )
                     if not contextual_delivery_claimed:
                         # A concurrent/replayed scheduler does not own delivery.
                         should_deliver = False

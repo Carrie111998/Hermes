@@ -16829,6 +16829,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             return False
         authorized, claimed = authorization_result
+        if authorized:
+            # This was the one route-locked claim attempt.  The scheduler must
+            # not retry a lost CAS after the route lock is released because a
+            # reset/recreate can occur in that gap.
+            target["_contextual_delivery_claim_attempted"] = True
         if claimed:
             target["_contextual_delivery_claimed"] = True
         return bool(authorized)
