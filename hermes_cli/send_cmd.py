@@ -263,10 +263,16 @@ def _load_hermes_env() -> None:
     env_path = home / ".env"
     if load_dotenv and env_path.exists():
         try:
-            load_dotenv(str(env_path), override=True, encoding="utf-8")
+            load_dotenv(
+                str(env_path), override=True, encoding="utf-8",
+                interpolate=False,
+            )
         except UnicodeDecodeError:
             try:
-                load_dotenv(str(env_path), override=True, encoding="latin-1")
+                load_dotenv(
+                    str(env_path), override=True, encoding="latin-1",
+                    interpolate=False,
+                )
             except Exception:
                 pass
         except Exception:
