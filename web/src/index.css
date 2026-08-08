@@ -253,3 +253,87 @@ html[dir="rtl"] {
   direction: rtl;
 }
 
+/* Hermes Studio shell — scoped to the three Studio appearance presets so
+   legacy themes remain visually unchanged. */
+html[data-theme-name^="studio-"] .studio-shell {
+  background: var(--background-base);
+}
+
+html[data-theme-name^="studio-"] .studio-primary-sidebar,
+html[data-theme-name^="studio-"] .studio-mobile-header {
+  background: color-mix(in srgb, var(--color-card) 92%, transparent);
+  border-color: var(--color-border);
+  box-shadow: none;
+  backdrop-filter: blur(18px) saturate(1.1);
+}
+
+html[data-theme-name^="studio-"] .studio-context-sidebar {
+  background: color-mix(in srgb, var(--color-card) 96%, transparent);
+  border-color: var(--color-border);
+}
+
+html[data-theme-name^="studio-"] .studio-brand-mark {
+  background: var(--color-foreground);
+  color: var(--background-base);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--background-base) 12%, transparent);
+}
+
+html[data-theme-name^="studio-"] .studio-nav-link {
+  margin-inline: 0.5rem;
+  border-radius: 0.625rem;
+  padding: 0.625rem 0.75rem;
+  font-family: var(--theme-font-sans);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  letter-spacing: -0.006em;
+  text-transform: none;
+}
+
+html[data-theme-name^="studio-"] .studio-nav-link[aria-current="page"] {
+  background: var(--color-accent);
+  color: var(--color-accent-foreground);
+}
+
+html[data-theme-name^="studio-"] .studio-nav-link[aria-current="page"] > span.absolute {
+  display: none;
+}
+
+html[data-theme-name^="studio-"] .font-mondwest,
+html[data-theme-name^="studio-"] .font-expanded,
+html[data-theme-name^="studio-"] .font-compressed {
+  font-family: var(--theme-font-display) !important;
+}
+
+html[data-theme-name^="studio-"] .text-display,
+html[data-theme-name^="studio-"] .studio-shell .uppercase {
+  text-transform: none;
+  letter-spacing: -0.006em;
+}
+
+html[data-theme-name^="studio-"] .studio-shell [class*="tracking-["] {
+  letter-spacing: 0.01em;
+}
+
+html[data-theme-name^="studio-"] .studio-main {
+  background: var(--background-base);
+}
+
+html[data-theme-name^="studio-"] .studio-page-frame {
+  max-width: 100%;
+}
+
+html[data-theme-name^="studio-"] :focus-visible {
+  outline-color: var(--color-ring);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-shell *,
+  .studio-shell *::before,
+  .studio-shell *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+

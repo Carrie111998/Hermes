@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from unittest.mock import AsyncMock
 
 from hermes_cli import web_server
 
@@ -20,6 +21,37 @@ class FakeBridge:
 
     def close(self):
         self.alive = False
+
+
+def test_terminate_pty_endpoint_closes_attach_token_sessions(monkeypatch):
+    from starlette.testclient import TestClient
+
+    terminate = AsyncMock(return_value=2)
+    monkeypatch.setattr(web_server.PTY_REGISTRY, "terminate_attach_token", terminate)
+
+    with TestClient(web_server.app) as client:
+        response = client.post(
+            "/api/pty/terminate",
+            json={"attach_token": "07" * 16},
+            headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "terminated": 2}
+    terminate.assert_awaited_once_with("07" * 16)
+
+
+def test_terminate_pty_endpoint_rejects_invalid_attach_token():
+    from starlette.testclient import TestClient
+
+    with TestClient(web_server.app) as client:
+        response = client.post(
+            "/api/pty/terminate",
+            json={"attach_token": "not-a-token"},
+            headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+        )
+
+    assert response.status_code == 422
 
 
 @pytest.fixture

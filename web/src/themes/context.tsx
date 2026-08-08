@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { BUILTIN_THEMES, defaultTheme } from "./presets";
+import { BUILTIN_THEMES, defaultTheme, resolveBuiltinTheme } from "./presets";
 import {
   FONT_CHOICES,
   THEME_DEFAULT_FONT_ID,
@@ -347,6 +347,12 @@ function applyFontOverride(fontId: string | undefined) {
 function applyTheme(theme: DashboardTheme) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
+  root.dataset.themeName = theme.name;
+  if (theme.name === "studio-light" || theme.name === "studio-dark") {
+    root.style.colorScheme = theme.name === "studio-dark" ? "dark" : "light";
+  } else {
+    root.style.removeProperty("color-scheme");
+  }
 
   // Clear any overrides from a previous theme before applying the new set.
   for (const cssVar of ALL_OVERRIDE_VARS) {
@@ -409,6 +415,21 @@ function applyTheme(theme: DashboardTheme) {
 // ---------------------------------------------------------------------------
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
+  const [prefersDark, setPrefersDark] = useState(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (event: MediaQueryListEvent) => setPrefersDark(event.matches);
+    setPrefersDark(media.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
   /** Name of the currently active theme (built-in id or user YAML name). */
   const [themeName, setThemeName] = useState<string>(() => {
     if (typeof window === "undefined") return "default";
@@ -453,12 +474,12 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const resolveTheme = useCallback(
     (name: string): DashboardTheme => {
       return (
-        BUILTIN_THEMES[name] ??
+        resolveBuiltinTheme(name, prefersDark) ??
         userThemeDefs[name] ??
         defaultTheme
       );
     },
-    [userThemeDefs],
+    [prefersDark, userThemeDefs],
   );
 
   // Apply the active theme (and re-assert the font override at its tail)

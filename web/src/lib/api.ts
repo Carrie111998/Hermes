@@ -337,6 +337,16 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 export const api = {
   buildWsUrl,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
+  terminatePty: (attachToken: string) =>
+    fetchJSON<{ ok: boolean; terminated: number }>("/api/pty/terminate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ attach_token: attachToken }),
+    }),
+  getDashboardPages: (query?: string) => {
+    const suffix = query ? `?query=${encodeURIComponent(query)}` : "";
+    return fetchJSON<DashboardPagesResponse>(`/api/dashboard/pages${suffix}`);
+  },
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
    *
@@ -1339,6 +1349,19 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+}
+
+export interface DashboardPage {
+  description: string;
+  group: "workspace" | "automations" | "integrations" | "manage" | "extensions";
+  id: string;
+  label: string;
+  path: string;
+}
+
+export interface DashboardPagesResponse {
+  count: number;
+  pages: DashboardPage[];
 }
 
 export interface ActionResponse {

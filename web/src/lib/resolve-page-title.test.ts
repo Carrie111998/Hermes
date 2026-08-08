@@ -39,6 +39,10 @@ describe("resolvePageTitle", () => {
     expect(resolvePageTitle("/files", t, [])).toBe("Files");
   });
 
+  it("uses a human-readable title for the profile builder route", () => {
+    expect(resolvePageTitle("/profiles/new", t, [])).toBe("New profile");
+  });
+
   it("prefers plugin tab labels", () => {
     expect(
       resolvePageTitle("/kanban", t, [{ path: "/kanban", label: "Kanban" }]),

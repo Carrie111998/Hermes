@@ -205,6 +205,40 @@ class TestPtyBridgeClose:
         assert sent == [(67890, signal.SIGHUP)]
         assert bridge._closed is True
 
+    def test_close_forces_cleanup_when_liveness_probe_raises(self, monkeypatch):
+        sent = []
+
+        class _FailingProbeProc:
+            pid = 12345
+            fd = -1
+
+            def isalive(self):
+                raise RuntimeError("probe failed")
+
+            def kill(self, sig):
+                sent.append(("kill", sig))
+
+            def close(self, force=False):
+                self.closed = force
+
+        fake = _FailingProbeProc()
+        monkeypatch.setattr(os, "getpgid", lambda pid: 67890)
+        monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._proc = fake
+        bridge._fd = -1
+        bridge._closed = False
+
+        bridge.close()
+
+        assert [sig for pgid, sig in sent if pgid == 67890] == [
+            signal.SIGHUP,
+            signal.SIGTERM,
+            signal.SIGKILL,
+        ]
+        assert fake.closed is True
+        assert bridge._closed is True
+
 
 @skip_on_windows
 class TestPtyBridgeEnv:
