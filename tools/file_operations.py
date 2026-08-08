@@ -1156,6 +1156,23 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_rg_path(self, path: str) -> str:
+        """Quote a search root for ripgrep without MSYS path rewriting.
+
+        The local Windows backend intentionally sets ``MSYS_NO_PATHCONV=1`` so
+        native utilities such as ``schtasks`` keep their command-line flags.
+        WinGet's native ``rg.exe`` therefore does not understand a Git Bash
+        ``/c/...`` path.  Keep the normal shell escaping for POSIX tools, but
+        pass a forward-slash native drive path to ripgrep on Windows.
+        """
+        if os.name != "nt":
+            return self._escape_shell_arg(path)
+
+        from tools.environments.local import _msys_to_windows_path
+
+        native_path = _msys_to_windows_path(path).replace("\\", "/")
+        return "'" + native_path.replace("'", "'\"'\"'") + "'"
+
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
 
@@ -2547,7 +2564,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._escape_shell_arg(pattern)} {self._escape_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2569,7 +2586,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._escape_shell_arg(pattern)} {self._escape_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2589,7 +2606,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+                f"{self._escape_shell_arg(pattern)} {self._escape_rg_path(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -2711,7 +2728,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_rg_path(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2722,7 +2739,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_rg_path(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2806,7 +2823,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_rg_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
