@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 import { MessageLine } from '../components/messageLine.js'
 import { MAX_HISTORY } from '../config/limits.js'
 import { toTranscriptMessages } from '../domain/messages.js'
-import { capTranscriptHistory, stampHumanMessage, upsert } from '../lib/messages.js'
+import { capTranscriptHistory, stampHumanMessage, streamingAssistantMessage, upsert } from '../lib/messages.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -201,6 +201,18 @@ describe('stampHumanMessage', () => {
     expect(stampHumanMessage({ role: 'assistant', text: 'reply', timestamp: 123 }, now).timestamp).toBe(123)
     expect(stampHumanMessage({ role: 'system', text: 'notice' }, now).timestamp).toBeUndefined()
     expect(stampHumanMessage({ role: 'tool', text: 'progress' }, now).timestamp).toBeUndefined()
+    expect(stampHumanMessage({ role: 'assistant', text: '   ' }, now).timestamp).toBeUndefined()
+  })
+
+  it('gives a streamed assistant bubble one deterministic turn timestamp', () => {
+    const timestamp = 1_786_165_445_000
+
+    expect(streamingAssistantMessage('partial', timestamp, ['web_search'])).toEqual({
+      role: 'assistant',
+      text: 'partial',
+      timestamp,
+      tools: ['web_search']
+    })
   })
 })
 
