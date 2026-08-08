@@ -5216,6 +5216,17 @@ def _server_breaker_key(server_name: str, task_id: Optional[str]) -> Any:
     return server_name
 
 
+def _clear_workspace_breaker_state_locked() -> None:
+    """Drop breaker entries owned by workspace-scoped transports."""
+    for state in (_server_error_counts, _server_breaker_opened_at):
+        workspace_keys = [
+            key for key in state
+            if isinstance(key, tuple) and len(key) == 2
+        ]
+        for key in workspace_keys:
+            state.pop(key, None)
+
+
 def _connect_workspace_server(
     server_name: str,
     task_id: Optional[str],
@@ -7450,6 +7461,7 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _clear_workspace_breaker_state_locked()
             _workspace_servers.clear()
             connecting = list(_workspace_server_connecting.values())
             _workspace_server_connecting.clear()
@@ -7478,6 +7490,7 @@ def shutdown_mcp_servers():
             # stale per-server backoff from before the restart (#50394).
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _clear_workspace_breaker_state_locked()
         for ready in connecting:
             ready.set()
 
@@ -7503,6 +7516,7 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+        _clear_workspace_breaker_state_locked()
         _workspace_servers.clear()
         connecting = list(_workspace_server_connecting.values())
         _workspace_server_connecting.clear()

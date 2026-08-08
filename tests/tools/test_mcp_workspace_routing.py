@@ -188,3 +188,18 @@ def test_workspace_sensitive_circuit_breaker_is_scoped_by_workspace(monkeypatch)
         mcp_tool._workspace_server_configs.clear()
         mcp_tool._server_error_counts.clear()
         mcp_tool._server_breaker_opened_at.clear()
+
+
+def test_shutdown_clears_workspace_scoped_circuit_breakers():
+    import tools.mcp_tool as mcp_tool
+
+    workspace_key = ("filesystem", "/projects/alpha")
+    mcp_tool._server_error_counts[workspace_key] = (
+        mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+    )
+    mcp_tool._server_breaker_opened_at[workspace_key] = 1.0
+
+    mcp_tool.shutdown_mcp_servers()
+
+    assert workspace_key not in mcp_tool._server_error_counts
+    assert workspace_key not in mcp_tool._server_breaker_opened_at
