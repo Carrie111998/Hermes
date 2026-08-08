@@ -13,7 +13,6 @@ agent's context for that turn if it was stacked behind an allowed one.
 """
 
 import asyncio
-
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -87,6 +86,25 @@ def _make_runner():
     return runner
 
 
+def _enable_normal_message_flow(runner):
+    state = SimpleNamespace(
+        turn=SimpleNamespace(lease=None, agent=None, started_ts=None),
+        conversation=SimpleNamespace(model_override=None, one_turn_restore=None),
+        persistent=SimpleNamespace(native_image_paths=[]),
+    )
+    runner._external_drain_active = False
+    runner._claim_active_session_slot = lambda *_args, **_kwargs: (None, None)
+    runner._session_state = lambda _key: state
+    runner._persist_active_agents = lambda: None
+    runner._begin_session_run_generation = lambda _key: 1
+    runner._restore_moa_one_shot = lambda *_args, **_kwargs: None
+    runner._restore_pending_one_turn_model_override = lambda *_args, **_kwargs: None
+    runner._release_turn_lease = lambda *_args, **_kwargs: None
+    runner._handle_message_with_agent = AsyncMock(
+        return_value={"final_response": "agent ok", "messages": []}
+    )
+
+
 def _make_skill(skills_dir, name, body="content"):
     sd = skills_dir / name
     sd.mkdir(parents=True, exist_ok=True)
@@ -131,8 +149,7 @@ def skills_env(tmp_path, monkeypatch):
     return skills_dir
 
 
-@pytest.mark.asyncio
-async def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch, skills_env):
+def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch, skills_env):
     """The whole stacked invocation is rejected when a NON-leading stacked
     skill is disabled for the message's platform — it must not silently load
     that skill's content just because only the first skill was checked."""
@@ -152,8 +169,8 @@ async def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch
     )
 
     runner = _make_runner()
-    result = await runner._handle_message(
-        _make_event("/allowed-skill /disabled-skill do something")
+    result = asyncio.run(
+        runner._handle_message(_make_event("/allowed-skill /disabled-skill do something"))
     )
 
     assert result is not None
@@ -186,3 +203,60 @@ def test_gateway_skill_dispatch_denies_governance_blocked_skill(monkeypatch, tmp
     assert result is not None
     assert "ToolTrust" in result
     assert "historical intent" in result
+
+
+def test_gateway_skill_dispatch_denies_protected_setup_failure(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    home = tmp_path / "home"
+    _configure_protected_governance(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: (_ for _ in ()).throw(RuntimeError("simulated governance setup failure")),
+    )
+
+    runner = _make_runner()
+    result = asyncio.run(runner._handle_message(_make_event("/tooltrust do something")))
+
+    assert result is not None
+    assert '"/tooltrust"' in result
+    assert "denied" in result.lower()
+    assert "protected task class" in result
+
+
+def test_gateway_skill_dispatch_keeps_unprotected_behavior_on_setup_failure(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    home = tmp_path / "home"
+    _configure_protected_governance(home)
+    (home / "config.yaml").write_text(
+        """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: general_ops
+    protected_task_classes:
+      - ardyn_engineering
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: (_ for _ in ()).throw(RuntimeError("simulated governance setup failure")),
+    )
+
+    runner = _make_runner()
+    _enable_normal_message_flow(runner)
+    result = asyncio.run(runner._handle_message(_make_event("/tooltrust do something")))
+
+    assert isinstance(result, dict)
+    assert result["final_response"] == "agent ok"
+    runner._handle_message_with_agent.assert_awaited_once()

@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_config_path
 from agent.skill_preprocessing import (
     expand_inline_shell as _expand_inline_shell,
     load_skills_config as _load_skills_config,
@@ -68,6 +68,32 @@ SKILL_SCAFFOLD_SQL_LIKE = _SKILL_INVOCATION_PREFIX + "%"
 # the joint (a bundle instruction cut off by the head window); callers cut the
 # description there rather than show the skill body on the far side.
 SKILL_EXCERPT_JOINT = "\x1e"
+
+
+def _protected_task_class_configured_fallback() -> bool:
+    """Best-effort config-only fallback when skill_governance can't import."""
+    try:
+        from agent.skill_utils import yaml_load
+
+        config_path = get_config_path()
+        if not config_path.exists():
+            return False
+        raw = yaml_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return False
+        skills_cfg = raw.get("skills") if isinstance(raw.get("skills"), dict) else {}
+        gov_cfg = skills_cfg.get("governance") if isinstance(skills_cfg.get("governance"), dict) else {}
+        task_class = str(gov_cfg.get("task_class") or "").strip().lower()
+        if not task_class:
+            return False
+        protected = gov_cfg.get("protected_task_classes") or []
+        if isinstance(protected, str):
+            protected = [protected]
+        protected_names = {str(item or "").strip().lower() for item in protected if str(item or "").strip()}
+        return task_class in protected_names
+    except Exception:
+        logger.debug("Failed to inspect protected skill governance fallback", exc_info=True)
+        return False
 
 
 def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
@@ -795,13 +821,16 @@ def build_preloaded_skills_prompt(
         disabled_names = get_disabled_skill_names()
     except Exception:
         disabled_names = set()
+    _protected_task = False
     try:
-        from agent.skill_governance import evaluate_skill_selection, governance_context
-
-        _governance_context = governance_context(mode="preload")
+        from agent.skill_governance import (
+            evaluate_skill_selection_fail_closed,
+            is_protected_task_class_configured,
+        )
+        _protected_task = is_protected_task_class_configured()
     except Exception:
-        evaluate_skill_selection = None
-        _governance_context = None
+        evaluate_skill_selection_fail_closed = None
+        _protected_task = _protected_task_class_configured_fallback()
 
     seen: set[str] = set()
     for raw_identifier in skill_identifiers:
@@ -821,12 +850,19 @@ def build_preloaded_skills_prompt(
             missing.append(identifier)
             continue
 
-        if evaluate_skill_selection is not None and _governance_context is not None:
-            decision = evaluate_skill_selection(skill_name, context=_governance_context)
-            if not decision.allowed:
+        if evaluate_skill_selection_fail_closed is not None:
+            decision = evaluate_skill_selection_fail_closed(
+                skill_name,
+                mode="preload",
+            )
+            if decision is not None and not decision.allowed:
                 rejected.add(identifier)
                 missing.append(identifier)
                 continue
+        elif _protected_task:
+            rejected.add(identifier)
+            missing.append(identifier)
+            continue
 
         # Track active usage for Curator lifecycle management (#17782)
         try:

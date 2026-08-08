@@ -215,6 +215,20 @@ def governance_context(
     )
 
 
+def is_protected_task_class_configured(
+    *,
+    task_class: str | None = None,
+) -> bool:
+    """Return whether the configured task class is currently protected.
+
+    This helper is safe to use from fail-closed call sites that need to decide
+    whether governance/setup failures must deny skill loading.
+    """
+    cfg = _load_governance_config()
+    resolved_task = _normalize_name(task_class) or cfg.task_class
+    return bool(resolved_task) and (resolved_task in cfg.protected_task_classes)
+
+
 def _lookup_entry(skill_name: str) -> tuple[SkillRegistryEntry | None, str | None, str]:
     entries, registry_path = _load_registry_entries()
     lookup = _normalize_name(skill_name)
@@ -254,14 +268,11 @@ def evaluate_skill_selection(
     context: GovernanceContext,
     emit_log: bool = True,
 ) -> SkillGovernanceDecision:
-    cfg = _load_governance_config()
     entry, matched_alias, registry_path = _lookup_entry(skill_name)
     classification = (
         entry.classification if entry is not None else GovernanceClassification.UNKNOWN
     )
-    protected = bool(context.task_class) and (
-        _normalize_name(context.task_class) in cfg.protected_task_classes
-    )
+    protected = is_protected_task_class_configured(task_class=context.task_class)
     allowed, reason = _decision_reason(
         classification=classification,
         protected_task=protected,
@@ -307,9 +318,7 @@ def evaluate_skill_selection_fail_closed(
         )
     except Exception as exc:
         cfg = _load_governance_config()
-        protected = bool(cfg.task_class) and (
-            _normalize_name(cfg.task_class) in cfg.protected_task_classes
-        )
+        protected = is_protected_task_class_configured(task_class=cfg.task_class)
         if not protected:
             logger.debug(
                 "Skill governance evaluation unavailable for %s",
@@ -411,9 +420,7 @@ def rank_skill_search_results(
     cfg = _load_governance_config()
     if not cfg.retrieval_ranking or not results:
         return results
-    protected = bool(context.task_class) and (
-        _normalize_name(context.task_class) in cfg.protected_task_classes
-    )
+    protected = is_protected_task_class_configured(task_class=context.task_class)
 
     decorated: list[tuple[tuple[int, int, str, str, str, str], int, Any]] = []
     for idx, result in enumerate(results):

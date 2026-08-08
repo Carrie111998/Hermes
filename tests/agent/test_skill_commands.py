@@ -1,5 +1,6 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
+import builtins
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -434,6 +435,75 @@ class TestBuildPreloadedSkillsPrompt:
         assert missing == ["disabled-skill"]
         assert "SECRET DISABLED CONTENT." not in prompt
         assert "enabled-skill" in prompt
+
+    def test_protected_preload_denies_all_when_governance_import_fails(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(
+            home,
+            """\
+  - name: protected-skill
+    classification: CURRENT
+""",
+        )
+        _make_skill(skills_dir, "protected-skill", body="must not load")
+
+        real_import = builtins.__import__
+
+        def _deny_governance_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent.skill_governance":
+                raise ImportError("simulated governance import failure")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            monkeypatch.setattr(builtins, "__import__", _deny_governance_import)
+            prompt, loaded, missing = build_preloaded_skills_prompt(["protected-skill"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["protected-skill"]
+
+    def test_unprotected_preload_keeps_loading_when_governance_import_fails(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(
+            home,
+            """\
+  - name: unprotected-skill
+    classification: CURRENT
+""",
+        )
+        (home / "config.yaml").write_text(
+            """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: general_ops
+    protected_task_classes:
+      - ardyn_engineering
+""",
+            encoding="utf-8",
+        )
+        _make_skill(skills_dir, "unprotected-skill", body="still loads")
+
+        real_import = builtins.__import__
+
+        def _deny_governance_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent.skill_governance":
+                raise ImportError("simulated governance import failure")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            monkeypatch.setattr(builtins, "__import__", _deny_governance_import)
+            prompt, loaded, missing = build_preloaded_skills_prompt(["unprotected-skill"])
+
+        assert loaded == ["unprotected-skill"]
+        assert missing == []
+        assert "still loads" in prompt
 
 
 
