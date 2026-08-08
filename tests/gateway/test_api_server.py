@@ -1189,9 +1189,10 @@ class TestChatCompletionsEndpoint:
                 cb = kwargs.get("stream_delta_callback")
                 ts_cb = kwargs.get("tool_start_callback")
                 tc_cb = kwargs.get("tool_complete_callback")
-                # The structured callbacks own the chat-completions SSE
-                # channel now; ``tool_progress_callback`` is intentionally
-                # not wired so each tool start emits exactly one event.
+                # The structured callbacks own the tool lifecycle on the
+                # chat-completions SSE channel; ``tool_progress_callback``
+                # is wired only for reasoning, so each tool start still
+                # emits exactly one event.
                 if ts_cb:
                     ts_cb("call_terminal_1", "terminal", {"command": "ls -la"})
                 if tc_cb:
@@ -1290,6 +1291,229 @@ class TestChatCompletionsEndpoint:
             assert "call_orphan_1" not in body
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
+
+    @staticmethod
+    def _tool_progress_payloads(body: str) -> list:
+        """Every ``hermes.tool.progress`` payload in an SSE body, in order."""
+        import json as _json
+
+        out = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    try:
+                        out.append(_json.loads(follow[len("data: "):]))
+                    except _json.JSONDecodeError:
+                        pass
+                    break
+        return out
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_completion_carries_result_and_failure(self, adapter):
+        """A settled tool must carry its output and its verdict live.
+
+        The lifecycle event used to be a bare ``status: completed`` with no
+        output attached, so a client could only render the spinner turning
+        into an unconditional green check. The output arrived when the
+        turn's transcript was re-read at the end of the turn, which meant a
+        tool that had actually failed was indistinguishable from one that
+        succeeded for as long as the turn kept running.
+        """
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_ok_1", "terminal", {"command": "true"})
+                    ts_cb("call_bad_1", "terminal", {"command": "false"})
+                if tc_cb:
+                    tc_cb(
+                        "call_ok_1", "terminal", {"command": "true"},
+                        '{"exit_code": 0, "output": "all good"}',
+                    )
+                    # A non-zero exit is the canonical terminal failure.
+                    tc_cb(
+                        "call_bad_1", "terminal", {"command": "false"},
+                        '{"exit_code": 1, "error": "boom"}',
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        settled = [
+            p for p in self._tool_progress_payloads(body)
+            if p.get("status") in ("completed", "failed")
+        ]
+        assert len(settled) == 2, settled
+
+        ok = next(p for p in settled if p["toolCallId"] == "call_ok_1")
+        assert ok["status"] == "completed"
+        # The output rides the event, so an expanded step has something to
+        # show before the transcript is ever re-read.
+        assert "all good" in ok["result"]
+        assert ok["resultTruncated"] is False
+
+        bad = next(p for p in settled if p["toolCallId"] == "call_bad_1")
+        assert bad["status"] == "failed"
+        assert "boom" in bad["result"]
+        # The one-line summary a collapsed step shows comes from the
+        # failure detector rather than the head of the raw JSON.
+        assert "boom" in bad["label"]
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_result_is_truncated(self, adapter):
+        """Tool output shares the stream with the reply, so it is capped."""
+        import asyncio
+
+        from gateway.platforms.api_server import TOOL_RESULT_STREAM_CHARS
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_big_1", "read_file", {"path": "big.txt"})
+                if tc_cb:
+                    tc_cb(
+                        "call_big_1", "read_file", {"path": "big.txt"},
+                        "x" * (TOOL_RESULT_STREAM_CHARS * 3),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "read"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        settled = [
+            p for p in self._tool_progress_payloads(body)
+            if p.get("status") in ("completed", "failed")
+        ]
+        assert len(settled) == 1, settled
+        assert len(settled[0]["result"]) == TOOL_RESULT_STREAM_CHARS
+        assert settled[0]["resultTruncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_reasoning_events(self, adapter):
+        """Reasoning must reach the client while the turn is still running.
+
+        ``_thinking`` is an underscore-prefixed internal tool, so the
+        structured tool callbacks filter it off this channel by design.
+        ``tool_progress_callback`` is therefore wired for reasoning alone —
+        and must stay filtered to it, or every tool chip would be emitted
+        twice (once structured, once via progress).
+        """
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                assert tp_cb is not None, "reasoning channel must be wired"
+                tp_cb("reasoning.available", "_thinking", "**Plan**\nfirst step", None)
+                # run_agent fires the progress callback side-by-side with the
+                # structured ones; these must not produce a second chip.
+                tp_cb("tool.started", "terminal", "ls -la", None)
+                if ts_cb:
+                    ts_cb("call_t_1", "terminal", {"command": "ls -la"})
+                tp_cb("tool.completed", "terminal", None, None)
+                if tc_cb:
+                    tc_cb("call_t_1", "terminal", {"command": "ls -la"}, "ok")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "think"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        reasoning = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.reasoning.delta":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    reasoning.append(_json.loads(follow[len("data: "):]))
+                    break
+
+        assert len(reasoning) == 1, reasoning
+        assert "first step" in reasoning[0]["delta"]
+
+        # The tool lifecycle stays single-emit: forwarding the progress
+        # callback's tool events too would double every chip.
+        pairs = [
+            (p.get("status"), p.get("toolCallId"))
+            for p in self._tool_progress_payloads(body)
+        ]
+        assert pairs == [("running", "call_t_1"), ("completed", "call_t_1")], pairs
+
+        # Reasoning must never leak into assistant text — the model would
+        # learn to imitate it instead of actually reasoning.
+        for line in lines:
+            if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                continue
+            try:
+                chunk = _json.loads(line[len("data: "):])
+            except _json.JSONDecodeError:
+                continue
+            if chunk.get("object") == "chat.completion.chunk":
+                for choice in chunk.get("choices", []):
+                    assert "first step" not in (choice.get("delta", {}).get("content") or "")
 
 
 # ---------------------------------------------------------------------------

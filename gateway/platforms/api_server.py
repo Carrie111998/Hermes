@@ -152,6 +152,19 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# How much of a tool's output rides the chat-completions SSE channel. The
+# result shares that stream with the reply text, so an unbounded one would
+# stall the prose queued behind it. Clients needing the whole thing still
+# read it from the stored transcript.
+TOOL_RESULT_STREAM_CHARS = 4_000
+# Cap for the one-line summary a client shows on the collapsed step.
+TOOL_LABEL_STREAM_CHARS = 120
+# Queue markers the chat-completions SSE writer turns into named events
+# rather than assistant text. Keyed by the marker the producer enqueues.
+_CUSTOM_SSE_EVENTS = {
+    "__tool_progress__": "hermes.tool.progress",
+    "__reasoning__": "hermes.reasoning.delta",
+}
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -4215,29 +4228,90 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
-                """Emit the matching ``status: completed`` event.
+                """Emit the matching ``completed``/``failed`` lifecycle event.
 
                 Dropped if the start was filtered (internal tool, missing
                 id, or never seen) so clients never get an orphaned
                 ``completed`` they can't correlate to a prior ``running``.
+
+                Carries the tool's output and its success/failure verdict.
+                Without them a client can only turn its spinner into an
+                unconditional green check: the output arrives when the
+                turn's transcript is re-read — minutes later, at the end of
+                the turn — and until then a tool that actually failed is
+                indistinguishable from one that succeeded.
+
+                Failure is derived from the result here rather than taken
+                from ``tool_progress_callback``. That callback does carry an
+                ``is_error`` flag, but no ``tool_call_id`` to correlate it
+                by, and wiring it for tool events would duplicate every chip
+                on this channel (see the callback wiring below).
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
+                from agent.display import _detect_tool_failure
+                from agent.tool_dispatch_helpers import _multimodal_text_summary
+                # A projection for display only: never let a malformed result
+                # take down the turn that produced it.
+                try:
+                    result_text = _multimodal_text_summary(function_result) or ""
+                except Exception:
+                    result_text = ""
+                try:
+                    is_error, failure_suffix = _detect_tool_failure(
+                        function_name, function_result
+                    )
+                except Exception:
+                    is_error, failure_suffix = False, ""
+                # On failure the detector's own tag (``[exit 1]``, a trimmed
+                # error message) is the most informative one line available.
+                # On success the opening line of the output is.
+                if is_error and failure_suffix:
+                    label = failure_suffix.strip().strip("[]")
+                else:
+                    label = next(
+                        (ln for ln in result_text.splitlines() if ln.strip()), ""
+                    ).strip()
                 _stream_q.put_threadsafe(("__tool_progress__", {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
-                    "status": "completed",
+                    "status": "failed" if is_error else "completed",
+                    "label": label[:TOOL_LABEL_STREAM_CHARS],
+                    "result": result_text[:TOOL_RESULT_STREAM_CHARS],
+                    "resultTruncated": len(result_text) > TOOL_RESULT_STREAM_CHARS,
                 }))
+
+            def _on_agent_progress(event_type, tool_name=None, preview=None, args=None, **kwargs):
+                """Forward reasoning, and nothing else.
+
+                ``run_agent`` fires this callback side-by-side with the
+                structured tool callbacks, so anything tool-shaped forwarded
+                here would double every chip on the wire — which is why this
+                callback used to be left unwired entirely. Reasoning is the
+                one thing with no structured equivalent: ``_on_tool_start``
+                filters ``_``-prefixed internal tools, and ``_thinking`` is
+                exactly such a tool, so this is the only channel on which a
+                reasoning trace can arrive while the turn is still running
+                rather than after the transcript is re-read.
+                """
+                if event_type != "reasoning.available":
+                    return
+                text = preview or ""
+                if not text:
+                    return
+                _stream_q.put_threadsafe(("__reasoning__", {"delta": text}))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
-            # ``tool_progress_callback`` is intentionally not wired here:
-            # it would duplicate every emit because ``run_agent`` fires it
+            # ``tool_progress_callback`` is wired only for reasoning — see
+            # ``_on_agent_progress``. Forwarding its tool events too would
+            # duplicate every emit, because ``run_agent`` fires it
             # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
             # The structured callbacks are strictly richer (they carry
-            # the tool_call id), so they own the chat-completions SSE channel.
+            # the tool_call id), so they still own the tool lifecycle on the
+            # chat-completions SSE channel.
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -4245,6 +4319,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_agent_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
@@ -4424,14 +4499,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
+                Tagged tuples ``(marker, payload)`` are sent as the custom
+                SSE event that marker names, so frontends can display them
+                without storing the markers in conversation history.  See
+                #6972 for the original tool event, #16588 for the
+                ``toolCallId``/``status`` lifecycle fields.
+
+                Both custom events are additive: a client that only knows
+                about ``delta.content`` ignores them, exactly as before.
                 """
-                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
-                    await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                if isinstance(item, tuple) and len(item) == 2 and item[0] in _CUSTOM_SSE_EVENTS:
+                    await response.write(
+                        _sse_frame(item[1], event=_CUSTOM_SSE_EVENTS[item[0]])
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
