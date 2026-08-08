@@ -105,7 +105,7 @@ function Pane({ active, label }: { active: boolean; label: string }) {
       <PaneVisibleContext.Provider value={active}>
         {/* The tree-group layer: only the ACTIVE tab is visible; inactive tabs
             stay mounted under `data-pane-hidden`. */}
-        <div data-pane-hidden={active ? undefined : ''} data-pane={label}>
+        <div data-pane={label} data-pane-hidden={active ? undefined : ''}>
           <Thread sessionKey={label} />
         </div>
       </PaneVisibleContext.Provider>
