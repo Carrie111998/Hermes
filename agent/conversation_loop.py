@@ -3266,6 +3266,7 @@ def run_conversation(
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
+                                    "_length_continuation_synthetic": True,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -6101,6 +6102,7 @@ def run_conversation(
                             messages.append({
                                 "role": "user",
                                 "content": _CODEX_INCOMPLETE_NUDGE,
+                                "_codex_incomplete_synthetic": True,
                             })
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
@@ -7129,6 +7131,7 @@ def run_conversation(
                             "[System: Continue now. Execute the required tool calls and only "
                             "send your final answer after completing the task.]"
                         ),
+                        "_intent_ack_synthetic": True,
                     }
                     messages.append(continue_msg)
                     agent._session_messages = messages
@@ -7338,6 +7341,57 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                # ── Incomplete-task boundary handoff guard (#80772) ────
+                # When todos still show remaining work, a text-only stop
+                # without `clarify` this turn is an invalid terminal state.
+                # Structured evidence only (todo store + clarify tool call) —
+                # do not parse freeform prose. Kanban workers are skipped so
+                # kanban_stop owns the terminal contract below.
+                try:
+                    from agent.boundary_handoff import build_boundary_handoff_nudge
+
+                    _valid_tools = getattr(agent, "valid_tool_names", None) or ()
+                    _handoff_nudge = build_boundary_handoff_nudge(
+                        todo_store=getattr(agent, "_todo_store", None),
+                        messages=messages + [final_msg],
+                        attempts=getattr(agent, "_boundary_handoff_nudges", 0),
+                        enabled=bool(
+                            getattr(agent, "_task_completion_guidance", True)
+                        ),
+                        clarify_available="clarify" in _valid_tools,
+                    )
+                except Exception:
+                    logger.debug("boundary handoff stop-loop check failed", exc_info=True)
+                    _handoff_nudge = None
+
+                if _handoff_nudge:
+                    agent._boundary_handoff_nudges = (
+                        getattr(agent, "_boundary_handoff_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "boundary_handoff_required"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("boundary handoff interim flush failed", exc_info=True)
+                    messages.append({
+                        "role": "user",
+                        "content": _handoff_nudge,
+                        "_boundary_handoff_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug(
+                        "boundary handoff nudge issued (attempt %d)",
+                        agent._boundary_handoff_nudges,
+                    )
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")

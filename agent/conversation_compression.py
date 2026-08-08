@@ -1930,6 +1930,11 @@ _SYNTHETIC_USER_FLAGS = (
     "_empty_recovery_synthetic",
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_boundary_handoff_synthetic",
+    "_intent_ack_synthetic",
+    "_length_continuation_synthetic",
+    "_codex_incomplete_synthetic",
+    "_kanban_stop_synthetic",
     "_dropped_toolcall_nudge",
 )
 

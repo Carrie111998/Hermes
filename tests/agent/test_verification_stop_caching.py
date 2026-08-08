@@ -33,6 +33,11 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
 
     assert "_verification_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
     assert "_pre_verify_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_boundary_handoff_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_intent_ack_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_length_continuation_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_codex_incomplete_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
+    assert "_kanban_stop_synthetic" in ra._EPHEMERAL_SCAFFOLDING_FLAGS
 
     # The nudge messages ARE scaffolding (they carry the synthetic flag).
     assert ra._is_ephemeral_scaffolding(
@@ -40,6 +45,13 @@ def test_verification_flags_registered_as_ephemeral(tmp_path, monkeypatch):
     )
     assert ra._is_ephemeral_scaffolding(
         {"role": "user", "content": "[System: run tests]", "_verification_stop_synthetic": True}
+    )
+    assert ra._is_ephemeral_scaffolding(
+        {
+            "role": "user",
+            "content": "[System: boundary handoff]",
+            "_boundary_handoff_synthetic": True,
+        }
     )
     # Real messages (including the assistant candidate) are not.
     assert not ra._is_ephemeral_scaffolding({"role": "user", "content": "hi"})

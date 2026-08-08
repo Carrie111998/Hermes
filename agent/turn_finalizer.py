@@ -42,23 +42,25 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
-# Verification continuation scaffolding flags: verify-on-stop / pre_verify
-# inject a synthetic user nudge to keep the agent going one more turn.
-# These nudges must be stripped from returned/live history to avoid
-# role-alternation breaks and poisoning the resumed transcript. The
-# assistant response is real content and is not flagged. (#65919 §7)
+# Continuation scaffolding flags: verify-on-stop / pre_verify / boundary
+# handoff inject a synthetic user nudge (assistant candidate stays real and
+# unflagged). Kanban stop-guard flags BOTH the narrated assistant exit and
+# the user nudge — both must be stripped from returned/live history.
+# (#65919 §7, #80772)
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_boundary_handoff_synthetic",
+    "_kanban_stop_synthetic",
 )
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
-    """Remove verification-continuation nudge messages from *messages* in place.
+    """Remove continuation-nudge scaffolding from *messages* in place.
 
-    Only the synthetic nudges carry these flags, so this strips just the
-    nudges while preserving the real attempted-final-answer that was
-    persisted to state.db.
+    Verify/pre_verify/boundary only flag the user nudge, so the attempted
+    final assistant answer is preserved. Kanban flags the narrated
+    assistant+nudge pair, so both sides are removed.
     """
     messages[:] = [
         m for m in messages

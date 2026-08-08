@@ -337,6 +337,8 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm",
 #      (fake addresses, fake JSON, fake numbers) instead of reporting
 #      the blocker.  (Observed on DeepSeek v4-flash on the same task:
 #      pushed through PEP-668 wall, then returned fabricated listings.)
+#   3. Ending with a partial-progress summary at a legitimate implementation
+#      boundary without calling `clarify` (or clearing remaining todos).
 #
 # Short on purpose.  This block is shipped to every user, every session,
 # in the cached system prompt — token cost is paid once at install and
@@ -354,6 +356,18 @@ TASK_COMPLETION_GUIDANCE = (
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
     "is always better than inventing a result."
+)
+
+# Clarify-gated boundary handoff — only injected when ``clarify`` is in the
+# live toolset (see system_prompt assembly). Leaf/cron/kanban surfaces that
+# strip clarify must not be told to call a missing tool.
+TASK_COMPLETION_BOUNDARY_GUIDANCE = (
+    "If work must pause at a permission, safety, workspace, repository, or "
+    "external-system boundary, do not end with a partial-progress summary alone. "
+    "Call `clarify` with a self-contained question stating what you completed "
+    "and verified, what remains, the exact boundary or blocker, whether any live "
+    "or external state changed, and the decision or authorization needed to "
+    "continue. Otherwise finish the remaining work and mark those todos completed."
 )
 
 # Universal parallel-tool-call guidance — applied to ALL models.
