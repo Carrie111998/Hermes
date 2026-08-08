@@ -71,13 +71,12 @@ def _isolate_codex_compat_cache(tmp_path, monkeypatch):
     reset_codex_compat_version_cache_for_tests()
 
 
-def _assert_codex_compat_headers(headers: dict, *, model: str | None = None) -> None:
-    from hermes_cli.codex_models import resolve_codex_compat_client_version
-
-    ver = resolve_codex_compat_client_version(model)
+def _assert_codex_compat_headers(headers: dict, *, expected_version: str) -> None:
     assert headers.get("originator") == "codex_cli_rs"
-    assert headers.get("version") == ver
-    assert headers.get("User-Agent") == f"codex_cli_rs/{ver} (Hermes Agent)"
+    assert headers.get("version") == expected_version
+    assert headers.get("User-Agent") == (
+        f"codex_cli_rs/{expected_version} (Hermes Agent)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +96,7 @@ class TestCodexCloudflareHeaders:
             ]
         )
         headers = _codex_cloudflare_headers(_make_codex_jwt(), model="gpt-5.6-sol")
-        _assert_codex_compat_headers(headers, model="gpt-5.6-sol")
+        _assert_codex_compat_headers(headers, expected_version="0.144.0")
         assert headers["version"] == "0.144.0"
 
     def test_falls_back_to_floor_without_catalog(self):
@@ -106,7 +105,10 @@ class TestCodexCloudflareHeaders:
 
         headers = _codex_cloudflare_headers(_make_codex_jwt())
         assert headers["version"] == _CODEX_CLI_COMPAT_FLOOR
-        _assert_codex_compat_headers(headers)
+        _assert_codex_compat_headers(
+            headers,
+            expected_version=_CODEX_CLI_COMPAT_FLOOR,
+        )
 
     def test_canonical_header_casing(self):
         """Upstream codex-rs uses PascalCase with trailing -ID. Match exactly."""
@@ -162,7 +164,7 @@ class TestPrimaryClientWiring:
             )
             headers = agent._client_kwargs.get("default_headers") or {}
             assert headers.get("ChatGPT-Account-ID") == "acct-rotation"
-            _assert_codex_compat_headers(headers, model="gpt-5.6-sol")
+            _assert_codex_compat_headers(headers, expected_version="0.144.0")
 
     def test_apply_client_headers_clears_codex_headers_off_chatgpt(self):
         """Switching AWAY from chatgpt.com must drop the codex headers."""
@@ -217,7 +219,7 @@ class TestAuxiliaryClientWiring:
             assert client is not None
             headers = mock_openai.call_args.kwargs.get("default_headers") or {}
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-try-codex"
-            _assert_codex_compat_headers(headers, model="gpt-5.4")
+            _assert_codex_compat_headers(headers, expected_version="0.144.0")
 
     def test_resolve_provider_client_raw_codex_passes_codex_headers(self, monkeypatch):
         """The ``raw_codex=True`` branch (used by the main agent loop for direct
@@ -236,4 +238,4 @@ class TestAuxiliaryClientWiring:
             assert client is not None
             headers = mock_openai.call_args.kwargs.get("default_headers") or {}
             assert headers.get("ChatGPT-Account-ID") == "acct-aux-raw-codex"
-            _assert_codex_compat_headers(headers, model="gpt-5.4")
+            _assert_codex_compat_headers(headers, expected_version="0.144.0")

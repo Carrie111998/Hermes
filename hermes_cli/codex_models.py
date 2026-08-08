@@ -103,21 +103,31 @@ def ensure_codex_minimal_client_versions(access_token: Optional[str] = None) -> 
     """Best-effort warm of the minimal-client-version cache before inference.
 
     Order: already-warm process cache → local models_cache.json → one live
-    /models probe when a token is provided and no per-model mins are known yet
-    (local CLI ``client_version`` alone is only a resolve fallback). Failures
-    are non-fatal; callers fall back to ``_CODEX_CLI_COMPAT_FLOOR``.
+    /models probe when a token is provided and no local compatibility version
+    is available. A failed live probe remains retryable; callers fall back to
+    ``_CODEX_CLI_COMPAT_FLOOR`` for that request.
     """
     global _live_min_version_probe_done
     if _minimal_client_versions:
         return
     _hydrate_minimal_versions_from_local_cache()
-    if _minimal_client_versions:
+    # The cache version is the identity of the real Codex CLI that fetched
+    # this catalog. It is sufficient for inference and avoids putting a hidden
+    # network request on every fresh Hermes client construction.
+    if _minimal_client_versions or _local_codex_cli_version:
         return
     if _live_min_version_probe_done:
         return
     if access_token and isinstance(access_token, str) and access_token.strip():
-        _live_min_version_probe_done = True
-        _fetch_models_from_api(access_token)
+        models = _fetch_models_from_api(access_token)
+        if models or _minimal_client_versions or _local_codex_cli_version:
+            _live_min_version_probe_done = True
+        else:
+            logger.warning(
+                "Codex compatibility version discovery failed; advertising floor %s "
+                "for this request and allowing a later retry",
+                _CODEX_CLI_COMPAT_FLOOR,
+            )
 
 
 def resolve_codex_compat_client_version(model: Optional[str] = None) -> str:
@@ -132,7 +142,11 @@ def resolve_codex_compat_client_version(model: Optional[str] = None) -> str:
     if isinstance(model, str) and model.strip():
         known = _minimal_client_versions.get(model.strip())
         if known:
-            return _max_semver(_CODEX_CLI_COMPAT_FLOOR, known)
+            return _max_semver(
+                _CODEX_CLI_COMPAT_FLOOR,
+                known,
+                _local_codex_cli_version or "",
+            )
 
     candidates: List[str] = [_CODEX_CLI_COMPAT_FLOOR]
     if _minimal_client_versions:

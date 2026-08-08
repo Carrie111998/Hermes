@@ -90,8 +90,9 @@ def test_fetch_from_api_remembers_minimal_client_versions(monkeypatch, tmp_path)
 
     models = codex_models._fetch_models_from_api(access_token="tok")
     assert "gpt-5.6-sol" in models
-    assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.144.0"
-    # Unknown / missing model still meets the max known gate (and floor).
+    # Advertise the real CLI version when it is newer than the model's gate.
+    assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.147.0"
+    # Unknown / missing models use the same current compatible identity.
     assert codex_models.resolve_codex_compat_client_version("gpt-unknown") == "0.147.0"
 
 
@@ -128,6 +129,51 @@ def test_resolve_falls_back_to_local_cli_cache_version(tmp_path, monkeypatch):
     )
     codex_models.reset_codex_compat_version_cache_for_tests()
     assert codex_models.resolve_codex_compat_client_version("gpt-5.6-sol") == "0.147.0"
+
+
+def test_local_cli_cache_avoids_live_probe(tmp_path, monkeypatch):
+    from hermes_cli import codex_models
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "models_cache.json").write_text(
+        json.dumps({"client_version": "0.147.0", "models": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    probes = []
+    monkeypatch.setattr(
+        codex_models,
+        "_fetch_models_from_api",
+        lambda token: probes.append(token) or [],
+    )
+    codex_models.reset_codex_compat_version_cache_for_tests()
+
+    codex_models.ensure_codex_minimal_client_versions("token")
+
+    assert probes == []
+    assert codex_models.resolve_codex_compat_client_version() == "0.147.0"
+
+
+def test_failed_live_probe_remains_retryable(tmp_path, monkeypatch, caplog):
+    from hermes_cli import codex_models
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    probes = []
+    monkeypatch.setattr(
+        codex_models,
+        "_fetch_models_from_api",
+        lambda token: probes.append(token) or [],
+    )
+    codex_models.reset_codex_compat_version_cache_for_tests()
+
+    codex_models.ensure_codex_minimal_client_versions("token")
+    codex_models.ensure_codex_minimal_client_versions("token")
+
+    assert probes == ["token", "token"]
+    assert "allowing a later retry" in caplog.text
 
 
 
@@ -256,4 +302,3 @@ class TestNormalizeModelForProvider:
         assert changed is True
         # Uses first from available list
         assert cli.model == "gpt-5.3-codex"
-
