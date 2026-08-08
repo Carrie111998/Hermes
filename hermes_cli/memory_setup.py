@@ -223,6 +223,19 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         outcome = install_specs(missing, timeout=120)
         if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
+            # Post-install smoke check (#81421): only after the install
+            # actually reports success. Pip may resolve and report ok
+            # while still backtracking the slim runtime to an ancient API
+            # release whose ``hindsight_api`` no longer exposes
+            # ``LocalSTEmbeddings`` — the daemon then crashes with
+            # "Unknown embeddings provider: onnx" while the update
+            # claims success. Running the probe only on the
+            # install-success branch avoids the contradiction raised
+            # by the previous flow: a failed install path used to print
+            # "Run manually:" guidance *and* raise a smoke-check
+            # RuntimeError saying pip reported success.
+            if provider_name == "hindsight":
+                _maybe_run_intel_macos_local_embedded_smoke_check()
         elif outcome.blocked:
             print(f"  ⚠ Cannot install {', '.join(missing)}: {outcome.reason}")
         else:
@@ -234,17 +247,6 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     except Exception as e:
         print(f"  ⚠ Install failed: {e}")
         print(f"  Run manually: {manual_cmd}")
-
-    # Post-install smoke check (#81421): pip reports success even when the
-    # resolver backtracked the slim runtime to an ancient API release whose
-    # hindsight_api no longer exposes LocalSTEmbeddings — the daemon then
-    # crashes with "Unknown embeddings provider: onnx" while the update
-    # claims success. Verify the configured local runtime is actually
-    # usable, and raise so ``hermes update`` can't report a healed install
-    # that is still broken. Gated to Intel macOS + local mode inside the
-    # helper; every other path returns immediately.
-    if provider_name == "hindsight":
-        _maybe_run_intel_macos_local_embedded_smoke_check()
 
     # Also show external dependencies (non-pip) if any
     ext_deps = meta.get("external_dependencies", [])
