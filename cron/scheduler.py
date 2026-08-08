@@ -3172,6 +3172,35 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Runtime backstop for jobs created before the guard existed and scripts
+    # whose contents changed after create/update validation. This MUST run
+    # before the no_agent short-circuit: a self-killing script can terminate the
+    # in-process scheduler before it records completion and create a flap loop.
+    try:
+        from tools.cron_gateway_guard import check_cron_gateway_selfkill
+
+        runtime_prompt = "\n".join(
+            part for part in (job.get("prompt"), extra_prompt) if part
+        )
+        selfkill_error = check_cron_gateway_selfkill(runtime_prompt, job.get("script"))
+    except Exception as exc:
+        selfkill_error = (
+            "Blocked: the runtime gateway self-kill guard could not be evaluated "
+            f"safely ({exc.__class__.__name__})."
+        )
+        logger.exception("Job '%s': gateway self-kill guard failed closed", job_id)
+    if selfkill_error:
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        blocked_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            "**Status:** BLOCKED_GATEWAY_SELFKILL\n\n"
+            f"{selfkill_error}\n"
+        )
+        logger.error("Job '%s': blocked by runtime gateway self-kill guard", job_id)
+        return False, blocked_doc, "", selfkill_error
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------

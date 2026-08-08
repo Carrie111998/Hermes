@@ -280,6 +280,53 @@ class TestUnifiedCronjobTool:
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
+    def test_create_rejects_gateway_selfkill(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Run hermes gateway restart",
+                schedule="every 1h",
+            )
+        )
+
+        assert result["success"] is False
+        assert "restart/stop/kill" in result["error"]
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
+    def test_update_rejects_gateway_selfkill_without_mutating_job(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Check gateway health", schedule="every 1h")
+        )
+        job_id = created["job_id"]
+
+        result = json.loads(
+            cronjob(action="update", job_id=job_id, prompt="systemctl restart hermes-gateway")
+        )
+
+        assert result["success"] is False
+        assert "restart/stop/kill" in result["error"]
+        from cron.jobs import get_job
+
+        assert get_job(job_id)["prompt"] == "Check gateway health"
+
+    def test_resume_rejects_legacy_gateway_selfkill_job(self):
+        created = json.loads(
+            cronjob(action="create", prompt="Check gateway health", schedule="every 1h")
+        )
+        job_id = created["job_id"]
+        assert json.loads(cronjob(action="pause", job_id=job_id))["success"] is True
+
+        from cron.jobs import load_jobs, save_jobs
+
+        jobs = load_jobs()
+        jobs[0]["prompt"] = "launchctl kickstart -k gui/501/ai.hermes.gateway"
+        save_jobs(jobs)
+
+        result = json.loads(cronjob(action="resume", job_id=job_id))
+        assert result["success"] is False
+        assert "restart/stop/kill" in result["error"]
+        assert load_jobs()[0]["enabled"] is False
+
 
     @staticmethod
     def _patch_named_legit(monkeypatch):

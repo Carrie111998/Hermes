@@ -1085,6 +1085,19 @@ def cronjob(
                 if scan_error:
                     return tool_error(scan_error, success=False)
 
+            # Gateway self-kill guard (flap-loop prevention, 2026-07-05):
+            # refuse jobs whose prompt/script would restart/stop/kill an
+            # ai.hermes.gateway* service from inside the gateway's own scheduler.
+            # Fail OPEN: a missing/broken guard must never block cron itself.
+            try:
+                from tools.cron_gateway_guard import check_cron_gateway_selfkill
+                _selfkill_error = check_cron_gateway_selfkill(prompt, script)
+            except Exception as _guard_exc:
+                logger.warning("cron gateway self-kill guard unavailable: %s", _guard_exc)
+                _selfkill_error = None
+            if _selfkill_error:
+                return tool_error(_selfkill_error, success=False)
+
             # Validate script path before storing
             if script:
                 script_error = _validate_cron_script_path(script)
@@ -1223,6 +1236,16 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
+            # Gateway self-kill guard: re-check on activate (resume) too, so a
+            # pre-guard self-killing job cannot be re-armed. Fail OPEN.
+            try:
+                from tools.cron_gateway_guard import check_cron_gateway_selfkill
+                _selfkill_error = check_cron_gateway_selfkill(job.get("prompt"), job.get("script"))
+            except Exception as _guard_exc:
+                logger.warning("cron gateway self-kill guard unavailable: %s", _guard_exc)
+                _selfkill_error = None
+            if _selfkill_error:
+                return tool_error(_selfkill_error, success=False)
             updated = resume_job(job_id)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
@@ -1373,6 +1396,21 @@ def cronjob(
                         "clear one before setting the other.",
                         success=False,
                     )
+
+            # Gateway self-kill guard: re-check when prompt or script changes so
+            # an update can't turn a benign job into a gateway self-restarter.
+            # Fail OPEN.
+            if prompt is not None or script is not None:
+                try:
+                    from tools.cron_gateway_guard import check_cron_gateway_selfkill
+                    _eff_prompt = updates.get("prompt", job.get("prompt"))
+                    _eff_script = updates.get("script", job.get("script"))
+                    _selfkill_error = check_cron_gateway_selfkill(_eff_prompt, _eff_script)
+                except Exception as _guard_exc:
+                    logger.warning("cron gateway self-kill guard unavailable: %s", _guard_exc)
+                    _selfkill_error = None
+                if _selfkill_error:
+                    return tool_error(_selfkill_error, success=False)
             if context_from is not None:
                 # Empty string / empty list clears the field; otherwise validate
                 # each referenced job exists before storing. Normalized to a list
