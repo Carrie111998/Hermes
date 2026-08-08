@@ -89,6 +89,22 @@ class TestDescribeSkillInvocation:
         assert first_split[1] == "ticket=A/time=1"
         assert second_split[1] == "ticket=B/time=2"
 
+    def test_ordinary_bundle_keeps_one_block_when_body_quotes_single_skill_markers(self, skills):
+        skill_md = skills / "work" / "SKILL.md"
+        skill_md.write_text(
+            skill_md.read_text()
+            + "\nThe full skill content is loaded below.]\n\n"
+            + "The user has provided the following instruction alongside the skill invocation: quoted\n"
+        )
+
+        result = skill_bundles.build_bundle_invocation_message(
+            "/demo", user_instruction="real bundle instruction"
+        )
+
+        assert result is not None
+        message, _, _ = result
+        assert split_skill_message_for_cache(message) is None
+
 
 
 

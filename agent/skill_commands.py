@@ -53,6 +53,10 @@ _RUNTIME_NOTE = "\n\n[Runtime note:"
 _BUNDLE_MARKER = " skill bundle,"
 _BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
 _BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
+_CRON_SKIPPED_SKILLS_PREFIX = (
+    "[IMPORTANT: The following skill(s) were listed for this job but could not be found "
+)
+_CRON_EXECUTION_PREFIX = "[IMPORTANT: You are running as a scheduled cron job. "
 
 # The skill name sits in the first quoted span of the activation note, for both
 # the single-skill and the bundle header ("work" / "/clean /work").
@@ -106,20 +110,48 @@ def split_skill_message_for_cache(content: Any) -> Optional[tuple[str, str]]:
 
     Cron's one-or-more-skill prompt uses the same activation and instruction
     markers as the slash-skill builder, so it gets the same boundary without
-    route-specific cache logic. Bundle messages are intentionally excluded:
-    their user instruction currently precedes the loaded skill blocks and is
-    therefore not a stable-prefix layout.
+    changing its canonical text. Ordinary bundle messages are excluded because
+    their user instruction precedes the loaded skill blocks; cron's bundle
+    wrapper is the exception because it appends its own instruction after all
+    stable blocks.
     """
-    if not isinstance(content, str) or not content.startswith(_SKILL_INVOCATION_PREFIX):
+    if not isinstance(content, str):
         return None
-    if _SINGLE_SKILL_MARKER not in content:
+
+    activation_index = content.find(_SKILL_INVOCATION_PREFIX)
+    starts_with_single_skill = activation_index == 0
+    starts_with_cron_skip_notice = (
+        content.startswith(_CRON_SKIPPED_SKILLS_PREFIX)
+        and activation_index > 0
+    )
+    if not starts_with_single_skill and not starts_with_cron_skip_notice:
         return None
+
+    activation_end = content.find("\n\n", activation_index)
+    if activation_end < 0:
+        activation_end = len(content)
+    activation_note = content[activation_index:activation_end]
+    is_single_skill_scaffold = _SINGLE_SKILL_MARKER in activation_note
+    is_bundle_scaffold = (
+        activation_index == 0 and _BUNDLE_MARKER in activation_note
+    )
 
     instruction_boundary = f"\n\n{_SINGLE_SKILL_INSTRUCTION}"
     boundary_index = content.rfind(instruction_boundary)
     if boundary_index >= 0:
         split_index = boundary_index + len(instruction_boundary)
+        suffix = content[split_index:]
+        # A normal bundle keeps its instruction before the skill blocks and
+        # must retain the ordinary one-block cache policy. Cron is the one
+        # bundle caller that appends a second, outer instruction after all
+        # stable blocks; its suffix always begins with the execution hint.
+        if not is_single_skill_scaffold and not (
+            is_bundle_scaffold and suffix.startswith(_CRON_EXECUTION_PREFIX)
+        ):
+            return None
     else:
+        if not is_single_skill_scaffold:
+            return None
         boundary_index = content.rfind(_RUNTIME_NOTE)
         if boundary_index < 0:
             return None
