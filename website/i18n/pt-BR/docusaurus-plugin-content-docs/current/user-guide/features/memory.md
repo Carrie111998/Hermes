@@ -1,31 +1,35 @@
 ---
 sidebar_position: 3
-title: "Memória persistente"
+title: "Memória Persistente"
 description: "Como o Hermes Agent lembra entre sessões — MEMORY.md, USER.md e busca de sessões"
 ---
 
-# Memória persistente
+# Memória Persistente {#persistent-memory}
 
-O Hermes Agent tem memória limitada e curada que persiste entre sessões. Isso permite lembrar suas preferências, projetos, ambiente e o que aprendeu.
+O Hermes Agent tem memória limitada e curada que persiste entre sessões. Isso permite lembrar suas preferências, seus projetos, seu ambiente e coisas que aprendeu.
 
-## Como funciona {#how-it-works}
+## Como Funciona {#how-it-works}
 
 Dois arquivos compõem a memória do agente:
 
-| Arquivo | Propósito | Limite de caracteres |
+| Arquivo | Propósito | Limite de Caracteres |
 |------|---------|------------|
 | **MEMORY.md** | Notas pessoais do agente — fatos do ambiente, convenções, coisas aprendidas | 2.200 chars (~800 tokens) |
 | **USER.md** | Perfil do usuário — suas preferências, estilo de comunicação, expectativas | 1.375 chars (~500 tokens) |
 
-Ambos ficam em `~/.hermes/memories/` e são injetados no system prompt como snapshot congelado no início da sessão. O agente gerencia a própria memória via a ferramenta `memory` — pode adicionar, substituir ou remover entradas.
+Ambos ficam em `~/.hermes/memories/` e são injetados no system prompt como um snapshot congelado no início da sessão. O agente gerencia a própria memória via a ferramenta `memory` — pode adicionar, substituir ou remover entradas.
 
-:::info
-Limites de caracteres mantêm a memória focada. A memória **não** compacta automaticamente: quando uma escrita excederia o limite, a ferramenta `memory` retorna erro em vez de descartar entradas silenciosamente. O agente então abre espaço — consolidando ou removendo entradas no mesmo turno antes de tentar de novo (veja [O que acontece quando a memória enche](#what-happens-when-memory-is-full)). Note que `replace` também respeita o limite: trocar uma entrada por conteúdo mais longo ainda pode estourar, então o novo conteúdo deve ser encurtado (ou outra entrada removida) para caber.
+:::caution Um agente por Hermes home
+Não aponte dois processos de agente para o mesmo diretório Hermes home. Escritas de memória são automáticas e voltam ao system prompt no início da sessão, então dois escritores compartilhando um home vão acumular entradas uma da outra em um estado que nenhum dos dois (nem você) autorizou. A memória é escopada por [profile](/user-guide/profiles) de propósito — dê ao segundo agente seu próprio profile e, se precisarem de memória compartilhada, use um [provedor de memória externo](/user-guide/features/memory-providers).
 :::
 
-## Como a memória aparece no system prompt {#how-memory-appears-in-the-system-prompt}
+:::info
+Limites de caracteres mantêm a memória focada. A memória **não** compacta automaticamente: quando uma escrita excederia o limite, a ferramenta `memory` retorna erro em vez de descartar entradas silenciosamente. O agente então abre espaço — consolidando ou removendo entradas no mesmo turno antes de tentar de novo (veja [O Que Acontece Quando a Memória Enche](#what-happens-when-memory-is-full)). Note que `replace` também respeita o limite: trocar uma entrada por conteúdo maior ainda pode estourar, então o novo conteúdo precisa ser encurtado (ou outra entrada removida) para caber.
+:::
 
-No início de cada sessão, entradas de memória são carregadas do disco e renderizadas no system prompt como um bloco congelado:
+## Como a Memória Aparece no System Prompt {#how-memory-appears-in-the-system-prompt}
+
+No início de toda sessão, entradas de memória são carregadas do disco e renderizadas no system prompt como um bloco congelado:
 
 ```
 ══════════════════════════════════════════════
@@ -40,13 +44,13 @@ User prefers concise responses, dislikes verbose explanations
 
 O formato inclui:
 - Um cabeçalho mostrando qual store (MEMORY ou USER PROFILE)
-- Porcentagem de uso e contagem de caracteres para o agente saber a capacidade
+- Percentual de uso e contagem de caracteres para o agente saber a capacidade
 - Entradas individuais separadas por delimitadores `§` (section sign)
 - Entradas podem ser multilinha
 
 **Padrão de snapshot congelado:** A injeção no system prompt é capturada uma vez no início da sessão e nunca muda no meio da sessão. Isso é intencional — preserva o prefix cache do LLM para desempenho. Quando o agente adiciona/remove entradas de memória durante a sessão, as mudanças são persistidas no disco imediatamente, mas só aparecem no system prompt quando a próxima sessão começa. Respostas de ferramentas sempre mostram o estado ao vivo.
 
-## Ações da ferramenta memory {#memory-tool-actions}
+## Ações da Ferramenta Memory {#memory-tool-actions}
 
 O agente usa a ferramenta `memory` com estas ações:
 
@@ -54,65 +58,65 @@ O agente usa a ferramenta `memory` com estas ações:
 - **replace** — Substitui uma entrada existente por conteúdo atualizado (usa correspondência por substring via `old_text`)
 - **remove** — Remove uma entrada que não é mais relevante (usa correspondência por substring via `old_text`)
 
-Não há ação `read` — o conteúdo da memória é injetado automaticamente no system prompt no início da sessão. O agente vê suas memórias como parte do contexto da conversa.
+Não há ação `read` — o conteúdo de memória é injetado automaticamente no system prompt no início da sessão. O agente vê suas memórias como parte do contexto da conversa.
 
-### Correspondência por substring {#substring-matching}
+### Correspondência por Substring {#substring-matching}
 
 As ações `replace` e `remove` usam correspondência por substring curta e única — você não precisa do texto completo da entrada. O parâmetro `old_text` só precisa ser uma substring única que identifique exatamente uma entrada:
 
 ```python
-# If memory contains "User prefers dark mode in all editors"
+# Se a memória contém "User prefers dark mode in all editors"
 memory(action="replace", target="memory",
        old_text="dark mode",
        content="User prefers light mode in VS Code, dark mode in terminal")
 ```
 
-Se a substring corresponder a várias entradas, um erro é retornado pedindo uma correspondência mais específica.
+Se a substring corresponder a múltiplas entradas, um erro é retornado pedindo uma correspondência mais específica.
 
-## Dois targets explicados {#two-targets-explained}
+## Dois Targets Explicados {#two-targets-explained}
 
-### `memory` — Notas pessoais do agente {#memory--agents-personal-notes}
+### `memory` — Notas Pessoais do Agente {#memory-agents-personal-notes}
 
 Para informação que o agente precisa lembrar sobre ambiente, fluxos de trabalho e lições aprendidas:
 
 - Fatos do ambiente (SO, ferramentas, estrutura do projeto)
 - Convenções e configuração do projeto
-- Quirks e workarounds de ferramentas descobertos
+- Quirks de ferramentas e workarounds descobertos
 - Entradas de diário de tarefas concluídas
 - Skills e técnicas que funcionaram
 
-### `user` — Perfil do usuário {#user--user-profile}
+### `user` — Perfil do Usuário {#user-user-profile}
 
 Para informação sobre identidade, preferências e estilo de comunicação do usuário:
 
-- Nome, papel, fuso horário
+- Nome, função, fuso horário
 - Preferências de comunicação (conciso vs detalhado, preferências de formato)
 - Pet peeves e coisas a evitar
-- Hábitos de fluxo de trabalho
-- Nível de skill técnica
+- Hábitos de workflow
+- Nível técnico
 
-## O que salvar vs ignorar {#what-to-save-vs-skip}
+## O Que Salvar vs Ignorar {#what-to-save-vs-skip}
 
-### Salve isto (proativamente) {#save-these-proactively}
+### Salve Estes (Proativamente) {#save-these-proactively}
 
-O agente salva automaticamente — você não precisa pedir. Ele salva quando aprende:
+O agente salva automaticamente — você não precisa pedir. Salva quando aprende:
 
 - **Preferências do usuário:** "Prefiro TypeScript a JavaScript" → salvar em `user`
 - **Fatos do ambiente:** "Este servidor roda Debian 12 com PostgreSQL 16" → salvar em `memory`
 - **Correções:** "Não use `sudo` para comandos Docker, usuário está no grupo docker" → salvar em `memory`
-- **Convenções:** "Projeto usa tabs, line width 120 chars, docstrings estilo Google" → salvar em `memory`
-- **Trabalho concluído:** "Migrei banco de MySQL para PostgreSQL em 2026-01-15" → salvar em `memory`
-- **Pedidos explícitos:** "Lembre que minha rotação de API key é mensal" → salvar em `memory`
+- **Convenções:** "Projeto usa tabs, linha de 120 chars, docstrings estilo Google" → salvar em `memory`
+- **Trabalho concluído:** "Migrei o banco de MySQL para PostgreSQL em 2026-01-15" → salvar em `memory`
+- **Pedidos explícitos:** "Lembre que a rotação da minha API key é mensal" → salvar em `memory`
 
-### Ignore isto {#skip-these}
+### Ignore Estes {#skip-these}
 
 - **Info trivial/óbvia:** "Usuário perguntou sobre Python" — vago demais para ser útil
-- **Fatos facilmente redescobertos:** "Python 3.12 suporta f-string nesting" — pode pesquisar na web
-- **Dumps de dados brutos:** Blocos grandes de código, logs, tabelas — grandes demais para memória
+- **Fatos facilmente redescobríveis:** "Python 3.12 suporta f-string aninhada" — dá para buscar na web
+- **Dumps de dados brutos:** Blocos grandes de código, logs, tabelas — grande demais para memória
 - **Efêmeros da sessão:** Caminhos temporários de arquivo, contexto de debug pontual
 - **Informação já em arquivos de contexto:** Conteúdo de SOUL.md e AGENTS.md
 
-## Gerenciamento de capacidade {#capacity-management}
+## Gerenciamento de Capacidade {#capacity-management}
 
 A memória tem limites rígidos de caracteres para manter system prompts limitados:
 
@@ -121,7 +125,7 @@ A memória tem limites rígidos de caracteres para manter system prompts limitad
 | memory | 2.200 chars | 8-15 entradas |
 | user | 1.375 chars | 5-10 entradas |
 
-### O que acontece quando a memória enche {#what-happens-when-memory-is-full}
+### O Que Acontece Quando a Memória Enche {#what-happens-when-memory-is-full}
 
 Quando você tenta adicionar uma entrada que excederia o limite, a ferramenta retorna erro:
 
@@ -142,7 +146,7 @@ O agente deve então:
 
 **Boa prática:** Quando a memória estiver acima de 80% da capacidade (visível no cabeçalho do system prompt), consolide entradas antes de adicionar novas. Por exemplo, mescle três entradas separadas "projeto usa X" em uma descrição abrangente do projeto.
 
-### Exemplos práticos de boas entradas de memória {#practical-examples-of-good-memory-entries}
+### Exemplos Práticos de Boas Entradas de Memória {#practical-examples-of-good-memory-entries}
 
 **Entradas compactas e densas em informação funcionam melhor:**
 
@@ -164,32 +168,32 @@ On January 5th, 2026, the user asked me to look at their project which is
 located at ~/code/api. I discovered it uses Go version 1.22 and...
 ```
 
-## Prevenção de duplicatas {#duplicate-prevention}
+## Prevenção de Duplicatas {#duplicate-prevention}
 
 O sistema de memória rejeita automaticamente entradas duplicadas exatas. Se você tentar adicionar conteúdo que já existe, retorna sucesso com mensagem "no duplicate added".
 
-## Varredura de segurança {#security-scanning}
+## Varredura de Segurança {#security-scanning}
 
 Entradas de memória são escaneadas por padrões de injeção e exfiltração antes de serem aceitas, já que são injetadas no system prompt. Conteúdo que corresponde a padrões de ameaça (prompt injection, exfiltração de credenciais, backdoors SSH) ou contém caracteres Unicode invisíveis é bloqueado.
 
-## Busca de sessões {#session-search}
+## Busca de Sessões {#session-search}
 
-Além de MEMORY.md e USER.md, o agente pode buscar conversas passadas usando a ferramenta `session_search`:
+Além de MEMORY.md e USER.md, o agente pode buscar conversas passadas com a ferramenta `session_search`:
 
 - Todas as sessões CLI e de mensagens ficam em SQLite (`~/.hermes/state.db`) com busca full-text FTS5
-- Consultas retornam mensagens reais do DB — sem sumarização LLM, sem truncamento
+- Consultas retornam mensagens reais do DB — sem sumarização por LLM, sem truncamento
 - O agente encontra coisas discutidas semanas atrás, mesmo que não estejam na memória ativa
 - O agente também pode rolar para frente/trás dentro de qualquer sessão encontrada
 
 ```bash
-hermes sessions list    # Browse past sessions
+hermes sessions list    # Navegar sessões passadas
 ```
 
-Veja [Ferramenta session search](/user-guide/sessions#session-search-tool) para as três formas de chamada (discovery / scroll / browse) e o formato de resposta.
+Veja [Session Search Tool](/user-guide/sessions#session-search-tool) para as três formas de chamada (discovery / scroll / browse) e o formato de resposta.
 
 ### session_search vs memory {#session_search-vs-memory}
 
-| Recurso | Memória persistente | Busca de sessões |
+| Recurso | Memória Persistente | Busca de Sessões |
 |---------|------------------|----------------|
 | **Capacidade** | ~1.300 tokens no total | Ilimitada (todas as sessões) |
 | **Velocidade** | Instantânea (no system prompt) | ~20ms consulta FTS5, ~1ms scroll |
@@ -198,55 +202,72 @@ Veja [Ferramenta session search](/user-guide/sessions#session-search-tool) para 
 | **Gerenciamento** | Curada manualmente pelo agente | Automático — todas as sessões armazenadas |
 | **Custo de token** | Fixo por sessão (~1.300 tokens) | Sob demanda (buscado quando necessário) |
 
-**Memória** é para fatos críticos que devem estar sempre no contexto. **Busca de sessões** é para consultas do tipo "discutimos X na semana passada?" onde o agente precisa lembrar detalhes de conversas passadas.
+**Memória** é para fatos críticos que devem estar sempre no contexto. **Busca de sessões** é para consultas do tipo "discutimos X na semana passada?" em que o agente precisa lembrar detalhes de conversas passadas.
+
+## Jornada de Aprendizado (`/journey`) {#learning-journey-journey}
+
+A jornada de aprendizado é uma visão em linha do tempo de tudo que o Hermes aprendeu — skills salvas e entradas de memória plotadas ao longo do tempo (mais antigas no topo, mais novas embaixo), com um scrubber "constelação" reproduzível que replaya a construção. Os mesmos dados do grafo alimentam três superfícies:
+
+- **CLI clássico / standalone** — `hermes journey` (aliases: `hermes learning`, `hermes memory-graph`) renderiza a linha do tempo no terminal. Flags: `--play` anima a construção (`--fps` para ajustar), `--width`/`--height` sobrescrevem o tamanho, `--no-color` desabilita cor, e `--json` despeja o payload bruto do grafo.
+- **TUI** — `/journey` (aliases: `/learning`, `/memory-graph`) abre a linha do tempo como overlay.
+- **App desktop** — `/journey` abre o painel Star Map / memory-graph, uma visualização interativa dos mesmos nós.
+
+Além de visualizar, a jornada também é onde você **poda e corrige** o que o Hermes aprendeu:
+
+| Comando | O que faz |
+|---------|--------------|
+| `hermes journey list` | Lista ids de nós — nomes de skills e ids `memory:<source>:<index>` para chunks de memória. |
+| `hermes journey delete <node> [-y]` | Exclui um nó. Skills são **arquivadas** (restauráveis), chunks de memória são removidos. `-y` pula a confirmação. |
+| `hermes journey edit <node>` | Abre o conteúdo do nó (`SKILL.md` da skill ou o chunk de memória) em `$EDITOR`. |
+
+Os mesmos subcomandos `list` / `delete <id>` / `edit <id>` funcionam pelo comando `/journey` no chat da CLI, e o painel desktop oferece edit/delete nos nós diretamente.
 
 ## Configuração {#configuration}
 
 ```yaml
-# In ~/.hermes/config.yaml
+# Em ~/.hermes/config.yaml
 memory:
   memory_enabled: true
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
-  write_approval: false     # false = write freely (default) | true = require approval
+  write_approval: false     # false = escrever livremente (padrão) | true = exigir aprovação
 ```
 
 ## Controlando escritas de memória (`write_approval`) {#controlling-memory-writes-write_approval}
 
-Por padrão o agente salva memória livremente — inclusive pela revisão de autoaperfeiçoamento em background que roda após um turno. Se preferir aprovar saves primeiro, defina `memory.write_approval: true`. É um gate simples liga/desliga aplicado a **ambos** turnos em foreground e à revisão em background:
+Por padrão o agente salva memória livremente — inclusive pela revisão de auto-melhoria em background que roda após um turno. Se preferir aprovar saves primeiro, defina `memory.write_approval: true`. É um gate simples liga/desliga aplicado a **ambos** turnos em foreground e a revisão em background:
 
 | `write_approval` | Comportamento |
 |------------------|-----------|
 | `false` (padrão) | Escrever livremente — o gate está desligado (comportamento pré-gate). |
-| `true` | Exigir aprovação antes de qualquer save. No CLI interativo, escritas em foreground pedem inline (entradas são pequenas o suficiente para ler por completo). Em todo lugar — plataformas de mensagens, scripts e a revisão de autoaperfeiçoamento em background — escritas são **staged** para revisão com `/memory pending`. |
+| `true` | Exigir aprovação antes de qualquer coisa ser salva. Na CLI interativa, escritas em foreground pedem confirmação inline (entradas são pequenas o suficiente para ler por completo). Em todo o resto — plataformas de mensagens, scripts e a revisão de auto-melhoria em background — escritas ficam **staged** para revisão com `/memory pending`. |
 
-> Para desligar memória por completo (não só gated), defina `memory_enabled: false`.
+> Para desligar a memória por completo (não só gatear), defina `memory_enabled: false`.
 
-Revise escritas staged do CLI ou de qualquer plataforma de mensagens:
+Revise escritas staged pela CLI ou qualquer plataforma de mensagens:
 
 ```
-/memory pending             # list staged memory writes (auto ones tagged [auto])
-/memory approve <id>        # apply one (or 'all')
-/memory reject <id>         # drop one (or 'all')
-/memory approval on         # turn the gate on (or 'off') and persist it
+/memory pending             # listar escritas de memória staged (auto ones tagged [auto])
+/memory approve <id>        # aplicar uma (ou 'all')
+/memory reject <id>         # descartar uma (ou 'all')
+/memory approval on         # ligar o gate (ou 'off') e persistir
 ```
 
 Esta é a resposta para "o agente salvou uma suposição errada sobre mim": defina
-`write_approval: true`, e todo save — especialmente os unprompted em background
-— espera seu sim/não antes de entrar no seu perfil.
+`write_approval: true`, e todo save — especialmente os em background não solicitados —
+espera seu sim/não antes de entrar no seu perfil.
 
 ## Notificações de revisão em background (`display.memory_notifications`) {#background-review-notifications-displaymemory_notifications}
 
-Após um turno, a revisão de autoaperfeiçoamento em background pode salvar memória
-ou atualizar uma skill silenciosamente. Este é o loop de aprendizado consciente de consentimento do Hermes: correções repetidas e lições duráveis de fluxo de trabalho viram entradas compactas de memória ou skills procedurais, enquanto `write_approval` pode staged essas escritas para revisão
-antes de afetar sessões futuras. Por padrão exibe uma linha curta
-`💾 Memory updated` no chat para você saber que aconteceu. Controle o quão verboso
-isso é:
+Após um turno, a revisão de auto-melhoria em background pode salvar memória
+ou atualizar uma skill silenciosamente. Este é o loop de aprendizado consciente do consentimento do Hermes: correções repetidas e lições duráveis de workflow viram entradas compactas de memória ou skills procedurais, enquanto `write_approval` pode colocar essas escritas em staging para revisão
+antes de afetarem sessões futuras. Por padrão aparece uma linha curta
+`💾 Memory updated` no chat para você saber que aconteceu. Controle o quão verboso fica:
 
 ```yaml
 display:
-  memory_notifications: on    # off | on (default) | verbose
+  memory_notifications: on    # off | on (padrão) | verbose
 ```
 
 | Valor | Comportamento |
@@ -270,15 +291,15 @@ em vez disso:
 auxiliary:
   background_review:
     provider: openrouter
-    model: google/gemini-3-flash-preview   # auto (default) = main chat model
+    model: google/gemini-3-flash-preview   # auto (padrão) = modelo principal de chat
 ```
 
 Quando você aponta para um modelo **diferente** do principal, a revisão roda
-lá por custo substancialmente menor (~3–5× em benchmarks). Como um modelo
-diferente não pode reutilizar o prompt cache do seu modelo principal, o fork automaticamente
+lá com custo substancialmente menor (~3–5× em benchmarks). Como um modelo
+diferente não reutiliza o prompt cache do principal, o fork automaticamente
 replaya um **digest** compacto da conversa (turnos recentes verbatim + um
 resumo dos mais antigos) em vez da transcrição completa — minimizando o que escreve
-no novo cache. Captura mantida: em testes, captura de memória foi
+no novo cache. Captura manteve: em testes, captura de memória foi
 idêntica e captura de skill quase idêntica à revisão no modelo principal.
 
 Deixe em `auto` (ou defina para seu modelo principal) e nada muda — a
@@ -287,40 +308,40 @@ revisão continua no modelo principal com replay completo do cache quente.
 ## Controlando escritas de skills (`skills.write_approval`) {#controlling-skill-writes-skillswrite_approval}
 
 Skills usam o mesmo gate liga/desliga, mas a UX de revisão difere porque um
-`SKILL.md` é grande demais para ler em uma bolha de chat:
+`SKILL.md` é grande demais para ler num balão de chat:
 
 ```yaml
 skills:
-  write_approval: false     # false = write freely (default) | true = require approval
+  write_approval: false     # false = escrever livremente (padrão) | true = exigir aprovação
 ```
 
 Quando `write_approval: true`, escritas de skill (create / edit / patch / write_file /
-delete) sempre **staged** independentemente da origem. Você revisa o gist de uma linha
+delete) sempre **staged** independente da origem. Você revisa o gist de uma linha
 inline, mas o diff completo fica out-of-band:
 
 ```
-/skills pending             # list staged skill writes + a one-line gist each
-/skills diff <id>           # full unified diff (best viewed in CLI or dashboard)
-/skills approve <id>        # apply it (or 'all')
-/skills reject <id>         # drop it (or 'all')
-/skills approval on         # turn the gate on (or 'off') and persist it
+/skills pending             # listar escritas de skill staged + gist de uma linha cada
+/skills diff <id>           # diff unificado completo (melhor visto na CLI ou dashboard)
+/skills approve <id>        # aplicar (ou 'all')
+/skills reject <id>         # descartar (ou 'all')
+/skills approval on         # ligar o gate (ou 'off') e persistir
 ```
 
-Em uma plataforma de mensagens, aprove uma skill pelo gist + metadata, ou abra
-`/skills diff` no CLI / dashboard / o arquivo staged em
+Em plataforma de mensagens, aprove uma skill pelo gist + metadados, ou abra
+`/skills diff` na CLI / dashboard / o arquivo staged em
 `~/.hermes/pending/skills/<id>.json` quando quiser ler a mudança inteira.
-Detalhes completos em [Gating de escritas de skill pelo agente](/user-guide/features/skills#gating-agent-skill-writes-skillswrite_approval).
+Detalhes completos em [Gating agent skill writes](/user-guide/features/skills#gating-agent-skill-writes-skillswrite_approval).
 
 
-## Provedores de memória externos {#external-memory-providers}
+## Provedores de Memória Externos {#external-memory-providers}
 
-Para memória persistente mais profunda que vai além de MEMORY.md e USER.md, o Hermes inclui 8 plugins de provedor de memória externo — incluindo Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover e Supermemory.
+Para memória persistente mais profunda além de MEMORY.md e USER.md, o Hermes inclui 8 plugins de provedor de memória externo — incluindo Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover e Supermemory.
 
-Provedores externos rodam **junto** com a memória built-in (nunca substituindo) e adicionam capacidades como grafos de conhecimento, busca semântica, extração automática de fatos e modelagem de usuário cross-session.
+Provedores externos rodam **junto** com a memória built-in (nunca a substituem) e adicionam capacidades como grafos de conhecimento, busca semântica, extração automática de fatos e modelagem de usuário entre sessões.
 
 ```bash
-hermes memory setup      # pick a provider and configure it
-hermes memory status     # check what's active
+hermes memory setup      # escolher um provedor e configurar
+hermes memory status     # verificar o que está ativo
 ```
 
-Veja o guia [Provedores de memória](./memory-providers.md) para detalhes completos de cada provedor, instruções de setup e comparação.
+Veja o guia [Memory Providers](./memory-providers.md) para detalhes completos de cada provedor, instruções de setup e comparação.

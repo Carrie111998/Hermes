@@ -1,18 +1,18 @@
 ---
 sidebar_position: 8
 title: "Referência de Configuração MCP"
-description: "Referência das chaves de configuração MCP do Hermes, semântica de filtragem e política de ferramentas utilitárias"
+description: "Referência das chaves de configuração MCP do Hermes Agent, semântica de filtragem e política de ferramentas utilitárias"
 ---
 
-# Referência de Configuração MCP
+# Referência de Configuração MCP {#mcp-config-reference}
 
-Esta página é a referência compacta que acompanha a documentação principal de MCP.
+Esta página é a referência compacta que complementa a documentação principal de MCP.
 
-Para orientação conceitual, veja:
+Para orientação conceitual, consulte:
 - [MCP (Model Context Protocol)](/user-guide/features/mcp)
-- [Usar MCP com o Hermes](/guides/use-mcp-with-hermes)
+- [Usar MCP com Hermes](/guides/use-mcp-with-hermes)
 
-## Formato da configuração raiz {#root-config-shape}
+## Formato raiz da configuração {#root-config-shape}
 
 ```yaml
 mcp_servers:
@@ -25,10 +25,10 @@ mcp_servers:
     url: "..."          # servidores HTTP
     headers: {}
 
-    # Configurações opcionais de TLS para HTTP/SSE:
-    ssl_verify: true                # bool ou caminho para um pacote de CA (PEM)
-    client_cert: "/path/to/cert.pem"  # certificado de cliente mTLS (veja abaixo)
-    # client_key: "/path/to/key.pem"  # opcional, quando a chave está em um arquivo separado
+    # Configurações TLS opcionais para HTTP/SSE:
+    ssl_verify: true                # bool ou caminho para um bundle CA (PEM)
+    client_cert: "/path/to/cert.pem"  # certificado cliente mTLS (veja abaixo)
+    # client_key: "/path/to/key.pem"  # opcional, quando a chave está em arquivo separado
 
     enabled: true
     timeout: 120
@@ -41,7 +41,7 @@ mcp_servers:
       prompts: true
 ```
 
-## Chaves do servidor {#server-keys}
+## Chaves de servidor {#server-keys}
 
 | Chave | Tipo | Aplica-se a | Significado |
 |---|---|---|---|
@@ -50,26 +50,69 @@ mcp_servers:
 | `env` | mapping | stdio | Ambiente passado ao subprocesso |
 | `url` | string | HTTP | Endpoint MCP remoto |
 | `headers` | mapping | HTTP | Cabeçalhos para requisições ao servidor remoto |
-| `ssl_verify` | bool ou string | HTTP | Verificação TLS. `true` (padrão) usa as CAs do sistema, `false` desativa a verificação (inseguro), ou uma string com o caminho para um pacote de CA personalizado (PEM) |
-| `client_cert` | string ou list | HTTP | Certificado de cliente mTLS. String = caminho para um arquivo PEM contendo certificado + chave. Lista `[cert, key]` = arquivos separados. Lista `[cert, key, password]` = chave criptografada |
-| `client_key` | string | HTTP | Caminho para a chave privada do cliente, quando `client_cert` é uma string e a chave está em um arquivo separado |
-| `enabled` | bool | ambos | Ignora o servidor completamente quando `false` |
-| `timeout` | number | ambos | Timeout de chamada de ferramenta em segundos (padrão: `300`) |
-| `connect_timeout` | number | ambos | Timeout de conexão inicial em segundos (padrão: `60`) |
-| `supports_parallel_tool_calls` | bool | ambos | Permite que ferramentas deste servidor sejam executadas em paralelo |
-| `skip_preflight` | bool | HTTP | Ignora a verificação fail-fast de content-type para endpoints Streamable HTTP válidos cujo HEAD/GET responde com um content-type não-MCP (padrão: `false`) |
-| `tools` | mapping | ambos | Política de filtragem e ferramentas utilitárias |
-| `auth` | string | HTTP | Método de autenticação. Defina como `oauth` para ativar OAuth 2.1 com PKCE |
-| `sampling` | mapping | ambos | Política de requisições de LLM iniciadas pelo servidor (veja o guia de MCP) |
+| `ssl_verify` | bool or string | HTTP | Verificação TLS. `true` (padrão) usa CAs do sistema, `false` desabilita a verificação (inseguro), ou um caminho string para um bundle CA customizado (PEM) |
+| `client_cert` | string or list | HTTP | Certificado cliente mTLS. String = caminho para um arquivo PEM contendo cert + key. List `[cert, key]` = arquivos separados. List `[cert, key, password]` = chave criptografada |
+| `client_key` | string | HTTP | Caminho para a chave privada do cliente, quando `client_cert` é uma string e a chave está em arquivo separado |
+| `enabled` | bool | both | Ignora o servidor por completo quando false |
+| `timeout` | number | both | Timeout de chamada de ferramenta em segundos (padrão: `300`) |
+| `connect_timeout` | number | both | Timeout de conexão inicial em segundos (padrão: `60`) |
+| `supports_parallel_tool_calls` | bool | both | Permite que ferramentas deste servidor executem em paralelo |
+| `skip_preflight` | bool | HTTP | Ignora a sonda fail-fast de content-type para endpoints Streamable HTTP válidos cujo HEAD/GET responde com content-type não-MCP (padrão: `false`) |
+| `transport` | string | HTTP | Defina como `sse` para usar o transporte SSE em vez de Streamable HTTP |
+| `keepalive_interval` | number | both | Cadência de ping de liveness em segundos (padrão: `180`, mínimo 5s). Defina abaixo do TTL de sessão do servidor para servidores que fazem GC de sessões ociosas rapidamente |
+| `idle_timeout_seconds` | number | stdio | Reciclagem opcional do servidor stdio após tempo ocioso (`0` desabilita). Também pode ficar sob um mapping `lifecycle:` |
+| `max_lifetime_seconds` | number | stdio | Reciclagem opcional do servidor stdio após idade (`0` desabilita). Também pode ficar sob um mapping `lifecycle:` |
+| `tools` | mapping | both | Filtragem e política de ferramentas utilitárias |
+| `auth` | string | HTTP | Método de autenticação. Defina como `oauth` para habilitar OAuth 2.1 com PKCE |
+| `sampling` | mapping | both | Política de requisições LLM iniciadas pelo servidor (veja o guia MCP) |
+| `elicitation` | mapping | both | Requisições de input do usuário iniciadas pelo servidor. `enabled` (padrão `true`) e `timeout` em segundos (padrão `300`). Requisições em modo form passam pela superfície de aprovação; modo URL é recusado (veja o guia MCP) |
+| `trust` | string | both | Nível de confiança: `full` (padrão) ou `untrusted`. Em um servidor `untrusted`, toda chamada de ferramenta com capacidade de escrita (qualquer ferramenta sem anotação `readOnlyHint: true`) exige aprovação do usuário pela superfície de aprovação padrão antes de executar. `readOnlyHint` é uma *dica* fornecida pelo servidor — um servidor mentiroso pode no máximo pular aprovação para ferramentas que alega serem somente leitura, nunca ganhar acesso extra — então marque como `untrusted` qualquer servidor que você não controla totalmente. Valores não reconhecidos são tratados como `untrusted` (fail-closed) |
 
-## Chaves da política `tools` {#tools-policy-keys}
+## Referências a variáveis de ambiente {#environment-variable-references}
+
+Valores string em qualquer lugar de uma entrada de servidor (`env`, `headers`, `args`, `url`, …) podem referenciar variáveis de ambiente com `${VAR}` ou a forma SecretRef estilo Cursor `${env:VAR}` — ambas resolvem para a mesma variável, então snippets MCP copiados de configs Cursor / Claude funcionam sem alteração:
+
+```yaml
+mcp_servers:
+  github:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${env:GITHUB_TOKEN}"   # igual a "${GITHUB_TOKEN}"
+```
+
+Os valores resolvem a partir do escopo de segredos do profile ativo (com fallback para o ambiente do processo), então coloque o segredo em `~/.hermes/.env`. Uma variável não definida mantém o placeholder literal.
+
+### Variáveis de contexto {#context-variables}
+
+Além de variáveis de env, as variáveis de contexto estilo Cursor também são interpoladas (nomes são sensíveis a maiúsculas/minúsculas):
+
+| Variável | Resolve para |
+|---|---|
+| `${userHome}` | Diretório home do usuário atual |
+| `${workspaceFolder}` | Raiz do workspace da sessão (cwd do terminal da sessão quando conhecido, senão o cwd do processo) |
+| `${workspaceFolderBasename}` | O basename de `${workspaceFolder}` |
+| `${pathSeparator}` / `${/}` | O separador de caminho do SO (`os.sep`) |
+
+```yaml
+mcp_servers:
+  filesystem:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "${workspaceFolder}"]
+    env:
+      CACHE_DIR: "${userHome}${/}.cache${/}mcp"
+```
+
+Qualquer outra referência `${...}` cai na busca de variável de env acima.
+
+## Chaves de política `tools` {#tools-policy-keys}
 
 | Chave | Tipo | Significado |
 |---|---|---|
-| `include` | string ou list | Lista de permissão de ferramentas MCP nativas do servidor |
-| `exclude` | string ou list | Lista de bloqueio de ferramentas MCP nativas do servidor |
-| `resources` | tipo booleano | Ativa/desativa `list_resources` + `read_resource` |
-| `prompts` | tipo booleano | Ativa/desativa `list_prompts` + `get_prompt` |
+| `include` | string or list | Lista branca de ferramentas MCP nativas do servidor. Entradas podem ser nomes exatos ou globs estilo fnmatch (`*_radar_*`, `get_zones_*`) |
+| `exclude` | string or list | Lista negra de ferramentas MCP nativas do servidor. Mesma semântica de nome exato / glob que `include` |
+| `resources` | bool-like | Habilita/desabilita `list_resources` + `read_resource` |
+| `prompts` | bool-like | Habilita/desabilita `list_prompts` + `get_prompt` |
 
 ## Semântica de filtragem {#filtering-semantics}
 
@@ -84,7 +127,7 @@ tools:
 
 ### `exclude` {#exclude}
 
-Se `exclude` estiver definido e `include` não, toda ferramenta MCP nativa do servidor é registrada, exceto essas.
+Se `exclude` estiver definido e `include` não, todas as ferramentas MCP nativas do servidor exceto esses nomes são registradas.
 
 ```yaml
 tools:
@@ -93,7 +136,7 @@ tools:
 
 ### Precedência {#precedence}
 
-Se ambos estiverem definidos, `include` prevalece.
+Se ambos estiverem definidos, `include` vence.
 
 ```yaml
 tools:
@@ -102,8 +145,8 @@ tools:
 ```
 
 Resultado:
-- `create_issue` ainda é permitida
-- `delete_issue` é ignorada porque `include` tem precedência
+- `create_issue` ainda é permitido
+- `delete_issue` é ignorado porque `include` tem precedência
 
 ## Política de ferramentas utilitárias {#utility-tool-policy}
 
@@ -117,14 +160,14 @@ Prompts:
 - `list_prompts`
 - `get_prompt`
 
-### Desativar resources {#disable-resources}
+### Desabilitar resources {#disable-resources}
 
 ```yaml
 tools:
   resources: false
 ```
 
-### Desativar prompts {#disable-prompts}
+### Desabilitar prompts {#disable-prompts}
 
 ```yaml
 tools:
@@ -133,10 +176,10 @@ tools:
 
 ### Registro consciente de capacidades {#capability-aware-registration}
 
-Mesmo quando `resources: true` ou `prompts: true`, o Hermes só registra essas ferramentas utilitárias se a sessão MCP realmente expuser a capacidade correspondente.
+Mesmo com `resources: true` ou `prompts: true`, o Hermes só registra essas ferramentas utilitárias se a sessão MCP expuser de fato a capacidade correspondente.
 
 Então isto é normal:
-- você ativa prompts
+- você habilita prompts
 - mas nenhuma utilidade de prompt aparece
 - porque o servidor não suporta prompts
 
@@ -152,16 +195,16 @@ mcp_servers:
 Comportamento:
 - nenhuma tentativa de conexão
 - nenhuma descoberta
-- nenhum registro de ferramentas
-- a configuração permanece disponível para reutilização posterior
+- nenhum registro de ferramenta
+- a config permanece no lugar para reutilização posterior
 
 ## Comportamento com resultado vazio {#empty-result-behavior}
 
-Se a filtragem remover todas as ferramentas nativas do servidor e nenhuma ferramenta utilitária for registrada, o Hermes não cria um toolset MCP vazio em runtime para aquele servidor.
+Se a filtragem remover todas as ferramentas nativas do servidor e nenhuma ferramenta utilitária for registrada, o Hermes não cria um toolset MCP runtime vazio para esse servidor.
 
-## Exemplos de configuração {#example-configs}
+## Configs de exemplo {#example-configs}
 
-### Lista de permissão segura do GitHub {#safe-github-allowlist}
+### Allowlist segura do GitHub {#safe-github-allowlist}
 
 ```yaml
 mcp_servers:
@@ -176,7 +219,7 @@ mcp_servers:
       prompts: false
 ```
 
-### Lista de bloqueio do Stripe {#stripe-blacklist}
+### Blacklist do Stripe {#stripe-blacklist}
 
 ```yaml
 mcp_servers:
@@ -188,7 +231,7 @@ mcp_servers:
       exclude: [delete_customer, refund_payment]
 ```
 
-### Servidor de documentos somente resources {#resource-only-docs-server}
+### Servidor de docs somente resources {#resource-only-docs-server}
 
 ```yaml
 mcp_servers:
@@ -200,29 +243,29 @@ mcp_servers:
       prompts: false
 ```
 
-### Certificado de cliente TLS (mTLS) {#tls-client-certificate-mtls}
+### Certificado cliente TLS (mTLS) {#tls-client-certificate-mtls}
 
-Para servidores HTTP/SSE que exigem um certificado de cliente, defina `client_cert` (e opcionalmente `client_key`):
+Para servidores HTTP/SSE que exigem certificado cliente, defina `client_cert` (e opcionalmente `client_key`):
 
 ```yaml
 mcp_servers:
-  # Certificado + chave combinados em um único arquivo PEM
+  # Cert + key combinados em um único arquivo PEM
   internal_api:
     url: "https://mcp.internal.example.com/mcp"
     client_cert: "~/secrets/mcp-client.pem"
 
-  # Arquivos de certificado e chave separados
+  # Arquivos de cert e key separados
   partner_api:
     url: "https://mcp.partner.example.com/mcp"
     client_cert: "~/secrets/client.crt"
     client_key: "~/secrets/client.key"
 
-  # Chave criptografada com senha (forma de lista de 3 elementos)
+  # Chave criptografada com passphrase (forma de lista com 3 elementos)
   bank_api:
     url: "https://mcp.bank.example.com/mcp"
     client_cert: ["~/secrets/client.crt", "~/secrets/client.key", "my-passphrase"]
 
-  # Pacote de CA personalizado (CA privada / servidor autoassinado)
+  # Bundle CA customizado (CA privada / servidor autoassinado)
   lab_api:
     url: "https://mcp.lab.local/mcp"
     ssl_verify: "~/secrets/lab-ca.pem"
@@ -230,48 +273,50 @@ mcp_servers:
 ```
 
 Notas:
-- Caminhos suportam expansão de `~`. Arquivos ausentes falham rapidamente no momento da conexão com uma mensagem de erro específica do servidor.
-- `ssl_verify: false` desativa totalmente a verificação de certificado do servidor. Não use isso com serviços reais.
-- Funciona tanto em transporte Streamable HTTP quanto SSE.
+- Caminhos suportam expansão de `~`. Arquivos ausentes falham rápido na conexão com mensagem de erro escopada ao servidor.
+- `ssl_verify: false` desabilita a verificação de certificado do servidor por completo. Não use isso com serviços reais.
+- Funciona tanto em transportes Streamable HTTP quanto SSE.
 
-## Recarregando a configuração {#reloading-config}
+## Recarregar config {#reloading-config}
 
-Depois de alterar a configuração MCP, recarregue os servidores com:
+Após alterar a config MCP, recarregue os servidores com:
 
 ```text
 /reload-mcp
 ```
 
-## Nomeação de ferramentas {#tool-naming}
+## Nomenclatura de ferramentas {#tool-naming}
 
-Ferramentas MCP nativas do servidor se tornam:
+Ferramentas MCP nativas do servidor tornam-se:
 
 ```text
-mcp_<server>_<tool>
+mcp__<server>__<tool>
 ```
 
 Exemplos:
-- `mcp_github_create_issue`
-- `mcp_filesystem_read_file`
-- `mcp_my_api_query_data`
+- `mcp__github__create_issue`
+- `mcp__filesystem__read_file`
+- `mcp__my_api__query_data`
 
 Ferramentas utilitárias seguem o mesmo padrão de prefixo:
-- `mcp_<server>_list_resources`
-- `mcp_<server>_read_resource`
-- `mcp_<server>_list_prompts`
-- `mcp_<server>_get_prompt`
+- `mcp__<server>__list_resources`
+- `mcp__<server>__read_resource`
+- `mcp__<server>__list_prompts`
+- `mcp__<server>__get_prompt`
+
+O delimitador de sublinhado duplo (`mcp__…__…`) segue a convenção usada por Claude Code, Codex e OpenCode, e desambigua a fronteira servidor/ferramenta mesmo quando qualquer componente contém sublinhados.
 
 ### Sanitização de nomes {#name-sanitization}
 
-Hifens (`-`) e pontos (`.`) tanto em nomes de servidor quanto em nomes de ferramenta são substituídos por underscores antes do registro. Isso garante que os nomes de ferramenta sejam identificadores válidos para as APIs de function-calling dos LLMs.
+Qualquer caractere que não seja letra, dígito ou sublinhado (hífens, pontos, espaços, etc.) em nomes de servidor e de ferramenta é substituído por sublinhado antes do registro. Isso garante que os nomes de ferramenta sejam identificadores válidos para APIs de function-calling de LLM.
 
-Por exemplo, um servidor chamado `my-api` que expõe uma ferramenta chamada `list-items.v2` se torna:
+Por exemplo, um servidor chamado `my-api` expondo uma ferramenta `list-items.v2` torna-se:
 
 ```text
-mcp_my_api_list_items_v2
+mcp__my_api__list_items_v2
 ```
 
-Tenha isso em mente ao escrever filtros `include` / `exclude` — use o nome **original** da ferramenta MCP (com hifens/pontos), não a versão sanitizada.
+Tenha isso em mente ao escrever filtros `include` / `exclude` — use o **nome original** da ferramenta MCP (com hífens/pontos), não a versão sanitizada.
 
 ## Autenticação OAuth 2.1 {#oauth-21-authentication}
 
@@ -285,8 +330,8 @@ mcp_servers:
 ```
 
 Comportamento:
-- O Hermes usa o fluxo OAuth 2.1 PKCE do SDK MCP (descoberta de metadados, registro dinâmico de cliente, troca e renovação de token)
-- Na primeira conexão, uma janela do navegador é aberta para autorização
-- Os tokens são persistidos em `~/.hermes/mcp-tokens/<server>.json` e reutilizados entre sessões
-- A renovação de token é automática; a reautorização só ocorre quando a renovação falha
+- O Hermes usa o fluxo OAuth 2.1 PKCE do MCP SDK (descoberta de metadados, registro dinâmico de cliente, troca de token e refresh)
+- Na primeira conexão, uma janela do navegador abre para autorização
+- Tokens são persistidos em `~/.hermes/mcp-tokens/<server>.json` e reutilizados entre sessões
+- Refresh de token é automático; reautorização só ocorre quando o refresh falha
 - Aplica-se apenas ao transporte HTTP/StreamableHTTP (servidores baseados em `url`)

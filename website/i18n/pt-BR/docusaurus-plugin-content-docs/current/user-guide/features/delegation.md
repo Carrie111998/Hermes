@@ -1,14 +1,14 @@
 ---
 sidebar_position: 7
-title: "Delegação de Subagentes"
-description: "Crie child agents isolados para fluxos de trabalho paralelos com delegate_task"
+title: "Delegação de subagentes"
+description: "Crie agentes filhos isolados para fluxos de trabalho paralelos com delegate_task"
 ---
 
-# Delegação de Subagentes
+# Delegação de subagentes
 
-A ferramenta `delegate_task` cria instâncias filhas de AIAgent com contexto isolado, acesso herdado às ferramentas e sessões de terminal próprias. Cada filho recebe uma conversa nova e trabalha de forma independente — apenas o resumo final entra no contexto do pai.
+A ferramenta `delegate_task` cria instâncias filhas de AIAgent com contexto isolado, acesso herdado a ferramentas e sessões de terminal próprias. Cada filho recebe uma conversa nova e trabalha de forma independente — apenas o resumo final entra no contexto do pai.
 
-Chamadas de modelo no nível superior rodam em background automaticamente. O Hermes retorna um handle imediatamente para a conversa continuar e depois publica o resultado como uma nova mensagem. Um subagente orquestrador espera seus próprios workers para sintetizar os resultados antes de retornar.
+Chamadas de modelo de nível superior rodam em segundo plano automaticamente. O Hermes retorna um identificador imediatamente para a conversa continuar e publica o resultado depois como uma nova mensagem. Um subagente orquestrador aguarda seus próprios workers para sintetizar os resultados antes de retornar.
 
 ## Tarefa única {#single-task}
 
@@ -33,8 +33,8 @@ delegate_task(tasks=[
 
 ## Como funciona o contexto do subagente {#how-subagent-context-works}
 
-:::warning Crítico: subagentes não sabem de nada
-Subagentes começam com uma **conversa completamente nova**. Eles não têm nenhum conhecimento do histórico de conversa do pai, de chamadas de ferramentas anteriores ou de qualquer coisa discutida antes da delegação. O único contexto do subagente vem dos campos `goal` e `context` que o agente pai preenche ao chamar `delegate_task`.
+:::warning Crítico: subagentes não sabem nada
+Subagentes começam com uma **conversa completamente nova**. Eles não têm conhecimento do histórico de conversa do pai, de chamadas de ferramentas anteriores nem de nada discutido antes da delegação. O único contexto do subagente vem dos campos `goal` e `context` que o agente pai preenche ao chamar `delegate_task`.
 :::
 
 Isso significa que o agente pai deve passar **tudo** que o subagente precisa na chamada:
@@ -54,7 +54,7 @@ delegate_task(
 )
 ```
 
-O subagente recebe um system prompt focado construído a partir do seu goal e context, instruindo-o a completar a tarefa e fornecer um resumo estruturado do que fez, do que encontrou, de quaisquer arquivos modificados e de quaisquer problemas encontrados.
+O subagente recebe um prompt de sistema focado construído a partir do seu `goal` e `context`, instruindo-o a concluir a tarefa e fornecer um resumo estruturado do que fez, do que encontrou, de quaisquer arquivos modificados e de quaisquer problemas encontrados.
 
 ## Exemplos práticos {#practical-examples}
 
@@ -79,7 +79,7 @@ delegate_task(tasks=[
 ])
 ```
 
-### Revisão de código + correção {#code-review--fix}
+### Revisão de código + correção {#code-review-fix}
 
 Delegue um fluxo de revisão e correção para um contexto novo:
 
@@ -94,7 +94,7 @@ delegate_task(
 )
 ```
 
-### Refatoração multi-arquivo {#multi-file-refactoring}
+### Refatoração em vários arquivos {#multi-file-refactoring}
 
 Delegue uma refatoração grande que inundaria o contexto do pai:
 
@@ -113,25 +113,25 @@ delegate_task(
 )
 ```
 
-## Detalhes do modo batch {#batch-mode-details}
+## Detalhes do modo em lote {#batch-mode-details}
 
-Quando um agente de nível superior fornece um array `tasks`, o Hermes retorna um handle de background, executa os subagentes em paralelo e publica um resultado consolidado depois que todos os filhos terminam. Um subagente orquestrador espera seu batch no turno atual para sintetizar os resultados.
+Quando um agente de nível superior fornece um array `tasks`, o Hermes retorna um identificador de segundo plano, executa os subagentes em paralelo e publica um resultado consolidado depois que todos os filhos terminam. Um subagente orquestrador aguarda seu lote no turno atual para sintetizar os resultados.
 
-- **Concorrência máxima:** 3 tarefas por padrão (configurável via `delegation.max_concurrent_children` ou a env var `DELEGATION_MAX_CONCURRENT_CHILDREN`; mínimo 1, sem teto rígido). Batches maiores que o limite retornam erro de ferramenta em vez de serem truncados silenciosamente.
-- **Thread pool:** Usa `ThreadPoolExecutor` com o limite de concorrência configurado como max workers
-- **Exibição de progresso:** No modo CLI, uma tree view mostra chamadas de ferramentas de cada subagente em tempo real com linhas de conclusão por tarefa. No gateway, o progresso é agrupado e repassado ao callback de progresso do pai
-- **Ordem dos resultados:** Resultados são ordenados por índice de tarefa para corresponder à ordem de entrada, independentemente da ordem de conclusão
-- **Cancelamento:** Mensagens de follow-up não cancelam um batch de background de nível superior. `/stop` ou fechar/redefinir a sessão proprietária cancela seus filhos ativos. Filhos síncronos de orquestrador ainda seguem o estado de interrupção do pai
+- **Concorrência máxima:** 3 tarefas por padrão (configurável via `delegation.max_concurrent_children` ou a variável de ambiente `DELEGATION_MAX_CONCURRENT_CHILDREN`; mínimo 1, sem teto rígido). Lotes maiores que o limite retornam erro de ferramenta em vez de serem truncados silenciosamente.
+- **Pool de threads:** usa `ThreadPoolExecutor` com o limite de concorrência configurado como máximo de workers
+- **Exibição de progresso:** no modo CLI, uma visualização em árvore mostra chamadas de ferramentas de cada subagente em tempo real com linhas de conclusão por tarefa. No gateway, o progresso é agrupado e repassado ao callback de progresso do pai
+- **Ordem dos resultados:** resultados são ordenados pelo índice da tarefa para corresponder à ordem de entrada, independentemente da ordem de conclusão
+- **Cancelamento:** mensagens de acompanhamento não cancelam um lote em segundo plano de nível superior. `/stop` ou fechar/redefinir a sessão proprietária cancela seus filhos ativos. Filhos orquestradores síncronos ainda seguem o estado de interrupção do pai
 
-Delegação síncrona de tarefa única a partir de um orquestrador roda diretamente, sem overhead de thread pool.
+Delegação síncrona de tarefa única a partir de um orquestrador roda diretamente, sem overhead do pool de threads.
 
-### Conclusões duráveis em background {#durable-background-completions}
+### Conclusões duráveis em segundo plano {#durable-background-completions}
 
-Quando uma delegação em background termina, o Hermes armazena seu evento de conclusão no `state.db` do profile ativo antes de publicá-lo na fila normal de fresh-turn. Se o Hermes reiniciar após a conclusão mas antes da entrega, o evento pendente é restaurado e roteado pelas mesmas verificações de propriedade. Consumidores concorrentes usam um claim durável, então apenas o consumidor que aceita com sucesso o turno sintético confirma a entrega; tentativas falhas liberam o claim para retry.
+Quando uma delegação em segundo plano termina, o Hermes armazena seu evento de conclusão no `state.db` do perfil ativo antes de publicá-lo na fila normal de turno novo. Se o Hermes reiniciar após a conclusão mas antes da entrega, o evento pendente é restaurado e roteado pelas mesmas verificações de propriedade. Consumidores concorrentes usam uma reivindicação durável, então apenas o consumidor que aceita com sucesso o turno sintético confirma a entrega; tentativas falhas liberam a reivindicação para nova tentativa.
 
-Isso não retoma a execução do filho após um crash. Uma delegação cujo processo proprietário desaparece enquanto ainda está rodando é registrada como `unknown`, porque o Hermes não consegue provar se seus efeitos colaterais externos aconteceram. Registros pendentes e entregues são limitados e locais ao profile.
+Isso não retoma a execução do filho após uma falha. Uma delegação cujo processo proprietário desaparece enquanto ainda está em execução é registrada como `unknown`, porque o Hermes não pode provar se seus efeitos colaterais externos ocorreram. Registros pendentes e entregues são limitados e locais ao perfil.
 
-## Override de modelo {#model-override}
+## Substituição de modelo {#model-override}
 
 Você pode configurar um modelo diferente para subagentes via `config.yaml` — útil para delegar tarefas simples a modelos mais baratos/rápidos:
 
@@ -144,22 +144,22 @@ delegation:
 
 Se omitido, subagentes usam o mesmo modelo do pai.
 
-## Acesso herdado às ferramentas {#inherited-tool-access}
+## Acesso herdado a ferramentas {#inherited-tool-access}
 
 `delegate_task` não aceita um parâmetro `toolsets` voltado ao modelo. Cada subagente herda os toolsets habilitados do pai, para que o modelo não possa conceder a um filho capacidades que o pai não tem. Configure as ferramentas do pai antes de iniciar a conversa se o trabalho delegado precisar de capacidades adicionais.
 
-Certas ferramentas são bloqueadas para subagentes mesmo quando o pai as tem:
-- `delegate_task` — bloqueado para subagentes leaf (o padrão). Mantido para filhos com `role="orchestrator"`, limitado por `max_spawn_depth` — veja [Limite de profundidade e orquestração aninhada](#depth-limit-and-nested-orchestration) abaixo.
+Certas ferramentas são bloqueadas para subagentes mesmo quando o pai as possui:
+- `delegate_task` — bloqueado para subagentes folha (padrão). Mantido para filhos com `role="orchestrator"`, limitado por `max_spawn_depth` — veja [Limite de profundidade e orquestração aninhada](#depth-limit-and-nested-orchestration) abaixo.
 - `clarify` — subagentes não podem interagir com o usuário
 - `memory` — sem gravações em memória persistente compartilhada
-- `send_message` — sem efeitos colaterais cross-platform
+- `send_message` — sem efeitos colaterais entre plataformas
 - `cronjob` — sem agendar mais trabalho em nome do pai
 
-Ambos os roles mantêm `execute_code` (programmatic tool calling) para que filhos possam agrupar trabalho mecânico.
+Ambos os papéis mantêm `execute_code` (chamada programática de ferramentas) para que filhos possam agrupar trabalho mecânico.
 
 ## Máximo de iterações {#max-iterations}
 
-Cada subagente tem um limite de iterações (padrão: 50) que controla quantos turnos de tool-calling ele pode fazer:
+Cada subagente tem um limite de iterações (padrão: 50) que controla quantos turnos de chamada de ferramentas pode fazer:
 
 ```python
 delegate_task(
@@ -171,11 +171,11 @@ delegate_task(
 
 ## Timeout do filho {#child-timeout}
 
-Por padrão **não há timeout de wall-clock** em subagentes. Filhos falham apenas pelo que estão realmente fazendo — erros de API, erros de ferramenta ou atingir seu orçamento de iterações — nunca por um cronômetro no nível da delegação. Versões anteriores tinham um teto rígido (300s, depois 600s), que continuava matando filhos legitimamente ocupados no meio da tarefa: revisões de código profundas, fan-outs grandes de pesquisa e modelos de raciocínio lentos rotineiramente precisam de mais de 10 minutos enquanto fazem progresso constante o tempo todo.
+Por padrão **não há timeout de relógio** em subagentes. Filhos falham apenas pelo que estão realmente fazendo — erros de API, erros de ferramenta ou atingir o orçamento de iterações — nunca por um cronômetro de delegação. Versões anteriores tinham um limite rígido (300s, depois 600s), que continuava matando filhos legitimamente ocupados no meio da tarefa: revisões profundas de código, grandes fan-outs de pesquisa e modelos de raciocínio lentos rotineiramente precisam de mais de 10 minutos enquanto fazem progresso constante o tempo todo.
 
-Filhos genuinamente travados ainda são detectados: o monitor de staleness de heartbeat para de atualizar a atividade do pai quando um filho não faz progresso (sem chamadas de API, sem inícios de ferramenta), permitindo que o timeout de inatividade do gateway dispare em um worker realmente emperrado.
+Filhos genuinamente travados ainda são detectados: o monitor de staleness de heartbeat para de atualizar a atividade do pai quando um filho não faz progresso (sem chamadas de API, sem inícios de ferramenta e sem ticks de timestamp de atividade), permitindo que o timeout de inatividade do gateway dispare em um worker realmente emperrado. Uma espera de modelo em andamento ainda conta como progresso — subagentes atualizam o relógio de atividade enquanto aguardam o provedor, então uma conclusão local lenta / com prefill longo não é tratada como parada.
 
-Se você quiser um teto rígido mesmo assim (ex.: controle de custo em delegação não supervisionada via cron), opte por instalação:
+Se você quiser um limite rígido mesmo assim (por exemplo, controle de custo em delegação não supervisionada acionada por cron), ative por instalação:
 
 ```yaml
 delegation:
@@ -183,63 +183,63 @@ delegation:
   # child_timeout_seconds: 1800  # opt-in hard cap (floor 30s)
 ```
 
-Um valor positivo impõe um limite rígido de wall-clock em cada filho; `0` ou um valor negativo desabilita.
+Um valor positivo impõe um limite rígido de relógio em cada filho; `0` ou um valor negativo desativa.
 
-Quando um teto configurado dispara, o resultado do filho carrega metadados estruturados de timeout junto com a mensagem de erro para que pais e hooks distingam um kill por cronômetro de outras falhas sem parsear texto: `timeout_seconds` (o teto configurado), `timed_out_after_seconds` (wall clock real) e `timeout_phase` (`before_first_llm_call` quando o filho nunca chegou à primeira requisição, `after_llm_calls` caso contrário). Os três são `null` em erros que não são timeout.
+Quando um limite configurado dispara, o resultado do filho traz metadados estruturados de timeout junto com a mensagem de erro para que pais e hooks distingam um kill por cronômetro de outras falhas sem analisar texto: `timeout_seconds` (o limite configurado), `timed_out_after_seconds` (relógio real) e `timeout_phase` (`before_first_llm_call` quando o filho nunca chegou à primeira requisição, `after_llm_calls` caso contrário). Os três são `null` em erros que não são timeout.
 
 :::tip Dump de diagnóstico em timeout com zero chamadas
-Com um teto rígido configurado, se um subagente expira tendo feito **zero** chamadas de API (geralmente: provider inacessível, falha de auth ou rejeição de tool schema), `delegate_task` grava um diagnóstico estruturado em `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log` contendo snapshot de config do subagente, trace de resolução de credenciais, quaisquer mensagens de erro precoces e stack traces de **todas** as threads vivas (não só a do filho) — um filho parado esperando uma thread helper aninhada é indistinguível de um provider lento sem o quadro completo.
+Com um limite rígido configurado, se um subagente expira tendo feito **zero** chamadas de API (geralmente: provedor inacessível, falha de autenticação ou rejeição de schema de ferramenta), `delegate_task` grava um diagnóstico estruturado em `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log` contendo snapshot de config do subagente, trace de resolução de credenciais, quaisquer mensagens de erro iniciais e stack traces de **todas** as threads vivas (não só a do filho) — um filho parado aguardando uma thread auxiliar aninhada é indistinguível de um provedor lento sem o quadro completo.
 :::
 
-## Detecção de stall para subagentes em background {#stall-detection-for-background-subagents}
+## Detecção de parada para subagentes em segundo plano {#stall-detection-for-background-subagents}
 
-Delegações em background (`delegate_task(background=true)`) são monitoradas por um
-**monitor de stall baseado em progresso** — ligado por padrão, zero config. Diferente de um
-timeout de wall-clock, nunca toca um filho que está fazendo progresso, não importa
+Delegações em segundo plano (`delegate_task(background=true)`) são monitoradas por um
+**monitor de parada baseado em progresso** — ativo por padrão, zero config. Diferente de um
+timeout de relógio, nunca toca um filho que está progredindo, não importa
 quanto tempo rode.
 
-O monitor amostra os sinais de progresso de cada filho detached — contagem de chamadas de API,
-ferramenta atual e timestamp da última atividade (que avança em **cada token
-streamed**, transição de ferramenta e limite de chamada de API, então um filho no meio de uma
+O monitor amostra os sinais de progresso de cada filho destacado — contagem de chamadas de API,
+ferramenta atual e timestamp da última atividade (que avança a **cada token
+streamado**, transição de ferramenta e limite de chamada de API, então um filho no meio de uma
 resposta longa sempre conta como vivo):
 
-1. **Filhos em progresso nunca são tocados.** Qualquer sinal avançando
-   reseta o relógio.
-2. Um filho cujo progresso está completamente congelado além do limiar stale
-   (450s ocioso, 1200s dentro de uma ferramenta — comandos de terminal e fetches web
+1. **Filhos em progresso nunca são tocados.** Qualquer sinal avançando reinicia
+   o relógio.
+2. Um filho cujo progresso está completamente congelado além do limiar de staleness
+   (450s ocioso, 1200s dentro de uma ferramenta — comandos de terminal e buscas web
    legitimamente lentos recebem o teto maior) é **interrompido** e
-   recebe uma janela de graça de 120s. Um filho que desenrola a tempo entrega seus
+   recebe uma janela de graça de 120s. Um filho que desfaz a tempo entrega seus
    resultados parciais pelo caminho normal de conclusão.
 3. Um filho que nunca retorna é finalizado à força com um evento terminal de conclusão `stalled`,
    para que a sessão proprietária ouça um desfecho em vez de
-   ficar em silêncio, e o slot async libera para novo trabalho.
+   ficar em silêncio, e o slot assíncrono libera para novo trabalho.
 
-O evento `stalled` carrega metadados estruturados espelhando os campos de timeout
-do caminho sync: `stalled_after_quiet_seconds`, `stall_threshold_seconds`,
+O evento `stalled` traz metadados estruturados espelhando os campos de timeout
+do caminho síncrono: `stalled_after_quiet_seconds`, `stall_threshold_seconds`,
 `stall_phase` (`idle` / `in_tool`) e `stall_grace_seconds`.
 
-Isso fechou um failure mode antigo em que um filho em background emperrado
-deixava sua sessão parecendo morta até um restart de processo. A wedge subjacente
-(filhos travados na primeira chamada de API após uptime de gateway de vários dias)
-também foi corrigida na raiz: filhos delegados agora rodam suas requisições de API
+Isso fechou um modo de falha antigo em que um filho em segundo plano emperrado
+deixava a sessão parecendo morta até reinício do processo. A causa raiz subjacente
+(filhos pendurados na primeira chamada de API após dias de uptime do gateway)
+também foi corrigida na raiz: filhos delegados agora executam suas requisições de API
 OpenAI-wire inline na própria thread de conversa em vez de uma thread worker
-aninhada — a camada onde a wedge vivia. O monitor de stall permanece
+aninhada — a camada onde o emperramento vivia. O monitor de parada permanece
 como rede de segurança para qualquer outra coisa.
 
 
-## Monitorando subagentes em execução (`/agents`) {#monitoring-running-subagents-agents}
+## Monitorar subagentes em execução (`/agents`) {#monitoring-running-subagents-agents}
 
-A TUI inclui um overlay `/agents` (alias `/tasks`) que transforma fan-out recursivo de `delegate_task` em uma superfície de auditoria de primeira classe:
+A TUI inclui uma sobreposição `/agents` (alias `/tasks`) que transforma fan-out recursivo de `delegate_task` em uma superfície de auditoria de primeira classe:
 
-- Tree view ao vivo de subagentes rodando e recém-finalizados, agrupados por pai
-- Rollups de custo, tokens e arquivos tocados por branch
+- Visualização em árvore ao vivo de subagentes em execução e recém-finalizados, agrupados por pai
+- Totais por ramo de custo, tokens e arquivos tocados
 - Controles de kill e pause — cancele um subagente específico no meio do voo sem interromper os irmãos
-- Revisão pós-hoc: percorra o histórico turno a turno de cada subagente mesmo depois que retornaram ao pai
+- Revisão pós-hoc: percorra o histórico turno a turno de cada subagente mesmo depois que retornou ao pai
 
-O CLI clássico apenas imprime `/agents` como um resumo em texto; a TUI é onde o overlay brilha. Veja [TUI — Slash commands](/user-guide/tui#slash-commands).
+A CLI clássica apenas imprime `/agents` como um resumo em texto; a TUI é onde a sobreposição brilha. Veja [TUI — Comandos slash](/user-guide/tui#slash-commands).
 
-No CLI clássico e em toda plataforma de gateway (Telegram, Discord, Slack, ...),
-`/agents` também lista **delegações em background com atividade ao vivo por filho**,
+Na CLI clássica e em toda plataforma de gateway (Telegram, Discord, Slack, ...),
+`/agents` também lista **delegações em segundo plano com atividade ao vivo por filho**,
 amostrada diretamente de cada filho em execução:
 
 ```
@@ -249,32 +249,49 @@ Background delegations: 1 running
   - child 2: 7 api calls · between turns · active 3s ago
 ```
 
-Uma delegação que o monitor de stall sinalizou aparece como
-`stalling · no progress 450s — interrupting`, e filhos longamente quietos mas saudáveis
-mostram seu tempo quieto para você distinguir "lento" de "travado" de
-relance.
+Uma delegação que o monitor de parada sinalizou aparece como
+`stalling · no progress 450s — interrupting`, e filhos saudáveis mas quietos há tempo
+mostram seu tempo de quietude para distinguir "lento" de "travado" de relance.
+
+## Direcionar um subagente em execução {#steering-a-running-subagent}
+
+Interromper um filho descarta o trabalho em andamento; muitas vezes você só quer redirecioná-lo. `steer_subagent(subagent_id, text)` em `tools/delegate_tool.py` é o espelho do lado de redirecionamento de `interrupt_subagent()`: enfileira texto em um filho vivo pelo mesmo mecanismo que [`/steer`](/reference/slash-commands) — o texto é anexado ao último resultado de ferramenta do filho no próximo limite de iteração, a chamada de ferramenta em andamento nunca é cortada, e o filho o vê como uma mensagem de usuário fora de banda. Hosts programáticos acessam via RPC de gateway `subagent.steer` com escopo de sessão, ao lado de `subagent.interrupt`:
+
+```json
+{"method": "subagent.steer", "params": {"session_id": "owning-ui-session", "subagent_id": "sa-0-1a2b3c4d", "text": "focus on pricing instead"}}
+```
+
+Ids de subagente vêm de `delegation.status` (ou `list_active_subagents()`) — o mesmo lugar de onde `subagent.interrupt` os obtém. O gateway aceita direcionamento apenas da sessão UI/gateway ao vivo exata que gerou o filho. Identidade de sessão ausente, estrangeira, ambígua ou obsoleta/reciclada é rejeitada; saber um id global de subagente não é autoridade. Chamadores in-process diretos mantêm o contrato de helper sem escopo deliberadamente.
+
+**Enfileirado não é entregue, mas nunca é sucesso sintético.** Uma resposta `"queued"` significa que o texto foi aceito antes do limite de conclusão do filho, não necessariamente que o filho já o viu. Aceitação e conclusão são sincronizadas: ou o filho ainda pode consumir o texto, ou seu texto exato é drenado para o resultado como `pending_steer`. Chamadas após fechamento retornam `"rejected"`. Se um filho aceitou o steer mas já havia produzido a resposta final, a entrada de conclusão que o pai recebe a retém como `missed_steer`, com uma nota anexada ao resumo:
+
+```
+[steer did not land — the subagent finished before it could be delivered: focus on pricing instead]
+```
+
+Assim o pai (ou o operador que o conduz) distingue um filho direcionado de um que terminou com as instruções antigas, e pode reemitir a orientação como acompanhamento em vez de confiar que chegou.
 
 ## Transcrições ao vivo {#live-transcripts}
 
-Cada dispatch de `delegate_task` também cria um **log append-only legível por humanos por tarefa** para que você (ou o agente pai) possa acompanhar um subagente trabalhando em tempo real em vez de esperar o resumo consolidado:
+Cada despacho de `delegate_task` também cria **um log append-only legível por humanos por tarefa** para você (ou o agente pai) acompanhar um subagente trabalhando em tempo real em vez de esperar o resumo consolidado:
 
 ```
 <hermes_home>/cache/delegation/live/<delegation_id>/task-<n>.log
 ```
 
-A resposta do dispatch inclui os caminhos como `live_transcripts`, e os arquivos são pré-criados no momento do dispatch, então isso funciona imediatamente:
+A resposta do despacho inclui os caminhos como `live_transcripts`, e os arquivos são pré-criados no momento do despacho, então funciona imediatamente:
 
 ```bash
 tail -f ~/.hermes/cache/delegation/live/deleg_ab12cd34/task-0.log
 ```
 
-Cada linha é timestamped e mostra o texto assistant do filho, snippets de thinking, chamadas de ferramenta (`-> tool_name({args})`), resultados de ferramenta e um marcador de status final. Um `manifest.json` no mesmo diretório descreve o batch (goals, contagem de tarefas, status por tarefa). Os logs persistem após a conclusão — também servem como registro operacional de fidelidade total junto ao resumo — e diretórios com mais de 7 dias são podados automaticamente em novos dispatches. Como vivem sob `cache/delegation`, também são legíveis de backends de terminal remotos (Docker/Modal/SSH).
+Cada linha tem timestamp e mostra o texto do assistente do filho, trechos de thinking, chamadas de ferramenta (`-> tool_name({args})`), resultados de ferramenta e um marcador de status final. Um `manifest.json` no mesmo diretório descreve o lote (goals, contagem de tarefas, status por tarefa). Os logs persistem após a conclusão — também servem como registro operacional de fidelidade total junto ao resumo — e diretórios com mais de 7 dias são podados automaticamente em novos despachos. Por estarem em `cache/delegation`, também são legíveis de backends de terminal remotos (Docker/Modal/SSH).
 
 ## Limite de profundidade e orquestração aninhada {#depth-limit-and-nested-orchestration}
 
-Por padrão, a delegação é **plana**: um pai (profundidade 0) cria filhos (profundidade 1), e esses filhos não podem delegar mais. Isso previne delegação recursiva descontrolada.
+Por padrão, a delegação é **plana**: um pai (profundidade 0) gera filhos (profundidade 1), e esses filhos não podem delegar mais. Isso evita delegação recursiva descontrolada.
 
-Para workflows multi-estágio (pesquisa → síntese, ou orquestração paralela sobre subproblemas), um pai pode criar filhos **orquestradores** que *podem* delegar seus próprios workers:
+Para fluxos multiestágio (pesquisa → síntese, ou orquestração paralela sobre subproblemas), um pai pode gerar filhos **orquestradores** que *podem* delegar seus próprios workers:
 
 ```python
 delegate_task(
@@ -285,51 +302,51 @@ delegate_task(
 ```
 
 - `role="leaf"` (padrão): filho não pode delegar mais — idêntico ao comportamento de delegação plana.
-- `role="orchestrator"`: filho mantém o toolset `delegation`. Limitado por `delegation.max_spawn_depth` (padrão **1** = plano, então `role="orchestrator"` é no-op nos defaults). Aumente `max_spawn_depth` para 2 para permitir que filhos orquestradores criem netos leaf; 3+ para árvores mais profundas. Não há teto superior — custo é o limite prático.
-- `delegation.orchestrator_enabled: false`: kill switch global que força todo filho a `leaf` independentemente do parâmetro `role`.
+- `role="orchestrator"`: filho mantém o toolset `delegation`. Limitado por `delegation.max_spawn_depth` (padrão **1** = plano, então `role="orchestrator"` é no-op nos padrões). Aumente `max_spawn_depth` para 2 para permitir que filhos orquestradores gerem netos folha; 3+ para árvores mais profundas. Não há teto superior — custo é o limite prático.
+- `delegation.orchestrator_enabled: false`: interruptor global que força todo filho a `leaf` independentemente do parâmetro `role`.
 
-**Aviso de custo:** Com `max_spawn_depth: 3` e `max_concurrent_children: 3`, a árvore pode atingir 3×3×3 = 27 agentes leaf concorrentes. Cada nível extra multiplica o gasto — aumente `max_spawn_depth` intencionalmente.
+**Aviso de custo:** Com `max_spawn_depth: 3` e `max_concurrent_children: 3`, a árvore pode atingir 3×3×3 = 27 agentes folha concorrentes. Cada nível extra multiplica o gasto — aumente `max_spawn_depth` intencionalmente.
 
 ## Ciclo de vida e durabilidade {#lifetime-and-durability}
 
-:::warning Durabilidade de conclusão em background não é execução durável
-Chamadas de `delegate_task` voltadas ao modelo no nível superior rodam em background automaticamente onde a sessão suporta entrega posterior. O Hermes retorna um handle imediatamente, e o resultado reentra na conversa depois que o filho ou batch termina. Subagentes orquestradores esperam seus workers no turno atual porque devem sintetizar esses resultados antes de retornar. Endpoints stateless request/response caem para execução síncrona quando não conseguem entregar um resultado detached depois.
+:::warning Durabilidade de conclusão em segundo plano não é execução durável
+Chamadas de `delegate_task` voltadas ao modelo de nível superior rodam em segundo plano automaticamente onde a sessão suporta entrega posterior. O Hermes retorna um identificador imediatamente, e o resultado reentra na conversa depois que o filho ou lote termina. Subagentes orquestradores aguardam seus workers no turno atual porque devem sintetizar esses resultados antes de retornar. Endpoints request/response sem estado caem para execução síncrona quando não podem entregar um resultado destacado depois.
 
-- Mensagens de follow-up normais não cancelam filhos em background. `/stop` cancela delegações em background em execução, e fechar ou redefinir a sessão proprietária descarta seus filhos ativos.
-- Fechamento/redefinição explícita de sessão interrompe os filhos em background dessa sessão. Fechar um viewer TUI de uma sessão do gateway não mata o trabalho do gateway.
-- Um restart de processo do Hermes **não** retoma um filho em execução. Sua tentativa vira `unknown` porque o Hermes não consegue provar quais efeitos colaterais aconteceram.
-- Um filho que completou antes do restart mas cujo resultado não foi entregue é restaurado e roteado de volta pelas verificações normais da sessão proprietária.
-- Filhos cancelados retornam um resultado estruturado (`status="interrupted"`, `exit_reason="interrupted"`), mas como o pai também foi interrompido, esse resultado muitas vezes nunca entra em uma resposta visível ao usuário.
+- Mensagens de acompanhamento normais não cancelam filhos em segundo plano. `/stop` cancela delegações em segundo plano em execução, e fechar ou redefinir a sessão proprietária descarta seus filhos ativos.
+- Fechar/redefinir sessão explicitamente interrompe os filhos em segundo plano dessa sessão. Fechar um visualizador TUI de uma sessão do gateway não mata o trabalho do gateway.
+- Reinício do processo Hermes **não** retoma um filho em execução. Sua tentativa vira `unknown` porque o Hermes não pode provar quais efeitos colaterais ocorreram.
+- Um filho que concluiu antes do reinício mas cujo resultado não foi entregue é restaurado e roteado de volta pelas verificações normais da sessão proprietária.
+- Filhos cancelados retornam um resultado estruturado (`status="interrupted"`, `exit_reason="interrupted"`), mas como o pai também foi interrompido, esse resultado muitas vezes nunca chega a uma resposta visível ao usuário.
 
-Para **execução durável** que deve sobreviver ao fechamento de sessão ou restart de processo, use:
+Para **execução durável** que deve sobreviver ao fechamento de sessão ou reinício de processo, use:
 
-- `cronjob` (action=`create`) — agenda uma execução de agente separada; imune a interrupções de turno do pai.
+- `cronjob` (action=`create`) — agenda uma execução de agente separada; imune a interrupções do turno do pai.
 - `terminal(background=True, notify_on_complete=True)` — comandos shell de longa duração que continuam rodando enquanto o agente faz outras coisas.
 :::
 
 ## Propriedades principais {#key-properties}
 
-- Cada subagente recebe sua **própria sessão de terminal** (separada do pai)
+- Cada subagente recebe **sua própria sessão de terminal** (separada do pai)
 - Subagentes herdam os toolsets habilitados do pai; o modelo não pode selecioná-los ou ampliá-los por chamada
-- **Delegação aninhada é opt-in** — apenas filhos com `role="orchestrator"` podem delegar mais, e só quando `max_spawn_depth` é aumentado do padrão 1 (plano). Desabilite globalmente com `orchestrator_enabled: false`.
-- Subagentes leaf **não podem** chamar: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Subagentes orquestradores mantêm `delegate_task` mas conservam os outros bloqueios. Ambos os roles mantêm `execute_code` (programmatic tool calling) para que filhos possam agrupar trabalho mecânico em vez de queimar iterações de raciocínio.
-- **Cancelamento segue propriedade** — `/stop` ou fechar/redefinir a sessão proprietária cancela seus filhos em background; descendentes síncronos sob orquestradores seguem o estado de interrupção do pai
-- Apenas o resumo final entra no contexto do pai, mantendo o uso de tokens eficiente
-- Subagentes herdam a **API key, configuração de provider e credential pool** do pai (permitindo rotação de chave em rate limits)
+- **Delegação aninhada é opt-in** — apenas filhos com `role="orchestrator"` podem delegar mais, e só quando `max_spawn_depth` é elevado do padrão 1 (plano). Desative globalmente com `orchestrator_enabled: false`.
+- Subagentes folha **não podem** chamar: `delegate_task`, `clarify`, `memory`, `send_message`, `cronjob`. Subagentes orquestradores mantêm `delegate_task` mas conservam os outros bloqueios. Ambos os papéis mantêm `execute_code` (chamada programática de ferramentas) para que filhos agrupem trabalho mecânico em vez de queimar iterações de raciocínio.
+- **Cancelamento segue propriedade** — `/stop` ou fechar/redefinir a sessão proprietária cancela seus filhos em segundo plano; descendentes síncronos sob orquestradores seguem o estado de interrupção do pai
+- Apenas o resumo final entra no contexto do pai, mantendo uso de tokens eficiente
+- Subagentes herdam a **chave de API, configuração de provedor e pool de credenciais** do pai (permitindo rotação de chave em rate limits)
 
 ## Delegação vs execute_code {#delegation-vs-execute_code}
 
 | Fator | delegate_task | execute_code |
 |--------|--------------|-------------|
 | **Raciocínio** | Loop completo de raciocínio LLM | Apenas execução de código Python |
-| **Contexto** | Conversa isolada nova | Sem conversa, só script |
+| **Contexto** | Conversa isolada nova | Sem conversa, apenas script |
 | **Acesso a ferramentas** | Todas as ferramentas não bloqueadas com raciocínio | 7 ferramentas via RPC, sem raciocínio |
 | **Paralelismo** | 3 subagentes concorrentes por padrão (configurável) | Script único |
 | **Melhor para** | Tarefas complexas que precisam de julgamento | Pipelines mecânicos multi-etapa |
 | **Custo de tokens** | Maior (loop LLM completo) | Menor (só stdout retornado) |
 | **Interação com usuário** | Nenhuma (subagentes não podem clarificar) | Nenhuma |
 
-**Regra prática:** Use `delegate_task` quando a subtarefa exige raciocínio, julgamento ou resolução de problemas multi-etapa. Use `execute_code` quando precisar de processamento mecânico de dados ou workflows scriptados.
+**Regra prática:** Use `delegate_task` quando a subtarefa exige raciocínio, julgamento ou resolução de problemas multi-etapa. Use `execute_code` quando precisar de processamento mecânico de dados ou fluxos scriptados.
 
 ## Configuração {#configuration}
 
@@ -352,7 +369,7 @@ delegation:
   # api_mode: "anthropic_messages"  # Optional. Wire protocol override for base_url ("chat_completions", "codex_responses", or "anthropic_messages"). Empty = auto-detect from URL (e.g. /anthropic suffix). Set explicitly for endpoints the heuristic can't classify (Azure AI Foundry, MiniMax, Zhipu GLM, LiteLLM proxies, …).
 ```
 
-Quando `base_url` aponta para um endpoint compatível com Anthropic — por exemplo um caminho terminando em `/anthropic`, uma rota Claude do Azure Foundry ou um proxy MiniMax `/anthropic` — `api_mode` é auto-detectado como `anthropic_messages` para o subagente usar o wire format certo sem você configurar nada. Defina `api_mode` explicitamente quando o palpite de auto-detecção estiver errado (raro).
+Quando `base_url` aponta para um endpoint compatível com Anthropic — por exemplo um caminho terminando em `/anthropic`, uma rota Claude do Azure Foundry ou um proxy MiniMax `/anthropic` — `api_mode` é auto-detectado como `anthropic_messages` para o subagente usar o formato wire correto sem você configurar nada. Defina `api_mode` explicitamente quando a detecção automática estiver errada (raro).
 
 :::tip
 O agente lida com delegação automaticamente com base na complexidade da tarefa. Você não precisa pedir explicitamente para delegar — ele fará quando fizer sentido.

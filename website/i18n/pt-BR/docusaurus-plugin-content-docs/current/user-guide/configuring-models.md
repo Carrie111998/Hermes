@@ -1,120 +1,122 @@
 ---
 sidebar_position: 3
+title: "Configurando models"
+description: "Como configurar o model principal e models auxiliares do Hermes Agent"
 ---
 
-# Configurando modelos
+# Configurando models
 
-O Hermes usa dois tipos de slots de modelo:
+O Hermes usa dois tipos de slots de model:
 
-- **Modelo principal** — com o qual o agente pensa. Toda mensagem do usuário, todo loop de chamada de ferramenta, toda resposta em streaming passa por este modelo.
-- **Modelos auxiliares** — trabalhos menores que o agente terceiriza. Compressão de contexto, visão (análise de imagem), sumarização de páginas web, pontuação de aprovação, roteamento de ferramentas MCP, geração de título de sessão e busca de skills. Cada um tem seu próprio slot e pode ser substituído independentemente.
+- **Model principal** — com o que o agente pensa. Toda mensagem user, todo loop de tool-call, toda resposta streamed passa por este model.
+- **Models auxiliares** — side-jobs menores que o agente offloada. Compressão de contexto, visão (análise de imagem), resumo de página web, scoring de aprovação, roteamento de ferramentas MCP, geração de título de sessão e busca de skills. Cada um tem seu próprio slot e pode ser overridden independentemente.
 
-Esta página cobre a configuração de ambos pelo dashboard. Se preferir arquivos de config ou CLI, vá para [Métodos alternativos](#alternative-methods) no final.
+Esta página cobre configurar ambos pelo dashboard. Se preferir arquivos de config ou CLI, vá para [Métodos alternativos](#alternative-methods) no final.
 
 :::tip Caminho mais rápido: Nous Portal
-O [Nous Portal](/user-guide/features/tool-gateway) oferece 300+ modelos em uma assinatura. Em uma instalação nova, execute `hermes setup --portal` para fazer login e definir Nous como seu provedor em um comando. Inspecione o que está conectado com `hermes portal info`.
+O [Nous Portal](/user-guide/features/tool-gateway) oferece 300+ models em uma assinatura. Em instalação fresh, rode `hermes setup --portal` para logar e definir Nous como provider em um comando. Inspecione o que está wired com `hermes portal info`.
 
-- Assinantes Portal também ganham **10% de desconto em provedores faturados por token**.
+- Assinantes Portal também ganham **10% off em providers cobrados por token**.
 :::
 
 :::note Schema `model:` — string vazia vs. mapping
-Em uma instalação nova, a config padrão incluída tem `model: ""` (sentinela de string vazia significando "ainda não configurado"). Na primeira vez que você executa `hermes setup` ou `hermes model`, essa chave é atualizada in-place para um mapping com sub-chaves `provider`, `default`, `base_url` e `api_mode` — a forma mostrada ao longo desta página e em [`profiles.md`](./profiles.md) / [`configuration.md`](./configuration.md). Se você vir uma string vazia em `config.yaml`, execute `hermes model` (ou clique **Change** no dashboard) e o Hermes gravará a forma dict para você.
+Em instalação brand-new o config default bundled tem `model: ""` (sentinel de string vazia significando "ainda não configurado"). Na primeira vez que você roda `hermes setup` ou `hermes model`, essa key é upgraded in-place para um mapping com sub-keys `provider`, `default`, `base_url` e `api_mode` — a forma mostrada nesta página e em [`profiles.md`](./profiles.md) / [`configuration.md`](./configuration.md). Se você vir string vazia em `config.yaml`, rode `hermes model` (ou clique **Change** no dashboard) e o Hermes escreverá a forma dict para você.
 :::
 
-## A página Models
+## A página Models {#the-models-page}
 
-Abra o dashboard e clique em **Models** na barra lateral. Você tem duas seções:
+Abra o dashboard e clique **Models** na sidebar. Você tem duas seções:
 
-1. **Model Settings** — o painel superior, onde você atribui modelos aos slots.
-2. **Usage analytics** — cards ranqueados mostrando todo modelo que executou uma sessão no período selecionado, com contagens de tokens, custo e badges de capacidade.
+1. **Model Settings** — painel superior, onde você atribui models aos slots.
+2. **Usage analytics** — cards ranqueados mostrando todo model que rodou sessão no período selecionado, com contagens de tokens, custo e badges de capability.
 
-![Models page overview](/img/docs/dashboard-models/overview.png)
+![Visão geral da página Models](/img/docs/dashboard-models/overview.png)
 
-O card superior é o painel **Model Settings**. A linha principal sempre mostra o que o agente usará para novas sessões. Clique **Change** para abrir o seletor.
+O card superior é o painel **Model Settings**. A linha principal sempre mostra o que o agente vai subir para novas sessões. Clique **Change** para abrir o picker.
 
-## Definindo o modelo principal
+## Definindo o model principal {#setting-the-main-model}
 
 Clique **Change** na linha Main model:
 
-![Model picker dialog](/img/docs/dashboard-models/picker-dialog.png)
+![Diálogo do model picker](/img/docs/dashboard-models/picker-dialog.png)
 
-O seletor tem duas colunas:
+O picker tem duas colunas:
 
-- **Esquerda** — provedores autenticados. Só aparecem provedores que você configurou (chave de API definida, OAuth feito ou endpoint custom definido). Se um provedor estiver ausente, vá em **Keys** e adicione a credencial.
-- **Direita** — a lista curada de modelos do provedor selecionado. São os modelos agenticos que o Hermes recomenda para aquele provedor, não o dump bruto `/models` (que no OpenRouter inclui 400+ modelos incluindo TTS, geradores de imagem e rerankers).
+- **Esquerda** — providers autenticados. Só providers que você configurou (API key set, OAuth feito, ou definido como endpoint custom) aparecem. Se um provider faltar, vá em **Keys** e adicione credencial.
+- **Direita** — lista curada de models do provider selecionado. São os models agentic que o Hermes recomenda para aquele provider, não o dump cru de `/models` (que no OpenRouter inclui 400+ models incluindo TTS, geradores de imagem e rerankers).
 
-Digite na caixa de filtro para restringir por nome de provedor, slug ou ID de modelo.
+Digite na caixa de filtro para estreitar por nome de provider, slug ou model ID.
 
-Escolha um modelo, pressione **Switch**, e o Hermes grava em `~/.hermes/config.yaml` na seção `model`. **Isso se aplica só a novas sessões** — qualquer aba de chat já aberta continua rodando o modelo com que começou. Para trocar quente o chat atual, use o slash command `/model` dentro dele.
+Escolha um model, clique **Switch**, e o Hermes grava em `~/.hermes/config.yaml` na seção `model`. **Isso aplica só a novas sessões** — qualquer aba de chat já aberta continua rodando o model com que começou. Para hot-swap o chat atual, use slash command `/model` dentro dele.
 
-### Trocas no meio da sessão e avisos de contexto
+### Trocas mid-session e avisos de contexto {#mid-session-switches-and-context-warnings}
 
-Quando você troca modelos **dentro de uma sessão ativa** (seletor de modelo Herm TUI, CLI `hermes` ou `/model` no Telegram/Discord), o Hermes estima se sua **próxima mensagem** executará **compressão de contexto preflight** contra a janela do novo modelo. Se a sessão já estiver perto ou acima do limiar de compressão daquele modelo (veja [Context Compression](./configuration.md#context-compression)), a resposta da troca inclui um aviso — o mesmo caminho `warning_message` usado para avisos de modelo caro. A troca ainda se aplica imediatamente; a compressão roda na **primeira mensagem do usuário após a troca**, antes do modelo responder.
+Quando você troca models **dentro de sessão ativa** (model picker Herm TUI, CLI `hermes` ou `/model` no Telegram/Discord), o Hermes estima se sua **próxima mensagem** vai rodar **compressão de contexto preflight** contra a janela do model novo. Se a sessão já está perto ou acima do threshold de compressão daquele model (veja [Context Compression](./configuration.md#context-compression)), a resposta da troca inclui aviso — o mesmo caminho `warning_message` usado para avisos de model caro. A troca ainda aplica imediatamente; compressão roda na **primeira mensagem user após a troca**, antes do model responder.
 
-:::warning Trocas no meio da sessão resetam o cache de prompt
-Caches de prompt são vinculados ao modelo que atende a requisição, então qualquer mudança de modelo no meio da conversa — uma troca explícita `/model`, um [fallback automático](./features/fallback-providers.md) ou uma rotação de [credential-pool](./features/credential-pools.md) para outra conta — significa que a próxima mensagem relê toda a conversa pelo preço integral de tokens de entrada em vez da taxa em cache (~75–90% de desconto). Em uma sessão longa, essa releitura única pode superar a diferença por token entre os dois modelos. Troque quando precisar, mas prefira fazer cedo na conversa ou logo após iniciar uma sessão nova.
+:::warning Trocas mid-session resetam o prompt cache
+Prompt caches são keyed ao model servindo a requisição, então qualquer mudança de model mid-conversation — troca explícita `/model`, [fallback automático](./features/fallback-providers.md), ou rotação de [credential-pool](./features/credential-pools.md) para conta diferente — significa que a próxima mensagem relê a conversa inteira a preço full de input-token em vez da taxa cached (~75–90% desconto). Em sessão longa esse re-read one-time pode eclipsar a diferença per-token entre os dois models. Troque quando precisar, mas prefira cedo na conversa ou logo após iniciar sessão fresh.
 :::
 
-## Definindo modelos auxiliares
+## Definindo models auxiliares {#setting-auxiliary-models}
 
-Clique **Show auxiliary** para revelar os 11 slots de tarefa:
+Clique **Show auxiliary** para revelar os 11 task slots:
 
-![Auxiliary panel expanded](/img/docs/dashboard-models/auxiliary-expanded.png)
+![Painel auxiliary expandido](/img/docs/dashboard-models/auxiliary-expanded.png)
 
-Toda tarefa auxiliar usa `auto` por padrão — significa que o Hermes tenta seu modelo principal para aquele trabalho também. Se essa rota estiver indisponível ou bater em falha estilo capacidade, `auto` segue qualquer `auxiliary.<task>.fallback_chain` específico da tarefa, depois a cadeia principal `fallback_providers` / `fallback_model`, depois a cadeia de descoberta auxiliar built-in do Hermes. Substitua uma tarefa específica quando quiser um modelo mais barato ou rápido para um side-job.
+Toda tarefa auxiliar default para `auto` — o Hermes tenta seu model principal para aquele job também. Se essa rota estiver indisponível ou bater falha estilo capacity, `auto` segue qualquer `auxiliary.<task>.fallback_chain` específico da tarefa, depois a cadeia principal `fallback_providers` / `fallback_model`, depois a cadeia built-in de discovery auxiliary do Hermes. Override uma tarefa específica quando quiser model mais barato ou rápido para side-job.
 
-### Padrões comuns de override
+### Padrões comuns de override {#common-override-patterns}
 
-| Task | When to override |
+| Tarefa | Quando fazer override |
 |---|---|
-| **Title Gen** | Almost always. A $0.10/M flash model writes session titles as well as Opus. Default config sets this to `google/gemini-3-flash-preview` on OpenRouter. |
-| **Vision** | When your main model lacks vision support. Point it at `google/gemini-2.5-flash` or `gpt-4o-mini`. |
-| **Compression** | When you're burning reasoning tokens on Opus/M2.7 just to summarize context. A fast chat model does the job at 1/50th the cost. |
-| **Approval** | For `approval_mode: smart` — a fast/cheap model (haiku, flash, gpt-5-mini) decides whether to auto-approve low-risk commands. Expensive models here are waste. |
-| **Web Extract** | When you use `web_extract` heavily. Same logic as compression — summarization doesn't need reasoning. |
-| **Skills Hub** | `hermes skills search` uses this. Usually fine at `auto`. |
-| **MCP** | MCP tool routing. Usually fine at `auto`. |
-| **Triage Specifier** | Routes the Kanban triage specifier (`hermes kanban specify`) that expands a rough one-liner into a concrete spec. A cheap, capable model works well. |
-| **Kanban Decomposer** | Routes Kanban task decomposition — splits a triage task into a graph of child tasks for specialist profiles. |
-| **Profile Describer** | Routes profile-description generation (`hermes profile describe --auto` / the dashboard auto-generate button). Short, cheap call. |
-| **Curator** | Routes the curator skill-usage review pass. Can run for minutes on reasoning models, so a cheaper aux model is often worthwhile. |
+| **Title Gen** | Quase sempre. Um model flash $0.10/M escreve títulos de sessão tão bem quanto Opus. Config default define para `google/gemini-3-flash-preview` no OpenRouter. |
+| **Vision** | Quando seu model principal não tem suporte a visão. Aponte para `google/gemini-2.5-flash` ou `gpt-4o-mini`. |
+| **Compression** | Quando você queima reasoning tokens em Opus/M2.7 só para resumir contexto. Um model chat rápido faz o job a 1/50 do custo. |
+| **Approval** | Para `approval_mode: smart` — model rápido/barato (haiku, flash, gpt-5-mini) decide se auto-aprova comandos low-risk. Models caros aqui são desperdício. |
+| **Web Extract** | Quando usa `web_extract` pesado. Mesma lógica de compression — resumo não precisa de reasoning. |
+| **Skills Hub** | `hermes skills search` usa isto. Geralmente ok em `auto`. |
+| **MCP** | Roteamento de ferramentas MCP. Geralmente ok em `auto`. |
+| **Triage Specifier** | Roteia o triage specifier Kanban (`hermes kanban specify`) que expande one-liner rough em spec concreta. Model barato e capaz funciona bem. |
+| **Kanban Decomposer** | Roteia decomposição de tarefas Kanban — divide tarefa de triage em grafo de child tasks para profiles specialist. |
+| **Profile Describer** | Roteia geração de descrição de profile (`hermes profile describe --auto` / botão auto-generate do dashboard). Chamada curta e barata. |
+| **Curator** | Roteia pass de review de skill-usage do curator. Pode rodar minutos em models de reasoning, então model aux barato costuma valer a pena. |
 
-### Override por tarefa
+### Override por tarefa {#per-task-override}
 
-Clique **Change** em qualquer linha auxiliar. O mesmo seletor abre, mesmo comportamento — escolha provedor + modelo, pressione Switch. A linha atualiza para mostrar `provider · model` em vez de `auto (use main model)`.
+Clique **Change** em qualquer linha auxiliary. Mesmo picker abre, mesmo comportamento — escolha provider + model, clique Switch. A linha atualiza para mostrar `provider · model` em vez de `auto (use main model)`.
 
-### Resetar tudo para auto
+### Resetar tudo para auto {#reset-all-to-auto}
 
-Se você ajustou demais e quer recomeçar, clique **Reset all to auto** no topo da seção auxiliar. Cada slot volta a usar seu modelo principal.
+Se over-tuned e quiser recomeçar, clique **Reset all to auto** no topo da seção auxiliary. Todo slot volta a usar seu model principal.
 
-## O atalho "Use as"
+## Atalho "Use as" {#the-use-as-shortcut}
 
-Todo card de modelo na página tem um dropdown **Use as**. Este é o caminho rápido — escolha um modelo que vê em suas analytics, clique **Use as**, e atribua ao slot principal ou a qualquer tarefa auxiliar específica em um clique:
+Todo card de model na página tem dropdown **Use as**. Este é o caminho rápido — escolha model que vê nos analytics, clique **Use as**, e atribua ao slot principal ou qualquer task auxiliary específica em um clique:
 
-![Use as dropdown](/img/docs/dashboard-models/use-as-dropdown.png)
+![Dropdown Use as](/img/docs/dashboard-models/use-as-dropdown.png)
 
 O dropdown tem:
 
 - **Main model** — igual a clicar Change na linha principal.
-- **All auxiliary tasks** — atribui este modelo a todos os 11 slots aux de uma vez. Útil quando você quer todo side-job em um flash barato.
-- **Individual task options** — Vision, Web Extract, Compression, etc. O modelo atualmente atribuído a cada tarefa está marcado `current`.
+- **All auxiliary tasks** — atribui este model a todos os 11 aux slots de uma vez. Útil quando quer todo side-job num model flash barato.
+- **Individual task options** — Vision, Web Extract, Compression, etc. O model atualmente atribuído a cada tarefa está marcado `current`.
 
-Cards recebem badge `main` ou `aux · <task>` quando estão atribuídos a algo — para ver de relance quais modelos históricos estão conectados onde.
+Cards são badged com `main` ou `aux · <task>` quando estão atribuídos a algo — para ver de relance quais models históricos estão wired onde.
 
-## O que é gravado em `config.yaml`
+## O que é gravado em `config.yaml` {#what-gets-written-to-configyaml}
 
-Quando você salva pelo dashboard, o Hermes grava em `~/.hermes/config.yaml`:
+Quando você salva via dashboard, o Hermes grava em `~/.hermes/config.yaml`:
 
-**Main model:**
+**Model principal:**
 ```yaml
 model:
   provider: openrouter
   default: anthropic/claude-opus-4.7
-  base_url: ''        # cleared on provider switch
+  base_url: ''        # limpo na troca de provider
   api_mode: chat_completions
 ```
 
-**Auxiliary override (example — vision on gemini-flash):**
+**Override auxiliary (exemplo — vision em gemini-flash):**
 ```yaml
 auxiliary:
   vision:
@@ -127,19 +129,19 @@ auxiliary:
     download_timeout: 30
 ```
 
-**Auxiliary on auto (default):**
+**Auxiliary em auto (padrão):**
 ```yaml
 auxiliary:
   compression:
     provider: auto
     model: ''
     base_url: ''
-    # ... other fields unchanged
+    # ... outros campos inalterados
 ```
 
-`provider: auto` com `model: ''` diz ao Hermes para usar o modelo principal para aquela tarefa, ainda honrando a política de fallback se a rota principal não puder atender a chamada auxiliar.
+`provider: auto` com `model: ''` diz ao Hermes para usar o model principal naquela tarefa, ainda honrando fallback policy se a rota principal não puder servir a chamada auxiliary.
 
-Cadeias de fallback específicas por tarefa ficam sob a mesma tarefa auxiliar:
+Fallback chains específicas de tarefa ficam sob a mesma tarefa auxiliary:
 
 ```yaml
 auxiliary:
@@ -151,37 +153,73 @@ auxiliary:
         model: inclusionai/ring-2.6-1t:free
 ```
 
-Quando `fallback_chain` está ausente, `auto` usa a cadeia top-level `fallback_providers` antes da cadeia de descoberta auxiliar built-in.
+Quando `fallback_chain` está ausente, `auto` usa a cadeia top-level `fallback_providers` antes da cadeia built-in de discovery auxiliary.
 
-## Quando entra em vigor?
+## Opções de request por provider {#per-provider-request-options}
 
-- **CLI** (`hermes chat`): na próxima invocação `hermes chat`.
-- **Gateway** (Telegram, Discord, Slack, etc.): na próxima sessão *nova*. Sessões existentes mantêm seu modelo. Reinicie o gateway (`hermes gateway restart`) se quiser forçar todas as sessões a pegar a mudança.
-- **Dashboard chat tab** (`/chat`): no próximo PTY novo. O chat aberto mantém seu modelo — use `/model` dentro dele para trocar quente.
+Entradas de provider (`providers.<name>` no dict `providers:`, ou itens na lista legacy `custom_providers`) aceitam dois knobs que moldam como o Hermes fala com o endpoint:
 
-Mudanças nunca invalidam caches de prompt em sessões rodando. Isso é deliberado: trocar o modelo principal dentro de uma sessão exige reset de cache (o system prompt contém conteúdo específico do modelo), e reservamos isso para o slash command explícito `/model` dentro do chat.
+**`extra_headers`** — mapping de headers HTTP extras anexados a toda requisição LLM roteada para a base URL daquele provider. Aplicados por último, após defaults de URL/profile e overrides de header do usuário, então sobrevivem a swaps de credencial e rebuilds de client. Útil para Cloudflare Access service tokens, auth de proxy ou esquemas bearer custom:
 
-## Solução de problemas
+```yaml
+providers:
+  my-gateway:
+    api: https://llm.internal.example.com/v1
+    api_key: sk-...
+    extra_headers:
+      CF-Access-Client-Id: "xxxx.access"
+      CF-Access-Client-Secret: "yyyy"
+```
 
-### "No authenticated providers" no seletor
+Valores de header carregam credenciais rotineiramente — o Hermes nunca os loga. `extra_headers` aplica a rotas OpenAI-compatible; os modos de API `anthropic_messages` e `bedrock_converse` não o usam.
 
-O Hermes lista um provedor só se tiver credencial funcional. Verifique **Keys** na barra lateral — você deve ver uma de: chave de API, OAuth bem-sucedido ou URL de endpoint custom. Se o provedor que você quer não estiver lá, execute `hermes setup` para conectá-lo, ou vá em **Keys** e adicione a env var.
+**`discover_models`** — defina `false` (padrão `true`) para pular query da listagem `/models` do endpoint e usar só os `models` que você configurou na entrada. Handy para gateways cuja listagem de models é lenta, não confiável ou ruidosa:
 
-### Modelo principal não mudou no meu chat rodando
+```yaml
+providers:
+  my-gateway:
+    api: https://llm.internal.example.com/v1
+    discover_models: false
+    models:
+      - my-finetune-v2
+      - my-finetune-v1
+```
 
-Esperado. O dashboard grava `config.yaml`, que novas sessões leem. O chat aberto é um processo de agente ao vivo — mantém o modelo com que foi spawnado. Use `/model <name>` dentro do chat para trocar quente aquela sessão específica.
+Com discovery off, o model picker (`hermes model`, `/model`) mostra a lista configurada em vez de probe live.
 
-### Override auxiliar "não surtiu efeito"
+:::note Formato legacy
+Configs antigos usavam lista top-level `custom_providers:` (com `base_url` em vez de `api`). Ainda funciona e é auto-migrado para dict `providers:` no `hermes update` (config v12).
+:::
 
-Três coisas para verificar:
+## Quando entra em vigor? {#when-does-it-take-effect}
 
-1. **Você iniciou uma sessão nova?** Chats existentes não relêem config.
-2. **`provider` está definido para algo além de `auto`?** Se o campo mostrar `auto`, a tarefa ainda usa seu modelo principal. Clique **Change** e escolha um provedor real.
-3. **O provedor está autenticado?** Se você atribuiu `minimax` a uma tarefa mas não tem chave MiniMax, a tarefa faz fallback para o padrão openrouter e registra aviso em `agent.log`.
+- **CLI** (`hermes chat`): próxima invocação `hermes chat`.
+- **Gateway** (Telegram, Discord, Slack, etc.): próxima sessão *nova*. Sessões existentes mantêm seu model. Reinicie o gateway (`hermes gateway restart`) se quiser forçar todas as sessões a pegar a mudança.
+- **Aba chat do dashboard** (`/chat`): próximo PTY novo. O chat aberto mantém seu model — use `/model` dentro dele para hot-swap.
 
-### Escolhi um modelo mas o Hermes trocou de provedor
+Mudanças nunca invalidam prompt caches em sessões rodando. Isso é deliberado: trocar model principal dentro de sessão requer reset de cache (system prompt contém conteúdo específico de model), e reservamos isso para slash command explícito `/model` dentro do chat.
 
-No OpenRouter (ou qualquer agregador), nomes de modelo bare resolvem *dentro* do agregador primeiro. Então `claude-sonnet-4` no OpenRouter vira `anthropic/claude-sonnet-4.6`, permanecendo na sua auth OpenRouter. Mas se você digitou `claude-sonnet-4` em auth Anthropic nativa, ficaria como `claude-sonnet-4-6`. Se vir troca inesperada de provedor, verifique se seu provedor atual é o esperado — o seletor sempre mostra o principal atual no topo do diálogo.
+## Solução de problemas {#troubleshooting}
+
+### "No authenticated providers" no picker
+
+O Hermes lista provider só se tem credencial funcional. Cheque **Keys** na sidebar — deve ver um de: API key, OAuth bem-sucedido, ou URL de endpoint custom. Se o provider que quer não está lá, rode `hermes setup` para configurar, ou vá em **Keys** e adicione a env var.
+
+### Model principal não mudou no chat rodando
+
+Esperado. O dashboard grava `config.yaml`, que novas sessões leem. O chat aberto é processo agent live — mantém o model com que foi spawnado. Use `/model <name>` dentro do chat para hot-swap aquela sessão específica.
+
+### Override auxiliary "não entrou em vigor"
+
+Três coisas para checar:
+
+1. **Iniciou sessão nova?** Chats existentes não relêem config.
+2. **`provider` está em algo diferente de `auto`?** Se o campo mostra `auto`, a tarefa ainda usa seu model principal. Clique **Change** e escolha provider real.
+3. **Provider está autenticado?** Se atribuiu `minimax` a uma tarefa mas não tem API key MiniMax, a tarefa cai para default openrouter e loga aviso em `agent.log`.
+
+### Escolhi model mas Hermes trocou providers
+
+No OpenRouter (ou qualquer agregador), nomes bare de model resolvem *dentro* do agregador primeiro. Então `claude-sonnet-4` no OpenRouter vira `anthropic/claude-sonnet-4.6`, ficando na auth OpenRouter. Mas se digitou `claude-sonnet-4` numa auth Anthropic nativa, ficaria `claude-sonnet-4-6`. Se vir troca inesperada de provider, cheque se provider atual é o esperado — o picker sempre mostra o main atual no topo do diálogo.
 
 ## Métodos alternativos {#alternative-methods}
 
@@ -190,22 +228,22 @@ No OpenRouter (ou qualquer agregador), nomes de modelo bare resolvem *dentro* do
 Dentro de qualquer sessão `hermes chat`:
 
 ```
-/model gpt-5.4 --provider openrouter             # session-only
-/model gpt-5.4 --provider openrouter --global    # also persists to config.yaml
-/model claude-opus-4.6 --once                    # next turn only, then auto-restores
+/model gpt-5.4 --provider openrouter             # só sessão
+/model gpt-5.4 --provider openrouter --global    # também persiste em config.yaml
+/model claude-opus-4.6 --once                    # só próximo turno, depois auto-restaura
 ```
 
-`--global` faz a mesma coisa que o botão **Change** do dashboard, além de trocar a sessão rodando in-place.
+`--global` faz o mesmo que **Change** do dashboard, mais troca a sessão rodando in-place.
 
-`--once` troca por um único turno e restaura o modelo anterior depois — em sucesso, erro ou interrupção. Nada é persistido: reiniciar o gateway no meio do turno volta ao modelo original. Útil para escalar uma pergunta difícil a um modelo caro ("pergunte ao Opus só desta vez") ou cair a um modelo barato para uma consulta descartável.
+`--once` troca por um turno e restaura o model anterior depois — em sucesso, erro ou interrupt igualmente. Nada persiste: restart de gateway mid-turn volta no model original. Útil para escalar uma pergunta difícil para model caro ("ask Opus just this once") ou cair para model barato numa query descartável.
 
 :::note Custo de prompt-cache
-Uma troca de um turno quebra o prefixo de prompt-cache do provedor duas vezes (saindo e voltando). Em uma sessão longa em provedor com prefixo em cache (Anthropic, OpenAI), o próximo turno paga custo integral de entrada — `--once` ganha em sessões curtas ou escalação barato→caro, mas uma pergunta rápida dentro de uma sessão longa cara pode custar mais do que economiza.
+Troca one-turn quebra o prefixo prompt-cache do provider duas vezes (saindo e voltando). Em sessão longa num provider cached-prefix (Anthropic, OpenAI), o próximo turno re-paga custo full de input — `--once` ganha em sessões curtas ou escalação barato→caro, mas pergunta lateral rápida dentro de sessão longa cara pode custar mais do que economiza.
 :::
 
-### Aliases customizados
+### Aliases custom
 
-Defina seus próprios nomes curtos para modelos que você usa muito, depois use `/model <alias>` no CLI ou qualquer plataforma de mensagens. Existem dois formatos equivalentes — escolha o que encaixa no seu fluxo.
+Defina nomes curtos para models que você alcança frequentemente, depois use `/model <alias>` no CLI ou qualquer plataforma de mensagens. Dois formatos equivalentes — escolha o que encaixa no workflow.
 
 **Canônico (top-level `model_aliases:`)** — controle total sobre provider + base_url:
 
@@ -227,54 +265,54 @@ hermes config set model.aliases.fav anthropic/claude-opus-4.6
 hermes config set model.aliases.grok x-ai/grok-4
 ```
 
-Ambos os caminhos alimentam o mesmo loader (`hermes_cli/model_switch.py`). Entradas declaradas em `model_aliases:` prevalecem sobre entradas `model.aliases:` com o mesmo nome.
+Ambos os caminhos alimentam o mesmo loader (`hermes_cli/model_switch.py`). Entradas declaradas em `model_aliases:` têm precedência sobre entradas `model.aliases:` com o mesmo nome.
 
-Depois `/model fav` ou `/model grok` no chat. Aliases do usuário sobrepõem nomes curtos built-in (`sonnet`, `kimi`, `opus`, etc.). Veja [Custom model aliases](/reference/slash-commands#custom-model-aliases) para a referência completa.
+Depois `/model fav` ou `/model grok` no chat. Aliases do usuário sombreiam nomes curtos built-in (`sonnet`, `kimi`, `opus`, etc.). Veja [Aliases de model custom](/reference/slash-commands#custom-model-aliases) para referência completa.
 
 ### Subcomando `hermes model`
 
 ```bash
-hermes model            # Interactive provider + model picker (the canonical way to switch defaults)
+hermes model            # Picker interativo provider + model (forma canônica de trocar defaults)
 ```
 
-`hermes model` guia você a escolher provedor, autenticar (fluxos OAuth abrem navegador; provedores de chave API pedem a chave) e escolher um modelo específico do catálogo curado daquele provedor. A escolha é gravada em `model.provider` e `model.default` em `~/.hermes/config.yaml`.
+`hermes model` guia você a escolher provider, autenticar (OAuth flows abrem browser; providers API-key pedem a key), e depois escolher model específico do catálogo curado daquele provider. A escolha é gravada em `model.provider` e `model.default` em `~/.hermes/config.yaml`.
 
-Para listar provedores/modelos sem abrir o seletor, use o dashboard ou os endpoints REST abaixo. Para inspecionar o que o CLI usará agora: `hermes config get model --json` e `hermes status`.
+Para listar providers/models sem lançar picker, use dashboard ou endpoints REST abaixo. Para inspecionar o que o CLI vai usar agora: `hermes config get model --json` e `hermes status`.
 
 ### Edição direta de config
 
-Edite `~/.hermes/config.yaml` e reinicie o que o lê. Veja a [referência de Configuration](./configuration.md) para o schema completo.
+Edite `~/.hermes/config.yaml` e reinicie o que o lê. Veja [Referência de configuração](./configuration.md) para schema completo.
 
 ### REST API
 
 O dashboard usa três endpoints. Útil para scripting:
 
 ```bash
-# List authenticated providers + curated model lists
+# Lista providers autenticados + listas curadas de models
 curl -H "X-Hermes-Session-Token: $TOKEN" http://localhost:PORT/api/model/options
 
-# Read current main + auxiliary assignments
+# Lê atribuições atuais main + auxiliary
 curl -H "X-Hermes-Session-Token: $TOKEN" http://localhost:PORT/api/model/auxiliary
 
-# Set the main model
+# Define model principal
 curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
   -d '{"scope":"main","provider":"openrouter","model":"anthropic/claude-opus-4.7"}' \
   http://localhost:PORT/api/model/set
 
-# Override a single auxiliary task
+# Override de uma task auxiliary
 curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
   -d '{"scope":"auxiliary","task":"vision","provider":"openrouter","model":"google/gemini-2.5-flash"}' \
   http://localhost:PORT/api/model/set
 
-# Assign one model to every auxiliary task
+# Atribui um model a toda task auxiliary
 curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
   -d '{"scope":"auxiliary","task":"","provider":"openrouter","model":"google/gemini-2.5-flash"}' \
   http://localhost:PORT/api/model/set
 
-# Reset all auxiliary tasks to auto
+# Reseta todas as tasks auxiliary para auto
 curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
   -d '{"scope":"auxiliary","task":"__reset__","provider":"","model":""}' \
   http://localhost:PORT/api/model/set
 ```
 
-O session token é injetado no HTML do dashboard na inicialização e rotaciona a cada reinício do servidor. Pegue nas devtools do navegador (`window.__HERMES_SESSION_TOKEN__`) se estiver scriptando contra um dashboard rodando.
+O session token é injetado no HTML do dashboard no startup e rotaciona a cada restart do server. Pegue em devtools do browser (`window.__HERMES_SESSION_TOKEN__`) se estiver scriptando contra dashboard rodando.
