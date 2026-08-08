@@ -283,6 +283,45 @@ class TestRunJobKanbanIsolation:
         assert observed["dispatcher_owned_during_init"] is False
         assert observed["dispatcher_owned_during_run"] is False
 
+    def test_explicit_toolset_exposes_cron_orchestrator_schema(
+        self, monkeypatch, worker_env
+    ):
+        import cron.scheduler as sched
+
+        observed: dict = {}
+
+        class InspectingAgent:
+            def __init__(self, **kwargs):
+                from model_tools import get_tool_definitions
+
+                definitions = get_tool_definitions(
+                    enabled_toolsets=kwargs["enabled_toolsets"], quiet_mode=True
+                )
+                observed["tool_names"] = {
+                    tool["function"]["name"] for tool in definitions
+                }
+
+            def run_conversation(self, *_a, **_kw):
+                return {"final_response": "done", "messages": []}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+        self._install_stubs(
+            monkeypatch, observed, agent_cls=InspectingAgent
+        )
+        monkeypatch.setattr(
+            sched,
+            "_resolve_cron_enabled_toolsets",
+            lambda job, cfg: ["terminal", "kanban"],
+        )
+
+        success, *_ = sched.run_job(self._job("kanban-orchestrator"))
+
+        assert success is True
+        assert "kanban_list" in observed["tool_names"]
+        assert "kanban_create" in observed["tool_names"]
+
     def test_environment_is_left_untouched(self, monkeypatch, worker_env):
         """The whole point of the ContextVar: os.environ must not be mutated, so
         the worker's claim heartbeat and the gateway watchers keep working."""

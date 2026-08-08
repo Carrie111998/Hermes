@@ -80,7 +80,9 @@ def test_delegated_child_context_suppresses_env_gated_kanban_tools(monkeypatch, 
     invalidate_check_fn_cache()
     _clear_tool_defs_cache()
     with delegated_child_context():
-        schema = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+        schema = get_tool_definitions(
+            enabled_toolsets=["terminal", "kanban"], quiet_mode=True
+        )
 
     names = {s["function"].get("name") for s in schema if "function" in s}
     assert "terminal" in names

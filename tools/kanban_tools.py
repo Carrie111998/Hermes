@@ -31,11 +31,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
-from tools.registry import registry, tool_error
+from tools.registry import registry, tool_error, uncached_check_fn
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
@@ -47,12 +50,24 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+_RUNTIME_KANBAN_TOOLSET: ContextVar[Optional[bool]] = ContextVar(
+    "runtime_kanban_toolset", default=None
+)
+
+
+@contextmanager
+def runtime_kanban_toolset(enabled: bool) -> Iterator[None]:
+    """Scope Kanban authorization to one agent's resolved toolset list."""
+    token = _RUNTIME_KANBAN_TOOLSET.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _RUNTIME_KANBAN_TOOLSET.reset(token)
 
 
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
-    # negligible overhead. The check_fn results are further TTL-cached
-    # (~30s) by the tool registry.
+    # negligible overhead for legacy top-level profile authorization.
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
@@ -60,6 +75,13 @@ def _profile_has_kanban_toolset() -> bool:
         return "kanban" in toolsets
     except Exception:
         return False
+
+
+def _kanban_toolset_authorized() -> bool:
+    runtime = _RUNTIME_KANBAN_TOOLSET.get()
+    if runtime is not None:
+        return runtime
+    return _profile_has_kanban_toolset()
 
 
 def _is_delegated_child_context() -> bool:
@@ -100,12 +122,14 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     )
 
 
+@uncached_check_fn
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
-    2. The current profile has ``kanban`` in its toolsets config
-       (orchestrator profiles like techlead that route work via Kanban).
+    2. The current agent explicitly selected the ``kanban`` toolset at runtime
+       (including platform/per-job selection), or its profile has the legacy
+       top-level opt-in.
 
     Humans running ``hermes chat`` without the kanban toolset see zero
     kanban tools. Workers spawned by the kanban dispatcher (gateway-
@@ -116,9 +140,10 @@ def _check_kanban_mode() -> bool:
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return True
-    return _profile_has_kanban_toolset()
+    return _kanban_toolset_authorized()
 
 
+@uncached_check_fn
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -132,7 +157,7 @@ def _check_kanban_orchestrator_mode() -> bool:
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
         return False
-    return _profile_has_kanban_toolset()
+    return _kanban_toolset_authorized()
 
 
 # ---------------------------------------------------------------------------
