@@ -1080,6 +1080,41 @@ def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
 
 
 @pytest.fixture(autouse=True)
+def _reset_terminal_runtime_state():
+    """Isolate process-global terminal state between tests.
+
+    Terminal/code-execution/file tools cache environments and interrupt state at
+    module scope. Full-suite runs can otherwise reuse a sandbox created by an
+    earlier test with a different backend (for example Modal), which makes later
+    tests nondeterministically inherit the wrong environment.
+    """
+    from tools.interrupt import _interrupted_threads, _lock, set_interrupt
+    from tools.file_tools import clear_file_ops_cache
+    from tools import terminal_tool as _terminal_tool
+
+    def _reset():
+        # Clear interrupt state for ALL threads, not just the current one.
+        # set_interrupt(False) only clears the calling thread's flag; worker
+        # thread flags survive and can bleed into later tests.
+        with _lock:
+            _interrupted_threads.clear()
+        set_interrupt(False)
+        clear_file_ops_cache()
+        _terminal_tool._stop_cleanup_thread()
+        for task_id in list(_terminal_tool._active_environments.keys()):
+            _terminal_tool.cleanup_vm(task_id)
+        _terminal_tool._creation_locks.clear()
+        _terminal_tool._task_env_overrides.clear()
+
+    _reset()
+
+    try:
+        yield
+    finally:
+        _reset()
+
+
+@pytest.fixture(autouse=True)
 def _live_system_guard(request, monkeypatch):
     """Block real os.kill / systemctl / gateway-pid scans during tests.
 
