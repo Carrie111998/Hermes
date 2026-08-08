@@ -572,6 +572,12 @@ export interface SessionMessage {
 
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
+  pagination?: {
+    limit: number
+    offset: number
+    order: 'latest' | 'oldest'
+    returned: number
+  }
   session_id: string
 }
 
