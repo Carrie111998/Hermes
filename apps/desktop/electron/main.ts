@@ -5035,7 +5035,7 @@ function buildApplicationMenu() {
       {
         label: 'Toggle Developer Tools',
         accelerator: process.platform === 'darwin' ? 'Alt+Cmd+I' : 'Ctrl+Shift+I',
-        click: () => toggleDevTools(mainWindow)
+        click: (_menuItem, browserWindow) => toggleDevTools(browserWindow || mainWindow)
       },
       { type: 'separator' },
       {
@@ -8887,8 +8887,6 @@ ipcMain.on('hermes:zoom:set-percent', (event, percent) => {
 // content origin so the pet lands where it sat in-window. A remembered/dragged
 // spot passes screen-space bounds (screen=true) and is used as-is. We return the
 // resolved screen bounds so the renderer can persist exactly where it opened.
-ipcMain.on('hermes:devtools:disable-f12', (_event, blocked) => { f12Blocked = blocked })
-
 ipcMain.handle('hermes:pet-overlay:open', async (_event, request) => {
   const bounds = request && request.bounds ? request.bounds : request
   const isScreen = Boolean(request && request.screen)
@@ -9845,6 +9843,30 @@ ipcMain.on('hermes:keep-awake', (_event, on) => {
     fs.writeFileSync(KEEP_AWAKE_CONFIG_PATH, JSON.stringify({ on: enabled }, null, 2), 'utf8')
   } catch (error) {
     rememberLog(`[keep-awake] write failed: ${error.message}`)
+  }
+})
+
+// Disable F12 DevTools: maintained in the main process so a cold launch
+// restores it before any window is shown (applied on ready). The renderer
+// toggles it from Settings → Advanced over IPC. See store/disable-f12.
+const DISABLE_F12_CONFIG_PATH = path.join(app.getPath('userData'), 'disable-f12.json')
+
+function readPersistedDisableF12() {
+  try {
+    return JSON.parse(fs.readFileSync(DISABLE_F12_CONFIG_PATH, 'utf8')).on === true
+  } catch {
+    return false
+  }
+}
+
+ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
+  f12Blocked = Boolean(on)
+
+  try {
+    fs.mkdirSync(path.dirname(DISABLE_F12_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(DISABLE_F12_CONFIG_PATH, JSON.stringify({ on: f12Blocked }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[disable-f12] write failed: ${error.message}`)
   }
 })
 
@@ -10864,6 +10886,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  f12Blocked = readPersistedDisableF12()
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
