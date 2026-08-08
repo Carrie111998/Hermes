@@ -607,6 +607,48 @@ export function firstStringField(record: Record<string, unknown>, keys: readonly
   return ''
 }
 
+/**
+ * Extract embedded HTML from an MCP tool result that follows the MCP Apps
+ * extension: a `content` array containing a `{ type: 'resource', resource:
+ * { mimeType: 'text/html', text: string } }` item. Returns the HTML string
+ * when found, empty string otherwise.
+ *
+ * Also checks `data.content` for results wrapped in a success envelope
+ * (common for SAP MCP and similar servers that wrap tool output).
+ */
+export function extractEmbeddedHtml(result: unknown): string {
+  const record = parseMaybeObject(result)
+  if (!record) return ''
+
+  const checkContent = (content: unknown): string => {
+    if (!Array.isArray(content)) return ''
+    for (const item of content) {
+      const entry = parseMaybeObject(item)
+      if (!entry) continue
+      if (entry.type === 'resource') {
+        const resource = parseMaybeObject(entry.resource)
+        if (resource && resource.mimeType === 'text/html' && typeof resource.text === 'string' && resource.text.trim()) {
+          return resource.text
+        }
+      }
+    }
+    return ''
+  }
+
+  // Direct content array
+  const direct = checkContent(record.content)
+  if (direct) return direct
+
+  // Wrapped in a success envelope (e.g. { success, tool, data: { content: [...] } })
+  const dataRecord = parseMaybeObject(record.data)
+  if (dataRecord) {
+    const wrapped = checkContent(dataRecord.content)
+    if (wrapped) return wrapped
+  }
+
+  return ''
+}
+
 function collectResultItems(value: unknown): unknown[] {
   if (Array.isArray(value)) {
     return value

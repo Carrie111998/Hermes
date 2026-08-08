@@ -52,6 +52,7 @@ import {
   clampForDisplay,
   cleanVisibleText,
   countDiffLineStats,
+  extractEmbeddedHtml,
   inlineDiffFromResult,
   isCardTool,
   isFileEditTool,
@@ -697,6 +698,20 @@ function ToolEntry({ part }: ToolEntryProps) {
                 )}
               </div>
             ))}
+          {(() => {
+            const embeddedHtml = extractEmbeddedHtml(result)
+            if (!embeddedHtml) return null
+            return (
+              <div className="mt-2 overflow-hidden rounded-lg border border-(--ui-stroke-secondary)" data-slot="tool-embedded-html">
+                <iframe
+                  srcDoc={embeddedHtml}
+                  sandbox="allow-same-origin"
+                  className="h-[240px] w-full border-0"
+                  style={{ minHeight: '200px', background: 'transparent' }}
+                />
+              </div>
+            )
+          })()}
           {toolViewMode === 'technical' && <ToolPayloadDisclosure args={part.args} result={part.result} />}
         </div>
       )}
