@@ -4369,6 +4369,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # Recovery can be suspended in stop/drain/start while disconnect begins.
         # Cancel and await both polling lifecycle owners immediately after the
         # fence, before any other teardown await lets them start a new generation.
+        #
+        # NOTE (#81335): the `task is current_task` check below does NOT protect
+        # against the fatal-error self-cancellation race. The gateway invokes
+        # disconnect() through `_safe_adapter_disconnect`, which wraps this
+        # coroutine in its own `asyncio.ensure_future` task
+        # (gateway/run.py:_await_adapter_cleanup_with_timeout) — so
+        # `current_task()` here is always that wrapper, never the real carrier
+        # (`_polling_error_task`) that transitively awaited its way down into
+        # this call. `_polling_error_task` still gets cancelled below, killing
+        # the fatal-error handler chain if it's awaiting this call. That race
+        # is guarded at the base-class level instead (see
+        # `BasePlatformAdapter._notify_fatal_error`'s shielded detached-task
+        # handler, PR #81337) — do not assume this guard already covers it.
         current_task = asyncio.current_task()
         lifecycle_tasks: list[asyncio.Task] = []
         lifecycle_seen: set[int] = set()
