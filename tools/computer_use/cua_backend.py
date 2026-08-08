@@ -1022,10 +1022,15 @@ def _parse_key_combo(keys: str) -> Tuple[Optional[str], List[str]]:
 class _AsyncBridge:
     """Runs one asyncio loop on a daemon thread; marshals coroutines from the caller."""
 
+    _CALL_CANCEL_CONFIRM_TIMEOUT = 2.0
+    _INFLIGHT_DRAIN_TIMEOUT = 2.0
+
     def __init__(self) -> None:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
+        self._inflight_lock = threading.Lock()
+        self._inflight_events: set[threading.Event] = set()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1055,12 +1060,53 @@ class _AsyncBridge:
             if asyncio.iscoroutine(coro):
                 coro.close()
             raise RuntimeError("cua-driver bridge not started")
-        fut = safe_schedule_threadsafe(coro, self._loop)
+
+        completed = threading.Event()
+
+        async def _tracked():
+            try:
+                return await coro
+            finally:
+                completed.set()
+                with self._inflight_lock:
+                    self._inflight_events.discard(completed)
+
+        tracked = _tracked()
+        with self._inflight_lock:
+            self._inflight_events.add(completed)
+        fut = safe_schedule_threadsafe(tracked, self._loop)
         if fut is None:
+            with self._inflight_lock:
+                self._inflight_events.discard(completed)
+            tracked.close()
+            if asyncio.iscoroutine(coro):
+                coro.close()
             raise RuntimeError("cua-driver bridge not started")
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            fut.cancel()
+            if not completed.wait(timeout=self._CALL_CANCEL_CONFIRM_TIMEOUT):
+                raise RuntimeError(
+                    "cua-driver action timed out and cancellation was not confirmed"
+                ) from exc
+            raise
 
     def stop(self) -> None:
+        deadline = time.monotonic() + self._INFLIGHT_DRAIN_TIMEOUT
+        while True:
+            with self._inflight_lock:
+                pending = [event for event in self._inflight_events if not event.is_set()]
+                self._inflight_events.intersection_update(pending)
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"cua-driver bridge still has {len(pending)} in-flight action(s)"
+                )
+            pending[0].wait(timeout=remaining)
+
         loop = self._loop
         thread = self._thread
         if loop and loop.is_running():
@@ -2071,14 +2117,10 @@ class CuaDriverBackend(ComputerUseBackend):
                 )
             except Exception as e:
                 logger.debug("cua-driver end_session failed (continuing teardown): %s", e)
-        try:
-            self._session.stop()
-        finally:
-            try:
-                self._bridge.stop()
-            finally:
-                if self._embedded_daemon is not None:
-                    self._embedded_daemon.stop()
+        self._session.stop()
+        self._bridge.stop()
+        if self._embedded_daemon is not None:
+            self._embedded_daemon.stop()
 
     def is_available(self) -> bool:
         # cua-driver runs on macOS, Windows, and Linux. The Linux path is

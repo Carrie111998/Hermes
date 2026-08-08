@@ -36,16 +36,24 @@ from __future__ import annotations
 
 # Re-export the public surface so `from tools.computer_use import ...` works.
 from tools.computer_use.tool import (  # noqa: F401
+    begin_computer_use_session_reactivation,
+    begin_computer_use_terminal_transition,
     check_computer_use_requirements,
     computer_use_cleanup_snapshot,
     computer_use_lifecycle_snapshot,
     computer_use_process_snapshot,
     drain_computer_use_cleanup,
+    end_computer_use_session_reactivation,
+    end_computer_use_terminal_transition,
     get_computer_use_schema,
     get_computer_use_session_generation,
     handle_computer_use,
+    is_computer_use_session_retired,
+    publish_computer_use_session,
     release_computer_use_session,
     release_computer_use_session_result,
     set_approval_callback,
+    set_computer_use_session_validator,
     submit_computer_use_session_release,
+    unpublish_computer_use_session,
 )

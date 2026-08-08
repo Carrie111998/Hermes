@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import queue
 import threading
@@ -62,6 +63,343 @@ def test_release_result_rejects_empty_or_generation_mismatch_without_stopping():
     assert mismatch.status == "mismatch"
     assert backend.stop_calls == 0
     assert computer_use.get_computer_use_session_generation("session-a") == generation
+
+
+@pytest.mark.parametrize("invalid_generation", [None, True, False, 0, -1, "1", 1.0])
+def test_release_result_rejects_invalid_generation_without_stopping(invalid_generation):
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("strict-generation")
+
+    actual_generation = computer_use.get_computer_use_session_generation("strict-generation")
+    assert actual_generation is not None
+
+    result = computer_use.release_computer_use_session_result(
+        "strict-generation",
+        expected_generation=invalid_generation,
+        reason="strict_validation",
+    )
+
+    assert result.status == "mismatch"
+    assert result.error == "expected_generation must be a positive integer"
+    assert backend.stop_calls == 0
+    assert computer_use.get_computer_use_session_generation("strict-generation") == actual_generation
+
+
+def test_release_result_omitted_generation_snapshots_exact_active_generation():
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("result-compat")
+
+    generation = computer_use.get_computer_use_session_generation("result-compat")
+    assert generation is not None
+
+    result = computer_use.release_computer_use_session_result("result-compat")
+
+    assert result.status == "released"
+    assert result.generation == generation
+    assert backend.stop_calls == 1
+    assert computer_use.get_computer_use_session_generation("result-compat") is None
+
+
+def test_release_result_omitted_generation_is_idempotent_when_absent():
+    from tools.computer_use import tool as computer_use
+
+    result = computer_use.release_computer_use_session_result("result-compat-absent")
+
+    assert result.status == "already_absent"
+    assert result.generation is None
+
+
+def test_terminal_transition_fence_blocks_same_session_backend_recreation():
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("terminal-fence")
+        generation = computer_use.get_computer_use_session_generation("terminal-fence")
+        token = computer_use.begin_computer_use_terminal_transition(
+            "terminal-fence"
+        )
+        try:
+            result = computer_use.release_computer_use_session_result(
+                "terminal-fence",
+                expected_generation=generation,
+                reason="test_terminal_fence",
+            )
+            assert result.released
+            with pytest.raises(RuntimeError, match="terminal transition"):
+                computer_use._get_backend("terminal-fence")
+        finally:
+            computer_use.end_computer_use_terminal_transition(token)
+
+        replacement = computer_use._get_backend("terminal-fence")
+        assert replacement is backend
+        replacement_generation = computer_use.get_computer_use_session_generation(
+            "terminal-fence"
+        )
+        assert replacement_generation > generation
+        assert computer_use.release_computer_use_session_result(
+            "terminal-fence",
+            expected_generation=replacement_generation,
+            reason="test_cleanup",
+        ).released
+
+
+def test_terminal_transition_rejects_action_that_looked_up_before_fence():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    lookup_complete = threading.Event()
+    allow_revalidation = threading.Event()
+
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("stale-terminal-call")
+        generation = computer_use.get_computer_use_session_generation(
+            "stale-terminal-call"
+        )
+
+        def stale_lookup(*, session_id):
+            lookup_complete.set()
+            assert allow_revalidation.wait(timeout=2)
+            return backend
+
+        with patch.object(computer_use, "_get_backend", side_effect=stale_lookup):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                acquire = pool.submit(
+                    computer_use._acquire_backend_for_call,
+                    "stale-terminal-call",
+                )
+                assert lookup_complete.wait(timeout=1)
+                transition = computer_use.begin_computer_use_terminal_transition(
+                    "stale-terminal-call"
+                )
+                allow_revalidation.set()
+                with pytest.raises(RuntimeError, match="changed while acquiring"):
+                    acquire.result(timeout=2)
+
+        try:
+            assert computer_use.release_computer_use_session_result(
+                "stale-terminal-call",
+                expected_generation=generation,
+                reason="test_terminal_fence",
+            ).released
+        finally:
+            computer_use.end_computer_use_terminal_transition(transition)
+
+
+def test_successful_terminal_transition_retires_old_session_id():
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("retired-route")
+        transition = computer_use.begin_computer_use_terminal_transition(
+            "retired-route"
+        )
+        released = computer_use.release_computer_use_session_result(
+            "retired-route",
+            expected_generation=transition.generation,
+            timeout=1.0,
+            reason="test-retire",
+        )
+        assert released.status == "released"
+        computer_use.end_computer_use_terminal_transition(
+            transition,
+            retire=True,
+        )
+        with pytest.raises(RuntimeError, match="retired"):
+            computer_use._get_backend("retired-route")
+
+
+def test_managed_route_publication_registry_reclaims_all_idle_sessions():
+    from tools.computer_use import tool as computer_use
+
+    for index in range(4096):
+        sid = f"managed-route-{index}"
+        publication = computer_use.publish_computer_use_session(sid)
+        computer_use.unpublish_computer_use_session(publication)
+
+    assert computer_use._managed_session_publications == {}
+    with pytest.raises(RuntimeError, match="retired or unpublished"):
+        computer_use._get_backend("managed-route-0")
+
+
+def test_managed_route_publication_is_reference_counted():
+    from tools.computer_use import tool as computer_use
+
+    sid = "concurrent-managed-route"
+    first = computer_use.publish_computer_use_session(sid)
+    second = computer_use.publish_computer_use_session(sid)
+    computer_use.unpublish_computer_use_session(first)
+    assert computer_use._managed_session_publications == {sid: {second}}
+    computer_use.unpublish_computer_use_session(second)
+    assert computer_use._managed_session_publications == {}
+
+
+def test_failed_terminal_transition_restores_exact_publication_lease():
+    from tools.computer_use import tool as computer_use
+
+    sid = "rollback-publication"
+    publication = computer_use.publish_computer_use_session(sid)
+    transition = computer_use.begin_computer_use_terminal_transition(sid)
+    assert publication.active is False
+
+    computer_use.end_computer_use_terminal_transition(
+        transition,
+        retire=False,
+    )
+    assert publication.active is True
+    computer_use.unpublish_computer_use_session(publication)
+    assert computer_use._managed_session_publications == {}
+
+
+def test_retired_session_reactivation_is_fenced_until_publication():
+    from tools.computer_use import tool as computer_use
+
+    first = _Backend()
+    second = _Backend()
+    with patch(
+        "tools.computer_use.cua_backend.CuaDriverBackend",
+        side_effect=[first, second],
+    ):
+        computer_use._get_backend("historical-route")
+        first_generation = computer_use.get_computer_use_session_generation(
+            "historical-route"
+        )
+        terminal = computer_use.begin_computer_use_terminal_transition(
+            "historical-route"
+        )
+        released = computer_use.release_computer_use_session_result(
+            "historical-route",
+            expected_generation=first_generation,
+            reason="switch_away",
+        )
+        assert released.released
+        computer_use.end_computer_use_terminal_transition(terminal, retire=True)
+
+        reactivation = computer_use.begin_computer_use_session_reactivation(
+            "historical-route"
+        )
+        with pytest.raises(RuntimeError, match="fenced"):
+            computer_use._get_backend("historical-route")
+        computer_use.end_computer_use_session_reactivation(
+            reactivation,
+            succeeded=True,
+        )
+        publication = computer_use.publish_computer_use_session(
+            "historical-route"
+        )
+        try:
+            assert computer_use._get_backend("historical-route") is second
+            second_generation = computer_use.get_computer_use_session_generation(
+                "historical-route"
+            )
+        finally:
+            computer_use.unpublish_computer_use_session(publication)
+
+    assert second_generation > first_generation
+
+
+def test_reactivation_completion_advances_scalar_route_epoch():
+    from tools.computer_use import tool as computer_use
+
+    reactivation = computer_use.begin_computer_use_session_reactivation(
+        "reactivation-epoch"
+    )
+    before_completion = computer_use._session_route_epoch_sequence
+    computer_use.end_computer_use_session_reactivation(
+        reactivation,
+        succeeded=True,
+    )
+
+    assert computer_use._session_route_epoch_sequence == before_completion + 1
+
+
+def test_stale_lookup_cannot_hop_to_reactivated_backend_generation():
+    from tools.computer_use import tool as computer_use
+
+    first = _Backend()
+    second = _Backend()
+    looked_up = threading.Event()
+    continue_lookup = threading.Event()
+    original_get = computer_use._get_backend
+
+    with patch(
+        "tools.computer_use.cua_backend.CuaDriverBackend",
+        side_effect=[first, second],
+    ):
+        original_get("historical-stale")
+        generation = computer_use.get_computer_use_session_generation(
+            "historical-stale"
+        )
+
+        def blocked_get(session_id=""):
+            backend = original_get(session_id)
+            looked_up.set()
+            assert continue_lookup.wait(timeout=2)
+            return backend
+
+        with patch.object(computer_use, "_get_backend", side_effect=blocked_get):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                stale = pool.submit(
+                    computer_use._acquire_backend_for_call,
+                    "historical-stale",
+                )
+                assert looked_up.wait(timeout=1)
+
+                terminal = computer_use.begin_computer_use_terminal_transition(
+                    "historical-stale"
+                )
+                released = computer_use.release_computer_use_session_result(
+                    "historical-stale",
+                    expected_generation=generation,
+                    reason="switch_away",
+                )
+                assert released.released
+                computer_use.end_computer_use_terminal_transition(
+                    terminal,
+                    retire=True,
+                )
+                reactivation = computer_use.begin_computer_use_session_reactivation(
+                    "historical-stale"
+                )
+                computer_use.end_computer_use_session_reactivation(
+                    reactivation,
+                    succeeded=True,
+                )
+                publication = computer_use.publish_computer_use_session(
+                    "historical-stale"
+                )
+                try:
+                    original_get("historical-stale")
+                    continue_lookup.set()
+
+                    with pytest.raises(RuntimeError, match="changed while acquiring"):
+                        stale.result(timeout=2)
+                finally:
+                    computer_use.unpublish_computer_use_session(publication)
+
+
+def test_public_bool_release_snapshots_exact_generation_before_teardown():
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    with patch("tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend):
+        computer_use._get_backend("bool-adapter")
+
+    generation = computer_use.get_computer_use_session_generation("bool-adapter")
+    assert generation is not None
+    assert computer_use.release_computer_use_session("bool-adapter") is True
+    assert backend.stop_calls == 1
+    assert computer_use.get_computer_use_session_generation("bool-adapter") is None
 
 
 def test_start_failure_attempts_cleanup_and_removes_confirmed_stopped_record():
@@ -435,6 +773,18 @@ def test_cleanup_supervisor_shutdown_is_bounded_with_blocked_daemon_worker():
     assert not any(worker.is_alive() for worker in supervisor._workers)
 
 
+@pytest.mark.parametrize("invalid_generation", [None, True, False, 0, -1, "1", 1.0])
+def test_supervised_release_rejects_invalid_generation_before_enqueue(invalid_generation):
+    from tools.computer_use import tool as computer_use
+
+    with pytest.raises(ValueError, match="expected_generation must be a positive integer"):
+        computer_use.submit_computer_use_session_release(
+            "strict-submit",
+            expected_generation=invalid_generation,
+            reason="strict_submit",
+        )
+
+
 def test_tracked_cleanup_supervisor_returns_future_and_drains():
     from tools.computer_use import tool as computer_use
 
@@ -604,6 +954,29 @@ def test_cua_session_unconfirmed_cancellation_raises_and_remains_retryable():
     assert session._started is False
 
 
+def test_backend_stop_retains_bridge_when_session_stop_is_unconfirmed():
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    backend = CuaDriverBackend()
+    session = MagicMock()
+    session._started = False
+    session.stop.side_effect = RuntimeError("session teardown unconfirmed")
+    bridge = MagicMock()
+    backend._session = session
+    backend._bridge = bridge
+    backend._embedded_daemon = None
+
+    with pytest.raises(RuntimeError, match="session teardown unconfirmed"):
+        backend.stop()
+
+    bridge.stop.assert_not_called()
+
+    session.stop.side_effect = None
+    backend.stop()
+    assert session.stop.call_count == 2
+    bridge.stop.assert_called_once_with()
+
+
 def test_embedded_daemon_stop_failure_retains_process_for_retry():
     from tools.computer_use.cua_backend import _EmbeddedCuaDaemon
 
@@ -619,6 +992,86 @@ def test_embedded_daemon_stop_failure_retains_process_for_retry():
         daemon.stop()
 
     assert daemon._process is process
+
+
+def test_async_bridge_run_cancels_and_confirms_timed_out_coroutine():
+    from tools.computer_use.cua_backend import _AsyncBridge
+
+    bridge = _AsyncBridge()
+    started = threading.Event()
+    finalized = threading.Event()
+
+    async def blocked_action():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finalized.set()
+
+    bridge.start()
+    try:
+        with pytest.raises(concurrent.futures.TimeoutError):
+            bridge.run(blocked_action(), timeout=0.02)
+        assert started.is_set()
+        assert finalized.wait(timeout=0.5)
+    finally:
+        bridge.stop()
+
+
+def test_async_bridge_run_retains_unconfirmed_timeout_until_coroutine_finishes():
+    from tools.computer_use.cua_backend import _AsyncBridge
+
+    bridge = _AsyncBridge()
+    bridge._CALL_CANCEL_CONFIRM_TIMEOUT = 0.02
+    release = threading.Event()
+    finalized = threading.Event()
+
+    async def cancellation_resistant_action():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+        finally:
+            finalized.set()
+
+    bridge.start()
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+    try:
+        with pytest.raises(RuntimeError, match="cancellation was not confirmed"):
+            bridge.run(cancellation_resistant_action(), timeout=0.01)
+        with bridge._inflight_lock:
+            assert any(not event.is_set() for event in bridge._inflight_events)
+        assert finalized.wait(timeout=1.0)
+        bridge.stop()
+    finally:
+        timer.cancel()
+        release.set()
+        if bridge._thread is not None:
+            bridge.stop()
+
+
+def test_async_bridge_stop_refuses_to_stop_with_unconfirmed_inflight_call():
+    from tools.computer_use.cua_backend import _AsyncBridge
+
+    bridge = _AsyncBridge()
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    thread = MagicMock()
+    thread.is_alive.return_value = False
+    pending = threading.Event()
+    bridge._loop = loop
+    bridge._thread = thread
+    bridge._inflight_events.add(pending)
+    bridge._INFLIGHT_DRAIN_TIMEOUT = 0.01
+
+    with pytest.raises(RuntimeError, match="in-flight action"):
+        bridge.stop()
+
+    loop.stop.assert_not_called()
+    assert bridge._thread is thread
+    assert bridge._loop is loop
 
 
 def test_async_bridge_stop_refuses_to_forget_a_live_thread():

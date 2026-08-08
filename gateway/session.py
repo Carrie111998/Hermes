@@ -15,10 +15,11 @@ import os
 import json
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -771,6 +772,13 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
 
 
 @dataclass
+class _RouteTerminalTransition:
+    session_id: str
+    callback_token: Any
+    rollback_entry_data: Dict[str, Any]
+
+
+@dataclass
 class SessionEntry:
     """
     Entry in the session store.
@@ -1215,6 +1223,12 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+@dataclass
+class _RouteTransitionLockEntry:
+    lock: Any = field(default_factory=threading.RLock)
+    users: int = 0
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -1240,10 +1254,22 @@ class SessionStore:
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
     
-    def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+    def __init__(
+        self,
+        sessions_dir: Path,
+        config: GatewayConfig,
+        has_active_processes_fn=None,
+        before_auto_reset_fn: Optional[Callable[[str, str], Any]] = None,
+        before_terminal_completion_fn: Optional[
+            Callable[[str, Any, str], None]
+        ] = None,
+        after_auto_reset_fn: Optional[Callable[[str, Any, bool], None]] = None,
+    ):
         self.sessions_dir = sessions_dir
         self.config = config
+        self._before_auto_reset_fn = before_auto_reset_fn
+        self._before_terminal_completion_fn = before_terminal_completion_fn
+        self._after_auto_reset_fn = after_auto_reset_fn
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._lock = threading.Lock()
@@ -1260,6 +1286,21 @@ class SessionStore:
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        # Every route-changing operation for one key participates in this lock,
+        # including get/create auto-reset, explicit reset, compression advance,
+        # and session switch. This reservation spans lock-free persistence/DB
+        # phases so no competing writer can cross a terminal teardown boundary.
+        self._route_transition_locks_guard = threading.Lock()
+        self._route_transition_locks: Dict[
+            str, _RouteTransitionLockEntry
+        ] = {}
+        self._active_route_transitions: set[str] = set()
+        self._route_terminal_transitions: Dict[
+            str, _RouteTerminalTransition
+        ] = {}
+        self._retained_terminal_transitions: Dict[
+            str, _RouteTerminalTransition
+        ] = {}
         # An unscoped pre-migration Slack key can represent at most one
         # workspace. Claim it once per process so simultaneous first messages
         # from two workspaces cannot both revive the same legacy session.
@@ -1508,10 +1549,14 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self, *, require_primary_db: bool = False) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        self._persist_routing_data(
+            data,
+            generation,
+            require_primary_db=require_primary_db,
+        )
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1532,7 +1577,13 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        require_primary_db: bool = False,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1566,6 +1617,10 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+                        if require_primary_db:
+                            raise RuntimeError(
+                                "terminal route transition could not persist state.db routing"
+                            ) from exc
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
@@ -1629,11 +1684,15 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
-    def _save_entries(self) -> None:
+    def _save_entries(self, *, require_primary_db: bool = False) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
         with self._lock:
             data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        self._persist_routing_data(
+            data,
+            generation,
+            require_primary_db=require_primary_db,
+        )
 
     def _save_entry(
         self,
@@ -1641,6 +1700,7 @@ class SessionStore:
         *,
         entry_data: Optional[Dict[str, Any]] = None,
         lock_held: bool = False,
+        require_primary_db: bool = False,
     ) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
 
@@ -1737,6 +1797,10 @@ class SessionStore:
                     "(%s); falling back to full index rewrite",
                     session_key, exc,
                 )
+                if require_primary_db:
+                    raise RuntimeError(
+                        "terminal route marker could not persist state.db routing"
+                    ) from exc
         if candidate_entry is not None:
             # DB upsert failed (or no DB): build the full snapshot now, carrying
             # the candidate entry so the fallback persists the intended
@@ -1754,9 +1818,13 @@ class SessionStore:
                         for key, current in self._entries.items()
                     }
             fallback_data[session_key] = candidate_entry
-            self._persist_routing_data(fallback_data, revision)
+            self._persist_routing_data(
+                fallback_data,
+                revision,
+                require_primary_db=require_primary_db,
+            )
         else:
-            self._save_entries()
+            self._save_entries(require_primary_db=require_primary_db)
 
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
@@ -2281,6 +2349,8 @@ class SessionStore:
         Sessions with active background processes are never reset.
         """
         session_key = self._generate_session_key(source)
+        if entry.metadata.get("terminal_transition"):
+            return "terminal_transition_recovery"
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
                 "Session reset skipped for %s — active background processes",
@@ -2382,6 +2452,172 @@ class SessionStore:
             self._ensure_loaded_locked()
             return len(self._entries) > 1
 
+    @contextmanager
+    def _route_transition_lock(self, session_key: str):
+        """Reserve a per-key route lock and reclaim it after the final user.
+
+        Waiters increment ``users`` before blocking on the RLock, so the map
+        entry cannot be removed while any holder or waiter can still reference
+        it. The final releaser removes only the same identity it reserved,
+        preventing a late cleanup from deleting a newer entry.
+        """
+        guard = getattr(self, "_route_transition_locks_guard", None)
+        if guard is None:
+            # Compatibility for tests/embedders that construct a partial store.
+            with self._lock:
+                guard = getattr(self, "_route_transition_locks_guard", None)
+                if guard is None:
+                    guard = threading.Lock()
+                    self._route_transition_locks_guard = guard
+                    self._route_transition_locks = {}
+        with guard:
+            locks = self._route_transition_locks
+            entry = locks.get(session_key)
+            if entry is None:
+                entry = _RouteTransitionLockEntry()
+                locks[session_key] = entry
+            entry.users += 1
+        try:
+            with entry.lock:
+                yield entry.lock
+        finally:
+            with guard:
+                entry.users -= 1
+                if entry.users == 0 and locks.get(session_key) is entry:
+                    locks.pop(session_key, None)
+
+    def _arm_route_terminal_transition(
+        self,
+        session_key: str,
+        session_id: str,
+        reason: str,
+    ) -> None:
+        before_terminal_reset = getattr(self, "_before_auto_reset_fn", None)
+
+        with self._lock:
+            retained = self._retained_terminal_transitions.pop(session_key, None)
+            if retained is not None:
+                if retained.session_id != session_id:
+                    self._retained_terminal_transitions[session_key] = retained
+                    raise RuntimeError(
+                        "retained terminal transition does not own current route"
+                    )
+                self._route_terminal_transitions[session_key] = retained
+                return
+
+            current = self._entries.get(session_key)
+            if current is None or current.session_id != session_id:
+                raise RuntimeError("terminal route changed before durable marker")
+            marker = {
+                "session_id": session_id,
+                "reason": reason,
+                "token": uuid.uuid4().hex,
+                "started_at": _now().isoformat(),
+            }
+            candidate = current.to_dict()
+            metadata = dict(candidate.get("metadata") or {})
+            metadata["terminal_transition"] = marker
+            candidate["metadata"] = metadata
+            current.metadata["terminal_transition"] = marker
+            rollback_entry_data = current.to_dict()
+
+        # Persist the recovery marker before releasing CUA. A crash or any
+        # later persistence failure therefore restarts in fail-closed reset
+        # recovery instead of reviving the old route. The per-key route
+        # reservation protects route ownership while blocking I/O stays outside
+        # ``self._lock``.
+        self._save_entry(
+            session_key,
+            entry_data=candidate,
+            require_primary_db=True,
+        )
+
+        callback_token = (
+            before_terminal_reset(session_id, reason)
+            if callable(before_terminal_reset)
+            else None
+        )
+        with self._lock:
+            self._route_terminal_transitions[session_key] = _RouteTerminalTransition(
+                session_id=session_id,
+                callback_token=callback_token,
+                rollback_entry_data=rollback_entry_data,
+            )
+
+    def _run_route_transition(self, session_key: str, operation: Callable[[], Any]) -> Any:
+        """Run one route mutation with a per-key reservation visible to pruners."""
+        with self._route_transition_lock(session_key):
+            with self._lock:
+                active = getattr(self, "_active_route_transitions", None)
+                if active is None:
+                    active = set()
+                    self._active_route_transitions = active
+                active.add(session_key)
+            operation_succeeded = False
+            try:
+                result = operation()
+                with self._lock:
+                    completing_transition = self._route_terminal_transitions.get(
+                        session_key
+                    )
+                before_terminal_completion = getattr(
+                    self, "_before_terminal_completion_fn", None
+                )
+                if (
+                    completing_transition is not None
+                    and callable(before_terminal_completion)
+                ):
+                    before_terminal_completion(
+                        completing_transition.session_id,
+                        completing_transition.callback_token,
+                        session_key,
+                    )
+                operation_succeeded = True
+                return result
+            finally:
+                terminal_transition = None
+                route_replaced = False
+                with self._lock:
+                    terminal_transition = self._route_terminal_transitions.pop(
+                        session_key, None
+                    )
+                    if terminal_transition is not None:
+                        current = self._entries.get(session_key)
+                        route_replaced = (
+                            current is not None
+                            and current.session_id != terminal_transition.session_id
+                        )
+                        if not (operation_succeeded and route_replaced):
+                            # Restore the durably marked old route. Keep the CUA
+                            # admission token retained so no caller can recreate
+                            # the released generation before a retry completes.
+                            self._entries[session_key] = SessionEntry.from_dict(
+                                terminal_transition.rollback_entry_data
+                            )
+                            self._retained_terminal_transitions[
+                                session_key
+                            ] = terminal_transition
+                try:
+                    if terminal_transition is not None:
+                        succeeded = operation_succeeded and route_replaced
+                        if not succeeded:
+                            # A replacement may already have reached the routing
+                            # DB before later SQLite work failed. Restore the old
+                            # marked route while the admission fence is retained.
+                            self._save_entries(require_primary_db=True)
+                        after_terminal_reset = getattr(
+                            self, "_after_auto_reset_fn", None
+                        )
+                        if after_terminal_reset is not None:
+                            after_terminal_reset(
+                                terminal_transition.session_id,
+                                terminal_transition.callback_token,
+                                succeeded,
+                            )
+                finally:
+                    with self._lock:
+                        self._active_route_transitions.discard(session_key)
+
     def get_or_create_session(
         self,
         source: SessionSource,
@@ -2417,7 +2653,12 @@ class SessionStore:
             return slot.result
 
         try:
-            result = self._get_or_create_session_impl(source, force_new=force_new)
+            result = self._run_route_transition(
+                session_key,
+                lambda: self._get_or_create_session_impl(
+                    source, force_new=force_new
+                ),
+            )
             slot.result = result
             return result
         except BaseException as exc:
@@ -2549,6 +2790,23 @@ class SessionStore:
                             _reset_reason = "resume_pending_expired"
             else:
                 _reset_reason = self._should_reset(_entry_for_checks, source)
+
+        # The per-key route-transition reservation is held across this entire
+        # implementation, including the lock-free teardown wait and Phase 3
+        # persistence. Revalidate the exact route under ``_lock``, then release
+        # that lock before bounded CUA I/O; reset/switch/compression writers for
+        # this key cannot cross the reservation.
+        if _reset_reason and _stale_session_id:
+            with self._lock:
+                current = self._entries.get(session_key)
+                reset_target_is_current = (
+                    current is not None
+                    and current.session_id == _stale_session_id
+                )
+            if reset_target_is_current:
+                self._arm_route_terminal_transition(
+                    session_key, _stale_session_id, _reset_reason
+                )
 
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
@@ -2689,13 +2947,19 @@ class SessionStore:
                     "profile_name": source.profile,
                 }
 
+        terminal_route_transition = (
+            session_key in self._route_terminal_transitions
+        )
         if _needs_save:
             if _metadata_only_save:
                 self._save_entry(session_key)
             else:
-                self._save_entries()
+                if terminal_route_transition:
+                    self._save_entries(require_primary_db=True)
+                else:
+                    self._save_entries()
 
-        # SQLite operations outside the lock (unchanged).
+        # SQLite operations outside the lock. Terminal transitions fail closed
         if self._db and db_end_session_id:
             # Use the specific reset reason so state.db is auditable (e.g.
             # "resume_pending_expired" is distinguishable from a normal
@@ -2713,6 +2977,10 @@ class SessionStore:
                 else:
                     self._db.end_session(db_end_session_id, _db_end_reason)
             except Exception as e:
+                if terminal_route_transition:
+                    raise RuntimeError(
+                        "terminal transition could not close prior SQLite session"
+                    ) from e
                 logger.debug("Session DB operation failed: %s", e)
 
         if self._db and db_create_kwargs:
@@ -2725,6 +2993,10 @@ class SessionStore:
                     display_name=entry.display_name,
                 )
             except Exception as e:
+                if terminal_route_transition:
+                    raise RuntimeError(
+                        "terminal transition could not create replacement SQLite session"
+                    ) from e
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
         return entry
@@ -3053,7 +3325,10 @@ class SessionStore:
 
         with self._lock:
             self._ensure_loaded_locked()
+            active_transitions = getattr(self, "_active_route_transitions", set())
             for key, entry in list(self._entries.items()):
+                if key in active_transitions:
+                    continue
                 if entry.suspended:
                     continue
                 # Never prune sessions with an active background process
@@ -3113,7 +3388,53 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+    def reset_session(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        reset_reason: str = "session_reset",
+        expected_session_id: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
+        """Force reset a session under the shared per-key transition fence."""
+        return self._run_route_transition(
+            session_key,
+            lambda: self._reset_session_impl(
+                session_key,
+                display_name,
+                reset_reason,
+                expected_session_id,
+            ),
+        )
+
+    def _reset_session_impl(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+        reset_reason: str = "session_reset",
+        expected_session_id: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            if (
+                expected_session_id is not None
+                and entry.session_id != expected_session_id
+            ):
+                return None
+            terminal_session_id = entry.session_id
+
+        self._arm_route_terminal_transition(
+            session_key, terminal_session_id, reset_reason
+        )
+        return self._apply_reset_session_impl(session_key, display_name)
+
+    def _apply_reset_session_impl(
+        self,
+        session_key: str,
+        display_name: Optional[str] = None,
+    ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -3144,7 +3465,7 @@ class SessionStore:
             )
 
             self._entries[session_key] = new_entry
-            self._save()
+            self._save(require_primary_db=True)
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
@@ -3168,7 +3489,9 @@ class SessionStore:
                 else:
                     self._db.end_session(db_end_session_id, "session_reset")
             except Exception as e:
-                logger.debug("Session DB operation failed: %s", e)
+                raise RuntimeError(
+                    "terminal reset could not close prior SQLite session"
+                ) from e
 
         if self._db and db_create_kwargs:
             try:
@@ -3180,7 +3503,9 @@ class SessionStore:
                     display_name=new_entry.display_name if new_entry else None,
                 )
             except Exception as e:
-                logger.debug("Session DB operation failed: %s", e)
+                raise RuntimeError(
+                    "terminal reset could not create replacement SQLite session"
+                ) from e
 
         return new_entry
 
@@ -3190,14 +3515,22 @@ class SessionStore:
         expected_session_id: str,
         target_session_id: str,
     ) -> Optional[SessionEntry]:
-        """CAS-advance one route along an already-verified compression lineage.
+        return self._run_route_transition(
+            session_key,
+            lambda: self._advance_compression_session_impl(
+                session_key,
+                expected_session_id,
+                target_session_id,
+            ),
+        )
 
-        Unlike ``switch_session``, this does not end or reopen SQLite rows. The
-        compression transaction already owns that lifecycle; this method only
-        repairs the persisted gateway key→session mapping. Returning ``None``
-        means the route moved after the caller's snapshot (for example /new),
-        so the caller must fail closed instead of overwriting the newer route.
-        """
+    def _advance_compression_session_impl(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
+        """CAS-advance one route along an already-verified compression lineage."""
         if not session_key or not expected_session_id or not target_session_id:
             return None
 
@@ -3210,17 +3543,41 @@ class SessionStore:
                 return entry
             if entry.session_id != expected_session_id:
                 return None
+
+        self._arm_route_terminal_transition(
+            session_key,
+            expected_session_id,
+            "compression_advance",
+        )
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None or entry.session_id != expected_session_id:
+                raise RuntimeError("compression route changed inside terminal boundary")
             if not self._heal_compression_tip_locked(
                 entry,
                 expected_session_id,
                 target_session_id,
             ):
-                return None
+                raise RuntimeError("compression route advance failed ownership check")
             entry.updated_at = _now()
-            self._save()
-            return entry
+        self._save_entries(require_primary_db=True)
+        return entry
 
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self,
+        session_key: str,
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
+        return self._run_route_transition(
+            session_key,
+            lambda: self._switch_session_impl(session_key, target_session_id),
+        )
+
+    def _switch_session_impl(
+        self,
+        session_key: str,
+        target_session_id: str,
+    ) -> Optional[SessionEntry]:
         """Switch a session key to point at an existing session ID.
 
         Used by ``/resume`` to restore a previously-named session.
@@ -3229,23 +3586,26 @@ class SessionStore:
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
         """
-        db_end_session_id = None
-        new_entry = None
-
         with self._lock:
             self._ensure_loaded_locked()
-
-            if session_key not in self._entries:
+            old_entry = self._entries.get(session_key)
+            if old_entry is None:
                 return None
-
-            old_entry = self._entries[session_key]
-
-            # Don't switch if already on that session
             if old_entry.session_id == target_session_id:
                 return old_entry
-
             db_end_session_id = old_entry.session_id
+            old_entry_data = old_entry.to_dict()
 
+        self._arm_route_terminal_transition(
+            session_key,
+            db_end_session_id,
+            "session_switch",
+        )
+        with self._lock:
+            current = self._entries.get(session_key)
+            if current is None or current.session_id != db_end_session_id:
+                raise RuntimeError("session switch route changed inside terminal boundary")
+            old_entry = SessionEntry.from_dict(old_entry_data)
             now = _now()
             new_entry = SessionEntry(
                 session_key=session_key,
@@ -3257,36 +3617,28 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
             )
-
             self._entries[session_key] = new_entry
-            self._save()
+        self._save_entries(require_primary_db=True)
 
-        if self._db and db_end_session_id:
+        if self._db:
             try:
-                # Promote (not plain end_session): a stale agent_close /
-                # ws_orphan_reap end on the outgoing session must be upgraded
-                # to the explicit switch boundary, or recovery can resurrect
-                # it over the user's /resume choice (#61220 bug class).
                 _promote = getattr(self._db, "promote_to_session_reset", None)
                 if callable(_promote):
                     _promote(db_end_session_id, "session_switch")
                 else:
                     self._db.end_session(db_end_session_id, "session_switch")
-            except Exception as e:
-                logger.debug("Session DB end_session failed: %s", e)
-
-        if self._db:
-            try:
                 self._db.reopen_session(target_session_id)
-            except Exception as e:
-                logger.debug("Session DB reopen_session failed: %s", e)
-            self._record_gateway_session_peer(
-                target_session_id,
-                session_key,
-                new_entry.origin if new_entry else None,
-                display_name=new_entry.display_name if new_entry else None,
-                include_compression_ancestors=True,
-            )
+                self._record_gateway_session_peer(
+                    target_session_id,
+                    session_key,
+                    new_entry.origin,
+                    display_name=new_entry.display_name,
+                    include_compression_ancestors=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "terminal session switch SQLite publication failed"
+                ) from exc
 
         return new_entry
 

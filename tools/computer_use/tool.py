@@ -199,6 +199,24 @@ class ComputerUseReleaseResult:
         return self.released
 
 
+@dataclass(frozen=True)
+class ComputerUseTerminalTransition:
+    session_id: str
+    generation: Optional[int]
+    invalidated_publications: tuple["ComputerUseSessionPublication", ...] = ()
+
+
+@dataclass(frozen=True)
+class ComputerUseSessionReactivation:
+    session_id: str
+
+
+@dataclass(eq=False)
+class ComputerUseSessionPublication:
+    session_id: str
+    active: bool = True
+
+
 @dataclass
 class _BackendRecord:
     session_id: str
@@ -214,10 +232,20 @@ class _BackendRecord:
 
 
 _backend_records: Dict[str, _BackendRecord] = {}
+_terminal_transitions: Dict[str, ComputerUseTerminalTransition] = {}
+_session_reactivations: Dict[str, ComputerUseSessionReactivation] = {}
+_managed_session_publications: Dict[
+    str, set[ComputerUseSessionPublication]
+] = {}
+_managed_routing_enabled = False
+_managed_session_validator = None
+_session_route_epoch_sequence = 0
+_backend_lookup_state = threading.local()
 _backend_generation_counters: OrderedDict[str, int] = OrderedDict()
 _backend_generation_sequence = 0
 _BACKEND_GENERATION_TOMBSTONE_CAP = 4096
 _DEFAULT_RELEASE_TIMEOUT = 5.0
+_EXPECTED_GENERATION_UNSET = object()
 
 
 def _next_backend_generation_locked(sid: str) -> int:
@@ -236,6 +264,20 @@ def _next_backend_generation_locked(sid: str) -> int:
             # generations rather than corrupting ownership or looping forever.
             break
     return generation
+
+
+def _stamp_backend_lookup_locked(
+    sid: str,
+    backend: ComputerUseBackend,
+    *,
+    route_allowed: bool,
+) -> None:
+    _backend_lookup_state.value = (
+        sid,
+        id(backend),
+        _session_route_epoch_sequence,
+        route_allowed,
+    )
 
 
 def _record_from_legacy_cache_locked(sid: str) -> Optional[_BackendRecord]:
@@ -261,6 +303,75 @@ def _record_from_legacy_cache_locked(sid: str) -> Optional[_BackendRecord]:
     return record
 
 
+def _has_active_publication_locked(sid: str) -> bool:
+    return any(
+        publication.active
+        for publication in _managed_session_publications.get(sid, ())
+    )
+
+
+def set_computer_use_session_validator(validator) -> None:
+    """Install the gateway's authoritative current-route validator."""
+    global _managed_routing_enabled, _managed_session_validator
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        _managed_session_validator = validator
+        _managed_routing_enabled = validator is not None
+        _session_route_epoch_sequence += 1
+
+
+def _validate_managed_publication(sid: str) -> tuple[bool, int]:
+    """Validate without lock inversion, retrying across route-epoch changes."""
+    while True:
+        with _backend_lock:
+            epoch = _session_route_epoch_sequence
+            if not sid or not _managed_routing_enabled:
+                return True, epoch
+            if _has_active_publication_locked(sid):
+                return True, epoch
+            validator = _managed_session_validator
+        try:
+            allowed = bool(validator(sid)) if callable(validator) else False
+        except Exception:
+            allowed = False
+        with _backend_lock:
+            if epoch == _session_route_epoch_sequence:
+                return allowed, epoch
+
+
+def publish_computer_use_session(
+    session_id: str,
+) -> ComputerUseSessionPublication:
+    """Publish one run-scoped gateway route lease for CUA acquisition."""
+    global _managed_routing_enabled
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("managed computer_use publication requires a session id")
+    with _backend_lock:
+        _managed_routing_enabled = True
+        if sid in _terminal_transitions or sid in _session_reactivations:
+            raise RuntimeError(
+                f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+            )
+        publication = ComputerUseSessionPublication(session_id=sid)
+        _managed_session_publications.setdefault(sid, set()).add(publication)
+        return publication
+
+
+def unpublish_computer_use_session(
+    publication: ComputerUseSessionPublication,
+) -> None:
+    """Release one exact run-scoped publication and reclaim its map entry."""
+    with _backend_lock:
+        publications = _managed_session_publications.get(publication.session_id)
+        if publications is None or publication not in publications:
+            raise RuntimeError("computer_use session publication token mismatch")
+        publications.remove(publication)
+        publication.active = False
+        if not publications:
+            _managed_session_publications.pop(publication.session_id, None)
+
+
 def get_computer_use_session_generation(session_id: str) -> Optional[int]:
     sid = str(session_id or "")
     if not sid:
@@ -268,6 +379,112 @@ def get_computer_use_session_generation(session_id: str) -> Optional[int]:
     with _backend_lock:
         record = _record_from_legacy_cache_locked(sid)
         return record.generation if record is not None else None
+
+
+def begin_computer_use_terminal_transition(
+    session_id: str,
+) -> ComputerUseTerminalTransition:
+    """Fence one session ID against CUA acquisition through route publication."""
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("terminal computer_use transition requires a session id")
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        if sid in _terminal_transitions or sid in _session_reactivations:
+            raise RuntimeError(
+                f"computer_use backend for session {sid!r} already has a lifecycle transition"
+            )
+        _session_route_epoch_sequence += 1
+        invalidated_publications = tuple(
+            publication
+            for publication in _managed_session_publications.get(sid, ())
+            if publication.active
+        )
+        for publication in invalidated_publications:
+            publication.active = False
+        record = _record_from_legacy_cache_locked(sid)
+        token = ComputerUseTerminalTransition(
+            session_id=sid,
+            generation=record.generation if record is not None else None,
+            invalidated_publications=invalidated_publications,
+        )
+        _terminal_transitions[sid] = token
+        return token
+
+
+def end_computer_use_terminal_transition(
+    transition: ComputerUseTerminalTransition,
+    *,
+    retire: bool = False,
+) -> None:
+    """Remove one exact fence after confirmed route publication."""
+    global _managed_routing_enabled, _session_route_epoch_sequence
+    with _backend_lock:
+        current = _terminal_transitions.get(transition.session_id)
+        if current is not transition:
+            raise RuntimeError("computer_use terminal transition token mismatch")
+        _terminal_transitions.pop(transition.session_id, None)
+        _session_route_epoch_sequence += 1
+        if retire:
+            _managed_routing_enabled = True
+        else:
+            publications = _managed_session_publications.get(
+                transition.session_id,
+                set(),
+            )
+            for publication in transition.invalidated_publications:
+                if publication in publications:
+                    publication.active = True
+
+
+def is_computer_use_session_retired(session_id: str) -> bool:
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    with _backend_lock:
+        return _managed_routing_enabled and not _has_active_publication_locked(sid)
+
+
+def begin_computer_use_session_reactivation(
+    session_id: str,
+) -> ComputerUseSessionReactivation:
+    """Fence and re-arm one explicitly republished historical route ID."""
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("computer_use reactivation requires a session id")
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        if _has_active_publication_locked(sid):
+            raise RuntimeError(
+                f"computer_use session {sid!r} is already published"
+            )
+        if sid in _terminal_transitions or sid in _session_reactivations:
+            raise RuntimeError(
+                f"computer_use session {sid!r} already has a lifecycle fence"
+            )
+        if _record_from_legacy_cache_locked(sid) is not None:
+            raise RuntimeError(
+                f"computer_use retired session {sid!r} still owns a backend"
+            )
+        token = ComputerUseSessionReactivation(session_id=sid)
+        _session_route_epoch_sequence += 1
+        _session_reactivations[sid] = token
+        return token
+
+
+def end_computer_use_session_reactivation(
+    reactivation: ComputerUseSessionReactivation,
+    *,
+    succeeded: bool,
+) -> None:
+    """Finish one exact reactivation fence or restore retirement on failure."""
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        current = _session_reactivations.get(reactivation.session_id)
+        if current is not reactivation:
+            raise RuntimeError("computer_use session reactivation token mismatch")
+        _session_reactivations.pop(reactivation.session_id, None)
+        _session_route_epoch_sequence += 1
 
 
 def computer_use_lifecycle_snapshot() -> Dict[str, Dict[str, Any]]:
@@ -601,7 +818,18 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
     sid = str(session_id or "")
     while True:
         release_generation: Optional[int] = None
+        route_allowed, route_epoch = _validate_managed_publication(sid)
         with _backend_lock:
+            if route_epoch != _session_route_epoch_sequence:
+                continue
+            if sid in _terminal_transitions or sid in _session_reactivations:
+                raise RuntimeError(
+                    f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+                )
+            if not route_allowed:
+                raise RuntimeError(
+                    f"computer_use backend for retired or unpublished session {sid!r} is unavailable"
+                )
             permission_mode = _cua_permission_mode(sid)
             if sid == "" and _backend is not None and sid not in _backends:
                 _backends[sid] = _backend
@@ -611,6 +839,11 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
             if record is not None:
                 if record.state == BackendLifecycleState.ACTIVE:
                     if record.permission_mode == permission_mode:
+                        _stamp_backend_lookup_locked(
+                            sid,
+                            record.backend,
+                            route_allowed=route_allowed,
+                        )
                         return record.backend
                     release_generation = record.generation
                 elif record.state == BackendLifecycleState.CLOSING:
@@ -687,6 +920,11 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                     sid,
                     record.generation,
                 )
+                _stamp_backend_lookup_locked(
+                    sid,
+                    backend,
+                    route_allowed=route_allowed,
+                )
                 return backend
 
         # Permission-mode changes are hard lifecycle boundaries. The exact
@@ -714,6 +952,18 @@ def _acquire_backend_for_call(
     sid = str(session_id or "")
     for _ in range(3):
         backend = _get_backend(session_id=sid)
+        lookup = getattr(_backend_lookup_state, "value", None)
+        expected_route_epoch = (
+            lookup[2]
+            if (
+                isinstance(lookup, tuple)
+                and len(lookup) == 4
+                and lookup[0] == sid
+                and lookup[1] == id(backend)
+                and lookup[3] is True
+            )
+            else None
+        )
         with _backend_lock:
             record = _record_from_legacy_cache_locked(sid)
             if record is None and sid == "":
@@ -736,18 +986,42 @@ def _acquire_backend_for_call(
                 _backend_permission_modes[sid] = record.permission_mode
                 _backend = backend
             if record is None or record.backend is not backend:
+                if (
+                    expected_route_epoch is not None
+                    and expected_route_epoch != _session_route_epoch_sequence
+                ):
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} changed while acquiring action lease"
+                    )
                 continue
             call_lock = record.call_lock
         call_lock.acquire()
         with _backend_lock:
             current = _backend_records.get(sid)
+            current_route_epoch = _session_route_epoch_sequence
             if (
                 current is record
                 and current.backend is backend
                 and current.state == BackendLifecycleState.ACTIVE
+                and sid not in _terminal_transitions
+                and sid not in _session_reactivations
+                and (
+                    not sid
+                    or (
+                        expected_route_epoch is not None
+                        and expected_route_epoch == current_route_epoch
+                    )
+                )
             ):
                 return backend, call_lock
         call_lock.release()
+        if (
+            expected_route_epoch is not None
+            and expected_route_epoch != current_route_epoch
+        ):
+            raise RuntimeError(
+                f"computer_use backend for session {sid!r} changed while acquiring action lease"
+            )
     raise RuntimeError(
         f"computer_use backend for session {sid!r} changed while acquiring action lease"
     )
@@ -756,19 +1030,37 @@ def _acquire_backend_for_call(
 def release_computer_use_session_result(
     session_id: str,
     *,
-    expected_generation: Optional[int] = None,
+    expected_generation: Any = _EXPECTED_GENERATION_UNSET,
     timeout: float = _DEFAULT_RELEASE_TIMEOUT,
     reason: str = "explicit",
     allow_empty_session: bool = False,
 ) -> ComputerUseReleaseResult:
-    """Close one exact backend generation with bounded, truthful lifecycle state."""
+    """Close one exact backend generation with bounded, truthful lifecycle state.
+
+    Omitting ``expected_generation`` preserves the historical public call shape,
+    but it never authorizes wildcard teardown: the exact active generation is
+    snapshotted under ``_backend_lock``. Passing ``None`` explicitly remains an
+    invalid generation.
+    """
     global _backend
     sid = str(session_id or "")
     started = time.monotonic()
-    if not sid and not allow_empty_session:
+    generation_omitted = expected_generation is _EXPECTED_GENERATION_UNSET
+    if (
+        not generation_omitted
+        and (type(expected_generation) is not int or expected_generation <= 0)
+    ):
         return ComputerUseReleaseResult(
             session_id=sid,
             generation=expected_generation,
+            status="mismatch",
+            reason=reason,
+            error="expected_generation must be a positive integer",
+        )
+    if not sid and not allow_empty_session:
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=None if generation_omitted else expected_generation,
             status="mismatch",
             reason=reason,
             error="empty session id rejected",
@@ -776,6 +1068,15 @@ def release_computer_use_session_result(
 
     with _backend_lock:
         record = _record_from_legacy_cache_locked(sid)
+        if generation_omitted:
+            if record is None:
+                return ComputerUseReleaseResult(
+                    session_id=sid,
+                    generation=None,
+                    status="already_absent",
+                    reason=reason,
+                )
+            expected_generation = record.generation
         if record is None:
             last_generation = _backend_generation_counters.get(sid)
             idempotent_absence = (
@@ -901,7 +1202,7 @@ def release_computer_use_session_result(
 def _release_computer_use_session_with_retries(
     session_id: str,
     *,
-    expected_generation: Optional[int],
+    expected_generation: int,
     timeout: float,
     reason: str,
     allow_empty_session: bool,
@@ -927,9 +1228,16 @@ def _release_computer_use_session_with_retries(
 
 
 def release_computer_use_session(session_id: str) -> bool:
-    """Backward-compatible bool adapter for explicit session teardown."""
+    """Backward-compatible bool adapter that snapshots one exact generation."""
+    sid = str(session_id or "")
+    with _backend_lock:
+        record = _record_from_legacy_cache_locked(sid)
+        if record is None:
+            return False
+        generation = record.generation
     result = release_computer_use_session_result(
-        session_id,
+        sid,
+        expected_generation=generation,
         timeout=_DEFAULT_RELEASE_TIMEOUT,
         reason="explicit",
         allow_empty_session=True,
@@ -940,13 +1248,15 @@ def release_computer_use_session(session_id: str) -> bool:
 def submit_computer_use_session_release(
     session_id: str,
     *,
-    expected_generation: Optional[int],
+    expected_generation: int,
     timeout: float = _DEFAULT_RELEASE_TIMEOUT,
     reason: str,
     max_attempts: int = 3,
     retry_delay: float = 0.1,
 ) -> concurrent.futures.Future:
     """Submit one exact generation close to the bounded cleanup supervisor."""
+    if type(expected_generation) is not int or expected_generation <= 0:
+        raise ValueError("expected_generation must be a positive integer")
     return _cleanup_supervisor.submit(
         session_id,
         expected_generation=expected_generation,
@@ -1022,6 +1332,8 @@ atexit.register(_finalize_computer_use_atexit)
 def reset_backend_for_tests() -> None:  # pragma: no cover
     """Test helper — tear down cached backends and reset lifecycle state."""
     global _backend, _backend_generation_sequence
+    global _managed_routing_enabled, _managed_session_validator
+    global _session_route_epoch_sequence
     _shutdown_backend_atexit()
     with _backend_lock:
         _backend = None
@@ -1029,6 +1341,12 @@ def reset_backend_for_tests() -> None:  # pragma: no cover
         _backend_call_locks.clear()
         _backend_permission_modes.clear()
         _backend_records.clear()
+        _terminal_transitions.clear()
+        _session_reactivations.clear()
+        _managed_session_publications.clear()
+        _managed_routing_enabled = False
+        _managed_session_validator = None
+        _session_route_epoch_sequence = 0
         _backend_generation_counters.clear()
         _backend_generation_sequence = 0
     with _approval_lock:

@@ -77,6 +77,10 @@ def test_auto_reset_cleanup_evicts_cached_agent():
                 "context_compressor._previous_summary into new compaction "
                 "summaries (#10710)."
             )
+            assert "_release_terminal_computer_use" not in calls, (
+                "auto-reset CUA release must happen inside SessionStore's single-flight "
+                "pre-rotation boundary, not after the replacement was published"
+            )
             found = True
             break
     assert found, (

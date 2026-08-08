@@ -1243,6 +1243,479 @@ class TestLastPromptTokens:
         assert entry.last_prompt_tokens == 50000  # unchanged
 
 
+class TestAutoResetPreRotationBoundary:
+    @staticmethod
+    def _source():
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="auto-reset-chat",
+            user_id="auto-reset-user",
+            chat_type="dm",
+        )
+
+    @staticmethod
+    def _store(tmp_path, callback):
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=callback,
+        )
+        store._db = None
+        source = TestAutoResetPreRotationBoundary._source()
+        original = store.get_or_create_session(source)
+        original.suspended = True
+        store._save_entries()
+        db = MagicMock()
+        store._db = db
+        store._compression_tip_for_session_id = MagicMock(
+            return_value=original.session_id
+        )
+        store._is_session_ended_in_db = MagicMock(return_value=False)
+        return store, source, original, db
+
+    def test_auto_reset_confirms_boundary_before_publish_and_db_transition(
+        self, tmp_path
+    ):
+        observed = []
+        holder = {}
+
+        def before_reset(session_id, reason):
+            store = holder["store"]
+            original = holder["original"]
+            observed.append((session_id, reason))
+            assert store._entries[original.session_key] is original
+            assert store._entries[original.session_key].session_id == session_id
+            holder["db"].promote_to_session_reset.assert_not_called()
+            holder["db"].create_session.assert_not_called()
+
+        store, source, original, db = self._store(tmp_path, before_reset)
+        holder.update(store=store, original=original, db=db)
+
+        replacement = store.get_or_create_session(source)
+
+        assert observed == [(original.session_id, "suspended")]
+        assert replacement.session_id != original.session_id
+        assert store._entries[original.session_key] is replacement
+        db.promote_to_session_reset.assert_called_once_with(
+            original.session_id, "suspended"
+        )
+        db.create_session.assert_called_once()
+
+    def test_auto_reset_release_failure_keeps_old_route_and_persistence(
+        self, tmp_path
+    ):
+        def before_reset(session_id, reason):
+            raise RuntimeError("exact CUA release failed")
+
+        store, source, original, db = self._store(tmp_path, before_reset)
+        sessions_file = tmp_path / "sessions.json"
+        before_json = sessions_file.read_text(encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="exact CUA release failed"):
+            store.get_or_create_session(source)
+
+        assert store._entries[original.session_key] is original
+        assert store._entries[original.session_key].session_id == original.session_id
+        assert sessions_file.read_text(encoding="utf-8") == before_json
+        db.promote_to_session_reset.assert_not_called()
+        db.end_session.assert_not_called()
+        db.create_session.assert_not_called()
+
+    def test_same_session_id_rebound_entry_cannot_bypass_pre_release(self, tmp_path):
+        import copy
+
+        events = []
+
+        def before_auto_reset(session_id, reason):
+            events.append((session_id, reason))
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=before_auto_reset,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        original.suspended = True
+
+        def rebind_same_id_then_reset(entry, _source):
+            rebound = copy.deepcopy(entry)
+            with store._lock:
+                store._entries[entry.session_key] = rebound
+            return "suspended"
+
+        store._should_reset = rebind_same_id_then_reset
+        replacement = store.get_or_create_session(source)
+
+        assert events == [(original.session_id, "suspended")]
+        assert replacement.session_id != original.session_id
+        assert replacement.prev_session_id == original.session_id
+
+    def test_auto_reset_releases_terminal_admission_after_publication(self, tmp_path):
+        token = object()
+        events = []
+
+        def before_terminal_reset(session_id, reason):
+            events.append(("begin", session_id, reason))
+            return token
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=before_terminal_reset,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        original.suspended = True
+
+        def after_terminal_reset(session_id, transition, succeeded):
+            current = store._entries[original.session_key]
+            events.append(
+                ("end", session_id, transition, succeeded, current.session_id)
+            )
+
+        store._after_auto_reset_fn = after_terminal_reset
+        replacement = store.get_or_create_session(source)
+
+        assert events == [
+            ("begin", original.session_id, "suspended"),
+            ("end", original.session_id, token, True, replacement.session_id),
+        ]
+
+    def test_explicit_reset_owns_pre_release_and_route_replacement_fence(
+        self, tmp_path
+    ):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        release_started = threading.Event()
+        allow_release = threading.Event()
+        events = []
+
+        def before_terminal_reset(session_id, reason):
+            events.append(("before", session_id, reason))
+            release_started.set()
+            assert allow_release.wait(timeout=2)
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=before_terminal_reset,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reset = pool.submit(
+                store.reset_session,
+                original.session_key,
+                None,
+                "session_reset",
+            )
+            assert release_started.wait(timeout=1)
+            switch = pool.submit(
+                store.switch_session,
+                original.session_key,
+                "concurrent-target",
+            )
+            time.sleep(0.05)
+            assert not switch.done()
+            allow_release.set()
+            replacement = reset.result(timeout=2)
+            switched = switch.result(timeout=2)
+
+        assert events == [
+            ("before", original.session_id, "session_reset"),
+            ("before", replacement.session_id, "session_switch"),
+        ]
+        assert replacement.session_id != original.session_id
+        assert switched.session_id == "concurrent-target"
+
+    def test_explicit_reset_releases_terminal_admission_after_publication(
+        self, tmp_path
+    ):
+        token = object()
+        events = []
+        store = None
+
+        def before_terminal_reset(session_id, reason):
+            events.append(("begin", session_id, reason))
+            return token
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=before_terminal_reset,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+
+        def after_terminal_reset(session_id, transition, succeeded):
+            current = store._entries[original.session_key]
+            events.append(
+                (
+                    "end",
+                    session_id,
+                    transition,
+                    succeeded,
+                    current.session_id,
+                )
+            )
+
+        store._after_auto_reset_fn = after_terminal_reset
+        replacement = store.reset_session(
+            original.session_key,
+            reset_reason="compression_exhausted",
+        )
+
+        assert events == [
+            ("begin", original.session_id, "compression_exhausted"),
+            (
+                "end",
+                original.session_id,
+                token,
+                True,
+                replacement.session_id,
+            ),
+        ]
+
+    @pytest.mark.parametrize(
+        ("transition", "reason"),
+        [
+            ("switch", "session_switch"),
+            ("advance", "compression_advance"),
+        ],
+    )
+    def test_route_replacement_paths_own_terminal_boundary(
+        self, tmp_path, transition, reason
+    ):
+        token = object()
+        events = []
+
+        def begin(session_id, actual_reason):
+            events.append(("begin", session_id, actual_reason))
+            return token
+
+        def before_complete(session_id, actual_token, session_key):
+            events.append(("complete", session_id, actual_token, session_key))
+
+        def end(session_id, actual_token, succeeded):
+            events.append(("end", session_id, actual_token, succeeded))
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=begin,
+            before_terminal_completion_fn=before_complete,
+            after_auto_reset_fn=end,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        old_session_id = original.session_id
+        target = "replacement-route-session"
+
+        if transition == "switch":
+            replacement = store.switch_session(original.session_key, target)
+        else:
+            def heal(entry, _expected, replacement_id):
+                entry.session_id = replacement_id
+                return True
+
+            store._heal_compression_tip_locked = MagicMock(side_effect=heal)
+            replacement = store.advance_compression_session(
+                original.session_key,
+                original.session_id,
+                target,
+            )
+
+        assert replacement.session_id == target
+        assert events == [
+            ("begin", old_session_id, reason),
+            ("complete", old_session_id, token, original.session_key),
+            ("end", old_session_id, token, True),
+        ]
+
+    def test_terminal_completion_failure_rolls_back_marked_route_for_retry(
+        self, tmp_path
+    ):
+        token = object()
+        completions = []
+
+        def fail_completion(session_id, transition, session_key):
+            completions.append((session_id, transition, session_key))
+            raise RuntimeError("route-keyed cleanup failed")
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=lambda _sid, _reason: token,
+            before_terminal_completion_fn=fail_completion,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+
+        with pytest.raises(RuntimeError, match="route-keyed cleanup failed"):
+            store.reset_session(
+                original.session_key,
+                reset_reason="session_expired",
+            )
+
+        retained = store._entries[original.session_key]
+        assert retained.session_id == original.session_id
+        assert retained.metadata.get("terminal_transition")
+        assert store._retained_terminal_transitions[original.session_key].callback_token is token
+        assert completions == [
+            (original.session_id, token, original.session_key)
+        ]
+
+        store._before_terminal_completion_fn = None
+        replacement = store.reset_session(
+            original.session_key,
+            reset_reason="terminal_transition_recovery",
+        )
+        assert replacement.session_id != original.session_id
+
+    def test_durable_terminal_marker_forces_reset_after_restart(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        original.metadata["terminal_transition"] = {
+            "session_id": original.session_id,
+            "reason": "session_reset",
+            "token": "crash-recovery-token",
+        }
+        store._save_entries()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        restarted._db = None
+        replacement = restarted.get_or_create_session(source)
+
+        assert replacement.session_id != original.session_id
+        assert replacement.auto_reset_reason == "terminal_transition_recovery"
+        assert "terminal_transition" not in replacement.metadata
+
+    def test_expiry_reset_cas_does_not_rotate_newer_route(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        current = store.get_or_create_session(source)
+
+        result = store.reset_session(
+            current.session_key,
+            reset_reason="session_expired",
+            expected_session_id="stale-expiry-snapshot",
+        )
+
+        assert result is None
+        assert store._entries[current.session_key].session_id == current.session_id
+
+    @pytest.mark.parametrize("mutator", ["reset", "switch", "advance"])
+    def test_concurrent_route_mutation_cannot_cross_pre_release_boundary(
+        self, tmp_path, mutator
+    ):
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        release_started = threading.Event()
+        allow_release = threading.Event()
+
+        def before_auto_reset(_session_id, _reason):
+            release_started.set()
+            assert allow_release.wait(timeout=2)
+
+        store = SessionStore(
+            sessions_dir=tmp_path,
+            config=GatewayConfig(),
+            before_auto_reset_fn=before_auto_reset,
+        )
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        original.suspended = True
+
+        target_session_id = "reserved-target-session"
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            auto_reset = pool.submit(store.get_or_create_session, source)
+            assert release_started.wait(timeout=1)
+            if mutator == "reset":
+                competing = pool.submit(store.reset_session, original.session_key)
+            elif mutator == "switch":
+                competing = pool.submit(
+                    store.switch_session,
+                    original.session_key,
+                    target_session_id,
+                )
+            else:
+                competing = pool.submit(
+                    store.advance_compression_session,
+                    original.session_key,
+                    original.session_id,
+                    target_session_id,
+                )
+            time.sleep(0.05)
+            assert not competing.done(), (
+                f"{mutator} crossed the terminal pre-release boundary"
+            )
+            allow_release.set()
+            auto_entry = auto_reset.result(timeout=2)
+            competing_result = competing.result(timeout=2)
+
+        assert auto_entry.session_id != original.session_id
+        if mutator == "reset":
+            assert competing_result.session_id != auto_entry.session_id
+        elif mutator == "switch":
+            assert competing_result.session_id == target_session_id
+        else:
+            assert competing_result is None
+
+    def test_concurrent_auto_reset_callers_share_failed_pre_rotation_boundary(
+        self, tmp_path
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        callback_started = threading.Event()
+        allow_failure = threading.Event()
+        callback_calls = []
+
+        def before_reset(session_id, reason):
+            callback_calls.append((session_id, reason))
+            callback_started.set()
+            assert allow_failure.wait(timeout=2.0)
+            raise RuntimeError("exact CUA release failed")
+
+        store, source, original, db = self._store(tmp_path, before_reset)
+        sessions_file = tmp_path / "sessions.json"
+        before_json = sessions_file.read_text(encoding="utf-8")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(store.get_or_create_session, source)
+            assert callback_started.wait(timeout=2.0)
+            second = pool.submit(store.get_or_create_session, source)
+            assert store._entries[original.session_key] is original
+            allow_failure.set()
+            with pytest.raises(RuntimeError, match="exact CUA release failed"):
+                first.result(timeout=2.0)
+            with pytest.raises(RuntimeError, match="exact CUA release failed"):
+                second.result(timeout=2.0)
+
+        assert callback_calls == [(original.session_id, "suspended")]
+        assert store._entries[original.session_key] is original
+        assert sessions_file.read_text(encoding="utf-8") == before_json
+        db.promote_to_session_reset.assert_not_called()
+        db.end_session.assert_not_called()
+        db.create_session.assert_not_called()
+
+
 class TestSessionMetadata:
     """SessionEntry metadata should persist arbitrary lightweight state."""
 
@@ -1530,3 +2003,70 @@ class TestGatewayRoutingTable:
         restarted._db.close()
 
 
+def test_route_transition_lock_registry_reclaims_idle_keys(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = None
+
+    for index in range(512):
+        with store._route_transition_lock(f"route-key-{index}"):
+            pass
+
+    assert store._route_transition_locks == {}
+
+
+def test_route_transition_lock_reclamation_preserves_waiter_serialisation(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = None
+    key = "shared-route-key"
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    third_entered = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    release_third = threading.Event()
+    active = 0
+    max_active = 0
+    active_guard = threading.Lock()
+
+    def worker(entered, release):
+        nonlocal active, max_active
+        with store._route_transition_lock(key):
+            with active_guard:
+                active += 1
+                max_active = max(max_active, active)
+            entered.set()
+            assert release.wait(timeout=3)
+            with active_guard:
+                active -= 1
+
+    def wait_for_users(expected):
+        for _ in range(300):
+            with store._route_transition_locks_guard:
+                entry = store._route_transition_locks.get(key)
+                if entry is not None and entry.users == expected:
+                    return
+            threading.Event().wait(0.01)
+        raise AssertionError(f"route lock never reached {expected} users")
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(worker, first_entered, release_first)
+        assert first_entered.wait(timeout=1)
+        second = pool.submit(worker, second_entered, release_second)
+        wait_for_users(2)
+        release_first.set()
+        assert second_entered.wait(timeout=1)
+        third = pool.submit(worker, third_entered, release_third)
+        wait_for_users(2)
+        assert not third_entered.is_set()
+        release_second.set()
+        assert third_entered.wait(timeout=1)
+        release_third.set()
+        first.result(timeout=3)
+        second.result(timeout=3)
+        third.result(timeout=3)
+
+    assert max_active == 1
+    assert store._route_transition_locks == {}
