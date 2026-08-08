@@ -29,13 +29,13 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
     getItem: (k: string) => store.get(String(k)) ?? null,
     setItem: (k: string, v: string) => void store.set(String(k), String(v)),
     removeItem: (k: string) => void store.delete(String(k)),
-    clear: () => store.clear(),
+    clear: () => store.clear()
   }
   for (const target of [globalThis, (globalThis as any).window].filter(Boolean)) {
     Object.defineProperty(target, 'localStorage', {
       value: storage,
       configurable: true,
-      writable: true,
+      writable: true
     })
   }
 }

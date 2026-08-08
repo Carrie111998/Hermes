@@ -80,7 +80,12 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     }
 
     if (role === 'assistant') {
-      out.push({ role, text, ...(displayTimestamp && { timestamp: displayTimestamp }), ...(pending.length && { tools: pending }) })
+      out.push({
+        role,
+        text,
+        ...(displayTimestamp && { timestamp: displayTimestamp }),
+        ...(pending.length && { tools: pending })
+      })
       pending = []
     } else if (role === 'user' || role === 'system') {
       out.push({ role, text, ...(role !== 'system' && displayTimestamp && { timestamp: displayTimestamp }) })
