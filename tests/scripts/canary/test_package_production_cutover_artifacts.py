@@ -349,10 +349,20 @@ def _release(tmp_path: Path) -> Path:
         "ops/muncho/systemd/muncho-discord-connector.service.in",
         "ops/muncho/systemd/hermes-cloud-gateway.discord-connector.conf",
         "ops/muncho/systemd/discord-public-connector.json.in",
+        "gateway/canonical_writer_bootstrap.py",
+        "gateway/production_alias_projection_cutover.py",
+        "gateway/support_ops_alias_projection.py",
+        "gateway/support_ops_team_registry.py",
+        "scripts/canonical_brain_alias_projector.py",
+        "scripts/canary/production_alias_projection_cutover_entrypoint.py",
     ):
         target = release / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / relative, target)
+    interpreter = release / ".venv/bin/python"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_bytes(b"fixture-python-binary\x00")
+    interpreter.chmod(0o555)
     (release / ".codex-source-commit").write_text(REVISION + "\n", encoding="ascii")
     browser_root = PRODUCTION_RELEASE
     dependency_unsigned = {
@@ -2313,7 +2323,9 @@ def test_build_emits_six_distinct_self_contained_action_sealed_artifacts(tmp_pat
     assert manifest["release_revision"] == REVISION
     assert manifest["secret_material_recorded"] is False
     assert set(manifest["artifacts"]) == set(package.ARTIFACTS)
-    assert set(manifest["plan_bindings"]) == set(package.PLAN_BINDINGS)
+    assert set(manifest["plan_bindings"]) == set(package.PLAN_BINDINGS) | {
+        package.ALIAS_PROJECTION_BINDING
+    }
     assert len({item["sha256"] for item in manifest["artifacts"].values()}) == 6
 
     for name, actions in package.ARTIFACTS.items():
@@ -2354,6 +2366,19 @@ def test_build_emits_six_distinct_self_contained_action_sealed_artifacts(tmp_pat
             "path": artifact["path"],
             "sha256": artifact["sha256"],
         }
+
+    host_source = Path(
+        manifest["artifacts"]["production-host-activation"]["path"]
+    ).read_text(encoding="utf-8")
+    prerequisite_block = host_source.partition("PREREQUISITE_UNITS = (")[2].partition(
+        ")"
+    )[0]
+    assert "CONNECTOR_UNIT" not in prerequisite_block
+    assert "or not _stopped(_service(CONNECTOR_UNIT))" in host_source
+    assert "The Discord connector is public ingress" in host_source
+    assert host_source.index(
+        '_systemctl("start", "--", CONNECTOR_UNIT, timeout=180)'
+    ) > host_source.index("def _host_commit_boot")
 
     manifest_path = release / "ops/muncho/cutover/artifacts/manifest.json"
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o444

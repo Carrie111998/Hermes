@@ -796,6 +796,9 @@ def _terminal(plan: cutover.CutoverPlan, approval_sha256: str) -> dict:
         "host_apply_receipt_sha256": "4" * 64,
         "host_boot_commit_receipt_sha256": "5" * 64,
         "activation_commit_intent_receipt_sha256": "6" * 64,
+        "alias_projection_package_sha256": "b" * 64,
+        "alias_projection_activation_authority_sha256": "c" * 64,
+        "alias_projection_activation_receipt_sha256": "d" * 64,
         "database_postflight_receipt_sha256": "7" * 64,
         "gateway_observation_sha256": "8" * 64,
         "writer_observation_sha256": "9" * 64,
@@ -1128,6 +1131,63 @@ class _WorkflowTransport:
                 "secret_digest_recorded": False,
             }
             return _hashed(unsigned, "receipt_sha256")
+        if action == "collect-bootstrap-target":
+            assert self.legacy_terminal is not None
+            assert self.freeze is not None
+            unit_plan = {
+                "schema": owner.initial_bootstrap.unit_inputs_v4.PLAN_SCHEMA,
+                "release_revision": REVISION,
+                "plan_sha256": "3" * 64,
+                "owner_subject_sha256": self.freeze.value[
+                    "owner_subject_sha256"
+                ],
+                "owner_public_key_ed25519_hex": self.freeze.value[
+                    "owner_public_key_ed25519_hex"
+                ],
+                "owner_key_id": self.freeze.value["owner_key_id"],
+            }
+            unit_approval = {
+                "schema": owner.initial_bootstrap.unit_inputs_v4.APPROVAL_SCHEMA,
+                "release_revision": REVISION,
+                "approval_sha256": "4" * 64,
+            }
+            fixed_inputs = {
+                "schema": owner.initial_bootstrap.unit_inputs_v4.FIXED_INPUTS_SCHEMA,
+                "release_revision": REVISION,
+                "unit_input_authority_plan_sha256": "3" * 64,
+                "unit_input_authority_approval_sha256": "4" * 64,
+                "fixed_inputs_sha256": "b" * 64,
+            }
+            unsigned = {
+                "schema": owner.initial_bootstrap.HOST_RECEIPT_SCHEMA,
+                "legacy_predecessor_revision": (
+                    owner.LEGACY_F5_PREDECESSOR_REVISION
+                ),
+                "release_revision": REVISION,
+                "consumer_unit_count": 79,
+                "fixed_unit_inputs_sha256": "b" * 64,
+                "unit_input_authority": {
+                    "plan": unit_plan,
+                    "approval": unit_approval,
+                    "fixed_inputs": fixed_inputs,
+                },
+                "release_publication_receipt_sha256": "c" * 64,
+                "release_payload_tree_sha256": "d" * 64,
+                "release_consumer_set_sha256": "e" * 64,
+                "consumer_catalog_sha256": "f" * 64,
+                "immutable_unit_paths_sha256": "0" * 64,
+                "runtime_safety_plan": {
+                    "runtime_safety_plan_sha256": "1" * 64,
+                },
+                "target_active_observation": {"receipt_sha256": "2" * 64},
+                "trust_anchors": {
+                    "alias_projection_package_sha256": "b" * 64,
+                },
+                "cutover_terminal_receipt": copy.deepcopy(
+                    self.legacy_terminal
+                ),
+            }
+            return _hashed(unsigned, "receipt_sha256")
         if action == "phase-b-preflight":
             assert self.cutover_plan is not None
             return _db_receipt(
@@ -1386,6 +1446,7 @@ def test_prepare_then_resume_consumes_once_before_first_mutation(
     bridge = BridgeBootstrap()
     workspace = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=Ed25519PrivateKey.generate(),
@@ -1393,6 +1454,7 @@ def test_prepare_then_resume_consumes_once_before_first_mutation(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_boundary=boundary,
         prepare_only=True,
         transport_factory=lambda _identity: prepare_transport,
@@ -1481,7 +1543,11 @@ def test_prepare_then_resume_consumes_once_before_first_mutation(
         now_unix=NOW,
     )
 
-    assert receipt["schema"] == owner.WORKFLOW_RECEIPT_SCHEMA
+    assert (
+        receipt["schema"]
+        == owner.initial_bootstrap.TERMINAL_ENVELOPE_SCHEMA
+    )
+    assert receipt["workflow_receipt"]["schema"] == owner.WORKFLOW_RECEIPT_SCHEMA
     assert boundary.consume_calls == 1
     assert resume_transport.calls[0] == "stage-publication"
 
@@ -1528,6 +1594,7 @@ def test_resume_rejects_tampered_approval_url_before_consumption(
     boundary = Boundary()
     workspace = dict(owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=Ed25519PrivateKey.generate(),
@@ -1535,6 +1602,7 @@ def test_resume_rejects_tampered_approval_url_before_consumption(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_boundary=boundary,
         prepare_only=True,
         transport_factory=lambda _identity: _WorkflowTransport(
@@ -1607,6 +1675,7 @@ def test_stale_v2_request_blocks_before_bridge_remote_call() -> None:
 
     workspace = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=Ed25519PrivateKey.generate(),
@@ -1614,6 +1683,7 @@ def test_stale_v2_request_blocks_before_bridge_remote_call() -> None:
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_boundary=Boundary(),
         prepare_only=True,
         transport_factory=lambda _identity: _WorkflowTransport(
@@ -1680,6 +1750,7 @@ def test_prepare_rejects_non_sha256_cutover_request_id(
     ):
         owner.execute_production_cutover_workflow(
             release_revision=REVISION,
+            legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
             owner_identity=object(),
             owner_subject_sha256="a" * 64,
             private_key=Ed25519PrivateKey.generate(),
@@ -1687,6 +1758,7 @@ def test_prepare_rejects_non_sha256_cutover_request_id(
                 _isolated_canary_goal_prerequisite()
             ),
             truth_mode="start_new_truth_epoch",
+            revision_ancestry_checker=lambda _predecessor, _target: True,
             passkey_boundary=Boundary(),
             prepare_only=True,
             transport_factory=lambda _identity: _WorkflowTransport(
@@ -1763,6 +1835,7 @@ def test_workflow_order_is_fixed_and_plan_is_produced_on_host(
 
     receipt = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=key,
@@ -1770,6 +1843,7 @@ def test_workflow_order_is_fixed_and_plan_is_produced_on_host(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_proof=proof,
         transport_factory=lambda _identity: transport,
         database_recovery_gate_runner=_recovery_gate_runner,
@@ -1889,6 +1963,7 @@ def test_workflow_samples_fresh_time_at_each_long_running_gate(
     )
     receipt = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=key,
@@ -1896,6 +1971,7 @@ def test_workflow_samples_fresh_time_at_each_long_running_gate(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_proof=proof,
         transport_factory=lambda _identity: transport,
         database_recovery_gate_runner=lambda *_args: (
@@ -1929,6 +2005,7 @@ def test_workflow_blocks_before_freeze_authoring_when_recovery_gate_fails(
     ):
         owner.execute_production_cutover_workflow(
             release_revision=REVISION,
+            legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
             owner_identity=object(),
             owner_subject_sha256="a" * 64,
             private_key=Ed25519PrivateKey.generate(),
@@ -1936,6 +2013,7 @@ def test_workflow_blocks_before_freeze_authoring_when_recovery_gate_fails(
                 _isolated_canary_goal_prerequisite()
             ),
             truth_mode="start_new_truth_epoch",
+            revision_ancestry_checker=lambda _predecessor, _target: True,
             transport_factory=lambda _identity: transport,
             database_recovery_gate_runner=blocked,
             now_unix=NOW,
@@ -2018,6 +2096,7 @@ def test_workflow_stages_exact_packaged_cron_before_cutover_plan(
 
     receipt = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=key,
@@ -2025,6 +2104,7 @@ def test_workflow_stages_exact_packaged_cron_before_cutover_plan(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda _predecessor, _target: True,
         passkey_proof=proof,
         transport_factory=lambda _identity: transport,
         database_recovery_gate_runner=_recovery_gate_runner,
@@ -2229,6 +2309,7 @@ def test_failure_after_signed_freeze_invokes_abort_before_any_apply(
     with pytest.raises(RuntimeError, match="injected capture failure"):
         owner.execute_production_cutover_workflow(
             release_revision=REVISION,
+            legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
             owner_identity=object(),
             owner_subject_sha256="a" * 64,
             private_key=key,
@@ -2236,6 +2317,7 @@ def test_failure_after_signed_freeze_invokes_abort_before_any_apply(
                 _isolated_canary_goal_prerequisite()
             ),
             truth_mode="start_new_truth_epoch",
+            revision_ancestry_checker=lambda _predecessor, _target: True,
             passkey_proof=proof,
             transport_factory=lambda _identity: transport,
             database_recovery_gate_runner=_recovery_gate_runner,
@@ -2311,6 +2393,7 @@ def test_cutover_and_abort_base_failures_are_both_preserved(
     with pytest.raises(BaseExceptionGroup) as caught:
         owner.execute_production_cutover_workflow(
             release_revision=REVISION,
+            legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
             owner_identity=object(),
             owner_subject_sha256="a" * 64,
             private_key=key,
@@ -2318,6 +2401,7 @@ def test_cutover_and_abort_base_failures_are_both_preserved(
                 _isolated_canary_goal_prerequisite()
             ),
             truth_mode="start_new_truth_epoch",
+            revision_ancestry_checker=lambda _predecessor, _target: True,
             passkey_proof=proof,
             transport_factory=lambda _identity: transport,
             database_recovery_gate_runner=_recovery_gate_runner,
@@ -2366,6 +2450,7 @@ def test_cron_stage_mismatch_aborts_freeze_before_cutover_plan(
     ):
         owner.execute_production_cutover_workflow(
             release_revision=REVISION,
+            legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
             owner_identity=object(),
             owner_subject_sha256="a" * 64,
             private_key=key,
@@ -2373,6 +2458,7 @@ def test_cron_stage_mismatch_aborts_freeze_before_cutover_plan(
                 _isolated_canary_goal_prerequisite()
             ),
             truth_mode="start_new_truth_epoch",
+            revision_ancestry_checker=lambda _predecessor, _target: True,
             passkey_proof=proof,
             transport_factory=lambda _identity: transport,
             database_recovery_gate_runner=_recovery_gate_runner,

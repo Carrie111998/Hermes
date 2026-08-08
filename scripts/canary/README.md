@@ -1137,6 +1137,8 @@ and each resume reads the preceding immutable output and writes a new filename:
 python -m scripts.canary.production_cutover_owner_launcher \
   prepare-cutover \
   --revision <exact-40-character-release-sha> \
+  --legacy-predecessor-revision \
+    f5ece3598efba6635e661aaa509d783fa2d802d8 \
   --isolated-canary-goal-prerequisite \
     /absolute/owner-only/cutover/isolated-canary-prerequisite.json \
   --owner-private-key /absolute/owner-only/cutover-owner-ed25519 \
@@ -1171,6 +1173,11 @@ python -m scripts.canary.production_cutover_owner_launcher \
   --output /absolute/owner-only/cutover/05-cutover-terminal.json
 ```
 
+This bootstrap surface accepts exactly the legacy f5 predecessor above, a
+strictly newer descendant release, and the owner-selected
+`start_new_truth_epoch` decision. It has no accepted-event input and does not
+inspect authored text to infer, reseed, or classify truth.
+
 The two approvals are distinct and ordered: the legacy passkey authorizes only
 the fixed temporary approval bridge; the v2 passkey authorizes the exact
 release-bound FreezePlan and is consumed into `passkey_claim_recorded`. Never
@@ -1181,7 +1188,29 @@ old workspaces and journals remain evidence.
 The fourth resume durably produces state `cutover_staged`; it binds the final
 tail, stopped services, cron continuity, authored and staged cutover plan, and
 their receipts. The fifth resume is the only route to the fixed idempotent
-internal `converge-cutover` root action and the terminal receipt.
+internal `converge-cutover` root action. It then observes only `TARGET_ACTIVE`
+for the immutable root-owned/read-only release, proves the complete 79-unit
+catalog (18 running services, the Phase-B startup oneshot, and all 30 triggers
+enabled), and emits the terminal activation receipt plus recurrent
+predecessor-trust envelope. Bootstrap never calls or emulates the recurrent
+Stage-C `PREDECESSOR_ACTIVE` observation.
+
+That fifth resume also fails closed unless the target's signed recurrent v4
+unit-input authority is already atomically persisted as root-owned files at
+`/var/lib/muncho-production-legacy-cutover/staged/unit-input-plan.json`
+(mode `0400`), `unit-input-approval.json` (mode `0400`), and
+`production-unit-inputs.json` (mode `0444`). The packaged cutover v4 inputs
+must be the exact `project_fixed_inputs_to_cutover_v4` projection of that
+fixed document. The recurrent predecessor trust binds the persisted v4 plan,
+approval, and embedded `fixed_inputs_sha256`; the FreezePlan remains separate
+bootstrap authority and never masquerades as the recurrent unit-input plan.
+
+The public-ingress cohort is separate from the voice guard: the Discord
+connector starts post-commit before the gateway, both are public-ingress
+services, and the gateway alone is voice-protected. The 16 other long-running
+services and Phase-B oneshot are precommit; all 30 socket/timer triggers are
+disabled before commit and enabled only in the terminal target state. Caddy
+proves web ingress only and is not evidence for Discord Gateway readiness.
 
 Recovery follows that boundary. Before `cutover_staged`, the fixed internal
 `abort-freeze` may restore only the signed exact legacy/Caddy pre-state; once

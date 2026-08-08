@@ -20,6 +20,7 @@ from gateway import canonical_capability_canary_runtime as canary_runtime
 from gateway import production_cron_continuity_package
 from gateway import production_cron_cutover_runtime
 from gateway import production_cron_migration
+from gateway import production_alias_projection_cutover
 from gateway import production_owner_runtime
 from gateway.operational_edge_catalog import (
     operation_catalog,
@@ -810,10 +811,11 @@ class Services:
         )
 
     def commit_boot(self):
+        self.calls.append("commit_boot_connector")
         self.boot_enabled = True
         self.gateway = _service(
             cutover.GATEWAY_UNIT,
-            active=True,
+            active=False,
             digest=self.target_gateway_digest,
             drop_in_digest=self.target_drop_in_digest,
         )
@@ -990,6 +992,14 @@ def _freeze(
         "database_postflight": _artifact("database-postflight.sql", "3"),
         "host_activation": _artifact("activation.json", "4"),
         "host_rollback": _artifact("activation-rollback.json", "5"),
+        "alias_projection": {
+            "path": str(
+                cutover.PRODUCTION_RELEASE_BASE
+                / f"hermes-agent-{REVISION[:12]}"
+                / "ops/muncho/alias-projection/artifacts/manifest.json"
+            ),
+            "sha256": "6" * 64,
+        },
     }
     gateway_target = _service(
         cutover.GATEWAY_UNIT,
@@ -2318,12 +2328,6 @@ class Host:
 
     def start_prerequisites(self, plan):
         self.calls.append("start_prerequisites")
-        self.services.connector = _service(
-            cutover.CONNECTOR_UNIT,
-            active=True,
-            digest=self.services.target_connector_digest,
-            unit_file_state="disabled",
-        )
         return _host_receipt(
             plan,
             "muncho-production-prerequisite-services-start.v1",
@@ -2685,6 +2689,110 @@ class CronBoundary:
                 else apply_receipt["receipt_sha256"]
             ),
         )
+
+
+def _alias_receipt(
+    action: str,
+    plan,
+    *,
+    prior: str | None = None,
+    activation_authority_sha256: str | None = None,
+):
+    evidence: dict[str, Any] = {"ok": True}
+    if action == "activation":
+        evidence["activation_authority_sha256"] = (
+            activation_authority_sha256
+        )
+    unsigned = {
+        "schema": {
+            "preflight": production_alias_projection_cutover.PREFLIGHT_SCHEMA,
+            "apply": production_alias_projection_cutover.APPLY_SCHEMA,
+            "postflight": production_alias_projection_cutover.POSTFLIGHT_SCHEMA,
+            "activation": production_alias_projection_cutover.ACTIVATION_SCHEMA,
+            "rollback": production_alias_projection_cutover.ROLLBACK_SCHEMA,
+        }[action],
+        "action": action,
+        "created_at": "2027-01-15T08:00:00Z",
+        "cutover_plan_sha256": plan.sha256,
+        "package_sha256": plan.value["artifacts"]["alias_projection"][
+            "sha256"
+        ],
+        "prior_receipt_sha256": prior,
+        "evidence": evidence,
+        "provider_or_model_invoked": False,
+        "discord_delivery_attempted": False,
+        "secret_material_recorded": False,
+    }
+    return _hashed(unsigned, "receipt_sha256")
+
+
+class AliasProjectionBoundary:
+    def __init__(self, services: Services) -> None:
+        self.services = services
+        self.preflight_receipt = None
+        self.apply_receipt = None
+        self.postflight_receipt = None
+
+    def _stopped(self) -> None:
+        assert self.services.gateway.stopped
+        assert self.services.connector.stopped
+
+    def preflight(self, plan):
+        self._stopped()
+        self.preflight_receipt = _alias_receipt("preflight", plan)
+        return self.preflight_receipt
+
+    def apply(self, plan, preflight_receipt):
+        self._stopped()
+        assert preflight_receipt == self.preflight_receipt
+        self.apply_receipt = _alias_receipt(
+            "apply", plan, prior=preflight_receipt["receipt_sha256"]
+        )
+        return self.apply_receipt
+
+    def postflight(self, plan, preflight_receipt, apply_receipt):
+        self._stopped()
+        assert preflight_receipt == self.preflight_receipt
+        assert apply_receipt == self.apply_receipt
+        self.postflight_receipt = _alias_receipt(
+            "postflight", plan, prior=apply_receipt["receipt_sha256"]
+        )
+        return self.postflight_receipt
+
+    def activate(
+        self,
+        plan,
+        preflight_receipt,
+        apply_receipt,
+        postflight_receipt,
+        activation_authority,
+    ):
+        assert self.services.gateway.value["active_state"] == "active"
+        assert self.services.connector.value["active_state"] == "active"
+        assert preflight_receipt == self.preflight_receipt
+        assert apply_receipt == self.apply_receipt
+        assert postflight_receipt == self.postflight_receipt
+        return _alias_receipt(
+            "activation",
+            plan,
+            prior=postflight_receipt["receipt_sha256"],
+            activation_authority_sha256=activation_authority[
+                "authority_sha256"
+            ],
+        )
+
+    def rollback(self, plan, preflight_receipt, apply_receipt):
+        assert preflight_receipt == self.preflight_receipt
+        assert apply_receipt == self.apply_receipt
+        return _alias_receipt(
+            "rollback", plan, prior=apply_receipt["receipt_sha256"]
+        )
+
+
+def _dependencies(*args, **kwargs):
+    services = kwargs.get("services", args[0] if args else None)
+    kwargs.setdefault("alias_projection", AliasProjectionBoundary(services))
+    return cutover.CutoverDependencies(*args, **kwargs)
 
 
 def test_freeze_stops_exact_gateway_and_captures_final_append_only_tail() -> None:
@@ -3327,13 +3435,16 @@ def test_successful_cutover_preserves_full_archive_and_canonical_digest_proofs()
     _seed_cutover_passkey(journal, plan, approval)
     terminal = cutover.execute_cutover(
         plan, approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services, Snapshots(plan.final_snapshot), database, host, journal,
             Prerequisites(), nullcontext
         ),
         now_unix=NOW,
     )
     assert terminal["schema"] == cutover.TERMINAL_SCHEMA
+    assert services.calls.index("commit_boot_connector") < services.calls.index(
+        "start_gateway"
+    )
     assert terminal["rollback_used"] is False
     assert terminal["host_boot_commit_receipt_sha256"]
     assert services.gateway.value["active_state"] == "active"
@@ -3342,7 +3453,7 @@ def test_successful_cutover_preserves_full_archive_and_canonical_digest_proofs()
     assert database.calls == ["preflight", "apply", "terminal"]
     assert cutover.execute_cutover(
         plan, approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services, Snapshots(plan.final_snapshot), database, host, journal,
             Prerequisites(), nullcontext
         ),
@@ -3377,7 +3488,7 @@ def test_owner_direct_mvp_cutover_emits_truthful_non_canary_terminal() -> None:
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             database,
@@ -3424,7 +3535,7 @@ def test_cutover_apply_without_parent_freeze_intent_fails() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -3454,7 +3565,7 @@ def test_expired_claim_can_record_apply_intent_from_durable_freeze_terminal() ->
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             database,
@@ -3530,7 +3641,7 @@ def test_cutover_apply_rejects_parent_intent_bound_to_different_claim() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -3582,7 +3693,7 @@ def test_cutover_apply_rejects_durable_freeze_abort_before_mutation() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -3619,7 +3730,7 @@ def test_expired_claim_resumes_exact_cutover_after_durable_apply_intent() -> Non
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             Database(plan),
@@ -3654,7 +3765,7 @@ def test_packaged_cron_cutover_is_ordered_and_journal_authority_is_exact() -> No
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             database,
@@ -3671,6 +3782,12 @@ def test_packaged_cron_cutover_is_ordered_and_journal_authority_is_exact() -> No
     assert cron.calls == ["preflight", "apply", "postflight", "activate"]
     entries = journal.load(plan.sha256)
     events = [entry.value["event"] for entry in entries]
+    assert events.index("host_applied") < events.index(
+        "alias_projection_preflight_validated"
+    )
+    assert events.index("alias_projection_postflight_validated") < events.index(
+        "prerequisites_started"
+    )
     assert events.index("host_applied") < events.index("cron_preflight_validated")
     assert events.index("cron_postflight_validated") < events.index(
         "prerequisites_started"
@@ -3679,9 +3796,13 @@ def test_packaged_cron_cutover_is_ordered_and_journal_authority_is_exact() -> No
         "activation_commit_intent"
     )
     assert events.index("gateway_started") < events.index(
+        "alias_projection_activation_authority"
+    )
+    assert events.index("alias_projection_activated") < events.index(
         "cron_activation_authority"
     )
     assert events.index("cron_activated") < events.index("terminal")
+    assert terminal["alias_projection_activation_receipt_sha256"]
     expected_entries = {
         entry.value["event"]: entry.sha256
         for entry in entries
@@ -3711,7 +3832,7 @@ def test_packaged_cron_cutover_is_ordered_and_journal_authority_is_exact() -> No
     assert cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             database,
@@ -3737,7 +3858,7 @@ def test_legacy_cron_plan_keeps_optional_boundary_as_strict_noop() -> None:
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             Database(plan),
@@ -3769,6 +3890,13 @@ def test_packaged_cron_rollback_precedes_host_and_database_rollback() -> None:
             trace.append("host")
             return super().rollback(plan, receipt)
 
+    class TracedAlias(AliasProjectionBoundary):
+        def rollback(self, plan, preflight_receipt, apply_receipt):
+            trace.append("alias")
+            return super().rollback(
+                plan, preflight_receipt, apply_receipt
+            )
+
     database = TracedDatabase(plan)
     database.apply_override = {"archive_extended19_sha256": "f" * 64}
     cron = CronBoundary(services, trace)
@@ -3779,7 +3907,7 @@ def test_packaged_cron_rollback_precedes_host_and_database_rollback() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -3788,11 +3916,15 @@ def test_packaged_cron_rollback_precedes_host_and_database_rollback() -> None:
                 Prerequisites(),
                 nullcontext,
                 cron=cron,
+                alias_projection=TracedAlias(services),
             ),
             now_unix=NOW,
         )
-    assert trace == ["cron", "host", "database"]
+    assert trace == ["alias", "cron", "host", "database"]
     events = [entry.value["event"] for entry in journal.load(plan.sha256)]
+    assert events.index("alias_projection_rolled_back") < events.index(
+        "cron_rolled_back"
+    )
     assert events.index("cron_rolled_back") < events.index("host_rolled_back")
     assert events.index("host_rolled_back") < events.index("database_rolled_back")
     assert cron.calls == ["preflight", "apply", "postflight", "rollback"]
@@ -3830,7 +3962,7 @@ def test_forged_cron_activation_receipt_is_not_appended_after_commit() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 Database(plan),
@@ -3904,7 +4036,7 @@ def test_final_tail_drift_blocks_before_any_database_mutation() -> None:
     with pytest.raises(cutover.ProductionCutoverError, match="rolled_back"):
         cutover.execute_cutover(
             plan, approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services, snapshots, database, Host(plan, services), journal,
                 Prerequisites(), nullcontext
             ),
@@ -3940,7 +4072,7 @@ def test_final_tail_reobservation_ignores_only_collection_timestamp() -> None:
     terminal = cutover.execute_cutover(
         plan,
         approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             snapshots,
             database,
@@ -3997,7 +4129,7 @@ def test_resume_after_host_applied_accepts_exact_target_unit_identities() -> Non
     terminal = cutover.execute_cutover(
         plan,
         first_approval,
-        cutover.CutoverDependencies(
+        _dependencies(
             services,
             Snapshots(plan.final_snapshot),
             database,
@@ -4161,7 +4293,7 @@ def test_resume_target_drift_rolls_back_fail_closed_instead_of_leaving_database_
         cutover.execute_cutover(
             plan,
             first,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -4190,7 +4322,7 @@ def test_host_failure_rolls_back_host_and_database_fail_closed() -> None:
     with pytest.raises(cutover.ProductionCutoverError, match="rolled_back"):
         cutover.execute_cutover(
             plan, approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services, Snapshots(plan.final_snapshot), database, host, journal,
                 Prerequisites(), nullcontext
             ),
@@ -4216,7 +4348,7 @@ def test_wrong_archive_digest_rolls_back_started_prerequisites_and_database() ->
     with pytest.raises(cutover.ProductionCutoverError, match="rolled_back"):
         cutover.execute_cutover(
             plan, approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services, Snapshots(plan.final_snapshot), database, host, journal,
                 Prerequisites(), nullcontext
             ),
@@ -4240,7 +4372,7 @@ def test_database_apply_exception_reconciles_without_accepted_receipt() -> None:
         cutover.execute_cutover(
             plan,
             approval,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -4279,7 +4411,7 @@ def test_unreceipted_database_apply_intent_rolls_back_instead_of_replaying() -> 
         cutover.execute_cutover(
             plan,
             first,
-            cutover.CutoverDependencies(
+            _dependencies(
                 services,
                 Snapshots(plan.final_snapshot),
                 database,
@@ -4301,7 +4433,7 @@ def test_rollback_terminal_prevents_stale_forward_replay() -> None:
     journal = MemoryJournal()
     first = _approval(private, plan)
     _seed_cutover_passkey(journal, plan, first)
-    dependencies = cutover.CutoverDependencies(
+    dependencies = _dependencies(
         services,
         Snapshots(plan.final_snapshot),
         database,

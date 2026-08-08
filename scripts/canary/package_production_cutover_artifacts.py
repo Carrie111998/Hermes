@@ -182,6 +182,10 @@ PLAN_BINDINGS = {
     "host_activation": "production-host-activation",
     "host_rollback": "production-host-rollback",
 }
+ALIAS_PROJECTION_BINDING = "alias_projection"
+ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT = Path(
+    "ops/muncho/alias-projection/artifacts"
+)
 
 # Every host file consumed by the sealed host-activation artifact must be
 # represented in the release package.  The fixed producer partitions the set
@@ -831,6 +835,63 @@ def _read_source(path: Path, *, maximum: int) -> bytes:
         payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise PackagingError("cutover_packaging_source_encoding_invalid") from exc
+    return payload
+
+
+def _read_binary_source(path: Path, *, maximum: int) -> bytes:
+    """Read one stable regular executable without interpreting its bytes."""
+
+    descriptor: int | None = None
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or not 0 < before.st_size <= maximum
+        ):
+            raise PackagingError("cutover_packaging_source_invalid")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        reachable = path.lstat()
+    except OSError as exc:
+        raise PackagingError("cutover_packaging_source_unavailable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    if (
+        identity(before) != identity(opened)
+        or identity(opened) != identity(after)
+        or identity(after) != identity(reachable)
+        or len(payload) != opened.st_size
+    ):
+        raise PackagingError("cutover_packaging_source_raced")
     return payload
 
 
@@ -2443,6 +2504,109 @@ def _host_artifact_contract(
     }
 
 
+def _alias_projection_package(
+    *,
+    release: Path,
+    revision: str,
+    unit_inputs: Mapping[str, Any],
+    package_if_missing: bool,
+) -> Mapping[str, Any]:
+    """Build or verify the existing transactional three-unit alias rail."""
+
+    from gateway import production_alias_projection_units as alias_projection
+
+    if (
+        alias_projection.PACKAGE_RELATIVE_ROOT
+        != ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT
+    ):
+        raise PackagingError("cutover_alias_projection_package_invalid")
+
+    inputs = _unit_inputs(unit_inputs, revision=revision)
+    paths = {
+        "writer_module_sha256": alias_projection.WRITER_MODULE_RELATIVE,
+        "projector_module_sha256": alias_projection.PROJECTOR_MODULE_RELATIVE,
+        "projection_reader_sha256": alias_projection.PROJECTION_READER_RELATIVE,
+        "team_registry_sha256": alias_projection.TEAM_REGISTRY_RELATIVE,
+        "cutover_runtime_sha256": alias_projection.CUTOVER_RUNTIME_RELATIVE,
+        "cutover_entrypoint_sha256": alias_projection.CUTOVER_ENTRYPOINT_RELATIVE,
+    }
+    try:
+        module_digests = {
+            name: _sha256(_read_source(release / relative, maximum=8 * 1024 * 1024))
+            for name, relative in paths.items()
+        }
+        interpreter_sha256 = _sha256(
+            _read_binary_source(
+                release / ".venv/bin/python",
+                maximum=512 * 1024 * 1024,
+            )
+        )
+        bundle = alias_projection.render_production_alias_projection_units(
+            revision=revision,
+            database_ip=inputs["database_ip"],
+            writer_user=inputs["writer"]["user"],
+            writer_group=inputs["writer"]["group"],
+            writer_uid=inputs["writer"]["uid"],
+            writer_gid=inputs["writer"]["gid"],
+            projector_user=inputs["projector"]["user"],
+            projector_group=inputs["projector"]["group"],
+            projector_uid=inputs["projector"]["uid"],
+            projector_gid=inputs["projector"]["gid"],
+            gateway_user=inputs["gateway"]["user"],
+            gateway_group=inputs["gateway"]["group"],
+            gateway_uid=inputs["gateway"]["uid"],
+            gateway_gid=inputs["gateway"]["gid"],
+            interpreter_sha256=interpreter_sha256,
+            **module_digests,
+        )
+    except (
+        OSError,
+        alias_projection.ProductionAliasProjectionUnitError,
+    ) as exc:
+        raise PackagingError(
+            "cutover_alias_projection_package_invalid"
+        ) from exc
+
+    output = release / alias_projection.PACKAGE_RELATIVE_ROOT
+    manifest_path = output / "manifest.json"
+    expected = bundle.manifest()
+    if package_if_missing:
+        for name, payload in bundle.unit_payloads().items():
+            _atomic_install(output / name, payload, mode=0o444)
+        _atomic_install(
+            manifest_path,
+            _canonical_bytes(expected) + b"\n",
+            mode=0o444,
+        )
+    try:
+        raw = _read_source(manifest_path, maximum=4 * 1024 * 1024)
+        observed = json.loads(raw.decode("utf-8", errors="strict"))
+        validated = alias_projection.validate_package_manifest(
+            observed,
+            expected_revision=revision,
+            expected_package_sha256=expected["package_sha256"],
+        )
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        alias_projection.ProductionAliasProjectionUnitError,
+    ) as exc:
+        raise PackagingError(
+            "cutover_alias_projection_package_invalid"
+        ) from exc
+    if raw != _canonical_bytes(validated) + b"\n" or validated != expected:
+        raise PackagingError("cutover_alias_projection_package_invalid")
+    for name, payload in bundle.unit_payloads().items():
+        if (
+            _read_source(output / name, maximum=1024 * 1024) != payload
+            or stat.S_IMODE((output / name).stat().st_mode) != 0o444
+        ):
+            raise PackagingError("cutover_alias_projection_package_invalid")
+    return validated
+
+
 def build_release_artifacts(
     release_root: Path,
     revision: str,
@@ -2485,6 +2649,12 @@ def build_release_artifacts(
     output_root = release / "ops" / "muncho" / "cutover" / "artifacts"
     prerequisite_contract = packaged_prerequisite_contract()
     normalized_unit_inputs = _unit_inputs(unit_inputs, revision=revision)
+    alias_package = _alias_projection_package(
+        release=release,
+        revision=revision,
+        unit_inputs=normalized_unit_inputs,
+        package_if_missing=True,
+    )
     operational_assets = _operational_asset_receipt(
         release=release,
         release_address=address,
@@ -2557,6 +2727,9 @@ def build_release_artifacts(
             "operational_asset_verification_sha256": operational_assets[
                 "verification_sha256"
             ],
+            "alias_projection_package_sha256": alias_package[
+                "package_sha256"
+            ],
         },
         "unit_inputs": normalized_unit_inputs,
         "sealed_runtime_artifact_request": sealed_descriptor,
@@ -2568,6 +2741,16 @@ def build_release_artifacts(
                 "sha256": manifest_artifacts[name]["sha256"],
             }
             for binding, name in PLAN_BINDINGS.items()
+        }
+        | {
+            ALIAS_PROJECTION_BINDING: {
+                "path": str(
+                    address
+                    / ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT
+                    / "manifest.json"
+                ),
+                "sha256": alias_package["package_sha256"],
+            }
         },
         "secret_material_recorded": False,
     }
@@ -2655,6 +2838,12 @@ def verify_release_artifacts(
     if manifest.get("manifest_sha256") != _sha256(_canonical_bytes(unsigned)):
         raise PackagingError("cutover_packaging_manifest_invalid")
     normalized_unit_inputs = _unit_inputs(unit_inputs, revision=revision)
+    alias_package = _alias_projection_package(
+        release=release,
+        revision=revision,
+        unit_inputs=normalized_unit_inputs,
+        package_if_missing=False,
+    )
     if manifest.get("unit_inputs") != normalized_unit_inputs:
         raise PackagingError("cutover_packaging_manifest_invalid")
     operational_assets = _operational_asset_receipt(
@@ -2708,6 +2897,9 @@ def verify_release_artifacts(
             "operational_asset_verification_sha256": operational_assets[
                 "verification_sha256"
             ],
+            "alias_projection_package_sha256": alias_package[
+                "package_sha256"
+            ],
     }:
         raise PackagingError("cutover_packaging_manifest_invalid")
     for name, actions in ARTIFACTS.items():
@@ -2737,13 +2929,26 @@ def verify_release_artifacts(
         ):
             raise PackagingError("cutover_packaging_artifact_drifted")
     bindings = manifest.get("plan_bindings")
-    if not isinstance(bindings, Mapping) or set(bindings) != set(PLAN_BINDINGS):
+    if (
+        not isinstance(bindings, Mapping)
+        or set(bindings) != set(PLAN_BINDINGS) | {ALIAS_PROJECTION_BINDING}
+    ):
         raise PackagingError("cutover_packaging_manifest_invalid")
     for binding, name in PLAN_BINDINGS.items():
         item = bindings[binding]
         artifact = manifest["artifacts"][name]
         if item != {"path": artifact["path"], "sha256": artifact["sha256"]}:
             raise PackagingError("cutover_packaging_manifest_invalid")
+    expected_alias_binding = {
+        "path": str(
+            address
+            / ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT
+            / "manifest.json"
+        ),
+        "sha256": alias_package["package_sha256"],
+    }
+    if bindings[ALIAS_PROJECTION_BINDING] != expected_alias_binding:
+        raise PackagingError("cutover_packaging_manifest_invalid")
     return manifest
 
 

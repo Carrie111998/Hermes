@@ -203,7 +203,6 @@ PREREQUISITE_UNITS = (
     ISOLATED_WORKER_SOCKET_UNIT,
     BROWSER_UNIT,
     ROUTEBACK_EDGE_UNIT,
-    CONNECTOR_UNIT,
     MAC_OPS_UNIT,
     PHASE_B_UNIT,
 )
@@ -8328,14 +8327,9 @@ def _host_start_writer(plan: Mapping[str, Any]) -> Mapping[str, Any]:
         != _target_service(plan, WRITER_UNIT, staged_disabled=True)
         or _stable_service(connector)
         != _target_service(plan, CONNECTOR_UNIT, staged_disabled=True)
+        or not _stopped(connector)
     ):
         raise ArtifactError("artifact_host_start_precondition_invalid")
-    if (
-        connector["active_state"] != "active"
-        or connector["sub_state"] != "running"
-        or connector["main_pid"] <= 0
-    ):
-        raise ArtifactError("artifact_connector_prerequisite_not_ready")
     _operational_edge_runtime(manifest)
     if _stopped(writer):
         _systemctl("start", "--", WRITER_UNIT, timeout=60)
@@ -8376,7 +8370,6 @@ def _host_start_prerequisites(plan: Mapping[str, Any]) -> Mapping[str, Any]:
         ISOLATED_WORKER_SOCKET_UNIT: ("active", "listening", 0),
         PHASE_B_UNIT: ("active", "exited", 0),
         ROUTEBACK_EDGE_UNIT: ("active", "running", 1),
-        CONNECTOR_UNIT: ("active", "running", 1),
         MAC_OPS_UNIT: ("active", "running", 1),
         BROWSER_UNIT: ("active", "running", 1),
     }
@@ -8405,6 +8398,7 @@ def _host_start_prerequisites(plan: Mapping[str, Any]) -> Mapping[str, Any]:
     if (
         not _stopped(_service(GATEWAY_UNIT))
         or not _stopped(_service(WRITER_UNIT))
+        or not _stopped(_service(CONNECTOR_UNIT))
     ):
         raise ArtifactError("artifact_prerequisite_started_forbidden_service")
     _operational_edge_runtime(manifest)
@@ -8438,6 +8432,7 @@ def _host_commit_boot(plan: Mapping[str, Any]) -> Mapping[str, Any]:
             for unit in BOOT_ENABLE_UNITS
         )
         or before[ISOLATED_WORKER_SERVICE_UNIT]["unit_file_state"] != "static"
+        or not _stopped(before[CONNECTOR_UNIT])
         or any(
             _stable_service(before[unit]) != expected(unit, before[unit])
             for unit in (GATEWAY_UNIT, WRITER_UNIT, CONNECTOR_UNIT)
@@ -8475,6 +8470,12 @@ def _host_commit_boot(plan: Mapping[str, Any]) -> Mapping[str, Any]:
     for unit in PREREQUISITE_UNITS:
         if _stopped(_service(unit)):
             _systemctl("start", "--", unit, timeout=180)
+    # The Discord connector is public ingress.  The durable activation commit
+    # intent must exist before this host action is reachable, so it starts here
+    # and never in the precommit prerequisite cohort.  The coordinator starts
+    # the gateway only after this receipt is accepted.
+    if _stopped(_service(CONNECTOR_UNIT)):
+        _systemctl("start", "--", CONNECTOR_UNIT, timeout=180)
     if _stopped(_service(WRITER_UNIT)):
         _systemctl("start", "--", WRITER_UNIT, timeout=60)
 

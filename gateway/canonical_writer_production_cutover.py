@@ -1813,7 +1813,7 @@ class FinalTailReceipt:
 
 _CUTOVER_ARTIFACT_NAMES = (
     "observe", "database_apply", "database_rollback", "database_postflight",
-    "host_activation", "host_rollback",
+    "host_activation", "host_rollback", "alias_projection",
 )
 _HOST_TRANSITION_SCHEMA = "muncho-production-host-transition-manifest.v1"
 _HOST_TRANSITION_FILE_NAMES = (
@@ -4164,6 +4164,37 @@ class CronCutoverBoundary(Protocol):
     ) -> Mapping[str, Any]: ...
 
 
+class AliasProjectionCutoverBoundary(Protocol):
+    """Transactional three-unit alias rail owned by this coordinator."""
+
+    def preflight(self, plan: CutoverPlan) -> Mapping[str, Any]: ...
+    def apply(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+    def postflight(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+    def activate(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+        postflight_receipt: Mapping[str, Any],
+        activation_authority: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+    def rollback(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+
 class ProductionCronCutoverBoundary:
     """Invoke only the digest-attested isolated release entrypoint.
 
@@ -4381,6 +4412,268 @@ class ProductionCronCutoverBoundary:
                 if apply_receipt is None
                 else str(apply_receipt["receipt_sha256"])
             ),
+        )
+
+
+class ProductionAliasProjectionCutoverBoundary:
+    """Invoke the exact release-packaged alias projection cutover rail."""
+
+    _ACTIONS = frozenset({
+        "preflight", "apply", "postflight", "activate", "rollback",
+    })
+
+    def __init__(
+        self,
+        *,
+        runner: Callable[..., Any] = subprocess.run,
+    ) -> None:
+        self._runner = runner
+
+    @staticmethod
+    def _identity(
+        plan: CutoverPlan,
+    ) -> tuple[Path, Path, Mapping[str, Any]]:
+        from gateway import production_alias_projection_units as units
+
+        binding = _artifact(
+            plan.value["artifacts"]["alias_projection"],
+            "alias projection package",
+            plan.value["release_revision"],
+        )
+        revision = str(plan.value["release_revision"])
+        release_root = (
+            PRODUCTION_RELEASE_BASE / f"hermes-agent-{revision[:12]}"
+        )
+        manifest_path = release_root / units.PACKAGE_RELATIVE_ROOT / "manifest.json"
+        if Path(str(binding["path"])) != manifest_path:
+            raise ProductionCutoverError(
+                "production_alias_projection_package_identity_invalid"
+            )
+        try:
+            raw = manifest_path.read_bytes()
+            value = json.loads(
+                raw.decode("utf-8", errors="strict"),
+                object_pairs_hook=activation._reject_duplicate_keys,
+                parse_constant=activation._reject_json_constant,
+            )
+            if raw != _canonical_bytes(value) + b"\n":
+                raise ValueError("alias package is not canonical")
+            manifest = units.validate_package_manifest(
+                value,
+                expected_revision=revision,
+                expected_package_sha256=str(binding["sha256"]),
+            )
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+            units.ProductionAliasProjectionUnitError,
+        ) as exc:
+            raise ProductionCutoverError(
+                "production_alias_projection_package_identity_invalid"
+            ) from exc
+        entrypoint = Path(str(manifest["modules"]["cutover_entrypoint"]["path"]))
+        expected_entrypoint = release_root / units.CUTOVER_ENTRYPOINT_RELATIVE
+        if entrypoint != expected_entrypoint:
+            raise ProductionCutoverError(
+                "production_alias_projection_package_identity_invalid"
+            )
+        return release_root / ".venv/bin/python", entrypoint, manifest
+
+    def _run(
+        self,
+        *,
+        action: str,
+        plan: CutoverPlan,
+        preflight_sha256: str | None = None,
+        apply_sha256: str | None = None,
+        postflight_sha256: str | None = None,
+        activation_authority_sha256: str | None = None,
+    ) -> Mapping[str, Any]:
+        from gateway import production_alias_projection_cutover as runtime
+
+        if action not in self._ACTIONS:
+            raise ValueError("production alias projection action is not fixed")
+        interpreter, entrypoint, manifest = self._identity(plan)
+        argv = [
+            str(interpreter),
+            "-B",
+            "-I",
+            str(entrypoint),
+            action,
+            "--expected-cutover-plan-sha256",
+            plan.sha256,
+            "--expected-release-revision",
+            str(plan.value["release_revision"]),
+            "--expected-package-sha256",
+            str(manifest["package_sha256"]),
+            "--expected-entrypoint-sha256",
+            str(manifest["modules"]["cutover_entrypoint"]["sha256"]),
+            "--expected-runtime-sha256",
+            str(manifest["modules"]["cutover_runtime"]["sha256"]),
+        ]
+        for flag, digest in (
+            ("--expected-preflight-receipt-sha256", preflight_sha256),
+            ("--expected-apply-receipt-sha256", apply_sha256),
+            ("--expected-postflight-receipt-sha256", postflight_sha256),
+            (
+                "--expected-activation-authority-sha256",
+                activation_authority_sha256,
+            ),
+        ):
+            if digest is not None:
+                argv.extend((flag, digest))
+        try:
+            result = self._runner(
+                tuple(argv),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/",
+                env={
+                    "LC_ALL": "C.UTF-8",
+                    "PATH": "/usr/bin:/bin",
+                    "PYTHONNOUSERSITE": "1",
+                },
+                timeout=_ARTIFACT_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ProductionCutoverError(
+                "production_alias_projection_boundary_failed"
+            ) from exc
+        stdout = getattr(result, "stdout", b"")
+        stderr = getattr(result, "stderr", b"")
+        if (
+            getattr(result, "returncode", 1) != 0
+            or not isinstance(stdout, bytes)
+            or not isinstance(stderr, bytes)
+            or stderr
+            or not 1 < len(stdout) <= _MAX_JSON + 1
+        ):
+            raise ProductionCutoverError(
+                "production_alias_projection_boundary_failed"
+            )
+        try:
+            value = json.loads(
+                stdout.decode("utf-8", errors="strict"),
+                object_pairs_hook=activation._reject_duplicate_keys,
+                parse_constant=activation._reject_json_constant,
+            )
+        except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ProductionCutoverError(
+                "production_alias_projection_receipt_invalid"
+            ) from exc
+        if not isinstance(value, Mapping) or stdout != _canonical_bytes(value) + b"\n":
+            raise ProductionCutoverError(
+                "production_alias_projection_receipt_invalid"
+            )
+        receipt_action = "activation" if action == "activate" else action
+        expected_prior = (
+            None
+            if action == "preflight"
+            else preflight_sha256
+            if action == "apply"
+            else apply_sha256
+            if action in {"postflight", "rollback"}
+            else postflight_sha256
+        )
+        try:
+            receipt = runtime.validate_cutover_receipt(
+                value,
+                action=receipt_action,
+                cutover_plan_sha256=plan.sha256,
+                package_sha256=str(manifest["package_sha256"]),
+                expected_prior_sha256=expected_prior,
+            )
+        except runtime.ProductionAliasProjectionCutoverError as exc:
+            raise ProductionCutoverError(
+                "production_alias_projection_receipt_invalid"
+            ) from exc
+        if (
+            action == "activate"
+            and receipt["evidence"].get("activation_authority_sha256")
+            != activation_authority_sha256
+        ):
+            raise ProductionCutoverError(
+                "production_alias_projection_activation_lineage_invalid"
+            )
+        return receipt
+
+    def preflight(self, plan: CutoverPlan) -> Mapping[str, Any]:
+        return self._run(action="preflight", plan=plan)
+
+    def apply(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return self._run(
+            action="apply",
+            plan=plan,
+            preflight_sha256=str(preflight_receipt["receipt_sha256"]),
+        )
+
+    def postflight(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return self._run(
+            action="postflight",
+            plan=plan,
+            preflight_sha256=str(preflight_receipt["receipt_sha256"]),
+            apply_sha256=str(apply_receipt["receipt_sha256"]),
+        )
+
+    def activate(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+        postflight_receipt: Mapping[str, Any],
+        activation_authority: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        from gateway import production_alias_projection_cutover as runtime
+
+        authority = runtime.validate_activation_authority(
+            activation_authority,
+            cutover_plan_sha256=plan.sha256,
+            package_sha256=str(plan.value["artifacts"]["alias_projection"]["sha256"]),
+            postflight_receipt_sha256=str(postflight_receipt["receipt_sha256"]),
+            expected_authority_sha256=str(
+                activation_authority.get("authority_sha256") or ""
+            ),
+        )
+        activation._ensure_root_directory(
+            runtime.STAGED_ACTIVATION_AUTHORITY_PATH.parent
+        )
+        activation._write_root_receipt(
+            runtime.STAGED_ACTIVATION_AUTHORITY_PATH,
+            authority,
+        )
+        return self._run(
+            action="activate",
+            plan=plan,
+            preflight_sha256=str(preflight_receipt["receipt_sha256"]),
+            apply_sha256=str(apply_receipt["receipt_sha256"]),
+            postflight_sha256=str(postflight_receipt["receipt_sha256"]),
+            activation_authority_sha256=str(authority["authority_sha256"]),
+        )
+
+    def rollback(
+        self,
+        plan: CutoverPlan,
+        preflight_receipt: Mapping[str, Any],
+        apply_receipt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        return self._run(
+            action="rollback",
+            plan=plan,
+            preflight_sha256=str(preflight_receipt["receipt_sha256"]),
+            apply_sha256=str(apply_receipt["receipt_sha256"]),
         )
 
 
@@ -4878,6 +5171,7 @@ class CutoverDependencies:
     prerequisites: CapabilityPrerequisiteBoundary
     lock: Callable[[], ContextManager[Any]] = activation._host_activation_lock
     cron: CronCutoverBoundary | None = None
+    alias_projection: AliasProjectionCutoverBoundary | None = None
 
 
 class ProductionArtifactProcessBoundary:
@@ -6789,6 +7083,227 @@ def _uses_packaged_cron_cutover(plan: CutoverPlan) -> bool:
     )
 
 
+def _require_alias_projection_receipt(
+    value: Mapping[str, Any],
+    *,
+    action: str,
+    plan: CutoverPlan,
+    expected_prior_sha256: str | None = None,
+) -> dict[str, Any]:
+    from gateway import production_alias_projection_cutover as runtime
+
+    try:
+        return runtime.validate_cutover_receipt(
+            value,
+            action=action,
+            cutover_plan_sha256=plan.sha256,
+            package_sha256=str(
+                plan.value["artifacts"]["alias_projection"]["sha256"]
+            ),
+            expected_prior_sha256=expected_prior_sha256,
+        )
+    except runtime.ProductionAliasProjectionCutoverError as exc:
+        raise ProductionCutoverError(
+            "production_alias_projection_receipt_invalid"
+        ) from exc
+
+
+@dataclass(frozen=True)
+class _AliasProjectionCutoverState:
+    preflight: Mapping[str, Any] | None = None
+    apply: Mapping[str, Any] | None = None
+    postflight: Mapping[str, Any] | None = None
+    activation_authority: Mapping[str, Any] | None = None
+    activation: Mapping[str, Any] | None = None
+    rollback: Mapping[str, Any] | None = None
+
+
+def _build_alias_projection_activation_authority(
+    *,
+    plan: CutoverPlan,
+    postflight_receipt: Mapping[str, Any],
+    entries: list[JournalEntry],
+) -> dict[str, Any]:
+    from gateway import production_alias_projection_cutover as runtime
+
+    required = {
+        name: _last(entries, name)
+        for name in (
+            "database_terminal_validated",
+            "activation_commit_intent",
+            "writer_started",
+            "gateway_started",
+        )
+    }
+    if any(entry is None for entry in required.values()):
+        raise ProductionCutoverError(
+            "production_alias_projection_activation_lineage_missing"
+        )
+    try:
+        return runtime.build_activation_authority(
+            cutover_plan_sha256=plan.sha256,
+            package_sha256=str(
+                plan.value["artifacts"]["alias_projection"]["sha256"]
+            ),
+            postflight_receipt_sha256=str(
+                postflight_receipt["receipt_sha256"]
+            ),
+            database_terminal_entry_sha256=required[
+                "database_terminal_validated"
+            ].sha256,
+            activation_commit_intent_entry_sha256=required[
+                "activation_commit_intent"
+            ].sha256,
+            writer_ready_entry_sha256=required["writer_started"].sha256,
+            gateway_started_entry_sha256=required["gateway_started"].sha256,
+        )
+    except runtime.ProductionAliasProjectionCutoverError as exc:
+        raise ProductionCutoverError(
+            "production_alias_projection_activation_authority_invalid"
+        ) from exc
+
+
+def _accepted_alias_projection_state(
+    entries: list[JournalEntry],
+    plan: CutoverPlan,
+) -> _AliasProjectionCutoverState:
+    def evidence(event: str) -> Mapping[str, Any] | None:
+        entry = _last(entries, event)
+        return None if entry is None else entry.value["evidence"]
+
+    preflight_value = evidence("alias_projection_preflight_validated")
+    if (
+        preflight_value is not None
+        and _last(entries, "alias_projection_preflight_started") is None
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_lineage_invalid"
+        )
+    preflight = (
+        None
+        if preflight_value is None
+        else _require_alias_projection_receipt(
+            preflight_value,
+            action="preflight",
+            plan=plan,
+        )
+    )
+    apply_value = evidence("alias_projection_applied")
+    if apply_value is not None and (
+        preflight is None
+        or _last(entries, "alias_projection_apply_started") is None
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_lineage_invalid"
+        )
+    applied = (
+        None
+        if apply_value is None
+        else _require_alias_projection_receipt(
+            apply_value,
+            action="apply",
+            plan=plan,
+            expected_prior_sha256=str(preflight["receipt_sha256"]),
+        )
+    )
+    postflight_value = evidence("alias_projection_postflight_validated")
+    if postflight_value is not None and (
+        applied is None
+        or _last(entries, "alias_projection_postflight_started") is None
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_lineage_invalid"
+        )
+    postflight = (
+        None
+        if postflight_value is None
+        else _require_alias_projection_receipt(
+            postflight_value,
+            action="postflight",
+            plan=plan,
+            expected_prior_sha256=str(applied["receipt_sha256"]),
+        )
+    )
+    authority_value = evidence("alias_projection_activation_authority")
+    authority: Mapping[str, Any] | None = None
+    if authority_value is not None:
+        if postflight is None:
+            raise ProductionCutoverError(
+                "production_alias_projection_activation_lineage_invalid"
+            )
+        expected = _build_alias_projection_activation_authority(
+            plan=plan,
+            postflight_receipt=postflight,
+            entries=entries,
+        )
+        if authority_value != expected:
+            raise ProductionCutoverError(
+                "production_alias_projection_activation_authority_invalid"
+            )
+        authority = expected
+    activation_value = evidence("alias_projection_activated")
+    if activation_value is not None and (
+        postflight is None
+        or authority is None
+        or _last(entries, "alias_projection_activation_started") is None
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_activation_lineage_invalid"
+        )
+    activated = (
+        None
+        if activation_value is None
+        else _require_alias_projection_receipt(
+            activation_value,
+            action="activation",
+            plan=plan,
+            expected_prior_sha256=str(postflight["receipt_sha256"]),
+        )
+    )
+    if (
+        activated is not None
+        and activated["evidence"].get("activation_authority_sha256")
+        != authority["authority_sha256"]
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_activation_lineage_invalid"
+        )
+    rollback_value = evidence("alias_projection_rolled_back")
+    if (
+        rollback_value is not None
+        and _last(entries, "alias_projection_rollback_started") is None
+    ):
+        raise ProductionCutoverError(
+            "production_alias_projection_lineage_invalid"
+        )
+    rolled_back = (
+        None
+        if rollback_value is None
+        else _require_alias_projection_receipt(
+            rollback_value,
+            action="rollback",
+            plan=plan,
+            expected_prior_sha256=(
+                None
+                if applied is None
+                else str(applied["receipt_sha256"])
+            ),
+        )
+    )
+    if activated is not None and rolled_back is not None:
+        raise ProductionCutoverError(
+            "production_alias_projection_lineage_invalid"
+        )
+    return _AliasProjectionCutoverState(
+        preflight=preflight,
+        apply=applied,
+        postflight=postflight,
+        activation_authority=authority,
+        activation=activated,
+        rollback=rolled_back,
+    )
+
+
 def _require_cron_cutover_receipt(
     value: Mapping[str, Any],
     *,
@@ -7016,7 +7531,8 @@ _ACTIVATION_COMMIT_INTENT_FIELDS = frozenset({
     "database_postflight_receipt_sha256",
     "prerequisite_start_receipt_sha256", "writer_start_receipt_sha256",
     "capability_prerequisite_receipt_sha256",
-    "gateway_stopped", "connector_active", "forward_only",
+    "gateway_stopped", "connector_stopped", "external_ingress_disabled",
+    "forward_only",
     "secret_material_recorded", "receipt_sha256",
 })
 
@@ -7468,7 +7984,7 @@ def _require_activation_commit_intent(
         )
     )
     if (
-        raw["schema"] != "muncho-production-activation-commit-intent.v1"
+        raw["schema"] != "muncho-production-activation-commit-intent.v2"
         or raw["plan_sha256"] != plan.sha256
         or raw["approval_sha256"] not in authorities
         or host is None
@@ -7488,7 +8004,8 @@ def _require_activation_commit_intent(
         or raw["capability_prerequisite_receipt_sha256"]
         != capability["receipt_sha256"]
         or raw["gateway_stopped"] is not True
-        or raw["connector_active"] is not True
+        or raw["connector_stopped"] is not True
+        or raw["external_ingress_disabled"] is not True
         or raw["forward_only"] is not True
         or raw["secret_material_recorded"] is not False
     ):
@@ -7561,6 +8078,10 @@ def _mutation_was_attempted(entries: list[JournalEntry]) -> bool:
             "database_applied",
             "host_apply_started",
             "host_applied",
+            "alias_projection_apply_started",
+            "alias_projection_applied",
+            "alias_projection_postflight_started",
+            "alias_projection_postflight_validated",
             "cron_apply_started",
             "cron_applied",
             "cron_postflight_started",
@@ -7626,6 +8147,16 @@ def _rollback_cutover(
             "cron_rolled_back",
         )
     )
+    alias_required = any(
+        _last(entries, event) is not None
+        for event in (
+            "alias_projection_applied",
+            "alias_projection_postflight_started",
+            "alias_projection_postflight_validated",
+            "alias_projection_rollback_started",
+            "alias_projection_rolled_back",
+        )
+    )
     rollback_errors: list[BaseException] = []
 
     for stop in (
@@ -7651,9 +8182,71 @@ def _rollback_cutover(
             rollback_errors.append(exc)
 
     cron_rollback: Mapping[str, Any] | None = None
+    alias_rollback: Mapping[str, Any] | None = None
     host_rollback: Mapping[str, Any] | None = None
     database_rollback: Mapping[str, Any] | None = None
-    # Cron owns jobs.json and its packaged unit files.  Restore those first,
+    # Alias projection owns three packaged units and its prepared directories.
+    # Restore it before host rollback removes identities and credentials.
+    if not rollback_errors and alias_required:
+        prior = _last(entries, "alias_projection_rolled_back")
+        try:
+            alias_state = _accepted_alias_projection_state(entries, plan)
+            if alias_state.activation is not None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_forward_only"
+                )
+            if prior is None:
+                if (
+                    dependencies.alias_projection is None
+                    or alias_state.preflight is None
+                    or alias_state.apply is None
+                ):
+                    raise ProductionCutoverError(
+                        "production_alias_projection_rollback_boundary_missing"
+                    )
+                if (
+                    _last(entries, "alias_projection_rollback_started")
+                    is None
+                ):
+                    dependencies.journal.append(
+                        plan.sha256,
+                        "alias_projection_rollback_started",
+                        {
+                            "apply_receipt_sha256": alias_state.apply[
+                                "receipt_sha256"
+                            ]
+                        },
+                        now_unix,
+                    )
+                alias_rollback = _require_alias_projection_receipt(
+                    dependencies.alias_projection.rollback(
+                        plan,
+                        alias_state.preflight,
+                        alias_state.apply,
+                    ),
+                    action="rollback",
+                    plan=plan,
+                    expected_prior_sha256=str(
+                        alias_state.apply["receipt_sha256"]
+                    ),
+                )
+                dependencies.journal.append(
+                    plan.sha256,
+                    "alias_projection_rolled_back",
+                    alias_rollback,
+                    now_unix,
+                )
+                entries = dependencies.journal.load(plan.sha256)
+            elif alias_state.rollback is None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_rollback_invalid"
+                )
+            else:
+                alias_rollback = alias_state.rollback
+        except BaseException as exc:
+            rollback_errors.append(exc)
+
+    # Cron owns jobs.json and its packaged unit files.  Restore those next,
     # while the exact owner-bound service identity and release still exist;
     # host/database rollback may remove prerequisites needed by this edge.
     if not rollback_errors and cron_required:
@@ -7916,6 +8509,10 @@ def execute_cutover(
             raise ProductionCutoverError("production_cutover_already_rolled_back")
         terminal_entry = _last(entries, "terminal")
         if terminal_entry is not None:
+            if _accepted_alias_projection_state(entries, plan).activation is None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_terminal_lineage_invalid"
+                )
             if (
                 _uses_packaged_cron_cutover(plan)
                 and _accepted_cron_cutover_state(entries, plan).activation
@@ -7938,6 +8535,7 @@ def execute_cutover(
         activation_commit_intent: Mapping[str, Any] | None = None
         database_terminal: Mapping[str, Any] | None = None
         prerequisite_acceptance: Mapping[str, Any] | None = None
+        alias_state = _AliasProjectionCutoverState()
         cron_state = _CronCutoverState()
         try:
             database_receipt = _accepted_database_apply(entries, plan)
@@ -7947,6 +8545,7 @@ def execute_cutover(
                 entries, plan
             )
             boot_commit_receipt = _accepted_host_boot_commit(entries, plan)
+            alias_state = _accepted_alias_projection_state(entries, plan)
             cron_state = _accepted_cron_cutover_state(entries, plan)
             if (
                 activation_commit_intent is None
@@ -7978,6 +8577,7 @@ def execute_cutover(
                 or database_terminal is None
                 or not prerequisites_started
                 or not writer_started
+                or alias_state.postflight is None
                 or _uses_packaged_cron_cutover(plan)
                 and cron_state.postflight is None
             ):
@@ -8055,13 +8655,7 @@ def execute_cutover(
                     raise ProductionCutoverError(
                         "production_cutover_writer_started_early"
                     )
-                if prerequisites_started:
-                    if current_connector.value["active_state"] != "active":
-                        if not current_connector.stopped:
-                            raise ProductionCutoverError(
-                                "production_cutover_connector_resume_state_invalid"
-                            )
-                elif not current_connector.stopped:
+                if not current_connector.stopped:
                     raise ProductionCutoverError(
                         "production_cutover_connector_started_early"
                     )
@@ -8087,6 +8681,133 @@ def execute_cutover(
                     now,
                 )
                 entries = dependencies.journal.load(plan.sha256)
+
+            alias_state = _accepted_alias_projection_state(entries, plan)
+            if alias_state.rollback is not None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_already_rolled_back"
+                )
+            if (
+                activation_commit_intent is not None
+                and alias_state.postflight is None
+            ):
+                raise ProductionCutoverError(
+                    "production_alias_projection_commit_lineage_invalid"
+                )
+            if activation_commit_intent is None:
+                if dependencies.alias_projection is None:
+                    raise ProductionCutoverError(
+                        "production_alias_projection_boundary_missing"
+                    )
+                if (
+                    not dependencies.services.observe_gateway().stopped
+                    or not dependencies.services.observe_writer().stopped
+                    or not dependencies.services.observe_connector().stopped
+                ):
+                    raise ProductionCutoverError(
+                        "production_alias_projection_services_not_stopped"
+                    )
+                if alias_state.preflight is None:
+                    if (
+                        _last(entries, "alias_projection_preflight_started")
+                        is None
+                    ):
+                        dependencies.journal.append(
+                            plan.sha256,
+                            "alias_projection_preflight_started",
+                            {
+                                "package_sha256": plan.value["artifacts"]
+                                ["alias_projection"]["sha256"]
+                            },
+                            now,
+                        )
+                    alias_preflight = _require_alias_projection_receipt(
+                        dependencies.alias_projection.preflight(plan),
+                        action="preflight",
+                        plan=plan,
+                    )
+                    dependencies.journal.append(
+                        plan.sha256,
+                        "alias_projection_preflight_validated",
+                        alias_preflight,
+                        now,
+                    )
+                    entries = dependencies.journal.load(plan.sha256)
+                    alias_state = _accepted_alias_projection_state(
+                        entries, plan
+                    )
+                if alias_state.apply is None:
+                    if (
+                        _last(entries, "alias_projection_apply_started")
+                        is None
+                    ):
+                        dependencies.journal.append(
+                            plan.sha256,
+                            "alias_projection_apply_started",
+                            {
+                                "preflight_receipt_sha256": (
+                                    alias_state.preflight["receipt_sha256"]
+                                )
+                            },
+                            now,
+                        )
+                    alias_apply = _require_alias_projection_receipt(
+                        dependencies.alias_projection.apply(
+                            plan, alias_state.preflight
+                        ),
+                        action="apply",
+                        plan=plan,
+                        expected_prior_sha256=str(
+                            alias_state.preflight["receipt_sha256"]
+                        ),
+                    )
+                    dependencies.journal.append(
+                        plan.sha256,
+                        "alias_projection_applied",
+                        alias_apply,
+                        now,
+                    )
+                    entries = dependencies.journal.load(plan.sha256)
+                    alias_state = _accepted_alias_projection_state(
+                        entries, plan
+                    )
+                if alias_state.postflight is None:
+                    if (
+                        _last(entries, "alias_projection_postflight_started")
+                        is None
+                    ):
+                        dependencies.journal.append(
+                            plan.sha256,
+                            "alias_projection_postflight_started",
+                            {
+                                "apply_receipt_sha256": (
+                                    alias_state.apply["receipt_sha256"]
+                                )
+                            },
+                            now,
+                        )
+                    alias_postflight = _require_alias_projection_receipt(
+                        dependencies.alias_projection.postflight(
+                            plan,
+                            alias_state.preflight,
+                            alias_state.apply,
+                        ),
+                        action="postflight",
+                        plan=plan,
+                        expected_prior_sha256=str(
+                            alias_state.apply["receipt_sha256"]
+                        ),
+                    )
+                    dependencies.journal.append(
+                        plan.sha256,
+                        "alias_projection_postflight_validated",
+                        alias_postflight,
+                        now,
+                    )
+                    entries = dependencies.journal.load(plan.sha256)
+                    alias_state = _accepted_alias_projection_state(
+                        entries, plan
+                    )
 
             if _uses_packaged_cron_cutover(plan):
                 cron_state = _accepted_cron_cutover_state(entries, plan)
@@ -8236,7 +8957,7 @@ def execute_cutover(
             if activation_commit_intent is None and (
                 not current_gateway.stopped
                 or not writer_stage_valid
-                or current_connector.value["active_state"] != "active"
+                or not current_connector.stopped
             ):
                 raise ProductionCutoverError(
                     "production_cutover_prerequisite_service_state_invalid"
@@ -8371,7 +9092,7 @@ def execute_cutover(
                 if (
                     not gateway_fenced.stopped
                     or writer_ready.value["active_state"] != "active"
-                    or connector_ready.value["active_state"] != "active"
+                    or not connector_ready.stopped
                     or gateway_fenced.stable_identity()
                     != ServiceObservation.from_mapping(
                         host_receipt["gateway_stopped"]
@@ -8407,7 +9128,7 @@ def execute_cutover(
                     artifact_name="host_activation",
                 )
                 intent_unsigned = {
-                    "schema": "muncho-production-activation-commit-intent.v1",
+                    "schema": "muncho-production-activation-commit-intent.v2",
                     "plan_sha256": plan.sha256,
                     "approval_sha256": approval.sha256,
                     "host_apply_receipt_sha256": host_receipt["receipt_sha256"],
@@ -8427,7 +9148,8 @@ def execute_cutover(
                         prerequisite_acceptance["receipt_sha256"]
                     ),
                     "gateway_stopped": True,
-                    "connector_active": True,
+                    "connector_stopped": True,
+                    "external_ingress_disabled": True,
                     "forward_only": True,
                     "secret_material_recorded": False,
                 }
@@ -8507,6 +9229,91 @@ def execute_cutover(
                     now,
                 )
             entries = dependencies.journal.load(plan.sha256)
+            alias_state = _accepted_alias_projection_state(entries, plan)
+            if alias_state.postflight is None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_postflight_missing"
+                )
+            expected_alias_authority = (
+                _build_alias_projection_activation_authority(
+                    plan=plan,
+                    postflight_receipt=alias_state.postflight,
+                    entries=entries,
+                )
+            )
+            alias_authority_entry = _last(
+                entries, "alias_projection_activation_authority"
+            )
+            if alias_authority_entry is None:
+                dependencies.journal.append(
+                    plan.sha256,
+                    "alias_projection_activation_authority",
+                    expected_alias_authority,
+                    now,
+                )
+                entries = dependencies.journal.load(plan.sha256)
+                alias_state = _accepted_alias_projection_state(entries, plan)
+            elif (
+                alias_authority_entry.value["evidence"]
+                != expected_alias_authority
+            ):
+                raise ProductionCutoverError(
+                    "production_alias_projection_activation_authority_invalid"
+                )
+            if alias_state.activation is None:
+                if dependencies.alias_projection is None:
+                    raise ProductionCutoverError(
+                        "production_alias_projection_boundary_missing"
+                    )
+                if (
+                    _last(entries, "alias_projection_activation_started")
+                    is None
+                ):
+                    dependencies.journal.append(
+                        plan.sha256,
+                        "alias_projection_activation_started",
+                        {
+                            "activation_authority_sha256": (
+                                expected_alias_authority["authority_sha256"]
+                            )
+                        },
+                        now,
+                    )
+                alias_activation = _require_alias_projection_receipt(
+                    dependencies.alias_projection.activate(
+                        plan,
+                        alias_state.preflight,
+                        alias_state.apply,
+                        alias_state.postflight,
+                        expected_alias_authority,
+                    ),
+                    action="activation",
+                    plan=plan,
+                    expected_prior_sha256=str(
+                        alias_state.postflight["receipt_sha256"]
+                    ),
+                )
+                if (
+                    alias_activation["evidence"].get(
+                        "activation_authority_sha256"
+                    )
+                    != expected_alias_authority["authority_sha256"]
+                ):
+                    raise ProductionCutoverError(
+                        "production_alias_projection_activation_lineage_invalid"
+                    )
+                dependencies.journal.append(
+                    plan.sha256,
+                    "alias_projection_activated",
+                    alias_activation,
+                    now,
+                )
+                entries = dependencies.journal.load(plan.sha256)
+                alias_state = _accepted_alias_projection_state(entries, plan)
+            if alias_state.activation is None:
+                raise ProductionCutoverError(
+                    "production_alias_projection_activation_missing"
+                )
             if _uses_packaged_cron_cutover(plan):
                 cron_state = _accepted_cron_cutover_state(entries, plan)
                 if cron_state.postflight is None:
@@ -8617,6 +9424,14 @@ def execute_cutover(
                 ],
                 "activation_commit_intent_receipt_sha256": (
                     activation_commit_intent["receipt_sha256"]
+                ),
+                "alias_projection_package_sha256": plan.value["artifacts"]
+                ["alias_projection"]["sha256"],
+                "alias_projection_activation_authority_sha256": (
+                    alias_state.activation_authority["authority_sha256"]
+                ),
+                "alias_projection_activation_receipt_sha256": (
+                    alias_state.activation["receipt_sha256"]
                 ),
                 "database_postflight_receipt_sha256": database_terminal[
                     "receipt_sha256"
@@ -8867,6 +9682,7 @@ def execute_fixed_staged(command: str) -> Mapping[str, Any]:
                 ),
                 journal=journal,
                 cron=ProductionCronCutoverBoundary(),
+                alias_projection=ProductionAliasProjectionCutoverBoundary(),
             ),
         )
     raise ValueError("production cutover command is invalid")

@@ -239,8 +239,8 @@ The public owner CLI exposes only `prepare-cutover` and `resume-cutover` for
 this transition. The remote action names described elsewhere in this document
 are sealed implementation steps; do not invoke them as substitute owner CLI
 actions. Create the output parent first as an owner-only directory. Every
-`--workspace`, `--output`, key, prerequisite, and accepted-receipt path passed
-below must be absolute.
+`--workspace`, `--output`, key, and prerequisite path passed below must be
+absolute.
 
 First prepare the exact freeze authority and the passkey-v2 request without
 staging the freeze publication:
@@ -249,6 +249,8 @@ staging the freeze publication:
 python -m scripts.canary.production_cutover_owner_launcher \
   prepare-cutover \
   --revision <exact-40-character-release-sha> \
+  --legacy-predecessor-revision \
+    f5ece3598efba6635e661aaa509d783fa2d802d8 \
   --isolated-canary-goal-prerequisite \
     /absolute/owner-only/cutover/isolated-canary-prerequisite.json \
   --owner-private-key /absolute/owner-only/cutover-owner-ed25519 \
@@ -257,11 +259,11 @@ python -m scripts.canary.production_cutover_owner_launcher \
     /absolute/owner-only/cutover/00-awaiting-bridge-bootstrap.json
 ```
 
-For `reseed_accepted_events`, replace the truth mode and also pass
-`--accepted-event-receipts /absolute/owner-only/cutover/accepted-events.json`;
-that file must contain exactly the top-level `accepted_event_receipts` list.
-Do not pass that option with `start_new_truth_epoch`. A successful prepare
-output has state `awaiting_bridge_bootstrap`.
+The initial bootstrap accepts only that exact legacy f5 predecessor, a
+strictly newer descendant release, and the owner-selected
+`start_new_truth_epoch` mode. There is no accepted-event input and no prose
+classification, inference, or reseed path. A successful prepare output has
+state `awaiting_bridge_bootstrap`.
 
 Advance exactly one durable state at a time. The first resume asks the legacy
 passkey verifier for the narrowly bound approval needed to install the
@@ -323,9 +325,12 @@ python -m scripts.canary.production_cutover_owner_launcher \
   --output /absolute/owner-only/cutover/04-cutover-staged.json
 ```
 
-Verify state `cutover_staged`. The fifth and final resume invokes only the
-fixed, idempotent internal `converge-cutover` root action and writes the
-terminal owner receipt:
+Verify state `cutover_staged`. The fifth and final resume invokes the fixed,
+idempotent internal `converge-cutover` root action, then the bootstrap-only
+`TARGET_ACTIVE` observer. It writes an activation receipt and recurrent
+predecessor-trust envelope only after the immutable root-owned/read-only target
+proves the complete 79-unit catalog. It never calls or emulates recurrent
+Stage-C `PREDECESSOR_ACTIVE`:
 
 ```bash
 python -m scripts.canary.production_cutover_owner_launcher \
@@ -334,6 +339,16 @@ python -m scripts.canary.production_cutover_owner_launcher \
   --workspace /absolute/owner-only/cutover/04-cutover-staged.json \
   --output /absolute/owner-only/cutover/05-cutover-terminal.json
 ```
+
+Terminalization additionally requires the exact recurrent v4 unit-input
+triplet to be present at the live staged paths: `unit-input-plan.json` and
+`unit-input-approval.json` are root-owned mode `0400`, and
+`production-unit-inputs.json` is root-owned mode `0444`. The release package's
+cutover v4 input document must equal the fixed document's canonical
+`project_fixed_inputs_to_cutover_v4` projection. The terminal predecessor
+trust uses the v4 plan hash, approval hash, and the fixed document's embedded
+`fixed_inputs_sha256`; the bootstrap FreezePlan and approval remain separately
+bound activation authority.
 
 The output writer is create-only. It accepts an existing file only for a
 byte-identical replay and otherwise fails with `owner_cutover_output_conflict`.
@@ -436,14 +451,26 @@ invoke a sibling socket or read a sibling state/credential projection.
 Gateway, writer, Discord connector, and the normal prerequisite services remain
 stopped throughout this isolated canary gate.
 
-The second host action starts the connector first and requires its in-process
-readiness before starting the writer. It never starts the gateway. The
-coordinator starts the gateway only after database postflight; the concrete
-service observer then fails closed if the live gateway process has a Discord
-token environment variable, an open connector/route-back credential file, a
-root process identity, or a gateway-owned privileged token lease. Terminal
-evidence requires gateway, writer, and connector active with the exact target
+The precommit host actions start only the 16 local/dormant long-running
+services and the Phase-B startup oneshot; all 30 socket/timer triggers remain
+disabled. The writer starts and reaches database postflight while both public
+ingress services—the Discord connector and gateway—remain stopped. After the
+durable activation commit intent, the host boot action starts the connector;
+the coordinator accepts its exact readiness and then starts the gateway. The
+connector is not a local-only prerequisite, and Caddy's web-ingress receipt is
+not Discord Gateway evidence. The gateway alone is in the voice-protected set,
+while connector and gateway are both in the public-ingress/session-drain set.
+Terminal evidence requires all 18 long-running services active, the Phase-B
+oneshot active/exited, and all 30 triggers enabled under the exact target
 unit/drop-in identities.
+
+The same cutover package now carries the existing three-unit alias-projection
+rail. Its preflight, install, and postflight run while gateway, writer, and
+connector are stopped; rollback restores its byte-exact prestate before any
+terminal authority. Only after writer, connector, and gateway activation does
+the coordinator issue the alias activation authority, start the exporter and
+projector, and enable the projector timer. The alias package and activation
+receipts are bound into the cutover terminal and initial activation receipt.
 
 Rollback requires all three services stopped, accepts only exact target or
 already-restored file identities, restores every exact backup, moves the

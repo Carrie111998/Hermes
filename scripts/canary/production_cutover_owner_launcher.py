@@ -40,6 +40,7 @@ from scripts.canary import full_canary_owner_launcher as canary_transport
 from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_authority as host_authority
 from scripts.canary import production_database_recovery_gate as database_recovery
+from scripts.canary import production_initial_release_bootstrap as initial_bootstrap
 from scripts.canary import production_cutover_passkey as cutover_passkey
 from scripts.canary import (
     production_cutover_unit_input_successor as unit_successor,
@@ -57,7 +58,7 @@ STOPPED_COLLECTOR_SCHEMA = "muncho-production-cutover-stopped-services.v1"
 OWNER_WORKSPACE_SCHEMA = "muncho-production-cutover-owner-workspace.v1"
 WORKFLOW_RECEIPT_SCHEMA = "muncho-production-cutover-owner-workflow.v4"
 PREPARED_WORKSPACE_SCHEMA = (
-    "muncho-production-cutover-passkey-workspace.v3"
+    "muncho-production-cutover-passkey-workspace.v4"
 )
 BRIDGE_BOOTSTRAP_INPUT_SCHEMA = (
     "muncho-production-cutover-bridge-bootstrap-input.v2"
@@ -69,6 +70,9 @@ BRIDGE_RECEIPT_SCHEMA = "muncho-owner-gate-caddy-approval-bridge.v2"
 CRON_STAGE_NOOP_SCHEMA = "muncho-production-cron-continuity-stage-noop.v1"
 CONVERGENCE_SCHEMA = "muncho-owner-gate-production-convergence.v1"
 MAX_JSON = 16 * 1024 * 1024
+LEGACY_F5_PREDECESSOR_REVISION = (
+    "f5ece3598efba6635e661aaa509d783fa2d802d8"
+)
 MAX_COLLECTOR_AGE_SECONDS = 900
 MINIMUM_V2_APPROVAL_MARGIN_SECONDS = 30
 LOCAL_RELEASE_PHASE_COMMANDS = {
@@ -363,6 +367,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         "apply-cutover",
         "commit-caddy-cutover",
         "converge-cutover",
+        "collect-bootstrap-target",
         "abort-freeze",
     })
 
@@ -960,6 +965,18 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "-m",
                 "scripts.canary.owner_gate_caddy_cutover",
                 phase,
+            )
+        if action == "collect-bootstrap-target":
+            return (
+                *prefix,
+                interpreter,
+                "-B",
+                "-I",
+                "-m",
+                "scripts.canary.production_initial_release_bootstrap",
+                "collect-target-active",
+                "--revision",
+                revision,
             )
         return (
             *prefix,
@@ -2561,6 +2578,9 @@ def _validate_terminal_receipt(
         "host_apply_receipt_sha256",
         "host_boot_commit_receipt_sha256",
         "activation_commit_intent_receipt_sha256",
+        "alias_projection_package_sha256",
+        "alias_projection_activation_authority_sha256",
+        "alias_projection_activation_receipt_sha256",
         "database_postflight_receipt_sha256",
         "gateway_observation_sha256",
         "writer_observation_sha256",
@@ -2954,6 +2974,7 @@ def execute_production_cutover_workflow(
     owner_subject_sha256: str,
     private_key: Ed25519PrivateKey,
     isolated_canary_goal_prerequisite: Mapping[str, Any],
+    legacy_predecessor_revision: str,
     truth_mode: str,
     accepted_event_receipts: list[Mapping[str, Any]] | None = None,
     passkey_proof: Mapping[str, Any] | None = None,
@@ -2963,6 +2984,7 @@ def execute_production_cutover_workflow(
     database_recovery_gate_runner: Any = database_recovery.run_for_owner,
     now_unix: int | None = None,
     clock: Callable[[], float] = time.time,
+    revision_ancestry_checker: Callable[[str, str], bool] | None = None,
 ) -> Mapping[str, Any]:
     """Execute the fixed production cutover state machine.
 
@@ -2981,8 +3003,40 @@ def execute_production_cutover_workflow(
     def gate_now() -> int:
         return int(clock()) if now_unix is None else now_unix
 
+    if revision_ancestry_checker is None:
+        def revision_ancestry_checker(predecessor: str, target: str) -> bool:
+            try:
+                completed = subprocess.run(
+                    (
+                        "/usr/bin/git",
+                        "merge-base",
+                        "--is-ancestor",
+                        predecessor,
+                        target,
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd=Path(__file__).resolve().parents[2],
+                    env={"LC_ALL": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+                    timeout=30,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return completed.returncode == 0
+
     if (
         package.REVISION.fullmatch(release_revision or "") is None
+        or legacy_predecessor_revision != LEGACY_F5_PREDECESSOR_REVISION
+        or release_revision == legacy_predecessor_revision
+        or release_revision[:12] == legacy_predecessor_revision[:12]
+        or truth_mode != "start_new_truth_epoch"
+        or accepted_event_receipts is not None
+        or not callable(revision_ancestry_checker)
+        or not revision_ancestry_checker(
+            legacy_predecessor_revision, release_revision
+        )
         or _SHA256.fullmatch(owner_subject_sha256 or "") is None
         or not callable(transport_factory)
         or not callable(database_recovery_gate_runner)
@@ -3142,6 +3196,7 @@ def execute_production_cutover_workflow(
             "schema": PREPARED_WORKSPACE_SCHEMA,
             "state": "awaiting_bridge_bootstrap",
             "release_revision": release_revision,
+            "legacy_predecessor_revision": legacy_predecessor_revision,
             "owner_subject_sha256": owner_subject_sha256,
             "freeze_plan": freeze.to_mapping(),
             "freeze_approval": freeze_approval,
@@ -3290,6 +3345,7 @@ _PREPARED_WORKSPACE_FIELDS = frozenset({
     "schema",
     "state",
     "release_revision",
+    "legacy_predecessor_revision",
     "owner_subject_sha256",
     "freeze_plan",
     "freeze_approval",
@@ -3355,6 +3411,12 @@ def resume_prepared_production_cutover_workflow(
         or package.REVISION.fullmatch(
             str(workspace.get("release_revision"))
         ) is None
+        or workspace.get("legacy_predecessor_revision")
+        != LEGACY_F5_PREDECESSOR_REVISION
+        or workspace.get("release_revision")
+        == workspace.get("legacy_predecessor_revision")
+        or str(workspace.get("release_revision"))[:12]
+        == str(workspace.get("legacy_predecessor_revision"))[:12]
         or _SHA256.fullmatch(
             str(workspace.get("owner_subject_sha256"))
         ) is None
@@ -3454,6 +3516,18 @@ def resume_prepared_production_cutover_workflow(
         raise OwnerCutoverError("owner_cutover_workspace_invalid") from None
     if (
         freeze.value["release_revision"] != release_revision
+        or freeze.value["cutover_authority"]["legacy_truth_decision"][
+            "mode"
+        ]
+        != "start_new_truth_epoch"
+        or freeze.value["cutover_authority"]["legacy_truth_decision"][
+            "accepted_event_receipts"
+        ]
+        != []
+        or freeze.value["cutover_authority"]["legacy_truth_decision"][
+            "accepted_event_ids"
+        ]
+        != []
         or freeze_publication != rebuilt_publication
         or freeze_publication.get("publication_sha256")
         != workspace["passkey_request"].get(
@@ -3734,7 +3808,7 @@ def resume_prepared_production_cutover_workflow(
             plan=durable_plan,
         )
         record("cutover_convergence_accepted", convergence)
-        return _build_workflow_receipt(
+        workflow_receipt = _build_workflow_receipt(
             release_revision=release_revision,
             freeze_plan_sha256=freeze.sha256,
             freeze_approval_sha256=approval["approval_sha256"],
@@ -3742,6 +3816,66 @@ def resume_prepared_production_cutover_workflow(
             convergence=convergence,
             gates=gates,
         )
+        try:
+            host_receipt = copy.deepcopy(dict(transport.invoke(
+                release_revision, "collect-bootstrap-target"
+            )))
+            host_unsigned = {
+                name: item
+                for name, item in host_receipt.items()
+                if name != "receipt_sha256"
+            }
+            if (
+                host_receipt.get("schema")
+                != initial_bootstrap.HOST_RECEIPT_SCHEMA
+                or host_receipt.get("legacy_predecessor_revision")
+                != workspace["legacy_predecessor_revision"]
+                or host_receipt.get("release_revision") != release_revision
+                or host_receipt.get("receipt_sha256")
+                != _sha(_canonical(host_unsigned))
+            ):
+                raise OwnerCutoverError(
+                    "owner_cutover_bootstrap_host_receipt_invalid"
+                )
+            terminal = _validate_terminal_receipt(
+                host_receipt["cutover_terminal_receipt"],
+                plan=durable_plan,
+            )
+            if (
+                terminal["receipt_sha256"]
+                != convergence["cutover_terminal_receipt_sha256"]
+            ):
+                raise OwnerCutoverError(
+                    "owner_cutover_bootstrap_host_receipt_invalid"
+                )
+            activation_receipt = (
+                initial_bootstrap.build_terminal_activation_receipt(
+                    legacy_predecessor_revision=workspace[
+                        "legacy_predecessor_revision"
+                    ],
+                    release_revision=release_revision,
+                    freeze_plan=freeze.to_mapping(),
+                    freeze_approval=approval,
+                    cutover_plan=durable_plan.to_mapping(),
+                    cutover_terminal_receipt=terminal,
+                    convergence_receipt=convergence,
+                    workflow_receipt=workflow_receipt,
+                    host_receipt=host_receipt,
+                )
+            )
+            return initial_bootstrap.build_terminal_envelope(
+                workflow_receipt=workflow_receipt,
+                activation_receipt=activation_receipt,
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            initial_bootstrap.ProductionInitialReleaseBootstrapError,
+        ) as exc:
+            raise OwnerCutoverError(
+                "owner_cutover_bootstrap_terminal_invalid"
+            ) from exc
 
     transport = transport_factory(owner_identity)
     freeze_staged = False
@@ -4117,6 +4251,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     os_login_migrate.add_argument("--output", type=Path, required=True)
     prepare = subparsers.add_parser("prepare-cutover")
     prepare.add_argument("--revision", required=True)
+    prepare.add_argument(
+        "--legacy-predecessor-revision",
+        choices=(LEGACY_F5_PREDECESSOR_REVISION,),
+        required=True,
+    )
     validation_authority = prepare.add_mutually_exclusive_group(required=True)
     validation_authority.add_argument(
         "--isolated-canary-goal-prerequisite", type=Path
@@ -4132,10 +4271,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     prepare.add_argument("--owner-private-key", type=Path, required=True)
     prepare.add_argument(
         "--truth-mode",
-        choices=("start_new_truth_epoch", "reseed_accepted_events"),
+        choices=("start_new_truth_epoch",),
         required=True,
     )
-    prepare.add_argument("--accepted-event-receipts", type=Path)
     prepare.add_argument("--output", type=Path, required=True)
     resume = subparsers.add_parser("resume-cutover")
     resume.add_argument("--revision", required=True)
@@ -4368,25 +4506,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise OwnerCutoverError(
                     "owner_cutover_workflow_input_invalid"
                 )
-            accepted = None
-            if arguments.accepted_event_receipts is not None:
-                if not arguments.accepted_event_receipts.is_absolute():
-                    raise OwnerCutoverError(
-                        "owner_cutover_event_receipts_invalid"
-                    )
-                accepted_value = _read_public_json(
-                    arguments.accepted_event_receipts
-                )
-                if (
-                    set(accepted_value) != {"accepted_event_receipts"}
-                    or not isinstance(
-                        accepted_value["accepted_event_receipts"], list
-                    )
-                ):
-                    raise OwnerCutoverError(
-                        "owner_cutover_event_receipts_invalid"
-                    )
-                accepted = accepted_value["accepted_event_receipts"]
             identity, trusted, configuration = (
                 build_production_cutover_owner_identity(
                     arguments.revision
@@ -4435,8 +4554,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 isolated_canary_goal_prerequisite=(
                     release_validation_authority
                 ),
+                legacy_predecessor_revision=(
+                    arguments.legacy_predecessor_revision
+                ),
                 truth_mode=arguments.truth_mode,
-                accepted_event_receipts=accepted,
+                accepted_event_receipts=None,
                 passkey_proof=None,
                 passkey_boundary=passkey_boundary,
                 prepare_only=True,

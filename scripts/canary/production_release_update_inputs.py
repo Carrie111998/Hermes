@@ -176,6 +176,7 @@ _HOST_SOURCE_FIELDS = frozenset(
         "sealed_runtime_artifact_request_sha256",
         "operational_asset_manifest_sha256",
         "operational_asset_verification_sha256",
+        "alias_projection_package_sha256",
     }
 )
 _SEALED_REQUEST_FIELDS = frozenset(
@@ -925,7 +926,9 @@ def validate_host_artifact_manifest(
     bindings = raw.get("plan_bindings")
     if (
         not isinstance(bindings, Mapping)
-        or set(bindings) != set(host_package.PLAN_BINDINGS)
+        or set(bindings)
+        != set(host_package.PLAN_BINDINGS)
+        | {host_package.ALIAS_PROJECTION_BINDING}
     ):
         _fail("release_update_inputs_host_manifest_invalid")
     assert isinstance(bindings, Mapping)
@@ -936,6 +939,16 @@ def validate_host_artifact_manifest(
             "sha256": artifact["sha256"],
         }:
             _fail("release_update_inputs_host_manifest_invalid")
+    alias_binding = bindings.get(host_package.ALIAS_PROJECTION_BINDING)
+    if alias_binding != {
+        "path": (
+            f"{release_root}/"
+            f"{host_package.ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT}/"
+            "manifest.json"
+        ),
+        "sha256": raw["source"]["alias_projection_package_sha256"],
+    }:
+        _fail("release_update_inputs_host_manifest_invalid")
     return raw
 
 

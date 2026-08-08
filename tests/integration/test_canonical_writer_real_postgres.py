@@ -1556,6 +1556,48 @@ def _dispatch(
     return response["result"]
 
 
+def _restart_real_postgres_writer(stack: RealWriterStack) -> None:
+    """Restart PG18 and reconstruct the attested writer service boundary."""
+
+    _run(["docker", "restart", stack.name])
+    _wait_ready(stack.name)
+
+    previous_database = stack.backend._database
+    mapping = _run(["docker", "port", stack.name, "5432/tcp"]).stdout.strip()
+    config = replace(
+        previous_database._config,
+        port=int(mapping.rsplit(":", 1)[1]),
+    )
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            tls_probe = _open_postgres_session(config)
+        except Exception:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+            continue
+        tls_probe.close()
+        break
+
+    database = CanonicalWriterDB(
+        config=config,
+        privilege_policy=_production_policy(config),
+        statements=PRODUCTION_STATEMENT_CATALOG,
+        _managed_hba_probe=lambda _config: _test_managed_hba_receipt(config),
+    )
+    database.startup_attest()
+    backend = PostgresCanonicalWriterBackend(database)
+    stack.backend = backend
+    stack.handlers = CanonicalWriterHandlers(
+        backend,
+        discord_edge_authority=CanonicalWriterDiscordAuthority(
+            capability_private_key=WRITER_CAPABILITY_PRIVATE_KEY,
+            edge_receipt_public_key=EDGE_RECEIPT_PRIVATE_KEY.public_key(),
+        ),
+    )
+
+
 def _verified_discord_receipt(edge_request: dict[str, object]) -> dict[str, object]:
     request = parse_request_for_reconciliation(edge_request)
     capability = verify_request_capability_for_reconciliation(
@@ -2387,6 +2429,10 @@ def test_real_postgres_routeback_claim_has_global_identity_and_exact_pending_sco
     assert legacy_free_retry["ok"] is True
     assert legacy_free_retry["result"]["state"] == "authorized"
     assert legacy_free_retry["result"]["deduped"] is True
+
+    # Exercise the same signed routeback lineage across a real PG18 process
+    # restart, not only a reconstructed writer runtime identity.
+    _restart_real_postgres_writer(stack)
 
     restarted_runtime = _runtime(
         "route-restart-recovery",

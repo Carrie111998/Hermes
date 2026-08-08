@@ -2881,6 +2881,8 @@ def test_sealed_cli_exposes_only_prepare_and_resume_cutover_workflow(
     common = [
         "--revision",
         REVISION,
+        "--legacy-predecessor-revision",
+        owner.LEGACY_F5_PREDECESSOR_REVISION,
         "--isolated-canary-goal-prerequisite",
         str(canary_prerequisite_path),
         "--owner-private-key",
@@ -2954,6 +2956,8 @@ def test_sealed_cli_builds_exact_owner_signed_direct_mvp_waiver(
         "prepare-cutover",
         "--revision",
         REVISION,
+        "--legacy-predecessor-revision",
+        owner.LEGACY_F5_PREDECESSOR_REVISION,
         "--owner-approved-direct-mvp-no-canary",
         "--owner-private-key",
         str(key_path),
@@ -3016,6 +3020,9 @@ def test_direct_mvp_terminal_is_truthful_and_waiver_bound() -> None:
         "host_apply_receipt_sha256": "7" * 64,
         "host_boot_commit_receipt_sha256": "8" * 64,
         "activation_commit_intent_receipt_sha256": "9" * 64,
+        "alias_projection_package_sha256": "e" * 64,
+        "alias_projection_activation_authority_sha256": "f" * 64,
+        "alias_projection_activation_receipt_sha256": "0" * 64,
         "database_postflight_receipt_sha256": "a" * 64,
         "gateway_observation_sha256": "b" * 64,
         "writer_observation_sha256": "c" * 64,
@@ -3140,6 +3147,40 @@ def _durable_workflow_fixture(
     )
     services, initial, host, _host_plan = workflow._workflow_inputs()
 
+    def bootstrap_activation(**kwargs) -> dict:
+        freeze_plan = kwargs["freeze_plan"]
+        unsigned = {
+            "schema": owner.initial_bootstrap.ACTIVATION_RECEIPT_SCHEMA,
+            "legacy_predecessor_revision": kwargs[
+                "legacy_predecessor_revision"
+            ],
+            "release_revision": kwargs["release_revision"],
+            "freeze_plan_sha256": freeze_plan["plan_sha256"],
+            "freeze_approval_sha256": kwargs["freeze_approval"][
+                "approval_sha256"
+            ],
+            "unit_input_authority_plan_sha256": "1" * 64,
+            "unit_input_authority_approval_sha256": "2" * 64,
+            "fixed_unit_inputs_sha256": "3" * 64,
+            "owner_subject_sha256": freeze_plan["owner_subject_sha256"],
+            "owner_public_key_ed25519_hex": freeze_plan[
+                "owner_public_key_ed25519_hex"
+            ],
+            "owner_key_id": freeze_plan["owner_key_id"],
+            "secret_material_recorded": False,
+            "secret_digest_recorded": False,
+        }
+        return {
+            **unsigned,
+            "receipt_sha256": hashlib.sha256(_canonical(unsigned)).hexdigest(),
+        }
+
+    monkeypatch.setattr(
+        owner.initial_bootstrap,
+        "build_terminal_activation_receipt",
+        bootstrap_activation,
+    )
+
     class PasskeyBoundary:
         def __init__(self) -> None:
             self.request_id: str | None = None
@@ -3216,11 +3257,146 @@ def _durable_workflow_fixture(
             return workflow._bridge_receipt(document, self.request)
 
     class WorkflowTransport(workflow._WorkflowTransport):
+        cutover_terminal: dict | None = None
+
         def invoke(self, revision: str, action: str, **kwargs) -> dict:
+            if action == "collect-bootstrap-target":
+                self.calls.append(action)
+                assert self.cutover_terminal is not None
+                assert self.cutover_plan is not None
+                freeze = self.cutover_plan.value["freeze_plan"]
+                unit_plan = {
+                    "schema": owner.initial_bootstrap.unit_inputs_v4.PLAN_SCHEMA,
+                    "release_revision": REVISION,
+                    "plan_sha256": "1" * 64,
+                    "owner_subject_sha256": freeze["owner_subject_sha256"],
+                    "owner_public_key_ed25519_hex": freeze[
+                        "owner_public_key_ed25519_hex"
+                    ],
+                    "owner_key_id": freeze["owner_key_id"],
+                }
+                unit_approval = {
+                    "schema": (
+                        owner.initial_bootstrap.unit_inputs_v4.APPROVAL_SCHEMA
+                    ),
+                    "release_revision": REVISION,
+                    "approval_sha256": "2" * 64,
+                }
+                fixed_inputs = {
+                    "schema": (
+                        owner.initial_bootstrap.unit_inputs_v4.FIXED_INPUTS_SCHEMA
+                    ),
+                    "release_revision": REVISION,
+                    "unit_input_authority_plan_sha256": "1" * 64,
+                    "unit_input_authority_approval_sha256": "2" * 64,
+                    "fixed_inputs_sha256": "3" * 64,
+                }
+                unsigned_host = {
+                    "schema": owner.initial_bootstrap.HOST_RECEIPT_SCHEMA,
+                    "legacy_predecessor_revision": (
+                        owner.LEGACY_F5_PREDECESSOR_REVISION
+                    ),
+                    "release_revision": REVISION,
+                    "consumer_unit_count": 79,
+                    "fixed_unit_inputs_sha256": "3" * 64,
+                    "unit_input_authority": {
+                        "plan": unit_plan,
+                        "approval": unit_approval,
+                        "fixed_inputs": fixed_inputs,
+                    },
+                    "release_publication_receipt_sha256": "4" * 64,
+                    "release_payload_tree_sha256": "5" * 64,
+                    "release_consumer_set_sha256": "6" * 64,
+                    "consumer_catalog_sha256": "7" * 64,
+                    "immutable_unit_paths_sha256": "8" * 64,
+                    "runtime_safety_plan": {
+                        "runtime_safety_plan_sha256": "9" * 64,
+                    },
+                    "target_active_observation": {
+                        "receipt_sha256": "0" * 64,
+                    },
+                    "trust_anchors": {
+                        "alias_projection_package_sha256": "a" * 64,
+                    },
+                    "cutover_terminal_receipt": copy.deepcopy(
+                        self.cutover_terminal
+                    ),
+                }
+                return {
+                    **unsigned_host,
+                    "receipt_sha256": hashlib.sha256(
+                        _canonical(unsigned_host)
+                    ).hexdigest(),
+                }
             if action != "converge-cutover":
                 return super().invoke(revision, action, **kwargs)
             self.calls.append(action)
             assert self.cutover_plan is not None
+            validation_mode, validation_authority = (
+                cutover._validate_release_validation_authority(
+                    self.cutover_plan.value["freeze_plan"][
+                        "cutover_authority"
+                    ]["isolated_canary_goal_prerequisite"],
+                    revision=REVISION,
+                )
+            )
+            assert validation_mode == "release_bound_isolated_canary"
+            equivalence = cutover._build_production_isolation_equivalence(
+                plan=self.cutover_plan,
+                evidence=validation_authority,
+            )
+            terminal_unsigned = {
+                "schema": cutover.TERMINAL_SCHEMA,
+                "plan_sha256": self.cutover_plan.sha256,
+                "freeze_plan_sha256": self.cutover_plan.value[
+                    "freeze_plan_sha256"
+                ],
+                "freeze_approval_sha256": self.cutover_plan.value[
+                    "freeze_approval_sha256"
+                ],
+                "approval_sha256": "1" * 64,
+                "final_tail_receipt_sha256": self.cutover_plan.value[
+                    "final_tail_receipt_sha256"
+                ],
+                "capability_prerequisite_receipt_sha256": "2" * 64,
+                "capability_prerequisite_file_sha256": "3" * 64,
+                "zero_canonical_database_mutation_observed": True,
+                "pre_db_zero_write_observation_sha256": "4" * 64,
+                "capability_topology_identity_sha256": "5" * 64,
+                "database_apply_receipt_sha256": "6" * 64,
+                "host_apply_receipt_sha256": "7" * 64,
+                "host_boot_commit_receipt_sha256": "8" * 64,
+                "activation_commit_intent_receipt_sha256": "9" * 64,
+                "alias_projection_package_sha256": "a" * 64,
+                "alias_projection_activation_authority_sha256": "b" * 64,
+                "alias_projection_activation_receipt_sha256": "c" * 64,
+                "database_postflight_receipt_sha256": "d" * 64,
+                "gateway_observation_sha256": "e" * 64,
+                "writer_observation_sha256": "f" * 64,
+                "connector_observation_sha256": "0" * 64,
+                "direct_discord_disabled": True,
+                "discord_dm_allowed": False,
+                "rollback_used": False,
+                "secret_material_recorded": False,
+                "completed_at_unix": NOW,
+                "isolated_canary_goal_continuation_terminal_sha256": (
+                    validation_authority[
+                        "goal_continuation_terminal_sha256"
+                    ]
+                ),
+                "isolated_canary_workspace_gateway_receipt_sha256": (
+                    validation_authority["workspace_gateway_receipt_sha256"]
+                ),
+                "isolation_equivalence_projection_sha256": equivalence[
+                    "projection_sha256"
+                ],
+            }
+            self.cutover_terminal = {
+                **terminal_unsigned,
+                "receipt_sha256": hashlib.sha256(
+                    _canonical(terminal_unsigned)
+                ).hexdigest(),
+            }
             unsigned = {
                 "schema": owner.CONVERGENCE_SCHEMA,
                 "release_revision": REVISION,
@@ -3231,7 +3407,9 @@ def _durable_workflow_fixture(
                 "preflight_receipt_sha256": "1" * 64,
                 "caddy_prepare_receipt_sha256": "2" * 64,
                 "maintenance_arm_receipt_sha256": "3" * 64,
-                "cutover_terminal_receipt_sha256": "4" * 64,
+                "cutover_terminal_receipt_sha256": self.cutover_terminal[
+                    "receipt_sha256"
+                ],
                 "caddy_terminal_receipt_sha256": "5" * 64,
                 "caddy_outcome": "private_v2_active",
                 "legacy_service_retirement_receipt_sha256": "6" * 64,
@@ -3258,6 +3436,7 @@ def _durable_workflow_fixture(
     transport = WorkflowTransport(initial, host, services)
     workspace = owner.execute_production_cutover_workflow(
         release_revision=REVISION,
+        legacy_predecessor_revision=owner.LEGACY_F5_PREDECESSOR_REVISION,
         owner_identity=object(),
         owner_subject_sha256="a" * 64,
         private_key=Ed25519PrivateKey.generate(),
@@ -3265,6 +3444,10 @@ def _durable_workflow_fixture(
             _isolated_canary_goal_prerequisite()
         ),
         truth_mode="start_new_truth_epoch",
+        revision_ancestry_checker=lambda predecessor, target: (
+            predecessor == owner.LEGACY_F5_PREDECESSOR_REVISION
+            and target == REVISION
+        ),
         passkey_boundary=boundary,
         prepare_only=True,
         transport_factory=lambda _identity: prepare_transport,
@@ -3329,16 +3512,26 @@ def test_durable_cutover_workspace_stops_before_convergence(
         now_unix=NOW + 3_600,
     )
 
-    assert transport.calls[-1:] == ["converge-cutover"]
+    assert transport.calls[-2:] == [
+        "converge-cutover",
+        "collect-bootstrap-target",
+    ]
     assert transport.calls.count("converge-cutover") == 1
-    assert receipt["schema"] == owner.WORKFLOW_RECEIPT_SCHEMA
-    assert receipt["convergence_receipt_sha256"] == (
+    assert receipt["schema"] == owner.initial_bootstrap.TERMINAL_ENVELOPE_SCHEMA
+    workflow_receipt = receipt["workflow_receipt"]
+    assert workflow_receipt["schema"] == owner.WORKFLOW_RECEIPT_SCHEMA
+    assert workflow_receipt["convergence_receipt_sha256"] == (
         transport.convergence_receipt["receipt_sha256"]
     )
-    assert receipt["terminal_receipt_sha256"] == "4" * 64
-    assert receipt["legacy_service_retirement_receipt_sha256"] == "6" * 64
-    assert receipt["caddy_outcome"] == "private_v2_active"
-    assert receipt["gates"][-1]["stage"] == "cutover_convergence_accepted"
+    assert workflow_receipt["terminal_receipt_sha256"] == (
+        transport.cutover_terminal["receipt_sha256"]
+    )
+    assert workflow_receipt["legacy_service_retirement_receipt_sha256"] == "6" * 64
+    assert workflow_receipt["caddy_outcome"] == "private_v2_active"
+    assert workflow_receipt["gates"][-1]["stage"] == "cutover_convergence_accepted"
+    assert receipt["predecessor_trust"]["activation_receipt_sha256"] == (
+        receipt["activation_receipt"]["receipt_sha256"]
+    )
     assert boundary.consume_calls == 1
 
     replayed = owner.resume_prepared_production_cutover_workflow(
@@ -3369,7 +3562,7 @@ def test_terminal_workflow_receipt_rejects_rebound_retirement_receipt(
         transport_factory=lambda _identity: transport,
         now_unix=NOW,
     )
-    changed = copy.deepcopy(receipt)
+    changed = copy.deepcopy(receipt["workflow_receipt"])
     changed["legacy_service_retirement_receipt_sha256"] = "f" * 64
     changed["receipt_sha256"] = hashlib.sha256(_canonical({
         name: item
@@ -3390,8 +3583,47 @@ def test_terminal_workflow_receipt_rejects_rebound_retirement_receipt(
             ],
             cutover_plan_sha256=workspace["cutover_plan"]["plan_sha256"],
             convergence=transport.convergence_receipt,
-            gates=receipt["gates"],
+            gates=receipt["workflow_receipt"]["gates"],
         )
+
+
+@pytest.mark.parametrize(
+    ("override", "ancestry"),
+    (
+        ({"legacy_predecessor_revision": "0" * 40}, True),
+        ({"truth_mode": "reseed_accepted_events"}, True),
+        ({"accepted_event_receipts": []}, True),
+        ({}, False),
+    ),
+)
+def test_initial_bootstrap_rejects_non_exact_semantic_authority(
+    override: dict,
+    ancestry: bool,
+) -> None:
+    arguments = {
+        "release_revision": REVISION,
+        "legacy_predecessor_revision": (
+            owner.LEGACY_F5_PREDECESSOR_REVISION
+        ),
+        "owner_identity": object(),
+        "owner_subject_sha256": "a" * 64,
+        "private_key": Ed25519PrivateKey.generate(),
+        "isolated_canary_goal_prerequisite": {},
+        "truth_mode": "start_new_truth_epoch",
+        "accepted_event_receipts": None,
+        "transport_factory": lambda _identity: object(),
+        "database_recovery_gate_runner": lambda **_kwargs: {},
+        "revision_ancestry_checker": (
+            lambda _predecessor, _target: ancestry
+        ),
+    }
+    arguments.update(override)
+
+    with pytest.raises(
+        owner.OwnerCutoverError,
+        match="owner_cutover_workflow_input_invalid",
+    ):
+        owner.execute_production_cutover_workflow(**arguments)
 
 
 def test_cutover_staged_tamper_rejects_before_remote_action(

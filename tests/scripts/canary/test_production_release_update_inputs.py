@@ -240,6 +240,16 @@ def _host_manifest(
                 "sha256": artifacts[name]["sha256"],
             }
             for binding, name in host_package.PLAN_BINDINGS.items()
+        }
+        | {
+            host_package.ALIAS_PROJECTION_BINDING: {
+                "path": (
+                    f"{release_root}/"
+                    f"{host_package.ALIAS_PROJECTION_PACKAGE_RELATIVE_ROOT}/"
+                    "manifest.json"
+                ),
+                "sha256": source["alias_projection_package_sha256"],
+            }
         },
         "secret_material_recorded": False,
     }
