@@ -11,8 +11,9 @@ byte-identical to the session's chat_id. QQ DM approvals could never be granted
 by button; users had to fall back to ``/approve``.
 
 These are behaviour contracts, not snapshots: the invariant is "the chat_type
-the session key generator emits must be authorizable", plus "widening the
-vocabulary must not widen who is allowed".
+the session key generator emits must be authorizable", plus two bounds —
+widening the vocabulary must not widen *who* is allowed, and it must not extend
+to spellings this adapter never produces.
 """
 import types
 
@@ -36,17 +37,34 @@ def _authorized(session_key, operator, group=None, guild=None):
     )
 
 
-# The vocabulary that must authorize a 1:1 chat. "dm" is what the gateway
-# writes; "c2c" is what QQ's own API calls the same scene.
-@pytest.mark.parametrize("chat_type", ["dm", "c2c", "direct", "private"])
+# The vocabulary that must authorize a 1:1 chat, and no wider. "dm" is what
+# gateway-built session keys carry (adapter.py:1301); "c2c" is what the
+# update-prompt path puts in its key via ``event.scene``. Both reach this
+# authorizer in production.
+ONE_TO_ONE_CHAT_TYPES = ["dm", "c2c"]
+
+
+@pytest.mark.parametrize("chat_type", ONE_TO_ONE_CHAT_TYPES)
 def test_owner_may_approve_own_dm_regardless_of_chat_type_spelling(chat_type):
     assert _authorized(f"agent:main:qqbot:{chat_type}:{OWNER}", OWNER) is True
 
 
-@pytest.mark.parametrize("chat_type", ["dm", "c2c", "direct", "private"])
+@pytest.mark.parametrize("chat_type", ONE_TO_ONE_CHAT_TYPES)
 def test_stranger_may_not_approve_someone_elses_dm(chat_type):
     """Widening the chat_type vocabulary must not widen authorization."""
     assert _authorized(f"agent:main:qqbot:{chat_type}:{OWNER}", STRANGER) is False
+
+
+@pytest.mark.parametrize("chat_type", ["direct", "private", "im", "user"])
+def test_chat_types_this_adapter_never_emits_are_not_authorized(chat_type):
+    """Keep the authorization vocabulary minimal.
+
+    ``gateway/slash_access.py`` treats "direct"/"private" as DM aliases, but the
+    QQ adapter only ever builds "dm", "group" and "guild" (adapter.py:1301,
+    1366, 1441). Accepting a spelling this adapter cannot produce would widen
+    the authorization surface for nothing, so it must stay rejected.
+    """
+    assert _authorized(f"agent:main:qqbot:{chat_type}:{OWNER}", OWNER) is False
 
 
 def test_dm_chat_type_written_by_session_key_builder_is_authorizable():
