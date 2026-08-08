@@ -44,7 +44,20 @@ function renderRow(session: SessionInfo) {
 
 afterEach(cleanup)
 
-describe('SidebarSessionRow Codex delivery badge', () => {
+describe('SidebarSessionRow bridge badges', () => {
+  it('keeps the provider badge but omits the non-actionable catalog-only mirror state', () => {
+    renderRow(
+      makeSession({
+        bridge_mirror_state: 'catalog_only',
+        bridge_provider: 'claude',
+        source: 'claude'
+      })
+    )
+
+    expect(screen.getByText('Claude')).toBeTruthy()
+    expect(screen.queryByText('Catalog only')).toBeNull()
+  })
+
   it.each([
     ['pending', 'Pending', 'text-(--ui-accent)'],
     ['visible', 'Visible in Codex', 'text-(--ui-text-tertiary)'],

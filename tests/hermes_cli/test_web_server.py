@@ -1870,6 +1870,30 @@ class TestWebServerEndpoints:
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
 
+    def test_profiles_sessions_sidebar_accepts_window_above_500(self):
+        """Load-more must be able to reach every non-empty session in a large
+        profile instead of silently stopping at the old 500-row transport cap."""
+        from hermes_state import SessionDB
+
+        expected = {f"large-sidebar-{index:04d}" for index in range(501)}
+        db = SessionDB()
+        try:
+            for session_id in expected:
+                db.create_session(session_id=session_id, source="desktop")
+                db.append_message(session_id=session_id, role="user", content="hi")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all&recents_limit=501&recents_exclude=cron,telegram"
+            "&cron_limit=1&messaging_limit=1"
+            "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
+        )
+        assert resp.status_code == 200
+        returned = {session["id"] for session in resp.json()["recents"]["sessions"]}
+        assert expected <= returned
+
     def test_profiles_sessions_sidebar_enriches_bridge_provider(self):
         """Imported Claude/Codex sessions must keep their provider badge on the
         batched sidebar route. The perf refactor 40160e2a0 added this route

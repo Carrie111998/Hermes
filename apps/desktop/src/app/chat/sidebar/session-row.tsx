@@ -98,16 +98,17 @@ export function SidebarSessionRow({
   const driverBadge = bridgeProvider ? null : sessionDriverLabel(session.driver)
   const driverDescription = driverBadge ? r.sessionDriver(driverBadge) : null
 
-  const bridgeMirrorState = session.bridge_mirror_state
-    ? {
-        catalog_only: r.bridgeCatalogOnly,
-        continued: r.bridgeContinued,
-        diverged: r.bridgeDiverged,
-        failed: r.bridgeFailed,
-        mirrored: r.bridgeMirrored,
-        queued: r.bridgeQueued
-      }[session.bridge_mirror_state]
-    : null
+  const bridgeMirrorState =
+    session.bridge_mirror_state && session.bridge_mirror_state !== 'catalog_only'
+      ? {
+          catalog_only: r.bridgeCatalogOnly,
+          continued: r.bridgeContinued,
+          diverged: r.bridgeDiverged,
+          failed: r.bridgeFailed,
+          mirrored: r.bridgeMirrored,
+          queued: r.bridgeQueued
+        }[session.bridge_mirror_state]
+      : null
 
   const bridgeProviderDescription = bridgeProvider ? r.bridgeProvider(bridgeProvider) : null
   const bridgeMirrorStateDescription = bridgeMirrorState ? r.bridgeMirrorState(bridgeMirrorState) : null

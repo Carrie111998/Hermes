@@ -4670,7 +4670,7 @@ def get_profiles_sessions_sidebar(
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
-    recents_cap = min(max(recents_limit, 1), 500)
+    recents_cap = min(max(recents_limit, 1), 5000)
     cron_cap = min(max(cron_limit, 1), 500)
     messaging_cap = min(max(messaging_limit, 1), 500)
 
