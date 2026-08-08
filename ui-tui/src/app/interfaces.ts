@@ -334,6 +334,7 @@ export interface UiState {
   notice: Notice | null
   pasteCollapseLines: number
   pasteCollapseChars: number
+  pasteCollapseDataChars: number
 
   sections: SectionVisibility
   sessionTitle: string

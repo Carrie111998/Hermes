@@ -229,6 +229,28 @@ const _pasteCollapseCharsFromConfig = (cfg: ConfigFullResponse | null): number =
   return 2000
 }
 
+const _pasteCollapseDataCharsFromConfig = (cfg: ConfigFullResponse | null): number => {
+  if (!cfg?.config) {
+    return 500
+  }
+
+  const raw = cfg.config.paste_collapse_data_threshold
+
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
+    return Math.round(raw)
+  }
+
+  if (typeof raw === 'string') {
+    const n = parseInt(raw, 10)
+
+    if (Number.isFinite(n) && n >= 0) {
+      return n
+    }
+  }
+
+  return 500
+}
+
 /** Fetch ``config.get full`` and fan the result through ``applyDisplay``.
  *
  * Extracted so the mtime-reload path can be exercised by the test
@@ -281,6 +303,7 @@ export const applyDisplay = (
     mouseTracking: normalizeMouseTracking(d),
     pasteCollapseLines: _pasteCollapseLinesFromConfig(cfg),
     pasteCollapseChars: _pasteCollapseCharsFromConfig(cfg),
+    pasteCollapseDataChars: _pasteCollapseDataCharsFromConfig(cfg),
     sections: resolveSections(d.sections),
     showReasoning: !!d.show_reasoning,
     statusBar: normalizeStatusBar(d.tui_statusbar),

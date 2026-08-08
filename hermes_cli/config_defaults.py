@@ -3051,9 +3051,18 @@ DEFAULT_CONFIG = {
     #   reaches this value collapse to a file reference even if line
     #   count is below the line threshold. Catches the "8000 chars of
     #   minified JSON / log output on one line" case. Set 0 to disable.
+    #
+    # paste_collapse_data_threshold (default 500)
+    #   Whitespace-free single-line paste guard. A paste with no
+    #   whitespace at all whose total length reaches this value
+    #   collapses even below the char threshold — catches ~1-2KB data
+    #   dumps (unit/ID streams, base64, log lines, minified output)
+    #   that sit under paste_collapse_char_threshold but are clearly
+    #   not prose (prose always contains whitespace). Set 0 to disable.
     "paste_collapse_threshold": 5,
     "paste_collapse_threshold_fallback": 5,
     "paste_collapse_char_threshold": 2000,
+    "paste_collapse_data_threshold": 500,
 
     # Computer Use (cua-driver) toolset settings.
     "computer_use": {

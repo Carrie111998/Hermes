@@ -3503,6 +3503,33 @@ def _should_auto_attach_clipboard_image_on_paste(pasted_text: str) -> bool:
     return not pasted_text.strip()
 
 
+def _should_collapse_paste(
+    text: str,
+    line_count: int,
+    threshold: int,
+    char_threshold: int,
+    data_threshold: int,
+) -> bool:
+    """Paste-collapse decision shared by the bracketed-paste and fallback handlers.
+
+    Collapse a paste to a file reference when it is too big to sit in the
+    input raw: enough lines (``threshold``), enough total chars
+    (``char_threshold``), or a whitespace-free single line long enough that it
+    can only be data — unit/ID streams, base64, log lines, minified output
+    (``data_threshold``). Prose always contains whitespace, so the data-like
+    test never fires on normal text. A threshold of 0 disables that guard.
+    """
+    if threshold > 0 and line_count >= threshold:
+        return True
+    if char_threshold > 0 and len(text) >= char_threshold:
+        return True
+    return (
+        data_threshold > 0
+        and len(text) >= data_threshold
+        and not re.search(r"\s", text)
+    )
+
+
 def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     from hermes_cli.input_sanitize import strip_leaked_bracketed_paste_wrappers
 
@@ -16361,9 +16388,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 buf = event.current_buffer
                 threshold = self.config.get("paste_collapse_threshold", 5)
                 char_threshold = self.config.get("paste_collapse_char_threshold", 2000)
-                lines_hit = threshold > 0 and line_count >= threshold
-                chars_hit = char_threshold > 0 and len(pasted_text) >= char_threshold
-                if (lines_hit or chars_hit) and not buf.text.strip().startswith('/'):
+                data_threshold = self.config.get("paste_collapse_data_threshold", 500)
+                if _should_collapse_paste(
+                    pasted_text, line_count, threshold, char_threshold, data_threshold
+                ) and not buf.text.strip().startswith('/'):
                     _paste_counter[0] += 1
                     paste_dir = _hermes_home / "pastes"
                     paste_dir.mkdir(parents=True, exist_ok=True)
@@ -16532,9 +16560,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             is_paste = chars_added > 1 or newlines_added >= 4
             threshold = self.config.get("paste_collapse_threshold_fallback", 5)
             char_threshold = self.config.get("paste_collapse_char_threshold", 2000)
-            lines_hit = threshold > 0 and line_count >= threshold
-            chars_hit = char_threshold > 0 and len(text) >= char_threshold
-            if (lines_hit or chars_hit) and is_paste and not text.startswith('/'):
+            data_threshold = self.config.get("paste_collapse_data_threshold", 500)
+            if _should_collapse_paste(
+                text, line_count, threshold, char_threshold, data_threshold
+            ) and is_paste and not text.startswith('/'):
                 _paste_counter[0] += 1
                 paste_dir = _hermes_home / "pastes"
                 paste_dir.mkdir(parents=True, exist_ok=True)

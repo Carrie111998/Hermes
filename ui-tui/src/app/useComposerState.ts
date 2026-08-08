@@ -18,6 +18,7 @@ import { resolveEditor } from '../lib/editor.js'
 import { readOsc52Clipboard } from '../lib/osc52.js'
 import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
+import { shouldCollapsePaste } from '../lib/pasteCollapse.js'
 
 import type {
   ComposerPasteResult,
@@ -275,10 +276,16 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       const lineCount = cleanedText.split('\n').length
       const pasteCollapseLines = getUiState().pasteCollapseLines
       const pasteCollapseChars = getUiState().pasteCollapseChars
-      const linesHit = pasteCollapseLines > 0 && lineCount >= pasteCollapseLines
-      const charsHit = pasteCollapseChars > 0 && cleanedText.length >= pasteCollapseChars
+      const pasteCollapseDataChars = getUiState().pasteCollapseDataChars
+      const collapse = shouldCollapsePaste({
+        text: cleanedText,
+        lineCount,
+        linesThreshold: pasteCollapseLines,
+        charsThreshold: pasteCollapseChars,
+        dataCharsThreshold: pasteCollapseDataChars
+      })
 
-      if (!linesHit && !charsHit) {
+      if (!collapse) {
         return {
           cursor: cursor + cleanedText.length,
           value: value.slice(0, cursor) + cleanedText + value.slice(cursor)

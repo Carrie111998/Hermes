@@ -124,6 +124,7 @@ export interface ConfigFullResponse {
     voice?: ConfigVoiceConfig
     paste_collapse_threshold?: number
     paste_collapse_char_threshold?: number
+    paste_collapse_data_threshold?: number
   }
 }
 
