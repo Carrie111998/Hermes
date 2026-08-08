@@ -10,6 +10,7 @@ omission.
 Run with:  python -m pytest tests/tools/test_read_extract.py -v
 """
 
+import base64
 import json
 import os
 import tempfile
@@ -237,8 +238,11 @@ class TestAnydocInitLifecycle(unittest.TestCase):
         self._saved_retry = read_extract.ANYDOC_RETRY_SECONDS
         read_extract._anydoc_module = read_extract._ANYDOC_UNSET
         read_extract._anydoc_failed_at = None
+        self._ensure = mock.patch("tools.lazy_deps.ensure", return_value=None)
+        self._ensure.start()
 
     def tearDown(self):
+        self._ensure.stop()
         self.rex._anydoc_module = self._saved_module
         self.rex._anydoc_failed_at = self._saved_failed_at
         self.rex.ANYDOC_RETRY_SECONDS = self._saved_retry
@@ -255,6 +259,13 @@ class TestAnydocInitLifecycle(unittest.TestCase):
             self.assertIs(self.rex._anydoc(), fake)
             self.assertIs(self.rex._anydoc(), fake)
         self.assertEqual(calls, ["anydoc"])
+
+    def test_failed_reconciliation_does_not_import_unverified_binding(self):
+        with mock.patch(
+            "tools.lazy_deps.ensure", side_effect=RuntimeError("wrong version")
+        ), mock.patch("importlib.import_module") as import_module:
+            self.assertIsNone(self.rex._anydoc())
+        import_module.assert_not_called()
 
     def test_failed_load_is_retried_after_cooldown(self):
         fake = object()
@@ -466,14 +477,64 @@ class TestReadFileToolIntegration(unittest.TestCase):
         self.assertIn("print(1)", res["content"])
 
 
-    def test_corrupt_docx_falls_through_to_binary_guard(self):
+    def test_corrupt_docx_surfaces_extraction_error(self):
         p = os.path.join(self.tmp, "bad.docx")
         with open(p, "wb") as fh:
             fh.write(b"not a zip")
         res = json.loads(read_file_tool(p))
-        # Should NOT crash; falls through to the binary-extension guard.
+        # Should NOT crash; the binary guard fires but surfaces the
+        # specific extraction failure instead of the generic message.
         self.assertIn("error", res)
-        self.assertIn("binary", res["error"].lower())
+        self.assertIn("extraction failed", res["error"].lower())
+        self.assertIn("docx", res["error"].lower())
+
+    def test_oversized_anydoc_read_surfaces_size_error(self):
+        import tools.read_extract as rex
+
+        saved_cap = rex.MAX_ANYDOC_BYTES
+        saved_module = rex._anydoc_module
+
+        class _FakeAnydoc:
+            def to_markdown(self, path):  # pragma: no cover - must not be called
+                raise AssertionError("conversion should be rejected before call")
+
+        rex._anydoc_module = _FakeAnydoc()
+        rex.MAX_ANYDOC_BYTES = 10
+        try:
+            p = os.path.join(self.tmp, "big.pdf")
+            with open(p, "wb") as fh:
+                fh.write(b"x" * 11)
+            res = json.loads(read_file_tool(p))
+            self.assertIn("error", res)
+            self.assertIn("too large", res["error"].lower())
+            # The size hint reaches the agent instead of a generic binary error.
+            self.assertNotIn("cannot read binary file", res["error"].lower())
+        finally:
+            rex.MAX_ANYDOC_BYTES = saved_cap
+            rex._anydoc_module = saved_module
+
+    def test_unavailable_converter_falls_back_to_raw_read(self):
+        import time
+
+        import tools.read_extract as rex
+
+        saved_module = rex._anydoc_module
+        saved_failed_at = rex._anydoc_failed_at
+        # Simulate "converter unavailable and in cooldown": _anydoc() returns
+        # None, the .pdf is not treated as extractable, and read_file keeps
+        # its historical raw-read fallthrough (no extraction error surfaced).
+        rex._anydoc_module = None
+        rex._anydoc_failed_at = time.monotonic()
+        try:
+            p = os.path.join(self.tmp, "doc.pdf")
+            with open(p, "wb") as fh:
+                fh.write(b"%PDF-1.4 fake")
+            res = json.loads(read_file_tool(p))
+            self.assertNotIn("error", res)
+            self.assertIn("%PDF-1.4 fake", res.get("content", ""))
+        finally:
+            rex._anydoc_module = saved_module
+            rex._anydoc_failed_at = saved_failed_at
 
     def test_docx_read_extracts(self):
         p = os.path.join(self.tmp, "d.docx")
@@ -483,6 +544,53 @@ class TestReadFileToolIntegration(unittest.TestCase):
         res = json.loads(read_file_tool(p))
         self.assertTrue(res.get("extracted_document"))
         self.assertIn("Report body", res["content"])
+
+    def test_backend_only_anydoc_path_uses_transferred_bytes(self):
+        from tools import file_tools, read_extract
+        from tools.file_operations import ReadResult
+
+        payload = br"{\rtf1\ansi Remote body\par}"
+
+        class FakeAnydoc:
+            def to_markdown_bytes(self, data):
+                self.seen = data
+                return "Remote body\n"
+
+        class FakeFileOps:
+            def read_file_bytes(self, path, max_bytes=None):
+                self.path = path
+                return ReadResult(
+                    base64_content=base64.b64encode(payload).decode("ascii"),
+                    file_size=len(payload),
+                    is_binary=True,
+                )
+
+            @staticmethod
+            def _add_line_numbers(content, start_line=1):
+                return "\n".join(
+                    f"{number}|{line}"
+                    for number, line in enumerate(content.split("\n"), start_line)
+                )
+
+        fake_anydoc = FakeAnydoc()
+        fake_ops = FakeFileOps()
+        saved_module = read_extract._anydoc_module
+        read_extract._anydoc_module = fake_anydoc
+        try:
+            with mock.patch.object(file_tools, "_get_file_ops", return_value=fake_ops), \
+                    mock.patch.object(
+                        file_tools,
+                        "_resolve_path_for_task",
+                        return_value=file_tools.PurePosixPath("/workspace/remote.rtf"),
+                    ), mock.patch("os.path.getsize", side_effect=AssertionError("host read")):
+                res = json.loads(read_file_tool("/workspace/remote.rtf", task_id="remote"))
+        finally:
+            read_extract._anydoc_module = saved_module
+
+        self.assertTrue(res.get("extracted_document"))
+        self.assertIn("Remote body", res["content"])
+        self.assertEqual(fake_anydoc.seen, payload)
+        self.assertEqual(fake_ops.path, "/workspace/remote.rtf")
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +694,48 @@ class TestPdfCoverageNote(unittest.TestCase):
                 text = read_extract._extract_anydoc(p)
         finally:
             os.unlink(p)
+        note.assert_not_called()
+        self.assertEqual(text, "converted\n")
+
+    def test_bytes_path_prepends_note_with_display_path(self):
+        """Backend-transferred PDF bytes get the same warning, and the
+        recovery command names the backend-visible path, not the host
+        temp file the scan ran against."""
+        from tools import read_extract
+        fake_mod = mock.Mock()
+        fake_mod.to_markdown_bytes.return_value = "# Title\n\nBody"
+        seen = {}
+
+        def fake_note(path, display_path=None):
+            seen["scan_path"] = path
+            seen["display_path"] = display_path
+            return f"[EXTRACTION COVERAGE WARNING: test '{display_path}']\n"
+
+        with mock.patch.object(read_extract, "_anydoc",
+                               return_value=fake_mod), \
+             mock.patch.object(read_extract, "_pdf_coverage_note",
+                               side_effect=fake_note):
+            text = read_extract._extract_anydoc_bytes(
+                b"%PDF-1.4 fake", "/workspace/remote.pdf"
+            )
+        self.assertTrue(text.startswith("[EXTRACTION COVERAGE WARNING"))
+        self.assertIn("/workspace/remote.pdf", text)
+        self.assertEqual(seen["display_path"], "/workspace/remote.pdf")
+        # The scanned file is a host temp materialization, already removed.
+        self.assertNotEqual(seen["scan_path"], "/workspace/remote.pdf")
+        self.assertFalse(os.path.exists(seen["scan_path"]))
+
+    def test_bytes_path_no_note_for_non_pdf(self):
+        from tools import read_extract
+        fake_mod = mock.Mock()
+        fake_mod.to_markdown_bytes.return_value = "converted"
+        with mock.patch.object(read_extract, "_anydoc",
+                               return_value=fake_mod), \
+             mock.patch.object(read_extract,
+                               "_pdf_coverage_note_from_bytes") as note:
+            text = read_extract._extract_anydoc_bytes(
+                b"{\\rtf1 fake}", "/workspace/remote.rtf"
+            )
         note.assert_not_called()
         self.assertEqual(text, "converted\n")
 
