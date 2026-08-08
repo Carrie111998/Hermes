@@ -871,34 +871,39 @@ export async function saveOnboardingLocalEndpoint(baseUrl: string, apiKey: strin
 
 // User picked a different model from the dropdown on the confirm card.
 // Persists immediately so the displayed value is always what's on disk.
-export async function setOnboardingModel(model: string) {
+export async function setOnboardingModel(model: string, provider?: string) {
   const { flow } = $desktopOnboarding.get()
 
   if (flow.status !== 'confirming_model') {
     return
   }
 
+  // The picker lists models from every configured provider. Keep the provider
+  // and model assignment paired; persisting only the model leaves the newly
+  // selected model attached to the provider used to start onboarding.
+  const nextProvider = provider?.trim() || flow.providerSlug
+
   // Optimistic update so the dropdown feels instant; revert on failure.
-  const previous = flow.currentModel
-  setFlow({ ...flow, currentModel: model, saving: true })
+  const previous = { currentModel: flow.currentModel, providerSlug: flow.providerSlug }
+  setFlow({ ...flow, currentModel: model, providerSlug: nextProvider, saving: true })
 
   try {
     await setModelAssignment({
       scope: 'main',
-      provider: flow.providerSlug,
+      provider: nextProvider,
       model
     })
     const current = $desktopOnboarding.get().flow
 
     if (current.status === 'confirming_model') {
-      setFlow({ ...current, currentModel: model, saving: false })
+      setFlow({ ...current, currentModel: model, providerSlug: nextProvider, saving: false })
     }
   } catch (error) {
     notifyError(error, 'Could not change model')
     const current = $desktopOnboarding.get().flow
 
     if (current.status === 'confirming_model') {
-      setFlow({ ...current, currentModel: previous, saving: false })
+      setFlow({ ...current, ...previous, saving: false })
     }
   }
 }

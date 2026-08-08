@@ -319,8 +319,8 @@ function ConfirmingModelPanel({
         currentModel={flow.currentModel}
         currentProvider={flow.providerSlug}
         onOpenChange={setPickerOpen}
-        onSelect={({ model }) => {
-          void setOnboardingModel(model)
+        onSelect={({ model, provider }) => {
+          void setOnboardingModel(model, provider)
           setPickerOpen(false)
         }}
         open={pickerOpen}
