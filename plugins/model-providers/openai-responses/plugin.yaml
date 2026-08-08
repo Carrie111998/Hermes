@@ -1,0 +1,5 @@
+name: openai-responses-provider
+kind: model-provider
+version: 1.0.0
+description: OpenAI (Responses API) provider with retained reasoning and compaction support
+author: Rickard Robin
