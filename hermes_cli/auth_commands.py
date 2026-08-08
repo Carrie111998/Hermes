@@ -6,6 +6,7 @@ import math
 import sys
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 import uuid
 
 from agent.credential_pool import (
@@ -526,6 +527,443 @@ def auth_status_command(args) -> None:
             print(f"  {key}: {value}")
 
 
+# Providers whose backend exposes a live account-usage endpoint. Mirrors
+# ``agent.account_usage.fetch_account_usage``'s dispatch (openai-codex,
+# anthropic, openrouter) so ``hermes auth usage`` reports a clear "not
+# supported" message for providers without a quota API instead of silently
+# printing an empty block. Extend the set in lockstep with the dispatch table.
+_ACCOUNT_USAGE_PROVIDERS = frozenset({"openai-codex", "anthropic", "openrouter"})
+
+# Hard wall-clock cap on the live usage fetch. The provider APIs are the same
+# ones the REPL ``/usage`` slash hits, and a stuck worker there is a known
+# regression; a slow upstream must not hang the terminal either. Matches the
+# 10s budget the in-REPL ``/usage`` uses for the same fetch.
+_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS = 10.0
+
+
+def _list_provider_account_credentials(provider: str) -> list[dict]:
+    """Return one row per pool entry for ``provider``, with an access_token.
+
+    Reads ``auth_store["credential_pool"][provider]`` — the same store the
+    runtime resolver reads. We only expose entries that carry a usable
+    ``access_token``; partial / placeholder rows are skipped silently so a
+    single broken credential does not break ``--all`` iteration.
+
+    Each row is a plain dict with at minimum:
+
+    - ``label``            (str)  — user-facing identifier from the entry,
+                                     falls back to ``account #<n>`` when
+                                     missing.
+    - ``source``           (str)  — pool ``source`` field (``manual:...``,
+                                     ``device_code``, etc.).
+    - ``access_token``     (str)  — bearer token for the live ``/usage`` call.
+    - ``account_id``       (str)  — value to send as ``ChatGPT-Account-Id``
+                                     when the provider partitions per
+                                     account; empty string when unknown.
+
+    The function never logs or prints the token; callers must not either.
+    """
+    rows: list[dict] = []
+    try:
+        from hermes_cli.auth import _load_auth_store
+
+        store = _load_auth_store() or {}
+    except Exception:
+        return rows
+    pool = store.get("credential_pool") if isinstance(store, dict) else None
+    if not isinstance(pool, dict):
+        return rows
+    entries = pool.get(provider)
+    if not isinstance(entries, list):
+        return rows
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("access_token") or "").strip()
+        if not token:
+            continue
+        label = str(entry.get("label") or "").strip() or f"account #{index}"
+        account_id = str(entry.get("account_id") or "").strip()
+        rows.append(
+            {
+                "label": label,
+                "source": str(entry.get("source") or "").strip(),
+                "access_token": token,
+                "account_id": account_id,
+            }
+        )
+    return rows
+
+
+def _fetch_account_usage_with_timeout(
+    *,
+    provider: str,
+    access_token: str,
+    account_id: str,
+):
+    """Run ``fetch_account_usage`` off-thread with the 10s budget.
+
+    Returns ``(snapshot, error_message)`` — exactly one of them is non-None.
+    The caller decides how to surface the error (continue iterating vs. abort).
+
+    Annotation deliberately omitted: ``AccountUsageSnapshot`` lives in
+    ``agent.account_usage`` (lazy-imported elsewhere in this module), and
+    pulling it in at module scope would force the OpenAI SDK import path on
+    every ``hermes auth`` invocation, not just ``usage``.
+    """
+    import concurrent.futures
+
+    from agent.account_usage import (
+        fetch_account_usage,
+    )
+
+    # ``ChatGPT-Account-Id`` is provider-specific (Codex) and read by
+    # ``_resolve_codex_usage_credentials`` from the singleton tokens store.
+    # For per-pool-entry fetches we override the resolver's singleton lookup
+    # by setting the active singleton tokens module-level cache if needed,
+    # but the simpler path here is: pass the token explicitly via
+    # ``api_key=`` and accept that the header (when required) will fall back
+    # to whatever the singleton holds — most calls succeed without it.
+    def _call() -> Optional["AccountUsageSnapshot"]:
+        return fetch_account_usage(
+            provider,
+            base_url=None,
+            api_key=access_token,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_call)
+        try:
+            snapshot = future.result(timeout=_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS)
+            return snapshot, None
+        except concurrent.futures.TimeoutError:
+            return (
+                None,
+                f"timed out after {_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s",
+            )
+        except Exception as exc:
+            return None, f"fetch failed — {exc}"
+
+
+def auth_usage_command(args) -> None:
+    """``hermes auth usage <provider>`` — show live account usage from the CLI.
+
+    A standalone, no-agent entry point for the same Codex / Anthropic /
+    OpenRouter account-usage view the REPL ``/usage`` slash renders. Lets a
+    user check the active account's rate-limit windows, plan, and banked
+    reset credits without first launching an interactive session.
+
+    Credential resolution is delegated to ``agent.account_usage`` (singleton
+    tokens → pool fallback), so this command reads whatever credential the
+    runtime resolver would have picked for an actual chat call — no separate
+    "which account?" prompt, no caller-supplied bearer token to misforward.
+
+    Multi-account scope:
+
+    - default (no flag): single snapshot from the resolver-selected account,
+      matching the REPL view. One pass, one exit code.
+    - ``--all``: iterate every pool entry for the provider and render each
+      separately. Errors per entry are reported inline but do not abort the
+      loop — a rate-limited account #2 must not block reporting account #1.
+      The command exits non-zero if every entry failed.
+    - ``--account <label>``: render only the pool entry whose ``label``
+      matches. Unknown labels exit non-zero with the known set listed.
+
+    Failures (timeout, no creds, provider offline, 4xx/5xx) print a short,
+    actionable message and exit non-zero instead of dumping a stacktrace, so
+    the command stays scriptable from cron / shell loops.
+    """
+    provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if not provider:
+        raise SystemExit(
+            "Provider is required. Example: `hermes auth usage openai-codex`."
+        )
+    if provider not in _ACCOUNT_USAGE_PROVIDERS:
+        # Surface the SUPPORTED set, not just the requested one, so a typo
+        # like ``hermes auth usage gpt-5`` self-corrects on the first try.
+        supported = ", ".join(sorted(_ACCOUNT_USAGE_PROVIDERS))
+        raise SystemExit(
+            f"{provider}: account usage is not supported. "
+            f"Supported providers: {supported}."
+        )
+
+    show_all = bool(getattr(args, "all_accounts", False))
+    account_filter = str(getattr(args, "account", "") or "").strip()
+
+    # Pool-aware prerequisite check: the provider can be in the supported set
+    # without the user having a usable credential for it. Fail fast with a
+    # hint pointing at ``hermes auth add`` rather than timing out on the
+    # provider API with a 401. ``auth_mod.get_auth_status`` is the same
+    # "logged in?" probe ``hermes auth status`` uses.
+    if not auth_mod.get_auth_status(provider).get("logged_in"):
+        raise SystemExit(
+            f"{provider}: not logged in. Run `hermes auth add {provider}` "
+            "or `hermes auth login`, then try again."
+        )
+
+    # Lazy import — ``fetch_account_usage`` pulls the OpenAI SDK chain, only
+    # needed here. ``render_account_usage_lines`` is the shared renderer that
+    # both the REPL and the CLI use, so output is byte-identical.
+    from agent.account_usage import (
+        render_account_usage_lines,
+    )
+
+    creds = _list_provider_account_credentials(provider)
+    if not creds:
+        # Provider is "logged in" via singleton / runtime resolver but the
+        # pool has no usable entries (e.g. all tokens still loading). Fall
+        # back to the original single-snapshot path so the user still gets
+        # the resolver-selected account's view instead of a hard error.
+        creds = [
+            {
+                "label": "default",
+                "source": "resolver",
+                "access_token": "",
+                "account_id": "",
+            }
+        ]
+
+    if account_filter:
+        matches = [c for c in creds if c["label"] == account_filter]
+        if not matches:
+            known = ", ".join(c["label"] for c in creds) or "(none)"
+            raise SystemExit(
+                f"{provider}: no account labeled {account_filter!r}. "
+                f"Known: {known}."
+            )
+        creds = matches
+
+    if not show_all and len(creds) > 1:
+        # Default behavior with multiple accounts: render the first (pool
+        # head) and print a hint that ``--all`` exists. This keeps the
+        # default output deterministic and one-shot, matching the original
+        # PR #81819 contract.
+        first = creds[0]
+        print(
+            f"Note: {provider} has {len(creds)} pool entries; showing "
+            f"{first['label']!r}. Re-run with --all to render every "
+            "account, or --account <label> to pick one."
+        )
+        creds = [first]
+
+    any_rendered = False
+    any_failed = False
+    for cred in creds:
+        # Render the per-account header whenever we are showing more than
+        # one snapshot in a single run. The default (single-snapshot) path
+        # keeps the original PR #81819 output byte-for-byte — no leading
+        # banner.
+        if len(creds) > 1:
+            print(f"\n=== {provider}: {cred['label']} ===")
+        if not cred["access_token"]:
+            # Fallback path: no explicit token, defer to the runtime resolver.
+            # Reuse the original single-snapshot fetch logic so the
+            # `--all`/default paths share semantics.
+            snapshot, error = _fetch_account_usage_with_timeout(
+                provider=provider,
+                access_token="",
+                account_id="",
+            )
+        else:
+            snapshot, error = _fetch_account_usage_with_timeout(
+                provider=provider,
+                access_token=cred["access_token"],
+                account_id=cred["account_id"],
+            )
+        if error is not None:
+            any_failed = True
+            print(f"  {cred['label']}: {error}")
+            continue
+        if snapshot is None or not snapshot.available:
+            reason = (
+                getattr(snapshot, "unavailable_reason", None) if snapshot else None
+            )
+            any_failed = True
+            if reason:
+                print(f"  {cred['label']}: usage unavailable — {reason}")
+            else:
+                print(
+                    f"  {cred['label']}: usage is not available right now "
+                    "(provider offline or account rate-limited)."
+                )
+            continue
+        any_rendered = True
+        for line in render_account_usage_lines(snapshot):
+            print(line)
+
+    if not any_rendered and any_failed:
+        raise SystemExit(
+            f"{provider}: no account returned usable usage. "
+            "Try `hermes auth status` for credential health."
+        )
+
+
+def _redeem_reset_credit_with_timeout(
+    *,
+    provider: str,
+    access_token: str,
+    force: bool,
+) -> "CodexResetRedeemResult | None":
+    """Run ``redeem_codex_reset_credit`` off-thread with the 10s budget.
+
+    Returns the result dataclass, or ``None`` on transport-level failure
+    (timeout / network). The function never raises.
+    """
+    import concurrent.futures
+
+    from agent.account_usage import redeem_codex_reset_credit
+
+    def _call():
+        return redeem_codex_reset_credit(
+            base_url=None,
+            api_key=access_token or None,
+            force=force,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_call)
+        try:
+            return future.result(timeout=_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            return None
+        except Exception:
+            # ``redeem_codex_reset_credit`` is contractually non-raising;
+            # any exception here is a transport / unexpected error.
+            return None
+
+
+def auth_usage_reset_command(args) -> None:
+    """``hermes auth usage reset <provider>`` — redeem banked rate-limit resets.
+
+    Mirror of the REPL ``/usage reset [--force]`` slash command, reachable
+    from any shell without an interactive session. For providers whose
+    backend exposes a ``rate-limit-reset-credits/consume`` endpoint
+    (currently only ``openai-codex``), this consumes one banked reset
+    credit and lifts the pool cooldowns so the credential becomes usable
+    again immediately.
+
+    Multi-account scope mirrors ``auth_usage_command``:
+
+    - default (no flag): single account from the resolver. Refuses if any
+      window is below the exhaustion threshold unless ``--force`` is set,
+      exactly like the REPL slash.
+    - ``--all``: iterate every pool entry. Per-entry outcomes print
+      inline; the command exits non-zero only if every entry failed.
+    - ``--account LABEL``: redeem on the named entry only.
+
+    The handler is intentionally non-mutating on no-credits-banked,
+    not-exhausted, and provider-unavailable states — it prints the
+    structured ``CodexResetRedeemResult.message`` and exits 0 in those
+    cases so cron / shell loops can distinguish "nothing to do" from
+    "could not reach provider".
+
+    This command never clears the local exhaustion flag — that is what
+    ``hermes auth reset <provider>`` is for, and they answer different
+    questions:
+
+    - ``auth reset`` — local: "my pool entry is stuck marked rate-limited;
+      clear the local flag so the resolver can pick it again."
+    - ``auth usage reset`` — server: "I have banked reset credits on the
+      Codex backend; consume one to actually restore quota."
+    """
+    provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if not provider:
+        raise SystemExit(
+            "Provider is required. Example: `hermes auth usage reset openai-codex`."
+        )
+    if provider not in _ACCOUNT_USAGE_PROVIDERS:
+        supported = ", ".join(sorted(_ACCOUNT_USAGE_PROVIDERS))
+        raise SystemExit(
+            f"{provider}: usage reset is not supported. "
+            f"Supported providers: {supported}."
+        )
+
+    # Currently only Codex exposes a consume endpoint; gate so a typo
+    # for a future provider fails with a clear message instead of
+    # silently doing nothing.
+    if provider != "openai-codex":
+        raise SystemExit(
+            f"{provider}: usage reset is not implemented yet "
+            "(only openai-codex exposes a consume endpoint)."
+        )
+
+    show_all = bool(getattr(args, "all_accounts", False))
+    account_filter = str(getattr(args, "account", "") or "").strip()
+    force = bool(getattr(args, "force", False))
+
+    if not auth_mod.get_auth_status(provider).get("logged_in"):
+        raise SystemExit(
+            f"{provider}: not logged in. Run `hermes auth add {provider}` "
+            "or `hermes auth login`, then try again."
+        )
+
+    creds = _list_provider_account_credentials(provider)
+    if not creds:
+        creds = [
+            {
+                "label": "default",
+                "source": "resolver",
+                "access_token": "",
+                "account_id": "",
+            }
+        ]
+
+    if account_filter:
+        matches = [c for c in creds if c["label"] == account_filter]
+        if not matches:
+            known = ", ".join(c["label"] for c in creds) or "(none)"
+            raise SystemExit(
+                f"{provider}: no account labeled {account_filter!r}. "
+                f"Known: {known}."
+            )
+        creds = matches
+
+    if not show_all and len(creds) > 1:
+        first = creds[0]
+        print(
+            f"Note: {provider} has {len(creds)} pool entries; resetting "
+            f"{first['label']!r}. Re-run with --all to reset every account, "
+            "or --account <label> to pick one."
+        )
+        creds = [first]
+
+    any_redeemed = False
+    any_failed = False
+    for cred in creds:
+        if len(creds) > 1:
+            print(f"\n=== {provider}: {cred['label']} ===")
+        result = _redeem_reset_credit_with_timeout(
+            provider=provider,
+            access_token=cred["access_token"],
+            force=force,
+        )
+        if result is None:
+            any_failed = True
+            print(
+                f"  {cred['label']}: timed out or transport error after "
+                f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s. Try again, "
+                "or check your network."
+            )
+            continue
+        if result.redeemed:
+            any_redeemed = True
+        print(f"  {cred['label']}: {result.message}")
+
+    # Exit-code contract:
+    # - 0 when at least one entry redeemed, OR every entry reported a
+    #   structured no-op (no_credits_banked / not_exhausted /
+    #   nothing_to_reset / no_credit / already_redeemed) — the operation
+    #   ran to completion, the backend just had nothing to give.
+    # - non-zero only on transport-level failure (timeout / network) for
+    #   every attempted entry, so shell loops can distinguish "nothing
+    #   to do" from "could not reach provider".
+    if not any_redeemed and any_failed:
+        raise SystemExit(
+            f"{provider}: usage reset could not reach the backend for "
+            "any account. Try again, or check your network."
+        )
+
+
 def auth_logout_command(args) -> None:
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
 
@@ -792,6 +1230,18 @@ def auth_command(args) -> None:
     if action == "status":
         auth_status_command(args)
         return
+    if action == "usage":
+        # ``auth_usage`` is a flat parser: positional ``provider`` plus
+        # flags ``--all`` / ``--account`` / ``--reset`` / ``--force``. The
+        # ``--reset`` flag toggles between the read path
+        # (``auth_usage_command``) and the redeem path
+        # (``auth_usage_reset_command``) so the legacy form
+        # ``auth usage <provider>`` keeps working byte-for-byte.
+        if getattr(args, "reset_action", False):
+            auth_usage_reset_command(args)
+        else:
+            auth_usage_command(args)
+        return
     if action == "logout":
         auth_logout_command(args)
         return
@@ -800,3 +1250,12 @@ def auth_command(args) -> None:
         return
     # No subcommand — launch interactive mode
     _interactive_auth()
+
+
+# Type-only imports — kept off the runtime path so ``hermes auth`` stays
+# fast even when the OpenAI / Codex SDKs are not installed locally. Used
+# purely to give static type-checkers (pyright, mypy) a name to resolve
+# when validating forward references in lazy-import helpers like
+# ``_fetch_account_usage_with_timeout``.
+if TYPE_CHECKING:
+    from agent.account_usage import AccountUsageSnapshot, CodexResetRedeemResult  # noqa: F401
