@@ -237,6 +237,61 @@ class TestSecondaryProfileFatalRecovery:
         assert replacement.disconnected is True
         assert runner._profile_failed_platforms == {}
 
+    @pytest.mark.asyncio
+    async def test_secondary_fatal_queues_reconnect_before_disconnect_returns(
+        self, monkeypatch
+    ):
+        """#81335: a wedged secondary disconnect() must not delay reconnect
+        scheduling — mirrors the primary-adapter fix from #80598."""
+        runner = _secondary_recovery_runner()
+        stale = _SecondaryRecoveryAdapter()
+        replacement = _SecondaryRecoveryAdapter()
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+
+        connect_started = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        async def connect(adapter, platform, *, is_reconnect=False):
+            # Keep the reconnect task alive so it can't pop the queued entry
+            # before we assert on it below.
+            connect_started.set()
+            await release_connect.wait()
+            replacement.connected = True
+            return True
+
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+
+        disconnect_entered = asyncio.Event()
+        release_disconnect = asyncio.Event()
+
+        async def blocking_disconnect():
+            # Disconnect has started — the reconnect must already be queued.
+            assert Platform.DISCORD in runner._profile_failed_platforms.get(
+                "reviewer", {}
+            )
+            disconnect_entered.set()
+            await release_disconnect.wait()
+            stale.disconnected = True
+
+        monkeypatch.setattr(stale, "disconnect", blocking_disconnect)
+        operation = asyncio.create_task(
+            runner._handle_profile_adapter_fatal_error(
+                "reviewer", Platform.DISCORD, stale
+            )
+        )
+        await asyncio.wait_for(disconnect_entered.wait(), timeout=0.5)
+        try:
+            assert Platform.DISCORD in runner._profile_failed_platforms["reviewer"]
+            assert Platform.DISCORD not in runner._profile_adapters["reviewer"]
+        finally:
+            release_disconnect.set()
+            await asyncio.wait_for(operation, timeout=0.5)
+            await asyncio.wait_for(connect_started.wait(), timeout=0.5)
+            release_connect.set()
+            for task in list(runner._background_tasks):
+                await asyncio.wait_for(task, timeout=0.5)
+
 
 class TestSecondaryProfileConfigHandling:
     """Secondary config errors degrade only when the profile is safe to skip."""

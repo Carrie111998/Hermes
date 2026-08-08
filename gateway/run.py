@@ -13771,9 +13771,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
         profile_map.pop(platform, None)
-        await self._safe_adapter_disconnect(adapter, platform)
         if not self._running:
             return
+        # #81335: queue the reconnect BEFORE the disconnect await, mirroring the
+        # primary-adapter fix (#80598). A wedged/slow disconnect() must not delay
+        # (or, on cancellation, lose) the reconnect scheduling for this profile.
         self._schedule_secondary_profile_reconnect(profile_name, platform, adapter)
         logger.error(
             "Fatal %s adapter error for multiplexed profile %s (%s)",
@@ -13783,6 +13785,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Reconnect is scoped to the profile's own config and secret mapping;
         # never rebuild a secondary adapter with the default profile's credentials.
+        await self._safe_adapter_disconnect(adapter, platform)
 
     def _make_profile_message_handler(self, profile_name: str):
         """Return a message handler that stamps source.profile then delegates.
