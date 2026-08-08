@@ -1531,6 +1531,24 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     return None
 
 
+def _resume_session_cwd(session_id: str) -> str:
+    """Return a resumed session's cwd without abandoning the owned database."""
+    db = None
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        return ((db.get_session(session_id) or {}).get("cwd") or "").strip()
+    except Exception:
+        return ""
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
 def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -2583,9 +2601,7 @@ def cmd_chat(args):
         and not getattr(args, "worktree", False)
     ):
         try:
-            from hermes_state import SessionDB
-
-            _saved_cwd = ((SessionDB().get_session(args.resume) or {}).get("cwd") or "").strip()
+            _saved_cwd = _resume_session_cwd(args.resume)
             if _saved_cwd and not os.path.isdir(_saved_cwd):
                 print(f"⚠ session's recorded dir is gone ({_saved_cwd}); staying in {os.getcwd()}")
             elif _saved_cwd and os.path.realpath(_saved_cwd) != os.path.realpath(os.getcwd()):
