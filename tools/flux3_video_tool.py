@@ -778,27 +778,11 @@ async def _handle_prompting_guide(args: dict, **kwargs) -> str:
 def _has_nous_credential() -> bool:
     """True when a Nous bearer is on hand, without spending a refresh to learn it.
 
-    Two lookups, because the transport itself has two.
-    ``peek_nous_access_token`` covers the env override and the active store's
-    cached token. A profile that was never logged into separately has neither,
-    and reads the credential from the global-root ``auth.json`` — the same
-    fallback ``resolve_nous_access_token`` takes when the transport refreshes.
-    Probing only the first would hide the tools from a profile whose calls
-    would have gone through perfectly well.
-
-    Neither lookup validates or refreshes the token: an expired credential is
-    the gateway's 401 to report, and that answer already asks for a sign-in.
+    ``peek_nous_access_token`` follows the canonical per-provider profile/global
+    fallback but does not validate or refresh the token. An expired credential
+    is the gateway's 401 to report, and that answer already asks for a sign-in.
     """
-    if peek_nous_access_token():
-        return True
-    try:
-        from hermes_cli.auth import get_provider_auth_state
-
-        state = get_provider_auth_state("nous") or {}
-    except Exception:
-        return False
-    token = state.get("access_token")
-    return isinstance(token, str) and bool(token.strip())
+    return bool(peek_nous_access_token())
 
 
 def check_bfl_requirements() -> bool:
@@ -813,7 +797,7 @@ def check_bfl_requirements() -> bool:
     nothing else: with no credential every call could only ever answer "sign
     in", so the six schemas would be pure cost on every API call.
 
-    Stays a pair of file reads — no portal probe, no OAuth refresh. Behind the
+    Stays a cached file read — no portal probe, no OAuth refresh. Behind the
     registry's 30s cache this still runs on every CLI start, gateway session
     and cron tick.
     """
