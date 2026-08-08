@@ -2,7 +2,7 @@
 name: e2a
 description: "Use e2a for Hermes-owned email over hosted MCP."
 version: 1.0.0
-author: TokenCanopy
+author: Josh Zhang (jiashuoz)
 license: Apache-2.0
 platforms:
   - linux
