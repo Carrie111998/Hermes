@@ -86,11 +86,11 @@ def main():
         }]
     }))
     print(f"[apply] Result: {apply_result}")
-    
+
     # 7. Final stats
     post_stats = json.loads(p.handle_tool_call("ebbinghaus_memory", {"action": "stats"}))
     print(f"[post] total={post_stats.get('count', 0)}, active={post_stats.get('active_count', 0)}, avg_salience={post_stats.get('avg_salience', 0):.3f}")
-    
+
     p.shutdown()
     print("[done] Dream synthesis complete")
 
