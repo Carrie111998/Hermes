@@ -668,7 +668,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
             except Exception as e:
                 metrics.summarization_errors += 1
-                self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
                 
                 if attempt < self.config.max_retries - 1:
                     time.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
@@ -737,7 +737,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
             except Exception as e:
                 metrics.summarization_errors += 1
-                self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
                 
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
@@ -831,6 +831,18 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         compress_until = self._snap_boundary(trajectory, compress_until, compress_start, compress_end)
         if compress_until <= compress_start:
             # Snapping collapsed the region; nothing can be safely compressed.
+            metrics.compressed_tokens = total_tokens
+            metrics.compressed_turns = len(trajectory)
+            metrics.still_over_limit = total_tokens > self.config.target_max_tokens
+            return trajectory, metrics
+
+        # If the region we can safely compress is no larger than the summary
+        # that would replace it, compression cannot reduce the token count --
+        # it would grow the trajectory and still spend a summarization call.
+        if (
+            sum(turn_tokens[compress_start:compress_until])
+            <= self.config.summary_target_tokens
+        ):
             metrics.compressed_tokens = total_tokens
             metrics.compressed_turns = len(trajectory)
             metrics.still_over_limit = total_tokens > self.config.target_max_tokens
@@ -946,6 +958,18 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         compress_until = self._snap_boundary(trajectory, compress_until, compress_start, compress_end)
         if compress_until <= compress_start:
             # Snapping collapsed the region; nothing can be safely compressed.
+            metrics.compressed_tokens = total_tokens
+            metrics.compressed_turns = len(trajectory)
+            metrics.still_over_limit = total_tokens > self.config.target_max_tokens
+            return trajectory, metrics
+
+        # If the region we can safely compress is no larger than the summary
+        # that would replace it, compression cannot reduce the token count --
+        # it would grow the trajectory and still spend a summarization call.
+        if (
+            sum(turn_tokens[compress_start:compress_until])
+            <= self.config.summary_target_tokens
+        ):
             metrics.compressed_tokens = total_tokens
             metrics.compressed_turns = len(trajectory)
             metrics.still_over_limit = total_tokens > self.config.target_max_tokens
@@ -1068,7 +1092,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         jsonl_files = sorted(input_dir.glob("*.jsonl"))
         
         if not jsonl_files:
-            self.logger.warning(f"No JSONL files found in {input_dir}")
+            self.logger.warning("No JSONL files found in %s", input_dir)
             return
         
         # Load ALL entries from all files
@@ -1084,7 +1108,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                             entry = json.loads(line)
                             all_entries.append((file_path, line_num, entry))
                         except json.JSONDecodeError as e:
-                            self.logger.warning(f"Skipping invalid JSON at {file_path}:{line_num}: {e}")
+                            self.logger.warning("Skipping invalid JSON at %s:%s: %s", file_path, line_num, e)
         
         total_entries = len(all_entries)
         
@@ -1153,7 +1177,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                         )
                 
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout processing entry from {file_path}:{entry_idx} (>{self.config.per_trajectory_timeout}s)")
+                    self.logger.warning("Timeout processing entry from %s:%s (>%ss)", file_path, entry_idx, self.config.per_trajectory_timeout)
                     
                     async with progress_lock:
                         self.aggregate_metrics.trajectories_failed += 1
@@ -1169,7 +1193,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     results[file_path][entry_idx] = None
                     
                 except Exception as e:
-                    self.logger.error(f"Error processing entry from {file_path}:{entry_idx}: {e}")
+                    self.logger.error("Error processing entry from %s:%s: %s", file_path, entry_idx, e)
                     
                     async with progress_lock:
                         self.aggregate_metrics.trajectories_failed += 1

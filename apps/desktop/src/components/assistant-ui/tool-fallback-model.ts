@@ -1,115 +1,220 @@
+import { type ToolTitleKey, translateNow } from '@/i18n'
 import { normalizeExternalUrl } from '@/lib/external-link'
+import { summarizeShellCommand } from '@/lib/summarize-command'
+import { capitalize, normalize } from '@/lib/text'
+import { isCardTool, isFileEditTool, isSilentTool } from '@/lib/tool-render-class'
 import { extractToolErrorMessage, formatToolResultSummary } from '@/lib/tool-result-summary'
-import { translateNow } from '@/i18n'
 
-export type ToolTone = 'agent' | 'browser' | 'default' | 'file' | 'image' | 'terminal' | 'web'
-export type ToolStatus = 'error' | 'running' | 'success' | 'warning'
+import {
+  compactPreview,
+  contextValue,
+  formatDurationSeconds,
+  isRecord,
+  numberValue,
+  parseMaybeObject,
+  unwrapToolPayload
+} from './format'
+import { findFirstUrl, hostnameOf, looksLikePath, looksLikeUrl } from './targets'
+import type {
+  CountMetric,
+  MessageRunningStateSlice,
+  SearchResultRow,
+  ToolMeta,
+  ToolMetaSpec,
+  ToolPart,
+  ToolStatus,
+  ToolTitleAction,
+  ToolTone,
+  ToolView
+} from './types'
 
-export interface ToolPart {
-  args?: unknown
-  isError?: boolean
-  result?: unknown
-  toolCallId?: string
-  toolName: string
-  type: 'tool-call'
+export * from './format'
+export * from './targets'
+export * from './types'
+
+// The transcript's render budget prices a turn by the same classification, so
+// it lives in `@/lib/tool-render-class` where both sides can reach it without
+// pulling this module's formatting/i18n weight into the cost path.
+export { isCardTool, isFileEditTool, isSilentTool }
+
+export interface DiffLineStats {
+  added: number
+  removed: number
 }
 
-export interface SearchResultRow {
-  snippet: string
-  title: string
-  url: string
-}
+export function countDiffLineStats(diff: string): DiffLineStats {
+  let added = 0
+  let removed = 0
 
-interface CountMetric {
-  count: number
-  noun: string
-}
-
-export interface ToolView {
-  countLabel?: string
-  detail: string
-  detailLabel: string
-  durationLabel?: string
-  icon?: string
-  imageUrl?: string
-  inlineDiff: string
-  previewTarget?: string
-  rawArgs: string
-  rawResult: string
-  /** Set for tools whose output naturally contains ANSI escape codes
-   *  (terminal/execute_code) so the renderer knows to run them through
-   *  the ANSI parser instead of printing them as literals. */
-  rendersAnsi?: boolean
-  searchHits?: SearchResultRow[]
-  /** When the backend reports stderr as a separate stream (terminal /
-   *  execute_code), the renderer shows it as its own labeled, neutrally
-   *  tinted block under stdout — distinct from an error tone. */
-  stderr?: string
-  /** When set, the renderer uses stdout+stderr as separate sections and
-   *  ignores the merged `detail`. */
-  stdout?: string
-  status: ToolStatus
-  subtitle: string
-  title: string
-  tone: ToolTone
-}
-
-interface ToolMeta {
-  done: string
-  icon?: string
-  pending: string
-  tone: ToolTone
-}
-
-export interface MessageRunningStateSlice {
-  message: {
-    status?: {
-      type?: string
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      added += 1
+    } else if (line.startsWith('-') && !line.startsWith('---')) {
+      removed += 1
     }
   }
-  thread: {
-    isRunning: boolean
-  }
+
+  return { added, removed }
 }
 
-const TOOL_META: Record<string, ToolMeta> = {
-  browser_click: { done: 'Clicked page element', pending: 'Clicking page element', icon: 'globe', tone: 'browser' },
-  browser_fill: { done: 'Filled form field', pending: 'Filling form field', icon: 'globe', tone: 'browser' },
-  browser_navigate: { done: 'Opened page', pending: 'Opening page', icon: 'globe', tone: 'browser' },
+export function fileEditPath(args: Record<string, unknown>, result: Record<string, unknown>): string {
+  return (
+    firstStringField(args, ['path', 'file', 'filepath']) ||
+    firstStringField(result, ['path', 'file', 'filepath', 'resolved_path']) ||
+    htmlPathFromInlineDiff(firstStringField(result, ['inline_diff', 'diff']))
+  )
+}
+
+export function fileEditBasename(path: string): string {
+  const normalized = path.replace(/\\/g, '/').trim()
+
+  return normalized.split('/').filter(Boolean).pop() || normalized
+}
+
+function numericField(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key]
+
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function readFileLineLabel(args: Record<string, unknown>, result: Record<string, unknown>): string {
+  if (numericField(args, 'offset') === undefined && numericField(args, 'limit') === undefined) {
+    return ''
+  }
+
+  const content = firstStringField(result, ['content'])
+  const offset = numericField(args, 'offset')
+  const limit = numericField(args, 'limit')
+
+  if (offset !== undefined && offset > 0) {
+    if (limit === undefined || limit <= 1) {
+      return `L${offset}`
+    }
+
+    return `L${offset}-${offset + limit - 1}`
+  }
+
+  const lines = content
+    .split('\n')
+    .map(line => /^(\d+)\|/.exec(line)?.[1])
+    .filter((line): line is string => !!line)
+    .map(Number)
+
+  if (lines.length === 0) {
+    return ''
+  }
+
+  const start = lines[0]!
+  const end = lines[lines.length - 1]!
+
+  return start === end ? `L${start}` : `L${start}-${end}`
+}
+
+function readFileDisplayTarget(args: Record<string, unknown>, result: Record<string, unknown>): string {
+  const inherited = firstStringField(args, ['context', 'preview'])
+
+  if (inherited) {
+    return inherited
+  }
+
+  const path = firstStringField(args, ['path', 'file', 'filepath'])
+
+  if (!path) {
+    return ''
+  }
+
+  const lineLabel = readFileLineLabel(args, result)
+
+  return [fileEditBasename(path), lineLabel].filter(Boolean).join(' ')
+}
+
+// The real command, preferring the actual argument over the backend's
+// display preview. `context` is a *summarized* preview ("sleep 70 + 2
+// commands") the gateway sends on tool.start before real args arrive — fine
+// as a placeholder for the live title, wrong for the `$` transcript, which
+// must show what actually ran.
+function shellCommand(args: Record<string, unknown>): string {
+  return (
+    firstStringField(args, ['command', 'code']) || firstStringField(args, ['context', 'preview']) || contextValue(args)
+  )
+}
+
+const TOOL_META: Record<ToolTitleKey, ToolMetaSpec> = {
+  browser_click: {
+    icon: 'globe',
+    tone: 'browser'
+  },
+  browser_fill: {
+    icon: 'globe',
+    tone: 'browser'
+  },
+  browser_navigate: {
+    icon: 'globe',
+    tone: 'browser'
+  },
   browser_snapshot: {
-    done: 'Captured page snapshot',
-    pending: 'Capturing page snapshot',
     icon: 'globe',
     tone: 'browser'
   },
   browser_take_screenshot: {
-    done: 'Captured screenshot',
-    pending: 'Capturing screenshot',
     icon: 'file-media',
     tone: 'browser'
   },
-  browser_type: { done: 'Typed on page', pending: 'Typing on page', icon: 'globe', tone: 'browser' },
-  clarify: { done: 'Asked a question', pending: 'Asking a question', icon: 'question', tone: 'agent' },
-  cronjob: { done: 'Cron job', pending: 'Scheduling cron job', icon: 'watch', tone: 'agent' },
-  edit_file: { done: 'Edited file', pending: 'Editing file', icon: 'edit', tone: 'file' },
-  execute_code: { done: 'Ran code', pending: 'Running code', icon: 'terminal', tone: 'terminal' },
-  image_generate: { done: 'Generated image', pending: 'Generating image', icon: 'file-media', tone: 'image' },
-  list_files: { done: 'Listed files', pending: 'Listing files', icon: 'files', tone: 'file' },
-  patch: { done: 'Patched file', pending: 'Patching file', icon: 'diff', tone: 'file' },
-  read_file: { done: 'Read file', pending: 'Reading file', icon: 'file', tone: 'file' },
-  search_files: { done: 'Searched files', pending: 'Searching files', icon: 'search', tone: 'file' },
+  browser_type: {
+    icon: 'globe',
+    tone: 'browser'
+  },
+  clarify: {
+    icon: 'question',
+    tone: 'agent'
+  },
+  cronjob: {
+    icon: 'watch',
+    tone: 'agent'
+  },
+  edit_file: { icon: 'edit', tone: 'file' },
+  execute_code: {
+    icon: 'terminal',
+    tone: 'terminal'
+  },
+  image_generate: {
+    icon: 'file-media',
+    tone: 'image'
+  },
+  list_files: {
+    icon: 'files',
+    tone: 'file'
+  },
+  memory: {
+    icon: 'brain',
+    tone: 'agent'
+  },
+  patch: { icon: 'edit', tone: 'file' },
+  read_file: { icon: 'file', tone: 'file' },
+  search_files: {
+    icon: 'search',
+    tone: 'file'
+  },
   session_search_recall: {
-    done: 'Searched session history',
-    pending: 'Searching session history',
     icon: 'search',
     tone: 'agent'
   },
-  terminal: { done: 'Ran command', pending: 'Running command', icon: 'terminal', tone: 'terminal' },
-  todo: { done: 'Updated todos', pending: 'Updating todos', icon: 'tools', tone: 'agent' },
-  vision_analyze: { done: 'Analyzed image', pending: 'Analyzing image', icon: 'eye', tone: 'image' },
-  web_extract: { done: 'Read webpage', pending: 'Reading webpage', icon: 'globe', tone: 'web' },
-  web_search: { done: 'Searched web', pending: 'Searching web', icon: 'search', tone: 'web' },
-  write_file: { done: 'Edited file', pending: 'Editing file', icon: 'edit', tone: 'file' }
+  terminal: {
+    icon: 'terminal',
+    tone: 'terminal'
+  },
+  todo: { icon: 'tools', tone: 'agent' },
+  vision_analyze: {
+    icon: 'eye',
+    tone: 'image'
+  },
+  web_extract: { icon: 'globe', tone: 'web' },
+  web_search: { icon: 'search', tone: 'web' },
+  write_file: { icon: 'edit', tone: 'file' }
+}
+
+function isToolTitleKey(name: string): name is ToolTitleKey {
+  return name in TOOL_META
 }
 
 const INLINE_CODE_SPLIT_RE = /(`[^`\n]+`)/g
@@ -122,151 +227,48 @@ export const selectMessageRunning = (state: MessageRunningStateSlice) =>
 function titleForTool(name: string): string {
   const normalized = name.replace(/^browser_/, '').replace(/^web_/, '')
 
-  return (
-    normalized
-      .split('_')
-      .filter(Boolean)
-      .map(part => `${part[0]?.toUpperCase() ?? ''}${part.slice(1)}`)
-      .join(' ') || name
-  )
+  return normalized.split('_').filter(Boolean).map(capitalize).join(' ') || name
 }
 
-const PREFIX_META: { icon?: string; prefix: string; tone: ToolTone; verb: string }[] = [
-  { prefix: 'browser_', verb: 'Browser', icon: 'globe', tone: 'browser' },
-  { prefix: 'web_', verb: 'Web', icon: 'globe', tone: 'web' }
+const PREFIX_META: { icon?: string; labelKey: string; prefix: string; tone: ToolTone }[] = [
+  { prefix: 'browser_', labelKey: 'browser', icon: 'globe', tone: 'browser' },
+  { prefix: 'web_', labelKey: 'web', icon: 'globe', tone: 'web' }
 ]
 
 function toolMeta(name: string): ToolMeta {
-  if (TOOL_META[name]) {
-    return TOOL_META[name]
+  if (isToolTitleKey(name)) {
+    const meta = TOOL_META[name]
+
+    return {
+      done: translateNow(`assistant.tool.titles.${name}.done`),
+      pending: translateNow(`assistant.tool.titles.${name}.pending`),
+      pendingAction: translateNow(`assistant.tool.titles.${name}.pendingAction`),
+      icon: meta.icon,
+      tone: meta.tone
+    }
   }
 
   const action = titleForTool(name)
   const prefix = PREFIX_META.find(p => name.startsWith(p.prefix))
 
-  return prefix
-    ? {
-        done: `${prefix.verb} ${action}`,
-        pending: `Running ${prefix.verb.toLowerCase()} ${action.toLowerCase()}`,
-        icon: prefix.icon,
-        tone: prefix.tone
-      }
-    : { done: action, pending: `Running ${action.toLowerCase()}`, tone: 'default' }
-}
+  if (prefix) {
+    const prefixLabel = translateNow(`assistant.tool.prefixes.${prefix.labelKey}`)
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
-}
-
-export function compactPreview(value: unknown, max = 72): string {
-  let raw: unknown
-
-  if (typeof value === 'string') {
-    raw = value
-  } else {
-    raw = parseMaybeObject(value).context
-  }
-
-  if (typeof raw !== 'string') {
-    if (raw == null) {
-      raw = ''
-    } else {
-      try {
-        raw = JSON.stringify(raw)
-      } catch {
-        raw = String(raw)
-      }
+    return {
+      done: translateNow('assistant.tool.titleTemplates.prefixedDone', prefixLabel, action),
+      pending: translateNow('assistant.tool.titleTemplates.runningPrefixedTool', prefixLabel, action),
+      pendingAction: translateNow('assistant.tool.actions.running'),
+      icon: prefix.icon,
+      tone: prefix.tone
     }
   }
 
-  const line = (raw as string).replace(/\s+/g, ' ').trim()
-
-  return line.length > max ? `${line.slice(0, max - 1)}…` : line
-}
-
-function contextValue(value: unknown): string {
-  const row = parseMaybeObject(value)
-
-  if (typeof row.context === 'string') {
-    return row.context
+  return {
+    done: action,
+    pending: translateNow('assistant.tool.titleTemplates.runningTool', action),
+    pendingAction: translateNow('assistant.tool.actions.running'),
+    tone: 'default'
   }
-
-  if (typeof row.preview === 'string') {
-    return row.preview
-  }
-
-  return typeof value === 'string' ? value : ''
-}
-
-function prettyJson(value: unknown): string {
-  return typeof value === 'string' ? value : JSON.stringify(value, null, 2)
-}
-
-function parseMaybeObject(value: unknown): Record<string, unknown> {
-  if (isRecord(value)) {
-    return value
-  }
-
-  if (typeof value !== 'string' || !value.trim()) {
-    return {}
-  }
-
-  try {
-    const parsed = JSON.parse(value)
-
-    return isRecord(parsed) ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function unwrapToolPayload(value: unknown): unknown {
-  const record = parseMaybeObject(value)
-
-  for (const key of ['data', 'result', 'output', 'response', 'payload']) {
-    const payload = record[key]
-
-    if (payload !== undefined && payload !== null) {
-      return payload
-    }
-  }
-
-  return value
-}
-
-function numberValue(value: unknown): null | number {
-  const n = typeof value === 'number' ? value : Number(value)
-
-  return Number.isFinite(n) ? n : null
-}
-
-function formatDurationSeconds(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    return ''
-  }
-
-  if (seconds < 1) {
-    const ms = Math.max(1, Math.round(seconds * 1000))
-
-    return `${ms}ms`
-  }
-
-  if (seconds < 60) {
-    return `${seconds.toFixed(seconds >= 10 ? 0 : 1)}s`
-  }
-
-  const wholeSeconds = Math.round(seconds)
-  const minutes = Math.floor(wholeSeconds / 60)
-  const remSeconds = wholeSeconds % 60
-
-  if (minutes < 60) {
-    return remSeconds ? `${minutes}m ${remSeconds}s` : `${minutes}m`
-  }
-
-  const hours = Math.floor(minutes / 60)
-  const remMinutes = minutes % 60
-
-  return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`
 }
 
 const COUNT_FIELD_KEYS = [
@@ -363,7 +365,7 @@ function countFromUnknown(value: unknown): null | number {
 }
 
 function singularizeNoun(noun: string): string {
-  const normalized = noun.trim().toLowerCase()
+  const normalized = normalize(noun)
 
   if (!normalized) {
     return ''
@@ -514,6 +516,16 @@ function toolResultCount(
     }
   }
 
+  // Memory success payloads put the live total on `entry_count` — keep the noun
+  // as entry/entries instead of falling through the generic `*_count` path.
+  if (part.toolName === 'memory') {
+    const entryTotal = countFromUnknown(resultRecord.entry_count)
+
+    if (entryTotal !== null) {
+      return countMetric(entryTotal, 'entry')
+    }
+  }
+
   const directCount = countFromRecord(resultRecord, fallbackNounByTool)
 
   if (directCount !== null) {
@@ -536,79 +548,6 @@ function toolResultCount(
   const textMetric = countFromText(summaryText, fallbackNounByTool)
 
   return textMetric ? normalizeMetricForTool(part.toolName, textMetric) : null
-}
-
-function looksLikeUrl(value: string): boolean {
-  return /^https?:\/\//i.test(value)
-}
-
-function looksLikePath(value: string): boolean {
-  return /^file:\/\//i.test(value) || /^(?:\/|\.{1,2}\/|~\/).+/.test(value)
-}
-
-export function isPreviewableTarget(target: string): boolean {
-  return Boolean(
-    target &&
-    (/^file:\/\//i.test(target) ||
-      /^(?:\/|\.{1,2}\/|~\/).+\.html?$/i.test(target) ||
-      /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/i.test(target))
-  )
-}
-
-function stableHash(value: string): string {
-  let hash = 0
-
-  for (let index = 0; index < value.length; index += 1) {
-    hash = Math.imul(31, hash) + value.charCodeAt(index)
-  }
-
-  return Math.abs(hash).toString(36)
-}
-
-export function toolPartDisclosureId(part: ToolPart): string {
-  if (part.toolCallId) {
-    return `tool:${part.toolCallId}`
-  }
-
-  return `tool:${part.toolName}:${stableHash(JSON.stringify(part.args ?? ''))}`
-}
-
-export function toolGroupDisclosureId(parts: ToolPart[]): string {
-  return `tool-group:${parts.map(toolPartDisclosureId).join('|')}`
-}
-
-const URL_PATTERN = /https?:\/\/[^\s'"<>)\]]+/i
-
-function findFirstUrl(...sources: unknown[]): string {
-  for (const src of sources) {
-    if (typeof src === 'string') {
-      const m = src.match(URL_PATTERN)
-
-      if (m) {
-        return m[0]
-      }
-    } else if (src && typeof src === 'object') {
-      for (const v of Object.values(src as Record<string, unknown>)) {
-        const found = findFirstUrl(v)
-
-        if (found) {
-          return found
-        }
-      }
-    }
-  }
-
-  return ''
-}
-
-function hostnameOf(value: string): string {
-  try {
-    const url = new URL(value)
-
-    return `${url.hostname}${url.pathname && url.pathname !== '/' ? url.pathname : ''}`
-  } catch {
-    return value
-  }
 }
 
 export function looksRedundant(title: string, detail: string): boolean {
@@ -656,7 +595,7 @@ function summarizeBrowserSnapshot(snapshot: string): string {
   return labels.length ? `${stats}\nTop controls: ${labels.join(', ')}` : stats
 }
 
-function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string {
+export function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = record[key]
 
@@ -752,10 +691,12 @@ function toolErrorText(part: ToolPart, result: Record<string, unknown>): string 
   // stage's code, etc. — all routinely produce useful output and aren't
   // failures. Only treat it as an error when the command produced no real
   // output to show; otherwise render the output normally (not red).
+  // `output_preview` counts as output: background-process polls report their
+  // text under that name, so omitting it painted healthy `process` rows red.
   const exit = numberValue(result.exit_code)
 
   if (exit !== null && exit !== 0) {
-    const hasOutput = Boolean(firstStringField(result, ['output', 'stdout', 'stderr'])?.trim())
+    const hasOutput = Boolean(firstStringField(result, ['output', 'stdout', 'stderr', 'output_preview'])?.trim())
 
     return hasOutput ? '' : `Command failed with exit code ${exit}.`
   }
@@ -768,7 +709,21 @@ function toolStatus(part: ToolPart, resultRecord: Record<string, unknown>): Tool
     return 'running'
   }
 
-  return toolErrorText(part, resultRecord) ? 'error' : 'success'
+  // Explicit success wins over isError / nested-error heuristics. Memory writes
+  // return `{ success: true }` when the batch landed; a stale outer `isError`
+  // envelope must not paint a real save amber.
+  if (resultRecord.success === true || resultRecord.ok === true) {
+    return 'success'
+  }
+
+  if (!toolErrorText(part, resultRecord)) {
+    return 'success'
+  }
+
+  // A rejected memory write is a budget negotiation, not a failure: the store
+  // refuses an over-limit batch and the agent retries smaller. Soft warning —
+  // never destructive-red beside routine bookkeeping.
+  return part.toolName === 'memory' ? 'warning' : 'error'
 }
 
 function durationLabel(resultRecord: Record<string, unknown>): string | undefined {
@@ -797,8 +752,8 @@ function toolPreviewTarget(toolName: string, args: Record<string, unknown>, resu
     return looksLikeUrl(explicit) ? explicit : findFirstUrl(args, result)
   }
 
-  if (toolName === 'write_file' || toolName === 'edit_file') {
-    return htmlPathFromInlineDiff(firstStringField(result, ['inline_diff']))
+  if (isFileEditTool(toolName)) {
+    return htmlPathFromInlineDiff(firstStringField(result, ['inline_diff', 'diff']))
   }
 
   return ''
@@ -858,9 +813,17 @@ function stripDividerLines(value: string): string {
 }
 
 export function inlineDiffFromResult(result: unknown): string {
-  const value = parseMaybeObject(result).inline_diff
+  const record = parseMaybeObject(result)
 
-  return typeof value === 'string' ? stripInlineDiffChrome(value) : ''
+  for (const key of ['inline_diff', 'diff']) {
+    const value = record[key]
+
+    if (typeof value === 'string' && value.trim()) {
+      return stripInlineDiffChrome(value)
+    }
+  }
+
+  return ''
 }
 
 // Falls back to a string only when there's something concrete to render —
@@ -901,8 +864,13 @@ function fallbackDetailText(args: unknown, result: unknown): string {
 }
 
 function cronScalar(value: unknown): string {
-  if (typeof value === 'string') return value.trim()
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'string') {
+    return value.trim()
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value)
+  }
 
   return ''
 }
@@ -910,7 +878,9 @@ function cronScalar(value: unknown): string {
 function formatCronTime(iso: string): string {
   const ts = Date.parse(iso)
 
-  if (Number.isNaN(ts)) return iso
+  if (Number.isNaN(ts)) {
+    return iso
+  }
 
   return new Date(ts).toLocaleString(undefined, {
     month: 'short',
@@ -920,10 +890,7 @@ function formatCronTime(iso: string): string {
   })
 }
 
-function cronjobSubtitle(
-  argsRecord: Record<string, unknown>,
-  resultRecord: Record<string, unknown>
-): string {
+function cronjobSubtitle(argsRecord: Record<string, unknown>, resultRecord: Record<string, unknown>): string {
   const jobs = Array.isArray(resultRecord.jobs) ? resultRecord.jobs : null
 
   if (jobs) {
@@ -932,23 +899,24 @@ function cronjobSubtitle(
 
   const message = firstStringField(resultRecord, ['message'])
 
-  if (message) return message
+  if (message) {
+    return message
+  }
 
   const action = firstStringField(argsRecord, ['action']) || 'manage'
   const name = firstStringField(resultRecord, ['name']) || firstStringField(argsRecord, ['name', 'job_id'])
-  const label = `${action[0]?.toUpperCase() ?? ''}${action.slice(1)}`
+  const label = capitalize(action)
 
   return name ? `${label} ${name}` : `Cron ${action}`
 }
 
-function cronjobDetail(
-  argsRecord: Record<string, unknown>,
-  resultRecord: Record<string, unknown>
-): string {
+function cronjobDetail(argsRecord: Record<string, unknown>, resultRecord: Record<string, unknown>): string {
   const jobs = Array.isArray(resultRecord.jobs) ? resultRecord.jobs : null
 
   if (jobs) {
-    if (!jobs.length) return 'No cron jobs scheduled'
+    if (!jobs.length) {
+      return 'No cron jobs scheduled'
+    }
 
     return jobs
       .slice(0, 20)
@@ -963,12 +931,14 @@ function cronjobDetail(
   }
 
   const nextRun = cronScalar(resultRecord.next_run_at)
+
   const rows: [string, string][] = [
     ['Schedule', cronScalar(resultRecord.schedule)],
     ['Repeat', cronScalar(resultRecord.repeat)],
     ['Delivery', cronScalar(resultRecord.deliver)],
     ['Next run', nextRun ? formatCronTime(nextRun) : '']
   ]
+
   const lines = rows.filter(([, value]) => value).map(([key, value]) => `${key}: ${value}`)
 
   return lines.length ? lines.join('\n') : fallbackDetailText(argsRecord, resultRecord)
@@ -1042,20 +1012,27 @@ function toolSubtitle(
       }
     }
 
-    const command = firstStringField(argsRecord, ['command', 'code']) || contextValue(argsRecord)
+    const command = firstStringField(argsRecord, ['context', 'preview', 'command', 'code']) || contextValue(argsRecord)
 
-    return command ? compactPreview(command, 120) : 'Executed command'
+    return command ? '' : 'Executed command'
   }
 
-  if (toolName === 'read_file' || toolName === 'write_file' || toolName === 'edit_file') {
-    const path =
-      firstStringField(argsRecord, ['path', 'file', 'filepath']) ||
-      htmlPathFromInlineDiff(firstStringField(resultRecord, ['inline_diff']))
+  if (toolName === 'read_file' || isFileEditTool(toolName)) {
+    const isEdit = isFileEditTool(toolName)
 
-    return (
-      path ||
-      (firstStringField(resultRecord, ['inline_diff']) ? 'Changed file' : fallbackDetailText(argsRecord, resultRecord))
-    )
+    const path = isEdit
+      ? fileEditPath(argsRecord, resultRecord)
+      : firstStringField(argsRecord, ['path', 'file', 'filepath'])
+
+    if (path) {
+      return path
+    }
+
+    if (!isEdit) {
+      return fallbackDetailText(argsRecord, resultRecord)
+    }
+
+    return inlineDiffFromResult(resultRecord) ? 'Changed file' : ''
   }
 
   if (toolName === 'web_extract') {
@@ -1065,6 +1042,13 @@ function toolSubtitle(
       findFirstUrl(argsRecord, resultRecord)
 
     return url ? hostnameOf(url) : 'Fetched webpage'
+  }
+
+  if (toolName === 'memory') {
+    // The raw payload is bookkeeping the user never needs: usage counters, a
+    // note telling the model not to retry, and the full operations array. The
+    // human-readable line is the only part worth showing.
+    return firstStringField(resultRecord, ['message', 'error'])
   }
 
   if (toolName === 'cronjob') {
@@ -1086,10 +1070,6 @@ function toolDetailLabel(toolName: string): string {
 
   if (toolName === 'browser_snapshot') {
     return 'Snapshot summary'
-  }
-
-  if (toolName === 'terminal' || toolName === 'execute_code') {
-    return 'Command output'
   }
 
   return ''
@@ -1120,6 +1100,13 @@ function toolDetailText(
     if (output || lines) {
       return [output, lines].filter(Boolean).join('\n')
     }
+
+    // A terminal row with no output already shows its command in the `$`
+    // transcript above; the generic fallback would print the same string a
+    // second time. `execute_code` has no transcript, so it keeps the fallback.
+    if (part.toolName === 'terminal') {
+      return ''
+    }
   }
 
   if (part.toolName === 'web_extract') {
@@ -1145,7 +1132,7 @@ function toolDetailText(
     }
   }
 
-  if (part.toolName === 'read_file') {
+  if (part.toolName === 'read_file' && part.result !== undefined) {
     const content = firstStringField(resultRecord, ['content', 'text', 'data', 'body'])
 
     if (content) {
@@ -1153,8 +1140,28 @@ function toolDetailText(
     }
   }
 
-  if (part.toolName === 'write_file' || part.toolName === 'edit_file') {
-    return inlineDiffFromResult(part.result) ? '' : fallbackDetailText(argsRecord, resultRecord)
+  if (part.toolName === 'memory') {
+    // Same reasoning as toolSubtitle: without this the generic fallback dumps
+    // the whole args + result payload into the expanded row.
+    return firstStringField(resultRecord, ['message', 'error'])
+  }
+
+  if (isFileEditTool(part.toolName)) {
+    if (inlineDiffFromResult(part.result)) {
+      return ''
+    }
+
+    const summary = firstStringField(resultRecord, ['message', 'summary'])
+
+    if (summary) {
+      return summary
+    }
+
+    if (fileEditPath(argsRecord, resultRecord)) {
+      return ''
+    }
+
+    return fallbackDetailText(argsRecord, resultRecord)
   }
 
   if (part.toolName === 'web_search') {
@@ -1190,6 +1197,7 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     url: translateNow('assistant.tool.copyUrl'),
     generic: translateNow('common.copy')
   }
+
   const args = parseMaybeObject(part.args)
   const result = parseMaybeObject(part.result)
   const detail = view.detail.trim()
@@ -1241,7 +1249,7 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     }
   }
 
-  if (part.toolName === 'read_file') {
+  if (part.toolName === 'read_file' && part.result !== undefined) {
     if (hasSubstantialOutput) {
       return { label: copy.file, text: detail }
     }
@@ -1253,8 +1261,12 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     }
   }
 
-  if (part.toolName === 'write_file' || part.toolName === 'edit_file') {
-    const path = firstStringField(args, ['path', 'file', 'filepath'])
+  if (isFileEditTool(part.toolName)) {
+    if (view.inlineDiff.trim()) {
+      return { label: copy.file, text: view.inlineDiff }
+    }
+
+    const path = fileEditPath(args, result)
 
     if (path) {
       return { label: copy.path, text: path }
@@ -1268,39 +1280,126 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
   return { label: copy.generic, text: view.title }
 }
 
+interface ToolTitleParts {
+  action?: ToolTitleAction
+  title: string
+}
+
+function titlePartsFromAction(title: string, action?: string): ToolTitleParts {
+  if (!action) {
+    return { title }
+  }
+
+  const actionStart = title.indexOf(action)
+
+  if (actionStart < 0) {
+    return { title }
+  }
+
+  return {
+    action: {
+      prefix: title.slice(0, actionStart),
+      suffix: title.slice(actionStart + action.length),
+      text: action
+    },
+    title
+  }
+}
+
 function dynamicTitle(
   part: ToolPart,
   args: Record<string, unknown>,
   result: Record<string, unknown>,
-  fallback: string
-): string {
+  fallback: ToolTitleParts
+): ToolTitleParts {
   const verb = (gerund: string, past: string) => (part.result === undefined ? gerund : past)
+
+  const titledAction = (action: string, title: string): ToolTitleParts =>
+    titlePartsFromAction(title, part.result === undefined ? action : undefined)
 
   if (part.toolName === 'web_extract') {
     const url = findFirstUrl(args, result)
+    const action = verb(translateNow('assistant.tool.actions.reading'), translateNow('assistant.tool.actions.read'))
 
-    return url ? `${verb('Reading', 'Read')} ${hostnameOf(url)}` : fallback
+    return url
+      ? titledAction(action, translateNow('assistant.tool.titleTemplates.actionTarget', action, hostnameOf(url)))
+      : fallback
   }
 
   if (part.toolName === 'browser_navigate') {
     const url = findFirstUrl(args, result)
 
-    return url ? `${verb('Opening', 'Opened')} ${hostnameOf(url)}` : fallback
+    if (!url) {
+      return fallback
+    }
+
+    const failed =
+      part.isError || result.success === false || result.ok === false || Boolean(firstStringField(result, ['error']))
+
+    if (failed) {
+      const failAction = translateNow('assistant.tool.actions.failedToOpen')
+
+      return titledAction(
+        failAction,
+        translateNow('assistant.tool.titleTemplates.actionTarget', failAction, hostnameOf(url))
+      )
+    }
+
+    const action = verb(translateNow('assistant.tool.actions.opening'), translateNow('assistant.tool.actions.opened'))
+
+    return titledAction(action, translateNow('assistant.tool.titleTemplates.actionTarget', action, hostnameOf(url)))
   }
 
   if (part.toolName === 'web_search') {
     const query = firstStringField(args, ['search_term', 'query']) || contextValue(args)
 
-    return query ? `${verb('Searching', 'Searched')} “${compactPreview(query, 48)}”` : fallback
+    const action = verb(
+      translateNow('assistant.tool.actions.searching'),
+      translateNow('assistant.tool.actions.searched')
+    )
+
+    return query
+      ? titledAction(
+          action,
+          translateNow('assistant.tool.titleTemplates.actionQuoted', action, compactPreview(query, 48))
+        )
+      : fallback
+  }
+
+  if (part.toolName === 'read_file') {
+    const target = readFileDisplayTarget(args, result)
+    const action = verb(translateNow('assistant.tool.actions.reading'), translateNow('assistant.tool.actions.read'))
+
+    return target
+      ? titledAction(action, translateNow('assistant.tool.titleTemplates.actionTarget', action, target))
+      : fallback
   }
 
   if (part.toolName === 'terminal' || part.toolName === 'execute_code') {
-    const command = firstStringField(args, ['command', 'code']) || contextValue(args)
+    const command = shellCommand(args)
 
     if (command) {
-      const verbText = part.toolName === 'execute_code' ? verb('Running code', 'Ran code') : verb('Running', 'Ran')
+      const action =
+        part.toolName === 'execute_code'
+          ? verb(translateNow('assistant.tool.actions.runningCode'), translateNow('assistant.tool.actions.ranCode'))
+          : verb(translateNow('assistant.tool.actions.running'), translateNow('assistant.tool.actions.ran'))
 
-      return `${verbText} · ${compactPreview(command, 160)}`
+      return titledAction(
+        action,
+        translateNow(
+          'assistant.tool.titleTemplates.actionCommand',
+          action,
+          compactPreview(summarizeShellCommand(command), 160)
+        )
+      )
+    }
+  }
+
+  if (isFileEditTool(part.toolName)) {
+    const path = fileEditPath(args, result)
+
+    if (path) {
+      return { title: fileEditBasename(path) }
     }
   }
 
@@ -1312,12 +1411,35 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
   const resultRecord = parseMaybeObject(part.result)
   const meta = toolMeta(part.toolName)
   const status = toolStatus(part, resultRecord)
-  const error = toolErrorText(part, resultRecord)
-  const baseTitle = part.result === undefined ? meta.pending : meta.done
-  const title = dynamicTitle(part, argsRecord, resultRecord, baseTitle)
+  // Skip residual error-heuristic text once status is success (stale isError
+  // envelope over a landed memory write would otherwise foul the subtitle).
+  const error = status === 'success' ? '' : toolErrorText(part, resultRecord)
+  // Over-budget memory refusals stay amber — don't claim "Saved".
+  const memoryMissed = part.toolName === 'memory' && part.result !== undefined && status !== 'success'
+
+  const baseTitle =
+    part.result === undefined
+      ? meta.pending
+      : memoryMissed
+        ? translateNow('assistant.tool.memoryWriteNoted')
+        : meta.done
+
+  const titleParts = dynamicTitle(
+    part,
+    argsRecord,
+    resultRecord,
+    titlePartsFromAction(baseTitle, part.result === undefined ? meta.pendingAction : undefined)
+  )
+
+  const title = titleParts.title
   const titleEnriched = title !== baseTitle
   const baseSubtitle = error || toolSubtitle(part, argsRecord, resultRecord)
-  const keepSubtitleWithTitle = part.toolName === 'terminal' || part.toolName === 'execute_code'
+
+  const keepSubtitleWithTitle =
+    part.toolName === 'terminal' ||
+    part.toolName === 'execute_code' ||
+    (isFileEditTool(part.toolName) && Boolean(baseSubtitle.trim()))
+
   const subtitle = titleEnriched && !error && !keepSubtitleWithTitle ? '' : baseSubtitle
   const detailBody = stripDividerLines(toolDetailText(part, argsRecord, resultRecord))
 
@@ -1330,6 +1452,11 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
 
   const searchHits =
     part.toolName === 'web_search' && status !== 'error' ? extractSearchResults(part.result) : undefined
+
+  const searchQuery =
+    part.toolName === 'web_search'
+      ? firstStringField(argsRecord, ['search_term', 'query']) || contextValue(argsRecord)
+      : ''
 
   const resultCount = status === 'error' ? null : toolResultCount(part, argsRecord, resultRecord)
 
@@ -1344,6 +1471,8 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
   // field — otherwise the merged `detail` already covers it and double-
   // rendering would duplicate output.
   const hasSplitStreams = rendersAnsi && (Boolean(stdout) || Boolean(stderrRaw))
+  const terminalCommand = part.toolName === 'terminal' ? shellCommand(argsRecord) : undefined
+  const terminalExitCode = part.toolName === 'terminal' ? numericField(resultRecord, 'exit_code') : undefined
 
   return {
     countLabel: resultCount ? formatCountLabel(resultCount) : undefined,
@@ -1354,15 +1483,17 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
     imageUrl: toolImageUrl(argsRecord, resultRecord),
     inlineDiff,
     previewTarget: toolPreviewTarget(part.toolName, argsRecord, resultRecord),
-    rawArgs: prettyJson(part.args),
-    rawResult: prettyJson(part.result),
     rendersAnsi: rendersAnsi || undefined,
+    searchQuery: searchQuery || undefined,
     searchHits: searchHits?.length ? searchHits : undefined,
     stderr: hasSplitStreams ? stderrRaw || undefined : undefined,
+    terminalCommand,
+    terminalExitCode,
     stdout: hasSplitStreams ? stdout || undefined : undefined,
     status,
     subtitle,
     title,
+    titleAction: titleParts.action,
     tone: meta.tone
   }
 }

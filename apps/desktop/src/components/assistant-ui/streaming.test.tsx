@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { useEffect, useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { Thread } from './thread'
+import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
 
@@ -48,6 +48,7 @@ vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
   window.setTimeout(() => callback(performance.now()), 0)
 )
 vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
+vi.stubGlobal('CSS', { escape: (str: string) => str })
 
 Element.prototype.scrollTo = function scrollTo() {}
 
@@ -58,9 +59,9 @@ Element.prototype.animate = function animate() {
   } as unknown as Animation
 }
 
-// jsdom returns 0 for offset*; the virtualizer reads those to size its
+// jsdom returns 0 for offset*; some layout code reads those to size the
 // viewport. Fall through to client* (which tests can override) or a sane
-// default so virtualized items render.
+// default so message rows render with non-zero dimensions.
 function stubOffsetDimension(
   prop: 'offsetHeight' | 'offsetWidth',
   clientProp: 'clientHeight' | 'clientWidth',
@@ -216,23 +217,48 @@ function assistantTodoMessage(
   } as ThreadMessage
 }
 
-function assistantReasoningTodoMessage(
-  todos: Array<{ content: string; id: string; status: 'cancelled' | 'completed' | 'in_progress' | 'pending' }>
+function assistantImageMessage(
+  running = false,
+  result: unknown = { image: 'https://cdn.example/cat.png', success: true }
 ): ThreadMessage {
   return {
-    id: 'assistant-reasoning-todo-1',
+    id: `assistant-image-${running ? 'running' : 'done'}`,
     role: 'assistant',
     content: [
-      { type: 'reasoning', text: 'Let me make a quick todo list.' },
       {
         type: 'tool-call',
-        toolCallId: 'todo-1',
-        toolName: 'todo',
-        args: { todos },
-        argsText: JSON.stringify({ todos }),
-        result: { todos }
-      },
-      { type: 'text', text: 'Done — fake list created.' }
+        toolCallId: 'image-1',
+        toolName: 'image_generate',
+        args: { prompt: 'draw a cat' },
+        argsText: JSON.stringify({ prompt: 'draw a cat' }),
+        ...(running ? {} : { result })
+      }
+    ],
+    status: running ? { type: 'running' } : { type: 'complete', reason: 'stop' },
+    createdAt,
+    metadata: {
+      unstable_state: null,
+      unstable_annotations: [],
+      unstable_data: [],
+      steps: [],
+      custom: {}
+    }
+  } as ThreadMessage
+}
+
+function assistantTerminalMessage(): ThreadMessage {
+  return {
+    id: 'assistant-terminal-1',
+    role: 'assistant',
+    content: [
+      {
+        type: 'tool-call',
+        toolCallId: 'terminal-1',
+        toolName: 'terminal',
+        args: { command: 'npm run check --workspace=apps/desktop' },
+        argsText: JSON.stringify({ command: 'npm run check --workspace=apps/desktop' }),
+        result: { exit_code: 0, stdout: 'all checks passed' }
+      }
     ],
     status: { type: 'complete', reason: 'stop' },
     createdAt,
@@ -246,7 +272,12 @@ function assistantReasoningTodoMessage(
   } as ThreadMessage
 }
 
-function StreamingHarness() {
+interface StreamingControls {
+  emitSecond: () => void
+  complete: () => void
+}
+
+function StreamingHarness({ onControls }: { onControls?: (controls: StreamingControls) => void } = {}) {
   const [messages, setMessages] = useState<ThreadMessage[]>([userMessage()])
   const [isRunning, setIsRunning] = useState(true)
 
@@ -254,6 +285,20 @@ function StreamingHarness() {
     const first = window.setTimeout(() => {
       setMessages([userMessage(), assistantMessage('first chunk')])
     }, 50)
+
+    if (onControls) {
+      onControls({
+        emitSecond: () => {
+          setMessages([userMessage(), assistantMessage('first chunk second chunk')])
+        },
+        complete: () => {
+          setMessages([userMessage(), assistantMessage('first chunk second chunk', false)])
+          setIsRunning(false)
+        }
+      })
+
+      return () => window.clearTimeout(first)
+    }
 
     const second = window.setTimeout(() => {
       setMessages([userMessage(), assistantMessage('first chunk second chunk')])
@@ -269,7 +314,7 @@ function StreamingHarness() {
       window.clearTimeout(second)
       window.clearTimeout(complete)
     }
-  }, [])
+  }, [onControls])
 
   const runtime = useExternalStoreRuntime<ThreadMessage>({
     messages,
@@ -280,20 +325,6 @@ function StreamingHarness() {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <Thread loading={isRunning && messages.at(-1)?.role !== 'assistant' ? 'response' : undefined} />
-    </AssistantRuntimeProvider>
-  )
-}
-
-function StaticThreadHarness() {
-  const runtime = useExternalStoreRuntime<ThreadMessage>({
-    messages: [userMessage(), assistantMessage('complete response', false)],
-    isRunning: false,
-    onNew: async () => {}
-  })
-
-  return (
-    <AssistantRuntimeProvider runtime={runtime}>
-      <Thread />
     </AssistantRuntimeProvider>
   )
 }
@@ -324,6 +355,37 @@ function MessageHarness({ message }: { message: ThreadMessage }) {
       <Thread />
     </AssistantRuntimeProvider>
   )
+}
+
+function TranscriptHarness({ messages }: { messages: ThreadMessage[] }) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages,
+    isRunning: false,
+    onNew: async () => {}
+  })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread />
+    </AssistantRuntimeProvider>
+  )
+}
+
+function assistantInterimMessage(text: string, id = 'assistant-interim-1'): ThreadMessage {
+  return {
+    id,
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    status: { type: 'complete', reason: 'stop' },
+    createdAt,
+    metadata: {
+      unstable_state: null,
+      unstable_annotations: [],
+      unstable_data: [],
+      steps: [],
+      custom: { interim: true }
+    }
+  } as ThreadMessage
 }
 
 function RunningMessageHarness({ message }: { message: ThreadMessage }) {
@@ -396,17 +458,35 @@ function IntroHarness() {
   )
 }
 
+function DismissibleErrorHarness({ onDismissError }: { onDismissError: (messageId: string) => void }) {
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages: [assistantErrorMessage('OpenRouter rejected the request (403).')],
+    isRunning: false,
+    onNew: async () => {}
+  })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread onDismissError={onDismissError} />
+    </AssistantRuntimeProvider>
+  )
+}
+
 describe('assistant-ui streaming renderer', () => {
   beforeEach(() => {
     resizeObservers.clear()
   })
 
   it('renders assistant text incrementally before completion', async () => {
-    const { container } = render(<StreamingHarness />)
+    let controls: StreamingControls | undefined
+
+    const registerControls = (next: StreamingControls) => {
+      controls = next
+    }
+
+    const { container } = render(<StreamingHarness onControls={registerControls} />)
 
     expect(screen.getByRole('status', { name: 'Hermes is loading a response' })).toBeTruthy()
-
-    await wait(80)
 
     await waitFor(() => {
       expect(container.textContent).toContain('first chunk')
@@ -414,14 +494,16 @@ describe('assistant-ui streaming renderer', () => {
     expect(container.textContent).not.toContain('second chunk')
     expect(screen.queryByRole('status', { name: 'Hermes is loading a response' })).toBeNull()
 
-    await wait(500)
-
+    // Producer-gated, not wall-clock-gated: the old test slept 80ms and
+    // assumed a 500ms timer could not fire before the assertion. On a loaded
+    // runner the test thread could be descheduled for >500ms, so both chunks
+    // arrived and this clean behavior test flaked.
+    act(() => controls?.emitSecond())
     await waitFor(() => {
       expect(container.textContent).toContain('first chunk second chunk')
     })
 
-    await wait(250)
-
+    act(() => controls?.complete())
     await waitFor(() => {
       expect(container.textContent).toContain('first chunk second chunk')
     })
@@ -433,228 +515,62 @@ describe('assistant-ui streaming renderer', () => {
     expect(container.querySelector('[data-slot="aui_composer-clearance"]')).toBeNull()
   })
 
+  it('suppresses the action footer on sealed interim messages, keeping it on the final reply', () => {
+    const { container } = render(
+      <TranscriptHarness
+        messages={[
+          userMessage(),
+          assistantInterimMessage('Let me check the files.'),
+          assistantInterimMessage('Now applying the patch.', 'assistant-interim-2'),
+          assistantMessage('All done — patch applied.', false)
+        ]}
+      />
+    )
+
+    // Interim commentary stays visible…
+    expect(container.textContent).toContain('Let me check the files.')
+    expect(container.textContent).toContain('Now applying the patch.')
+    expect(container.textContent).toContain('All done — patch applied.')
+
+    // …but only the turn's final reply carries the copy/refresh action bar.
+    const actionBars = container.querySelectorAll('[data-slot="aui_msg-actions"]')
+    expect(actionBars).toHaveLength(1)
+
+    const finalRoot = [...container.querySelectorAll('[data-slot="aui_assistant-message-root"]')].find(root =>
+      root.textContent?.includes('All done — patch applied.')
+    )
+
+    expect(finalRoot?.querySelector('[data-slot="aui_msg-actions"]')).toBeTruthy()
+  })
+
   it('renders assistant provider errors inline', () => {
     render(<MessageHarness message={assistantErrorMessage('OpenRouter rejected the request (403).')} />)
 
     expect(screen.getByRole('alert').textContent).toContain('OpenRouter rejected the request (403).')
   })
 
-  it('does not pull the viewport back down after the user scrolls up during streaming', async () => {
-    const { container } = render(<StreamingHarness />)
+  it('omits the dismiss control when no onDismissError handler is supplied', () => {
+    render(<MessageHarness message={assistantErrorMessage('OpenRouter rejected the request (403).')} />)
 
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
-
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-
-    await act(async () => {
-      viewport.scrollTop = 800
-      fireEvent.scroll(viewport)
-    })
-    await wait(0)
-
-    await act(async () => {
-      fireEvent.wheel(viewport, { deltaY: -120 })
-      viewport.scrollTop = 420
-      fireEvent.scroll(viewport)
-    })
-
-    scrollHeight = 1_200
-
-    await act(async () => {
-      for (const observer of resizeObservers) {
-        observer.trigger(1_200)
-      }
-    })
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(420)
+    expect(screen.queryByRole('button', { name: 'Dismiss error' })).toBeNull()
   })
 
-  it('does not auto-follow idle layout shifts', async () => {
-    const { container } = render(<StaticThreadHarness />)
+  it('invokes onDismissError with the errored message id when the dismiss control is clicked', () => {
+    const onDismissError = vi.fn()
+    render(<DismissibleErrorHarness onDismissError={onDismissError} />)
 
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
+    const dismiss = screen.getByRole('button', { name: 'Dismiss error' })
+    fireEvent.click(dismiss)
 
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-
-    await act(async () => {
-      viewport.scrollTop = 420
-      fireEvent.scroll(viewport)
-    })
-
-    scrollHeight = 1_200
-
-    await act(async () => {
-      for (const observer of resizeObservers) {
-        observer.trigger(1_200)
-      }
-    })
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(420)
+    expect(onDismissError).toHaveBeenCalledTimes(1)
+    expect(onDismissError).toHaveBeenCalledWith('assistant-error-1')
   })
 
-  it('does not follow streaming content growth even while parked at the bottom', async () => {
-    const { container } = render(<StreamingHarness />)
-
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let clientHeight = 200
-    let scrollHeight = 1_000
-
-    Object.defineProperty(viewport, 'clientHeight', {
-      configurable: true,
-      get: () => clientHeight
-    })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-
-    // Park the user at the bottom of the current content.
-    await act(async () => {
-      viewport.scrollTop = 800
-      fireEvent.scroll(viewport)
-    })
-
-    clientHeight = 240
-
-    await act(async () => {
-      viewport.scrollTop = 760
-      fireEvent.scroll(viewport)
-    })
-
-    // Content grows as tokens stream in. Streaming auto-follow is removed, so
-    // the viewport must NOT chase the new bottom — it stays where the user
-    // last left it.
-    scrollHeight = 1_200
-
-    await act(async () => {
-      for (const observer of resizeObservers) {
-        observer.trigger(1_200)
-      }
-    })
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(760)
-  })
-
-  it('honors the first upward wheel scroll even when a programmatic bottom-pin scroll event is still pending', async () => {
-    const { container } = render(<StreamingHarness />)
-
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
-
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-    await wait(0)
-
-    await act(async () => {
-      fireEvent.wheel(viewport, { deltaY: -120 })
-      viewport.scrollTop = 420
-      fireEvent.scroll(viewport)
-    })
-
-    scrollHeight = 1_200
-
-    await act(async () => {
-      for (const observer of resizeObservers) {
-        observer.trigger(1_200)
-      }
-    })
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(420)
-  })
-
-  it('does not snap to the bottom on final code-highlight growth after a run completes', async () => {
-    const { container } = render(<StreamingHarness />)
-
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
-
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-
-    await act(async () => {
-      viewport.scrollTop = 800
-      fireEvent.scroll(viewport)
-    })
-
-    await wait(650)
-
-    // Completion re-measures (Shiki highlight) and grows the content. The
-    // post-run bottom lock is removed, so the viewport stays put instead of
-    // snapping to the new bottom.
-    scrollHeight = 1_700
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(800)
-  })
-
-  it('does not restart bottom-follow after completion when the user scrolled up', async () => {
-    const { container } = render(<StreamingHarness />)
-
-    const content = container.querySelector('[data-slot="aui_thread-content"]') as HTMLDivElement
-    const viewport = content.parentElement as HTMLDivElement
-    let scrollHeight = 1_000
-
-    Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 200 })
-    Object.defineProperty(viewport, 'scrollHeight', {
-      configurable: true,
-      get: () => scrollHeight
-    })
-
-    await wait(80)
-
-    await act(async () => {
-      viewport.scrollTop = 800
-      fireEvent.scroll(viewport)
-    })
-
-    await act(async () => {
-      fireEvent.wheel(viewport, { deltaY: -120 })
-      viewport.scrollTop = 420
-      fireEvent.scroll(viewport)
-    })
-
-    await wait(650)
-
-    scrollHeight = 1_700
-    await wait(0)
-
-    expect(viewport.scrollTop).toBe(420)
-  })
+  // Scroll behavior (follow-at-bottom, escape-on-scroll-up, re-engage) is owned
+  // by the use-stick-to-bottom library and covered by its own test suite. We
+  // don't re-assert its scrollTop mechanics here — doing so in jsdom (no real
+  // layout, spring animation via rAF) only produces brittle change-detector
+  // tests. The rendering/streaming-content tests below remain the contract.
 
   it('renders an incomplete streaming fenced code block as a code card', async () => {
     const { container } = render(<RunningMessageHarness message={assistantMessage('```ts\nconst answer = 42\n')} />)
@@ -670,14 +586,19 @@ describe('assistant-ui streaming renderer', () => {
   it('renders an incomplete streaming reasoning fenced code block as a code card', async () => {
     const { container } = render(<RunningReasoningHarness />)
     const ui = within(container)
+    const thinkingToggle = ui.getByRole('button', { name: /thinking/i })
 
-    fireEvent.click(ui.getByRole('button', { name: /thinking/i }))
+    if (thinkingToggle.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(thinkingToggle)
+    }
 
     await waitFor(() => {
       expect(container.querySelector('[data-slot="code-card"]')).toBeTruthy()
     })
 
-    expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toContain('const answer = 42')
+    await waitFor(() => {
+      expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toContain('const answer = 42')
+    })
     expect(container.textContent).not.toContain('```ts')
   })
 
@@ -685,7 +606,8 @@ describe('assistant-ui streaming renderer', () => {
     const { container } = render(<ReasoningHarness />)
     const ui = within(container)
 
-    fireEvent.click(ui.getByRole('button', { name: /thinking/i }))
+    // Settled, so the header is past tense — a running block says "Thinking".
+    fireEvent.click(ui.getByRole('button', { name: /thought/i }))
 
     expect(container.querySelector('[data-slot="aui_reasoning-text"]')?.textContent).toBe(
       'The user is asking what this file is.'
@@ -718,7 +640,7 @@ describe('assistant-ui streaming renderer', () => {
     expect(container.textContent).toContain('Interim answer.')
   })
 
-  it('renders live todo rows during a running turn', () => {
+  it('does not render an inline todo panel — todos live in the composer status stack', () => {
     const { container } = render(
       <TodoHarness
         message={assistantTodoMessage([
@@ -728,52 +650,46 @@ describe('assistant-ui streaming renderer', () => {
       />
     )
 
-    const ui = within(container)
-
-    expect(container.querySelector('[data-slot="aui_todo-hoisted"]')).toBeTruthy()
-    expect(ui.getAllByText('Boil water').length).toBeGreaterThan(0)
-    expect(ui.getByText('Gather ingredients')).toBeTruthy()
-    expect(ui.queryByText(/pending/i)).toBeNull()
-    expect(ui.queryByRole('button', { name: /todo/i })).toBeNull()
+    expect(container.querySelector('[data-slot="aui_todo-hoisted"]')).toBeNull()
   })
 
-  it('renders archived todos after turn completion regardless of pending state', () => {
-    const first = render(
-      <TodoHarness message={assistantTodoMessage([{ content: 'Boil water', id: 'boil', status: 'pending' }], false)} />
-    )
+  it('renders completed image generation results in the tool slot', async () => {
+    const { container } = render(<MessageHarness message={assistantImageMessage()} />)
 
-    const ui = within(first.container)
-
-    expect(ui.getAllByText('Boil water').length).toBeGreaterThan(0)
-
-    first.unmount()
-
-    const second = render(
-      <TodoHarness
-        message={assistantTodoMessage([{ content: 'Serve latte', id: 'serve', status: 'completed' }], false)}
-      />
-    )
-
-    const archivedUi = within(second.container)
-
-    expect(archivedUi.getAllByText('Serve latte').length).toBeGreaterThan(0)
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: 'Generated image' }).getAttribute('src')).toBe(
+        'https://cdn.example/cat.png'
+      )
+    })
+    expect(container.querySelector('[data-slot="aui_generated-image"]')).toBeTruthy()
+    expect(screen.queryByRole('status', { name: /rendering image/i })).toBeNull()
   })
 
-  it('hoists todo outside the thinking disclosure when reasoning is present', () => {
+  it('uses the normal tool row for failed image generations instead of dropping their error payload', async () => {
     const { container } = render(
-      <TodoHarness
-        message={assistantReasoningTodoMessage([
-          { content: 'Buy oats', id: 'oats', status: 'completed' },
-          { content: "Reply to Sam's email", id: 'email', status: 'in_progress' }
-        ])}
+      <MessageHarness
+        message={assistantImageMessage(false, { error: 'FAL rejected the prompt', image: null, success: false })}
       />
     )
 
-    const todoPanel = container.querySelector('[data-slot="aui_todo-hoisted"]')
-    const thinkingDisclosure = container.querySelector('[data-slot="aui_thinking-disclosure"]')
+    fireEvent.click(container.querySelector('[data-tool-row] button')!)
 
-    expect(todoPanel).toBeTruthy()
-    expect(thinkingDisclosure).toBeTruthy()
-    expect(Boolean(thinkingDisclosure?.contains(todoPanel as Node))).toBe(false)
+    await waitFor(() => {
+      expect(container.textContent).toContain('FAL rejected the prompt')
+    })
+    expect(container.querySelector('[data-slot="aui_generated-image"]')).toBeNull()
+    expect(container.textContent).not.toContain('"success":false')
+  })
+
+  it('shows the command prompt and exit code for terminal calls', async () => {
+    const { container } = render(<MessageHarness message={assistantTerminalMessage()} />)
+
+    fireEvent.click(container.querySelector('[data-tool-row] button')!)
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('$ npm run check --workspace=apps/desktop')
+      expect(container.textContent).toContain('exit 0')
+      expect(container.textContent).toContain('all checks passed')
+    })
   })
 })

@@ -65,7 +65,6 @@ export function LanguageSwitcher({ className, collapsed = false, dropUp = false 
       )}
       disabled={isSavingLocale}
       size="sm"
-      title={title}
       type="button"
       variant="outline"
     >

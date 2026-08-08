@@ -58,6 +58,16 @@ def build_gateway_parser(subparsers, *, cmd_gateway: Callable, cmd_proxy: Callab
             "gateway's exit code. No effect outside an s6 container."
         ),
     )
+    gateway_run.add_argument(
+        "--external-supervisor",
+        action="store_true",
+        help=(
+            "Declare that an external process manager owns this foreground "
+            "gateway. In-chat restarts and updates exit back to that manager "
+            "instead of spawning a detached replacement. Use this when a "
+            "launchd/systemd wrapper strips its native environment markers."
+        ),
+    )
     add_accept_hooks_flag(gateway_run)
     add_accept_hooks_flag(gateway_parser)
 
