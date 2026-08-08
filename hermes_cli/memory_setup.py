@@ -36,9 +36,9 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
     releases whose overlapping ``hindsight_api`` files override the working
     slim API and crash the daemon with "Unknown embeddings provider: onnx"
     (#81421).  On that platform the local-embedded mode installs the thin
-    slim stack instead (wrapper installed ``--no-deps`` upstream, so the
-    explicit slim client + api-slim[local-onnx] specs are the portable
-    declaration).
+    slim stack instead — ``hindsight-all-slim`` + ``hindsight-api-slim[local-onnx]``
+    + ``hindsight-embed`` (the wrapper is installed ``--no-deps`` upstream,
+    so these explicit specs are the portable declaration).
     """
     deps = list(declared or [])
     if provider_name == "hindsight":
@@ -52,6 +52,11 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
                 if _is_intel_macos():
                     deps.append("hindsight-all-slim")
                     deps.append("hindsight-api-slim[local-onnx]")
+                    # The embed manager must be declared explicitly: it is
+                    # the component that drives the configured ONNX
+                    # embeddings provider, and a venv rebuild strips it
+                    # exactly like hindsight-embed did in #70636.
+                    deps.append("hindsight-embed")
                 else:
                     deps.append("hindsight-all")
         except Exception:
@@ -167,13 +172,17 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         return
 
     # pip name → import name mapping for packages where they differ
+    # (Intel-macOS slim stack, #81421: the slim meta-packages don't expose
+    # a top-level import at their pip name, so map them to the modules they
+    # ship — otherwise the missing-dep probe re-installs them every refresh)
     _IMPORT_NAMES = {
         "honcho-ai": "honcho",
         "mem0ai": "mem0",
         "hindsight-client": "hindsight_client",
         "hindsight-all": "hindsight",
-        "hindsight-all-slim": "hindsight_all_slim",
-        "hindsight-api-slim": "hindsight_api_slim",
+        "hindsight-all-slim": "hindsight_api",
+        "hindsight-api-slim": "hindsight_api",
+        "hindsight-embed": "hindsight_embed",
     }
 
     # Check which packages need installation.
@@ -191,6 +200,14 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
             missing.append(dep)
 
     if not missing:
+        # Even when every slim dep already imports, the configured local
+        # runtime on Intel macOS may still be stale — the #81421 failure
+        # mode is an ancient hindsight_api release that is importable but
+        # no longer exposes LocalSTEmbeddings, so the probe above would
+        # skip reinstall while the daemon still crashes. Smoke-check even
+        # on the refresh path (gated inside the helper).
+        if provider_name == "hindsight":
+            _maybe_run_intel_macos_local_embedded_smoke_check()
         return
 
     print(f"\n  Installing dependencies: {', '.join(missing)}")
@@ -218,6 +235,17 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         print(f"  ⚠ Install failed: {e}")
         print(f"  Run manually: {manual_cmd}")
 
+    # Post-install smoke check (#81421): pip reports success even when the
+    # resolver backtracked the slim runtime to an ancient API release whose
+    # hindsight_api no longer exposes LocalSTEmbeddings — the daemon then
+    # crashes with "Unknown embeddings provider: onnx" while the update
+    # claims success. Verify the configured local runtime is actually
+    # usable, and raise so ``hermes update`` can't report a healed install
+    # that is still broken. Gated to Intel macOS + local mode inside the
+    # helper; every other path returns immediately.
+    if provider_name == "hindsight":
+        _maybe_run_intel_macos_local_embedded_smoke_check()
+
     # Also show external dependencies (non-pip) if any
     ext_deps = meta.get("external_dependencies", [])
     for dep in ext_deps:
@@ -233,6 +261,119 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
                 if install_cmd:
                     print(f"\n  ⚠ '{dep_name}' not found. Install with:")
                     print(f"    {install_cmd}")
+
+
+def _maybe_run_intel_macos_local_embedded_smoke_check() -> None:
+    """Post-install/refresh smoke check for the Intel-macOS slim runtime.
+
+    On Intel macOS + local/local_embedded, pip reports success even when
+    the resolver backtracked the slim stack to an ancient ``hindsight_api``
+    release whose files shadow the working slim runtime — the daemon then
+    crashes with "Unknown embeddings provider: onnx" while the update
+    claims success (#81421).  This verifies the configured local runtime
+    is actually usable, prints an actionable failure banner, and raises
+    so ``hermes update`` cannot report a healed install that is still
+    broken.
+
+    It is gated to (Intel macOS + local mode); every other path returns
+    immediately and costs nothing on refresh.
+    """
+    import json as _json
+
+    try:
+        cfg_path = get_hermes_home() / "hindsight" / "config.json"
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    except Exception:
+        cfg = {}
+    if cfg.get("mode", "") not in {"local", "local_embedded"}:
+        return
+    if not _is_intel_macos():
+        return
+    smoke_errors = _smoke_import_hindsight_local()
+    if not smoke_errors:
+        return
+    print(
+        "  ✗ Hindsight slim runtime smoke validation failed (#81421). The "
+        "daemon will not start with this stack; re-running the install "
+        "will not help until the resolver stops backtracking. Check `pip "
+        "show hindsight-api-slim` and `pip show hindsight-embed` for "
+        "overlapping API files."
+    )
+    for err in smoke_errors:
+        print(f"    {err}")
+    raise RuntimeError(
+        "Hindsight slim runtime smoke validation failed on Intel macOS "
+        "— pip (or an existing importable release) reports success but "
+        "the configured local runtime is not usable. See the warnings "
+        "printed above; the heal is NOT considered successful. (#81421)"
+    )
+
+
+def _smoke_import_hindsight_local() -> list:
+    """Validate the Hindsight local runtime is usable; returns a list of
+    failure descriptions (empty on success).
+
+    Runs the probe in a clean subprocess so cached modules from the
+    updating process cannot mask the newly installed environment (#81421).
+    The subprocess exits 0 with JSON ``{"errors": [...]}`` on stdout;
+    a non-zero exit is itself treated as a failure (the script crashed
+    before it could report).
+
+    The probe covers more than bare imports: the #81421 regression is
+    "pip says ok but the daemon crashes with Unknown embeddings provider:
+    onnx", which means a fully importable API surface can still expose a
+    runtime that rejects the configured embeddings provider.  We import
+    the slim API backend (``hindsight_api``), the embed manager
+    (``hindsight_embed``), and confirm the configured local embeddings
+    class (``hindsight_api.LocalSTEmbeddings`` — the SentenceTransformers /
+    ONNX provider that backs ``local_embedded``) resolves.  We do not
+    instantiate it (that triggers a model download we can't do in CI);
+    resolving the class is enough to detect the backtrack failure mode.
+    """
+    import json as _json
+    import subprocess as _sp
+    import sys as _sys
+
+    script = (
+        "import json\n"
+        "errors = []\n"
+        "api_module = None\n"
+        "for mod in ('hindsight_api', 'hindsight_embed'):\n"
+        "    try:\n"
+        "        m = __import__(mod)\n"
+        "    except Exception as e:\n"
+        "        errors.append(f'{mod}: {type(e).__name__}: {e}')\n"
+        "        continue\n"
+        "    if mod == 'hindsight_api':\n"
+        "        api_module = m\n"
+        "if api_module is not None and not hasattr(api_module, 'LocalSTEmbeddings'):\n"
+        "    errors.append(\n"
+        "        'hindsight_api.LocalSTEmbeddings: AttributeError: the slim runtime '\n"
+        "        'shipped an API release that does not expose the configured ONNX '\n"
+        "        'embeddings provider — this is the #81421 backtrack failure mode'\n"
+        "    )\n"
+        "print(json.dumps({'errors': errors}))\n"
+    )
+    try:
+        completed = _sp.run(
+            [_sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as e:
+        return [f"subprocess invocation failed: {type(e).__name__}: {e}"]
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "")[:200].strip()
+        return [f"smoke subprocess exited {completed.returncode}: {stderr or '<no stderr>'}"]
+    try:
+        payload = _json.loads(completed.stdout)
+    except Exception as e:
+        return [f"smoke subprocess output not parseable JSON: {type(e).__name__}: {e}"]
+    if not isinstance(payload, dict) or not isinstance(payload.get("errors"), list):
+        return ["smoke subprocess output shape unexpected"]
+    return [str(err) for err in payload["errors"]]
 
 
 def _get_available_providers() -> list:

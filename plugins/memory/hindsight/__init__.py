@@ -973,7 +973,14 @@ class HindsightMemoryProvider(MemoryProvider):
         # ONNX runtime (#81421).  On that platform install the thin slim
         # stack instead, matching ``_provider_pip_dependencies``.
         if _is_intel_macos():
-            local_dep = ["hindsight-all-slim", "hindsight-api-slim[local-onnx]"]
+            local_dep = [
+                "hindsight-all-slim",
+                "hindsight-api-slim[local-onnx]",
+                # Same explicit embed spec as ``_provider_pip_dependencies``:
+                # the embed manager drives the configured ONNX embeddings
+                # provider and must be declared, not assumed.
+                "hindsight-embed",
+            ]
         else:
             local_dep = ["hindsight-all"]
         if mode == "local_embedded":
