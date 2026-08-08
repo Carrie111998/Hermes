@@ -418,6 +418,102 @@ class TestScopedLocks:
         assert payload["pid"] == os.getpid()
         assert payload["metadata"]["platform"] == "telegram"
 
+    def test_acquire_scoped_lock_self_reacquire_heals_null_start_time(self, tmp_path, monkeypatch):
+        """Regression for #81468: gateway must self-reacquire its own lock
+        even when the on-disk record's start_time is null.
+
+        On macOS, psutil can transiently fail to read create_time() at the
+        moment the lock is first written, leaving start_time: null on disk
+        forever (only a successful self-reacquire ever refreshes it). A
+        live reconnect (e.g. after a Discord 503 burst) then calls
+        acquire_scoped_lock() again from the *same* PID, but this time
+        _get_process_start_time() succeeds and returns a real value. The
+        None/number mismatch must not make the gateway see itself as a
+        foreign squatter of its own token lock.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "discord-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "start_time": None,
+            "kind": "hermes-gateway",
+            "argv": list(sys.argv),
+        }))
+
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 999)
+
+        acquired, existing = status.acquire_scoped_lock(
+            "discord-bot-token", "secret", metadata={"platform": "discord"}
+        )
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+        assert payload["start_time"] == 999
+        assert payload["metadata"]["platform"] == "discord"
+
+    def test_acquire_scoped_lock_same_pid_different_start_time_still_self_reacquires(
+        self, tmp_path, monkeypatch
+    ):
+        """A PID match with two *known, differing* start_times is still
+        treated as self-reacquisition, not routed through the staleness
+        check.
+
+        There can only ever be one live process holding this PID right now
+        (this call). If the on-disk record names the same PID with a
+        different start_time, its writer is necessarily dead already (PID
+        reuse), so taking over is always correct -- start_time cannot
+        distinguish "us" from "an unrelated live process" the way it does
+        for *other* PIDs, because no other live process can share our PID.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "discord-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "start_time": 111,
+            "kind": "hermes-gateway",
+            "argv": list(sys.argv),
+        }))
+
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 999)
+
+        acquired, existing = status.acquire_scoped_lock(
+            "discord-bot-token", "secret", metadata={"platform": "discord"}
+        )
+
+        assert acquired is True
+        payload = json.loads(lock_path.read_text())
+        assert payload["start_time"] == 999
+        assert payload["metadata"]["platform"] == "discord"
+
+    def test_release_scoped_lock_heals_null_start_time(self, tmp_path, monkeypatch):
+        """Regression for #81468: release must not no-op on its own lock
+        just because the on-disk start_time disagrees with the live one.
+
+        Mirrors the acquire-side bug: release_scoped_lock() required
+        start_time equality to confirm ownership, so a lock with
+        start_time: null on disk (platform without /proc, psutil miss at
+        first write) could never be released by the very process that owns
+        it -- leaving the lock file stuck until an unrelated staleness
+        check cleaned it up.
+        """
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "discord-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "start_time": None,
+            "kind": "hermes-gateway",
+            "argv": list(sys.argv),
+        }))
+
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 999)
+
+        status.release_scoped_lock("discord-bot-token", "secret")
+
+        assert not lock_path.exists()
 
     def test_acquire_scoped_lock_race_second_acquirer_loses(self, tmp_path, monkeypatch):
         """Two racing starters both observe the same stale lock. The loser's

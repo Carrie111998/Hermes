@@ -1391,7 +1391,21 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         except (KeyError, TypeError, ValueError):
             existing_pid = None
 
-        if existing_pid == os.getpid() and existing.get("start_time") == record.get("start_time"):
+        if existing_pid == os.getpid():
+            # Same PID as the live process: this record is always ours to
+            # refresh, regardless of start_time. start_time only guards PID
+            # reuse by a *different* process, which cannot happen for our
+            # own PID -- if the disk record isn't from this call, it is from
+            # a now-dead process that used to have this PID, and taking over
+            # its abandoned lock is correct too. Requiring start_time to
+            # match here broke self-reacquisition whenever the two writes
+            # disagreed (e.g. start_time: null on disk from a platform
+            # without /proc, once psutil failed at the first write), which
+            # made a gateway reconnecting (e.g. after a Discord 503 burst)
+            # report its own live PID as a foreign squatter of its own lock
+            # forever (#81468). This matches the same "compare only when
+            # both are known" idiom already used for *other* PIDs below and
+            # by runtime_status_pid_is_live.
             _write_json_file(lock_path, record)
             return True, existing
 
@@ -1503,8 +1517,10 @@ def release_scoped_lock(scope: str, identity: str) -> None:
         return
     if existing.get("pid") != os.getpid():
         return
-    if existing.get("start_time") != _get_process_start_time(os.getpid()):
-        return
+    # Same PID as the live process means we own this lock -- see the matching
+    # comment in acquire_scoped_lock (#81468). Requiring start_time equality
+    # here left the lock stuck across reconnects whenever the disk and live
+    # values disagreed (e.g. start_time: null from a platform without /proc).
     try:
         lock_path.unlink(missing_ok=True)
     except OSError:
