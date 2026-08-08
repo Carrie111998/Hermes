@@ -265,7 +265,28 @@ def set_session_vars(
     try:
         from agent.runtime_cwd import set_session_cwd
 
-        set_session_cwd(cwd)
+        # Either the caller pinned a cwd (cron jobs pass ``_job_workdir``), or
+        # we snapshot the process-global fallback at the moment the session
+        # is bound.  The snapshot is what protects a multi-session gateway
+        # from inheriting a transient TERMINAL_CWD written by a concurrent
+        # workdir cron job: the cron holds ``_terminal_cwd_lock`` for the
+        # duration of the job, but a different session's resolver still
+        # runs from a thread with no lock held.  Pinning here means the
+        # gateway session's cwd is captured before any concurrent cron
+        # writer can dirty the process-global value (#81451).  Cron
+        # workdir-less jobs intentionally pass cwd="" so they also pick
+        # up the current TERMINAL_CWD — by the time ``run_job`` calls
+        # ``set_session_vars``, the worker has already snapshotted
+        # ``_prior_terminal_cwd`` and is about to hold the write lock,
+        # so the value is stable.
+        resolved_cwd = cwd
+        if not resolved_cwd:
+            import os as _os
+            try:
+                resolved_cwd = _os.environ.get("TERMINAL_CWD", "").strip() or _os.getcwd()
+            except Exception:
+                resolved_cwd = ""
+        set_session_cwd(resolved_cwd)
     except Exception:
         pass
     return tokens
