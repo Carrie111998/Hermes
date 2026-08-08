@@ -120,6 +120,33 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Suppress benign asyncio subprocess-transport teardown noise (#81175)
+# ---------------------------------------------------------------------------
+# When an MCP stdio server's subprocess transport is GC'd after the event
+# loop closes, BaseSubprocessTransport.__del__ raises RuntimeError("Event
+# loop is closed") via sys.unraisablehook (not via the loop's exception
+# handler). This is cosmetic — the transport already completed — but noisy
+# in the TUI. Install a filter that swallows ONLY this specific pattern.
+_original_unraisablehook = sys.unraisablehook
+
+
+def _quiet_asyncio_del_hook(unraisable):
+    """Swallow benign asyncio transport __del__ noise."""
+    if (
+        unraisable.exc_type is RuntimeError
+        and unraisable.exc_value is not None
+        and "Event loop is closed" in str(unraisable.exc_value)
+    ):
+        return  # benign shutdown race — suppress
+    _original_unraisablehook(unraisable)
+
+
+try:
+    sys.unraisablehook = _quiet_asyncio_del_hook
+except AttributeError:
+    pass  # Python < 3.8 — no unraisablehook, skip silently
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
