@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -12,7 +11,6 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
-from hermes_constants import get_hermes_home
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
@@ -28,44 +26,23 @@ class ManagedToolGatewayConfig:
     managed_mode: bool
 
 
-def auth_json_path():
-    """Return the Hermes auth store path, respecting HERMES_HOME overrides."""
-    return get_hermes_home() / "auth.json"
-
-
-def _nous_provider_from_store(data: object) -> Optional[dict]:
-    if not isinstance(data, dict):
-        return None
-    providers = data.get("providers", {})
-    if not isinstance(providers, dict) or "nous" not in providers:
-        return None
-    nous_provider = providers.get("nous")
-    if isinstance(nous_provider, dict):
-        return nous_provider
-    return None
-
-
 def _read_nous_provider_state() -> Optional[dict]:
-    """Read Nous OAuth state from the profile, then the shared root fallback."""
+    """Read Nous OAuth state with the canonical profile/global fallback."""
     try:
-        path = auth_json_path()
-        if path.is_file():
-            state = _nous_provider_from_store(
-                json.loads(path.read_text(encoding="utf-8"))
-            )
-            if state is not None:
-                return state
-    except Exception:
-        pass
+        from hermes_cli.auth import get_provider_auth_state
 
-    # Named profiles inherit OAuth providers from the global auth store. Keep
-    # this read-only so a shared rotating refresh token retains one owner.
-    try:
-        from hermes_cli.auth import _load_global_auth_store
-
-        return _nous_provider_from_store(_load_global_auth_store())
+        return get_provider_auth_state("nous")
     except Exception:
         return None
+
+
+def _access_token_from_provider(provider: object) -> Optional[str]:
+    if not isinstance(provider, dict):
+        return None
+    access_token = provider.get("access_token")
+    if isinstance(access_token, str) and access_token.strip():
+        return access_token.strip()
+    return None
 
 
 def _parse_timestamp(value: object) -> Optional[datetime]:
@@ -127,11 +104,7 @@ def peek_nous_access_token() -> Optional[str]:
     if explicit:
         return explicit
 
-    nous_provider = _read_nous_provider_state() or {}
-    access_token = nous_provider.get("access_token")
-    if isinstance(access_token, str) and access_token.strip():
-        return access_token.strip()
-    return None
+    return _access_token_from_provider(_read_nous_provider_state())
 
 
 def read_nous_access_token() -> Optional[str]:
@@ -140,7 +113,7 @@ def read_nous_access_token() -> Optional[str]:
     if explicit:
         return explicit
     nous_provider = _read_nous_provider_state() or {}
-    cached_token = peek_nous_access_token()
+    cached_token = _access_token_from_provider(nous_provider)
 
     if cached_token and not _access_token_is_expiring(
         nous_provider.get("expires_at"),
