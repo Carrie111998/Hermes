@@ -444,7 +444,7 @@ def _env_ref_name(ref: str) -> str:
     return ref
 
 
-def _workspace_folder() -> str:
+def _workspace_folder(task_id: Optional[str] = None) -> str:
     """Best-effort absolute workspace root for ``${workspaceFolder}``.
 
     Resolution order:
@@ -457,7 +457,7 @@ def _workspace_folder() -> str:
     try:
         from tools.file_tools import _authoritative_workspace_root
 
-        root = _authoritative_workspace_root()
+        root = _authoritative_workspace_root(task_id or "default")
         if root:
             return root
     except Exception:
@@ -465,7 +465,7 @@ def _workspace_folder() -> str:
     return os.getcwd()
 
 
-def _context_var_value(ref: str) -> Optional[str]:
+def _context_var_value(ref: str, task_id: Optional[str] = None) -> Optional[str]:
     """Resolve Cursor-style context variables in ``${...}`` references.
 
     Supports the case-sensitive names Cursor's ``mcp.json`` interpolation
@@ -477,9 +477,9 @@ def _context_var_value(ref: str) -> Optional[str]:
     if ref == "userHome":
         return os.path.expanduser("~")
     if ref == "workspaceFolder":
-        return _workspace_folder()
+        return _workspace_folder() if task_id is None else _workspace_folder(task_id)
     if ref == "workspaceFolderBasename":
-        root = _workspace_folder()
+        root = _workspace_folder() if task_id is None else _workspace_folder(task_id)
         return os.path.basename(root.rstrip("/\\")) or root
     if ref in ("pathSeparator", "/"):
         return os.sep
@@ -1962,10 +1962,12 @@ class MCPServerTask:
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
+        "_publish_tools",
     )
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, *, publish_tools: bool = True):
         self.name = name
+        self._publish_tools = publish_tools
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -3166,7 +3168,7 @@ class MCPServerTask:
         registry-owned before its first successful session, so ownership also
         authorizes its first publication.
         """
-        if self._registered_tool_names:
+        if not self._publish_tools or self._registered_tool_names:
             return
         if not self._ready.is_set():
             with _lock:
@@ -3674,6 +3676,11 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+# Raw configs containing workspace context variables. Their public tool names
+# stay process-global, while calls route to a transport scoped by workspace.
+_workspace_server_configs: Dict[str, dict] = {}
+_workspace_servers: Dict[Tuple[str, str], MCPServerTask] = {}
+_workspace_server_connecting: Dict[Tuple[str, str], threading.Event] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
@@ -4127,6 +4134,7 @@ def _handle_auth_error_and_retry(
     exc: BaseException,
     retry_call,
     op_description: str,
+    server: Optional[MCPServerTask] = None,
 ):
     """Attempt auth recovery and one retry; return None to fall through.
 
@@ -4175,8 +4183,10 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
+        srv = server
+        if srv is None:
+            with _lock:
+                srv = _servers.get(server_name)
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -4333,6 +4343,7 @@ def _handle_session_expired_and_retry(
     exc: BaseException,
     retry_call,
     op_description: str,
+    server: Optional[MCPServerTask] = None,
 ):
     """Trigger a transport reconnect and retry once on session expiry.
 
@@ -4360,8 +4371,10 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    with _lock:
-        srv = _servers.get(server_name)
+    srv = server
+    if srv is None:
+        with _lock:
+            srv = _servers.get(server_name)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -4820,7 +4833,7 @@ def _interrupted_call_result() -> str:
 # Config loading
 # ---------------------------------------------------------------------------
 
-def _interpolate_env_vars(value):
+def _interpolate_env_vars(value, task_id: Optional[str] = None):
     """Recursively resolve ``${VAR}`` placeholders.
 
     Both ``${VAR}`` and Cursor-style ``${env:VAR}`` are accepted — the
@@ -4839,17 +4852,31 @@ def _interpolate_env_vars(value):
 
     if isinstance(value, str):
         def _replace(m):
-            ctx = _context_var_value(m.group(1).strip())
+            ctx = _context_var_value(m.group(1).strip(), task_id)
             if ctx is not None:
                 return ctx
             name = _env_ref_name(m.group(1))
             return _get_secret(name, m.group(0)) or m.group(0)
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+        return {k: _interpolate_env_vars(v, task_id) for k, v in value.items()}
     if isinstance(value, list):
-        return [_interpolate_env_vars(v) for v in value]
+        return [_interpolate_env_vars(v, task_id) for v in value]
     return value
+
+
+def _contains_workspace_context(value: Any) -> bool:
+    """Return whether a config value depends on the active workspace."""
+    if isinstance(value, str):
+        return any(
+            match.group(1).strip() in {"workspaceFolder", "workspaceFolderBasename"}
+            for match in _ENV_VAR_PATTERN.finditer(value)
+        )
+    if isinstance(value, dict):
+        return any(_contains_workspace_context(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_workspace_context(v) for v in value)
+    return False
 
 
 # (server_name, dotted key path) pairs already warned about — see
@@ -4958,7 +4985,10 @@ def _load_mcp_config() -> Dict[str, dict]:
         except Exception:
             pass
         safe_servers: Dict[str, dict] = {}
+        workspace_server_configs: Dict[str, dict] = {}
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+            if isinstance(cfg, dict) and _contains_workspace_context(cfg):
+                workspace_server_configs[name] = dict(cfg)
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
@@ -4978,6 +5008,9 @@ def _load_mcp_config() -> Dict[str, dict]:
                 safe_servers[name] = dict(cfg)
         except Exception:
             logger.debug("Failed to load portable MCP servers", exc_info=True)
+        with _lock:
+            _workspace_server_configs.clear()
+            _workspace_server_configs.update(workspace_server_configs)
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
@@ -4988,7 +5021,12 @@ def _load_mcp_config() -> Dict[str, dict]:
 # Server connection helper
 # ---------------------------------------------------------------------------
 
-async def _connect_server(name: str, config: dict) -> MCPServerTask:
+async def _connect_server(
+    name: str,
+    config: dict,
+    *,
+    publish_tools: bool = True,
+) -> MCPServerTask:
     """Create an MCPServerTask, start it, and return when ready.
 
     The server Task keeps the connection alive in the background.
@@ -4999,7 +5037,10 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         ImportError: if HTTP transport is needed but not available.
         Exception: on connection or initialization failure.
     """
+    # Instantiate with the historical one-argument contract so test/plugin
+    # subclasses that override __init__(name) remain compatible.
     server = MCPServerTask(name)
+    server._publish_tools = publish_tools
     claim = _connect_server_claim.get()
     claim_token = None
     if claim is not None:
@@ -5154,13 +5195,97 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
-def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
-    """Return a connected server, lazily reconnecting recycled stdio state.
+def _workspace_scope_key(server_name: str, task_id: Optional[str]) -> Tuple[str, str]:
+    root = os.path.abspath(_workspace_folder(task_id))
+    return server_name, os.path.normcase(root)
 
-    Also the single first-use connect point for lazy (schema-cache
-    registered) servers, so raw tool calls AND the resource/prompt utility
-    handlers all trigger the deferred spawn (#56832).
-    """
+
+def _connect_workspace_server(
+    server_name: str,
+    task_id: Optional[str],
+) -> Optional[MCPServerTask]:
+    """Return a transport whose fixed config is expanded for this workspace."""
+    with _lock:
+        template = _workspace_server_configs.get(server_name)
+    if template is None:
+        return None
+
+    config = _interpolate_env_vars(template, task_id)
+    scope_key = _workspace_scope_key(server_name, task_id)
+    wait_timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)) + 30.0
+
+    with _lock:
+        primary = _servers.get(server_name)
+        if primary is not None and primary._config == config:
+            return primary
+        scoped = _workspace_servers.get(scope_key)
+        if scoped is not None and scoped._config == config:
+            return scoped
+        ready = _workspace_server_connecting.get(scope_key)
+        owns_connect = ready is None
+        if owns_connect:
+            ready = threading.Event()
+            _workspace_server_connecting[scope_key] = ready
+
+    if not owns_connect:
+        ready.wait(timeout=wait_timeout)
+        with _lock:
+            scoped = _workspace_servers.get(scope_key)
+        return scoped if scoped is not None and scoped._config == config else None
+
+    connected: Optional[MCPServerTask] = None
+    stale: Optional[MCPServerTask] = None
+    try:
+        _ensure_mcp_loop()
+
+        async def _connect():
+            return await _connect_server(
+                server_name,
+                config,
+                publish_tools=False,
+            )
+
+        connected = _run_on_mcp_loop(_connect, timeout=wait_timeout)
+        with _lock:
+            stale = _workspace_servers.get(scope_key)
+            _workspace_servers[scope_key] = connected
+    except Exception as exc:
+        logger.warning(
+            "MCP server '%s': workspace-scoped connect failed for %s: %s",
+            server_name,
+            scope_key[1],
+            _format_connect_error(exc),
+        )
+    finally:
+        with _lock:
+            ready = _workspace_server_connecting.pop(scope_key, ready)
+        ready.set()
+
+    if stale is not None and stale is not connected:
+        try:
+            _run_on_mcp_loop(stale.shutdown, timeout=15)
+        except BaseException:
+            logger.debug(
+                "MCP server '%s': stale workspace transport shutdown failed",
+                server_name,
+                exc_info=True,
+            )
+    return connected
+
+
+def _get_connected_server_for_call(
+    server_name: str,
+    task_id: Optional[str] = None,
+) -> Optional[MCPServerTask]:
+    """Return the workspace-correct connected server for a tool call."""
+    with _lock:
+        workspace_sensitive = server_name in _workspace_server_configs
+    if workspace_sensitive:
+        server = _connect_workspace_server(server_name, task_id)
+        if server is not None and server.session is None and server._is_recycled_stdio():
+            _request_lazy_reconnect(server_name, server)
+        return server
+
     with _lock:
         server = _servers.get(server_name)
         is_lazy = server_name in _lazy_server_configs
@@ -5223,7 +5348,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 )
             # Cooldown elapsed → fall through as a half-open probe.
 
-        server = _get_connected_server_for_call(server_name)
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        server = _get_connected_server_for_call(server_name, task_id)
         if not server:
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5380,6 +5506,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -5390,6 +5517,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -5410,7 +5538,8 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        server = _get_connected_server_for_call(server_name, task_id)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5444,11 +5573,13 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once, "resources/list",
+                server=server,
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once, "resources/list",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -5466,7 +5597,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        server = _get_connected_server_for_call(server_name, task_id)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5505,11 +5637,13 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once, "resources/read",
+                server=server,
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once, "resources/read",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -5527,7 +5661,8 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        server = _get_connected_server_for_call(server_name, task_id)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5566,11 +5701,13 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once, "prompts/list",
+                server=server,
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once, "prompts/list",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -5588,7 +5725,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        server = _get_connected_server_for_call(server_name, task_id)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5631,11 +5769,13 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
                 server_name, exc, _call_once, "prompts/get",
+                server=server,
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
                 server_name, exc, _call_once, "prompts/get",
+                server=server,
             )
             if recovered is not None:
                 return recovered
@@ -7274,7 +7414,10 @@ def shutdown_mcp_servers():
     All servers are shut down in parallel via ``asyncio.gather``.
     """
     with _lock:
-        servers_snapshot = list(_servers.values())
+        servers_snapshot = list({
+            id(server): server
+            for server in [*_servers.values(), *_workspace_servers.values()]
+        }.values())
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -7286,6 +7429,11 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _workspace_servers.clear()
+            connecting = list(_workspace_server_connecting.values())
+            _workspace_server_connecting.clear()
+        for ready in connecting:
+            ready.set()
         _stop_mcp_loop()
         return
 
@@ -7301,11 +7449,16 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _workspace_servers.clear()
+            connecting = list(_workspace_server_connecting.values())
+            _workspace_server_connecting.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+        for ready in connecting:
+            ready.set()
 
     with _lock:
         loop = _mcp_loop
@@ -7329,6 +7482,11 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+        _workspace_servers.clear()
+        connecting = list(_workspace_server_connecting.values())
+        _workspace_server_connecting.clear()
+    for ready in connecting:
+        ready.set()
 
     _stop_mcp_loop()
 
