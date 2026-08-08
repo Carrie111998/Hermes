@@ -936,14 +936,20 @@ def test_auth_usage_times_out_cleanly(monkeypatch, capsys):
         "concurrent.futures.ThreadPoolExecutor", _HangingPool
     )
 
+    # No pool entries are seeded; the command falls back to a single
+    # ``default`` synthetic row whose fetch hangs. The single-entry path
+    # surfaces the timeout inline (no stacktrace) and then exits non-zero
+    # because no entry rendered.
     with pytest.raises(SystemExit) as exc_info:
         auth_usage_command(SimpleNamespace(provider="openai-codex"))
     msg = str(exc_info.value)
-    # The timeout must surface a short actionable line, not a stacktrace, and
-    # the message must include the budget so the user can correlate it with
-    # the known REPL ``/usage`` 10s cap.
-    assert "timed out" in msg
-    assert f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s" in msg
+    out = capsys.readouterr().out
+    # The timeout must surface a short actionable line, not a stacktrace,
+    # and the inline message must include the budget so the user can
+    # correlate it with the known REPL ``/usage`` 10s cap.
+    assert "timed out" in out
+    assert f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s" in out
+    assert "no account returned usable usage" in msg
     assert "Traceback" not in capsys.readouterr().err
 
 
@@ -958,7 +964,8 @@ def test_auth_usage_reports_unavailable_snapshot(monkeypatch, capsys):
     # ``fetch_account_usage`` returns a snapshot with ``unavailable_reason``
     # when the endpoint is reachable but the payload is in a shape we can't
     # render (e.g. a future Codex payload change). The command must surface
-    # that reason, not "usage is not available right now."
+    # that reason inline (per entry) instead of as the final SystemExit
+    # summary, and exit non-zero because nothing rendered.
     snapshot = AccountUsageSnapshot(
         provider="openai-codex",
         source="usage_api",
@@ -994,6 +1001,415 @@ def test_auth_usage_reports_unavailable_snapshot(monkeypatch, capsys):
 
     with pytest.raises(SystemExit) as exc_info:
         auth_usage_command(SimpleNamespace(provider="openai-codex"))
-    assert "unexpected response shape" in str(exc_info.value)
+    out = capsys.readouterr().out
+    # Inline per-entry message carries the provider reason; the SystemExit
+    # summary only fires because nothing rendered.
+    assert "unexpected response shape" in out
+    assert "no account returned usable usage" in str(exc_info.value)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `--all` / `--account` — multi-pool-entry iteration for `auth usage`
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The default (no flag) path renders only the resolver-selected account and
+# prints a hint when the pool has more than one entry. ``--all`` iterates
+# every entry and renders each separately; ``--account LABEL`` filters to a
+# single entry by stored label. Per-entry failures are surfaced inline and
+# do not abort the loop; only "no entry rendered at all" exits non-zero.
+
+
+def _seed_pool(monkeypatch, entries):
+    """Patch ``_load_auth_store`` so it returns the given provider entries."""
+    store = {"credential_pool": {"openai-codex": list(entries)}}
+    monkeypatch.setattr(
+        "hermes_cli.auth_commands._list_provider_account_credentials",
+        lambda provider: [
+            {
+                "label": e.get("label", ""),
+                "source": e.get("source", "manual:device_code"),
+                "access_token": e.get("access_token", "tok-" + e.get("label", "")),
+                "account_id": e.get("account_id", ""),
+            }
+            for e in entries
+            if e.get("access_token")
+        ],
+    )
+    return store
+
+
+def test_auth_usage_all_renders_every_pool_entry(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    # Stub the per-account fetch to return a happy-path snapshot for every
+    # entry; the loop should render both, each under its own header.
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        plan="Plus",
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=100.0,
+                reset_at=datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=(),
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+
+    # Stub the per-account fetch (resolved lazily inside
+    # ``_fetch_account_usage_with_timeout``) so the test does not hit the
+    # network. The snapshot must be available, or the command will exit
+    # non-zero and the assertions below will fire spuriously.
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
+    )
+
+    auth_usage_command(
+        SimpleNamespace(provider="openai-codex", all_accounts=True, account="")
+    )
+
+    out = capsys.readouterr().out
+    # Both labels appear, each preceded by its own header banner, and the
+    # renderer output is shared (so ``Session`` is rendered twice).
+    assert "=== openai-codex: codex-current ===" in out
+    assert "=== openai-codex: openai-codex-oauth-2 ===" in out
+    assert out.count("Session") == 2
+    # No final SystemExit — both rendered cleanly.
+    assert "no account returned usable usage" not in out
+
+
+def test_auth_usage_account_filters_to_label(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        plan="Plus",
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=50.0,
+                reset_at=datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=(),
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
+    )
+
+    auth_usage_command(
+        SimpleNamespace(
+            provider="openai-codex", all_accounts=False, account="codex-current"
+        )
+    )
+
+    out = capsys.readouterr().out
+    # The renderer output reflects the requested entry's snapshot (the
+    # only window is the one we built above). The other label must NOT
+    # appear anywhere — including the renderer, since each entry has its
+    # own snapshot and we filtered to one.
+    assert "Account limits" in out
+    assert "Session" in out
+    assert "50%" in out
+    # With a single-entry filter, no per-account header banner is emitted
+    # (consistent with the default one-shot path).
+    assert "===" not in out
+
+
+def test_auth_usage_account_unknown_label_exits_nonzero(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(
+            SimpleNamespace(
+                provider="openai-codex", all_accounts=False, account="ghost"
+            )
+        )
+    msg = str(exc_info.value)
+    # Must name the requested label and list the known set so the user can
+    # self-correct on retry.
+    assert "ghost" in msg
+    assert "codex-current" in msg
+    assert "openai-codex-oauth-2" in msg
+
+
+def test_auth_usage_all_continues_after_per_entry_failure(monkeypatch, capsys):
+    """One entry's fetch failure must not abort the rest of the loop."""
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    good_snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        plan="Plus",
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=10.0,
+                reset_at=datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=(),
+    )
+
+    call_count = {"n": 0}
+
+    def _flaky_fetch(*args, **kwargs):
+        call_count["n"] += 1
+        # First call hangs (timeout), second returns the good snapshot.
+        if call_count["n"] == 1:
+            raise concurrent.futures.TimeoutError()
+        return good_snapshot
+
+    class _FlakyFuture:
+        def __init__(self, fn, *args, **kwargs):
+            self._fn = fn
+            self._args = args
+            self._kwargs = kwargs
+
+        def result(self, timeout=None):
+            return self._fn(*self._args, **self._kwargs)
+
+    class _FlakyPool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            # Wrap so the timeout the helper enforces kicks in — emulate
+            # by raising TimeoutError on first call (handled above) and
+            # returning the snapshot on the second.
+            return _FlakyFuture(_flaky_fetch, fn, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _FlakyPool
+    )
+
+    auth_usage_command(
+        SimpleNamespace(provider="openai-codex", all_accounts=True, account="")
+    )
+
+    out = capsys.readouterr().out
+    # First entry's timeout surfaces inline; second entry still renders.
+    assert "codex-current" in out
+    assert "openai-codex-oauth-2" in out
+    assert "timed out" in out
+    assert "Account limits" in out
+    # Both entries were attempted (not just the first).
+    assert call_count["n"] == 2
+
+
+def test_auth_usage_default_warns_when_multiple_pool_entries(monkeypatch, capsys):
+    """The no-flag path must show the head entry AND a hint about ``--all``."""
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        plan="Plus",
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=100.0,
+                reset_at=datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=(),
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
+    )
+
+    auth_usage_command(
+        SimpleNamespace(provider="openai-codex", all_accounts=False, account="")
+    )
+
+    out = capsys.readouterr().out
+    # Hint points the user at --all; the head entry's snapshot still renders.
+    assert "2 pool entries" in out
+    assert "--all" in out
+    assert "codex-current" in out
+    # The second entry never renders in the default path.
+    assert "openai-codex-oauth-2" not in out
+
+
+def test_auth_usage_lists_provider_account_credentials_skips_partial_rows():
+    """Pool rows without an access_token are silently dropped."""
+    from hermes_cli.auth_commands import _list_provider_account_credentials
+
+    # Real ``_load_auth_store`` reads ~/.hermes/auth.json — that's not what
+    # we want here. Patch it directly so the test is hermetic.
+    import hermes_cli.auth_commands as ac
+
+    ac.__dict__["_list_provider_account_credentials"]  # ensure imported
+    fake_store = {
+        "credential_pool": {
+            "openai-codex": [
+                {"label": "ok-1", "access_token": "tok-1"},
+                {"label": "no-token", "access_token": ""},  # partial
+                {"label": "ok-2", "access_token": "tok-2"},
+                "not-a-dict",  # malformed
+                {"label": "auto", "access_token": "tok-3"},
+            ],
+            "anthropic": [{"label": "anth", "access_token": "tok-a"}],
+        }
+    }
+    import hermes_cli.auth as auth_mod
+
+    original = auth_mod._load_auth_store
+    auth_mod._load_auth_store = lambda: fake_store
+    try:
+        rows = _list_provider_account_credentials("openai-codex")
+    finally:
+        auth_mod._load_auth_store = original
+
+    labels = [r["label"] for r in rows]
+    # Partial / malformed rows are silently dropped; valid rows are kept
+    # in original order so the user sees the pool's own head-to-tail view.
+    assert labels == ["ok-1", "ok-2", "auto"]
+    # And the access tokens were carried through untouched (the function
+    # never redacts them, but it must not return empty / partial rows).
+    assert all(r["access_token"] for r in rows)
 
 

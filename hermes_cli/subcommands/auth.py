@@ -80,6 +80,27 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
             "(openai-codex, anthropic, openrouter)"
         ),
     )
+    auth_usage.add_argument(
+        "--all",
+        action="store_true",
+        dest="all_accounts",
+        help=(
+            "Render usage for every pool entry of this provider instead of "
+            "just the resolver-selected one. Per-entry failures are reported "
+            "inline; the command exits non-zero only if no entry returned "
+            "usable usage."
+        ),
+    )
+    auth_usage.add_argument(
+        "--account",
+        dest="account",
+        default="",
+        metavar="LABEL",
+        help=(
+            "Render usage for the pool entry whose stored label matches "
+            "LABEL. Use `hermes auth list <provider>` to see available labels."
+        ),
+    )
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state"
     )
