@@ -4015,6 +4015,13 @@ def recompute_ready(
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    Each promotion records the ``promoted`` event, and — when the task has a
+    recent PR comment and no prior override for that evidence was already
+    consumed — attaches a one-shot ``active_pr`` respawn-guard override to
+    it. The promotion is the only re-queue a dependency wait ever sees, so it
+    carries the same "one guarded claim" authority an explicit unblock would
+    (see ``_auto_promote_respawn_override``).
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -4067,7 +4074,17 @@ def recompute_ready(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                # An auto-promotion re-queues the task deliberately (the board
+                # itself decided the wait is over), so mint the same one-shot
+                # respawn-guard override an explicit unblock would — otherwise
+                # a dependency-waiting task with a recent PR comment re-enters
+                # ``ready`` and is wedged there by the ``active_pr`` guard for
+                # the full 24h window with no operator action available.
+                override = _auto_promote_respawn_override(conn, task_id)
+                _append_event(
+                    conn, task_id, "promoted",
+                    {"respawn_overrides": [override]} if override else None,
+                )
                 promoted += 1
     return promoted
 
@@ -7886,14 +7903,19 @@ def _latest_active_pr_comment_id(conn: sqlite3.Connection, task_id: str, cutoff:
 def _has_unconsumed_respawn_override(
     conn: sqlite3.Connection, task_id: str, reason: str, evidence_kind: str, evidence_id: int,
 ) -> bool:
-    """Whether an operator unblock still authorizes one guarded retry.
+    """Whether a prior override still authorizes one guarded retry.
 
-    The override is tied to the exact PR comment or successful run which it
-    acknowledged. A later ``claimed`` event consumes it, even if spawning then
-    fails and releases the task back to ``ready``.
+    Overrides ride on ``unblocked`` events (an explicit operator unblock) or
+    on ``promoted`` events (``recompute_ready`` auto-promoting a task back to
+    ``ready`` — the only re-queue path for a dependency wait, which
+    ``unblock_task`` cannot reach in ``todo``). The override is tied to the
+    exact PR comment or successful run which it acknowledged. A later
+    ``claimed`` event consumes it, even if spawning then fails and releases
+    the task back to ``ready``.
     """
     events = conn.execute(
-        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('unblocked', 'promoted') "
         "ORDER BY id DESC",
         (task_id,),
     ).fetchall()
@@ -7927,6 +7949,81 @@ def _has_unconsumed_respawn_override(
             ).fetchone()
             return claimed is None
     return False
+
+
+def _auto_promote_respawn_override(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, object]]:
+    """Mint a one-shot ``active_pr`` override when a promotion re-queues a task.
+
+    ``recompute_ready`` is the only re-queue path a dependency wait ever sees:
+    ``block_task(kind="dependency")`` parks the task in ``todo``, and
+    ``unblock_task`` only reaches ``blocked``/``scheduled`` — so an explicit
+    unblock can never authorize the retry a dependency promotion requests.
+    The promotion itself is that deliberate "run it again" signal. This mints
+    the same evidence-bound, consumed-on-claim override ``unblock_task`` mints,
+    but only for the one guard that ignores plain re-queue events
+    (``active_pr``): ``recent_success`` already honours the ``promoted`` event
+    directly and needs no override.
+
+    Loop brake — one auto-mint per PR-comment evidence. Without it, the
+    parentless dependency-block churn from #81305 (``recompute_ready``
+    re-promoting every tick because "all parents done" is vacuously true over
+    zero parents) would mint a fresh override every tick, turning the
+    ``active_pr`` guard from a once-per-24h throttle into a spawn-per-tick
+    loop. Once any override for this exact evidence has been consumed by a
+    ``claimed`` event, the automatic path refuses to re-mint; the guard
+    re-applies until fresh evidence (a newer PR comment) appears or an
+    operator acts explicitly (``hermes kanban block`` + ``unblock`` — the
+    only explicit path that reaches a task already back in ``ready``).
+    """
+    now = int(time.time())
+    comment_id = _latest_active_pr_comment_id(
+        conn, task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+    )
+    if comment_id is None:
+        return None
+    if _has_unconsumed_respawn_override(
+        conn, task_id, "active_pr", "pr_comment", comment_id,
+    ):
+        # An unconsumed override already authorizes one guarded claim —
+        # don't stack a duplicate on the promotion event.
+        return None
+    for event in conn.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('unblocked', 'promoted') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(event["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        overrides = (
+            payload.get("respawn_overrides") if isinstance(payload, dict) else None
+        )
+        if not isinstance(overrides, list):
+            continue
+        if not any(
+            isinstance(override, dict)
+            and override.get("reason") == "active_pr"
+            and isinstance(override.get("evidence"), dict)
+            and override["evidence"].get("kind") == "pr_comment"
+            and override["evidence"].get("id") == comment_id
+            for override in overrides
+        ):
+            continue
+        consumed = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'claimed' "
+            "AND id > ? LIMIT 1",
+            (task_id, event["id"]),
+        ).fetchone()
+        if consumed is not None:
+            return None
+    return {
+        "reason": "active_pr",
+        "evidence": {"kind": "pr_comment", "id": comment_id},
+    }
 
 
 def _respawn_guard_override_payloads(
@@ -8007,6 +8104,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        An explicit unblock — or a ``recompute_ready`` promotion, which
+        is the only re-queue path for a dependency wait — mints a
+        one-shot override for the PR-comment evidence, consumed by the
+        next claim; the automatic promotion path mints at most one
+        override per evidence so a re-blocking loop cannot respawn
+        every tick.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
