@@ -7159,7 +7159,8 @@ def run_conversation(
                 # When todos still show remaining work, a text-only stop
                 # without `clarify` this turn is an invalid terminal state.
                 # Structured evidence only (todo store + clarify tool call) —
-                # do not parse freeform prose.
+                # do not parse freeform prose. Kanban workers are skipped so
+                # kanban_stop owns the terminal contract below.
                 try:
                     from agent.boundary_handoff import build_boundary_handoff_nudge
 

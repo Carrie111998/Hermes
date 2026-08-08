@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     drain_truncation_warnings,
+    TASK_COMPLETION_BOUNDARY_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
@@ -56,9 +57,11 @@ class TestGuidanceConstants:
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
     def test_task_completion_guidance_requires_clarify_at_boundary(self):
-        guidance = TASK_COMPLETION_GUIDANCE.lower()
+        # Base block stays tool-agnostic; clarify handoff is a separate gated block.
+        assert "`clarify`" not in TASK_COMPLETION_GUIDANCE
+        guidance = TASK_COMPLETION_BOUNDARY_GUIDANCE.lower()
 
-        assert "`clarify`" in TASK_COMPLETION_GUIDANCE
+        assert "`clarify`" in TASK_COMPLETION_BOUNDARY_GUIDANCE
         assert "completed and verified" in guidance
         assert "what remains" in guidance
         assert "exact boundary or blocker" in guidance

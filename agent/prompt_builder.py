@@ -355,7 +355,13 @@ TASK_COMPLETION_GUIDANCE = (
     "approach, ask the user). NEVER substitute plausible-looking fabricated "
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
-    "is always better than inventing a result.\n"
+    "is always better than inventing a result."
+)
+
+# Clarify-gated boundary handoff — only injected when ``clarify`` is in the
+# live toolset (see system_prompt assembly). Leaf/cron/kanban surfaces that
+# strip clarify must not be told to call a missing tool.
+TASK_COMPLETION_BOUNDARY_GUIDANCE = (
     "If work must pause at a permission, safety, workspace, repository, or "
     "external-system boundary, do not end with a partial-progress summary alone. "
     "Call `clarify` with a self-contained question stating what you completed "

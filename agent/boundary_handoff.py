@@ -22,6 +22,17 @@ _ACTIVE_STATUSES = frozenset({"pending", "in_progress"})
 _DEFAULT_MAX_ATTEMPTS = 2
 _MAX_REMAINING_IN_NUDGE = 6
 
+# Runtime-injected user turns that do not end the human turn window.
+# Keys ending in ``_synthetic`` are covered generically; these extra
+# markers use a different naming convention in the conversation loop.
+_INTERNAL_USER_MARKERS = frozenset(
+    {
+        "_dropped_toolcall_nudge",
+        "_empty_terminal_sentinel",
+        "_thinking_prefill",
+    }
+)
+
 
 def remaining_todo_items(todo_store: Any) -> list[dict[str, str]]:
     """Return pending/in_progress todo items from a TodoStore-like object."""
@@ -69,7 +80,9 @@ def _tool_call_name(tc: Any) -> str:
 
 def _is_synthetic_user_message(msg: dict) -> bool:
     """True for runtime-injected user turns (nudges), not the human user."""
-    return any(str(key).endswith("_synthetic") for key in msg)
+    if any(str(key).endswith("_synthetic") for key in msg):
+        return True
+    return any(marker in msg for marker in _INTERNAL_USER_MARKERS)
 
 
 def turn_called_clarify(messages: Iterable[dict] | None) -> bool:
@@ -127,13 +140,23 @@ def build_boundary_handoff_nudge(
 ) -> Optional[str]:
     """Return a synthetic follow-up when remaining work ends without ``clarify``.
 
-    Returns ``None`` when the guard should not fire (disabled, ``clarify`` not
-    in the toolset, no remaining todos, clarify already asked, or nudge budget
-    exhausted). Freeform reply text is ignored — terminal validity is
-    structured evidence only.
+    Returns ``None`` when the guard should not fire (disabled, kanban worker,
+    ``clarify`` not in the toolset, no remaining todos, clarify already asked,
+    or nudge budget exhausted). Freeform reply text is ignored — terminal
+    validity is structured evidence only.
     """
     if not enabled or not clarify_available or attempts >= max_attempts:
         return None
+
+    # Kanban workers must terminate with kanban_complete / kanban_block, not
+    # clarify. Defer to kanban_stop so this guard cannot steal the nudge.
+    try:
+        from agent.kanban_stop import kanban_stop_nudge_enabled
+
+        if kanban_stop_nudge_enabled():
+            return None
+    except Exception:
+        pass
 
     remaining = remaining_todo_items(todo_store)
     if not remaining:

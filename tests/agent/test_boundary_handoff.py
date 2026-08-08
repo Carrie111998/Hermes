@@ -149,6 +149,36 @@ def test_synthetic_nudge_does_not_reset_clarify_window():
     assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
 
 
+def test_dropped_toolcall_nudge_does_not_reset_clarify_window():
+    store = _store(("remaining step", "pending"))
+    messages = [
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {
+            "role": "user",
+            "content": "Your previous turn indicated a tool call but none was included.",
+            "_dropped_toolcall_nudge": True,
+        },
+        {"role": "assistant", "content": "Paused pending your decision."},
+    ]
+    assert turn_called_clarify(messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
+
+
+def test_kanban_worker_skips_boundary_handoff_nudge(monkeypatch):
+    store = _store(("remaining step", "pending"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.delenv("HERMES_KANBAN_STOP_NUDGE", raising=False)
+    assert (
+        build_boundary_handoff_nudge(
+            todo_store=store,
+            messages=[{"role": "assistant", "content": "Stopped mid-task."}],
+            clarify_available=True,
+        )
+        is None
+    )
+
+
 def test_nudge_budget_disable_and_clarify_unavailable():
     store = _store(("remaining step", "pending"))
     assert (
