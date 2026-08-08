@@ -135,6 +135,36 @@ describe('PendingToolApproval', () => {
     expect(screen.queryByRole('menuitem', { name: /Always allow/ })).toBeNull()
   })
 
+  it('hides both "Always allow" and "Allow this session" for a protected-instruction gate (#81887)', () => {
+    // Protected-instruction writes (e.g. edits to AGENTS.md, .cursorrules) are
+    // always one-operation — the backend signals this with both flags false
+    // and the server synthesizes choices=["once", "deny"]. Even if a future
+    // server regression forwards choices including "session"/"always", the UI
+    // must hide them whenever allowPermanent is explicitly false.
+    setRequest('write to AGENTS.md', false, { choices: ['once', 'deny'] })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    expect(screen.getByRole('button', { name: /Run/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /More approval options/ })).toBeNull()
+    expect(screen.queryByText(/Allow this session/)).toBeNull()
+    expect(screen.queryByText(/Always allow/)).toBeNull()
+  })
+
+  it('hides "Always allow" when allowPermanent=false even if choices would otherwise include it (#81887)', () => {
+    // Regression guard: a malformed payload that sends allowPermanent=false
+    // alongside choices listing "always" must still hide the permanent tier.
+    setRequest('write to .cursorrules', false, {
+      choices: ['once', 'session', 'always', 'deny']
+    })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.keyDown(screen.getByRole('button', { name: /More approval options/ }), { key: 'Enter' })
+
+    expect(screen.getByRole('menuitem', { name: /Allow this session/ })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: /Always allow/ })).toBeNull()
+  })
+
   it('renders only Once and Deny for a Smart DENY owner override', () => {
     setRequest('rm -rf /tmp/x', true, { smartDenied: true })
     render(<PendingToolApproval part={part('terminal')} />)

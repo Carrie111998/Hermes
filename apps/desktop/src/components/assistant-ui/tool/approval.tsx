@@ -119,8 +119,12 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   const allowPermanent = request.allowPermanent !== false
   const choices = request.choices ?? (request.smartDenied ? ['once', 'deny'] : undefined)
+  // Defense in depth: if the backend explicitly disallows a permanent allow,
+  // never offer "Always allow" regardless of what `choices` says. The
+  // protected-instruction gate (#81887) is the canonical case — it must be
+  // one-operation only — but the rule is general.
+  const allowAlways = choices ? allowPermanent && choices.includes('always') : allowPermanent
   const allowSession = choices ? choices.includes('session') : true
-  const allowAlways = choices ? choices.includes('always') : allowPermanent
   const hasMoreOptions = allowSession || allowAlways
   const hasCommand = request.command.trim().length > 0
 

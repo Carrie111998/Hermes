@@ -1835,7 +1835,13 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
         if payload.get("smart_denied"):
             payload["choices"] = ["once", "deny"]
         elif payload.get("allow_permanent") is False:
-            payload["choices"] = ["once", "session", "deny"]
+            # Protected-instruction gates also pass allow_session=False (one-
+            # operation only — never persisted). Honor it so the desktop UI
+            # doesn't render "Allow this session" as if it stuck (#81887).
+            if payload.get("allow_session") is False:
+                payload["choices"] = ["once", "deny"]
+            else:
+                payload["choices"] = ["once", "session", "deny"]
         elif "allow_permanent" in payload:
             payload["choices"] = ["once", "session", "always", "deny"]
     if "command" in payload:
