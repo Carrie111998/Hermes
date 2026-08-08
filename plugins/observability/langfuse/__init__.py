@@ -50,6 +50,12 @@ class TraceState:
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     last_updated_at: float = field(default_factory=time.time)
+    session_id: str = ""
+    # propagate_attributes() context, entered in _start_root_trace and held
+    # open for the trace's whole lifetime so that child observations created
+    # by later hook invocations inherit session_id/tags. Closed in
+    # _finish_trace / _evict_stale_locked.
+    attr_ctx: Any = None
 
 
 _STATE_LOCK = threading.Lock()
@@ -621,33 +627,31 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if session_id:
         trace_ctx["session_id"] = session_id
 
+    tags = ["hermes", "langfuse"]
+    if platform:
+        tags.append(f"channel:{platform}")
+
+    # propagate_attributes() applies session_id/tags only to observations
+    # created while its context is open. Entering and exiting it around just
+    # the root span's creation would leave every child observation — the
+    # LLM-call generations and tool spans created by later hook invocations —
+    # without session_id or tags, silently breaking session-level cost/token
+    # aggregation. Enter it manually and hold it open in TraceState (closed
+    # in _finish_trace / _evict_stale_locked), the same way root_ctx itself
+    # is already held open across hooks.
+    attr_ctx = None
     if propagate_attributes is not None:
         try:
-            with propagate_attributes(
+            attr_ctx = propagate_attributes(
                 session_id=session_id or task_key,
                 trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
-            ):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
+                tags=tags,
             )
-            root_span = root_ctx.__enter__()
-    else:
+            attr_ctx.__enter__()
+        except Exception:
+            attr_ctx = None
+
+    try:
         root_ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
             name="Hermes turn",
@@ -657,6 +661,14 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             end_on_exit=False,
         )
         root_span = root_ctx.__enter__()
+    except Exception:
+        if attr_ctx is not None:
+            try:
+                attr_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            attr_ctx = None
+        raise
 
     try:
         root_span.set_trace_io(input=trace_input)
@@ -664,7 +676,13 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(
+        trace_id=trace_id,
+        root_ctx=root_ctx,
+        root_span=root_span,
+        session_id=session_id,
+        attr_ctx=attr_ctx,
+    )
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -732,6 +750,11 @@ def _evict_stale_locked() -> None:
             state.root_span.end()
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
+        if state.attr_ctx is not None:
+            try:
+                state.attr_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
@@ -760,6 +783,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:
+        if state.attr_ctx is not None:
+            try:
+                state.attr_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
         try:
             client.flush()
         except Exception:
