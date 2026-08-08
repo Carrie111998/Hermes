@@ -1958,6 +1958,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_session_invalidation_event", "_session_invalidation_owner",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -2016,6 +2017,12 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        # A handler can still be awaiting an RPC when keepalive or another
+        # lifecycle signal tears down the transport. Keep one event per live
+        # ClientSession so those calls fail as soon as their owning session is
+        # invalidated instead of waiting for the full tool timeout (#81995).
+        self._session_invalidation_event = asyncio.Event()
+        self._session_invalidation_owner: Optional[Any] = None
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2104,7 +2111,61 @@ class MCPServerTask:
     def _mark_stdio_recycled(self, reason: str) -> None:
         """Mark a stdio session dormant before its transport finishes closing."""
         self._recycled_reason = reason
-        self.session = None
+        self._invalidate_session()
+
+    def _capture_session_for_rpc(self) -> tuple[Any, asyncio.Event]:
+        """Return the current session and its lifecycle invalidation event."""
+        session = self.session
+        if session is None:
+            raise RuntimeError(f"MCP server '{self.name}' is not connected")
+        if self._session_invalidation_owner is not session:
+            self._session_invalidation_event = asyncio.Event()
+            self._session_invalidation_owner = session
+        return session, self._session_invalidation_event
+
+    def _invalidate_session(self, *, clear: bool = True) -> None:
+        """Wake RPCs owned by the current transport, optionally clearing it."""
+        if (
+            self.session is not None
+            and self._session_invalidation_owner is not self.session
+        ):
+            self._session_invalidation_event = asyncio.Event()
+            self._session_invalidation_owner = self.session
+        self._session_invalidation_event.set()
+        if clear:
+            self._session_invalidation_owner = None
+            self.session = None
+
+    async def _call_session_rpc(self, operation: str, call) -> Any:
+        """Run one RPC until it completes or its transport is replaced."""
+        session, invalidated = self._capture_session_for_rpc()
+        if invalidated.is_set():
+            raise RuntimeError(
+                f"MCP server '{self.name}' restarted while {operation} was "
+                "starting; retry the call on the replacement session."
+            )
+        rpc_task = asyncio.ensure_future(call(session))
+        invalidated_task = asyncio.create_task(invalidated.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {rpc_task, invalidated_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Prefer a response that completed in the same loop turn as the
+            # lifecycle signal; the RPC result is already authoritative.
+            if rpc_task in done:
+                return await rpc_task
+            raise RuntimeError(
+                f"MCP server '{self.name}' restarted while {operation} was "
+                "in flight; retry the call on the replacement session."
+            )
+        finally:
+            for task in (rpc_task, invalidated_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                rpc_task, invalidated_task, return_exceptions=True
+            )
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -2223,8 +2284,11 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server (follow nextCursor)
             async with self._rpc_lock:
-                new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                new_mcp_tools = await self._call_session_rpc(
+                    "tools/list refresh",
+                    lambda session: _paginate_full_list(
+                        session.list_tools, "tools", self.name
+                    ),
                 )
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for
@@ -2449,8 +2513,10 @@ class MCPServerTask:
                         pass
 
         if self._shutdown_event.is_set():
+            self._invalidate_session(clear=False)
             return "shutdown"
         self._reconnect_event.clear()
+        self._invalidate_session(clear=False)
         return "reconnect"
 
     async def _wait_for_reconnect_or_shutdown(
@@ -3267,10 +3333,16 @@ class MCPServerTask:
 
         while True:
             try:
-                if self._is_http():
-                    lifecycle_reason = await self._run_http(config)
-                else:
-                    lifecycle_reason = await self._run_stdio(config)
+                try:
+                    if self._is_http():
+                        lifecycle_reason = await self._run_http(config)
+                    else:
+                        lifecycle_reason = await self._run_stdio(config)
+                finally:
+                    # Transport context managers can also exit via exceptions,
+                    # bypassing _wait_for_lifecycle_event. Always release RPCs
+                    # tied to that generation before the reconnect loop moves on.
+                    self._invalidate_session()
                 # Transport returned cleanly. Two cases:
                 #  - _shutdown_event was set: exit the run loop entirely.
                 #  - _reconnect_event was set (auth recovery): loop back and
@@ -3284,7 +3356,7 @@ class MCPServerTask:
                         "waiting for lazy reconnect",
                         self.name, self._recycled_reason,
                     )
-                    self.session = None
+                    self._invalidate_session()
                     await self._wait_for_lazy_reconnect()
                     if self._shutdown_event.is_set():
                         break
@@ -3346,7 +3418,7 @@ class MCPServerTask:
                 # _ready set here lets handler-side recovery mistake the stale
                 # pre-reconnect session for a fresh one and retry too early.
                 self._ready.clear()
-                self.session = None
+                self._invalidate_session()
                 continue
             except asyncio.CancelledError:
                 # Task was cancelled (shutdown, gateway restart, explicit
@@ -3358,10 +3430,10 @@ class MCPServerTask:
                 # restarted. Re-raise so the task's cancellation propagates
                 # correctly to asyncio's task machinery and ``shutdown()``'s
                 # ``await self._task`` completes. See #9930.
-                self.session = None
+                self._invalidate_session()
                 raise
             except Exception as exc:
-                self.session = None
+                self._invalidate_session()
                 # Unwrap anyio TaskGroup wrappers first: str(exc) on a
                 # BaseExceptionGroup is "unhandled errors in a TaskGroup
                 # (N sub-exceptions)" — useless in logs, and it hides the
@@ -3581,7 +3653,7 @@ class MCPServerTask:
                 if self._shutdown_event.is_set():
                     return
             finally:
-                self.session = None
+                self._invalidate_session()
 
     async def start(self, config: dict):
         """Create the background Task and wait until ready (or failed)."""
@@ -3630,7 +3702,7 @@ class MCPServerTask:
             await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
-        self.session = None
+        self._invalidate_session()
 
     def _deregister_tools(self) -> None:
         """Drop this server's tools from the global registry (idempotent).
@@ -5183,6 +5255,15 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+async def _call_server_session_rpc(server: Any, operation: str, call) -> Any:
+    """Run an RPC with lifecycle invalidation for managed server tasks."""
+    if isinstance(server, MCPServerTask):
+        return await server._call_session_rpc(operation, call)
+    # Compatibility for lightweight third-party/test server adapters that
+    # predate MCPServerTask's lifecycle generation tracking.
+    return await call(server.session)
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5267,7 +5348,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await _call_server_session_rpc(
+                        server,
+                        f"tools/call {tool_name}",
+                        lambda session: session.call_tool(
+                            tool_name, arguments=args
+                        ),
+                    )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5417,8 +5504,12 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                all_resources = await _paginate_full_list(
-                    server.session.list_resources, "resources", server_name
+                all_resources = await _call_server_session_rpc(
+                    server,
+                    "resources/list",
+                    lambda session: _paginate_full_list(
+                        session.list_resources, "resources", server_name
+                    ),
                 )
             resources = []
             for r in all_resources:
@@ -5477,7 +5568,11 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                result = await server.session.read_resource(uri)
+                result = await _call_server_session_rpc(
+                    server,
+                    "resources/read",
+                    lambda session: session.read_resource(uri),
+                )
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
             contents = result.contents if hasattr(result, "contents") else []
@@ -5534,8 +5629,12 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                all_prompts = await _paginate_full_list(
-                    server.session.list_prompts, "prompts", server_name
+                all_prompts = await _call_server_session_rpc(
+                    server,
+                    "prompts/list",
+                    lambda session: _paginate_full_list(
+                        session.list_prompts, "prompts", server_name
+                    ),
                 )
             prompts = []
             for p in all_prompts:
@@ -5600,7 +5699,13 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock:
-                result = await server.session.get_prompt(name, arguments=arguments)
+                result = await _call_server_session_rpc(
+                    server,
+                    "prompts/get",
+                    lambda session: session.get_prompt(
+                        name, arguments=arguments
+                    ),
+                )
             # GetPromptResult has .messages list
             messages = []
             for msg in (result.messages if hasattr(result, "messages") else []):
