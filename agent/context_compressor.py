@@ -40,7 +40,67 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.context_compressor_text_utils import (
+    _content_text_for_contains,
+    _redact_compaction_text,
+)
+from agent.context_compressor_skill_prune import (  # noqa: E402
+    SKILL_PRUNED_MARKER_PREFIX,
+    _MAX_PRUNED_SKILL_MARKERS,
+    _PRUNED_SKILLS_SECTION_HEADING,
+    _SKILL_PRUNE_RECENT_WINDOW,
+    _SKILL_PRUNED_MARKER_RE,
+    _SKILL_VIEW_PRUNE_MIN_CHARS,
+    _collect_ghosted_skill_names,
+    _collect_protected_skill_names,
+    _extract_pruned_skill_names,
+    _reinject_pruned_skill_markers,
+    _skill_pruned_marker,
+    _skill_view_call_sites,
+)
+from agent.context_compressor_budget import (  # noqa: E402
+    HISTORICAL_TASK_HEADING,
+    _ACTIVE_TASK_MAX_CHARS,
+    _AUTO_FOCUS_MAX_CHARS,
+    _AUTO_FOCUS_MAX_TURNS,
+    _AUTO_FOCUS_TURN_MAX_CHARS,
+    _CHARS_PER_TOKEN,
+    _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS,
+    _FALLBACK_SUMMARY_MAX_CHARS,
+    _FALLBACK_TURN_MAX_CHARS,
+    _FEASIBILITY_SKIP_MIDDLE_FRACTION,
+    _HISTORICAL_TASK_SECTION_RE,
+    _IMAGE_CHAR_EQUIVALENT,
+    _IMAGE_TOKEN_ESTIMATE,
+    _MAX_TAIL_MESSAGE_FLOOR,
+    _MEDIA_DIRECTIVE_RE,
+    _PATH_MENTION_RE,
+    _PRESSURE_KEEP_RECENT_MESSAGES,
+    _REPLAY_BUDGET_KEYS,
+    _SMALL_CTX_THRESHOLD_PERCENT,
+    _SMALL_CTX_WINDOW_LIMIT,
+    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+    _collect_path_mentions,
+    _content_length_for_budget,
+    _dedupe_append,
+    _estimate_msg_budget_tokens,
+    _extract_tool_call_id,
+    _extract_tool_call_name_and_args,
+    _reasoning_details_text_chars,
+    _serialized_length_for_budget,
+)
 from agent.turn_context import drop_stale_api_content
+from agent.context_compressor_media import (  # noqa: E402
+    _IMAGE_PART_TYPES,
+    _append_text_to_content,
+    _content_has_images,
+    _image_part_label,
+    _is_image_part,
+    _strip_historical_media,
+    _strip_image_parts_from_parts,
+    _strip_images_from_content,
+    _truncate_tool_call_args_json,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -92,9 +152,6 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
     if classified.reason is FailoverReason.billing:
         return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
     return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
-
-
-HISTORICAL_TASK_HEADING = "## Historical Task Snapshot"
 
 
 SUMMARY_PREFIX = (
@@ -435,718 +492,6 @@ _SUMMARY_INPUT_MAX_CHARS = 160_000
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
-
-# Ghost-skill defense (#32106): when compaction reduces an old ``skill_view``
-# result to a 1-line metadata summary, the model still believes the skill is
-# loaded even though its instructions are gone. The marker below is the ONE
-# canonical prune signal — ``_skill_pruned_marker()`` builds it and every
-# presence check matches against the same string, so the emit side and the
-# check side can never drift apart (the original PR #44166 emitted
-# ``[SKILL_PRUNED:`` but presence-checked ``[SKILL_PRUNED]``, making
-# re-injection fire even when the marker had survived).
-SKILL_PRUNED_MARKER_PREFIX = "[SKILL_PRUNED:"
-# skill_view results at or below this size stay verbatim in pruned
-# summaries — small skills are cheap to keep and their loss is unlikely to
-# ghost the model. Shared by the emit site and the summarizer-input scan.
-_SKILL_VIEW_PRUNE_MIN_CHARS = 5000
-# Cap for the deterministic marker re-injection list — keeps a very long
-# session from growing an unbounded "## Pruned Skills" block in every
-# iterative summary update. Newest-referenced skills win.
-_MAX_PRUNED_SKILL_MARKERS = 20
-
-
-def _skill_pruned_marker(skill_name: str) -> str:
-    """Return the canonical prune marker for *skill_name*.
-
-    Used verbatim by BOTH the emit sites (tool-result summarization,
-    summary re-injection) and the survival check in
-    ``_reinject_pruned_skill_markers`` — one string, no drift.
-    """
-    return (
-        f"{SKILL_PRUNED_MARKER_PREFIX} content lost in compression; "
-        f"reload with skill_view(name='{skill_name}')]"
-    )
-
-
-# Matches the canonical marker and captures the skill name. Anchored on the
-# shared prefix constant so a wording change to the marker body updates the
-# emit helper and this extractor together.
-_SKILL_PRUNED_MARKER_RE = re.compile(
-    re.escape(SKILL_PRUNED_MARKER_PREFIX)
-    + r"[^\]]*?reload with skill_view\(name='([^']+)'\)"
-)
-
-
-def _extract_pruned_skill_names(text: str) -> list[str]:
-    """Return skill names referenced by prune markers in *text*, in order."""
-    names: list[str] = []
-    for match in _SKILL_PRUNED_MARKER_RE.finditer(text or ""):
-        name = match.group(1)
-        if name not in names:
-            names.append(name)
-    return names
-
-
-def _collect_ghosted_skill_names(turns: List[Dict[str, Any]]) -> list[str]:
-    """Skill names whose instructions are about to be lost in compaction.
-
-    Covers BOTH shapes a compacted middle window can carry:
-
-    - a ``skill_view`` result already demoted by Phase-1 pruning — the
-      canonical ``[SKILL_PRUNED: ...]`` marker is in the row content;
-    - a RAW ``skill_view`` body that was never demoted (it sat inside the
-      protected tail of an earlier prune, then aged into the compression
-      window). The summarizer will paraphrase the instructions away, which
-      is exactly the ghost-skill failure — so it needs a marker too.
-    """
-    names: list[str] = []
-
-    def _add(name: str) -> None:
-        if name and name not in names:
-            names.append(name)
-
-    call_id_to_skill: dict[str, str] = {}
-    for idx, skill in _skill_view_call_sites(turns):
-        msg = turns[idx]
-        for tc in msg.get("tool_calls") or []:
-            tc_fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
-            tc_name = tc_fn.get("name", "") if isinstance(tc_fn, dict) else getattr(tc_fn, "name", "")
-            if tc_name != "skill_view":
-                continue
-            cid = tc.get("id", "") if isinstance(tc, dict) else (getattr(tc, "id", "") or "")
-            if cid:
-                call_id_to_skill[cid] = skill
-    for msg in turns:
-        content = msg.get("content")
-        text = content if isinstance(content, str) else _content_text_for_contains(content)
-        for name in _extract_pruned_skill_names(text):
-            _add(name)
-        if (
-            msg.get("role") == "tool"
-            and isinstance(content, str)
-            and len(content) > _SKILL_VIEW_PRUNE_MIN_CHARS
-        ):
-            skill = call_id_to_skill.get(str(msg.get("tool_call_id") or ""))
-            if skill:
-                _add(skill)
-    return names
-
-
-_PRUNED_SKILLS_SECTION_HEADING = "## Pruned Skills"
-
-
-def _reinject_pruned_skill_markers(summary: str, skill_names: list[str]) -> str:
-    """Deterministically restore prune markers the summarizer dropped.
-
-    ``skill_names`` was extracted from the summarizer INPUT before the LLM
-    call. For every skill whose canonical marker (``_skill_pruned_marker``)
-    is absent from the model's output, append it under a ``## Pruned
-    Skills`` section. Presence is checked against the SAME canonical string
-    the emit sites produce — a paraphrased or renamed marker counts as
-    dropped and is restored (the original PR checked the literal
-    ``[SKILL_PRUNED]``, which never matches the emitted ``[SKILL_PRUNED:``
-    form, so it duplicated markers that HAD survived).
-
-    The appended block is plain body text: it never carries a handoff
-    prefix, the merged-summary delimiter, or a start-of-content scaffolding
-    marker, so ``classify_summary_content`` / todo-snapshot flag handling
-    are unaffected. The block is routed through ``_redact_compaction_text``
-    like every other compaction-boundary text.
-    """
-    if not skill_names:
-        return summary
-    missing = [
-        name for name in skill_names
-        if _skill_pruned_marker(name) not in summary
-    ]
-    if not missing:
-        return summary
-    lines = [_skill_pruned_marker(name) for name in missing]
-    block = (
-        "\n\n" + _PRUNED_SKILLS_SECTION_HEADING + "\n"
-        + "\n".join(lines)
-        + "\n(The listed skills' instructions were pruned during context "
-        "compression. Reload with the skill_view call in each marker before "
-        "relying on that skill; one reload per skill is enough — ignore any "
-        "older markers for the same skill.)"
-    )
-    return summary + _redact_compaction_text(block)
-
-
-# A skill_view call within this many trailing messages counts as "just
-# loaded": its full instruction body must survive the Phase-1 prune even when
-# the token-budget boundary would otherwise demote it (#32106). Distinct from
-# the protected-tail boundary, which is token-based and can land immediately
-# after a bulky just-loaded skill body.
-_SKILL_PRUNE_RECENT_WINDOW = 10
-
-
-def _skill_view_call_sites(
-    messages: List[Dict[str, Any]],
-) -> list[tuple[int, str]]:
-    """Yield ``(message_index, skill_name)`` for every skill_view tool call."""
-    sites: list[tuple[int, str]] = []
-    for i, msg in enumerate(messages):
-        if msg.get("role") != "assistant":
-            continue
-        for tc in msg.get("tool_calls") or []:
-            if isinstance(tc, dict):
-                fn = tc.get("function", {})
-                name = fn.get("name", "") if isinstance(fn, dict) else ""
-                args_str = fn.get("arguments", "") if isinstance(fn, dict) else ""
-            else:
-                fn = getattr(tc, "function", None)
-                name = getattr(fn, "name", "") if fn else ""
-                args_str = getattr(fn, "arguments", "") if fn else ""
-            if name != "skill_view" or not isinstance(args_str, str) or not args_str:
-                continue
-            try:
-                args = json.loads(args_str)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if isinstance(args, dict):
-                skill = args.get("name", "")
-                if isinstance(skill, str) and skill:
-                    sites.append((i, skill))
-    return sites
-
-
-def _collect_protected_skill_names(
-    messages: List[Dict[str, Any]], prune_boundary: int,
-) -> set[str]:
-    """Skill names whose skill_view bodies must survive Phase-1 demotion.
-
-    A skill is protected (lower-cased set) when any of these hold:
-
-    - its most recent ``skill_view`` call sits within the last
-      ``_SKILL_PRUNE_RECENT_WINDOW`` messages (just loaded / just reloaded);
-    - its most recent ``skill_view`` call sits inside the protected tail
-      (at or after *prune_boundary*);
-    - its name is mentioned in a user message inside the protected tail
-      (the user is actively steering work that depends on it).
-
-    Protection applies to the ordinary Phase-1/2 prune only. The Pass-4
-    pressure demotion deliberately ignores it: when the protected region
-    itself exceeds the soft budget, exempting skill bodies would recreate
-    the #61932 dead-end shape.
-    """
-    total = len(messages)
-    if not total:
-        return set()
-    recent_start = max(0, total - _SKILL_PRUNE_RECENT_WINDOW)
-    tail_start = max(0, prune_boundary)
-    tail_user_texts: list[str] = []
-    for msg in messages[tail_start:]:
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and content:
-            tail_user_texts.append(content.lower())
-    protected: set[str] = set()
-    for idx, skill in _skill_view_call_sites(messages):
-        key = skill.lower()
-        if idx >= recent_start or idx >= tail_start:
-            protected.add(key)
-        elif any(key in text for text in tail_user_texts):
-            protected.add(key)
-    return protected
-
-# Chars per token rough estimate
-_CHARS_PER_TOKEN = 4
-# Flat token cost per attached image part.  Real cost varies by provider and
-# dimensions (Anthropic ≈ width×height/750, GPT-4o up to ~1700 for
-# high-detail 2048×2048, Gemini 258/tile), but 1600 is a realistic ceiling
-# that keeps compression budgeting honest for multi-image conversations.
-# Matches Claude Code's IMAGE_TOKEN_ESTIMATE constant.
-_IMAGE_TOKEN_ESTIMATE = 1600
-# Same figure expressed in the char-budget currency the rest of the
-# compressor speaks in.  Used when accumulating message "content length"
-# for tail-cut decisions.
-_IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
-_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
-
-# Hard ceiling for the deterministic summary-failure handoff.  The fallback is
-# only meant to preserve continuity anchors from the dropped window, not to
-# become another unbounded transcript copy after the LLM summarizer failed.
-_FALLBACK_SUMMARY_MAX_CHARS = 8_000
-_FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 3_000
-_FALLBACK_TURN_MAX_CHARS = 700
-_AUTO_FOCUS_MAX_TURNS = 3
-_AUTO_FOCUS_TURN_MAX_CHARS = 260
-_AUTO_FOCUS_MAX_CHARS = 700
-_ACTIVE_TASK_MAX_CHARS = 1400
-# Keep a short run of recent messages verbatim even when the token budget is
-# already exhausted.  The public ``protect_last_n`` default is intentionally
-# high for small/light tails, but using all 20 as a hard floor here would bring
-# back the old large-tool-output case where nothing can be compacted.
-_MAX_TAIL_MESSAGE_FLOOR = 8
-
-# Pre-LLM feasibility skip (#60451): when the compressible middle is below
-# this fraction of threshold_tokens (and a prior real-usage ineffectiveness
-# strike exists), skip the LLM summary call — deterministic dropping alone
-# recovers the negligible savings such a summary could deliver.
-_FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
-# Under context pressure (protected-tail tool bodies alone exceed the soft
-# tail budget), demote large completed tool/file outputs even inside the
-# protected region — but always keep this many trailing messages verbatim so
-# the active user ask / latest tool pair remain readable.  Issue #61932.
-_PRESSURE_KEEP_RECENT_MESSAGES = 3
-
-# Models with context windows below this get their compression threshold
-# floored at ``_SMALL_CTX_THRESHOLD_PERCENT`` (raise-only — an explicitly
-# higher user/model threshold always wins).  At the default 50% trigger a
-# 128K-262K model compacts with only ~64-131K consumed; the incompressible
-# floor (system prompt + tool schemas + protected tail + rolling summary)
-# eats most of the reclaimed headroom, so compaction re-fires every 1-2
-# turns and the session spends most of its wall-clock summarizing.
-_SMALL_CTX_WINDOW_LIMIT = 512_000
-_SMALL_CTX_THRESHOLD_PERCENT = 0.75
-
-
-_PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
-
-# MEDIA delivery directives must not reach the summarizer — if one leaks into
-# the summary, the downstream model may re-emit it as an active directive on
-# the next turn, triggering bogus attachment sends (#14665).
-_MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
-_HISTORICAL_TASK_SECTION_RE = re.compile(
-    rf"(?ms)^{re.escape(HISTORICAL_TASK_HEADING)}\s*\n.*?(?=^## |\Z)"
-)
-
-
-def _redact_compaction_text(text: Any) -> str:
-    """Redact text that crosses a compaction summary boundary.
-
-    Compaction summaries persist across sessions and are re-injected into
-    every subsequent summarizer prompt, so this boundary uses strict mode:
-
-    - ``force=True`` — deliberately overrides ``security.redact_secrets:
-      false``. That opt-out targets *live tool output* (e.g. working on the
-      redactor itself); a summary is a persistence boundary where a leaked
-      credential keeps re-entering prompts indefinitely.
-    - ``redact_url_credentials=True`` — OAuth callback codes, magic-link
-      tokens, and URL userinfo never need to survive summarization the way
-      they must survive live navigation flows.
-    """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
-    )
-
-
-def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
-    value = value.strip()
-    if value and value not in items and len(items) < limit:
-        items.append(value)
-
-
-def _extract_tool_call_name_and_args(tool_call: Any) -> tuple[str, str]:
-    """Return a best-effort ``(name, arguments)`` pair for dict/object tool calls."""
-    if isinstance(tool_call, dict):
-        fn = tool_call.get("function") or {}
-        return str(fn.get("name") or "unknown"), str(fn.get("arguments") or "")
-
-    fn = getattr(tool_call, "function", None)
-    if fn is None:
-        return "unknown", ""
-    return str(getattr(fn, "name", None) or "unknown"), str(getattr(fn, "arguments", None) or "")
-
-
-def _extract_tool_call_id(tool_call: Any) -> str:
-    if isinstance(tool_call, dict):
-        return str(tool_call.get("id") or "")
-    return str(getattr(tool_call, "id", "") or "")
-
-
-def _collect_path_mentions(text: str, relevant_files: list[str], *, limit: int = 12) -> None:
-    for match in _PATH_MENTION_RE.findall(text):
-        _dedupe_append(relevant_files, match.rstrip(".,:;"), limit=limit)
-
-
-def _content_length_for_budget(raw_content: Any) -> int:
-    """Return the effective char-length of a message's content for token budgeting.
-
-    Plain strings: ``len(content)``. Multimodal lists: sum of text-part
-    ``len(text)`` plus a flat ``_IMAGE_CHAR_EQUIVALENT`` per image part
-    (``image_url`` / ``input_image`` / Anthropic-style ``image``). This
-    keeps the compressor from treating a turn with 5 attached images as
-    near-zero tokens just because the text part is empty.
-    """
-    if isinstance(raw_content, str):
-        return len(raw_content)
-    if not isinstance(raw_content, list):
-        return len(str(raw_content or ""))
-
-    total = 0
-    for p in raw_content:
-        if isinstance(p, str):
-            total += len(p)
-            continue
-        if not isinstance(p, dict):
-            total += len(str(p))
-            continue
-        ptype = p.get("type")
-        if ptype in {"image_url", "input_image", "image"}:
-            total += _IMAGE_CHAR_EQUIVALENT
-        else:
-            # text / input_text / tool_result-with-text / anything else with
-            # a text field.  Ignore the raw base64 payload inside image_url
-            # dicts — dimensions don't matter, only whether it's an image.
-            total += len(p.get("text", "") or "")
-    return total
-
-
-def _serialized_length_for_budget(value: Any) -> int:
-    """Return a stable char-length for non-content replay/metadata fields."""
-    if value is None or value == "":
-        return 0
-    if isinstance(value, str):
-        return len(value)
-    try:
-        return len(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
-    except (TypeError, ValueError):
-        return len(str(value))
-
-
-# Provider replay/metadata fields that ride the wire on every request but are
-# invisible to ``msg["content"]``/``msg["tool_calls"]`` accounting.  Codex
-# Responses sessions in particular carry ``codex_reasoning_items`` blobs of
-# ``encrypted_content`` that can dominate the serialized session (a measured
-# 214-turn session held ~115K tokens / 27% of its payload there — #55572).
-#
-# ``reasoning_details`` is handled separately (see
-# ``_reasoning_details_text_chars``): its signed/base64 envelope is excluded
-# from the budget, mirroring the preflight estimator's exclusion in
-# ``model_metadata._estimate_message_tokens_without_images`` (#73298).
-_REPLAY_BUDGET_KEYS = (
-    "reasoning",
-    "reasoning_content",
-    "codex_reasoning_items",
-    "codex_message_items",
-)
-
-
-def _reasoning_details_text_chars(value: Any) -> int:
-    """Textual thinking chars inside a ``reasoning_details`` envelope.
-
-    ``reasoning_details`` carries provider thinking blocks: the actual
-    thinking TEXT plus opaque signed/base64 envelope blobs (Anthropic
-    ``signature``, redacted ``data``, encrypted payloads).  The envelope is
-    never billed at anything near chars/4 by the provider and — on every
-    transport except Codex Responses — is replayed for at most the newest
-    assistant turn, so charging it on every message inflated the tail-budget
-    walk and silently shrank the surviving tail (#73298, second site).
-
-    Count only the thinking text (the #51800 lesson: real reasoning text
-    MUST stay visible to the budget), skip everything else.
-    """
-    if not value:
-        return 0
-    if isinstance(value, str):
-        return len(value)
-    total = 0
-    if isinstance(value, dict):
-        value = [value]
-    if isinstance(value, list):
-        for part in value:
-            if isinstance(part, str):
-                total += len(part)
-            elif isinstance(part, dict):
-                for text_key in ("thinking", "text", "summary"):
-                    text = part.get(text_key)
-                    if isinstance(text, str):
-                        total += len(text)
-    return total
-
-
-def _estimate_msg_budget_tokens(msg: dict) -> int:
-    """Token estimate for one message in the tail-protection budget walks.
-
-    Counts the message content plus the **full** ``tool_call`` envelope —
-    ``id``, ``type``, ``function.name`` and JSON structure — not just
-    ``function.arguments``.  Counting only the arguments string undercounted
-    assistant turns that fan out into parallel tool calls by 2-15x (a
-    4-tool-call turn measures ~73 vs ~1,090 real tokens), so the protected
-    tail overshot ``tail_token_budget`` and compression became ineffective.
-    See issue #28053.
-
-    Also counts provider replay fields (``codex_reasoning_items`` etc. —
-    see ``_REPLAY_BUDGET_KEYS``).  The preflight "should I compress?"
-    estimator sees the full message shape, so the tail walk must use the
-    same size class; otherwise an assistant message with tiny visible
-    content but large hidden replay blobs is protected as if it were small,
-    the post-compression session stays near the context limit, and
-    compaction re-fires continuously (#55572).  Accounting-only: replay
-    fields are never mutated or pruned here.
-    """
-    content = msg.get("content") or ""
-    if isinstance(content, str):
-        tokens = estimate_tokens_rough(content) + 10  # +10 for role/key overhead
-    else:
-        content_len = _content_length_for_budget(content)
-        tokens = content_len // _CHARS_PER_TOKEN + 10
-    for tc in msg.get("tool_calls") or []:
-        if isinstance(tc, dict):
-            tokens += estimate_tokens_rough(str(tc))
-    for key in _REPLAY_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
-    # reasoning_details: charge only the thinking TEXT, never the signed /
-    # base64 envelope (#73298 second site; mirrors the preflight estimator's
-    # exclusion in model_metadata).  When the same thinking text already rides
-    # in ``reasoning``/``reasoning_content`` (measured byte-identical on
-    # Anthropic-wire sessions), skip it here entirely so the prose is not
-    # charged twice on top of the envelope exclusion.
-    if not (msg.get("reasoning") or msg.get("reasoning_content")):
-        tokens += (
-            _reasoning_details_text_chars(msg.get("reasoning_details"))
-            // _CHARS_PER_TOKEN
-        )
-    return tokens
-
-
-def _content_text_for_contains(content: Any) -> str:
-    """Return a best-effort text view of message content.
-
-    Used only for substring checks when we need to know whether we've already
-    appended a note to a message. Keeps multimodal lists intact elsewhere.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(part for part in parts if part)
-    return str(content)
-
-
-def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
-    """Append or prepend plain text to message content safely.
-
-    Compression sometimes needs to add a note or merge a summary into an
-    existing message. Message content may be plain text or a multimodal list of
-    blocks, so direct string concatenation is not always safe.
-    """
-    if content is None:
-        return text
-    if isinstance(content, str):
-        return text + content if prepend else content + text
-    if isinstance(content, list):
-        text_block = {"type": "text", "text": text}
-        return [text_block, *content] if prepend else [*content, text_block]
-    rendered = str(content)
-    return text + rendered if prepend else rendered + text
-
-
-def _strip_image_parts_from_parts(parts: Any) -> Any:
-    """Strip image parts from an OpenAI-style content-parts list.
-
-    Returns a new list with image_url / image / input_image parts replaced
-    by a text placeholder, or None if the list had no images (callers
-    skip the replacement in that case). Used by the compressor to prune
-    old computer_use screenshots.
-    """
-    if not isinstance(parts, list):
-        return None
-    had_image = False
-    out = []
-    for part in parts:
-        if not isinstance(part, dict):
-            out.append(part)
-            continue
-        ptype = part.get("type")
-        if ptype in {"image", "image_url", "input_image"}:
-            had_image = True
-            out.append({"type": "text", "text": "[screenshot removed to save context]"})
-        else:
-            out.append(part)
-    return out if had_image else None
-
-
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
-    """Shrink long string values inside a tool-call arguments JSON blob while
-    preserving JSON validity.
-
-    The ``function.arguments`` field on a tool call is a JSON-encoded string
-    passed through to the LLM provider; downstream providers strictly
-    validate it and return a non-retryable 400 when it is not well-formed.
-    An earlier implementation sliced the raw JSON at a fixed byte offset and
-    appended ``...[truncated]`` — which routinely produced strings like::
-
-        {"path": "/foo/bar", "content": "# long markdown
-        ...[truncated]
-
-    i.e. an unterminated string and a missing closing brace. MiniMax, for
-    example, rejects this with ``invalid function arguments json string``
-    and the session gets stuck re-sending the same broken history on every
-    turn. See issue #11762 for the observed loop.
-
-    This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
-    to begin with — some model backends use non-JSON tool arguments — the
-    original string is returned unchanged rather than replaced with
-    something neither we nor the backend can parse.
-    """
-    try:
-        parsed = json.loads(args)
-    except (ValueError, TypeError):
-        return args
-
-    def _shrink(obj: Any) -> Any:
-        if isinstance(obj, str):
-            if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
-            return obj
-        if isinstance(obj, dict):
-            return {k: _shrink(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_shrink(v) for v in obj]
-        return obj
-
-    shrunken = _shrink(parsed)
-    # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
-
-
-_IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
-
-
-def _is_image_part(part: Any) -> bool:
-    """True if ``part`` is a multimodal image content block.
-
-    Recognizes all three shapes the agent handles:
-      - OpenAI chat.completions: ``{"type": "image_url", "image_url": ...}``
-      - OpenAI Responses API:    ``{"type": "input_image", "image_url": "..."}``
-      - Anthropic native:        ``{"type": "image", "source": {...}}``
-    """
-    if not isinstance(part, dict):
-        return False
-    return part.get("type") in _IMAGE_PART_TYPES
-
-
-def _content_has_images(content: Any) -> bool:
-    """True if a message's ``content`` is a multimodal list with image parts."""
-    if not isinstance(content, list):
-        return False
-    return any(_is_image_part(p) for p in content)
-
-
-def _strip_images_from_content(content: Any) -> Any:
-    """Return a copy of ``content`` with every image part replaced by a
-    short text placeholder.
-
-    - String content is returned unchanged.
-    - Non-list, non-string content is returned unchanged.
-    - List content: image parts become ``{"type": "text", "text": "[Attached
-      image — stripped after compression]"}``; other parts are preserved as-is.
-
-    Input is never mutated.
-    """
-    if not isinstance(content, list):
-        return content
-    if not any(_is_image_part(p) for p in content):
-        return content
-
-    new_parts: List[Any] = []
-    for p in content:
-        if _is_image_part(p):
-            new_parts.append({
-                "type": "text",
-                "text": "[Attached image — stripped after compression]",
-            })
-        else:
-            new_parts.append(p)
-    return new_parts
-
-
-def _strip_historical_media(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Replace image parts in older messages with placeholder text.
-
-    The anchor is the *last* user message that has any image content. Every
-    message before that anchor gets its image parts replaced with a short
-    placeholder so the outgoing request stops re-shipping the same multi-MB
-    base-64 image blobs on every turn.
-
-    If no user message carries images, the list is returned unchanged.
-    If the only user message with images is the very first one (nothing
-    earlier to strip), the list is returned unchanged.
-
-    Shallow copies of touched messages only; input is never mutated.
-    Port of Kilo-Org/kilocode#9434 (adapted for the OpenAI-style message
-    shape the hermes compressor emits).
-    """
-    if not messages:
-        return messages
-
-    # Find the newest user message that carries at least one image part.
-    # We anchor on image-bearing user messages (not all user messages) so
-    # a plain text follow-up after a big-image turn still strips the old
-    # image — matching the problem kilocode#9434 set out to solve.
-    anchor = -1
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "user":
-            continue
-        if _content_has_images(msg.get("content")):
-            anchor = i
-            break
-
-    if anchor <= 0:
-        # No image-bearing user message, or it's the very first message —
-        # nothing before it to strip.
-        return messages
-
-    changed = False
-    result: List[Dict[str, Any]] = []
-    for i, msg in enumerate(messages):
-        if i >= anchor or not isinstance(msg, dict):
-            result.append(msg)
-            continue
-        content = msg.get("content")
-        if not _content_has_images(content):
-            result.append(msg)
-            continue
-        new_msg = msg.copy()
-        new_msg["content"] = _strip_images_from_content(content)
-        # Content rewritten → the api_content sidecar (exact bytes previously
-        # sent) is stale; drop it so replay can't resend the pre-rewrite bytes.
-        drop_stale_api_content(new_msg)
-        result.append(new_msg)
-        changed = True
-
-    return result if changed else messages
-
-
-def _image_part_label(part: Dict[str, Any]) -> str:
-    """Render a multimodal image part as a short text label for the summarizer.
-
-    Keeps a real, referenceable URL when the image lives at an http(s)
-    address — the summary can then preserve the handle so the agent (or a
-    later vision_analyze call) can still reach the image after compaction.
-    Base64 ``data:`` URLs carry no reusable reference and would flood the
-    summarizer input, so they collapse to ``[image]``.
-    """
-    url = ""
-    if isinstance(part.get("image_url"), dict):
-        url = str(part["image_url"].get("url") or "")
-    elif isinstance(part.get("image_url"), str):
-        url = part["image_url"]
-    elif isinstance(part.get("url"), str):
-        url = part["url"]
-    if url.startswith(("http://", "https://")):
-        return f"[image: {url}]"
-    return "[image]"
 
 
 def _str_arg(args: dict, key: str, default: str = "") -> str:
