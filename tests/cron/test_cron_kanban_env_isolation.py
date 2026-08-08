@@ -29,6 +29,7 @@ is left completely untouched.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import threading
 
@@ -302,6 +303,15 @@ class TestRunJobKanbanIsolation:
                 }
 
             def run_conversation(self, *_a, **_kw):
+                from model_tools import handle_function_call
+
+                observed["list_result"] = json.loads(
+                    handle_function_call(
+                        "kanban_list",
+                        {},
+                        enabled_toolsets=["terminal", "kanban"],
+                    )
+                )
                 return {"final_response": "done", "messages": []}
 
             def get_activity_summary(self):
@@ -321,6 +331,26 @@ class TestRunJobKanbanIsolation:
         assert success is True
         assert "kanban_list" in observed["tool_names"]
         assert "kanban_create" in observed["tool_names"]
+        assert "error" not in observed["list_result"]
+        assert "tasks" in observed["list_result"]
+
+    def test_non_dispatcher_context_ignores_inherited_worker_identity(
+        self, monkeypatch, worker_env
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        monkeypatch.setenv("HERMES_SESSION_ID", "cron-session")
+        kanban_tools._auto_heartbeat_last_attempt = 0.0
+
+        with non_dispatcher_owned_context():
+            assert kanban_tools._require_orchestrator_tool("kanban_list") is None
+            assert kanban_tools._enforce_worker_task_ownership("t_other") is None
+            assert kanban_tools._worker_run_id("t_worker_real_task") is None
+            assert kanban_tools._stamp_worker_session_metadata(
+                "t_worker_real_task", {"source": "cron"}
+            ) == {"source": "cron"}
+            assert kanban_tools.heartbeat_current_worker_from_env() is False
 
     def test_environment_is_left_untouched(self, monkeypatch, worker_env):
         """The whole point of the ContextVar: os.environ must not be mutated, so
