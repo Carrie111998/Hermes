@@ -14,6 +14,7 @@ late-binding seam in :mod:`hermes_cli.web_deps` so tests that
 
 import asyncio  # noqa: F401 — used by handlers
 import logging
+import sqlite3  # noqa: F401
 import subprocess  # noqa: F401
 import sys  # noqa: F401
 import time  # noqa: F401
@@ -23,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
 from hermes_cli.web_deps import late
+from hermes_cli.web_routers import _session_db_pool
 from hermes_cli.web_models import (
     ProfileCreate,
     ProfileActiveUpdate,
@@ -37,6 +39,30 @@ from hermes_cli.web_models import (
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
+
+
+def _is_schema_or_corrupt_error(exc: BaseException) -> bool:
+    """True when a read query failed because the store is stale/corrupt.
+
+    These are errors a fresh read-only handle won't outgrow, so the pooled
+    handle is invalidated on release and the next request re-opens (letting
+    the writable heal path in ``_open_session_db_for_profile`` run).
+    Transient errors (SQLITE_BUSY etc.) keep the warm handle.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "no such table",
+            "no such column",
+            "malformed",
+            "file is not a database",
+            "no such module",
+            "disk image",
+        )
+    )
 
 sessions_router = APIRouter()
 router = APIRouter()
@@ -92,7 +118,6 @@ def get_profiles_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
@@ -134,11 +159,15 @@ def get_profiles_sessions(
         try:
             # Read-only: this loop runs on every sidebar refresh, so it must
             # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
+            # read_only docstring). Handles come from the bounded read-only
+            # pool (#141): one reusable connection per profile instead of a
+            # fresh WAL-mode open per request — a client-disconnect pile-up
+            # used to exhaust the process fd limit (Errno 24).
+            db, cached = _session_db_pool.acquire(name, db_path)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue
+        invalidate = False
         try:
             rows = db.list_sessions_rich(
                 source=source_filter,
@@ -176,9 +205,10 @@ def get_profiles_sessions(
                 s["pinned"] = bool(s.get("pinned"))
                 merged.append(s)
         except Exception as exc:
+            invalidate = _is_schema_or_corrupt_error(exc)
             errors.append({"profile": name, "error": str(exc)})
         finally:
-            db.close()
+            _session_db_pool.release(name, db, cached=cached, invalidate=invalidate)
 
     sort_key = "last_active" if order == "recent" else "started_at"
     merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
@@ -226,7 +256,6 @@ def get_profiles_sessions_sidebar(
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
     desktop's per-slice calls.
     """
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     # cron + messaging are cross-profile; recents is scoped to recents_profile.
@@ -290,10 +319,12 @@ def get_profiles_sessions_sidebar(
         if not db_path.exists():
             continue
         try:
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Bounded read-only pool (#141) — see get_profiles_sessions.
+            db, cached = _session_db_pool.acquire(name, db_path)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue
+        invalidate = False
         try:
             if recents_scope == "all" or name == recents_scope:
                 profile_rows = _slice(db, exclude=recents_exclude_list, cap=recents_cap)
@@ -310,9 +341,10 @@ def get_profiles_sessions_sidebar(
                 _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
             )
         except Exception as exc:
+            invalidate = _is_schema_or_corrupt_error(exc)
             errors.append({"profile": name, "error": str(exc)})
         finally:
-            db.close()
+            _session_db_pool.release(name, db, cached=cached, invalidate=invalidate)
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)

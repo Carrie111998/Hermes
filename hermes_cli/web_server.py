@@ -11195,17 +11195,6 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 # query raises "no such table: sessions".
 _session_db_bootstrap_lock = threading.Lock()
 
-# Stale-schema probe for read-only opens: compiled against the newest columns
-# the dashboard read paths query. Reads at most one row per table. Read-only
-# opens skip _reconcile_columns(), so an older store would otherwise 500 on
-# every poll until something opened it writable.
-_SESSION_DB_READ_PROBE_SQL = (
-    "SELECT (SELECT archived FROM sessions LIMIT 1), "
-    "(SELECT pinned FROM sessions LIMIT 1), "
-    "(SELECT active FROM messages LIMIT 1), "
-    "(SELECT compacted FROM messages LIMIT 1)"
-)
-
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     """Open a SessionDB with an explicit access mode for a profile.
@@ -11220,12 +11209,14 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     """
     import sqlite3
 
+    from hermes_cli.web_routers import _session_db_pool
     from hermes_state import SessionDB, _default_db_path, is_malformed_db_error
 
     if profile:
-        _name, home = _cron_profile_home(profile)
+        pool_key, home = _cron_profile_home(profile)
         db_path = Path(home) / "state.db"
     else:
+        pool_key = "default"
         db_path = Path(_default_db_path())
     if not read_only:
         return SessionDB(db_path=db_path, read_only=False)
@@ -11244,17 +11235,11 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
                 SessionDB(db_path=db_path, read_only=False).close()
 
     def _open_probed():
-        db = SessionDB(db_path=db_path, read_only=True)
-        # Unit-test fakes may replace SessionDB without exposing a raw
-        # connection. Probe only real connections.
-        conn = getattr(db, "_conn", None)
-        if conn is not None:
-            try:
-                conn.execute(_SESSION_DB_READ_PROBE_SQL).fetchone()
-            except BaseException:
-                db.close()
-                raise
-        return db
+        # Handles come from the bounded read-only pool (#141): one reusable
+        # connection per profile instead of a fresh WAL-mode open per request,
+        # which used to pile up fds under desktop polling (Errno 24). The
+        # pool probes fresh handles (stale-schema check) before caching them.
+        return _session_db_pool.acquire(pool_key, db_path)[0]
 
     try:
         return _open_probed()
@@ -11263,6 +11248,9 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
         stale_schema = "no such table" in message or "no such column" in message
         if not stale_schema and not is_malformed_db_error(exc):
             raise
+        # Drop any pooled read-only handle for this store so the heal below
+        # is followed by a fresh (probed) open.
+        _session_db_pool.drop_idle(pool_key)
         SessionDB(db_path=db_path, read_only=False).close()
         return _open_probed()
 
