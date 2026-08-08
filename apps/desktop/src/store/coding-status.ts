@@ -2,6 +2,7 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
 import { desktopGit } from '@/lib/desktop-git'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 
 import {
   $projectScope,
@@ -497,6 +498,13 @@ export function _resetCodingStatusForTests(): void {
 // and ⌘⇧B now works from a detached session inside a project. '' means that no
 // repo is in reach. That is a no-op and not an error, because a worktree only
 // exists inside a repo.
+//
+// On a remote gateway, the candidate cwd is whatever the backend reported for
+// the focused session / project. The renderer's local `repoStatus` probe can
+// only validate paths that exist on the LOCAL filesystem, so it always returns
+// null for VPS-only paths (#81724 — ⌘⇧B was a silent no-op). Trust the
+// candidate here and let the backend's `git worktree add` surface a clean 400
+// if the path is not actually a repo on the VPS.
 export async function resolveWorktreeRepoPath(): Promise<string> {
   const runtimeId = $focusedRuntimeId.get()
   const scope = $projectScope.get()
@@ -509,7 +517,11 @@ export async function resolveWorktreeRepoPath(): Promise<string> {
   for (const candidate of candidates) {
     const path = candidate.trim()
 
-    if (path && (await isGitRepoPath(path))) {
+    if (!path) {
+      continue
+    }
+
+    if (isDesktopFsRemoteMode() || (await isGitRepoPath(path))) {
       return path
     }
   }
