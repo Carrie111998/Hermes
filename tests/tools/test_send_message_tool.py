@@ -1675,6 +1675,156 @@ class TestSendViaAdapterStandaloneFallback:
         assert recorded["content"] == "done"
         assert recorded["metadata"] == {"publish_topic": "alerts-channel"}
 
+    @pytest.mark.asyncio
+    async def test_live_mattermost_adapter_receives_multi_chunk_metadata(self, monkeypatch):
+        from tools.send_message_tool import _send_via_adapter
+
+        platform = Platform("mattermost")
+        recorded = {}
+
+        class Adapter:
+            async def send(self, *, chat_id, content, metadata=None):
+                recorded["metadata"] = metadata
+                return SimpleNamespace(success=True, message_id="mattermost-id")
+
+        runner = SimpleNamespace(adapters={platform: Adapter()})
+        fake_gateway_run = ModuleType("gateway.run")
+        fake_gateway_run._gateway_runner_ref = lambda: runner
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+
+        result = await _send_via_adapter(
+            platform,
+            SimpleNamespace(extra={}),
+            "channel-1",
+            "part 1",
+            multi_chunk=True,
+        )
+
+        assert result == {"success": True, "message_id": "mattermost-id"}
+        assert recorded["metadata"] == {"multi_chunk": True}
+
+    @pytest.mark.asyncio
+    async def test_standalone_mattermost_receives_multi_chunk_flag(self, monkeypatch):
+        from gateway.platform_registry import platform_registry
+        from tools.send_message_tool import _send_via_adapter
+
+        recorded = {}
+
+        async def fake_send(pconfig, chat_id, message, **kwargs):
+            recorded["kwargs"] = kwargs
+            return {"success": True, "message_id": "mattermost-id"}
+
+        entry = SimpleNamespace(standalone_sender_fn=fake_send)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr(
+            platform_registry,
+            "get",
+            lambda name: entry if name == "mattermost" else None,
+        )
+
+        result = await _send_via_adapter(
+            _FakePlatform("mattermost"),
+            SimpleNamespace(extra={}),
+            "channel-1",
+            "part 1",
+            multi_chunk=True,
+        )
+
+        assert result == {"success": True, "message_id": "mattermost-id"}
+        assert recorded["kwargs"]["multi_chunk"] is True
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_fn_called_when_no_adapter(self, monkeypatch):
+        """Registry has hook, runner ref returns None: the hook is awaited."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        recorded = {}
+
+        async def fake_send(pconfig, chat_id, message, **kwargs):
+            recorded["pconfig"] = pconfig
+            recorded["chat_id"] = chat_id
+            recorded["message"] = message
+            recorded["kwargs"] = kwargs
+            return {"success": True, "message_id": "msg-42"}
+
+        platform_registry.register(self._make_entry(fake_send))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            pconfig = SimpleNamespace(extra={})
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                pconfig,
+                "room/123",
+                "hello cron",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert result == {"success": True, "message_id": "msg-42"}
+        assert recorded["chat_id"] == "room/123"
+        assert recorded["message"] == "hello cron"
+        assert recorded["pconfig"] is pconfig
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_fn_kwargs_forwarded(self, monkeypatch):
+        """thread_id, media_files, and force_document all reach the hook."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        recorded = {}
+
+        async def fake_send(pconfig, chat_id, message, *, thread_id=None,
+                            media_files=None, force_document=False):
+            recorded["thread_id"] = thread_id
+            recorded["media_files"] = media_files
+            recorded["force_document"] = force_document
+            return {"success": True, "message_id": "x"}
+
+        platform_registry.register(self._make_entry(fake_send))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+                thread_id="thread-7",
+                media_files=["/tmp/a.png"],
+                force_document=True,
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert recorded["thread_id"] == "thread-7"
+        assert recorded["media_files"] == ["/tmp/a.png"]
+        assert recorded["force_document"] is True
+
+    @pytest.mark.asyncio
+    async def test_standalone_sender_fn_absent_returns_helpful_error(self, monkeypatch):
+        """Registry entry has no hook: the fall-through error explains both
+        options (gateway-running and standalone hook)."""
+        from tools.send_message_tool import _send_via_adapter
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.register(self._make_entry(None))
+        try:
+            monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+            result = await _send_via_adapter(
+                _FakePlatform("fakeplatform"),
+                SimpleNamespace(extra={}),
+                "chat-1",
+                "hi",
+            )
+        finally:
+            platform_registry.unregister("fakeplatform")
+
+        assert "error" in result
+        assert "fakeplatform" in result["error"]
+        assert "standalone_sender_fn" in result["error"]
 
     @pytest.mark.asyncio
     async def test_standalone_sender_fn_raises_is_caught_and_formatted(self, monkeypatch):

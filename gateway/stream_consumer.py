@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -245,6 +246,21 @@ class GatewayStreamConsumer:
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
+        # Once any streaming path splits the response across platform messages,
+        # preserve that fact for all subsequent sends/edits in this turn. Rich
+        # adapters use it to keep every chunk plain instead of emitting several
+        # independent rich cards.
+        self._is_multi_chunk = False
+        # Exact original-text prefix sealed into earlier overflow messages.
+        # Post-stream transforms can then edit only the active continuation
+        # instead of duplicating this prefix into the last message.
+        self._finalized_overflow_prefix = ""
+        # Full filtered text for the active stream segment, independent of
+        # delivery chunking. When an exact chunk prefix cannot be recovered
+        # (fallback sends or code-fence-aware truncation), prefix-preserving
+        # transforms can still be delivered as an appendix without rewriting
+        # the final continuation with the entire response.
+        self._streamed_source_text = ""
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
         self._last_edit_overflowed = False
@@ -343,6 +359,8 @@ class GatewayStreamConsumer:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if expect_edits:
             meta["expect_edits"] = True
+        if self._is_multi_chunk:
+            meta["multi_chunk"] = True
         if final:
             meta["notify"] = True
         return meta or None
@@ -361,6 +379,149 @@ class GatewayStreamConsumer:
     def message_id(self) -> str | None:
         """The Discord/chat message ID of the last-sent or edited message."""
         return self._message_id
+
+    async def edit_transformed_final(self, content: str) -> bool:
+        """Apply a post-stream transform to the active visible message.
+
+        After overflow, earlier chunks are immutable separate posts. For
+        prefix-preserving transforms, strip that sealed prefix and edit only
+        the last continuation when it still fits one post; otherwise append
+        only the new suffix. If an earlier chunk was rewritten, send a plain
+        replacement before best-effort cleanup of the obsolete active segment.
+        """
+        if not self._message_id:
+            return False
+        transformed = self._clean_for_display(content)
+        if self._is_multi_chunk:
+            if self._finalized_overflow_prefix:
+                if not transformed.startswith(self._finalized_overflow_prefix):
+                    return await self._send_transformed_replacement(transformed)
+                transformed = transformed[len(self._finalized_overflow_prefix):]
+                if not self._fits_single_message(transformed):
+                    streamed = self._clean_for_display(self._streamed_source_text)
+                    full_transformed = self._clean_for_display(content)
+                    if streamed and full_transformed.startswith(streamed):
+                        appendix = full_transformed[len(streamed):]
+                        if not appendix.strip():
+                            return True
+                        return await self._send_transformed_appendix(appendix)
+                    return await self._send_transformed_replacement(full_transformed)
+            else:
+                streamed = self._clean_for_display(self._streamed_source_text)
+                if not streamed or not transformed.startswith(streamed):
+                    # Earlier messages cannot be rewritten safely. Never put
+                    # the full transformed response into only the final chunk.
+                    return await self._send_transformed_replacement(transformed)
+                appendix = transformed[len(streamed):]
+                if not appendix.strip():
+                    return True
+                return await self._send_transformed_appendix(appendix)
+        result = await self._edit_message(
+            message_id=self._message_id,
+            content=transformed,
+            finalize=True,
+        )
+        return bool(getattr(result, "success", False))
+
+    def _fits_single_message(self, content: str) -> bool:
+        """Return whether *content* is safe for one platform edit."""
+        limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        len_fn = getattr(self.adapter, "message_len_fn", None)
+        try:
+            measured = len_fn(content) if callable(len_fn) else len(content)
+            return int(measured) <= int(limit)
+        except (TypeError, ValueError):
+            return len(content) <= 4096
+
+    def _split_transformed_content(self, content: str) -> list[str]:
+        """Split transformed delivery through the platform-safe chunking rail."""
+        raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
+        len_fn: "Callable[[str], int]" = len
+        if isinstance(self.adapter, _BasePlatformAdapter):
+            try:
+                raw_limit = self.adapter.max_message_length_for_chat(self.chat_id)
+                len_fn = self.adapter.message_len_fn_for_chat(self.chat_id)
+            except Exception as exc:
+                logger.debug("per-chat transformed limit resolution failed: %s", exc)
+        try:
+            safe_limit = max(1, int(raw_limit) - 100)
+        except (TypeError, ValueError):
+            safe_limit = 3996
+        chunks = self._truncate_for_stream(content, safe_limit, len_fn)
+        if not chunks or any(len_fn(chunk) > safe_limit for chunk in chunks):
+            chunks = self._split_text_chunks(content, safe_limit, len_fn)
+        return chunks
+
+    async def _send_transformed_chunks(self, content: str) -> Optional[list[str]]:
+        """Deliver every transformed chunk, returning IDs only on full success."""
+        chunks = self._split_transformed_content(content)
+        if not chunks:
+            return []
+        if len(chunks) > 1:
+            self._is_multi_chunk = True
+        message_ids: list[str] = []
+        for chunk in chunks:
+            result = await self.adapter.send(
+                chat_id=self.chat_id,
+                content=chunk,
+                metadata=self._metadata_for_send(final=True),
+            )
+            if not getattr(result, "success", False):
+                return None
+            message_id = getattr(result, "message_id", None)
+            if message_id:
+                message_ids.append(str(message_id))
+                self._track_preview_id(message_id)
+            self._message_id = message_id or self._message_id
+            self._last_sent_text = chunk
+            self._already_sent = True
+            self._notify_new_message()
+        return message_ids
+
+    async def _send_transformed_appendix(self, appendix: str) -> bool:
+        """Send an append-only transform as a fresh plain continuation."""
+        message_ids = await self._send_transformed_chunks(appendix)
+        if message_ids is None:
+            return False
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        return True
+
+    async def _send_transformed_replacement(self, transformed: str) -> bool:
+        """Send a plain replacement, then retire obsolete streamed chunks.
+
+        A non-prefix-preserving transform cannot be represented by editing only
+        the final continuation. Send the corrected response first (so cleanup
+        can never cause data loss), force multi-message/plain metadata, and
+        best-effort delete the obsolete preview chunks on capable platforms.
+        """
+        obsolete_ids = set(self._segment_preview_message_ids)
+        if self._message_id and self._message_id != "__no_edit__":
+            obsolete_ids.add(str(self._message_id))
+        replacement_ids = await self._send_transformed_chunks(transformed)
+        if replacement_ids is None:
+            return False
+
+        replacement_id_set = set(replacement_ids)
+        delete_fn = getattr(self.adapter, "delete_message", None)
+        if callable(delete_fn):
+            for message_id in obsolete_ids:
+                if str(message_id) in replacement_id_set:
+                    continue
+                try:
+                    await delete_fn(self.chat_id, message_id)
+                except Exception:
+                    logger.debug(
+                        "Transformed-response cleanup failed for %s",
+                        message_id,
+                        exc_info=True,
+                    )
+
+        self._preview_message_ids.difference_update(obsolete_ids)
+        self._segment_preview_message_ids.difference_update(obsolete_ids)
+        self._final_response_sent = True
+        self._final_content_delivered = True
+        return True
 
     @property
     def final_content_delivered(self) -> bool:
@@ -399,14 +560,17 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        edit_metadata = dict(self.metadata) if self.metadata else {}
+        if self._is_multi_chunk:
+            edit_metadata["multi_chunk"] = True
+        if edit_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -567,6 +731,8 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
+        self._finalized_overflow_prefix = ""
+        self._streamed_source_text = ""
         self._segment_preview_message_ids = set()
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
@@ -826,7 +992,12 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             flush_event = item[1]
                             break
+                        before = self._accumulated
                         self._filter_and_accumulate(item)
+                        if self._accumulated.startswith(before):
+                            self._streamed_source_text += self._accumulated[
+                                len(before):
+                            ]
                     except queue.Empty:
                         break
 
@@ -834,7 +1005,10 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
+                    before = self._accumulated
                     self._flush_think_buffer()
+                    if self._accumulated.startswith(before):
+                        self._streamed_source_text += self._accumulated[len(before):]
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /
@@ -891,6 +1065,8 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and self._accumulated:
+                    if _len_fn(self._accumulated) > _safe_limit:
+                        self._is_multi_chunk = True
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -898,14 +1074,14 @@ class GatewayStreamConsumer:
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
-                        # segment break).  Seal only the overflowing head chunks
-                        # as fixed messages, then keep the trailing chunk in
-                        # _accumulated so the normal send/edit path below makes
-                        # it the active preview.  That lets chunk 2, 3, ... keep
-                        # updating in-place as later streamed deltas arrive
-                        # instead of posting every split as an immutable message.
+                        # segment break). Seal only the overflowing head chunks
+                        # as fixed messages, then keep the trailing chunk active
+                        # so later deltas continue editing it in place. Preserve
+                        # the original source boundary for safe post-stream
+                        # transformations independently of adapter formatting.
+                        overflow_source = self._accumulated
                         chunks = self._truncate_for_stream(
-                            self._accumulated, _safe_limit, _len_fn,
+                            overflow_source, _safe_limit, _len_fn,
                         )
                         if len(chunks) <= 1:
                             # A malformed/legacy adapter result must not leave
@@ -933,6 +1109,18 @@ class GatewayStreamConsumer:
                             reply_to = new_id
 
                         if all_heads_delivered:
+                            # Recover the exact original prefix represented by
+                            # the sealed posts. Adapter splitters may append a
+                            # trailing ``(N/N)`` indicator to the visible tail;
+                            # strip it only for source-boundary lookup.
+                            last_visible = re.sub(
+                                r" \(\d+/\d+\)$", "", chunks[-1]
+                            )
+                            last_start = overflow_source.rfind(last_visible)
+                            if last_start >= 0:
+                                self._finalized_overflow_prefix = overflow_source[
+                                    :last_start
+                                ]
                             self._accumulated = chunks[-1]
                             # The head chunks are sealed.  Clear the edit target
                             # so the remaining tail is sent as a fresh active
@@ -1027,7 +1215,15 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        remainder = self._accumulated[split_at:]
+                        stripped_remainder = remainder.lstrip("\n")
+                        stripped_separator = remainder[:
+                            len(remainder) - len(stripped_remainder)
+                        ]
+                        self._finalized_overflow_prefix += (
+                            self._accumulated[:split_at] + stripped_separator
+                        )
+                        self._accumulated = stripped_remainder
                         self._message_id = None
                         self._last_sent_text = ""
                         # Sealed head chunk delivered — this turn is now a
@@ -1457,8 +1653,12 @@ class GatewayStreamConsumer:
                 logger.debug("per-chat limit resolution failed: %s", e)
         safe_limit = max(500, raw_limit - 100)
         chunks = self._split_text_chunks(continuation, safe_limit, len_fn=_len_fn)
-
         stale_message_id = self._message_id  # partial message to clean up
+        # Even one continuation chunk is part of a multi-post response when a
+        # visible partial remains as its prefix.
+        if len(chunks) > 1 or (chunks and stale_message_id):
+            self._is_multi_chunk = True
+
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
@@ -1506,6 +1706,7 @@ class GatewayStreamConsumer:
             sent_any_chunk = True
             last_successful_chunk = chunk
             last_message_id = result.message_id or last_message_id
+            self._track_preview_id(result.message_id)
             # Each fallback chunk is a fresh platform message — notify
             # so any stale tool-progress bubble gets closed off.
             self._notify_new_message()
@@ -1771,11 +1972,14 @@ class GatewayStreamConsumer:
         tail = self._clean_for_display(tail)
         if not tail.strip():
             return
+        # This tail follows an already visible partial message, so it and every
+        # later segment in the turn belong to a multi-post response.
+        self._is_multi_chunk = True
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
             if result.success:
                 self._already_sent = True
@@ -1808,11 +2012,14 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return False
+        # Commentary plus the eventual answer is a multi-message response.
+        # Mark it before either send so rich adapters keep every post plain.
+        self._is_multi_chunk = True
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(expect_edits=True),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser

@@ -7,7 +7,9 @@ description: >
   Connects to a self-hosted or cloud Mattermost instance via the v4 REST
   API + WebSocket event stream and relays messages between Mattermost
   channels/DMs and the Hermes agent. Supports thread-mode replies, native
-  file uploads, channel-scoped allowlists, and home-channel cron delivery.
+  file uploads, channel-scoped allowlists, home-channel cron delivery,
+  native rich posts, passive allowlisted channel observation, and signed
+  approval/feedback actions.
 author: NousResearch
 requires_env:
   - name: MATTERMOST_URL
@@ -19,6 +21,10 @@ requires_env:
     prompt: "Mattermost bot token"
     password: true
 optional_env:
+  - name: MATTERMOST_INTERACTION_SECRET
+    description: "Secret used to sign Mattermost approval and feedback callbacks"
+    prompt: "Interaction callback signing secret"
+    password: true
   - name: MATTERMOST_ALLOWED_USERS
     description: "Comma-separated Mattermost user IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
