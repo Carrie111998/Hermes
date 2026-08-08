@@ -33,6 +33,30 @@ const dayOfYear = (date: Date): number => {
   return Math.floor((current - start) / 86_400_000) + 1
 }
 
+const weekNumber = (date: Date, firstWeekday: 0 | 1): number => {
+  const firstDay = new Date(date.getFullYear(), 0, 1).getDay()
+  const firstOccurrence = (7 + firstWeekday - firstDay) % 7
+  const day = dayOfYear(date) - 1
+
+  return day < firstOccurrence ? 0 : Math.floor((day - firstOccurrence) / 7) + 1
+}
+
+const isoWeekParts = (date: Date): { year: number; week: number; weekday: number } => {
+  const weekday = ((date.getDay() + 6) % 7) + 1
+  const thursday = new Date(date.getFullYear(), date.getMonth(), date.getDate() + (4 - weekday))
+  const year = thursday.getFullYear()
+  const januaryFirstWeekday = ((new Date(year, 0, 1).getDay() + 6) % 7) + 1
+  const firstThursday = new Date(year, 0, 1 + ((4 - januaryFirstWeekday + 7) % 7))
+
+  const days = Math.round(
+    (Date.UTC(thursday.getFullYear(), thursday.getMonth(), thursday.getDate()) -
+      Date.UTC(firstThursday.getFullYear(), firstThursday.getMonth(), firstThursday.getDate())) /
+      86_400_000
+  )
+
+  return { year, week: Math.floor(days / 7) + 1, weekday }
+}
+
 const timezoneOffset = (date: Date): string => {
   const total = -date.getTimezoneOffset()
   const sign = total < 0 ? '-' : '+'
@@ -69,6 +93,15 @@ export function formatDisplayTimestamp(value: Date | number | undefined, options
   }
 
   const hour12 = date.getHours() % 12 || 12
+  const iso = isoWeekParts(date)
+  const year = date.getFullYear()
+  const yearShort = pad(year % 100)
+  const month = pad(date.getMonth() + 1)
+  const day = pad(date.getDate())
+  const hour = pad(date.getHours())
+  const minute = pad(date.getMinutes())
+  const second = pad(date.getSeconds())
+  const meridiem = date.getHours() < 12 ? 'AM' : 'PM'
 
   const replacements: Record<string, string> = {
     '%': '%',
@@ -76,24 +109,46 @@ export function formatDisplayTimestamp(value: Date | number | undefined, options
     A: WEEKDAYS_LONG[date.getDay()],
     b: MONTHS_SHORT[date.getMonth()],
     B: MONTHS_LONG[date.getMonth()],
-    d: pad(date.getDate()),
+    h: MONTHS_SHORT[date.getMonth()],
+    c: `${WEEKDAYS_SHORT[date.getDay()]} ${MONTHS_SHORT[date.getMonth()]} ${String(date.getDate()).padStart(2, ' ')} ${hour}:${minute}:${second} ${pad(year, 4)}`,
+    C: pad(Math.floor(year / 100)),
+    d: day,
+    D: `${month}/${day}/${yearShort}`,
     e: String(date.getDate()).padStart(2, ' '),
+    F: `${pad(year, 4)}-${month}-${day}`,
     f: pad(date.getMilliseconds() * 1000, 6),
-    H: pad(date.getHours()),
+    G: pad(iso.year, 4),
+    g: pad(iso.year % 100),
+    H: hour,
     I: pad(hour12),
     j: pad(dayOfYear(date), 3),
-    m: pad(date.getMonth() + 1),
-    M: pad(date.getMinutes()),
-    p: date.getHours() < 12 ? 'AM' : 'PM',
-    S: pad(date.getSeconds()),
+    k: String(date.getHours()).padStart(2, ' '),
+    l: String(hour12).padStart(2, ' '),
+    m: month,
+    M: minute,
+    n: '\n',
+    p: meridiem,
+    P: meridiem.toLowerCase(),
+    r: `${pad(hour12)}:${minute}:${second} ${meridiem}`,
+    R: `${hour}:${minute}`,
+    s: String(Math.floor(date.getTime() / 1000)),
+    S: second,
+    t: '\t',
+    T: `${hour}:${minute}:${second}`,
+    u: String(iso.weekday),
+    U: pad(weekNumber(date, 0)),
+    V: pad(iso.week),
     w: String(date.getDay()),
-    y: pad(date.getFullYear() % 100),
-    Y: pad(date.getFullYear(), 4),
+    W: pad(weekNumber(date, 1)),
+    x: `${month}/${day}/${yearShort}`,
+    X: `${hour}:${minute}:${second}`,
+    y: yearShort,
+    Y: pad(year, 4),
     z: timezoneOffset(date),
     Z: timezoneName(date)
   }
 
-  return String(options.format || '%H:%M').replace(/%([%aAbBdefHIjmMpSwyYzZ])/g, (token, directive: string) =>
+  return String(options.format || '%H:%M').replace(/%([%a-zA-Z])/g, (token, directive: string) =>
     Object.prototype.hasOwnProperty.call(replacements, directive) ? replacements[directive] : token
   )
 }
