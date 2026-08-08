@@ -225,6 +225,19 @@ def _get_langfuse() -> Optional[Langfuse]:
         _LANGFUSE_CLIENT = _INIT_FAILED
         return None
 
+    # atexit is LIFO: registering AFTER the SDK's constructor (which installs
+    # its own shutdown flush) means our finalizer runs FIRST at exit — root
+    # spans ended there are still picked up by the SDK's exporter. Closes the
+    # short-lived-process gap (kanban workers / hermes chat -q / cron): exit
+    # with tool calls still queued left the root span un-ended → anonymous
+    # trace with no name/session/metadata on the backend.
+    try:
+        import atexit
+
+        atexit.register(_finalize_all_traces)
+    except Exception:  # pragma: no cover - fail-open
+        pass
+
     return _LANGFUSE_CLIENT
 
 
@@ -732,6 +745,46 @@ def _evict_stale_locked() -> None:
             state.root_span.end()
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
+
+
+def _finalize_all_traces() -> None:
+    """End every open root span so short-lived processes export complete traces.
+
+    Gateway turns normally end their root span via ``_finish_trace`` (final
+    assistant message with no tool calls). But short-lived CLI processes —
+    kanban workers, ``hermes chat -q`` one-shots, cron jobs — can exit while
+    the last LLM call still has tool calls queued, leaving the root span
+    un-ended. Ended children DO export via the SDK's own atexit flush, so the
+    backend shows an anonymous trace (no name/session/metadata) whose
+    observations all point at a root that never arrived (observed live
+    2026-08-08: kanban workers produced 4 such traces in one tick).
+
+    Registered with ``atexit`` AFTER the Langfuse client is constructed:
+    atexit is LIFO, so this runs BEFORE the SDK's own shutdown hook — spans
+    ended here still get flushed by the SDK's exporter.
+    """
+    with _STATE_LOCK:
+        states = list(_TRACE_STATE.items())
+        _TRACE_STATE.clear()
+    for _key, state in states:
+        try:
+            for observation in state.generations.values():
+                _end_observation(observation)
+            for observation in state.tools.values():
+                _end_observation(observation)
+            for queue in state.pending_tools_by_name.values():
+                for observation in queue:
+                    _end_observation(observation)
+            state.root_span.end()
+        except Exception as exc:  # pragma: no cover - fail-open
+            _debug(f"atexit finalize failed for {_key}: {exc}")
+    if states:
+        client = _get_langfuse()
+        if client is not None:
+            try:
+                client.flush()
+            except Exception:
+                pass
 
 
 def _finish_trace(task_key: str, *, output: Any = None) -> None:
