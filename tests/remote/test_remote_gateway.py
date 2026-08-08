@@ -181,6 +181,10 @@ class Phone:
         merged = {**self.headers, **(headers or {})}
         return self._request("PATCH", path, body, headers=merged)
 
+    def delete(self, path, headers=None):
+        merged = {**self.headers, **(headers or {})}
+        return self._request("DELETE", path, None, headers=merged)
+
     def register_token(self, token):
         self.headers["Authorization"] = f"Bearer {token}"
 
@@ -494,3 +498,177 @@ def test_audit_never_contains_token_material(server, tmp_path, monkeypatch):
     for r in rows:
         if r["action"] in ("approval.decision", "device.scope_requested"):
             assert r["actor"] == device_id
+
+
+# ---------------------------------------------------------------------------
+# v1.1: session lifecycle (pin/archive/rename/delete) + projects + profiles
+# ---------------------------------------------------------------------------
+
+
+def test_session_patch_pin_archive_and_delete(server, tmp_path, home_env):
+    """PATCH /sessions/{id} {pinned|archived|title} and DELETE mirror the
+    desktop's session sidebar actions against the SAME state.db — the
+    desktop and the phone stay in sync because they share the host DB."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(home_env / "state.db")
+    phone, _ = _paired_phone(server, tmp_path)
+
+    # create via the real API route (as the app does)
+    status, body = phone.post(
+        "/api/remote/v1/sessions",
+        {"id": "phone-test-1", "title": "Phone Test", "cwd": str(home_env)})
+    assert status == 201, body
+    sid = "phone-test-1"
+
+    # pin
+    status, body = phone.patch(f"/api/remote/v1/sessions/{sid}", {"pinned": True})
+    assert status == 200, body
+    row = db.get_session(sid)
+    assert row is not None and row["pinned"] == 1
+
+    # archive
+    status, body = phone.patch(f"/api/remote/v1/sessions/{sid}", {"archived": True})
+    assert status == 200, body
+    row = db.get_session(sid)
+    assert row is not None and row["archived"] == 1
+
+    # rename
+    status, body = phone.patch(f"/api/remote/v1/sessions/{sid}", {"title": "Renamed by phone"})
+    assert status == 200, body
+    row = db.get_session(sid)
+    assert row is not None and row["title"] == "Renamed by phone"
+
+    # list excludes archived (matches desktop sidebar behaviour)
+    status, body = phone.get("/api/remote/v1/sessions")
+    assert status == 200, body
+    sessions = json.loads(body)
+    items = sessions if isinstance(sessions, list) else sessions.get("sessions", [])
+    assert all(s["id"] != sid for s in items)
+
+    # delete
+    status, body = phone.delete(f"/api/remote/v1/sessions/{sid}")
+    assert status == 200, body
+    assert db.get_session(sid) is None
+
+
+def test_session_patch_requires_chat_scope(server, tmp_path):
+    """A read-only device cannot mutate sessions (chat scope required);
+    session lifecycle is the chat surface, not control."""
+    state = RemoteState(tmp_path)
+    pairing = state.create_pairing(600)
+    phone = Phone(server)
+    phone.pair(pairing["secret_hex"])
+    result = server.adapter.confirm_pairing(
+        derive_confirmation_code(pairing["secret_hex"]))
+    state.update_device(result["device_id"], scopes=["read"])
+    phone.register_token(result["token"])
+
+    status, body = phone.patch("/api/remote/v1/sessions/nope", {"pinned": True})
+    assert status == 403
+    assert "insufficient_scope" in body
+
+
+def test_projects_tree_route(server, tmp_path, home_env):
+    """GET /projects returns the desktop sidebar tree: projects from
+    projects.db, sessions grouped into repos/lanes, hydrated rows."""
+    from hermes_state import SessionDB
+    from hermes_cli import projects_db as pdb
+
+    db = SessionDB(home_env / "state.db")
+    cwd = str(home_env / "work" / "repo-a")
+    # host-created sessions carry cwd (phone-created ones are unowned, as
+    # on the desktop); the tree lane groups by cwd -> project folder match
+    db.create_session("tree-session-1", source="tui", cwd=cwd)
+    db.set_session_title("tree-session-1", "Tree Session")
+    # tree only includes sessions with >= 1 message (desktop parity)
+    db.append_message("tree-session-1", role="user", content="hello")
+    sid = "tree-session-1"
+
+    phone, _ = _paired_phone(server, tmp_path)
+    with pdb.connect_closing() as conn:
+        pid = pdb.create_project(conn, name="repo-a", folders=[cwd])
+        pdb.set_active(conn, pid)
+
+    status, body = phone.get("/api/remote/v1/projects")
+    assert status == 200, body
+    tree = json.loads(body)
+    assert tree["active_project_id"] == pid
+    projects = tree.get("projects", [])
+    assert any(p.get("id") == pid for p in projects)
+    for project in projects:
+        if project.get("id") == pid:
+            assert project["sessionCount"] >= 1
+            nested = [
+                s["id"]
+                for repo in project.get("repos", [])
+                for grp in repo.get("groups", [])
+                for s in grp.get("sessions", [])
+            ]
+            assert sid in nested
+
+
+def test_profiles_list_and_switch(server, tmp_path, monkeypatch):
+    """GET /profiles mirrors `hermes profile list`; switch writes the
+    active-profile marker (the desktop reads the same file)."""
+    from hermes_cli import profiles as prof
+
+    phone, _ = _paired_phone(server, tmp_path, scopes=("read", "approve", "control", "chat"))
+
+    status, body = phone.get("/api/remote/v1/profiles")
+    assert status == 200, body
+    payload = json.loads(body)
+    assert "profiles" in payload and "active" in payload
+    names = [p["name"] for p in payload["profiles"]]
+    assert "default" in names
+
+    # switch to default (no-op safe)
+    status, body = phone.post("/api/remote/v1/profiles/default/switch", {})
+    assert status == 200, body
+    assert json.loads(body)["active"] == "default"
+
+    # unknown profile -> 404
+    status, body = phone.post("/api/remote/v1/profiles/does-not-exist/switch", {})
+    assert status == 404
+
+
+def test_profiles_create_rename_delete(server, tmp_path):
+    """Profile CRUD parity with `hermes profile create|rename|delete`."""
+    from hermes_cli import profiles as prof
+
+    phone, _ = _paired_phone(server, tmp_path, scopes=("read", "approve", "control", "chat"))
+
+    # create
+    status, body = phone.post("/api/remote/v1/profiles", {"name": "phone-created"})
+    assert status == 201, body
+    assert prof.get_profile_dir("phone-created").is_dir()
+
+    # rename
+    status, body = phone.patch("/api/remote/v1/profiles/phone-created", {"new_name": "phone-renamed"})
+    assert status == 200, body
+    assert prof.get_profile_dir("phone-renamed").is_dir()
+
+    # delete
+    status, body = phone.delete("/api/remote/v1/profiles/phone-renamed")
+    assert status == 200, body
+    assert not prof.get_profile_dir("phone-renamed").exists()
+
+    # deleting the active profile is refused
+    status, body = phone.delete("/api/remote/v1/profiles/default")
+    assert status == 409
+
+
+def test_profiles_require_control_scope(server, tmp_path):
+    """Profile mutation is host admin: chat-only devices get 403."""
+    state = RemoteState(tmp_path)
+    pairing = state.create_pairing(600)
+    phone = Phone(server)
+    phone.pair(pairing["secret_hex"])
+    result = server.adapter.confirm_pairing(
+        derive_confirmation_code(pairing["secret_hex"]))
+    state.update_device(result["device_id"], scopes=["read", "chat"])
+    phone.register_token(result["token"])
+
+    status, body = phone.post("/api/remote/v1/profiles", {"name": "sneaky"})
+    assert status == 403
+    assert "insufficient_scope" in body

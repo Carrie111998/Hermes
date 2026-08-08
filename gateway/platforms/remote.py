@@ -786,6 +786,181 @@ class RemoteDeviceAdapter(APIServerAdapter):
         rows = self.state.read_audit()
         return web_json(rows, 200)
 
+    # -- projects tree (desktop sidebar parity) ------------------------------------
+
+    async def _handle_projects_tree(self, request) -> Any:
+        """GET /projects — the same tree the desktop sidebar renders.
+
+        Mirrors tui_gateway.server._build_project_tree: sessions come from
+        the gateway's own HERMES_HOME/state.db via list_sessions_rich, and
+        projects come from the profile's projects.db. The tree is hydrated
+        (lanes carry full session rows) so the phone can drill into
+        projects exactly like the desktop sidebar.
+        """
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web_json({"error": "session_db_unavailable"}, 503)
+        try:
+            rows = db.list_sessions_rich(
+                limit=500,
+                offset=0,
+                order_by_last_active=True,
+                min_message_count=1,
+                include_children=False,
+                include_archived=False,
+            )
+            from tui_gateway.server import _project_tree_row
+
+            sessions = [_project_tree_row(r) for r in rows]
+
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as conn:
+                projects = [p.to_dict() for p in pdb.list_projects(conn)]
+                active_id = pdb.get_active_id(conn)
+                discovered = pdb.list_discovered_repos(conn)
+
+            from tui_gateway import project_tree
+
+            tree = project_tree.build_tree(
+                projects,
+                sessions,
+                discovered,
+                None,
+                preview_limit=3,
+                hydrate=True,
+                exists=lambda _path: True,
+            )
+            tree["active_project_id"] = active_id
+            return web_json(tree, 200)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("[remote] projects tree failed")
+            return web_json({"error": f"projects tree failed: {exc}"}, 500)
+
+    # -- profiles (hermes profile parity) ------------------------------------------
+
+    async def _handle_list_profiles(self, request) -> Any:
+        """GET /profiles — list profiles exactly like `hermes profile list`."""
+        try:
+            from hermes_cli.profiles import get_active_profile_name, list_profiles
+
+            profiles = []
+            for p in list_profiles():
+                profiles.append({
+                    "name": p.name,
+                    "is_default": p.is_default,
+                    "model": p.model,
+                    "provider": p.provider,
+                    "description": p.description or "",
+                    "gateway_running": bool(p.gateway_running),
+                    "skill_count": p.skill_count,
+                })
+            return web_json({
+                "profiles": profiles,
+                "active": get_active_profile_name(),
+            }, 200)
+        except Exception as exc:
+            logger.exception("[remote] profiles list failed")
+            return web_json({"error": f"profiles list failed: {exc}"}, 500)
+
+    async def _handle_create_profile(self, request) -> Any:
+        """POST /profiles {name, description?} — create a profile."""
+        try:
+            body = await request.json()
+        except Exception:
+            return web_json({"code": "malformed_request"}, 400)
+        name = str(body.get("name", "")).strip()
+        if not name:
+            return web_json({"code": "invalid_name", "message": "name is required"}, 400)
+        description = body.get("description")
+        if description is not None and not isinstance(description, str):
+            return web_json({"code": "invalid_description"}, 400)
+        try:
+            from hermes_cli.profiles import create_profile
+
+            path = create_profile(name, description=description or None, no_alias=True)
+            self.state.audit(_device_id_of(request), "profile.created", name)
+            return web_json({"name": name, "path": str(path)}, 201)
+        except ValueError as exc:
+            return web_json({"code": "invalid_name", "message": str(exc)}, 400)
+        except Exception as exc:
+            logger.exception("[remote] profile create failed")
+            return web_json({"error": f"profile create failed: {exc}"}, 500)
+
+    async def _handle_rename_profile(self, request) -> Any:
+        """PATCH /profiles/{name} {new_name} — rename a profile."""
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web_json({"code": "malformed_request"}, 400)
+        new_name = str(body.get("new_name", "")).strip()
+        if not new_name:
+            return web_json({"code": "invalid_name", "message": "new_name is required"}, 400)
+        try:
+            from hermes_cli.profiles import rename_profile
+
+            path = rename_profile(name, new_name)
+            self.state.audit(_device_id_of(request), "profile.renamed", f"{name} -> {new_name}")
+            return web_json({"name": new_name, "path": str(path)}, 200)
+        except FileNotFoundError as exc:
+            return web_json({"code": "profile_not_found", "message": str(exc)}, 404)
+        except FileExistsError as exc:
+            return web_json({"code": "profile_exists", "message": str(exc)}, 409)
+        except ValueError as exc:
+            return web_json({"code": "invalid_name", "message": str(exc)}, 400)
+        except Exception as exc:
+            logger.exception("[remote] profile rename failed")
+            return web_json({"error": f"profile rename failed: {exc}"}, 500)
+
+    async def _handle_delete_profile(self, request) -> Any:
+        """DELETE /profiles/{name} — delete a profile."""
+        name = request.match_info["name"]
+        active = ""
+        try:
+            from hermes_cli.profiles import delete_profile, get_active_profile_name
+
+            active = get_active_profile_name()
+            if name == active:
+                return web_json(
+                    {"code": "profile_active", "message": "cannot delete the active profile"},
+                    409,
+                )
+            path = delete_profile(name, yes=True)
+            self.state.audit(_device_id_of(request), "profile.deleted", name)
+            return web_json({"name": name, "path": str(path)}, 200)
+        except FileNotFoundError as exc:
+            return web_json({"code": "profile_not_found", "message": str(exc)}, 404)
+        except ValueError as exc:
+            return web_json({"code": "invalid_name", "message": str(exc)}, 400)
+        except Exception as exc:
+            logger.exception("[remote] profile delete failed")
+            return web_json({"error": f"profile delete failed: {exc}"}, 500)
+
+    async def _handle_switch_profile(self, request) -> Any:
+        """POST /profiles/{name}/switch — set the active profile.
+
+        Mirrors `hermes profile use {name}`: writes ~/.hermes/active_profile.
+        The running gateway keeps serving its own home until restarted; the
+        response reports the new active profile so the app can prompt a
+        reconnect (the operator restarts the gateway with the new home).
+        """
+        name = request.match_info["name"]
+        try:
+            from hermes_cli.profiles import get_profile_dir, set_active_profile
+
+            set_active_profile(name)
+            self.state.audit(_device_id_of(request), "profile.switched", name)
+            path = str(get_profile_dir(name)) if name != "default" else None
+            return web_json({"active": name, "path": path, "restart_required": True}, 200)
+        except FileNotFoundError as exc:
+            return web_json({"code": "profile_not_found", "message": str(exc)}, 404)
+        except ValueError as exc:
+            return web_json({"code": "invalid_name", "message": str(exc)}, 400)
+        except Exception as exc:
+            logger.exception("[remote] profile switch failed")
+            return web_json({"error": f"profile switch failed: {exc}"}, 500)
+
     # -- approvals front-door ---------------------------------------------------------
 
     async def _handle_list_approvals(self, request) -> Any:
@@ -1109,8 +1284,16 @@ class RemoteDeviceAdapter(APIServerAdapter):
             ("GET", f"{base}/capabilities", self._handle_capabilities),
             ("GET", f"{base}/sessions", self._handle_list_sessions),
             ("POST", f"{base}/sessions", self._handle_create_session),
+            ("PATCH", f"{base}/sessions/{{session_id}}", self._handle_patch_session),
+            ("DELETE", f"{base}/sessions/{{session_id}}", self._handle_delete_session),
             ("GET", f"{base}/sessions/{{session_id}}/messages", self._handle_session_messages),
             ("POST", f"{base}/sessions/{{session_id}}/chat", self._handle_session_chat),
+            ("GET", f"{base}/projects", self._handle_projects_tree),
+            ("GET", f"{base}/profiles", self._handle_list_profiles),
+            ("POST", f"{base}/profiles", self._handle_create_profile),
+            ("PATCH", f"{base}/profiles/{{name}}", self._handle_rename_profile),
+            ("DELETE", f"{base}/profiles/{{name}}", self._handle_delete_profile),
+            ("POST", f"{base}/profiles/{{name}}/switch", self._handle_switch_profile),
             ("GET", f"{base}/runs", self._handle_list_runs),
             ("GET", f"{base}/runs/{{run_id}}", self._handle_get_run),
             ("GET", f"{base}/runs/{{run_id}}/events", self._handle_run_events),
@@ -1177,6 +1360,14 @@ def _required_scope(path: str, method: str) -> Optional[str]:
         return _SCOPE_READ
     if path.endswith("/chat"):
         return _SCOPE_CHAT
+    # Session lifecycle (create/patch/delete) is the chat surface — the
+    # phone manages its own conversation list with the chat scope it
+    # already holds. Host-level surfaces (jobs, kanban, devices, profiles)
+    # stay on control.
+    if "/sessions" in path:
+        return _SCOPE_CHAT
+    if "/profiles" in path:
+        return _SCOPE_CONTROL
     if "/approval" in path or "/decision" in path:
         return _SCOPE_APPROVE
     if path.endswith("/stop") or "/jobs/" in path or "/kanban/" in path or path.endswith("/test-push"):
