@@ -9049,7 +9049,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
-        active_message_id = self._active_turn_message_ids.get(session_key)
+        active_message_id = getattr(self, "_active_turn_message_ids", {}).get(session_key)
         if effective_mode == "hybrid":
             is_active_root_edit = (
                 bool(event.metadata.get("is_edit"))
@@ -15927,7 +15927,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
         if event.message_id is not None:
-            self._active_turn_message_ids[_quick_key] = str(event.message_id)
+            active_turn_message_ids = getattr(self, "_active_turn_message_ids", None)
+            if active_turn_message_ids is None:
+                active_turn_message_ids = self._active_turn_message_ids = {}
+            active_turn_message_ids[_quick_key] = str(event.message_id)
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
@@ -23198,7 +23201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # are deliberately NOT cleared here — _release_turn_lease owns
             # them (#64934).
             state.turn.clear()
-        self._active_turn_message_ids.pop(session_key, None)
+        getattr(self, "_active_turn_message_ids", {}).pop(session_key, None)
         # Turn boundary: a running-agent slot was just released.  Persist the
         # new (lower) in-flight count so the dashboard readout stays current
         # between lifecycle transitions.  Preserves gateway_state (see
