@@ -191,3 +191,58 @@ def test_real_money_language_is_always_owner_gated() -> None:
             )
     finally:
         approval.reset_goal_authorization(token)
+
+
+def test_bounded_absolute_workspace_pythonpath_is_goal_authorized(monkeypatch) -> None:
+    from tools import approval
+    from tools import tirith_security
+
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        tirith_security,
+        "check_command_security",
+        lambda _command: {
+            "action": "block",
+            "findings": [
+                {
+                    "rule_id": "interpreter_hijack_env",
+                    "severity": "HIGH",
+                    "title": "Interpreter hijack environment variable: PYTHONPATH",
+                    "description": "fixture",
+                }
+            ],
+            "summary": "fixture",
+        },
+    )
+    auth_token = approval.set_goal_authorization(_active_envelope())
+    session_token = approval.set_current_session_key("goal-pythonpath-e2e")
+    interactive_token = approval.set_hermes_interactive_context(True)
+    prompts = 0
+
+    def callback(*_args, **_kwargs):
+        nonlocal prompts
+        prompts += 1
+        return "once"
+
+    try:
+        safe = approval.check_all_command_guards(
+            "export PYTHONPATH=/home/ubuntu/OddsEdge/src; python -m pytest -q",
+            "local",
+            approval_callback=callback,
+        )
+        assert safe["approved"] is True
+        assert safe.get("goal_authorized") is True
+        assert prompts == 0
+
+        unsafe = approval.check_all_command_guards(
+            "PYTHONPATH=.:/tmp/plugin python task.py",
+            "local",
+            approval_callback=callback,
+        )
+        assert unsafe["approved"] is True
+        assert unsafe.get("goal_authorized") is not True
+        assert prompts == 1
+    finally:
+        approval.reset_hermes_interactive_context(interactive_token)
+        approval.reset_current_session_key(session_token)
+        approval.reset_goal_authorization(auth_token)

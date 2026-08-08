@@ -106,6 +106,42 @@ def _audit_risk_decision(risk_class: str, reason: str) -> None:
     # Never include command/tool payloads here: they may contain secrets.
     logger.info("%s reason=%s", risk_class, reason)
 
+
+_GOAL_PYTHONPATH_ROOTS = (
+    "/home/ubuntu/OddsEdge",
+    "/home/ubuntu/worktrees",
+    "/home/ubuntu/projects",
+    "/home/ubuntu/.hermes/workspace/hermes-agent-updated",
+)
+_PYTHONPATH_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[;&|\n]\s*|\b(?:env|export)\s+)PYTHONPATH=(?:\"([^\"]*)\"|'([^']*)'|([^\s;&|]+))"
+)
+
+
+def _goal_tirith_warnings_auto_execute(command: str, warnings: list[tuple]) -> bool:
+    """Allow only a bounded, absolute workspace PYTHONPATH Tirith finding."""
+    tirith_keys = [key for key, _, is_tirith in warnings if is_tirith]
+    if not tirith_keys:
+        return True
+    if any(key != "tirith:interpreter_hijack_env" for key in tirith_keys):
+        return False
+    assignments = _PYTHONPATH_ASSIGNMENT_RE.findall(command or "")
+    if not assignments:
+        return False
+    for groups in assignments:
+        value = next((part for part in groups if part != ""), "")
+        entries = value.split(":")
+        if not entries or any(not entry or not os.path.isabs(entry) for entry in entries):
+            return False
+        for entry in entries:
+            normalized = os.path.normpath(entry)
+            if not any(
+                normalized == root or normalized.startswith(root + os.sep)
+                for root in _GOAL_PYTHONPATH_ROOTS
+            ):
+                return False
+    return True
+
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
 # os.environ["HERMES_INTERACTIVE"] races: one session's restore in `finally`
@@ -4012,8 +4048,8 @@ def check_all_command_guards(command: str, env_type: str,
     goal_risk_class, goal_risk_reason = classify_goal_action(command, combined_desc_for_goal)
     # Tirith findings are content-level security signals, not merely broad
     # shell-pattern matches. An active goal must never silently bypass them.
-    if goal_risk_class == AUTO_EXECUTE and not any(
-        is_tirith for _, _, is_tirith in warnings
+    if goal_risk_class == AUTO_EXECUTE and _goal_tirith_warnings_auto_execute(
+        command, warnings
     ):
         _audit_risk_decision(goal_risk_class, goal_risk_reason)
         return {
