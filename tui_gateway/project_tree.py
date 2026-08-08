@@ -516,6 +516,7 @@ def _project_node(
     preview_sessions: list[dict],
     color: Any = None,
     icon: Any = None,
+    conversation_groups: Optional[list[dict]] = None,
     is_auto: bool = False,
     is_no_project: bool = False,
 ) -> dict:
@@ -530,6 +531,7 @@ def _project_node(
         "sessionCount": session_count,
         "lastActive": last_active,
         "repos": repos,
+        "conversationGroups": conversation_groups or [],
         "previewSessions": preview_sessions,
     }
 
@@ -545,6 +547,8 @@ def build_tree(
     is_junk_root: Optional[Callable[[str], bool]] = None,
     is_junk_cwd: Optional[Callable[[str], bool]] = None,
     exists: Optional[Exists] = None,
+    conversation_groups: Optional[list[dict]] = None,
+    session_assignments: Optional[dict[str, dict]] = None,
 ) -> dict:
     """Build the authoritative project tree.
 
@@ -567,17 +571,41 @@ def build_tree(
     ``previewSessions``. When True (drill-in), lanes carry full session rows.
     """
     active_projects = [p for p in projects if not p.get("archived")]
+    active_by_id = {project["id"]: project for project in active_projects}
+    groups_by_project: dict[str, list[dict]] = {}
+    group_by_id: dict[str, dict] = {}
+    for group in conversation_groups or []:
+        project_id = str(group.get("project_id") or "")
+        group_id = str(group.get("id") or "")
+        if project_id not in active_by_id or not group_id:
+            continue
+        groups_by_project.setdefault(project_id, []).append(group)
+        group_by_id[group_id] = group
+    for groups in groups_by_project.values():
+        groups.sort(key=lambda group: (int(group.get("position") or 0), str(group.get("name") or "")))
+
+    assignments = session_assignments or {}
     _junk = is_junk_root or (lambda _root: False)
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     _exists = exists or (lambda _path: True)
     folder_index = _FolderIndex(active_projects)
 
     by_project: dict[str, list[dict]] = {}
+    grouped_session_ids: set[str] = set()
+    sessions_by_group: dict[str, list[dict]] = {}
     unowned: list[dict] = []
     for session in sessions:
-        owner = _project_for_session(session, folder_index, resolve)
+        session_id = str(session.get("id") or "")
+        assignment = assignments.get(session_id) or {}
+        assigned_project = active_by_id.get(str(assignment.get("project_id") or ""))
+        owner = assigned_project or _project_for_session(session, folder_index, resolve)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
+            group_id = str(assignment.get("group_id") or "")
+            group = group_by_id.get(group_id)
+            if group and group.get("project_id") == owner["id"]:
+                grouped_session_ids.add(session_id)
+                sessions_by_group.setdefault(group_id, []).append(session)
         else:
             unowned.append(session)
 
@@ -598,9 +626,23 @@ def build_tree(
     for project in active_projects:
         psessions = by_project.get(project["id"], [])
         scoped_ids.extend(s["id"] for s in psessions if s.get("id"))
+        repo_sessions = [s for s in psessions if str(s.get("id") or "") not in grouped_session_ids]
         repos = _seed_folder_repos(
-            _build_repos(psessions, resolve, hydrate), project.get("folders") or [], resolve
+            _build_repos(repo_sessions, resolve, hydrate), project.get("folders") or [], resolve
         )
+        rendered_groups = []
+        for group in groups_by_project.get(project["id"], []):
+            group_sessions = sorted(
+                sessions_by_group.get(group["id"], []), key=_session_time, reverse=True
+            )
+            rendered_groups.append(
+                {
+                    "id": group["id"],
+                    "label": group.get("name") or group["id"],
+                    "position": int(group.get("position") or 0),
+                    "sessions": group_sessions if hydrate else [],
+                }
+            )
         result.append(
             _project_node(
                 pid=project["id"],
@@ -608,6 +650,7 @@ def build_tree(
                 path=project.get("primary_path"),
                 color=project.get("color"),
                 icon=project.get("icon"),
+                conversation_groups=rendered_groups,
                 repos=repos,
                 session_count=len(psessions),
                 last_active=_last_active(psessions),

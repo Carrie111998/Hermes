@@ -560,6 +560,50 @@ export async function moveSessionToProject(
   void refreshProjectTree()
 }
 
+export async function assignSessionConversationGroup(
+  sessionId: string,
+  projectId: string,
+  groupId: null | string
+): Promise<void> {
+  await gatewayRequest('projects.sessions.assign', {
+    session_id: sessionId,
+    project_id: projectId,
+    group_id: groupId
+  })
+  await refreshProjectTree()
+}
+
+export interface ConversationGroupInfo {
+  id: string
+  project_id: string
+  name: string
+  position: number
+  created_at: number
+}
+
+export async function createConversationGroup(projectId: string, name: string): Promise<void> {
+  await gatewayRequest<{ group: ConversationGroupInfo }>('projects.groups.create', {
+    project_id: projectId,
+    name
+  })
+  await refreshProjectTree()
+}
+
+export async function renameConversationGroup(groupId: string, name: string): Promise<void> {
+  await gatewayRequest<{ group: ConversationGroupInfo }>('projects.groups.update', { id: groupId, name })
+  await refreshProjectTree()
+}
+
+export async function deleteConversationGroup(groupId: string): Promise<void> {
+  await gatewayRequest('projects.groups.delete', { id: groupId })
+  await refreshProjectTree()
+}
+
+export async function reorderConversationGroups(projectId: string, ids: string[]): Promise<void> {
+  await gatewayRequest('projects.groups.reorder', { project_id: projectId, ids })
+  await refreshProjectTree()
+}
+
 export interface RepoDiscoveryPolicy {
   enabled: boolean
   roots: string[]
@@ -786,6 +830,7 @@ function projectInfoToTreeNode(project: ProjectInfo): SidebarProjectTree {
     color: project.color ?? null,
     icon: project.icon ?? null,
     isAuto: false,
+    conversationGroups: [],
     repos: [],
     sessionCount: 0,
     previewSessions: []

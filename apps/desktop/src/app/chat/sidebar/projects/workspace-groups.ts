@@ -45,6 +45,13 @@ export interface SidebarWorkspaceTree {
   sessionCount: number
 }
 
+export interface SidebarConversationGroup {
+  id: string
+  label: string
+  position: number
+  sessions: SessionInfo[]
+}
+
 /** A project node: human-named (or repo-derived), holds its repo subtree. */
 export interface SidebarProjectTree {
   id: string
@@ -60,6 +67,7 @@ export interface SidebarProjectTree {
   // claimed. It has no folder, so no repo/worktree structure — its one lane
   // exists only to carry the rows.
   isNoProject?: boolean
+  conversationGroups?: SidebarConversationGroup[]
   repos: SidebarWorkspaceTree[]
   sessionCount: number
   // Max activity timestamp across the project's sessions (overview sort key).
@@ -659,6 +667,18 @@ export function excludeProjectSessions(
 
   const previewSessions = project.previewSessions?.filter(session => !isExcluded(session))
 
+  const conversationGroups = (project.conversationGroups ?? []).map(group => {
+    const sessions = group.sessions.filter(session => !isExcluded(session))
+
+    if (sessions.length !== group.sessions.length) {
+      changed = true
+
+      return { ...group, sessions }
+    }
+
+    return group
+  })
+
   changed ||= previewSessions?.length !== project.previewSessions?.length
 
   if (!changed) {
@@ -667,9 +687,12 @@ export function excludeProjectSessions(
 
   return {
     ...project,
+    conversationGroups,
     previewSessions,
     repos,
-    sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0)
+    sessionCount:
+      repos.reduce((n, repo) => n + repo.sessionCount, 0) +
+      conversationGroups.reduce((n, group) => n + group.sessions.length, 0)
   }
 }
 
@@ -684,9 +707,11 @@ export function overlayLiveLanes(
   }
 
   let changed = false
+  const groupedIds = new Set((project.conversationGroups ?? []).flatMap(group => group.sessions.map(session => session.id)))
+  const repoLive = groupedIds.size ? live.filter(session => !groupedIds.has(session.id)) : live
 
   const repos = project.repos.map(repo => {
-    const next = overlayRepoLanes(repo, live, removed)
+    const next = overlayRepoLanes(repo, repoLive, removed)
 
     changed ||= next !== repo
 
@@ -697,7 +722,13 @@ export function overlayLiveLanes(
     return project
   }
 
-  return { ...project, repos, sessionCount: repos.reduce((n, repo) => n + repo.sessionCount, 0) }
+  return {
+    ...project,
+    repos,
+    sessionCount:
+      repos.reduce((n, repo) => n + repo.sessionCount, 0) +
+      (project.conversationGroups ?? []).reduce((n, group) => n + group.sessions.length, 0)
+  }
 }
 
 /** Merge live sessions into per-project overview previews, keyed by project id. */
