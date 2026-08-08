@@ -7155,6 +7155,55 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── Incomplete-task boundary handoff guard (#80772) ────
+                # When todos still show remaining work, a final reply that is
+                # neither a completion claim nor a blocker/clarification
+                # handoff is an invalid terminal state. Nudge for an
+                # actionable pause instead of accepting a vague summary.
+                try:
+                    from agent.boundary_handoff import build_boundary_handoff_nudge
+
+                    _handoff_nudge = build_boundary_handoff_nudge(
+                        todo_store=getattr(agent, "_todo_store", None),
+                        final_response=final_response,
+                        messages=messages + [final_msg],
+                        attempts=getattr(agent, "_boundary_handoff_nudges", 0),
+                        enabled=bool(
+                            getattr(agent, "_task_completion_guidance", True)
+                        ),
+                    )
+                except Exception:
+                    logger.debug("boundary handoff stop-loop check failed", exc_info=True)
+                    _handoff_nudge = None
+
+                if _handoff_nudge:
+                    agent._boundary_handoff_nudges = (
+                        getattr(agent, "_boundary_handoff_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "boundary_handoff_required"
+                    agent._emit_interim_assistant_message(final_msg)
+                    messages.append(final_msg)
+                    try:
+                        agent._flush_messages_to_session_db(messages, conversation_history)
+                    except Exception:
+                        logger.debug("boundary handoff interim flush failed", exc_info=True)
+                    messages.append({
+                        "role": "user",
+                        "content": _handoff_nudge,
+                        "_boundary_handoff_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug(
+                        "boundary handoff nudge issued (attempt %d)",
+                        agent._boundary_handoff_nudges,
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the
