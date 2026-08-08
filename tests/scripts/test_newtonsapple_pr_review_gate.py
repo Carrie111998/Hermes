@@ -276,6 +276,20 @@ def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
         dead_letter_content="review failed permanently",
     )
     assert first == {"attempts": 1, "dead_lettered": False, "retry_after": 170}
+    assert store.pending_summaries() == [
+        {
+            "id": 1,
+            "key": f"retry:1:{gate.tuple_key(review_tuple)}",
+            "marker": gate._retry_marker(review_tuple, 1),
+            "content": gate._retry_content(
+                review_tuple,
+                attempt=1,
+                max_attempts=2,
+                retry_after=170,
+                failure_reason="the review run ended before formal publication",
+            ),
+        }
+    ]
     assert store.reserve(review_tuple, now=169, lease_seconds=30) is None
     second_token = store.reserve(review_tuple, now=170, lease_seconds=30)
     assert isinstance(second_token, str)
@@ -290,14 +304,12 @@ def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
         dead_letter_content="review failed permanently",
     )
     assert second == {"attempts": 2, "dead_lettered": True, "retry_after": None}
-    assert store.pending_summaries() == [
-        {
-            "id": 1,
-            "key": f"blocker:dead-letter:{gate.tuple_key(review_tuple)}",
-            "marker": "dead-letter-marker",
-            "content": "review failed permanently",
-        }
-    ]
+    assert store.pending_summaries()[-1] == {
+        "id": 2,
+        "key": f"blocker:dead-letter:{gate.tuple_key(review_tuple)}",
+        "marker": "dead-letter-marker",
+        "content": "review failed permanently",
+    }
     assert store.reserve(review_tuple, now=10_000, lease_seconds=30) is None
 
 
@@ -340,6 +352,7 @@ def test_release_settlement_never_publishes_a_github_status(monkeypatch, tmp_pat
                 "base_sha": review_tuple.base_sha,
                 "head_sha": review_tuple.head_sha,
                 "lease_token": lease_token,
+                "failure_code": "review_evidence_incomplete",
             },
             "newtonsapple-bot",
             store,
@@ -351,8 +364,10 @@ def test_release_settlement_never_publishes_a_github_status(monkeypatch, tmp_pat
         "dead_lettered": True,
         "retry_after": None,
     }
-    assert len(delivered) == 1
-    assert "No GitHub review was published" in delivered[0][0]
+    assert len(delivered) == gate.MAX_REVIEW_ATTEMPTS
+    assert "No GitHub review was posted" in delivered[0][0]
+    assert "immutable review evidence was incomplete" in delivered[0][0]
+    assert "No GitHub review was published" in delivered[-1][0]
 
 
 def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):

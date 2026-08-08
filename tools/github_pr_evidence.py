@@ -112,6 +112,8 @@ class EvidenceScope:
     required_logs_materialized: bool = False
     required_artifact_inventories_materialized: bool = False
     base_tree_sha: str = ""
+    merge_base_sha: str = ""
+    merge_base_tree_sha: str = ""
     head_tree_sha: str = ""
     required_execution_gates: tuple[str, ...] = ()
     baseline_execution_gates: tuple[str, ...] = ()
@@ -133,6 +135,7 @@ class EvidenceScope:
     tree_raw_inventory: set[tuple[str, str, str]] = field(default_factory=set)
     tree_changed_inventory: set[tuple[str, str, str]] = field(default_factory=set)
     base_tree: dict[str, dict[str, Any]] = field(default_factory=dict)
+    merge_base_tree: dict[str, dict[str, Any]] = field(default_factory=dict)
     head_tree: dict[str, dict[str, Any]] = field(default_factory=dict)
     blob_tokens_by_sha: dict[str, str] = field(default_factory=dict)
     canonical_blob_tokens: set[str] = field(default_factory=set)
@@ -789,6 +792,44 @@ def _tree_map(value: Any) -> tuple[str, dict[str, dict[str, Any]]]:
     return str(tree_sha), result
 
 
+def _comparison_merge_base(scope: EvidenceScope) -> str:
+    """Resolve the immutable merge base used by GitHub's pull-request diff."""
+    comparison = _run_gh_json(
+        [
+            f"repos/{scope.repository}/compare/{scope.base_sha}...{scope.head_sha}",
+            "--jq",
+            "{base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}",
+        ]
+    )
+    base_commit = comparison.get("base_commit") if isinstance(comparison, dict) else None
+    merge_base = (
+        comparison.get("merge_base_commit") if isinstance(comparison, dict) else None
+    )
+    merge_base_sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
+    if (
+        not isinstance(base_commit, dict)
+        or base_commit.get("sha") != scope.base_sha
+        or not isinstance(merge_base_sha, str)
+        or _SHA_RE.fullmatch(merge_base_sha) is None
+    ):
+        raise RuntimeError("Pull-request merge-base evidence was malformed")
+    return merge_base_sha
+
+
+def _commit_tree_identity(repository: str, commit_sha: str) -> str:
+    commit = _run_gh_json([f"repos/{repository}/git/commits/{commit_sha}"])
+    tree = commit.get("tree") if isinstance(commit, dict) else None
+    tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+    if (
+        not isinstance(commit, dict)
+        or commit.get("sha") != commit_sha
+        or not isinstance(tree_sha, str)
+        or _SHA_RE.fullmatch(tree_sha) is None
+    ):
+        raise RuntimeError("Exact commit tree identity was malformed")
+    return tree_sha
+
+
 def _new_blob_cursor(
     scope: EvidenceScope,
     entry: dict[str, Any],
@@ -867,45 +908,53 @@ def _is_canonical_gate_path(path: str) -> bool:
 
 
 def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
-    base_inventory_sha, base = _tree_map(
+    merge_base_sha = _comparison_merge_base(scope)
+    base_tree_sha, base = _tree_map(
         _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.base_sha}?recursive=1"])
     )
-    head_inventory_sha, head = _tree_map(
+    if merge_base_sha == scope.base_sha:
+        merge_base_tree_sha = base_tree_sha
+        merge_base = base
+    else:
+        merge_base_tree_sha, merge_base = _tree_map(
+            _run_gh_json(
+                [f"repos/{scope.repository}/git/trees/{merge_base_sha}?recursive=1"]
+            )
+        )
+    head_tree_sha, head = _tree_map(
         _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.head_sha}?recursive=1"])
     )
-    base_sha = base_inventory_sha
-    head_sha = head_inventory_sha
     if scope.concise_review:
-        commit_trees = []
-        for commit_sha in (scope.base_sha, scope.head_sha):
-            commit = _run_gh_json(
-                [f"repos/{scope.repository}/git/commits/{commit_sha}"]
+        expected_base_tree = _commit_tree_identity(scope.repository, scope.base_sha)
+        expected_merge_base_tree = expected_base_tree
+        if merge_base_sha != scope.base_sha:
+            expected_merge_base_tree = _commit_tree_identity(
+                scope.repository, merge_base_sha
             )
-            tree = commit.get("tree") if isinstance(commit, dict) else None
-            tree_sha = tree.get("sha") if isinstance(tree, dict) else None
-            if (
-                not isinstance(commit, dict)
-                or commit.get("sha") != commit_sha
-                or not isinstance(tree_sha, str)
-                or _SHA_RE.fullmatch(tree_sha) is None
-            ):
-                raise RuntimeError("Exact commit tree identity was malformed")
-            commit_trees.append(tree_sha)
-        base_sha, head_sha = commit_trees
-    scope.base_tree_sha = base_sha
-    scope.head_tree_sha = head_sha
+        expected_head_tree = _commit_tree_identity(scope.repository, scope.head_sha)
+        if (
+            base_tree_sha != expected_base_tree
+            or merge_base_tree_sha != expected_merge_base_tree
+            or head_tree_sha != expected_head_tree
+        ):
+            raise RuntimeError("Immutable tree did not match exact commit identity")
+    scope.base_tree_sha = base_tree_sha
+    scope.merge_base_sha = merge_base_sha
+    scope.merge_base_tree_sha = merge_base_tree_sha
+    scope.head_tree_sha = head_tree_sha
     scope.base_tree = base
+    scope.merge_base_tree = merge_base
     scope.head_tree = head
 
-    removed = set(base) - set(head)
-    added = set(head) - set(base)
+    removed = set(merge_base) - set(head)
+    added = set(head) - set(merge_base)
     inventory: set[tuple[str, str, str]] = set()
     rename_targets: dict[tuple[str, str, str], list[str]] = {}
     for path in added:
         entry = head[path]
         rename_targets.setdefault((entry["sha"], entry["mode"], entry["type"]), []).append(path)
     for old_path in sorted(tuple(removed)):
-        entry = base[old_path]
+        entry = merge_base[old_path]
         candidates = rename_targets.get((entry["sha"], entry["mode"], entry["type"]), [])
         if candidates:
             new_path = sorted(candidates)[0]
@@ -917,8 +966,8 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
         inventory.add(("removed", path, ""))
     for path in sorted(added):
         inventory.add(("added", "", path))
-    for path in sorted(set(base) & set(head)):
-        if base[path] != head[path]:
+    for path in sorted(set(merge_base) & set(head)):
+        if merge_base[path] != head[path]:
             inventory.add(("modified", path, path))
     scope.tree_raw_inventory = inventory
     scope.tree_changed_inventory = set(inventory)
@@ -944,18 +993,26 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
         scope.required_logs_materialized = True
         scope.required_artifact_inventories_materialized = True
     else:
-        for source, tree in (("base", base), ("head", head)):
+        trees = [("merge_base", merge_base)]
+        if merge_base_sha != scope.base_sha:
+            trees.append(("base", base))
+        trees.append(("head", head))
+        for source, tree in trees:
             for path in sorted(changed_paths | canonical_paths):
                 entry = tree.get(path)
                 if entry is None or entry["type"] != "blob":
+                    continue
+                if source == "base" and path not in canonical_paths:
                     continue
                 purpose = "canonical" if path in canonical_paths else "changed"
                 token = _new_blob_cursor(scope, entry, source=source, purpose=purpose)
                 if token not in blob_cursors[purpose]:
                     blob_cursors[purpose].append(token)
     return {
-        "base_tree_sha": base_sha,
-        "head_tree_sha": head_sha,
+        "base_tree_sha": base_tree_sha,
+        "merge_base_sha": merge_base_sha,
+        "merge_base_tree_sha": merge_base_tree_sha,
+        "head_tree_sha": head_tree_sha,
         "changes": [
             {"status": status, "base_path": old, "head_path": new}
             for status, old, new in sorted(inventory)

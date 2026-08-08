@@ -450,6 +450,17 @@ class WebhookAdapter(BasePlatformAdapter):
             result = await self._deliver_github_review(content, delivery)
             if result.success:
                 self._successful_github_reviews.add(chat_id)
+                delivery.pop("_github_review_failure_code", None)
+            else:
+                delivery["_github_review_failure_code"] = {
+                    "GitHub PR review evidence is incomplete or out of scope": (
+                        "review_evidence_incomplete"
+                    ),
+                    "GitHub PR execution evidence is incomplete or out of scope": (
+                        "execution_evidence_incomplete"
+                    ),
+                    "PR state changed before publish": "live_tuple_changed",
+                }.get(result.error, "publication_failed")
             return result
 
         # Cross-platform delivery — any platform with a gateway adapter.
@@ -1636,6 +1647,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "head_sha": trusted_tuple.head_sha,
             "lease_token": lease_token,
         }
+        if operation == "release":
+            settlement_payload["failure_code"] = delivery.get(
+                "_github_review_failure_code", "processing_failed"
+            )
         keep, _ = await asyncio.to_thread(
             self._route_processor.run_route_script,
             static_route["script"],

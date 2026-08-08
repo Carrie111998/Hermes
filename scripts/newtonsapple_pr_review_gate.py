@@ -35,6 +35,13 @@ LEASE_SECONDS = 2 * 60 * 60
 RETRY_DELAY_SECONDS = 5 * 60
 MAX_REVIEW_ATTEMPTS = 3
 BUZZ_CHANNEL = "b1cb95c9-6a36-4516-abdd-81d853a9412e"
+FAILURE_REASONS = {
+    "review_evidence_incomplete": "immutable review evidence was incomplete or out of scope",
+    "execution_evidence_incomplete": "execution evidence was incomplete or out of scope",
+    "live_tuple_changed": "the live pull-request tuple changed before publication",
+    "publication_failed": "GitHub did not accept or confirm the formal review",
+    "processing_failed": "the review run ended before formal publication",
+}
 BASELINE_EXECUTION_GATES = ("quality", "integration", "e2e")
 EXECUTION_GATE_COMMANDS = {
     "quality": ["npm", "run", "check"],
@@ -296,12 +303,14 @@ class ReviewStateStore:
         max_attempts: int,
         dead_letter_marker: str,
         dead_letter_content: str,
+        failure_reason: str = "the review run ended before formal publication",
     ) -> dict:
         if (
             retry_delay <= 0
             or max_attempts <= 0
             or not dead_letter_marker
             or not dead_letter_content
+            or not failure_reason
         ):
             raise ValueError("invalid retry policy")
         key = tuple_key(review_tuple)
@@ -324,11 +333,12 @@ class ReviewStateStore:
                 "(key, failures, retry_after, dead_lettered_at) VALUES (?, ?, ?, ?)",
                 (key, failures, retry_after, now if dead_lettered else None),
             )
+            thread = connection.execute(
+                "SELECT requested_event_id FROM review_threads WHERE key = ?",
+                (key,),
+            ).fetchone()
+            reply_to = None if thread is None else str(thread[0])
             if dead_lettered:
-                thread = connection.execute(
-                    "SELECT requested_event_id FROM review_threads WHERE key = ?",
-                    (key,),
-                ).fetchone()
                 connection.execute(
                     "INSERT OR IGNORE INTO summary_outbox"
                     "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
@@ -336,7 +346,24 @@ class ReviewStateStore:
                         f"blocker:dead-letter:{key}",
                         dead_letter_marker,
                         dead_letter_content,
-                        None if thread is None else str(thread[0]),
+                        reply_to,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "INSERT OR IGNORE INTO summary_outbox"
+                    "(key, marker, content, reply_to) VALUES (?, ?, ?, ?)",
+                    (
+                        f"retry:{failures}:{key}",
+                        _retry_marker(review_tuple, failures),
+                        _retry_content(
+                            review_tuple,
+                            attempt=failures,
+                            max_attempts=max_attempts,
+                            retry_after=retry_after,
+                            failure_reason=failure_reason,
+                        ),
+                        reply_to,
                     ),
                 )
         return {
@@ -1314,6 +1341,36 @@ def _dead_letter_marker(review_tuple: ReviewTuple) -> str:
     )
 
 
+def _retry_marker(review_tuple: ReviewTuple, attempt: int) -> str:
+    return (
+        "<!-- newtonsapple-pr-review-retry:v2 "
+        f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"attempt={attempt} -->"
+    )
+
+
+def _retry_content(
+    review_tuple: ReviewTuple,
+    *,
+    attempt: int,
+    max_attempts: int,
+    retry_after: Optional[int],
+    failure_reason: str,
+) -> str:
+    if retry_after is None:
+        raise ValueError("retry timestamp is missing")
+    retry_at = datetime.fromtimestamp(retry_after, timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    return (
+        f"**PR review retry scheduled:** PR #{review_tuple.pr_number} at head "
+        f"`{review_tuple.head_sha[:12]}` failed before publication because "
+        f"{failure_reason}. No GitHub review was posted. Attempt {attempt + 1} "
+        f"of {max_attempts} will be eligible after {retry_at}."
+    )
+
+
 def _summary_content(review_tuple: ReviewTuple, pr_url: str, review_body: str) -> str:
     findings = re.findall(
         r"(?m)^###\s+(P[0-3])\s+[—-]\s+(.+?)\s*$", review_body
@@ -1728,6 +1785,10 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         )
         return {"settled": "claim_publish"}
     if operation == "release":
+        failure_code = payload.get("failure_code", "processing_failed")
+        if not isinstance(failure_code, str) or failure_code not in FAILURE_REASONS:
+            failure_code = "processing_failed"
+        failure_reason = FAILURE_REASONS[failure_code]
         failure = store.record_failure(
             review_tuple,
             lease_token=lease_token,
@@ -1739,12 +1800,13 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
                 "**Operational blocker:** automated review for PR "
                 f"#{review_tuple.pr_number} at head `{review_tuple.head_sha}` "
                 f"failed after {MAX_REVIEW_ATTEMPTS} attempts. The tuple was "
-                "dead-lettered. No GitHub review was published; retry the "
+                f"dead-lettered because {failure_reason}. No GitHub review was "
+                "published; retry the "
                 "review request after resolving this blocker."
             ),
+            failure_reason=failure_reason,
         )
-        if failure["dead_lettered"]:
-            drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
+        drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
         return {"settled": "release", **failure}
     if operation != "complete":
         raise RuntimeError("invalid settlement operation")

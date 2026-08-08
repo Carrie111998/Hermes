@@ -1509,6 +1509,10 @@ class TestGitHubReviewDelivery:
         assert result.error == "publish failed"
         publish.assert_awaited_once()
         assert chat_id not in adapter._successful_github_reviews
+        assert (
+            adapter._delivery_info[chat_id]["_github_review_failure_code"]
+            == "publication_failed"
+        )
 
     @pytest.mark.asyncio
     async def test_webhook_response_without_delivery_authority_fails_closed(self):
@@ -1540,15 +1544,23 @@ class TestGitHubReviewDelivery:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("send_result", "outcome", "expected_operation"),
+        ("send_result", "outcome", "expected_operation", "expected_failure_code"),
         [
-            (SendResult(success=True), ProcessingOutcome.SUCCESS, "complete"),
-            (SendResult(success=False), ProcessingOutcome.SUCCESS, "release"),
-            (None, ProcessingOutcome.FAILURE, "release"),
+            (SendResult(success=True), ProcessingOutcome.SUCCESS, "complete", None),
+            (
+                SendResult(
+                    success=False,
+                    error="GitHub PR review evidence is incomplete or out of scope",
+                ),
+                ProcessingOutcome.SUCCESS,
+                "release",
+                "review_evidence_incomplete",
+            ),
+            (None, ProcessingOutcome.FAILURE, "release", "processing_failed"),
         ],
     )
     async def test_settles_exact_tuple_after_processing(
-        self, send_result, outcome, expected_operation
+        self, send_result, outcome, expected_operation, expected_failure_code
     ):
         adapter = _make_adapter(
             {
@@ -1606,17 +1618,20 @@ class TestGitHubReviewDelivery:
         ) as settle:
             await adapter.on_processing_complete(event, outcome)
 
+        settlement = {
+            "operation": expected_operation,
+            "contract_version": "v2",
+            "repository": "org/repo",
+            "pr_number": "42",
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
+        }
+        if expected_failure_code is not None:
+            settlement["failure_code"] = expected_failure_code
         settle.assert_called_once_with(
             "newtonsapple-pr-review-gate.py",
-            {
-                "operation": expected_operation,
-                "contract_version": "v2",
-                "repository": "org/repo",
-                "pr_number": "42",
-                "base_sha": self.base_sha,
-                "head_sha": self.head_sha,
-                "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
-            },
+            settlement,
             trusted_github_pr_environment=True,
         )
 

@@ -37,6 +37,13 @@ BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 
 
+def _comparison(merge_base_sha=BASE_SHA):
+    return {
+        "base_commit": {"sha": BASE_SHA},
+        "merge_base_commit": {"sha": merge_base_sha},
+    }
+
+
 def _scope(pr_number=42):
     return EvidenceScope(
         contract_version="v2",
@@ -486,7 +493,8 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
                 github_pr_evidence_tool("read", manifest["cursors"]["changed_files"])
             )
         with patch(
-            "tools.github_pr_evidence._run_gh_json", side_effect=[base_tree, head_tree]
+            "tools.github_pr_evidence._run_gh_json",
+            side_effect=[_comparison(), base_tree, head_tree],
         ) as run:
             result = json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
@@ -497,6 +505,11 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
     assert scope.base_tree_sha == "c" * 40
     assert scope.head_tree_sha == "d" * 40
     assert [call.args[0] for call in run.call_args_list] == [
+        [
+            f"repos/org/repo/compare/{BASE_SHA}...{HEAD_SHA}",
+            "--jq",
+            "{base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}",
+        ],
         [f"repos/org/repo/git/trees/{BASE_SHA}?recursive=1"],
         [f"repos/org/repo/git/trees/{HEAD_SHA}?recursive=1"],
     ]
@@ -556,7 +569,13 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
             )
         with patch(
             "tools.github_pr_evidence._run_gh_json",
-            side_effect=[base_tree, head_tree, base_commit, head_commit],
+            side_effect=[
+                _comparison(),
+                base_tree,
+                head_tree,
+                base_commit,
+                head_commit,
+            ],
         ) as run:
             result = json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
@@ -580,18 +599,21 @@ def test_tree_evidence_rejects_gitlink_submodule_entries():
         manifest = json.loads(github_pr_evidence_tool("manifest"))
         with patch(
             "tools.github_pr_evidence._run_gh_json",
-            return_value={
-                "sha": "c" * 40,
-                "truncated": False,
-                "tree": [
-                    {
-                        "path": "vendor/untrusted",
-                        "mode": "160000",
-                        "type": "commit",
-                        "sha": "d" * 40,
-                    }
-                ],
-            },
+            side_effect=[
+                _comparison(),
+                {
+                    "sha": "c" * 40,
+                    "truncated": False,
+                    "tree": [
+                        {
+                            "path": "vendor/untrusted",
+                            "mode": "160000",
+                            "type": "commit",
+                            "sha": "d" * 40,
+                        }
+                    ],
+                },
+            ],
         ):
             result = json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["tree_diff"])
@@ -633,7 +655,8 @@ def test_tree_diff_normalizes_rename_with_changed_content_from_github_inventory(
     }
 
     with evidence_scope(scope), patch(
-        "tools.github_pr_evidence._run_gh_json", side_effect=[base_tree, head_tree]
+        "tools.github_pr_evidence._run_gh_json",
+        side_effect=[_comparison(), base_tree, head_tree],
     ):
         token = _new_cursor(scope, _Cursor("tree_diff"))
         result = json.loads(github_pr_evidence_tool("read", token))
@@ -649,6 +672,72 @@ def test_tree_diff_normalizes_rename_with_changed_content_from_github_inventory(
         if cursor.kind == "blob" and "changed" in cursor.data["purposes"]
     }
     assert changed_blobs == {"8" * 40, "9" * 40}
+
+
+def test_tree_diff_uses_merge_base_when_the_base_branch_advanced():
+    scope = _scope()
+    scope.observed_changed_files = 1
+    scope.api_changed_inventory = {("modified", "src/app.py", "src/app.py")}
+    merge_base_sha = "e" * 40
+    merge_base_tree = {
+        "sha": "c" * 40,
+        "truncated": False,
+        "tree": [
+            {"path": path, "mode": "100644", "type": "blob", "sha": sha}
+            for path, sha in {
+                "AGENTS.md": "1" * 40,
+                "docs/DEV.md": "2" * 40,
+                "docs/TESTING.md": "3" * 40,
+                "package.json": "4" * 40,
+                "playwright.config.ts": "5" * 40,
+                ".github/workflows/ci.yml": "6" * 40,
+                "src/app.py": "7" * 40,
+            }.items()
+        ],
+    }
+    head_tree = {
+        **merge_base_tree,
+        "sha": "d" * 40,
+        "tree": [
+            entry if entry["path"] != "src/app.py" else {**entry, "sha": "8" * 40}
+            for entry in merge_base_tree["tree"]
+        ],
+    }
+    base_tip_tree = {
+        **merge_base_tree,
+        "sha": "f" * 40,
+        "tree": merge_base_tree["tree"]
+        + [
+            {
+                "path": ".github/workflows/security.yml",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "9" * 40,
+            }
+        ],
+    }
+
+    with evidence_scope(scope), patch(
+        "tools.github_pr_evidence._run_gh_json",
+        side_effect=[
+            _comparison(merge_base_sha),
+            base_tip_tree,
+            merge_base_tree,
+            head_tree,
+        ],
+    ):
+        token = _new_cursor(scope, _Cursor("tree_diff"))
+        result = json.loads(github_pr_evidence_tool("read", token))
+
+    assert result["success"] is True
+    assert result["items"]["base_tree_sha"] == "f" * 40
+    assert result["items"]["merge_base_sha"] == merge_base_sha
+    assert result["items"]["merge_base_tree_sha"] == "c" * 40
+    assert ".github/workflows/security.yml" in result["items"]["canonical_paths"]
+    assert result["items"]["changes"] == [
+        {"status": "modified", "base_path": "src/app.py", "head_path": "src/app.py"}
+    ]
+    assert scope.tree_diff_reconciled is True
 
 
 def test_gate_graph_includes_workspace_locks_containers_and_invoked_config_paths():
@@ -1015,6 +1104,8 @@ def test_pr_184_shape_completes_without_reading_157_artifact_entries():
             archive.writestr(f"coverage/{index}.json", '{"covered": true}')
 
     def json_response(args):
+        if args[0] == f"repos/org/repo/compare/{BASE_SHA}...{HEAD_SHA}":
+            return _comparison()
         endpoint = args[-1]
         if endpoint == "repos/org/repo/pulls/42":
             return pull
