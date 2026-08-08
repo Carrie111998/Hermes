@@ -29,6 +29,34 @@ def test_env_can_disable(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[]) is None
 
 
+def test_kanban_stop_pair_stripped_from_finalize_history():
+    from agent.turn_finalizer import (
+        _VERIFICATION_CONTINUATION_FLAGS,
+        _drop_verification_continuation_scaffolding,
+    )
+
+    assert "_kanban_stop_synthetic" in _VERIFICATION_CONTINUATION_FLAGS
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {
+            "role": "assistant",
+            "content": "Let me write the report now.",
+            "_kanban_stop_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "[System: call kanban_complete]",
+            "_kanban_stop_synthetic": True,
+        },
+        {"role": "assistant", "content": "Calling kanban_complete now."},
+    ]
+    _drop_verification_continuation_scaffolding(messages)
+    assert [m.get("content") for m in messages] == [
+        "work kanban task",
+        "Calling kanban_complete now.",
+    ]
+
+
 def test_nudge_when_no_terminal_tool(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
     messages = [
