@@ -34,6 +34,16 @@ _installed: dict[str, "_ThreadRoutingStream"] = {}
 # displace and later restore a routing proxy; they must not allocate another
 # permanent /dev/null descriptor every time that happens.
 _sinks: dict[str, TextIO] = {}
+_routing_states: dict[str, "_RoutingState"] = {}
+
+
+class _RoutingState:
+    """Silencing registry shared by every proxy generation for one stream."""
+
+    def __init__(self, sink: TextIO) -> None:
+        self.sink = sink
+        self.silenced: dict[int, int] = {}
+        self.lock = threading.Lock()
 
 
 class _ThreadRoutingStream:
@@ -46,32 +56,27 @@ class _ThreadRoutingStream:
     ``.fileno()`` behave like the underlying stream for the calling thread.
     """
 
-    def __init__(self, passthrough: TextIO, sink: TextIO) -> None:
+    def __init__(self, passthrough: TextIO, state: _RoutingState) -> None:
         self._passthrough = passthrough
-        self._sink = sink
-        # ident -> nesting depth.  A thread is silenced while depth > 0, so
-        # nested ``thread_scoped_silence()`` on the same thread composes
-        # correctly (the inner exit decrements rather than fully clearing).
-        self._silenced: dict[int, int] = {}
-        self._lock = threading.Lock()
+        self._state = state
 
     def _target(self) -> TextIO:
-        if self._silenced.get(threading.get_ident(), 0) > 0:
-            return self._sink
+        if self._state.silenced.get(threading.get_ident(), 0) > 0:
+            return self._state.sink
         return self._passthrough
 
     # --- registration -----------------------------------------------------
     def silence(self, ident: int) -> None:
-        with self._lock:
-            self._silenced[ident] = self._silenced.get(ident, 0) + 1
+        with self._state.lock:
+            self._state.silenced[ident] = self._state.silenced.get(ident, 0) + 1
 
     def unsilence(self, ident: int) -> None:
-        with self._lock:
-            depth = self._silenced.get(ident, 0) - 1
+        with self._state.lock:
+            depth = self._state.silenced.get(ident, 0) - 1
             if depth > 0:
-                self._silenced[ident] = depth
+                self._state.silenced[ident] = depth
             else:
-                self._silenced.pop(ident, None)
+                self._state.silenced.pop(ident, None)
 
     # --- file-like surface ------------------------------------------------
     def write(self, data):  # type: ignore[no-untyped-def]
@@ -118,6 +123,7 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
             # temporary replacement. Adopt it instead of wrapping it and
             # growing an unbounded proxy chain.
             _installed[attr] = current
+            _routing_states[attr] = current._state
             return current
         if proxy is not None and current is proxy:
             return proxy
@@ -129,7 +135,11 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
         if sink is None or sink.closed:
             sink = open(os.devnull, "w", encoding="utf-8")
             _sinks[attr] = sink
-        proxy = _ThreadRoutingStream(passthrough, sink)
+        state = _routing_states.get(attr)
+        if state is None or state.sink is not sink:
+            state = _RoutingState(sink)
+            _routing_states[attr] = state
+        proxy = _ThreadRoutingStream(passthrough, state)
         setattr(sys, attr, proxy)
         _installed[attr] = proxy
         return proxy

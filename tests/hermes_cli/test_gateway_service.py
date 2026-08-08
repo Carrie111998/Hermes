@@ -233,8 +233,15 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
-    def test_launchd_plist_has_gateway_file_descriptor_headroom(self):
+    def test_launchd_plist_has_gateway_file_descriptor_headroom(self, monkeypatch):
         """launchd's 256-file default is below a normal busy gateway footprint."""
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="maxfiles 256 unlimited\n", stderr=""
+            ),
+        )
         plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode())
 
         assert plist["SoftResourceLimits"]["NumberOfFiles"] >= 4096
@@ -248,12 +255,60 @@ class TestGeneratedSystemdUnits:
         monkeypatch.setattr(
             resource_limits, "configured_nofile_soft_limit", lambda config=None: 65536
         )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="maxfiles 256 unlimited\n", stderr=""
+            ),
+        )
 
         plist = gateway_cli.generate_launchd_plist()
 
         assert "<key>SoftResourceLimits</key>" in plist
         assert "<key>NumberOfFiles</key>" in plist
         assert "<integer>65536</integer>" in plist
+
+    def test_launchd_limit_never_lowers_domain_or_safe_floor(self, monkeypatch):
+        """launchd accepts an absolute limit, so resolve a non-lowering value."""
+        import hermes_cli.resource_limits as resource_limits
+
+        monkeypatch.setattr(
+            resource_limits, "configured_nofile_soft_limit", lambda config=None: 64
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="maxfiles 8192 unlimited\n", stderr=""
+            ),
+        )
+
+        assert gateway_cli._launchd_nofile_soft_limit() == 8192
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="maxfiles 256 unlimited\n", stderr=""
+            ),
+        )
+        assert gateway_cli._launchd_nofile_soft_limit() == 4096
+
+    def test_launchd_limit_omits_absolute_override_when_domain_is_unknown(self, monkeypatch):
+        """Failing to inspect inheritance must not risk lowering a higher limit."""
+        import hermes_cli.resource_limits as resource_limits
+
+        monkeypatch.setattr(
+            resource_limits, "configured_nofile_soft_limit", lambda config=None: 4096
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError("launchctl unavailable")),
+        )
+
+        assert gateway_cli._launchd_nofile_soft_limit() is None
 
     def test_launchd_plist_omits_nofile_block_when_disabled(self, monkeypatch):
         """runtime.nofile_soft_limit: 0/false/null disables the adjustment; the

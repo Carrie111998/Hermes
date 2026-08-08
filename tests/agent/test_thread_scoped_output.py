@@ -131,3 +131,40 @@ def test_temporary_global_redirects_do_not_allocate_new_sinks(monkeypatch):
         assert thread_output._installed == original_proxies
     finally:
         sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def test_silence_survives_redirect_restoring_an_older_proxy(monkeypatch):
+    """Silencing is stream-wide, even when a redirect swaps proxy generations."""
+    monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "_sinks", {})
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    passthrough = io.StringIO()
+    sys.stdout = passthrough
+    entered = threading.Event()
+    release = threading.Event()
+
+    try:
+        with thread_scoped_silence():
+            pass
+
+        def worker():
+            with thread_scoped_silence():
+                entered.set()
+                assert release.wait(timeout=10)
+                print("must-stay-silenced")
+
+        redirected = io.StringIO()
+        with contextlib.redirect_stdout(redirected):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            assert entered.wait(timeout=10)
+
+        release.set()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive()
+        assert "must-stay-silenced" not in passthrough.getvalue()
+        assert "must-stay-silenced" not in redirected.getvalue()
+    finally:
+        release.set()
+        sys.stdout, sys.stderr = original_stdout, original_stderr

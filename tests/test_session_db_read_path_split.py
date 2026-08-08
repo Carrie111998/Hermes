@@ -37,8 +37,13 @@ def test_read_conn_is_per_thread(db):
     t1 = threading.Thread(target=grab, args=(1,))
     t2 = threading.Thread(target=grab, args=(2,))
     t1.start(); t2.start(); t1.join(); t2.join()
-    assert conns[1] is not None and conns[2] is not None
-    assert conns[1] is not conns[2]
+    try:
+        assert conns[1] is not None and conns[2] is not None
+        assert conns[1] is not conns[2]
+    finally:
+        for conn in conns.values():
+            if conn is not None:
+                db._close_read_conn(conn)
 
 
 @pytest.mark.requires_wal

@@ -709,7 +709,7 @@ class TestFTS5Search:
             # _get_read_conn opens one pool member; return it before the
             # searches so both calls deterministically borrow the traced
             # connection under the bounded-pool contract.
-            db._read_pool.put_nowait(read_conn)
+            db._return_read_conn(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 

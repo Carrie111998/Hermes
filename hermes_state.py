@@ -2572,7 +2572,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # too-small _READ_POOL_MAX is diagnosable from a running process
         # instead of inferred from latency.
         self._read_permit_exhausted = 0
-        self._read_conns_lock = threading.Lock()
+        # A condition coordinates pool opens/checkouts with close().  Merely
+        # draining idle entries is insufficient: an opener or checked-out
+        # reader can otherwise outlive close() and publish/use a descriptor
+        # after shutdown has returned.
+        self._read_conns_lock = threading.Condition()
+        self._read_opening = 0
+        self._read_active: set[sqlite3.Connection] = set()
         # Set when close() begins.  _read_ctx checks this under the lock
         # before returning a connection to the pool, so a reader still in
         # flight during the drain closes its own connection instead of
@@ -2847,19 +2853,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 < _READ_OPEN_RETRY_SECONDS
             ):
                 return None
-        # Take the descriptor permit BEFORE the open, so concurrent openers
-        # race for permits rather than for file descriptors. Non-blocking:
-        # losing the race means "use the writer connection", not "wait".
-        if not self._read_permits.acquire(blocking=False):
-            with self._read_conns_lock:
+            # Take the descriptor permit and register the in-flight open while
+            # holding the lifecycle condition. close() then either wins before
+            # this point or waits until this opener finishes; there is no gap
+            # in which it can return and a new connection can appear later.
+            if not self._read_permits.acquire(blocking=False):
                 self._read_permit_exhausted += 1
-            logger.debug(
-                "read pool at capacity (%d) for %s; serving this read from the "
-                "locked writer connection",
-                _READ_POOL_MAX,
-                self.db_path,
-            )
-            return None
+                logger.debug(
+                    "read pool at capacity (%d) for %s; serving this read from the "
+                    "locked writer connection",
+                    _READ_POOL_MAX,
+                    self.db_path,
+                )
+                return None
+            self._read_opening += 1
         # Bound before the try: the except handlers close it if the open
         # half-succeeded, and an unbound name there would raise NameError over
         # the top of the real failure.
@@ -2899,6 +2906,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # writer connection still serves reads until the stamp expires.
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
+                self._read_opening -= 1
+                self._read_conns_lock.notify_all()
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             if closed:
                 self._read_permits.release()
@@ -2912,7 +2921,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             closed = self._discard_partial_read_conn(conn)
             if closed:
                 self._read_permits.release()
+            with self._read_conns_lock:
+                self._read_opening -= 1
+                self._read_conns_lock.notify_all()
             raise
+        with self._read_conns_lock:
+            self._read_opening -= 1
+            if self._read_conns_closed:
+                discard = True
+            else:
+                self._read_active.add(conn)
+                discard = False
+            self._read_conns_lock.notify_all()
+        if discard:
+            self._close_read_conn(conn)
+            return None
         return conn
 
     def _discard_partial_read_conn(self, conn) -> bool:
@@ -2950,12 +2973,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         come from there over-releases the BoundedSemaphore, which raises
         ValueError rather than silently widening the ceiling.
         """
+        closed = False
         try:
             conn.close()
         except Exception as exc:
             logger.warning("read-conn close failed for %s: %s", self.db_path, exc)
         else:
-            self._read_permits.release()
+            closed = True
+        try:
+            if closed:
+                self._read_permits.release()
+        finally:
+            with self._read_conns_lock:
+                self._read_active.discard(conn)
+                self._read_conns_lock.notify_all()
 
     def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
         """Borrow a read connection from the pool, opening one on a miss.
@@ -2973,10 +3004,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not self._wal_active or self.read_only:
             return None
-        try:
-            return self._read_pool.get_nowait()
-        except queue.Empty:
-            return self._get_read_conn()
+        with self._read_conns_lock:
+            if self._read_conns_closed:
+                return None
+            try:
+                conn = self._read_pool.get_nowait()
+            except queue.Empty:
+                conn = None
+            if conn is not None:
+                self._read_active.add(conn)
+                return conn
+        return self._get_read_conn()
+
+    def _return_read_conn(self, conn: sqlite3.Connection) -> None:
+        """Return an active reader to the idle pool or close it after shutdown."""
+        returned = False
+        with self._read_conns_lock:
+            self._read_active.discard(conn)
+            if not self._read_conns_closed:
+                try:
+                    self._read_pool.put_nowait(conn)
+                    returned = True
+                except queue.Full:
+                    pass
+            self._read_conns_lock.notify_all()
+        if not returned:
+            self._close_read_conn(conn)
 
     @contextmanager
     def _read_ctx(self):
@@ -3001,25 +3054,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 yield conn
             finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() has already drained the pool, so this connection
-                    # is surplus. Close it here — dropping it on the floor is
-                    # what leaked the fd.
-                    #
-                    # queue.Full is now unreachable in practice (permits and
-                    # maxsize are both _READ_POOL_MAX, so there can never be a
-                    # ninth connection to return), but the branch stays: it is
-                    # load-bearing if those two ever drift apart, and a leak is
-                    # the failure mode it prevents.
-                    self._close_read_conn(conn)
+                self._return_read_conn(conn)
             return
         with self._lock:
             yield self._conn
@@ -3537,6 +3572,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # already been drained.
         with self._read_conns_lock:
             self._read_conns_closed = True
+            while self._read_opening or self._read_active:
+                self._read_conns_lock.wait()
         while True:
             try:
                 conn = self._read_pool.get_nowait()

@@ -156,6 +156,80 @@ def test_reader_after_close_does_not_repopulate_pool(db):
     assert db._read_pool.qsize() == 0
 
 
+@pytest.mark.requires_wal
+def test_read_open_racing_close_is_discarded(db, monkeypatch):
+    """An opener that crossed the pre-open gate must still honor close()."""
+    import hermes_state as _hs
+
+    real_connect = _hs._connect_tracked_db
+    open_started = threading.Event()
+    allow_open = threading.Event()
+    result = []
+
+    def blocked_connect(*args, **kwargs):
+        open_started.set()
+        assert allow_open.wait(timeout=10), "test did not release blocked read open"
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(_hs, "_connect_tracked_db", blocked_connect)
+    worker = threading.Thread(target=lambda: result.append(db._get_read_conn()))
+    worker.start()
+    assert open_started.wait(timeout=10), "read open never reached the race window"
+
+    close_returned = threading.Event()
+    closer = threading.Thread(target=lambda: (db.close(), close_returned.set()))
+    closer.start()
+    returned_before_open = close_returned.wait(timeout=2)
+    allow_open.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert not worker.is_alive() and not closer.is_alive()
+    assert not returned_before_open, "close returned while a read open was still in flight"
+    assert result == [None], "a reader opened after SessionDB.close() completed"
+    assert _live_count(db.db_path) == 0, "the post-close reader remained tracked/open"
+
+
+@pytest.mark.requires_wal
+def test_close_waits_for_checked_out_reader_before_returning(db, monkeypatch):
+    """close() cannot return while a checked-out reader can still start work."""
+    checked_out = threading.Event()
+    allow_handoff = threading.Event()
+    original_checkout = db._checkout_read_conn
+    query_completed = threading.Event()
+
+    def blocked_checkout():
+        conn = original_checkout()
+        checked_out.set()
+        assert allow_handoff.wait(timeout=10), "test did not release checkout handoff"
+        return conn
+
+    monkeypatch.setattr(db, "_checkout_read_conn", blocked_checkout)
+
+    def reader():
+        with db._read_ctx() as conn:
+            conn.execute("SELECT 1").fetchone()
+            query_completed.set()
+
+    worker = threading.Thread(target=reader)
+    worker.start()
+    assert checked_out.wait(timeout=10)
+
+    close_returned = threading.Event()
+    closer = threading.Thread(target=lambda: (db.close(), close_returned.set()))
+    closer.start()
+    returned_before_handoff = close_returned.wait(timeout=2)
+    allow_handoff.set()
+    worker.join(timeout=10)
+    closer.join(timeout=10)
+
+    assert not worker.is_alive() and not closer.is_alive()
+    assert not returned_before_handoff, "close returned before an active checkout drained"
+    assert query_completed.is_set()
+    assert close_returned.is_set()
+    assert _live_count(db.db_path) == 0
+
+
 def test_reads_are_still_correct_under_concurrency(db):
     """Pooling must not corrupt results when threads share connections."""
     results = []
@@ -372,7 +446,7 @@ def test_close_returns_every_permit(db):
 
     held = [db._checkout_read_conn() for _ in range(_READ_POOL_MAX)]
     for c in held:
-        db._read_pool.put_nowait(c)
+        db._return_read_conn(c)
     assert db._read_pool.qsize() == _READ_POOL_MAX
 
     db.close()

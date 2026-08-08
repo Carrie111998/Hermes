@@ -4083,6 +4083,47 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_nofile_soft_limit() -> int | None:
+    """Resolve a safe absolute launchd maxfiles value.
+
+    launchd has no "at least" operator: ``NumberOfFiles`` replaces the
+    inherited soft limit.  Inspect the domain value and never emit a smaller
+    number.  If inheritance cannot be established, omit the plist override;
+    the gateway's early in-process helper still raises its own limit without
+    ever lowering it.
+    """
+    from hermes_cli.resource_limits import (
+        DEFAULT_NOFILE_SOFT_LIMIT,
+        configured_nofile_soft_limit,
+    )
+
+    target = configured_nofile_soft_limit()
+    if target is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["/bin/launchctl", "limit", "maxfiles"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        fields = result.stdout.split()
+        if len(fields) < 3 or fields[0] != "maxfiles":
+            return None
+        if fields[1].lower() == "unlimited":
+            return None
+        inherited_soft = int(fields[1])
+        if inherited_soft <= 0:
+            return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        logger.debug("Could not inspect launchd maxfiles inheritance", exc_info=True)
+        return None
+    return max(target, DEFAULT_NOFILE_SOFT_LIMIT, inherited_soft)
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     # Stable cwd anchor — never the volatile source checkout. See
@@ -4137,9 +4178,7 @@ def generate_launchd_plist() -> str:
     # applies as a second layer for non-launchd launches.
     nofile_block = ""
     try:
-        from hermes_cli.resource_limits import configured_nofile_soft_limit
-
-        nofile_target = configured_nofile_soft_limit()
+        nofile_target = _launchd_nofile_soft_limit()
     except Exception:
         nofile_target = None
     if nofile_target:
