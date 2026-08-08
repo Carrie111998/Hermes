@@ -1248,7 +1248,10 @@ def init_agent(
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()
             elif base_url_host_matches(effective_base, "chatgpt.com"):
                 from agent.auxiliary_client import _codex_cloudflare_headers
-                client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+                client_kwargs["default_headers"] = _codex_cloudflare_headers(
+                    api_key,
+                    model=getattr(agent, "model", None),
+                )
             elif base_url_host_matches(effective_base, "x.ai"):
                 from tools.xai_http import hermes_xai_default_headers
 

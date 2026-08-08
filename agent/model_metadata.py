@@ -2411,6 +2411,18 @@ def _fetch_codex_oauth_context_lengths_with_source(
 
     entries = data.get("models", []) if isinstance(data, dict) else []
     result: Dict[str, int] = {}
+    if isinstance(entries, list):
+        try:
+            from hermes_cli.codex_models import (
+                remember_codex_minimal_client_versions,
+                remember_local_codex_cli_version,
+            )
+
+            remember_codex_minimal_client_versions(entries)
+            if isinstance(data, dict):
+                remember_local_codex_cli_version(data.get("client_version"))
+        except Exception:
+            pass
     for item in entries:
         if not isinstance(item, dict):
             continue

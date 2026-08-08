@@ -1191,7 +1191,10 @@ _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
 _CODEX_AUX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
-def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
+def _codex_cloudflare_headers(
+    access_token: str,
+    model: Optional[str] = None,
+) -> Dict[str, str]:
     """Headers required to avoid Cloudflare 403s on chatgpt.com/backend-api/codex.
 
     The Cloudflare layer in front of the Codex endpoint whitelists a small set of
@@ -1201,17 +1204,29 @@ def _codex_cloudflare_headers(access_token: str) -> Dict[str, str]:
     a 403 with ``cf-mitigated: challenge`` regardless of auth correctness.
 
     We pin ``originator: codex_cli_rs`` to match the upstream codex-rs CLI, set
-    ``User-Agent`` to a codex_cli_rs-shaped string (beats SDK fingerprinting),
-    and extract ``ChatGPT-Account-ID`` (canonical casing, from codex-rs
-    ``auth.rs``) out of the OAuth JWT's ``chatgpt_account_id`` claim.
+    ``User-Agent`` / ``version`` from the selected model's catalog
+    ``minimal_client_version`` (falling back to other discovered mins, the local
+    Codex CLI cache version, then a known floor), and extract
+    ``ChatGPT-Account-ID`` (canonical casing, from codex-rs ``auth.rs``) out of
+    the OAuth JWT's ``chatgpt_account_id`` claim. Advertising a version below
+    the model's gate causes ChatGPT-account Codex to reject models such as
+    ``gpt-5.6-sol`` before inference.
 
     Malformed tokens are tolerated — we drop the account-ID header rather than
     raise, so a bad token still surfaces as an auth error (401) instead of a
     crash at client construction.
     """
+    from hermes_cli.codex_models import (
+        ensure_codex_minimal_client_versions,
+        resolve_codex_compat_client_version,
+    )
+
+    ensure_codex_minimal_client_versions(access_token)
+    compat_version = resolve_codex_compat_client_version(model)
     headers = {
-        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "User-Agent": f"codex_cli_rs/{compat_version} (Hermes Agent)",
         "originator": "codex_cli_rs",
+        "version": compat_version,
     }
     if not isinstance(access_token, str) or not access_token.strip():
         return headers
@@ -3678,7 +3693,7 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
     real_client = _create_openai_client(
         api_key=codex_token,
         base_url=base_url,
-        default_headers=_codex_cloudflare_headers(codex_token),
+        default_headers=_codex_cloudflare_headers(codex_token, model=model),
     )
     return CodexAuxiliaryClient(real_client, model), model
 
@@ -6316,7 +6331,7 @@ def resolve_provider_client(
             raw_client = _create_openai_client(
                 api_key=codex_token,
                 base_url=_CODEX_AUX_BASE_URL,
-                default_headers=_codex_cloudflare_headers(codex_token),
+                default_headers=_codex_cloudflare_headers(codex_token, model=model),
             )
             return (raw_client, final_model)
         # Standard path: wrap in CodexAuxiliaryClient adapter
