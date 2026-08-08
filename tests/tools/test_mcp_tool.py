@@ -1014,6 +1014,63 @@ class TestDiscoverAndRegister:
                         mcp_tool._servers.pop(key, None)
                         mcp_tool._server_connect_errors.pop(key, None)
 
+    def test_same_named_server_trust_gate_isolated_across_profiles(self, tmp_path):
+        import tools.mcp_tool as mcp_tool
+        from tools.registry import ToolRegistry
+
+        home_a = str((tmp_path / "profile-a").resolve())
+        home_b = str((tmp_path / "profile-b").resolve())
+        registry = ToolRegistry()
+        tool_name = "mcp__shared__write"
+
+        def server_for(home):
+            server = mcp_tool.MCPServerTask("shared", profile_home=home)
+            server._tools = [_make_mcp_tool("write", "write data")]
+            return server
+
+        with patch.dict(mcp_tool._server_trust_levels, {}, clear=True), patch.dict(
+            mcp_tool._tool_read_only_hints, {}, clear=True
+        ), patch.dict(mcp_tool._servers, {}, clear=True), patch.dict(
+            mcp_tool._lazy_server_configs, {}, clear=True
+        ), patch.dict(mcp_tool._server_error_counts, {}, clear=True), patch.dict(
+            mcp_tool._server_breaker_opened_at, {}, clear=True
+        ), patch("tools.registry.registry", registry), patch(
+            "tools.mcp_tool._track_mcp_tool_server"
+        ):
+            assert mcp_tool._register_server_tools(
+                "shared",
+                server_for(home_a),
+                {
+                    "trust": "full",
+                    "tools": {"resources": False, "prompts": False},
+                },
+            ) == [tool_name]
+            assert mcp_tool._register_server_tools(
+                "shared",
+                server_for(home_b),
+                {
+                    "trust": "untrusted",
+                    "tools": {"resources": False, "prompts": False},
+                },
+            ) == [tool_name]
+            handler_a = registry.get_entry(
+                tool_name, profile_home=home_a
+            ).handler
+            handler_b = registry.get_entry(
+                tool_name, profile_home=home_b
+            ).handler
+
+            with patch(
+                "tools.approval.request_elicitation_consent",
+                return_value="decline",
+            ) as consent:
+                result_a = json.loads(handler_a({}))
+                result_b = json.loads(handler_b({}))
+
+            assert "not connected" in result_a["error"]
+            assert "did not approve" in result_b["error"]
+            consent.assert_called_once()
+
 
     def test_same_server_normalization_collision_skips_all_ambiguous_tools(self, caplog):
         from tools.mcp_tool import _register_server_tools

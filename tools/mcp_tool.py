@@ -3913,8 +3913,8 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # Classification happens at CALL TIME from data captured at DISCOVERY —
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
-_server_trust_levels: Dict[str, str] = {}
-_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+_server_trust_levels: Dict[MCPServerKey, str] = _ProfileServerDict()
+_tool_read_only_hints: Dict[MCPServerKey, Dict[str, bool]] = _ProfileServerDict()
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -3960,31 +3960,40 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
 
 
 def _record_tool_trust_metadata(
-    server_name: str, config: dict, tools: List[Any]
+    server_name: str,
+    config: dict,
+    tools: List[Any],
+    profile_home: Optional[str] = None,
 ) -> None:
     """Capture per-server trust and per-tool readOnlyHint at discovery."""
+    server_key = _server_key(server_name, profile_home)
     with _lock:
-        _server_trust_levels[server_name] = _normalize_server_trust(
+        _server_trust_levels[server_key] = _normalize_server_trust(
             (config or {}).get("trust")
         )
-        hints = _tool_read_only_hints.setdefault(server_name, {})
+        hints = _tool_read_only_hints.setdefault(server_key, {})
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
                 hints[name] = _annotation_read_only_hint(tool)
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+def _trust_gate_check(
+    server_name: str,
+    tool_name: str,
+    profile_home: Optional[str] = None,
+) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
 
     Returns None when the call may proceed, or an error string (already
     formatted via ``tool_error``) when the call is blocked. Fail-closed:
     approval-system errors block the call.
     """
-    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    server_key = _server_key(server_name, profile_home)
+    trust = _server_trust_levels.get(server_key, _TRUST_FULL)
     if trust != _TRUST_UNTRUSTED:
         return None
-    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+    if _tool_read_only_hints.get(server_key, {}).get(tool_name) is True:
         return None
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
@@ -5351,7 +5360,11 @@ def _make_tool_handler(
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
         # first-use spawn below. A denied call never touches the server.
-        gate_error = _trust_gate_check(server_name, tool_name)
+        gate_error = _trust_gate_check(
+            server_name,
+            tool_name,
+            profile_home=profile_home,
+        )
         if gate_error is not None:
             return gate_error
 
@@ -6382,7 +6395,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     # configured trust tier and each tool's readOnlyHint annotation NOW,
     # at discovery, so the call-time gate in _make_tool_handler classifies
     # from data we control rather than re-reading server-supplied state.
-    _record_tool_trust_metadata(name, config, server._tools)
+    _record_tool_trust_metadata(name, config, server._tools, profile_home)
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
@@ -6631,7 +6644,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         for raw in tools_from_cache_entry(entry)
         if isinstance(raw, dict) and raw.get("name")
     ]
-    _record_tool_trust_metadata(name, config, cached_tool_objs)
+    _record_tool_trust_metadata(name, config, cached_tool_objs, profile_home)
     for raw in tools_from_cache_entry(entry):
         if not isinstance(raw, dict):
             continue
