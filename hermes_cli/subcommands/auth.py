@@ -66,6 +66,20 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "status", help="Show auth status for a provider"
     )
     auth_status.add_argument("provider", help="Provider id")
+    auth_usage = auth_subparsers.add_parser(
+        "usage",
+        help=(
+            "Show live account usage (Codex / Anthropic / OpenRouter) for a "
+            "provider, fetched outside an interactive session"
+        ),
+    )
+    auth_usage.add_argument(
+        "provider",
+        help=(
+            "Provider id with a live usage endpoint "
+            "(openai-codex, anthropic, openrouter)"
+        ),
+    )
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state"
     )

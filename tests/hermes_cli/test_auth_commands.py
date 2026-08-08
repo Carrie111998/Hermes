@@ -769,3 +769,231 @@ def test_auth_remove_copilot_suppresses_all_variants(tmp_path, monkeypatch):
     assert is_source_suppressed("copilot", "env:GITHUB_TOKEN")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# `hermes auth usage <provider>` — standalone live account-usage fetch
+# ──────────────────────────────────────────────────────────────────────────
+#
+# These tests cover the no-agent CLI entry point that the REPL ``/usage``
+# slash used to own. The fetch helpers (``fetch_account_usage``,
+# ``render_account_usage_lines``) live in ``agent.account_usage`` and are
+# already covered there; here we only verify the command-shape behavior:
+#   * rejects an empty / unsupported provider cleanly,
+#   * fails fast when the provider has no usable credential,
+#   * prints the rendered snapshot for a happy-path fetch,
+#   * exits non-zero (and never with a stacktrace) on a slow fetch timeout.
+
+import concurrent.futures
+from types import SimpleNamespace
+
+from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+
+def test_auth_usage_rejects_missing_provider(capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(SimpleNamespace(provider=""))
+    # argparse already rejects ``hermes auth usage`` (no provider) at the
+    # parser level; this guard is the "empty string" fallback for direct
+    # programmatic callers. ``SystemExit(str)`` stores the message on
+    # ``.code`` — exit code is implicitly 1 when the message is a string.
+    assert "Provider is required" in str(exc_info.value)
+    assert exc_info.value.code != 0  # non-zero → scriptable from cron/loops
+
+
+def test_auth_usage_rejects_unsupported_provider(capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(SimpleNamespace(provider="spotify"))
+    msg = str(exc_info.value)
+    assert "not supported" in msg
+    # The error must list the SUPPORTED set so a typo self-corrects on retry
+    # rather than the user having to read the docs to find the right id.
+    assert "openai-codex" in msg
+    assert "anthropic" in msg
+    assert "openrouter" in msg
+
+
+def test_auth_usage_requires_logged_in_credential(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    # ``get_auth_status`` is the same probe ``hermes auth status`` uses; patch
+    # it to simulate "provider is supported but not logged in" so the command
+    # fails fast with the auth-add hint instead of timing out on the API.
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": False, "error": "no creds"},
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(SimpleNamespace(provider="openai-codex"))
+    assert "not logged in" in str(exc_info.value)
+    assert "hermes auth add openai-codex" in str(exc_info.value)
+
+
+def test_auth_usage_renders_snapshot_on_success(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+
+    # Build a deterministic snapshot so the assertion is value-driven, not
+    # snapshot-of-a-snapshot. ``available`` must be True for the command to
+    # proceed past the unavailable-guard and reach the render branch.
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        plan="Pro",
+        windows=(
+            AccountUsageWindow(
+                label="Session",
+                used_percent=42.0,
+                reset_at=datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc),
+            ),
+        ),
+        details=("You have 2 resets banked - use /usage reset to activate",),
+    )
+
+    # The command goes through a ThreadPoolExecutor + ``fetch_account_usage``;
+    # short-circuit the executor by replacing ``submit`` so the snapshot is
+    # returned synchronously without touching the network.
+    class _ImmediateFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self, timeout=None):
+            return self._value
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return _ImmediateFuture(fn(*args, **kwargs))
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+    # Patch at the import path the lazy import resolves to.
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(_account_usage, "fetch_account_usage", lambda *a, **kw: snapshot)
+
+    auth_usage_command(SimpleNamespace(provider="openai-codex"))
+
+    out = capsys.readouterr().out
+    # The renderer (``render_account_usage_lines``) is the source of truth;
+    # assert on its surface, not the literal byte sequence, so a renderer
+    # tweak doesn't silently break this test.
+    assert "Account limits" in out
+    assert "Session" in out
+    assert "openai-codex" in out
+    assert "Pro" in out
+    assert "resets banked" in out
+
+
+def test_auth_usage_times_out_cleanly(monkeypatch, capsys):
+    from hermes_cli.auth_commands import (
+        _ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS,
+        auth_usage_command,
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+
+    class _HangingFuture:
+        def result(self, timeout=None):
+            # Mirror concurrent.futures' exact behavior on a hard timeout so
+            # the command's own except-branch (not a generic Exception
+            # fallback) handles it. Using TimeoutError makes that explicit.
+            raise concurrent.futures.TimeoutError()
+
+    class _HangingPool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return _HangingFuture()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _HangingPool
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(SimpleNamespace(provider="openai-codex"))
+    msg = str(exc_info.value)
+    # The timeout must surface a short actionable line, not a stacktrace, and
+    # the message must include the budget so the user can correlate it with
+    # the known REPL ``/usage`` 10s cap.
+    assert "timed out" in msg
+    assert f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s" in msg
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_auth_usage_reports_unavailable_snapshot(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+
+    # ``fetch_account_usage`` returns a snapshot with ``unavailable_reason``
+    # when the endpoint is reachable but the payload is in a shape we can't
+    # render (e.g. a future Codex payload change). The command must surface
+    # that reason, not "usage is not available right now."
+    snapshot = AccountUsageSnapshot(
+        provider="openai-codex",
+        source="usage_api",
+        fetched_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        unavailable_reason="unexpected response shape",
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_command(SimpleNamespace(provider="openai-codex"))
+    assert "unexpected response shape" in str(exc_info.value)
+
+

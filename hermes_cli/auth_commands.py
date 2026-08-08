@@ -526,6 +526,114 @@ def auth_status_command(args) -> None:
             print(f"  {key}: {value}")
 
 
+# Providers whose backend exposes a live account-usage endpoint. Mirrors
+# ``agent.account_usage.fetch_account_usage``'s dispatch (openai-codex,
+# anthropic, openrouter) so ``hermes auth usage`` reports a clear "not
+# supported" message for providers without a quota API instead of silently
+# printing an empty block. Extend the set in lockstep with the dispatch table.
+_ACCOUNT_USAGE_PROVIDERS = frozenset({"openai-codex", "anthropic", "openrouter"})
+
+# Hard wall-clock cap on the live usage fetch. The provider APIs are the same
+# ones the REPL ``/usage`` slash hits, and a stuck worker there is a known
+# regression; a slow upstream must not hang the terminal either. Matches the
+# 10s budget the in-REPL ``/usage`` uses for the same fetch.
+_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS = 10.0
+
+
+def auth_usage_command(args) -> None:
+    """``hermes auth usage <provider>`` — show live account usage from the CLI.
+
+    A standalone, no-agent entry point for the same Codex / Anthropic /
+    OpenRouter account-usage view the REPL ``/usage`` slash renders. Lets a
+    user check the active account's rate-limit windows, plan, and banked
+    reset credits without first launching an interactive session.
+
+    Credential resolution is delegated to ``agent.account_usage`` (singleton
+    tokens → pool fallback), so this command reads whatever credential the
+    runtime resolver would have picked for an actual chat call — no separate
+    "which account?" prompt, no caller-supplied bearer token to misforward.
+
+    Multi-account scope is the same as the REPL view: one snapshot per
+    invocation, taken from the account the resolver selects. A per-pool-entry
+    iteration is intentionally out of scope here; the multi-account PR #80015
+    family keeps "aggregate / selector" for a follow-up.
+
+    Failures (timeout, no creds, provider offline, 4xx/5xx) print a short,
+    actionable message and exit non-zero instead of dumping a stacktrace, so
+    the command stays scriptable from cron / shell loops.
+    """
+    provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if not provider:
+        raise SystemExit(
+            "Provider is required. Example: `hermes auth usage openai-codex`."
+        )
+    if provider not in _ACCOUNT_USAGE_PROVIDERS:
+        # Surface the SUPPORTED set, not just the requested one, so a typo
+        # like ``hermes auth usage gpt-5`` self-corrects on the first try.
+        supported = ", ".join(sorted(_ACCOUNT_USAGE_PROVIDERS))
+        raise SystemExit(
+            f"{provider}: account usage is not supported. "
+            f"Supported providers: {supported}."
+        )
+
+    # Pool-aware prerequisite check: the provider can be in the supported set
+    # without the user having a usable credential for it. Fail fast with a
+    # hint pointing at ``hermes auth add`` rather than timing out on the
+    # provider API with a 401. ``auth_mod.get_auth_status`` is the same
+    # "logged in?" probe ``hermes auth status`` uses.
+    if not auth_mod.get_auth_status(provider).get("logged_in"):
+        raise SystemExit(
+            f"{provider}: not logged in. Run `hermes auth add {provider}` "
+            "or `hermes auth login`, then try again."
+        )
+
+    # Lazy import — ``fetch_account_usage`` pulls the OpenAI SDK chain, only
+    # needed here. Off-thread with a hard timeout so a slow / hung provider
+    # API cannot stall the terminal (mirrors the REPL ``/usage`` discipline).
+    import concurrent.futures
+
+    from agent.account_usage import (
+        fetch_account_usage,
+        render_account_usage_lines,
+    )
+
+    print(f"Fetching {provider} account usage…")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            snapshot = pool.submit(
+                fetch_account_usage, provider, base_url=None, api_key=None
+            ).result(timeout=_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            raise SystemExit(
+                f"{provider}: timed out after "
+                f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s waiting on the "
+                "usage endpoint. Try again, or check your network."
+            )
+        except Exception as exc:
+            # Fail loud (non-zero, short message) but never a stacktrace — the
+            # user wants an actionable line, not a Python traceback in chat.
+            raise SystemExit(f"{provider}: usage fetch failed — {exc}")
+
+    if snapshot is None or not snapshot.available:
+        # ``fetch_account_usage`` returns None for unsupported providers and a
+        # snapshot with ``unavailable_reason`` set for "endpoint reachable but
+        # not in a shape we can render" (e.g. a future Codex payload change).
+        reason = getattr(snapshot, "unavailable_reason", None) if snapshot else None
+        if reason:
+            raise SystemExit(f"{provider}: usage unavailable — {reason}")
+        raise SystemExit(
+            f"{provider}: usage is not available right now. "
+            "The provider may be offline or the account may be rate-limited; "
+            "try `hermes auth status` and retry shortly."
+        )
+
+    # Mirror the REPL / TUI render path verbatim so the terminal output and
+    # the slash command look the same (same headers, same reset phrasing,
+    # same plan row). One source of truth: ``render_account_usage_lines``.
+    for line in render_account_usage_lines(snapshot):
+        print(line)
+
+
 def auth_logout_command(args) -> None:
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
 
@@ -791,6 +899,9 @@ def auth_command(args) -> None:
         return
     if action == "status":
         auth_status_command(args)
+        return
+    if action == "usage":
+        auth_usage_command(args)
         return
     if action == "logout":
         auth_logout_command(args)
