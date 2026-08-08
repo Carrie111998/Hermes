@@ -903,11 +903,22 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
-                return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            sample = content_sample[:1000]
+            # One exception to the U+FFFD rule: read_file samples with
+            # `head -c 1000`, which truncates at a byte boundary. When that
+            # boundary splits a multi-byte UTF-8 character, the dangling
+            # continuation bytes decode to exactly one *trailing* U+FFFD —
+            # a sampling artifact, not evidence of binary content. Genuine
+            # binary data yields many scattered replacement chars (well above
+            # the non-printable ratio below too), so a lone trailing U+FFFD
+            # is treated as text, not binary. (#81480)
+            if "\ufffd" in sample:
+                if sample.count("\ufffd") > 1 or not sample.endswith("\ufffd"):
+                    return True
+                return False
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     

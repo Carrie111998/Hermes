@@ -51,6 +51,31 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    def test_single_trailing_replacement_is_sampling_artifact(self, ops):
+        """A lone trailing U+FFFD is a `head -c 1000` truncation artifact.
+
+        When the 1000-byte sample boundary splits a multi-byte UTF-8 char,
+        the terminal's errors=replace decode emits exactly one trailing
+        U+FFFD. That is not binary content and must not block reading a
+        valid UTF-8 text file (regression for #81480).
+        """
+        sample = "# Instru\u00e7\u00f5es de review \u2014 valida\u00e7\u00e3o\n" * 60 + "\ufffd"
+        assert sample.endswith("\ufffd")
+        assert sample.count("\ufffd") == 1
+        assert ops._is_likely_binary("notes.md", content_sample=sample) is False
+
+    def test_multiple_scattered_replacements_are_binary(self, ops):
+        """Genuine binary data produces many scattered U+FFFD chars."""
+        # Random non-UTF-8 bytes decoded with errors=replace
+        sample = "\ufffd" * 40 + "abc" * 100 + "\ufffd" * 40
+        assert ops._is_likely_binary("data.bin", content_sample=sample) is True
+
+    def test_trailing_replacement_with_other_garbage_is_binary(self, ops):
+        """A trailing U+FFFD plus any other replacement char is binary."""
+        sample = "text" + "\ufffd" + "more" + "\ufffd"
+        assert sample.count("\ufffd") == 2
+        assert ops._is_likely_binary("f.xyz", content_sample=sample) is True
+
 
 # =========================================================================
 # _check_lint edge cases
