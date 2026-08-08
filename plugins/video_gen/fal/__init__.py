@@ -155,6 +155,8 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "durations": (4, 15),
         "audio": True,
         "negative": False,
+        # FAL input schema has no `seed` (only returned on output).
+        "seed": False,
     },
     "seedance-2.5": {
         "display": "Seedance 2.5",
@@ -337,34 +339,59 @@ def _load_video_gen_section() -> Dict[str, Any]:
         return {}
 
 
+_ENDPOINT_MODALITY_LEAVES = frozenset({"text-to-video", "image-to-video"})
+
+
 def _normalize_family_key(c: str) -> Optional[str]:
     """Try to extract a known family ID from a model string.
 
     Handles bare IDs (``seedance-2.5``), full endpoint paths
-    (``bytedance/seedance-2.5/text-to-video``), and provider-prefixed
+    (``bytedance/seedance-2.5/text-to-video``), truncated endpoint stems
+    (``minimax/h3``, ``bytedance/seedance-2.0/mini``), and provider-prefixed
     names (``bytedance/seedance-2.5``).
     """
     c = c.strip()
+    if not c:
+        return None
     if c in FAL_FAMILIES:
         return c
-    # A declared endpoint is unambiguous, so it wins over the segment scan
-    # below — which would otherwise see the "seedance-2.0" segment inside
-    # ".../seedance-2.0/mini/..." and route the cheap Mini tier to the
-    # full-price family, and which misses ids that aren't a path segment
-    # at all ("minimax-h3" in "minimax/h3/...").
+
+    # Exact declared endpoint — unambiguous, and beats any segment scan
+    # that would otherwise see "seedance-2.0" inside ".../seedance-2.0/mini/...".
     for fid, meta in FAL_FAMILIES.items():
         if c in (meta.get("text_endpoint"), meta.get("image_endpoint")):
             return fid
-    # Try matching the first path segment(s) against family IDs.
-    parts = c.split("/")
+
+    # Truncated stem of a declared endpoint: "minimax/h3" or
+    # "bytedance/seedance-2.0/mini". The next path segment after ``c`` must
+    # be a modality leaf so "bytedance/seedance-2.0" does not also match the
+    # Mini family's deeper ".../seedance-2.0/mini/text-to-video" path.
+    stem_hits: List[Tuple[int, str]] = []
+    for fid, meta in FAL_FAMILIES.items():
+        for endpoint in (meta.get("text_endpoint"), meta.get("image_endpoint")):
+            if not isinstance(endpoint, str):
+                continue
+            if not endpoint.startswith(c + "/"):
+                continue
+            first = endpoint[len(c) + 1:].split("/", 1)[0]
+            if first in _ENDPOINT_MODALITY_LEAVES:
+                stem_hits.append((len(c), fid))
+                break
+    if stem_hits:
+        stem_hits.sort(key=lambda item: item[0], reverse=True)
+        return stem_hits[0][1]
+
+    # Longest family-id path-segment match ("bytedance/seedance-2.5" →
+    # seedance-2.5; prefers seedance-2.0-mini over seedance-2.0 when both
+    # somehow appear).
+    parts = set(c.split("/"))
+    best_fid: Optional[str] = None
+    best_len = -1
     for fid in FAL_FAMILIES:
-        if c == fid or parts[-1] == fid or (len(parts) >= 2 and parts[-2] == fid):
-            return fid
-        # Handle "bytedance/seedance-2.5/text-to-video" → "seedance-2.5"
-        for p in parts:
-            if p == fid:
-                return fid
-    return None
+        if fid in parts and len(fid) > best_len:
+            best_fid = fid
+            best_len = len(fid)
+    return best_fid
 
 
 def _resolve_family(explicit: Optional[str]) -> Tuple[str, Dict[str, Any]]:
@@ -613,7 +640,7 @@ class FALVideoGenProvider(VideoGenProvider):
                 modalities.append("text")
             if meta.get("image_endpoint"):
                 modalities.append("image")
-            out.append({
+            entry: Dict[str, Any] = {
                 "id": fid,
                 "display": meta["display"],
                 "speed": meta["speed"],
@@ -621,7 +648,15 @@ class FALVideoGenProvider(VideoGenProvider):
                 "price": meta["price"],
                 "tier": meta.get("tier", "premium"),
                 "modalities": modalities,
-            })
+            }
+            durs = meta.get("durations")
+            if durs:
+                if _is_duration_range(durs):
+                    entry["min_duration"], entry["max_duration"] = durs
+                else:
+                    entry["min_duration"] = min(durs)
+                    entry["max_duration"] = max(durs)
+            out.append(entry)
         return out
 
     def default_model(self) -> Optional[str]:
@@ -642,12 +677,26 @@ class FALVideoGenProvider(VideoGenProvider):
         }
 
     def capabilities(self) -> Dict[str, Any]:
+        # Union across families so the tool schema doesn't understate the
+        # longest-running models (Seedance 2.5 = 30s, FLUX 3 = 20s).
+        max_dur = 1
+        min_dur: Optional[int] = None
+        for meta in FAL_FAMILIES.values():
+            durs = meta.get("durations")
+            if not durs:
+                continue
+            if _is_duration_range(durs):
+                lo, hi = durs
+            else:
+                lo, hi = min(durs), max(durs)
+            max_dur = max(max_dur, hi)
+            min_dur = lo if min_dur is None else min(min_dur, lo)
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": ["16:9", "9:16", "1:1"],
             "resolutions": ["360p", "540p", "720p", "1080p"],
-            "max_duration": 15,
-            "min_duration": 1,
+            "max_duration": max_dur,
+            "min_duration": min_dur if min_dur is not None else 1,
             "supports_audio": True,
             "supports_negative_prompt": True,
             "max_reference_images": 0,

@@ -149,6 +149,13 @@ class TestAugust2026Catalog:
         assert "resolution" not in p
         assert p["aspect_ratio"] == "1:1"
 
+    def test_seedream_lite_uses_documented_size_presets(self, image_tool):
+        """Lite accepts FAL's preset enum; custom ImageSize dicts are unnecessary."""
+        p = image_tool._build_fal_payload(
+            "bytedance/seedream/v5/lite/text-to-image", "hello", "landscape"
+        )
+        assert p["image_size"] == "landscape_16_9"
+
 
 # ---------------------------------------------------------------------------
 # Payload building — three size families

@@ -254,6 +254,25 @@ class TestFamilyKeyNormalization:
         assert _normalize_family_key("  pixverse-v6  ") == "pixverse-v6"
         assert _normalize_family_key("nonsense/thing") is None
 
+    def test_truncated_endpoint_stems_resolve(self):
+        """Config often stores the FAL app path without the modality leaf."""
+        from plugins.video_gen.fal import _normalize_family_key
+
+        assert _normalize_family_key("bytedance/seedance-2.0/mini") == "seedance-2.0-mini"
+        assert _normalize_family_key("bytedance/seedance-2.0") == "seedance-2.0"
+        assert _normalize_family_key("minimax/h3") == "minimax-h3"
+        assert _normalize_family_key("xai/grok-imagine-video/v1.5") == "grok-imagine-1.5"
+        assert _normalize_family_key("google/gemini-omni-flash") == "gemini-omni-flash"
+        assert _normalize_family_key("blackforestlabs/flux-3") == "flux-3"
+
+    def test_capabilities_span_longest_family_duration(self):
+        """Provider caps must not understate Seedance 2.5's 30s ceiling."""
+        from plugins.video_gen.fal import FALVideoGenProvider
+
+        caps = FALVideoGenProvider().capabilities()
+        assert caps["max_duration"] >= 30
+        assert caps["min_duration"] <= 1
+
 
 class TestPayloadBuilder:
     def test_drops_unsupported_keys(self):
@@ -300,6 +319,7 @@ class TestPayloadBuilder:
     @pytest.mark.parametrize(
         "family_id",
         [
+            "seedance-2.0",
             "seedance-2.0-mini",
             "seedance-2.5",
             "minimax-h3",
