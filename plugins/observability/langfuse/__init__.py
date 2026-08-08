@@ -699,7 +699,8 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     level: Optional[str] = None, status_message: Optional[str] = None) -> None:
     if observation is None:
         return
     try:
@@ -712,6 +713,10 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
+        if level is not None:
+            update_kwargs["level"] = level
+        if status_message is not None:
+            update_kwargs["status_message"] = status_message
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
@@ -768,13 +773,29 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         return
 
     try:
+        # Anything still here never received its post_api_request/post_tool_call
+        # completion (both pop their entry on a normal finish) — the turn ended
+        # (retries exhausted, exception, disconnect) without a recorded response
+        # for this call. Mark it accordingly instead of closing it silently.
         for observation in state.generations.values():
-            _end_observation(observation)
+            _end_observation(
+                observation,
+                level="ERROR",
+                status_message="Turn ended without a recorded response for this call.",
+            )
         for observation in state.tools.values():
-            _end_observation(observation)
+            _end_observation(
+                observation,
+                level="ERROR",
+                status_message="Turn ended before this tool call's result was recorded.",
+            )
         for queue in state.pending_tools_by_name.values():
             for observation in queue:
-                _end_observation(observation)
+                _end_observation(
+                    observation,
+                    level="ERROR",
+                    status_message="Turn ended before this tool call's result was recorded.",
+                )
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
             state.root_span.set_trace_io(output=final_output)
@@ -915,7 +936,11 @@ def on_pre_llm_request(
         state.last_updated_at = time.time()
         previous = state.generations.pop(req_key, None)
         if previous is not None:
-            _end_observation(previous)
+            _end_observation(
+                previous,
+                level="WARNING",
+                status_message="Retried: no response was recorded for this attempt before the next attempt started.",
+            )
         state.generations[req_key] = _start_child_observation(
             state,
             client=client,
