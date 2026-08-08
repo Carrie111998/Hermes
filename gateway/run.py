@@ -1624,10 +1624,12 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+        tool_name = tool_name_by_call_id.get(call_id) or str(
+            msg.get("tool_name") or msg.get("name") or ""
+        )
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
             continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.
@@ -19655,7 +19657,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "reply_to": reply_anchor,
                     "metadata": thread_meta,
                 }
-                await adapter.send_voice(**send_kwargs)
+                send_result = await adapter.send_voice(**send_kwargs)
+                if send_result is not None and not getattr(send_result, "success", True):
+                    logger.warning(
+                        "Auto voice reply delivery failed: %s",
+                        getattr(send_result, "error", "send returned success=False"),
+                    )
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
@@ -21949,23 +21956,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"{unavailable_note}\n\n{user_text}", []
             return unavailable_note, []
 
+        async def _transcribe_with_local_fallback(path: str):
+            result = await asyncio.to_thread(transcribe_audio, path)
+            if not result.get("success"):
+                fallback = await asyncio.to_thread(
+                    transcribe_audio_local_fallback,
+                    path,
+                )
+                if fallback.get("success"):
+                    logger.info(
+                        "Configured STT failed for %s; recovered with local STT",
+                        path,
+                    )
+                    result = fallback
+            return result
+
         enriched_parts = []
         successful_transcripts: List[str] = []
+        stt_timeout_seconds = getattr(self.config, "stt_timeout_seconds", 45.0)
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
-                if not result.get("success"):
-                    fallback = await asyncio.to_thread(
-                        transcribe_audio_local_fallback,
-                        path,
-                    )
-                    if fallback.get("success"):
-                        logger.info(
-                            "Configured STT failed for %s; recovered with local STT",
-                            path,
-                        )
-                        result = fallback
+                result = await asyncio.wait_for(
+                    _transcribe_with_local_fallback(path),
+                    timeout=stt_timeout_seconds,
+                )
                 if result["success"]:
                     transcript = result["transcript"]
                     # Speech-to-text can return success=True with an empty or
@@ -21980,6 +21995,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "words. Do not guess at the content; ask the user "
                             "to resend or type it out.]"
                         )
+
                         continue
                     successful_transcripts.append(transcript)
                     # Pass the transcript through as a plain quoted line. The
@@ -22007,6 +22023,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "[voice message could not be transcribed automatically; "
                         f"the audio is available at: {agent_path}]"
                     )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Voice transcription timed out after %.1fs for %s; continuing fail-open",
+                    stt_timeout_seconds,
+                    path,
+                )
+                from tools.credential_files import to_agent_visible_cache_path
+
+                agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+                enriched_parts.append(
+                    "[voice message could not be transcribed automatically; "
+                    f"the audio is available at: {agent_path}]"
+                )
             except Exception as e:
                 logger.error("Transcription error: %s", e)
                 from tools.credential_files import to_agent_visible_cache_path

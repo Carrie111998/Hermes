@@ -177,6 +177,42 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
 
 
+@pytest.mark.asyncio
+async def test_auto_voice_reply_logs_unsuccessful_send_result(tmp_path, monkeypatch, caplog):
+    """A failed auto voice-reply delivery must be logged, not silently ignored."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    from types import SimpleNamespace as _SimpleNamespace
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def _fake_text_to_speech_tool(*, text, output_path, **_kwargs):
+        _os.makedirs(_os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as fh:
+            fh.write(b"\x00" * 32)
+        return _json.dumps({"success": True, "file_path": output_path})
+
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", _fake_text_to_speech_tool)
+    monkeypatch.setattr("tools.tts_tool._strip_markdown_for_tts", lambda text: text)
+
+    runner = object.__new__(GatewayRunner)
+    adapter = _SimpleNamespace(
+        send_voice=AsyncMock(
+            return_value=SendResult(success=False, error="chat unavailable")
+        ),
+        is_in_voice_channel=lambda *_a, **_k: False,
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    event = _event()
+
+    with caplog.at_level("WARNING"):
+        await runner._send_voice_reply(event, "Hello there.")
+
+    assert "Auto voice reply delivery failed" in caplog.text
+    assert "chat unavailable" in caplog.text
+
+
 class _DiscordMediaFailureAdapter(BasePlatformAdapter):
     """Minimal adapter to exercise non-streaming MEDIA failure notification."""
 
