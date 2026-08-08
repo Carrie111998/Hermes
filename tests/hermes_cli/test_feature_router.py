@@ -14,9 +14,9 @@ from pathlib import Path
 import pytest
 
 from agent.feature_registry import (
-    KNOWN_CAPABILITIES,
     Feature,
     FeatureRegistry,
+    resolve_known_capabilities,
 )
 from agent.feature_router import FeatureRouter
 
@@ -30,8 +30,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 def test_registry_seed_features_have_known_capabilities():
     reg = FeatureRegistry()
     assert reg.features
+    known = resolve_known_capabilities()
     for f in reg.features:
-        assert f.suggested_capability in KNOWN_CAPABILITIES
+        assert f.suggested_capability in known
+
+
+def test_slash_capabilities_resolved_at_runtime():
+    """Slash-command capabilities must come from the LIVE command registry.
+
+    Regression (review #81582): `/whats-new` used to be hand-maintained in a
+    static whitelist, so the router could suggest a command the installed
+    product did not have (it only existed in the unmerged companion PR).
+    Resolution is now dynamic: a command that exists on disk is suggested,
+    one that does not (simulated here with a fake registry) is dropped.
+    """
+    known = resolve_known_capabilities()
+    # /model and /retry are real commands in the product's command registry.
+    assert "/model" in known
+    assert "/retry" in known
+    # A command that only exists in an unmerged companion PR is NOT known.
+    assert "/whats-new" not in known
+
+
+def test_registry_drops_unavailable_slash_command(monkeypatch):
+    """A seed referencing a not-yet-landed command is dropped at init.
+
+    When the companion PR that ships `/whats-new` merges, the runtime
+    registry will contain it and the release_brief feature re-enables
+    automatically — no manual whitelist edit either way.
+    """
+    from hermes_cli import commands as commands_module
+
+    fake_registry = [
+        commands_module.CommandDef("model", "fake model cmd", "Session"),
+    ]
+    monkeypatch.setattr(commands_module, "COMMAND_REGISTRY", fake_registry)
+
+    reg = FeatureRegistry()
+    ids = {f.id for f in reg.features}
+    # release_brief references /whats-new which is NOT in the fake registry.
+    assert "release_brief" not in ids
+    # Other tool-backed features survive.
+    assert "parallel_subtasks" in ids
+
+
+def test_registry_keeps_available_slash_command(monkeypatch):
+    """A seed referencing a landed command is kept and suggestible."""
+    from hermes_cli import commands as commands_module
+
+    fake_registry = [
+        commands_module.CommandDef("whats-new", "fake", "Session"),
+    ]
+    monkeypatch.setattr(commands_module, "COMMAND_REGISTRY", fake_registry)
+
+    reg = FeatureRegistry()
+    ids = {f.id for f in reg.features}
+    assert "release_brief" in ids
+    f = reg.suggest("what's new in this release")
+    assert f is not None
+    assert f.id == "release_brief"
 
 
 @pytest.mark.parametrize(

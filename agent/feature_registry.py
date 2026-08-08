@@ -103,13 +103,12 @@ def compile_features(features: List[Feature]) -> List[Feature]:
 # The registry.  Every entry references EXISTING capabilities.
 # ---------------------------------------------------------------------------
 
-# Whitelist of capability names the router may suggest.  Anything else is
-# dropped at init (defense: a registry entry can't name a tool that doesn't
-# exist, and can't be repointed at something dangerous).
-KNOWN_CAPABILITIES = frozenset({
+# Core model-tool names the router may suggest.  These mirror the narrow
+# waist of the agent toolset and are static: every one is a first-party
+# model tool shipped by the agent core.
+TOOL_CAPABILITIES = frozenset({
     "delegate_task",        # parallel subagents
     "cronjob",              # scheduled jobs
-    "/whats-new",           # release briefs (PR-A)
     "web_search",           # web research
     "browser_navigate",     # browser automation
     "terminal",             # shell
@@ -119,6 +118,38 @@ KNOWN_CAPABILITIES = frozenset({
     "moa",                  # mixture of agents
     "computer_use",         # desktop control
 })
+
+
+def resolve_known_capabilities() -> frozenset[str]:
+    """Return the capability names the router may suggest.
+
+    Tools come from the static ``TOOL_CAPABILITIES`` set; slash commands are
+    resolved **at runtime** from the live command registry so a registry
+    entry can only suggest a command the installed product actually ships.
+    A command that exists only in an unmerged companion PR is automatically
+    dropped until it lands (review #81582: ``/whats-new`` gated on #81580),
+    and a command removed from the product stops being suggested without a
+    manual whitelist edit.  The resolution is defensive: if the command
+    module cannot be imported, we fall back to tools-only rather than
+    raising (a broken registry must never break a turn).
+    """
+    names = set(TOOL_CAPABILITIES)
+    try:
+        from hermes_cli import commands as _commands_module
+
+        # Read the registry attribute at call time (not import time) so
+        # monkeypatched registries in tests and future dynamic registries
+        # take effect without a reload.
+        for cmd in getattr(_commands_module, "COMMAND_REGISTRY", ()):
+            names.add(f"/{cmd.name}")
+            for alias in cmd.aliases:
+                names.add(f"/{alias}")
+    except Exception as e:  # noqa: BLE001 — defensive fallback
+        logger.debug(
+            "feature registry: could not resolve slash commands "
+            "(falling back to tools only): %s", e,
+        )
+    return frozenset(names)
 
 
 def _seed_features() -> List[Feature]:
@@ -218,10 +249,15 @@ class FeatureRegistry:
 
     def __init__(self, features: Optional[List[Feature]] = None):
         raw = features if features is not None else _seed_features()
-        # Whitelist guard: drop any entry naming an unknown capability.
+        # Capability guard: drop any entry naming a capability that does not
+        # exist in the INSTALLED product.  Tools are a static set; slash
+        # commands are resolved at runtime from the live command registry,
+        # so a seed naming a command from an unmerged companion PR is
+        # dropped until that PR lands (and re-enabled automatically after).
+        known = resolve_known_capabilities()
         kept: List[Feature] = []
         for f in raw:
-            if f.suggested_capability and f.suggested_capability not in KNOWN_CAPABILITIES:
+            if f.suggested_capability and f.suggested_capability not in known:
                 logger.warning(
                     "feature %s references unknown capability %r — dropped",
                     f.id, f.suggested_capability,
