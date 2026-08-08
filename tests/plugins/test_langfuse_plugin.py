@@ -1538,3 +1538,54 @@ class TestMoAReferenceGenerations:
             mod._emit_moa_reference_generations(state, client=object(), references=value)
 
         assert gens == []
+
+class TestAtexitFinalization(TestTurnTraceIsolation):
+    """Short-lived processes (kanban workers, `hermes chat -q`, cron) can exit
+    with tool calls still queued — the root span never ends and the backend
+    shows an anonymous trace (no name/session/metadata). _finalize_all_traces
+    (registered atexit after client construction) must end every open root."""
+
+    def test_finalize_all_ends_open_roots_and_clears_state(self, monkeypatch):
+        mod = self._fresh_plugin()
+        started: list = []
+        ended: list = []
+        client = self._fake_client(started)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(
+            mod, "_end_observation", lambda obs, **k: ended.append(obs)
+        )
+        mod._TRACE_STATE.clear()
+
+        # Three worker-style turns that never finalize (tool calls pending).
+        for n in range(3):
+            self._run_turn(mod, session=f"worker-{n}", turn_n=0, finalize=False)
+        assert len(mod._TRACE_STATE) == 3
+
+        root_ends: list = []
+        for state in mod._TRACE_STATE.values():
+            real_end = state.root_span.end
+            state.root_span.end = lambda *a, _r=real_end, **k: root_ends.append(1)
+
+        mod._finalize_all_traces()
+
+        assert len(root_ends) == 3, "every open root span must be ended"
+        assert mod._TRACE_STATE == {}, "state must be drained"
+        # Idempotent: a second call (SDK/atexit re-entry) is a no-op.
+        mod._finalize_all_traces()
+        assert len(root_ends) == 3
+
+    def test_atexit_hook_is_registered_on_client_init(self, monkeypatch):
+        mod = self._fresh_plugin()
+        registered: list = []
+        import atexit as _atexit
+
+        monkeypatch.setattr(mod, "Langfuse", lambda **kw: object())
+        monkeypatch.setattr(
+            _atexit, "register", lambda fn, *a, **k: registered.append(fn)
+        )
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-0123456789abcdef")
+        monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-0123456789abcdef")
+        mod._LANGFUSE_CLIENT = None
+
+        assert mod._get_langfuse() is not None
+        assert mod._finalize_all_traces in registered
