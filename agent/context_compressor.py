@@ -40,6 +40,10 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.context_compressor_text_utils import (
+    _content_text_for_contains,
+    _redact_compaction_text,
+)
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -714,27 +718,6 @@ _HISTORICAL_TASK_SECTION_RE = re.compile(
 )
 
 
-def _redact_compaction_text(text: Any) -> str:
-    """Redact text that crosses a compaction summary boundary.
-
-    Compaction summaries persist across sessions and are re-injected into
-    every subsequent summarizer prompt, so this boundary uses strict mode:
-
-    - ``force=True`` — deliberately overrides ``security.redact_secrets:
-      false``. That opt-out targets *live tool output* (e.g. working on the
-      redactor itself); a summary is a persistence boundary where a leaked
-      credential keeps re-entering prompts indefinitely.
-    - ``redact_url_credentials=True`` — OAuth callback codes, magic-link
-      tokens, and URL userinfo never need to survive summarization the way
-      they must survive live navigation flows.
-    """
-    return redact_sensitive_text(
-        text or "",
-        force=True,
-        redact_url_credentials=True,
-    )
-
-
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
     value = value.strip()
     if value and value not in items and len(items) < limit:
@@ -903,29 +886,6 @@ def _estimate_msg_budget_tokens(msg: dict) -> int:
             // _CHARS_PER_TOKEN
         )
     return tokens
-
-
-def _content_text_for_contains(content: Any) -> str:
-    """Return a best-effort text view of message content.
-
-    Used only for substring checks when we need to know whether we've already
-    appended a note to a message. Keeps multimodal lists intact elsewhere.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "\n".join(part for part in parts if part)
-    return str(content)
 
 
 def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -> Any:
