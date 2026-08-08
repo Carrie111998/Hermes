@@ -219,23 +219,12 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
+    install_succeeded = False
     try:
         outcome = install_specs(missing, timeout=120)
         if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
-            # Post-install smoke check (#81421): only after the install
-            # actually reports success. Pip may resolve and report ok
-            # while still backtracking the slim runtime to an ancient API
-            # release whose ``hindsight_api`` no longer exposes
-            # ``LocalSTEmbeddings`` — the daemon then crashes with
-            # "Unknown embeddings provider: onnx" while the update
-            # claims success. Running the probe only on the
-            # install-success branch avoids the contradiction raised
-            # by the previous flow: a failed install path used to print
-            # "Run manually:" guidance *and* raise a smoke-check
-            # RuntimeError saying pip reported success.
-            if provider_name == "hindsight":
-                _maybe_run_intel_macos_local_embedded_smoke_check()
+            install_succeeded = True
         elif outcome.blocked:
             print(f"  ⚠ Cannot install {', '.join(missing)}: {outcome.reason}")
         else:
@@ -247,6 +236,20 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     except Exception as e:
         print(f"  ⚠ Install failed: {e}")
         print(f"  Run manually: {manual_cmd}")
+
+    # Post-install smoke check (#81421): only after the install actually
+    # reports success. Pip may resolve and report ok while still
+    # backtracking the slim runtime to an ancient API release whose
+    # ``hindsight_api`` no longer exposes ``LocalSTEmbeddings`` — the
+    # daemon then crashes with "Unknown embeddings provider: onnx" while
+    # the update claims success. Deliberately OUTSIDE the install
+    # try/except: its RuntimeError must propagate to the caller (the
+    # wizard / update flow), not be swallowed as a failed-install notice.
+    # A failed or blocked install never reaches it, so the "Run manually:"
+    # guidance and the smoke-check error can't contradict each other
+    # (#81530 follow-up).
+    if install_succeeded and provider_name == "hindsight":
+        _maybe_run_intel_macos_local_embedded_smoke_check()
 
     # Also show external dependencies (non-pip) if any
     ext_deps = meta.get("external_dependencies", [])
