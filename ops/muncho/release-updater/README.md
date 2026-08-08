@@ -98,7 +98,7 @@ The recurrent updater must never bootstrap missing Canonical units, accept a
 compatibility-symlink runtime as its predecessor, or infer the initial truth
 mode.
 
-The dormant runtime currently uses transaction intent v5, authority-record v3,
+The dormant runtime currently uses transaction intent v6, authority-record v4,
 and event v2 (`muncho-production-release-update-intent.v6`,
 `muncho-production-release-update-authority-record.v4`, and
 `muncho-production-release-update-event.v2`).  An activation installer must
