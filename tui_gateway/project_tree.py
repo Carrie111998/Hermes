@@ -473,6 +473,39 @@ def _relabel_repos_for_project(repos: list[dict], folders: list[dict]) -> list[d
     return repos
 
 
+def _flatten_repos(repos: list[dict], project_label: str) -> list[dict]:
+    """Collapse git branch/worktree lanes into a single flat session lane.
+
+    When git is suppressed (repos are backup-only), the branch-icon header and
+    "+" git-switch button are meaningless noise (and the git switch can fail
+    when paths don't exist locally). Flatten all repo → lane → sessions into
+    one repo → one lane → all sessions, so the desktop renders sessions directly
+    under the project name with no branch icon and a plain "+" new-session button.
+    """
+    all_sessions: list[dict] = []
+    for repo in repos:
+        for group in repo.get("groups") or []:
+            all_sessions.extend(group.get("sessions") or [])
+    all_sessions.sort(key=_session_time, reverse=True)
+    flat_lane = {
+        "id": f"flat::{project_label}",
+        "label": project_label,
+        "path": None,
+        "isMain": False,
+        "isKanban": False,
+        "sessions": all_sessions,
+    }
+    return [
+        {
+            "id": f"flat::{project_label}",
+            "label": project_label,
+            "path": None,
+            "groups": [flat_lane],
+            "sessionCount": len(all_sessions),
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Explicit-project ownership
 # ---------------------------------------------------------------------------
@@ -636,10 +669,17 @@ def build_tree(
     for project in active_projects:
         psessions = by_project.get(project["id"], [])
         scoped_ids.extend(s["id"] for s in psessions if s.get("id"))
-        repos = _seed_folder_repos(
-            _build_repos(psessions, resolve, hydrate), project.get("folders") or [], resolve
-        )
-        repos = _relabel_repos_for_project(repos, project.get("folders") or [])
+        if suppress_git_auto:
+            # Git lanes off: flatten all sessions into one plain lane. No branch
+            # icons, no repo headers, no "+" git-switch. Just sessions.
+            repos = _flatten_repos(
+                _build_repos(psessions, resolve, hydrate), project.get("name") or project["id"]
+            )
+        else:
+            repos = _seed_folder_repos(
+                _build_repos(psessions, resolve, hydrate), project.get("folders") or [], resolve
+            )
+            repos = _relabel_repos_for_project(repos, project.get("folders") or [])
         result.append(
             _project_node(
                 pid=project["id"],
