@@ -27,7 +27,10 @@ import sys
 import tempfile
 import threading
 import time
+import difflib
+import errno
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
@@ -3112,6 +3115,311 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     atomic_yaml_write(config_path, data, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Structured config write results with fallback diff
+# ---------------------------------------------------------------------------
+
+_LOCKED_CONFIG_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS, errno.EBUSY}
+
+
+@dataclass
+class ConfigWriteResult:
+    """Structured outcome for config.yaml write attempts."""
+
+    success: bool
+    path: Path
+    error: Optional[BaseException] = None
+    blocked: bool = False
+    diff: str = ""
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
+class ConfigWriteError(OSError):
+    """Raised when Hermes cannot persist config.yaml changes."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        action: str,
+        error: BaseException,
+        blocked: bool,
+        diff: str = "",
+    ) -> None:
+        self.path = Path(path)
+        self.action = action
+        self.original_error = error
+        self.blocked = blocked
+        self.diff = diff
+        super().__init__(describe_config_write_failure(
+            ConfigWriteResult(
+                success=False,
+                path=self.path,
+                error=error,
+                blocked=blocked,
+                diff=diff,
+            ),
+            action=action,
+        ))
+
+
+def _render_yaml_text(
+    data: Any,
+    *,
+    default_flow_style: bool = False,
+    sort_keys: bool = False,
+    extra_content: Optional[str] = None,
+) -> str:
+    text = yaml.dump(data, default_flow_style=default_flow_style, sort_keys=sort_keys)
+    if extra_content:
+        text += extra_content
+    return text
+
+
+def _build_config_diff(path: Path, before: str, after: str) -> str:
+    """Build a unified diff for manual fallback, with credentials redacted."""
+    # Redact credentials in the diff output so api_key/secret fields are
+    # never shown to the user. Parse the YAML, apply redact_config_value,
+    # re-render, then diff. Falls back to raw text if parsing fails.
+    try:
+        before_data = yaml.safe_load(before) if before.strip() else {}
+        after_data = yaml.safe_load(after) if after.strip() else {}
+        before_redacted = _render_yaml_text(redact_config_value(before_data))
+        after_redacted = _render_yaml_text(redact_config_value(after_data))
+    except Exception:
+        before_redacted = before
+        after_redacted = after
+
+    diff_lines = list(
+        difflib.unified_diff(
+            before_redacted.splitlines(),
+            after_redacted.splitlines(),
+            fromfile=str(path),
+            tofile=f"{path} (proposed)",
+            lineterm="",
+        )
+    )
+    return "\n".join(diff_lines)
+
+
+def _looks_like_locked_config_error(path: Path, exc: BaseException) -> bool:
+    if isinstance(exc, OSError) and exc.errno in _LOCKED_CONFIG_ERRNOS:
+        return True
+
+    text = str(exc).lower()
+    if any(
+        token in text
+        for token in (
+            "read-only",
+            "resource busy",
+            "operation not permitted",
+            "permission denied",
+            "device or resource busy",
+        )
+    ):
+        return True
+
+    try:
+        if path.exists() and not os.access(path, os.W_OK):
+            return True
+    except OSError:
+        pass
+
+    try:
+        if not os.access(path.parent, os.W_OK):
+            return True
+    except OSError:
+        pass
+
+    return False
+
+
+def describe_config_write_failure(result: ConfigWriteResult, *, action: str = "save configuration") -> str:
+    """Format a user-facing config write failure with a manual patch when possible."""
+    path = Path(result.path)
+    reason = str(result.error) if result.error else "unknown error"
+    if result.blocked:
+        header = (
+            f"Hermes could not {action} because `{path}` is read-only or otherwise locked."
+        )
+    else:
+        header = f"Hermes could not {action}: {reason}"
+
+    lines = [header]
+    if result.blocked:
+        lines.append(f"Reason: {reason}")
+
+    if result.diff:
+        lines.extend(
+            [
+                "",
+                "Apply this patch manually:",
+                "```diff",
+                result.diff,
+                "```",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def save_text_config_result(path: Path, text: str) -> ConfigWriteResult:
+    """Attempt to atomically replace a config file with already-rendered text."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    before = ""
+    if path.exists():
+        try:
+            before = path.read_text(encoding="utf-8")
+        except Exception:
+            before = ""
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        return ConfigWriteResult(success=True, path=path)
+    except Exception as exc:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return ConfigWriteResult(
+            success=False,
+            path=path,
+            error=exc,
+            blocked=_looks_like_locked_config_error(path, exc),
+            diff=_build_config_diff(path, before, text),
+        )
+
+
+def load_raw_config_mapping_result(
+    path: Path,
+    *,
+    action: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[ConfigWriteResult]]:
+    """Load the raw user config as a mapping or return a structured failure."""
+    path = Path(path)
+    if not path.exists():
+        return {}, None
+
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return None, ConfigWriteResult(success=False, path=path, error=exc, blocked=False)
+
+    try:
+        parsed = yaml.safe_load(raw_text) if raw_text.strip() else {}
+    except yaml.YAMLError:
+        return None, ConfigWriteResult(
+            success=False,
+            path=path,
+            error=ValueError(
+                f"`{path}` contains invalid YAML. Fix it before Hermes can {action}."
+            ),
+            blocked=False,
+        )
+
+    if parsed is None:
+        return {}, None
+    if not isinstance(parsed, dict):
+        return None, ConfigWriteResult(
+            success=False,
+            path=path,
+            error=ValueError(
+                f"`{path}` must contain a top-level mapping/object. Fix it before Hermes can {action}."
+            ),
+            blocked=False,
+        )
+
+    return parsed, None
+
+
+def save_yaml_config_result(
+    path: Path,
+    data: Dict[str, Any],
+    *,
+    default_flow_style: bool = False,
+    sort_keys: bool = False,
+    extra_content: Optional[str] = None,
+) -> ConfigWriteResult:
+    """Attempt to persist a YAML config file and capture fallback context on failure.
+
+    Routes through main's ``atomic_config_write()`` chokepoint (which calls
+    ``require_readable_config_before_write()``) so an unreadable existing
+    config is never silently clobbered.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    before = ""
+    if path.exists():
+        try:
+            before = path.read_text(encoding="utf-8")
+        except Exception:
+            before = ""
+
+    after = _render_yaml_text(
+        data,
+        default_flow_style=default_flow_style,
+        sort_keys=sort_keys,
+        extra_content=extra_content,
+    )
+
+    try:
+        atomic_config_write(
+            path,
+            data,
+            default_flow_style=default_flow_style,
+            sort_keys=sort_keys,
+            extra_content=extra_content,
+        )
+        return ConfigWriteResult(success=True, path=path)
+    except Exception as exc:
+        return ConfigWriteResult(
+            success=False,
+            path=path,
+            error=exc,
+            blocked=_looks_like_locked_config_error(path, exc),
+            diff=_build_config_diff(path, before, after),
+        )
+
+
+def save_config_key_result(
+    key_path: str,
+    value: Any,
+    *,
+    config_path: Optional[Path] = None,
+) -> ConfigWriteResult:
+    """Update a dot-separated key in a YAML config and return a structured result."""
+    path = Path(config_path) if config_path is not None else get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    config, error_result = load_raw_config_mapping_result(path, action=f"update `{key_path}`")
+    if error_result is not None:
+        return error_result
+    assert config is not None
+
+    keys = key_path.split(".")
+    current = config
+    for key in keys[:-1]:
+        if key not in current or not isinstance(current[key], dict):
+            current[key] = {}
+        current = current[key]
+    current[keys[-1]] = value
+
+    return save_yaml_config_result(path, config)
+
+
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml.
 
@@ -4504,6 +4812,96 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
+def edit_config_validated():
+    """Open a temporary copy of config.yaml in the editor, validate YAML, then save.
+
+    Unlike ``edit_config()`` (which opens the live file directly), this writes
+    to a temp file first, validates the edited YAML before replacing the real
+    config, and surfaces a clear error with a manual diff fallback if the
+    write fails (e.g. read-only mount).
+    """
+    if is_managed():
+        managed_error("edit configuration")
+        return
+    config_path = get_config_path()
+
+    # Ensure config exists
+    if not config_path.exists():
+        try:
+            save_config(DEFAULT_CONFIG, strip_defaults=False)
+            print(f"Created {config_path}")
+        except Exception as exc:
+            print(f"Could not create {config_path}: {exc}")
+            return
+
+    # Find editor
+    editor = os.getenv('EDITOR') or os.getenv('VISUAL')
+    if not editor:
+        import shutil
+        import sys as _sys
+        if _sys.platform == "win32":
+            candidates = ['notepad', 'code', 'vim', 'vi', 'nano']
+        else:
+            candidates = ['nano', 'vim', 'vi', 'code', 'notepad']
+        for cmd in candidates:
+            if shutil.which(cmd):
+                editor = cmd
+                break
+
+    if not editor:
+        print("No editor found. Config file is at:")
+        print(f"  {config_path}")
+        return
+
+    original_text = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    fd, temp_path_raw = tempfile.mkstemp(prefix="hermes-config-", suffix=".yaml")
+    temp_path = Path(temp_path_raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(original_text)
+
+        while True:
+            print(f"Opening temporary copy in {editor}...")
+            completed = subprocess.run([editor, str(temp_path)])
+            if completed.returncode != 0:
+                print(f"Editor exited with status {completed.returncode}; config not changed.")
+                return
+
+            edited_text = temp_path.read_text(encoding="utf-8")
+            try:
+                parsed = yaml.safe_load(edited_text) if edited_text.strip() else {}
+            except yaml.YAMLError as exc:
+                print("Config not saved: YAML syntax is invalid.")
+                print(f"  {exc}")
+                retry = input("Edit again? (y/n): ").strip().lower()
+                if retry in ("y", "yes"):
+                    continue
+                return
+
+            if parsed is not None and not isinstance(parsed, dict):
+                print("Config not saved: top-level must be a mapping/object.")
+                retry = input("Edit again? (y/n): ").strip().lower()
+                if retry in ("y", "yes"):
+                    continue
+                return
+
+            result = save_text_config_result(config_path, edited_text)
+            if result:
+                try:
+                    os.chmod(config_path, 0o600)
+                except (OSError, NotImplementedError):
+                    pass
+                print(f"Saved {config_path}")
+            else:
+                print(describe_config_write_failure(result, action="save configuration"))
+            return
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _cron_model_drift_axis_for_config_key(key: str) -> Optional[str]:
     """Return the cron drift guard axis affected by a config key, if any."""
     normalized = str(key or "").strip().lower()
@@ -5137,7 +5535,7 @@ def config_command(args):
         show_config()
     
     elif subcmd == "edit":
-        edit_config()
+        edit_config_validated()
     
     elif subcmd == "get":
         key = getattr(args, 'key', None)

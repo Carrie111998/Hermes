@@ -2695,15 +2695,31 @@ def load_permanent_allowlist() -> set:
         return set()
 
 
-def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+def save_permanent_allowlist(patterns: set) -> str | None:
+    """Save permanently allowed command patterns to config.
+
+    Returns a user-facing warning when the allowlist could not be persisted.
+    """
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli.config import ConfigWriteError, load_config, save_config
         config = load_config()
         config["command_allowlist"] = list(patterns)
         save_config(config)
+        return None
+    except ConfigWriteError as exc:
+        warning = (
+            "Permanent approval was applied for this session only because Hermes "
+            "could not persist the command allowlist.\n\n"
+            f"{exc}"
+        )
+        logger.warning("Could not save allowlist: %s", exc)
+        return warning
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
+        return (
+            "Permanent approval was applied for this session only because Hermes "
+            f"could not persist the command allowlist: {e}"
+        )
 
 
 # =========================================================================
