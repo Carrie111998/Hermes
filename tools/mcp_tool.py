@@ -6761,15 +6761,29 @@ def refresh_agent_mcp_tools(
     from model_tools import get_tool_definitions
     from tools.registry import registry
 
+    # A strict execution-profile child has a host-pinned tool snapshot. Reserve
+    # a per-agent invocation epoch under the same lock used by profile freezing
+    # so a slower, older rebuild cannot publish after a newer request.
+    with _agent_tools_lock:
+        frozen = getattr(agent, "_delegate_frozen_tool_names", None)
+        if isinstance(frozen, (set, frozenset)):
+            return set()
+        refresh_epoch_raw = getattr(agent, "_tool_refresh_epoch", 0)
+        refresh_epoch = (
+            refresh_epoch_raw + 1 if isinstance(refresh_epoch_raw, int) else 1
+        )
+        agent._tool_refresh_epoch = refresh_epoch
+
     # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
     # the user just ENABLED in config is picked up; the agent's stored selection
     # is then updated to match. The automatic paths (between-turns, late-binding)
     # pass nothing and reuse the agent's build-time selection unchanged.
-    if enabled_override is not None or disabled_override is not None:
+    publish_toolset_selection = (
+        enabled_override is not None or disabled_override is not None
+    )
+    if publish_toolset_selection:
         enabled = enabled_override if enabled_override is not None else getattr(agent, "enabled_toolsets", None)
         disabled = disabled_override if disabled_override is not None else getattr(agent, "disabled_toolsets", None)
-        agent.enabled_toolsets = enabled
-        agent.disabled_toolsets = disabled
     else:
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
@@ -6804,12 +6818,26 @@ def refresh_agent_mcp_tools(
     # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    staged_engine_names = _reinject_post_build_tools(
+        agent,
+        new_defs,
+        new_names,
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
+    )
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
     # stale (older-generation) rebuild can't overwrite a newer published one.
     with _agent_tools_lock:
+        # The profile freeze may have been installed while definitions were
+        # being rebuilt outside this lock. Recheck at the publication boundary
+        # so an in-flight legacy refresh cannot broaden a newly strict child.
+        frozen = getattr(agent, "_delegate_frozen_tool_names", None)
+        if isinstance(frozen, (set, frozenset)):
+            return set()
+        if getattr(agent, "_tool_refresh_epoch", None) != refresh_epoch:
+            return set()
         # Defensive: the published generation should be an int, but tolerate an
         # agent that never set it (or set a non-int, e.g. a test mock) rather
         # than throwing TypeError on the comparison and silently failing the
@@ -6819,6 +6847,9 @@ def refresh_agent_mcp_tools(
         if snapshot_generation < published_gen:
             # A newer snapshot already won; our set is stale — drop it.
             return set()
+        if publish_toolset_selection:
+            agent.enabled_toolsets = enabled
+            agent.disabled_toolsets = disabled
         current = {
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
@@ -6839,7 +6870,14 @@ def refresh_agent_mcp_tools(
         return new_names - current
 
 
-def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
+def _reinject_post_build_tools(
+    agent,
+    tools_list: list,
+    name_set: set,
+    *,
+    enabled_toolsets=None,
+    disabled_toolsets=None,
+) -> set:
     """Append memory-provider and context-engine tools onto staged locals.
 
     Mirrors the post-``get_tool_definitions`` injection in ``agent_init`` so a
@@ -6870,8 +6908,8 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
             # Honor the same toolset gate inject_memory_provider_tools uses.
             from agent.memory_manager import memory_provider_tools_enabled
             if memory_provider_tools_enabled(
-                getattr(agent, "enabled_toolsets", None),
-                getattr(agent, "disabled_toolsets", None),
+                enabled_toolsets,
+                disabled_toolsets,
                 memory_tool_present="memory" in name_set,
             ):
                 for schema in get_mem_schemas():
@@ -6888,8 +6926,11 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
     # model latency penalty.
     staged_engine_names: set = set()
     try:
-        enabled = getattr(agent, "enabled_toolsets", None)
-        context_engine_allowed = enabled is None or "context_engine" in enabled
+        context_engine_allowed = (
+            enabled_toolsets is None or "context_engine" in enabled_toolsets
+        ) and not (
+            disabled_toolsets and "context_engine" in disabled_toolsets
+        )
         compressor = getattr(agent, "context_compressor", None)
         get_schemas = getattr(compressor, "get_tool_schemas", None) if compressor else None
         if context_engine_allowed and callable(get_schemas):

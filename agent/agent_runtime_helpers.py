@@ -2990,6 +2990,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
             if skip_tool_execution_middleware:
                 dispatch_kwargs["skip_tool_execution_middleware"] = True
+            frozen_dispatch = getattr(agent, "_delegate_frozen_dispatch_entries", None)
+            if frozen_dispatch is not None:
+                dispatch_kwargs["dispatch_snapshot"] = frozen_dispatch
             return _ra().handle_function_call(
                 function_name,
                 next_args,

@@ -249,6 +249,57 @@ class TestStripBlockedTools(unittest.TestCase):
             (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
         )
 
+    def test_exact_leaf_disables_deferred_tool_search_assembly(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["file"]
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Review exactly",
+                context=None,
+                toolsets=["file"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+                exact_tool_catalog=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertTrue(kwargs["skip_tool_search_assembly"])
+        self.assertTrue(kwargs["defer_session_start_observers"])
+
+    def test_exact_orchestrator_does_not_regain_generic_delegate_task(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["hermes-cli"]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Coordinate named profiles",
+                context=None,
+                toolsets=["hermes-cli"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+                exact_tool_catalog=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertTrue(kwargs["skip_tool_search_assembly"])
+        self.assertNotIn("delegation", kwargs["enabled_toolsets"])
+        self.assertIn("delegation", kwargs["disabled_toolsets"])
+
 
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):

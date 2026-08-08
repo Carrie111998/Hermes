@@ -676,6 +676,29 @@ class TestInit:
             # The value is discarded — nothing downstream reads it anymore.
             assert not hasattr(a, "tool_delay")
 
+    def test_skip_tool_search_assembly_reaches_tool_definition_builder(self):
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]) as mock_defs,
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                enabled_toolsets=["file"],
+                skip_tool_search_assembly=True,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        mock_defs.assert_any_call(
+            enabled_toolsets=["file"],
+            disabled_toolsets=None,
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+
     def test_prompt_caching_claude_openrouter(self):
         """Claude model via OpenRouter should enable prompt caching."""
         with (
@@ -1511,6 +1534,21 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
+    @pytest.mark.parametrize("quiet_mode", [False, True])
+    def test_profile_sequential_tool_calls_forward_frozen_dispatch(
+        self, agent, quiet_mode
+    ):
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        snapshot = {"web_search": object()}
+        agent.quiet_mode = quiet_mode
+        agent._delegate_frozen_dispatch_entries = snapshot
+
+        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
+            agent._execute_tool_calls_sequential(mock_msg, [], "task-1")
+
+        assert mock_hfc.call_args.kwargs["dispatch_snapshot"] is snapshot
+
     def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
         old_text = "stale preference entry"
         tc = _mock_tool_call(
@@ -1903,6 +1941,16 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_profile_invoke_tool_forwards_frozen_dispatch_snapshot(self, agent):
+        frozen = {"web_search": object()}
+        agent._delegate_frozen_dispatch_entries = frozen
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        assert mock_hfc.call_args.kwargs["dispatch_snapshot"] is frozen
+        assert result == "result"
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")

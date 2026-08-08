@@ -912,7 +912,9 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
-def _blocked_toolsets_for_role(role: str) -> List[str]:
+def _blocked_toolsets_for_role(
+    role: str, *, exact_tool_catalog: bool = False
+) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
     ``_strip_blocked_tools`` can remove fully blocked toolsets, but it must keep
@@ -923,7 +925,7 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     stored ``disabled_toolsets``.
     """
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
-    if role == "orchestrator":
+    if role == "orchestrator" and not exact_tool_catalog:
         blocked_names.discard("delegate_task")
     return sorted(
         name
@@ -1214,6 +1216,18 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Per-launch override for ambient MCP toolset preservation.  None keeps
+    # the legacy behavior (delegation.inherit_mcp_toolsets config); False is
+    # the strict-profile path that always opts out.  Explicit kwarg, not a
+    # process global.
+    inherit_mcp: Optional[bool] = None,
+    # Profile launches need the literal callable catalog, not a deferred
+    # tool_search bridge whose hidden dispatch surface cannot be receipted by
+    # exact tool name. Legacy launches keep progressive disclosure enabled.
+    exact_tool_catalog: bool = False,
+    # Strict profiles pin their protocol at system authority while keeping the
+    # caller's goal/context in the user message. Legacy callers leave this unset.
+    system_prompt_override: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1274,7 +1288,10 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        _inherit_mcp = (
+            _get_inherit_mcp_toolsets() if inherit_mcp is None else bool(inherit_mcp)
+        )
+        if _inherit_mcp:
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
@@ -1296,7 +1313,7 @@ def _build_child_agent(
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
         inherited_disabled = []
-    if effective_role == "orchestrator":
+    if effective_role == "orchestrator" and not exact_tool_catalog:
         # Role grants delegate_task explicitly, matching the unconditional
         # delegation toolset re-add below.
         inherited_disabled = [
@@ -1304,25 +1321,38 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            inherited_disabled
+            + _blocked_toolsets_for_role(
+                effective_role, exact_tool_catalog=exact_tool_catalog
+            )
+            + ["kanban"]
         )
     )
 
-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
-    # removed.  The re-add is unconditional on parent-toolset membership because
-    # orchestrator capability is granted by role, not inherited — see the
-    # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
+    # Legacy orchestrators retain the 'delegation' toolset that
+    # _strip_blocked_tools removed. Exact-profile orchestrators deliberately do
+    # not: generic delegate_task cannot name a host execution profile and would
+    # bypass the allowed_child_profiles graph. They coordinate through host
+    # plugin tools that submit named lifecycle requests instead.
+    if (
+        effective_role == "orchestrator"
+        and not exact_tool_catalog
+        and "delegation" not in child_toolsets
+    ):
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
-    child_prompt = _build_child_system_prompt(
-        goal,
-        context,
-        workspace_path=workspace_hint,
-        role=effective_role,
-        max_spawn_depth=max_spawn,
-        child_depth=child_depth,
+    child_prompt = (
+        system_prompt_override
+        if system_prompt_override is not None
+        else _build_child_system_prompt(
+            goal,
+            context,
+            workspace_path=workspace_hint,
+            role=effective_role,
+            max_spawn_depth=max_spawn,
+            child_depth=child_depth,
+        )
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1500,6 +1530,12 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    exact_registry_generation = None
+    if exact_tool_catalog:
+        from tools.registry import registry
+
+        exact_registry_generation = registry.generation()
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
@@ -1518,6 +1554,8 @@ def _build_child_agent(
             fallback_model=parent_fallback,
             enabled_toolsets=child_toolsets,
             disabled_toolsets=child_disabled_toolsets,
+            skip_tool_search_assembly=exact_tool_catalog,
+            defer_session_start_observers=exact_tool_catalog,
             quiet_mode=True,
             ephemeral_system_prompt=child_prompt,
             log_prefix=f"[subagent-{task_index}]",
@@ -1543,6 +1581,15 @@ def _build_child_agent(
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
+        )
+    if exact_tool_catalog:
+        from tools.registry import registry
+
+        final_generation = registry.generation()
+        child._delegate_tool_registry_generation = (
+            exact_registry_generation
+            if final_generation == exact_registry_generation
+            else -1
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
@@ -1575,38 +1622,56 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
-    # Register child for interrupt propagation
-    if hasattr(parent_agent, "_active_children"):
-        lock = getattr(parent_agent, "_active_children_lock", None)
-        if lock:
-            with lock:
+    def publish_launch() -> None:
+        if getattr(child, "_delegate_launch_published", False):
+            return
+        child._delegate_launch_published = True
+
+        # Register child for interrupt propagation.
+        if hasattr(parent_agent, "_active_children"):
+            lock = getattr(parent_agent, "_active_children_lock", None)
+            if lock:
+                with lock:
+                    parent_agent._active_children.append(child)
+            else:
                 parent_agent._active_children.append(child)
-        else:
-            parent_agent._active_children.append(child)
 
-    # Announce the spawn immediately — the child may sit in a queue
-    # for seconds if max_concurrent_children is saturated, so the TUI
-    # wants a node in the tree before run starts.
-    if child_progress_cb:
+        # Announce the spawn immediately — the child may sit in a queue.
+        if child_progress_cb:
+            try:
+                child_progress_cb("subagent.spawn_requested", preview=goal)
+            except Exception as exc:
+                logger.debug("spawn_requested relay failed: %s", exc)
+
         try:
-            child_progress_cb("subagent.spawn_requested", preview=goal)
-        except Exception as exc:
-            logger.debug("spawn_requested relay failed: %s", exc)
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
 
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "subagent_start",
-            parent_session_id=getattr(parent_agent, "session_id", None),
-            parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
-            parent_subagent_id=parent_subagent_id,
-            child_session_id=getattr(child, "session_id", None),
-            child_subagent_id=subagent_id,
-            child_role=effective_role,
-            child_goal=goal,
-        )
-    except Exception:
-        logger.debug("subagent_start hook invocation failed", exc_info=True)
+            _invoke_hook(
+                "subagent_start",
+                parent_session_id=getattr(parent_agent, "session_id", None),
+                parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                parent_subagent_id=parent_subagent_id,
+                child_session_id=getattr(child, "session_id", None),
+                child_subagent_id=subagent_id,
+                child_role=effective_role,
+                child_goal=goal,
+            )
+        except Exception:
+            logger.debug("subagent_start hook invocation failed", exc_info=True)
+
+    if exact_tool_catalog:
+        def publish_context_session_start() -> None:
+            if getattr(child, "_delegate_context_session_start_published", False):
+                return
+            child._delegate_context_session_start_published = True
+            from agent.agent_init import _notify_context_session_start
+
+            _notify_context_session_start(child)
+
+        child._publish_deferred_launch = publish_launch
+        child._publish_deferred_context_session_start = publish_context_session_start
+    else:
+        publish_launch()
 
     return child
 
@@ -1967,6 +2032,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    timeout_override: Optional[float] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2145,7 +2211,11 @@ def _run_single_child(
         # Run child with an optional hard timeout (off by default —
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # timeout_override (execution profiles) is a cooperative deadline: on
+        # expiry the worker is interrupted and abandoned, never terminated.
+        child_timeout = (
+            timeout_override if timeout_override is not None else _get_child_timeout()
+        )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2739,9 +2809,17 @@ def _run_child_lifecycle(
     goal: str,
     child=None,
     parent_agent=None,
+    timeout_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run one child and apply the same host lifecycle used by delegate_task."""
-    result = _run_single_child(task_index, goal, child, parent_agent)
+    # Only forward the override when set so the legacy call shape (and any
+    # 4-arg test double) is untouched when no profile deadline is in play.
+    if timeout_override is not None:
+        result = _run_single_child(
+            task_index, goal, child, parent_agent, timeout_override=timeout_override
+        )
+    else:
+        result = _run_single_child(task_index, goal, child, parent_agent)
     result.setdefault("task_index", task_index)
     task = {"goal": goal}
     _finalize_child_results(

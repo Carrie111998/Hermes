@@ -44,6 +44,68 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_is_disabled_for_execution_profile_tool_snapshot(monkeypatch):
+    """Strict profile children keep the exact build-time schemas and selection."""
+    agent = _agent(["read_file"], enabled=["file"])
+    agent._delegate_frozen_tool_names = frozenset({"read_file"})
+    original_tools = agent.tools
+
+    import model_tools
+
+    def must_not_rebuild(**_kwargs):
+        raise AssertionError("strict profile snapshot must not be rebuilt")
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", must_not_rebuild)
+
+    added = mcp_tool.refresh_agent_mcp_tools(
+        agent,
+        enabled_override=["all"],
+        disabled_override=[],
+    )
+
+    assert added == set()
+    assert agent.tools is original_tools
+    assert agent.valid_tool_names == {"read_file"}
+    assert agent.enabled_toolsets == ["file"]
+
+
+def test_refresh_drops_publish_when_profile_freezes_during_rebuild(monkeypatch):
+    agent = _agent(["read_file"], enabled=["file"])
+    original_tools = agent.tools
+    entered = threading.Event()
+    release = threading.Event()
+    observed = {}
+
+    import model_tools
+
+    def rebuild(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return [_tool("read_file"), _tool("terminal")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", rebuild)
+
+    def refresh():
+        observed["added"] = mcp_tool.refresh_agent_mcp_tools(
+            agent,
+            enabled_override=["all"],
+            disabled_override=[],
+        )
+
+    thread = threading.Thread(target=refresh)
+    thread.start()
+    assert entered.wait(timeout=1)
+    agent._delegate_frozen_tool_names = frozenset({"read_file"})
+    release.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert observed == {"added": set()}
+    assert agent.tools is original_tools
+    assert agent.valid_tool_names == {"read_file"}
+    assert agent.enabled_toolsets == ["file"]
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 
@@ -132,6 +194,83 @@ def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
 
     assert "mcp_new_tool" in agent.valid_tool_names  # MCP tool still lands
     assert "lcm_grep" not in agent.valid_tool_names   # gated out (#5544)
+
+
+def test_refresh_reinjection_uses_staged_toolset_overrides(monkeypatch):
+    agent = _agent(
+        ["read_file", "memory_search", "lcm_grep"],
+        enabled=["all", "context_engine"],
+        disabled=[],
+    )
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: [
+            {"name": "memory_search", "description": "", "parameters": {}}
+        ]
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: [
+            {"name": "lcm_grep", "description": "", "parameters": {}}
+        ]
+    )
+    agent._context_engine_tool_names = {"lcm_grep"}
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: [_tool("read_file")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(
+        agent,
+        enabled_override=["file"],
+        disabled_override=["memory", "context_engine"],
+    )
+
+    assert agent.enabled_toolsets == ["file"]
+    assert agent.disabled_toolsets == ["memory", "context_engine"]
+    assert agent.valid_tool_names == {"read_file"}
+    assert agent._context_engine_tool_names == set()
+
+
+def test_newer_same_generation_refresh_wins(monkeypatch):
+    agent = _agent(["read_file"], enabled=["file"], disabled=[])
+    old_entered = threading.Event()
+    release_old = threading.Event()
+
+    import model_tools
+
+    def rebuild(*, enabled_toolsets=None, **_kwargs):
+        if enabled_toolsets == ["all"]:
+            old_entered.set()
+            assert release_old.wait(timeout=2)
+            return [_tool("read_file"), _tool("terminal")]
+        return [_tool("read_file")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", rebuild)
+
+    old = threading.Thread(
+        target=lambda: mcp_tool.refresh_agent_mcp_tools(
+            agent,
+            enabled_override=["all"],
+            disabled_override=[],
+        )
+    )
+    old.start()
+    assert old_entered.wait(timeout=1)
+
+    mcp_tool.refresh_agent_mcp_tools(
+        agent,
+        enabled_override=["file"],
+        disabled_override=[],
+    )
+    release_old.set()
+    old.join(timeout=2)
+
+    assert not old.is_alive()
+    assert agent.enabled_toolsets == ["file"]
+    assert agent.valid_tool_names == {"read_file"}
 
 
 def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):

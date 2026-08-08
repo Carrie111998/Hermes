@@ -22,7 +22,8 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from types import MappingProxyType
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,14 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+
+
+class FrozenToolDispatchEntry(NamedTuple):
+    """Immutable handler and effective schema captured for one strict launch."""
+
+    handler: Callable
+    is_async: bool
+    schema_json: str
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +796,98 @@ class ToolRegistry:
                 sanitized = _sanitize_tool_error(raw)
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
+            return tool_error(sanitized)
+
+    def snapshot_dispatch_entries(
+        self,
+        tool_names: Set[str],
+        *,
+        effective_schemas: Optional[Mapping[str, dict]] = None,
+    ) -> Mapping[str, FrozenToolDispatchEntry]:
+        """Capture immutable handlers and effective schemas for a strict child."""
+        _generation, snapshot = self.snapshot_dispatch_entries_with_generation(
+            tool_names,
+            effective_schemas=effective_schemas,
+        )
+        return snapshot
+
+    def snapshot_dispatch_entries_with_generation(
+        self,
+        tool_names: Set[str],
+        *,
+        effective_schemas: Optional[Mapping[str, dict]] = None,
+    ) -> tuple[int, Mapping[str, FrozenToolDispatchEntry]]:
+        """Atomically capture registry generation, handlers, and schemas."""
+        with self._lock:
+            generation = self._generation
+            snapshot = {
+                name: FrozenToolDispatchEntry(
+                    entry.handler,
+                    entry.is_async,
+                    json.dumps(
+                        (
+                            effective_schemas[name]
+                            if effective_schemas is not None
+                            and name in effective_schemas
+                            else entry.schema
+                        ),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    ),
+                )
+                for name in sorted(tool_names)
+                if (entry := self._tools.get(name)) is not None
+            }
+        return generation, MappingProxyType(snapshot)
+
+    @staticmethod
+    def get_snapshot_schema(
+        snapshot: Mapping[str, FrozenToolDispatchEntry], name: str
+    ) -> Optional[dict]:
+        """Return a fresh copy of one launch-time effective tool schema."""
+        entry = snapshot.get(name)
+        if not isinstance(entry, FrozenToolDispatchEntry):
+            return None
+        try:
+            schema = json.loads(entry.schema_json)
+        except (TypeError, ValueError):
+            return None
+        return schema if isinstance(schema, dict) else None
+
+    def generation(self) -> int:
+        """Return the current mutation generation under the registry lock."""
+        with self._lock:
+            return self._generation
+
+    def dispatch_snapshot(
+        self,
+        snapshot: Mapping[str, FrozenToolDispatchEntry],
+        name: str,
+        args: dict,
+        **kwargs,
+    ) -> str | dict:
+        """Dispatch through a previously captured immutable handler table."""
+        entry = snapshot.get(name)
+        if not isinstance(entry, FrozenToolDispatchEntry):
+            return tool_error(f"Unknown tool in frozen dispatch snapshot: {name}")
+        try:
+            if entry.is_async:
+                from model_tools import _run_async
+
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+            return self._normalize_handler_result(name, result)
+        except Exception as e:
+            logger.exception("Frozen tool %s dispatch error: %s", name, e)
+            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+            try:
+                from model_tools import _sanitize_tool_error
+
+                sanitized = _sanitize_tool_error(raw)
+            except Exception:
+                sanitized = raw
             return tool_error(sanitized)
 
     # ------------------------------------------------------------------

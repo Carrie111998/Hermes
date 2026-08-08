@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1168,7 +1169,48 @@ def _managed_runtime_path_entries() -> list[str]:
         return []
 
 
-def _append_missing_sane_path_entries(existing_path: str) -> str:
+def _installed_user_runtime_path_entries(home: str | None = None) -> list[str]:
+    """Return detected standard user-runtime dirs missing from GUI launch PATHs.
+
+    This is convenience discovery inside the ambient same-user boundary, not a
+    security verification: executable existence is checked before PATH construction,
+    but no claim is made against same-user replacement between check and use.
+    """
+    if _IS_WINDOWS:
+        return []
+    requested_home = home or os.environ.get("HOME")
+    if not requested_home:
+        return []
+    expected_home = os.path.realpath(os.path.expanduser("~"))
+    user_home = os.path.realpath(os.path.expanduser(requested_home))
+    if user_home != expected_home:
+        return []
+    bun_dir = os.path.join(user_home, ".bun", "bin")
+    bun = os.path.join(bun_dir, "bun")
+    try:
+        home_stat = os.lstat(user_home)
+        directory_stat = os.lstat(bun_dir)
+        bun_stat = os.lstat(bun)
+    except OSError:
+        return []
+    if not stat.S_ISDIR(home_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        return []
+    if not stat.S_ISREG(bun_stat.st_mode) or not os.access(bun, os.X_OK):
+        return []
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        expected_uid = getuid()
+        if any(
+            item.st_uid != expected_uid
+            for item in (home_stat, directory_stat, bun_stat)
+        ):
+            return []
+    return [bun_dir]
+
+
+def _append_missing_sane_path_entries(
+    existing_path: str, *, home: str | None = None
+) -> str:
     """Return a normalised POSIX PATH with missing sane entries appended.
 
     On POSIX the caller-supplied PATH is rewritten (not merely appended to):
@@ -1198,9 +1240,14 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     if _IS_WINDOWS:
         return existing_path
 
-    sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
+    sane_entries: list[str] = [entry for entry in _SANE_PATH.split(":") if entry]
     sane_entries.extend(
         entry for entry in _managed_runtime_path_entries() if entry not in sane_entries
+    )
+    sane_entries.extend(
+        entry
+        for entry in _installed_user_runtime_path_entries(home)
+        if entry not in sane_entries
     )
     if not existing_path:
         return ":".join(sane_entries)
@@ -1295,7 +1342,9 @@ def _make_run_env(env: dict) -> dict:
                 run_env[k] = value
     path_key = _path_env_key(run_env)
     if path_key is not None:
-        new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+        new_path = _append_missing_sane_path_entries(
+            run_env.get(path_key, ""), home=run_env.get("HOME")
+        )
         # On Windows, ensure Git Bash's coreutils dirs (…\usr\bin etc.) are on
         # PATH.  A non-login ``bash -c`` fallback (used when ``bash -l`` is
         # broken) never sources /etc/profile, so without this cat/mktemp/mv and
