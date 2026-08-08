@@ -8,6 +8,7 @@ the provider's config schema. Writes config to config.yaml + .env.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import sys
 import shlex
@@ -29,6 +30,15 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
     ``hermes memory setup`` — if the update-time refresh only reinstalled
     the declared ``hindsight-client``, the embedded daemon would stay
     broken after a venv rebuild stripped ``hindsight-embed`` (#70636).
+
+    Intel macOS (Darwin + x86_64) is a special case (#81421): the full
+    ``hindsight-all`` meta-package pulls MLX with no x86_64 wheel on
+    Darwin, and the resolver backtracks to ancient API releases whose
+    ``hindsight_api`` files shadow the working slim runtime. The fix
+    routes Intel macOS to the slim stack (hindsight-all-slim +
+    hindsight-api-slim[local-onnx] + hindsight-embed) instead of the
+    bare full bundle. Apple Silicon and every other platform keep the
+    existing full install path.
     """
     deps = list(declared or [])
     if provider_name == "hindsight":
@@ -39,7 +49,23 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
             mode = cfg.get("mode", "")
             # "local" is a legacy alias for "local_embedded"
             if mode in {"local", "local_embedded"}:
-                deps.append("hindsight-all")
+                is_intel_macos = (
+                    platform.system() == "Darwin"
+                    and platform.machine() == "x86_64"
+                )
+                if is_intel_macos:
+                    # Slim stack for Intel macOS — keeps the daemon on the
+                    # version-aligned slim runtime instead of letting the
+                    # resolver backtrack the full bundle over it (#81421).
+                    deps.extend(
+                        [
+                            "hindsight-all-slim",
+                            "hindsight-api-slim[local-onnx]",
+                            "hindsight-embed",
+                        ]
+                    )
+                else:
+                    deps.append("hindsight-all")
         except Exception:
             pass
     return deps

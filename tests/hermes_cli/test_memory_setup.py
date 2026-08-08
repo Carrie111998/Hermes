@@ -96,3 +96,141 @@ def test_install_dependencies_force_reinstalls_versioned_specs(tmp_path, monkeyp
 
     assert installed, "force=True must reach the install step"
     assert any("mem0ai>=2.0.10,<3" in specs for specs in installed)
+
+
+# ---------------------------------------------------------------------------
+# _provider_pip_dependencies — platform-aware slim-runtime selection (#81421)
+# ---------------------------------------------------------------------------
+# Darwin+x86_64 (Intel macOS) cannot satisfy the full `hindsight-all` stack
+# cleanly: the meta-package pulls MLX without distinguishing arm64 from x86_64,
+# so the resolver backtracks to ancient releases and the slim runtime is
+# silently downgraded (#81421). The fix routes Intel macOS to the slim stack
+# while keeping every other platform (Apple Silicon, Linux, Windows) on the
+# existing full `hindsight-all` install path.
+# ---------------------------------------------------------------------------
+
+
+def _fake_platform(system, machine):
+    """Build a `platform`-like namespace exposing .system() / .machine().
+
+    `memory_setup._provider_pip_dependencies` will import `platform` and call
+    `.system()` / `.machine()`; we don't want the host's actual values to
+    leak into the test, so we monkeypatch the whole `platform` module.
+    """
+    return SimpleNamespace(system=lambda: system, machine=lambda: machine)
+
+
+def test_hindsight_intel_macos_uses_slim_runtime(tmp_path, monkeypatch):
+    """Darwin+x86_64 local_embedded must request the slim stack — never the
+    bare full bundle, which triggers the resolver backtrack that drops the
+    slim runtime on top of the working one (#81421)."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text('{"mode": "local_embedded"}', encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Darwin", "x86_64"))
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client>=0.6.1"]
+    )
+
+    assert "hindsight-all" not in deps, (
+        "Intel macOS must NOT request the bare `hindsight-all` meta-package: "
+        "it pulls MLX with no x86_64 wheel and the resolver backtracks to "
+        "ancient API releases that shadow the working slim runtime (#81421)."
+    )
+    assert any("hindsight-all-slim" in d for d in deps), (
+        "Intel macOS must request `hindsight-all-slim` as part of the slim stack."
+    )
+    assert any("hindsight-api-slim" in d for d in deps), (
+        "Intel macOS must request `hindsight-api-slim` (with local-onnx extra) "
+        "so the daemon can import the configured ONNX embeddings provider."
+    )
+
+
+def test_hindsight_apple_silicon_keeps_full_runtime(tmp_path, monkeypatch):
+    """Darwin+arm64 has no known MLX/x86_64-wheel conflict and must keep the
+    full `hindsight-all` runtime — the fix is Intel-macOS-specific."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text('{"mode": "local_embedded"}', encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Darwin", "arm64"))
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client>=0.6.1"]
+    )
+
+    assert "hindsight-all" in deps, (
+        "Apple Silicon has no MLX/x86_64 backtrack issue — keep the existing "
+        "full `hindsight-all` install path (#81421)."
+    )
+    assert not any("hindsight-all-slim" in d for d in deps), (
+        "Apple Silicon must not be routed to the slim stack — the slim stack "
+        "is the Intel-macOS workaround, not a generic slim-first policy."
+    )
+
+
+def test_hindsight_linux_keeps_full_runtime(tmp_path, monkeypatch):
+    """Linux has no Darwin-specific MLX conflict and must keep the existing
+    full `hindsight-all` runtime untouched."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text('{"mode": "local_embedded"}', encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Linux", "x86_64"))
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client>=0.6.1"]
+    )
+
+    assert "hindsight-all" in deps, (
+        "Linux must keep the existing full `hindsight-all` runtime — "
+        "the #81421 fix is scoped to Intel macOS only."
+    )
+    assert not any("hindsight-all-slim" in d for d in deps)
+
+
+def test_hindsight_intel_macos_non_local_embedded_keeps_full_runtime(tmp_path, monkeypatch):
+    """The slim-routing only applies to ``local_embedded`` (and its legacy
+    alias ``local``). Other modes that legitimately want the full bundle
+    — and any mode the codebase doesn't yet expand — must stay unchanged:
+    we don't widen the slim workaround to platforms/modes that don't have
+    the MLX/x86_64 backtrack issue, and we don't pre-empt other PRs that
+    own their respective mode expansions (#81316 for ``local_external``)."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text('{"mode": "cloud"}', encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Darwin", "x86_64"))
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client>=0.6.1"]
+    )
+
+    # A mode the function does NOT expand at all (e.g. cloud-only) must
+    # pass through untouched on Intel macOS — no slim stack, no full
+    # bundle, just the declared bridge packages.
+    assert deps == ["hindsight-client>=0.6.1"], (
+        "Modes outside {local, local_embedded} must not be expanded on any "
+        "platform; the #81421 fix must be scoped narrowly to local_embedded."
+    )
+
+
+def test_hindsight_intel_macos_local_alias_uses_slim_runtime(tmp_path, monkeypatch):
+    """``local`` is a legacy alias for ``local_embedded`` and must get the
+    same Intel-macOS slim treatment, mirroring the existing alias branch
+    in the non-Intel code path."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir()
+    config_path.write_text('{"mode": "local"}', encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(memory_setup, "platform", _fake_platform("Darwin", "x86_64"))
+
+    deps = memory_setup._provider_pip_dependencies(
+        "hindsight", ["hindsight-client>=0.6.1"]
+    )
+
+    assert "hindsight-all" not in deps
+    assert any("hindsight-all-slim" in d for d in deps)
+    assert any("hindsight-api-slim" in d for d in deps)
