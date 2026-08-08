@@ -785,12 +785,18 @@ export function useSessionActions({
 
               const running = Boolean(activated.running ?? cachedViewState.busy)
 
-              // While idle, the persisted REST transcript is the display
-              // authority: session.activate returns the runtime's compressed
-              // context projection, not necessarily the complete conversation.
-              // During a live turn, keep the runtime/cache projection so an
-              // accepted but not-yet-persisted prompt or stream is never lost.
-              if (!running && persistedTranscriptPromise) {
+              // The persisted REST transcript is the source of truth for what
+              // the model sees on the NEXT submit. session.activate returns
+              // empty messages (omit_messages: true / messages_omitted), so the
+              // cached snapshot we hydrated from is the only "history" we hold
+              // — and it is a snapshot of the gateway's view at some past
+              // moment, after which the gateway may have appended further turns
+              // that the model needs to see (#81951). Awaiting the persisted
+              // transcript unconditionally — even mid-turn — keeps the model
+              // prompt in sync with the gateway; the live inflight projection
+              // is still merged on top so an in-flight tail is never lost.
+              // Watch mirrors skip the REST fetch by design (live-only).
+              if (persistedTranscriptPromise) {
                 const persisted = await persistedTranscriptPromise
 
                 if (!isCurrentResume()) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { ChatMessage } from '@/lib/chat-messages'
+import { chatMessageText, type ChatMessage } from '@/lib/chat-messages'
 
 import { reconcileResumeMessages } from './utils'
 
@@ -138,5 +138,122 @@ describe('reconcileResumeMessages — structural parts on a mid-turn switch', ()
     expect(assistant.parts.some(part => part.type === 'reasoning')).toBe(false)
     expect(assistant.parts.some(part => part.type === 'tool-call')).toBe(false)
     expect(assistant.parts).toEqual([{ type: 'text', text: 'brand new partial' }])
+  })
+})
+
+/**
+ * Resuming onto a session the gateway already owns returns a CACHED snapshot
+ * (the desktop's local mirror from a prior session.resume) — that snapshot is
+ * stale by definition because the gateway may have appended further turns
+ * after it was taken. The persisted REST transcript (getLatestSessionMessages)
+ * is what the model will see on the next submit; when it disagrees with the
+ * cached snapshot, the persisted wins (#81951).
+ *
+ * The warm-cache path applies the persisted transcript over the cached snapshot
+ * via a second reconcileResumeMessages call — exactly what the test below
+ * mirrors: pass the cached snapshot as `previousMessages` (warm path's
+ * initial step), then reconcile the persisted over the result.
+ */
+describe('reconcileResumeMessages — persisted transcript overrides stale snapshot (#81951)', () => {
+  it('appends turns the cached snapshot missed', () => {
+    // The cached snapshot was taken before the gateway received a third user
+    // turn. The persisted transcript carries it. After the merge, the third
+    // turn must be present alongside the cached rows.
+    const cached: ChatMessage[] = [
+      user('u1', 'first ask'),
+      { id: 'a1', parts: [{ type: 'text', text: 'first answer' }], role: 'assistant' },
+      user('u2', 'second ask'),
+      { id: 'a2', parts: [{ type: 'text', text: 'second answer' }], role: 'assistant' }
+    ]
+
+    const persisted: ChatMessage[] = [
+      user('u1', 'first ask'),
+      { id: 'a1', parts: [{ type: 'text', text: 'first answer' }], role: 'assistant' },
+      user('u2', 'second ask'),
+      { id: 'a2', parts: [{ type: 'text', text: 'second answer' }], role: 'assistant' },
+      user('u3', 'third ask (gateway-only)'),
+      { id: 'a3', parts: [{ type: 'text', text: 'third answer' }], role: 'assistant' }
+    ]
+
+    // Warm-path Step 1: session.activate returns empty messages (omit_messages)
+// and no inflight/queued, so activatedMessages === cachedViewState.messages.
+    const activatedMessages = reconcileResumeMessages(cached, [])
+    expect(activatedMessages.map(m => chatMessageText(m).trim() || m.id)).toEqual([
+      'first ask',
+      'first answer',
+      'second ask',
+      'second answer'
+    ])
+
+    // Warm-path Step 2 (the fix): persisted is always reconciled on top, even
+    // when the session is mid-turn — the cached snapshot must not leak into
+    // the model prompt at the expense of the gateway's authoritative history.
+    const merged = reconcileResumeMessages(persisted, activatedMessages)
+    expect(merged.map(m => chatMessageText(m).trim() || m.id)).toEqual([
+      'first ask',
+      'first answer',
+      'second ask',
+      'second answer',
+      'third ask (gateway-only)',
+      'third answer'
+    ])
+  })
+
+  it('prefers the persisted transcript text when the cached snapshot is older', () => {
+    // The cached snapshot was taken mid-response: assistant is partial. The
+    // persisted transcript carries the FULLER answer the gateway now has.
+    // Reconciling persisted on top of the snapshot must surface the newer
+    // assistant text.
+    const cached: ChatMessage[] = [
+      user('u1', 'summarize'),
+      { id: 'a1', parts: [{ type: 'text', text: 'partial answer' }], role: 'assistant' }
+    ]
+
+    const persisted: ChatMessage[] = [
+      user('u1', 'summarize'),
+      { id: 'a1', parts: [{ type: 'text', text: 'partial answer complete with conclusion' }], role: 'assistant' }
+    ]
+
+    const activatedMessages = reconcileResumeMessages(cached, [])
+    const merged = reconcileResumeMessages(persisted, activatedMessages)
+
+    expect(merged).toHaveLength(2)
+    expect(chatMessageText(merged[1]!).trim()).toBe('partial answer complete with conclusion')
+  })
+
+  it('keeps cached reasoning/tool parts even when the persisted text is newer', () => {
+    // Same scenario as the warm-cache reasoning carry-over test, but framed
+    // as a stale-snapshot merge: the snapshot has structural parts the
+    // gateway's text-only persisted dump can't carry, and we still want
+    // them on the final transcript the model sees.
+    const cached: ChatMessage[] = [
+      user('u1', 'read the config'),
+      {
+        id: 'a1',
+        parts: [
+          { type: 'reasoning', text: 'I should read the file first.' },
+          { type: 'tool-call', toolCallId: 'call-1', toolName: 'read_file', result: 'contents' },
+          { type: 'text', text: 'Reading it now' }
+        ],
+        role: 'assistant'
+      }
+    ]
+
+    // Persisted from the gateway is text-only — the tool/reasoning live in
+    // the cache. The merged transcript must keep them.
+    const persisted: ChatMessage[] = [
+      user('u1', 'read the config'),
+      { id: 'a1', parts: [{ type: 'text', text: 'Reading it now — found the key' }], role: 'assistant' }
+    ]
+
+    const activatedMessages = reconcileResumeMessages(cached, [])
+    const merged = reconcileResumeMessages(persisted, activatedMessages)
+
+    const assistant = merged[1]!
+    expect(assistant.parts.filter(p => p.type === 'tool-call')).toHaveLength(1)
+    expect(assistant.parts.filter(p => p.type === 'reasoning')).toHaveLength(1)
+    expect(assistant.parts.filter(p => p.type === 'text').at(-1)).toMatchObject({
+      text: 'Reading it now — found the key'
+    })
   })
 })
