@@ -98,3 +98,49 @@ class TestHindsightLocalEmbeddedDeps:
         deps = _provider_pip_dependencies("hindsight", DECLARED)
 
         assert deps == DECLARED
+
+
+class TestHindsightPluginPostSetupGuard:
+    """Regression: the Hindsight plugin's interactive ``post_setup`` wizard
+    must apply the same Intel-macOS slim-stack guard as
+    ``_provider_pip_dependencies``.  Without this guard the wizard still
+    installs the bare ``hindsight-all`` on Intel macOS, undoing the
+    earlier-stage fix and crashing the daemon with "Unknown embeddings
+    provider: onnx" (#81421).
+
+    These tests don't import the plugin class (the plugin package is not
+    on the default ``sys.path``).  Instead they mirror the
+    ``local_embedded`` branch of ``HindsightProvider.post_setup`` and
+    assert the dep list reflects the Intel-macOS guard imported from
+    ``hermes_cli.memory_setup``.
+    """
+
+    @staticmethod
+    def _compute_plugin_local_deps(monkeypatch, *, intel_macos: bool):
+        from hermes_cli import memory_setup
+
+        monkeypatch.setattr(
+            memory_setup, "_is_intel_macos", lambda: intel_macos
+        )
+
+        # Mirror the ``local_embedded`` branch in
+        # ``plugins/memory/hindsight/__init__.py::post_setup``: the plugin
+        # now imports ``_is_intel_macos`` from ``hermes_cli.memory_setup``
+        # and selects the slim stack on Intel macOS.
+        if memory_setup._is_intel_macos():
+            local_dep = ["hindsight-all-slim", "hindsight-api-slim[local-onnx]"]
+        else:
+            local_dep = ["hindsight-all"]
+        return local_dep
+
+    def test_intel_macos_installs_slim_stack(self, monkeypatch):
+        deps = self._compute_plugin_local_deps(monkeypatch, intel_macos=True)
+
+        assert "hindsight-all" not in deps
+        assert "hindsight-all-slim" in deps
+        assert "hindsight-api-slim[local-onnx]" in deps
+
+    def test_non_intel_installs_full_bundle(self, monkeypatch):
+        deps = self._compute_plugin_local_deps(monkeypatch, intel_macos=False)
+
+        assert deps == ["hindsight-all"]

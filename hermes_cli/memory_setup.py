@@ -172,6 +172,8 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
         "mem0ai": "mem0",
         "hindsight-client": "hindsight_client",
         "hindsight-all": "hindsight",
+        "hindsight-all-slim": "hindsight_all_slim",
+        "hindsight-api-slim": "hindsight_api_slim",
     }
 
     # Check which packages need installation.
