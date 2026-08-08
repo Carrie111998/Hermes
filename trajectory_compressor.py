@@ -680,7 +680,7 @@ class TrajectoryCompressor:
                 
             except Exception as e:
                 metrics.summarization_errors += 1
-                self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
                 
                 if attempt < self.config.max_retries - 1:
                     time.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
@@ -734,7 +734,7 @@ class TrajectoryCompressor:
                 
             except Exception as e:
                 metrics.summarization_errors += 1
-                self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
+                self.logger.warning("Summarization attempt %d failed: %s", attempt + 1, e)
                 
                 if attempt < self.config.max_retries - 1:
                     await asyncio.sleep(jittered_backoff(attempt + 1, base_delay=self.config.retry_delay, max_delay=30.0))
@@ -1013,7 +1013,7 @@ class TrajectoryCompressor:
         jsonl_files = sorted(input_dir.glob("*.jsonl"))
         
         if not jsonl_files:
-            self.logger.warning(f"No JSONL files found in {input_dir}")
+            self.logger.warning("No JSONL files found in %s", input_dir)
             return
         
         # Load ALL entries from all files
@@ -1029,7 +1029,7 @@ class TrajectoryCompressor:
                             entry = json.loads(line)
                             all_entries.append((file_path, line_num, entry))
                         except json.JSONDecodeError as e:
-                            self.logger.warning(f"Skipping invalid JSON at {file_path}:{line_num}: {e}")
+                            self.logger.warning("Skipping invalid JSON at %s:%s: %s", file_path, line_num, e)
         
         total_entries = len(all_entries)
         
@@ -1098,7 +1098,7 @@ class TrajectoryCompressor:
                         )
                 
                 except asyncio.TimeoutError:
-                    self.logger.warning(f"Timeout processing entry from {file_path}:{entry_idx} (>{self.config.per_trajectory_timeout}s)")
+                    self.logger.warning("Timeout processing entry from %s:%s (>%ss)", file_path, entry_idx, self.config.per_trajectory_timeout)
                     
                     async with progress_lock:
                         self.aggregate_metrics.trajectories_failed += 1
@@ -1114,7 +1114,7 @@ class TrajectoryCompressor:
                     results[file_path][entry_idx] = None
                     
                 except Exception as e:
-                    self.logger.error(f"Error processing entry from {file_path}:{entry_idx}: {e}")
+                    self.logger.error("Error processing entry from %s:%s: %s", file_path, entry_idx, e)
                     
                     async with progress_lock:
                         self.aggregate_metrics.trajectories_failed += 1
