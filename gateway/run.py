@@ -63,7 +63,11 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
 )
-from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.config import (
+    _is_ssh_remote_tilde_cwd,
+    cfg_get,
+    resolve_personality_overlay,
+)
 from hermes_cli.fallback_config import get_fallback_chain
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -8169,16 +8173,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _load_ephemeral_system_prompt() -> str:
-        """Load ephemeral system prompt from config or env var.
-        
-        Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then falls back to
-        agent.system_prompt in ~/.hermes/config.yaml.
+        """Load the prompt overlay from config or env var.
+
+        Checks HERMES_EPHEMERAL_SYSTEM_PROMPT env var first, then composes the
+        manual agent.system_prompt with the selected display.personality in
+        ~/.hermes/config.yaml.
         """
         prompt = os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        return resolve_personality_overlay(cfg)
 
     def _resolve_model_for_channel(
         self,

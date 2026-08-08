@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
+from hermes_cli.config import resolve_personality_overlay
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
@@ -4502,11 +4503,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
-        # Ephemeral system prompt: env var takes precedence, then config
-        self.system_prompt = (
-            os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
-            or CLI_CONFIG["agent"].get("system_prompt", "")
-        )
+        # Prompt overlay: env var wins, then the user's manual
+        # agent.system_prompt composed with the selected display.personality.
+        self.system_prompt = os.getenv(
+            "HERMES_EPHEMERAL_SYSTEM_PROMPT", ""
+        ) or resolve_personality_overlay(CLI_CONFIG)
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
