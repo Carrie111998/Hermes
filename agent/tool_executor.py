@@ -884,12 +884,55 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # later and dispatching a tool the turn has already reported as timed out.
     batch_abandoned = threading.Event()
     authorization_gate = _ConcurrentToolAuthorizationGate()
+    batch_mutation_state = getattr(agent, "_turn_failed_file_mutations", None)
+    batch_mutation_lock = getattr(agent, "_turn_file_mutation_state_lock", None)
+    if batch_mutation_lock is None:
+        batch_mutation_lock = threading.Lock()
+        agent._turn_file_mutation_state_lock = batch_mutation_lock
+    recorded_mutation_indices: set[int] = set()
+
+    def _record_batch_file_mutation(
+        index: int,
+        function_name: str,
+        function_args: dict[str, Any],
+        result: Any,
+        is_error: bool,
+        blocked: bool,
+        *,
+        allow_abandoned: bool = False,
+        fingerprint_failures: bool = True,
+    ) -> None:
+        """Record against this batch's turn state, never a later turn's state."""
+        if blocked or batch_mutation_state is None:
+            return
+        try:
+            with batch_mutation_lock:
+                if batch_abandoned.is_set() and not allow_abandoned:
+                    return
+                if getattr(agent, "_turn_failed_file_mutations", None) is not batch_mutation_state:
+                    return
+                agent._record_file_mutation_result(
+                    function_name,
+                    function_args,
+                    result,
+                    is_error,
+                    task_id=effective_task_id,
+                    expected_state=batch_mutation_state,
+                    fingerprint_failures=fingerprint_failures,
+                )
+                recorded_mutation_indices.add(index)
+        except Exception as _ver_err:
+            logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
     def _abandon_batch() -> None:
         """Release every gate-parked worker so none dispatches post-abandon."""
         batch_abandoned.set()
         with start_condition:
             start_condition.notify_all()
+        # Fence any recorder that passed its pre-abandon check. Once this lock
+        # round-trip completes, detached workers can no longer mutate the turn.
+        with batch_mutation_lock:
+            pass
 
     # The gate bound must sit UNDER the batch deadline, otherwise the deadline
     # fires first and the parked workers are still falsely reported as timed
@@ -999,25 +1042,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         dispatched = False
         start_advanced = False
 
-        def _record_file_mutation(result: Any, is_error: bool, is_blocked: bool) -> None:
-            """Record at worker completion before a sibling can hide recovery order."""
-            if is_blocked:
-                return
-            try:
-                state_lock = getattr(agent, "_turn_file_mutation_state_lock", None)
-                if state_lock is None:
-                    state_lock = threading.Lock()
-                    agent._turn_file_mutation_state_lock = state_lock
-                with state_lock:
-                    agent._record_file_mutation_result(
-                        function_name,
-                        function_args,
-                        result,
-                        is_error,
-                        task_id=effective_task_id,
-                    )
-            except Exception as _ver_err:
-                logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
         def _advance_start(callback=None) -> None:
             nonlocal start_advanced
@@ -1097,7 +1121,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
-                _record_file_mutation(result, True, False)
+                _record_batch_file_mutation(
+                    index, function_name, function_args, result, True, False,
+                )
                 results[index] = (
                     function_name,
                     function_args,
@@ -1128,7 +1154,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            _record_file_mutation(result, is_error, blocked)
+            _record_batch_file_mutation(
+                index, function_name, function_args, result, is_error, blocked,
+            )
             results[index] = (
                 function_name,
                 function_args,
@@ -1465,6 +1493,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
+
+        if i not in recorded_mutation_indices:
+            _record_batch_file_mutation(
+                i,
+                name,
+                args,
+                function_result,
+                is_error,
+                blocked,
+                allow_abandoned=True,
+                fingerprint_failures=False,
+            )
 
         agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""

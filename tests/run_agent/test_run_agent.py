@@ -2185,6 +2185,71 @@ class TestConcurrentToolExecution:
         assert target.read_text(encoding="utf-8") == "after\n"
         assert agent._unresolved_file_mutation_failures() == {}
 
+    def test_concurrent_mutation_timeout_is_recorded_and_late_worker_is_fenced(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A timeout stays unresolved and its detached worker cannot touch a later turn."""
+        import types
+        import agent.tool_executor as tool_executor
+
+        target = tmp_path / "timed-out.txt"
+        target.write_text("before\n", encoding="utf-8")
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_fingerprint_bytes = 0
+        agent._turn_file_mutation_fingerprint_budget_exhausted = False
+        agent._turn_file_mutation_fingerprint_lock = threading.Lock()
+        agent._turn_file_mutation_state_lock = threading.Lock()
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+        monkeypatch.setattr(tool_executor, "_resolve_concurrent_tool_timeout", lambda: 0.05)
+        monkeypatch.setattr(
+            tool_executor,
+            "_ra",
+            lambda: types.SimpleNamespace(_set_interrupt=lambda *_args, **_kwargs: None),
+        )
+
+        def invoke(*_args, **_kwargs):
+            assert release_worker.wait(timeout=2)
+            worker_finished.set()
+            return json.dumps({"success": True, "resolved_path": str(target)})
+
+        monkeypatch.setattr(agent, "_invoke_tool", invoke)
+        patch_call = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            }),
+            call_id="patch-timeout",
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[patch_call])
+
+        agent._execute_tool_calls_concurrent(message, [], "task-1")
+
+        old_state = agent._turn_failed_file_mutations
+        assert str(target) in old_state
+        assert old_state[str(target)]["fingerprint"] is None
+
+        next_state = {
+            str(target): {
+                "tool": "patch",
+                "error_preview": "next-turn failure",
+            }
+        }
+        agent._turn_failed_file_mutations = next_state
+        agent._turn_file_mutation_state_lock = threading.Lock()
+        release_worker.set()
+        assert worker_finished.wait(timeout=2)
+        assert agent._turn_failed_file_mutations is next_state
+        assert next_state[str(target)]["error_preview"] == "next-turn failure"
+
     def test_agent_runtime_post_hook_ownership_predicate_covers_agent_tools(self, agent):
         """Sequential and concurrent agent-level paths share post-hook ownership."""
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook

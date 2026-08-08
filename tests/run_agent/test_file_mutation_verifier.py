@@ -19,6 +19,7 @@ when a later on-disk change proves recovery through another route.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -177,6 +178,76 @@ class TestRecordFileMutationResult:
         )
 
         assert agent._unresolved_file_mutation_failures() == {}
+
+    def test_failure_uses_resolved_target_reported_by_tool(self, tmp_path, monkeypatch):
+        agent = _bare_agent()
+        actual = tmp_path / "actual.txt"
+        wrong = tmp_path / "wrong.txt"
+        actual.write_text("actual baseline\n", encoding="utf-8")
+        wrong.write_text("wrong baseline\n", encoding="utf-8")
+        monkeypatch.setattr(
+            agent,
+            "_resolve_file_mutation_target",
+            lambda *_args, **_kwargs: str(wrong),
+        )
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "relative.txt", "old_string": "x", "new_string": "y"},
+            json.dumps({
+                "error": "Could not find old_string",
+                "resolved_path": str(actual),
+            }),
+            is_error=True,
+        )
+
+        info = agent._turn_failed_file_mutations["relative.txt"]
+        assert info["resolved_path"] == str(actual)
+        assert info["fingerprint"] == (
+            "file",
+            actual.stat().st_size,
+            hashlib.sha256(actual.read_bytes()).hexdigest(),
+        )
+
+    def test_patch_failure_reports_exact_resolved_target(self, tmp_path):
+        from tools.file_tools import patch_tool
+
+        target = tmp_path / "target.txt"
+        target.write_text("actual content\n", encoding="utf-8")
+
+        result = json.loads(patch_tool(
+            mode="replace",
+            path=str(target),
+            old_string="missing content",
+            new_string="replacement",
+            task_id="mutation-verifier-test",
+        ))
+
+        assert result.get("error")
+        assert result["resolved_path"] == str(target)
+        assert result["resolved_paths"] == [str(target)]
+
+    def test_stale_expected_state_cannot_mutate_next_turn(self):
+        agent = _bare_agent()
+        old_state = agent._turn_failed_file_mutations
+        next_state = {
+            "/tmp/a.md": {
+                "tool": "patch",
+                "error_preview": "next-turn failure",
+            }
+        }
+        agent._turn_failed_file_mutations = next_state
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
+            json.dumps({"success": True}),
+            is_error=False,
+            expected_state=old_state,
+        )
+
+        assert agent._turn_failed_file_mutations is next_state
+        assert next_state["/tmp/a.md"]["error_preview"] == "next-turn failure"
 
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()
