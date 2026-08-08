@@ -8,6 +8,7 @@ per-thread read-only connection under WAL, never touch self._lock, and fall
 back to the legacy locked path when WAL or the read connection is missing.
 """
 
+import gc
 import threading
 
 import pytest
@@ -37,6 +38,25 @@ def test_read_conn_is_per_thread(db):
     t1.start(); t2.start(); t1.join(); t2.join()
     assert conns[1] is not None and conns[2] is not None
     assert conns[1] is not conns[2]
+
+
+@pytest.mark.requires_wal
+def test_short_lived_reader_threads_release_their_connections(db):
+    """A long-running gateway must not retain one SQLite FD pair per worker.
+
+    Gateway/webhook work uses short-lived threads.  The read connection is
+    thread-scoped, so the thread's exit is also the connection's ownership
+    boundary; retaining those connections until gateway shutdown eventually
+    exhausts macOS launchd's file-descriptor limit.
+    """
+    for _ in range(40):
+        thread = threading.Thread(target=lambda: db.get_session("s1"))
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    gc.collect()
+    assert len(db._read_conns) <= 8
 
 
 def test_read_conn_reused_within_thread(db):

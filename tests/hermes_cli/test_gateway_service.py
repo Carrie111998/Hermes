@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,6 +232,16 @@ class TestGeneratedSystemdUnits:
 
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
+
+    def test_launchd_plist_has_gateway_file_descriptor_headroom(self):
+        """launchd's 256-file default is below a normal busy gateway footprint."""
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode())
+
+        assert plist["SoftResourceLimits"]["NumberOfFiles"] >= 8192
+        assert (
+            plist["HardResourceLimits"]["NumberOfFiles"]
+            >= plist["SoftResourceLimits"]["NumberOfFiles"]
+        )
 
 
 
@@ -1995,4 +2006,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
-

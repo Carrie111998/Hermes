@@ -7,11 +7,13 @@ context.  This is the property the old process-global
 ``contextlib.redirect_stdout(devnull)`` violated (issue #55769 / #55925).
 """
 
+import contextlib
 import io
 import sys
 import threading
 import time
 
+import agent.thread_scoped_output as thread_output
 from agent.thread_scoped_output import thread_scoped_silence
 
 
@@ -94,3 +96,31 @@ def test_repeated_contexts_never_write_to_a_closed_sink():
             sys.stdout.fileno()
     finally:
         sys.stdout = original
+
+
+def test_temporary_global_redirects_do_not_allocate_new_sinks(monkeypatch):
+    """A displaced proxy is temporary, not a reason to leak another FD pair."""
+    opened_sinks = []
+
+    def fake_open(*_args, **_kwargs):
+        sink = io.StringIO()
+        opened_sinks.append(sink)
+        return sink
+
+    monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "open", fake_open, raising=False)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    try:
+        with thread_scoped_silence():
+            pass
+        assert len(opened_sinks) == 2
+
+        for _ in range(20):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with thread_scoped_silence():
+                    print("hidden")
+
+        assert len(opened_sinks) == 2
+    finally:
+        sys.stdout, sys.stderr = original_stdout, original_stderr
