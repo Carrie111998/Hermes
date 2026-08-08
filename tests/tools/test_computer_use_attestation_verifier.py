@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -27,11 +26,26 @@ def _review_root(tmp_path: Path) -> Path:
     from tools.computer_use.tool import _CUA_ATTESTATION_MODULES
 
     review = tmp_path / "review"
-    for relative in _CUA_ATTESTATION_MODULES:
-        source = ROOT / relative
-        destination = review / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+    subprocess.run(
+        ["git", "clone", "--quiet", "--no-checkout", "--shared", str(ROOT), str(review)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=review,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "sparse-checkout", "set", "--no-cone", *_CUA_ATTESTATION_MODULES],
+        cwd=review,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "--quiet", "--detach", "HEAD"],
+        cwd=review,
+        check=True,
+    )
     return review
 
 
@@ -58,7 +72,7 @@ def test_verifier_accepts_exact_reviewed_source(tmp_path, monkeypatch):
     receipt = _receipt(tmp_path, monkeypatch)
     result = _verify(receipt, _review_root(tmp_path))
     assert result.returncode == 0, result.stderr
-    assert "reviewed content identity" in result.stdout
+    assert "verified commit identity" in result.stdout
 
 
 def test_verifier_recomputes_callable_fingerprint_from_reviewed_source(tmp_path, monkeypatch):
@@ -109,11 +123,6 @@ def test_verifier_rejects_forged_clean_claim_for_dirty_review_source(tmp_path, m
     receipt = _receipt(tmp_path, monkeypatch)
     data = json.loads(receipt.read_text(encoding="utf-8"))
     review = _review_root(tmp_path)
-    subprocess.run(["git", "init"], cwd=review, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=review, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=review, check=True)
-    subprocess.run(["git", "add", "."], cwd=review, check=True)
-    subprocess.run(["git", "commit", "-m", "review baseline"], cwd=review, check=True, capture_output=True)
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=review, text=True).strip()
     target_relative = "tools/approval.py"
     target = review / target_relative
