@@ -1207,6 +1207,39 @@ class TestBuildJobPromptBumpUse:
             for call in mock_bump.call_args_list
         )
 
+    def test_skill_prompt_keeps_run_data_outside_the_cacheable_prefix(self):
+        from agent.prompt_caching import apply_anthropic_cache_control
+
+        def _skill_view(name: str) -> str:
+            return json.dumps({"success": True, "content": f"Stable content for {name}."})
+
+        with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
+             patch("tools.skill_usage.bump_use"):
+            first = _build_job_prompt({
+                "id": "cron-task",
+                "skills": ["alpha", "beta"],
+                "prompt": "ticket=A/time=1",
+            })
+            second = _build_job_prompt({
+                "id": "cron-task",
+                "skills": ["alpha", "beta"],
+                "prompt": "ticket=B/time=2",
+            })
+
+        first_wire = apply_anthropic_cache_control(
+            [{"role": "user", "content": first}],
+            native_anthropic=True,
+        )[0]["content"]
+        second_wire = apply_anthropic_cache_control(
+            [{"role": "user", "content": second}],
+            native_anthropic=True,
+        )[0]["content"]
+
+        assert first_wire[0] == second_wire[0]
+        assert first_wire[0]["cache_control"] == {"type": "ephemeral"}
+        assert first_wire[1]["text"].endswith("ticket=A/time=1")
+        assert second_wire[1]["text"].endswith("ticket=B/time=2")
+
 
 class TestSendMediaViaAdapter:
     """Unit tests for _send_media_via_adapter — routes files to typed adapter methods."""

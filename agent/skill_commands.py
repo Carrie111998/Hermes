@@ -97,6 +97,40 @@ def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
     return None
 
 
+def split_skill_message_for_cache(content: Any) -> Optional[tuple[str, str]]:
+    """Split stable single-skill scaffolding from its volatile invocation tail.
+
+    The returned boundary is used only while decorating an outgoing provider
+    request. The canonical conversation message remains a string, preserving
+    persistence, transcript rendering, and memory-provider behavior.
+
+    Cron's one-or-more-skill prompt uses the same activation and instruction
+    markers as the slash-skill builder, so it gets the same boundary without
+    route-specific cache logic. Bundle messages are intentionally excluded:
+    their user instruction currently precedes the loaded skill blocks and is
+    therefore not a stable-prefix layout.
+    """
+    if not isinstance(content, str) or not content.startswith(_SKILL_INVOCATION_PREFIX):
+        return None
+    if _SINGLE_SKILL_MARKER not in content:
+        return None
+
+    instruction_boundary = f"\n\n{_SINGLE_SKILL_INSTRUCTION}"
+    boundary_index = content.rfind(instruction_boundary)
+    if boundary_index >= 0:
+        split_index = boundary_index + len(instruction_boundary)
+    else:
+        boundary_index = content.rfind(_RUNTIME_NOTE)
+        if boundary_index < 0:
+            return None
+        split_index = boundary_index + len(_RUNTIME_NOTE)
+
+    prefix, suffix = content[:split_index], content[split_index:]
+    if not prefix or not suffix:
+        return None
+    return prefix, suffix
+
+
 def describe_skill_invocation(content: Any, separator: str = " — ") -> Optional[str]:
     """Render a slash-skill-expanded turn the way the user typed it.
 
