@@ -12010,6 +12010,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
         )
 
+        # Source/ownership check (#81513): never hijack a live gateway
+        # session. The destination key may already be bound to a session
+        # the gateway is actively serving (e.g. an ongoing QQ conversation
+        # on the home channel). switch_session would END that session and
+        # rebind the key to the CLI session — silently replacing a live
+        # conversation with the CLI's, making the old history unreachable
+        # from the platform. Only proceed when the destination is unbound,
+        # bound to the CLI session itself (Case B — already gateway-owned),
+        # or bound to a session that is closed or an empty fresh reset.
+        await self.async_session_store._ensure_loaded()
+        existing_entry = self.session_store._entries.get(session_key)  # noqa: SLF001
+        if existing_entry is not None:
+            bound_session_id = existing_entry.session_id
+            if bound_session_id == cli_session_id:
+                raise RuntimeError(
+                    f"session {cli_session_id} is already the gateway session "
+                    f"for {session_key}; nothing to hand off"
+                )
+            try:
+                bound_row = (
+                    None
+                    if self._session_db is None
+                    else await self._session_db.get_session(bound_session_id)
+                )
+            except Exception:
+                bound_row = None
+            if (
+                bound_row is not None
+                and bound_row.get("ended_at") is None
+                and (bound_row.get("message_count") or 0) > 0
+            ):
+                raise RuntimeError(
+                    f"destination {session_key} is already bound to live gateway "
+                    f"session {bound_session_id}; end that conversation first "
+                    f"(e.g. /new on the platform) before handing off"
+                )
+
         # Make sure there's an entry in the session_store for this key. If
         # the home channel has never been used, get_or_create_session
         # creates one; switch_session then re-points it.
