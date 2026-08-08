@@ -6499,6 +6499,78 @@ skills:
     assert "tooltrust" not in texts
 
 
+def test_complete_slash_hides_bundles_when_governance_config_is_malformed(
+    monkeypatch, tmp_path
+):
+    import agent.skill_bundles as skill_bundles_mod
+    import agent.skill_commands as skill_commands_mod
+    import tools.skills_tool as skills_tool_module
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    home.mkdir()
+    skills_dir.mkdir()
+    (home / "config.yaml").write_text("skills:\n  governance: []\n", encoding="utf-8")
+    (skills_dir / "SafeSkill").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "SafeSkill" / "SKILL.md").write_text(
+        "---\nname: SafeSkill\ndescription: allowed\n---\n\n# SafeSkill\n\nAllowed.\n",
+        encoding="utf-8",
+    )
+    bundles_dir.mkdir(parents=True, exist_ok=True)
+    (bundles_dir / "safe-pack.yaml").write_text(
+        "name: safe-pack\nskills:\n  - SafeSkill\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+    skill_bundles_mod._bundles_cache = {}
+    skill_bundles_mod._bundles_cache_mtime = None
+
+    items = _slash_completions("/safe")
+    texts = {item["text"].strip() for item in items if item["kind"] == "skill"}
+
+    assert "safe-pack" not in texts
+
+
+def test_complete_slash_keeps_bundles_visible_when_unprotected(monkeypatch, tmp_path):
+    import agent.skill_bundles as skill_bundles_mod
+    import agent.skill_commands as skill_commands_mod
+    import tools.skills_tool as skills_tool_module
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    skills_dir.mkdir()
+    (skills_dir / "SafeSkill").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "SafeSkill" / "SKILL.md").write_text(
+        "---\nname: SafeSkill\ndescription: allowed\n---\n\n# SafeSkill\n\nAllowed.\n",
+        encoding="utf-8",
+    )
+    bundles_dir.mkdir(parents=True, exist_ok=True)
+    (bundles_dir / "safe-pack.yaml").write_text(
+        "name: safe-pack\nskills:\n  - SafeSkill\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+    skill_bundles_mod._bundles_cache = {}
+    skill_bundles_mod._bundles_cache_mtime = None
+
+    items = _slash_completions("/safe")
+    texts = {item["text"].strip() for item in items if item["kind"] == "skill"}
+
+    assert "safe-pack" in texts
+
+
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")

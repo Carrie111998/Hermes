@@ -21,6 +21,17 @@ description: Description for {name}.
     )
 
 
+def _make_bundle(bundles_dir: Path, slug: str, skills: list[str]) -> None:
+    bundles_dir.mkdir(parents=True, exist_ok=True)
+    (bundles_dir / f"{slug}.yaml").write_text(
+        "name: {slug}\nskills:\n{skills}\n".format(
+            slug=slug,
+            skills="\n".join(f"  - {skill}" for skill in skills),
+        ),
+        encoding="utf-8",
+    )
+
+
 def _configure_protected_governance(home: Path) -> None:
     (home / "governance").mkdir(parents=True, exist_ok=True)
     (home / "config.yaml").write_text(
@@ -114,3 +125,71 @@ def test_cli_completer_hides_governance_blocked_skills(monkeypatch, tmp_path):
 
     assert "safeskill" in texts
     assert "tooltrust" not in texts
+
+
+def test_show_help_hides_bundles_when_governance_config_is_malformed(monkeypatch, tmp_path):
+    import agent.skill_bundles as skill_bundles_mod
+    import cli as cli_mod
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    home.mkdir()
+    skills_dir.mkdir()
+    (home / "config.yaml").write_text("skills:\n  governance: []\n", encoding="utf-8")
+    _make_skill(skills_dir, "SafeSkill", body="allowed")
+    _make_bundle(bundles_dir, "safe-pack", ["SafeSkill"])
+
+    printed: list[str] = []
+
+    class _FakeChatConsole:
+        def print(self, *args, **kwargs):
+            printed.append(" ".join(str(arg) for arg in args))
+
+    cli_obj = _make_cli()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(cli_mod, "_skill_bundles", None)
+    monkeypatch.setattr(skill_bundles_mod, "_bundles_cache", {})
+    monkeypatch.setattr(skill_bundles_mod, "_bundles_cache_mtime", None)
+    monkeypatch.setattr(cli_mod, "ChatConsole", _FakeChatConsole)
+    monkeypatch.setattr(cli_mod, "_cprint", lambda text: printed.append(str(text)))
+
+    cli_obj.show_help()
+
+    output = "\n".join(printed)
+    assert "/safe-pack" not in output
+
+
+def test_show_help_keeps_bundles_visible_when_unprotected(monkeypatch, tmp_path):
+    import agent.skill_bundles as skill_bundles_mod
+    import cli as cli_mod
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    bundles_dir = tmp_path / "bundles"
+    skills_dir.mkdir()
+    _make_skill(skills_dir, "SafeSkill", body="allowed")
+    _make_bundle(bundles_dir, "safe-pack", ["SafeSkill"])
+
+    printed: list[str] = []
+
+    class _FakeChatConsole:
+        def print(self, *args, **kwargs):
+            printed.append(" ".join(str(arg) for arg in args))
+
+    cli_obj = _make_cli()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles_dir))
+    monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(cli_mod, "_skill_bundles", None)
+    monkeypatch.setattr(skill_bundles_mod, "_bundles_cache", {})
+    monkeypatch.setattr(skill_bundles_mod, "_bundles_cache_mtime", None)
+    monkeypatch.setattr(cli_mod, "ChatConsole", _FakeChatConsole)
+    monkeypatch.setattr(cli_mod, "_cprint", lambda text: printed.append(str(text)))
+
+    cli_obj.show_help()
+
+    output = "\n".join(printed)
+    assert "/safe-pack" in output

@@ -10,6 +10,7 @@ from agent.skill_bundles import (
     _slugify,
     build_bundle_invocation_message,
     delete_bundle,
+    get_discoverable_skill_bundles,
     get_bundle,
     get_skill_bundles,
     list_bundles,
@@ -145,6 +146,52 @@ class TestGetSkillBundles:
         result = get_skill_bundles()
         assert "/a" in result
         assert "/b" in result
+
+
+class TestDiscoverableSkillBundles:
+    def test_hides_bundle_with_governance_blocked_member(self, bundles_env, monkeypatch):
+        bundles_dir, skills_dir = bundles_env
+        home = bundles_dir.parent / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(
+            home,
+            """\
+  - name: skill-a
+    classification: CURRENT
+  - name: skill-b
+    classification: COMPATIBILITY_ONLY
+""",
+        )
+        _make_skill(skills_dir, "skill-a", body="safe")
+        _make_skill(skills_dir, "skill-b", body="blocked")
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a", "skill-b"])
+
+        assert get_discoverable_skill_bundles() == {}
+
+    def test_fail_closes_when_governance_config_is_malformed(self, bundles_env, monkeypatch):
+        bundles_dir, skills_dir = bundles_env
+        home = bundles_dir.parent / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        (home / "config.yaml").write_text(
+            "skills:\n  governance: []\n",
+            encoding="utf-8",
+        )
+        _make_skill(skills_dir, "skill-a", body="safe")
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a"])
+
+        assert get_discoverable_skill_bundles() == {}
+
+    def test_preserves_unprotected_behavior(self, bundles_env, monkeypatch):
+        bundles_dir, skills_dir = bundles_env
+        home = bundles_dir.parent / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _make_skill(skills_dir, "skill-a", body="safe")
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a"])
+
+        visible = get_discoverable_skill_bundles()
+
+        assert list(visible) == ["/combo"]
 
 
 class TestResolveBundleCommandKey:

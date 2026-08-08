@@ -4058,6 +4058,12 @@ def get_skill_bundles() -> dict:
     return _skill_bundles
 
 
+def get_discoverable_skill_bundles() -> dict:
+    from agent.skill_bundles import get_discoverable_skill_bundles as _impl
+
+    return _impl()
+
+
 def build_bundle_invocation_message(*args, **kwargs):
     from agent.skill_bundles import build_bundle_invocation_message as _impl
 
@@ -7719,7 +7725,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] {_escape(info['description'])}"
                 )
 
-        _bundles_now = get_skill_bundles()
+        _bundles_now = get_discoverable_skill_bundles()
         if _bundles_now:
             _cprint(f"\n  ▣ {_BOLD}Skill Bundles{_RST} ({len(_bundles_now)} installed):")
             for cmd, info in sorted(_bundles_now.items()):
@@ -16308,7 +16314,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _completer = SlashCommandCompleter(
             skill_commands_provider=lambda: get_skill_commands(),
             command_filter=cli_ref._command_available,
-            skill_bundles_provider=lambda: get_skill_bundles(),
+            skill_bundles_provider=lambda: get_discoverable_skill_bundles(),
         )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
