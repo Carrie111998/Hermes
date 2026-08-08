@@ -1,8 +1,8 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
-import { desktopGit } from '@/lib/desktop-git'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
+import { desktopGit } from '@/lib/desktop-git'
 
 import {
   $projectScope,

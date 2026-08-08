@@ -14,9 +14,8 @@ import {
   repoStatusForCwd,
   resolveWorktreeRepoPath
 } from './coding-status'
-import { $connection, $currentCwd, $selectedStoredSessionId } from './session'
+import { $connection, $currentCwd, $selectedStoredSessionId, setActiveSessionId } from './session'
 import { $sessionStates } from './session-states'
-import { setActiveSessionId } from './session'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
