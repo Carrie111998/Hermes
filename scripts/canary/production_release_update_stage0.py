@@ -69,6 +69,9 @@ _JSON_INPUTS = {
     "host_mutation_authority_sha256": (
         "host-mutation-authority-receipt.json"
     ),
+    "host_mutation_initial_collector_receipt_sha256": (
+        "host-mutation-initial-collector-receipt.json"
+    ),
     "cron_artifact_index_sha256": "cron-artifact-index.json",
     "alias_artifact_index_sha256": "alias-artifact-index.json",
     "successor_unit_input_publication_sha256": (
@@ -90,6 +93,7 @@ _SEMANTIC_JSON_INPUTS = frozenset(
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
         "host_mutation_authority_sha256",
+        "host_mutation_initial_collector_receipt_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -104,6 +108,7 @@ _INTERNAL_IDENTITY_FIELDS = {
     "release_consumer_set_sha256": "consumer_set_sha256",
     "host_artifact_manifest_sha256": "manifest_sha256",
     "host_mutation_authority_sha256": "receipt_sha256",
+    "host_mutation_initial_collector_receipt_sha256": "receipt_sha256",
     "cron_artifact_index_sha256": "artifact_index_sha256",
     "alias_artifact_index_sha256": "package_sha256",
     "successor_unit_input_publication_sha256": "publication_sha256",

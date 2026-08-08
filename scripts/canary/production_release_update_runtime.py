@@ -20,8 +20,8 @@ from scripts.canary import production_cutover_activation_lock as authority_lock
 from scripts.canary import production_release_update_contract as authority
 
 
-INTENT_SCHEMA = "muncho-production-release-update-intent.v5"
-AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v3"
+INTENT_SCHEMA = "muncho-production-release-update-intent.v6"
+AUTHORITY_RECORD_SCHEMA = "muncho-production-release-update-authority-record.v4"
 EVENT_SCHEMA = "muncho-production-release-update-event.v2"
 ZERO_SHA256 = "0" * 64
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -431,6 +431,7 @@ _PLAN_PROJECTION_FIELDS = (
     "release_consumer_set_sha256",
     "host_artifact_manifest_sha256",
     "host_mutation_authority_sha256",
+    "host_mutation_initial_collector_receipt_sha256",
     "cron_artifact_index_sha256",
     "alias_artifact_index_sha256",
     "successor_unit_input_publication_sha256",

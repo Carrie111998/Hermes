@@ -53,7 +53,7 @@ def test_signed_publication_deterministically_defines_transaction_identity() -> 
     assert first_intent == replayed_intent
     assert first_record == replayed_record
     assert first_record["intent"] == first_intent
-    assert first_intent["schema"] == "muncho-production-release-update-intent.v5"
+    assert first_intent["schema"] == "muncho-production-release-update-intent.v6"
     assert first_intent["transaction_nonce_sha256"] == approval["nonce_sha256"]
     assert first_intent["created_at_unix"] == approval["issued_at_unix"]
     assert first_intent["created_at_unix"] == first_intent["approval_issued_at_unix"]

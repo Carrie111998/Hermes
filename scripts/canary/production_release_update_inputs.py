@@ -26,6 +26,8 @@ from gateway import production_alias_projection_units as alias_units
 from gateway import production_cron_continuity_package as trusted_cron
 from ops.muncho.runtime import trusted_cron_collector_rail as cron_rail
 from scripts.canary import package_production_cutover_artifacts as host_package
+from scripts.canary import production_cutover_host_authority as host_authority
+from scripts.canary import production_cutover_owner_launcher as cutover_owner
 from scripts.canary import production_release_consumer_inventory as inventory
 from scripts.canary import production_release_host_observer as host_observer
 from scripts.canary import production_release_unit_inputs_v4 as unit_inputs_v4
@@ -36,8 +38,8 @@ from scripts.canary import production_release_update_runtime as update_runtime
 RELEASE_CONSUMER_SET_SCHEMA = (
     "muncho-production-release-consumer-set.v1"
 )
-ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v3"
-ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v3"
+ACTIVATION_PLAN_SCHEMA = "muncho-production-release-activation-plan.v4"
+ROLLBACK_PLAN_SCHEMA = "muncho-production-release-rollback-plan.v4"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -47,6 +49,7 @@ _DOCUMENT_FIELDS = frozenset(
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
         "host_mutation_authority_sha256",
+        "host_mutation_initial_collector_receipt_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -60,6 +63,7 @@ _ARTIFACT_IDENTITY_FIELDS = frozenset(
         "release_consumer_set_sha256",
         "host_artifact_manifest_sha256",
         "host_mutation_authority_sha256",
+        "host_mutation_initial_collector_receipt_sha256",
         "cron_artifact_index_sha256",
         "alias_artifact_index_sha256",
         "successor_unit_input_publication_sha256",
@@ -156,30 +160,6 @@ _HOST_MANIFEST_FIELDS = frozenset(
         "plan_bindings",
         "secret_material_recorded",
         "manifest_sha256",
-    }
-)
-_HOST_MUTATION_AUTHORITY_FIELDS = frozenset(
-    {
-        "schema",
-        "release_revision",
-        "request_sha256",
-        "initial_collector_receipt_sha256",
-        "release_manifest_sha256",
-        "host_artifact_contract_sha256",
-        "gateway_target_identity",
-        "writer_target_identity",
-        "connector_target_identity",
-        "host_transition",
-        "capability_topology",
-        "cron_continuity_plan",
-        "readback_file_count",
-        "readback_files",
-        "readback_set_sha256",
-        "observed_at_unix",
-        "source_boot_id_sha256",
-        "secret_material_recorded",
-        "secret_digest_recorded",
-        "receipt_sha256",
     }
 )
 _HOST_SOURCE_FIELDS = frozenset(
@@ -959,39 +939,14 @@ def validate_host_artifact_manifest(
     return raw
 
 
-def _valid_host_target_prestate(value: Any) -> bool:
-    if not isinstance(value, Mapping) or set(value) != {
-        "state",
-        "sha256",
-        "uid",
-        "gid",
-        "mode",
-    }:
-        return False
-    if value.get("state") == "absent":
-        return all(
-            value.get(name) is None
-            for name in ("sha256", "uid", "gid", "mode")
-        )
-    return (
-        value.get("state") == "present"
-        and isinstance(value.get("sha256"), str)
-        and _SHA256.fullmatch(value["sha256"]) is not None
-        and type(value.get("uid")) is int
-        and value["uid"] >= 0
-        and type(value.get("gid")) is int
-        and value["gid"] >= 0
-        and type(value.get("mode")) is int
-        and 0 <= value["mode"] <= 0o7777
-    )
-
-
 def validate_host_mutation_authority(
     value: Any,
     *,
+    initial_collector_receipt: Mapping[str, Any],
     release_revision: str,
     host_artifact_manifest: Mapping[str, Any],
     host_inventory: Mapping[str, Any],
+    now_unix: int,
 ) -> Mapping[str, Any]:
     """Validate the signed-plan-bound root host readback authority.
 
@@ -1003,12 +958,44 @@ def validate_host_mutation_authority(
 
     code = "release_update_inputs_host_mutation_authority_invalid"
     revision = _revision(release_revision, code)
-    raw = _self_hashed(
-        value,
-        fields=_HOST_MUTATION_AUTHORITY_FIELDS,
-        digest_field="receipt_sha256",
-        code=code,
-    )
+    try:
+        initial = cutover_owner.validate_initial_collector_receipt(
+            initial_collector_receipt,
+            release_revision=revision,
+            now_unix=now_unix,
+        )
+        if not isinstance(value, Mapping):
+            _fail(code)
+        request = host_authority.build_host_authority_request(
+            initial_collector_receipt=initial,
+            release_manifest_sha256=str(
+                value.get("release_manifest_sha256", "")
+            ),
+            gateway_target_identity=value.get("gateway_target_identity", {}),
+            writer_target_identity=value.get("writer_target_identity", {}),
+            connector_target_identity=value.get(
+                "connector_target_identity", {}
+            ),
+            host_transition=value.get("host_transition", {}),
+            capability_topology=value.get("capability_topology", {}),
+            cron_continuity_plan=value.get("cron_continuity_plan", {}),
+        )
+        raw = host_authority.validate_host_authority_receipt(
+            value,
+            host_authority_request=request,
+            initial_collector_receipt=initial,
+            release_revision=revision,
+            now_unix=now_unix,
+        )
+    except (
+        cutover_owner.OwnerCutoverError,
+        host_authority.HostAuthorityError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        _fail(code, exc)
+    raw = _plain(raw)
     manifest = _plain(host_artifact_manifest)
     inventory_receipt = _plain(host_inventory)
     contract = manifest.get("host_artifact_contract")
@@ -1018,16 +1005,18 @@ def validate_host_mutation_authority(
     )
     readback = raw.get("readback_files")
     inventory_processes = inventory_receipt.get("processes")
+    inventory_observed_at = (
+        inventory_receipt.get("observed_at_unix_ns", 0) // 1_000_000_000
+        if type(inventory_receipt.get("observed_at_unix_ns")) is int
+        else None
+    )
     boot_id = (
         inventory_processes.get("boot_id")
         if isinstance(inventory_processes, Mapping)
         else None
     )
     if (
-        raw.get("schema")
-        != "muncho-production-cutover-host-authority.v1"
-        or raw.get("release_revision") != revision
-        or not isinstance(contract, Mapping)
+        not isinstance(contract, Mapping)
         or raw.get("release_manifest_sha256")
         != manifest.get("manifest_sha256")
         or raw.get("host_artifact_contract_sha256")
@@ -1037,14 +1026,16 @@ def validate_host_mutation_authority(
         or not isinstance(readback, list)
         or raw.get("readback_file_count") != len(readback)
         or len(readback) != len(host_package.HOST_ARTIFACT_TARGETS)
-        or type(raw.get("observed_at_unix")) is not int
-        or raw["observed_at_unix"] <= 0
         or type(inventory_receipt.get("observed_at_unix_ns")) is not int
+        or not isinstance(inventory_observed_at, int)
+        or not now_unix - host_authority.MAX_AGE_SECONDS
+        <= inventory_observed_at
+        <= now_unix + 30
         or abs(
             raw["observed_at_unix"]
-            - inventory_receipt["observed_at_unix_ns"] // 1_000_000_000
+            - inventory_observed_at
         )
-        > 900
+        > host_authority.MAX_AGE_SECONDS
         or not isinstance(boot_id, str)
         or raw.get("source_boot_id_sha256")
         != sha256_bytes(boot_id.encode("ascii", errors="strict"))
@@ -1080,10 +1071,6 @@ def validate_host_mutation_authority(
             != contract_item.get("staged_path")
             or transition_item.get("target_path")
             != contract_item.get("target_path")
-            or _SHA256.fullmatch(
-                str(transition_item.get("sha256", ""))
-            )
-            is None
             or (
                 contract_item.get("package_sha256") is not None
                 and transition_item.get("sha256")
@@ -1092,13 +1079,6 @@ def validate_host_mutation_authority(
             or contract_item.get("actual_sha256_bound_by")
             != raw.get("schema")
             or contract_item.get("required_readback") is not True
-            or type(transition_item.get("uid")) is not int
-            or transition_item["uid"] < 0
-            or type(transition_item.get("gid")) is not int
-            or transition_item["gid"] < 0
-            or type(transition_item.get("mode")) is not int
-            or not 0 <= transition_item["mode"] <= 0o7777
-            or not _valid_host_target_prestate(transition_item.get("pre"))
             or not isinstance(observed, Mapping)
             or set(observed)
             != {
@@ -1112,20 +1092,12 @@ def validate_host_mutation_authority(
             }
             or observed.get("name") != expected_name
             or observed.get("sha256") != transition_item.get("sha256")
-            or type(observed.get("size")) is not int
-            or observed["size"] <= 0
-            or type(observed.get("staged_uid")) is not int
-            or observed["staged_uid"] < 0
-            or type(observed.get("staged_gid")) is not int
-            or observed["staged_gid"] < 0
+            or observed.get("staged_uid") != 0
+            or observed.get("staged_gid") != 0
             or observed.get("staged_mode") != 0o400
             or observed.get("target_pre") != transition_item.get("pre")
         ):
             _fail(code)
-    if raw.get("readback_set_sha256") != sha256_bytes(
-        canonical_bytes({"files": readback})
-    ):
-        _fail(code)
     return raw
 
 
@@ -1454,9 +1426,13 @@ def validate_stage0_inputs(
     )
     host_mutation_authority = validate_host_mutation_authority(
         documents["host_mutation_authority_sha256"],
+        initial_collector_receipt=documents[
+            "host_mutation_initial_collector_receipt_sha256"
+        ],
         release_revision=release,
         host_artifact_manifest=host_manifest,
         host_inventory=host_receipt,
+        now_unix=now_unix,
     )
     cron_index = validate_cron_artifact_index(
         documents["cron_artifact_index_sha256"],
@@ -1477,6 +1453,9 @@ def validate_stage0_inputs(
         "host_mutation_authority_sha256": host_mutation_authority[
             "receipt_sha256"
         ],
+        "host_mutation_initial_collector_receipt_sha256": documents[
+            "host_mutation_initial_collector_receipt_sha256"
+        ]["receipt_sha256"],
         "cron_artifact_index_sha256": cron_index[
             "artifact_index_sha256"
         ],
@@ -1521,6 +1500,9 @@ def validate_stage0_inputs(
         "release_consumer_set_sha256": consumer_set,
         "host_artifact_manifest_sha256": host_manifest,
         "host_mutation_authority_sha256": host_mutation_authority,
+        "host_mutation_initial_collector_receipt_sha256": _plain(
+            documents["host_mutation_initial_collector_receipt_sha256"]
+        ),
         "cron_artifact_index_sha256": cron_index,
         "alias_artifact_index_sha256": alias_index,
         "successor_unit_input_publication_sha256": _plain(successor),

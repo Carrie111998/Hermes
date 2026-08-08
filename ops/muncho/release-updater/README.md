@@ -69,13 +69,16 @@ host mutation set, fixed production entrypoint, recovery gate, and disposable
 Linux power-loss/restart E2E suite land together.  The missing entrypoint is an
 intentional deployment interlock, not a packaging omission.
 
-Plan v6 now binds the exact read-only host-mutation authority receipt.  That
-receipt supplies the staged SHA-256 and rollback prestate for every declared
-host target, including the dynamically rendered owner-runtime and root-verifier
-payloads whose package manifest digest is intentionally null.  Its identity is
-also carried by the activation/rollback plans and durable transaction intent.
-This closes the data-authority gap only; it does not authorize a host mutation
-caller and does not relax the initial Canonical cutover requirement.
+Plan v7 now binds the exact read-only host-mutation authority receipt and its
+exact initial collector receipt.  The canonical host-authority validator
+reconstructs and validates the complete target identities, transition,
+capability topology, cron-continuity plan, request, staged SHA-256 values, and
+rollback prestates rather than accepting a reduced local projection.  Both
+receipts must also satisfy the canonical 900-second freshness window and
+30-second future-skew limit.  Their identities are carried by the
+activation/rollback plans and durable transaction intent.  This closes the
+data-authority and stale-replay gaps only; it does not authorize a host
+mutation caller and does not relax the initial Canonical cutover requirement.
 
 A legacy release already present at the deterministic candidate path is never
 upgraded in place.  Stage 0 accepts only a distinct successor revision in a
@@ -96,8 +99,8 @@ compatibility-symlink runtime as its predecessor, or infer the initial truth
 mode.
 
 The dormant runtime currently uses transaction intent v5, authority-record v3,
-and event v2 (`muncho-production-release-update-intent.v5`,
-`muncho-production-release-update-authority-record.v3`, and
+and event v2 (`muncho-production-release-update-intent.v6`,
+`muncho-production-release-update-authority-record.v4`, and
 `muncho-production-release-update-event.v2`).  An activation installer must
 prove that no legacy v3/v1/v1 authority or journal evidence, or any earlier
 format, exists on the host, or perform an explicitly reviewed migration before
