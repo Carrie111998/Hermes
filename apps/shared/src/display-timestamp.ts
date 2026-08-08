@@ -25,10 +25,12 @@ const MONTHS_LONG = [
 const pad = (value: number, width = 2) => String(value).padStart(width, '0')
 
 const dayOfYear = (date: Date): number => {
-  const start = new Date(date.getFullYear(), 0, 1)
-  const current = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  // UTC calendar arithmetic avoids an off-by-one after local daylight-saving
+  // transitions, where consecutive local midnights can be 23 or 25 hours apart.
+  const start = Date.UTC(date.getFullYear(), 0, 1)
+  const current = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
 
-  return Math.floor((current.getTime() - start.getTime()) / 86_400_000) + 1
+  return Math.floor((current - start) / 86_400_000) + 1
 }
 
 const timezoneOffset = (date: Date): string => {
