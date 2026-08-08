@@ -86,14 +86,16 @@ def test_peek_nous_access_token_falls_back_to_global_store_for_named_profile(
     tmp_path, monkeypatch
 ):
     monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "auth.json").write_text(json.dumps({
+    root = tmp_path / "root"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (root / "auth.json").write_text(json.dumps({
+        "providers": {"nous": {"access_token": "global-nous-token"}}
+    }))
+    (profile / "auth.json").write_text(json.dumps({
         "providers": {"xai-oauth": {"access_token": "profile-token"}}
     }))
-    monkeypatch.setattr(
-        "hermes_cli.auth._load_global_auth_store",
-        lambda: {"providers": {"nous": {"access_token": "global-nous-token"}}},
-    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
 
     assert managed_tool_gateway.peek_nous_access_token() == "global-nous-token"
 
