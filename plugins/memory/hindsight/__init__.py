@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import re
 from contextlib import contextmanager
 import sys
 import threading
@@ -71,6 +72,28 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+
+# Extended configuration the embedded daemon understands beyond what the base
+# env builder emits (embeddings, reranker, consolidation, LLM failover). Only
+# these keys pass through from the Hermes profile .env into the materialized
+# daemon env. Deliberately NOT a bare "HINDSIGHT_API_" prefix match: that
+# would also copy the cloud-mode HINDSIGHT_API_KEY / HINDSIGHT_API_URL into
+# the daemon env, where the daemon has no use for them.
+_EXTENDED_DAEMON_ENV_PREFIXES = (
+    "HINDSIGHT_API_EMBEDDINGS_",
+    "HINDSIGHT_API_RERANKER_",
+    "HINDSIGHT_API_CONSOLIDATION_",
+)
+_EXTENDED_DAEMON_ENV_EXACT = (
+    "HINDSIGHT_API_LLM_BASE_URL",
+    "HINDSIGHT_API_LLM_REASONING_EFFORT",
+    "HINDSIGHT_API_LLM_STRATEGY",
+    "CODEX_HOME",
+)
+# Failover LLM slots (HINDSIGHT_API_LLM_1_*, _2_, ...). Regex, not a bare
+# "HINDSIGHT_API_LLM_" prefix, so the base-emitted HINDSIGHT_API_LLM_API_KEY /
+# _MODEL / _PROVIDER (which must never be refilled from .env) stay excluded.
+_EXTENDED_DAEMON_LLM_SLOT_RE = re.compile(r"^HINDSIGHT_API_LLM_\d+_")
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
@@ -531,7 +554,25 @@ def _load_simple_env(path) -> dict[str, str]:
     return values
 
 
-def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
+def _is_extended_daemon_env_key(key: str) -> bool:
+    """Return True for keys the embedded daemon consumes beyond the base set.
+
+    Explicit allowlist (prefixes + exact keys + numbered LLM failover slots) —
+    see the module constants.
+    """
+    return (
+        key in _EXTENDED_DAEMON_ENV_EXACT
+        or key.startswith(_EXTENDED_DAEMON_ENV_PREFIXES)
+        or bool(_EXTENDED_DAEMON_LLM_SLOT_RE.match(key))
+    )
+
+
+def _build_embedded_profile_env(
+    config: dict[str, Any],
+    *,
+    llm_api_key: str | None = None,
+    hermes_home: str | Path | None = None,
+) -> dict[str, str]:
     """Build the profile-scoped env file that standalone hindsight-embed consumes."""
     current_key = llm_api_key
     if current_key is None:
@@ -566,6 +607,27 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         env_values["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(
             _parse_int_setting(idle_timeout, _DEFAULT_IDLE_TIMEOUT)
         )
+
+    # Preserve extended daemon configuration from the Hermes profile .env.
+    # The embedded daemon additionally understands the allowlisted
+    # HINDSIGHT_API_* variables (embeddings, reranker, consolidation, LLM
+    # failover strategy, CODEX_HOME). _materialize_embedded_profile_env()
+    # overwrites the daemon env file whenever the base config changes, so
+    # without this pass-through those extended settings would be silently
+    # dropped on the next restart. Base config keys always win (k not in
+    # env_values) and the daemon env file is deliberately NOT a source — it is
+    # the artifact we write, and reading it back would make settings sticky
+    # after they are removed from the profile .env.
+    try:
+        env_home = Path(hermes_home) if hermes_home else get_hermes_home()
+        for k, v in _load_simple_env(env_home / ".env").items():
+            if _is_extended_daemon_env_key(k) and k not in env_values and v:
+                env_values[k] = v
+    except Exception as exc:
+        logger.warning(
+            "Hindsight extended daemon env pass-through failed: %s", exc, exc_info=True
+        )
+
     return env_values
 
 
@@ -613,11 +675,18 @@ def _validate_profile_env_permissions(profile_env) -> None:
             )
 
 
-def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
+def _materialize_embedded_profile_env(
+    config: dict[str, Any],
+    *,
+    llm_api_key: str | None = None,
+    hermes_home: str | Path | None = None,
+):
     """Write the profile-scoped env file that standalone hindsight-embed uses."""
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
-    env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    env_values = _build_embedded_profile_env(
+        config, llm_api_key=llm_api_key, hermes_home=hermes_home
+    )
     content = "".join(f"{key}={value}\n" for key, value in env_values.items())
     try:
         _secure_write_profile_env(profile_env, content)
@@ -1065,6 +1134,7 @@ class HindsightMemoryProvider(MemoryProvider):
             _materialize_embedded_profile_env(
                 materialized_config,
                 llm_api_key=llm_api_key or None,
+                hermes_home=hermes_home,
             )
 
         print(f"\n  ✓ Hindsight memory configured ({mode} mode)")
