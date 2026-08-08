@@ -33,21 +33,39 @@ def auth_json_path():
     return get_hermes_home() / "auth.json"
 
 
+def _nous_provider_from_store(data: object) -> Optional[dict]:
+    if not isinstance(data, dict):
+        return None
+    providers = data.get("providers", {})
+    if not isinstance(providers, dict) or "nous" not in providers:
+        return None
+    nous_provider = providers.get("nous")
+    if isinstance(nous_provider, dict):
+        return nous_provider
+    return None
+
+
 def _read_nous_provider_state() -> Optional[dict]:
+    """Read Nous OAuth state from the profile, then the shared root fallback."""
     try:
         path = auth_json_path()
-        if not path.is_file():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        providers = data.get("providers", {})
-        if not isinstance(providers, dict):
-            return None
-        nous_provider = providers.get("nous", {})
-        if isinstance(nous_provider, dict):
-            return nous_provider
+        if path.is_file():
+            state = _nous_provider_from_store(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
+            if state is not None:
+                return state
     except Exception:
         pass
-    return None
+
+    # Named profiles inherit OAuth providers from the global auth store. Keep
+    # this read-only so a shared rotating refresh token retains one owner.
+    try:
+        from hermes_cli.auth import _load_global_auth_store
+
+        return _nous_provider_from_store(_load_global_auth_store())
+    except Exception:
+        return None
 
 
 def _parse_timestamp(value: object) -> Optional[datetime]:

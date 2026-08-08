@@ -82,6 +82,22 @@ def test_resolve_managed_tool_gateway_is_disabled_without_subscription():
     assert result is None
 
 
+def test_peek_nous_access_token_falls_back_to_global_store_for_named_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "auth.json").write_text(json.dumps({
+        "providers": {"xai-oauth": {"access_token": "profile-token"}}
+    }))
+    monkeypatch.setattr(
+        "hermes_cli.auth._load_global_auth_store",
+        lambda: {"providers": {"nous": {"access_token": "global-nous-token"}}},
+    )
+
+    assert managed_tool_gateway.peek_nous_access_token() == "global-nous-token"
+
+
 def test_read_nous_access_token_refreshes_expiring_cached_token(tmp_path, monkeypatch):
     monkeypatch.delenv("TOOL_GATEWAY_USER_TOKEN", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
