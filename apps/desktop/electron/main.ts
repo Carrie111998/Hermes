@@ -159,7 +159,7 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor, shouldGuardWindowClose } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -8773,6 +8773,8 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  registerChatWindow(win)
+
   if (IS_MAC) {
     win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
   }
@@ -8853,6 +8855,7 @@ function createInstanceWindow() {
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  registerChatWindow(win)
   instanceWindows.add(win)
 
   if (IS_MAC) {
@@ -9272,6 +9275,8 @@ function createWindow() {
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
+  registerChatWindow(mainWindow)
+
   if (IS_MAC) {
     mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
 
@@ -9347,6 +9352,9 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
+  // Persist geometry on close. The quit guard is installed centrally by
+  // registerChatWindow so primary, session, and instance windows share the
+  // same last-chat-window behavior.
   mainWindow.on('close', () => schedulePersistWindowState.flush())
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
@@ -10583,6 +10591,18 @@ ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWat
 // Each renderer reports the turns it has in flight; the quit guard reads the
 // merged picture. Keyed by webContents id so a closed window stops counting.
 const activeWorkByWebContents = new Map<number, ActiveWork>()
+
+const chatWindows = new Set<any>()
+
+function registerChatWindow(window: any) {
+  chatWindows.add(window)
+  window.on('close', (event: Electron.Event) => heldCloseForActiveWork(event, window))
+  window.once('closed', () => chatWindows.delete(window))
+}
+
+function hasOtherChatWindows(window: any): boolean {
+  return [...chatWindows].some(candidate => candidate !== window && !candidate.isDestroyed())
+}
 
 // The same merged picture drives background throttling: chat windows run
 // unthrottled while any turn is in flight (streaming must paint while hidden)
@@ -11945,6 +11965,53 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
     })
     .catch(() => {
       // A dialog we can't show must not become a quit we can't perform.
+      quitPromptOpen = false
+      quitConfirmedWithActiveWork = true
+      app.quit()
+    })
+
+  return true
+}
+
+function heldCloseForActiveWork(event: Electron.Event, window: BrowserWindow): boolean {
+  const work = mergeActiveWork(activeWorkByWebContents.values())
+
+  if (
+    !shouldGuardWindowClose(work, isQuittingForHandoff, IS_MAC, hasOtherChatWindows(window)) ||
+    SKIP_QUIT_CONFIRM ||
+    quitConfirmedWithActiveWork ||
+    quitPromptOpen
+  ) {
+    return false
+  }
+
+  const prompt = quitPromptFor(work, isQuittingForHandoff)
+
+  if (!prompt) {
+    return false
+  }
+
+  event.preventDefault()
+  quitPromptOpen = true
+
+  void dialog
+    .showMessageBox(window, {
+      buttons: ['Keep Running', 'Quit Anyway'],
+      cancelId: 0,
+      defaultId: 0,
+      detail: prompt.detail,
+      message: prompt.message,
+      type: 'question'
+    })
+    .then(({ response }) => {
+      quitPromptOpen = false
+
+      if (response === 1) {
+        quitConfirmedWithActiveWork = true
+        app.quit()
+      }
+    })
+    .catch(() => {
       quitPromptOpen = false
       quitConfirmedWithActiveWork = true
       app.quit()

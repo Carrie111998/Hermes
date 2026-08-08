@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { mergeActiveWork, normalizeActiveWork, quitPromptFor, shouldGuardWindowClose } from './quit-guard'
 
 test('normalizeActiveWork drops junk and keeps the count at least the title count', () => {
   assert.deepEqual(normalizeActiveWork(null), { count: 0, titles: [] })
@@ -59,4 +59,29 @@ test('quitPromptFor speaks singular for one chat', () => {
   assert.ok(prompt)
   assert.equal(prompt.message, 'Hermes is still working on 1 chat.')
   assert.ok(prompt.detail.includes('mid-turn'))
+})
+
+// -- shouldGuardWindowClose -------------------------------------------------
+
+test('shouldGuardWindowClose returns true for active work on Windows/Linux', () => {
+  assert.equal(shouldGuardWindowClose({ count: 1, titles: ['Fix login'] }, false, false, false), true)
+  assert.equal(shouldGuardWindowClose({ count: 3, titles: ['a', 'b', 'c'] }, false, false, false), true)
+})
+
+test('shouldGuardWindowClose returns false when no work is active', () => {
+  assert.equal(shouldGuardWindowClose({ count: 0, titles: [] }, false, false, false), false)
+})
+
+test('shouldGuardWindowClose returns false on macOS', () => {
+  // macOS closing the primary window is a "stay in Dock" gesture, not a quit.
+  assert.equal(shouldGuardWindowClose({ count: 2, titles: ['Fix login'] }, false, true, false), false)
+})
+
+test('shouldGuardWindowClose returns false during a handoff', () => {
+  // Update / swap / uninstall relaunch: the app is replacing itself.
+  assert.equal(shouldGuardWindowClose({ count: 2, titles: ['Fix login'] }, true, false, false), false)
+})
+
+test('shouldGuardWindowClose returns false when another chat window remains open', () => {
+  assert.equal(shouldGuardWindowClose({ count: 1, titles: ['Fix login'] }, false, false, true), false)
 })
