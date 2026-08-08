@@ -3102,6 +3102,7 @@ def run_conversation(
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
+                                    "_length_continuation_synthetic": True,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -5923,6 +5924,7 @@ def run_conversation(
                             messages.append({
                                 "role": "user",
                                 "content": _CODEX_INCOMPLETE_NUDGE,
+                                "_codex_incomplete_synthetic": True,
                             })
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")

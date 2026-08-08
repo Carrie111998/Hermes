@@ -213,6 +213,38 @@ def test_intent_ack_continue_does_not_reset_clarify_window():
     assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
 
 
+def test_length_continuation_does_not_reset_clarify_window():
+    store = _store(("remaining step", "pending"))
+    messages = [
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {
+            "role": "user",
+            "content": "Continue your previous response from where it was cut off.",
+            "_length_continuation_synthetic": True,
+        },
+        {"role": "assistant", "content": "Paused pending your decision."},
+    ]
+    assert turn_called_clarify(messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
+
+
+def test_codex_incomplete_nudge_does_not_reset_clarify_window():
+    store = _store(("remaining step", "pending"))
+    messages = [
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {
+            "role": "user",
+            "content": "[System: Your previous response was incomplete. Continue.]",
+            "_codex_incomplete_synthetic": True,
+        },
+        {"role": "assistant", "content": "Paused pending your decision."},
+    ]
+    assert turn_called_clarify(messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
+
+
 def test_nudge_budget_disable_and_clarify_unavailable():
     store = _store(("remaining step", "pending"))
     assert (

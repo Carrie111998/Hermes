@@ -1911,6 +1911,8 @@ _SYNTHETIC_USER_FLAGS = (
     "_pre_verify_synthetic",
     "_boundary_handoff_synthetic",
     "_intent_ack_synthetic",
+    "_length_continuation_synthetic",
+    "_codex_incomplete_synthetic",
     "_dropped_toolcall_nudge",
 )
 
