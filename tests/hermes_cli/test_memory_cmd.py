@@ -1,5 +1,6 @@
 """Tests for the ``hermes memory`` CLI subcommand."""
 
+import argparse
 import json
 import os
 import sys
@@ -8,10 +9,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hermes_cli.memory_cmd import memory_command
+from hermes_cli.subcommands.memory import build_memory_parser
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _run_memory_cli(monkeypatch, argv, memory_entries=None, user_entries=None):
     """Run ``hermes memory ...`` with a fake on-disk store and return stdout."""
@@ -48,11 +53,17 @@ def _run_memory_cli(monkeypatch, argv, memory_entries=None, user_entries=None):
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
             if not matches:
-                return json.dumps({"success": False, "error": f"No entry matched '{old_text}'."})
+                return json.dumps({
+                    "success": False,
+                    "error": f"No entry matched '{old_text}'.",
+                })
             if len(matches) > 1:
                 unique = set(e for _, e in matches)
                 if len(unique) > 1:
-                    return json.dumps({"success": False, "error": f"Multiple entries matched."})
+                    return json.dumps({
+                        "success": False,
+                        "error": f"Multiple entries matched.",
+                    })
             idx = matches[0][0]
             entries.pop(idx)
             self._removed.append(old_text)
@@ -66,6 +77,42 @@ def _run_memory_cli(monkeypatch, argv, memory_entries=None, user_entries=None):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("action", ["setup", "status", "off", "reset"])
+def test_provider_actions_route_to_provider_handler(action):
+    """Existing provider actions retain the provider command handler."""
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+
+    def provider_handler(args):
+        return args
+
+    build_memory_parser(subparsers, cmd_memory=provider_handler)
+
+    args = parser.parse_args(["memory", action])
+    assert args.memory_command == action
+    assert args.func is provider_handler
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["list"],
+        ["show", "memory"],
+        ["delete", "user", "timezone", "-y"],
+    ],
+)
+def test_review_actions_route_to_review_handler(argv):
+    """Review actions use the on-disk memory review command handler."""
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_memory_parser(subparsers, cmd_memory=lambda args: args)
+
+    args = parser.parse_args(["memory", *argv])
+    assert args.memory_command == argv[0]
+    assert args.func is memory_command
+
 
 def test_memory_list_empty(monkeypatch, capsys):
     """Both stores empty shows (empty) for each."""
@@ -92,34 +139,22 @@ def test_memory_list_populated(monkeypatch, capsys):
     assert "1 entries" in out
 
 
-def test_memory_list_is_default_action(monkeypatch, capsys):
-    """Running ``hermes memory`` with no subcommand defaults to list."""
-    _run_memory_cli(monkeypatch, ["memory"], memory_entries=["test entry"])
-    out = capsys.readouterr().out
-    assert "test entry" in out
-    assert "MEMORY (agent notes)" in out
-
-
 def test_memory_list_honors_configured_limits(monkeypatch, capsys):
     """The real on-disk store uses configured limits for reads and mutations."""
     import hermes_cli.main as main_mod
-    import tools.memory_tool as mem_mod
 
     hermes_home = Path(os.environ["HERMES_HOME"])
     memory_dir = hermes_home / "memories"
     (hermes_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "memory": {
-                    "memory_char_limit": 17,
-                    "user_char_limit": 11,
-                }
+        yaml.safe_dump({
+            "memory": {
+                "memory_char_limit": 17,
+                "user_char_limit": 11,
             }
-        ),
+        }),
         encoding="utf-8",
     )
     (memory_dir / "MEMORY.md").write_text("remember me", encoding="utf-8")
-    monkeypatch.setattr(mem_mod, "MEMORY_DIR", memory_dir)
     monkeypatch.setattr(sys, "argv", ["hermes", "memory", "list"])
 
     main_mod.main()

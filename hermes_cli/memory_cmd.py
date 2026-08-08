@@ -15,7 +15,7 @@ def memory_command(args):
 
     store = load_on_disk_store()
 
-    action = getattr(args, "memory_action", None)
+    action = getattr(args, "memory_command", None)
 
     if action is None or action == "list":
         _list_memories(store)
@@ -39,7 +39,9 @@ def _list_memories(store):
         limit = store._char_limit(target)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
-        print(f"\n  {label}  [{pct}% \u2014 {current:,}/{limit:,} chars, {len(entries)} entries]")
+        print(
+            f"\n  {label}  [{pct}% \u2014 {current:,}/{limit:,} chars, {len(entries)} entries]"
+        )
         print(f"  {'─' * 50}")
         if not entries:
             print("  (empty)")
