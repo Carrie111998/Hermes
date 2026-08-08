@@ -901,9 +901,13 @@ class ShellFileOperations(FileOperations):
             # lossy text would let a read→edit→write round-trip silently
             # overwrite the original bytes with mojibake. Treat a file whose
             # sample carries the replacement char as binary (read-only) so the
-            # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # agent can't corrupt it.
+            # NOTE: allow exactly one U+FFFD — `head -c 1000` truncation can
+            # split a UTF-8 multi-byte char at the 1000-byte boundary, and the
+            # truncated tail decodes to a single U+FFFD even in legitimate
+            # UTF-8 text (common with CJK files). Genuine decode failures
+            # produce many more (e.g. GBK-decoding a UTF-8 file → dozens).
+            if content_sample[:1000].count("\ufffd") > 1:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')

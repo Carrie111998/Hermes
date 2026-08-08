@@ -673,3 +673,26 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_truncated_cjk_tail_single_ufffd_not_flagged(self, tmp_path):
+        """A 1000-byte `head -c` truncation can split a UTF-8 multi-byte char.
+
+        The truncated tail decodes (errors="replace") to exactly one U+FFFD —
+        this is truncation noise, not mojibake, and must NOT flag the file
+        binary. Genuine decode failures produce multiple U+FFFD chars and are
+        still caught by the >1 threshold.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # 333 CJK chars (3 bytes each) = 999 bytes; the 1000th byte splits a
+        # 3-byte char → 1 U+FFFD after lossy decode. No newlines → the
+        # non-printable ratio is 0, so only the U+FFFD check could flag it.
+        truncated_sample = "汉" * 333 + "\ufffd"
+        assert len(truncated_sample) == 334
+        assert ops._is_likely_binary("notes.txt", truncated_sample) is False
+
+    def test_many_ufffd_still_flagged_binary(self, tmp_path):
+        """Two or more U+FFFD chars in the sample = real mojibake, not truncation."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # e.g. GBK bytes decoded as UTF-8 yield dozens of replacement chars.
+        mojibake_sample = "正常文本" * 10 + "\ufffd" * 50
+        assert ops._is_likely_binary("notes.txt", mojibake_sample) is True
