@@ -10425,14 +10425,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Skill bundles take precedence over individual skills — /<bundle>
             # loads multiple skills at once. Rescans cheaply when files change.
-            elif base_cmd in skill_bundles:
+            elif base_cmd in discoverable_skill_bundles:
                 user_instruction = cmd_original[len(base_cmd):].strip()
                 bundle_result = build_bundle_invocation_message(
                     base_cmd, user_instruction, task_id=self.session_id
                 )
                 if bundle_result:
                     msg, loaded_names, missing = bundle_result
-                    bundle_info = skill_bundles[base_cmd]
+                    bundle_info = discoverable_skill_bundles[base_cmd]
                     print(
                         f"\n⚡ Loading bundle: {bundle_info['name']} "
                         f"({len(loaded_names)} skills)"
