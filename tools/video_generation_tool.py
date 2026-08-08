@@ -145,6 +145,17 @@ VIDEO_GENERATE_SCHEMA: Dict[str, Any] = {
                     "dependent)."
                 ),
             },
+            "upscale": {
+                "type": "boolean",
+                "description": (
+                    "Optional high-resolution pass: when true, the generated "
+                    "video is run through the active backend's video upscaler "
+                    "(extra cost and latency, roughly 2x resolution). Use when "
+                    "the user asks for high-res / 4K output. Omit for the "
+                    "model's native resolution. Ignored by backends without "
+                    "an upscaler."
+                ),
+            },
             "model": {
                 "type": "string",
                 "description": (
@@ -311,12 +322,24 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
     prompt = (args.get("prompt") or "").strip()
     image_url = (args.get("image_url") or "").strip() or None
     reference_image_urls = _normalize_reference_images(args.get("reference_image_urls"))
+    task_id = _kw.get("task_id")
+
+    # Terminal-backend confinement chokepoint (mirrors image_generate): under
+    # a non-local backend, path-like source images resolve through the shared
+    # sandbox-aware resolver and reach providers as data: URLs.
+    from tools.image_generation_tool import _confine_source_images
+
+    image_url, reference_image_urls, confine_error = _confine_source_images(
+        image_url, reference_image_urls, task_id)
+    if confine_error is not None:
+        return confine_error
     duration = _coerce_int(args.get("duration"))
     aspect_ratio = (args.get("aspect_ratio") or DEFAULT_ASPECT_RATIO).strip() or DEFAULT_ASPECT_RATIO
     resolution = (args.get("resolution") or DEFAULT_RESOLUTION).strip() or DEFAULT_RESOLUTION
     negative_prompt = (args.get("negative_prompt") or "").strip() or None
     audio = _coerce_bool(args.get("audio"))
     seed = _coerce_int(args.get("seed"))
+    upscale = _coerce_bool(args.get("upscale"))
     model_override = (args.get("model") or "").strip() or None
 
     # Soft validation — providers do their own. Prompt is required by the
@@ -350,6 +373,7 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
         "negative_prompt": negative_prompt,
         "audio": audio,
         "seed": seed,
+        "upscale": upscale,
     }
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}

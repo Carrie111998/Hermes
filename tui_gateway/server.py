@@ -295,6 +295,12 @@ _pool = concurrent.futures.ThreadPoolExecutor(
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 
+# Exact in-memory session generation executing on the current turn thread.
+# Unlike a public session id, this object identity cannot be supplied by RPC.
+_current_runtime_session_record: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
+)
+
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -1342,6 +1348,34 @@ def _db_for_profile(profile: str | None = None):
         return None, False
 
 
+def _transfer_db_to_agent(agent, db) -> bool:
+    """Hand a DEDICATED profile handle to *agent*, which closes it on teardown.
+
+    The build sites open a per-profile ``state.db`` handle, pass it to
+    ``_make_agent``, and own it until the built agent is the one that will be
+    torn down. This marks that transfer: from here ``AIAgent.close()`` (reached
+    via :func:`_teardown_session`) releases the handle, so the caller must stop
+    closing it.
+
+    Returns True only when the transfer actually happened. It is refused when
+    *agent* is not holding *this* handle — the build failed before
+    ``_make_agent``, or the agent was given a different db — because a False
+    return is what tells the caller the handle is still its own to close.
+    Never called for the shared launch handle: that one is opened by
+    ``_get_db()``, outlives every agent, and stays at ``_owns_session_db``
+    False.
+    """
+    if agent is None or db is None:
+        return False
+    try:
+        if getattr(agent, "_session_db", None) is not db:
+            return False
+        agent._owns_session_db = True
+        return True
+    except Exception:
+        return False
+
+
 @contextlib.contextmanager
 def _profile_db(params: dict | None = None):
     """Yield the SessionDB for ``params['profile']`` (app-global remote mode).
@@ -1900,6 +1934,31 @@ def handle_request(req: dict) -> dict | None:
     return fn(rid, params)
 
 
+def _current_session_steer_authority(
+    session_id: str,
+) -> tuple[Transport | None, dict | None]:
+    """Resolve unforgeable steering authority for this exact RPC context.
+
+    The public session id is only a lookup hint. Authority is the identity of
+    both the request's ContextVar-bound transport and the live in-memory
+    session record currently stored under that id. Session transport rebinding,
+    removal, or id reuse therefore invalidates an earlier generation.
+    """
+    transport = current_transport()
+    if transport is None or not session_id:
+        return None, None
+    expected_session = _current_runtime_session_record.get()
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if (
+            session is None
+            or (expected_session is not None and session is not expected_session)
+            or session.get("transport") is not transport
+        ):
+            return None, None
+        return transport, session
+
+
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     """Route inbound RPCs — long handlers to the pool, everything else inline.
 
@@ -2108,6 +2167,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        session_db = None
+        owns_db = False
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -2126,7 +2187,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from hermes_state import SessionDB
 
+                    # DEDICATED handle — ours until _transfer_db_to_agent hands
+                    # it to the built agent in the finally below. Every path
+                    # that leaves this build without that transfer (the except
+                    # below, and a session reaped mid-build) must close it.
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
+                    owns_db = True
                 except Exception:
                     session_db = None
 
@@ -2262,6 +2328,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     unregister_gateway_notify(key)
                 except Exception:
                     pass
+            # Dedicated profile handle: hand it to the agent that will actually
+            # be torn down, or close it here when no such agent exists. Both
+            # non-transfer cases are real: the except above (build raised, so
+            # nothing holds the handle) and `replaced` (the session was reaped
+            # mid-build, so this agent is discarded and _teardown_session will
+            # never reach it). Transferring to a discarded agent would leak the
+            # handle exactly as before.
+            if owns_db and session_db is not None:
+                built = None if replaced else current.get("agent")
+                if not _transfer_db_to_agent(built, session_db):
+                    with contextlib.suppress(Exception):
+                        session_db.close()
             ready.set()
 
     build_thread = threading.Thread(target=_build, daemon=True)
@@ -2361,6 +2439,8 @@ def _terminal_task_cwd(session: dict | None) -> str:
                 raw = ""
         if raw and raw not in {".", "auto", "cwd"}:
             return raw
+        if backend == "ssh":
+            return "~"
 
     return _session_cwd(session)
 
@@ -2445,6 +2525,27 @@ def _heal_dead_cwd(cwd: str) -> str:
 def _is_local_terminal_backend() -> bool:
     backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
     return not backend or backend == "local"
+
+
+def _effective_terminal_backend() -> str:
+    """Active terminal backend name (``local``, ``docker``, ``ssh``, ...).
+
+    ``TERMINAL_ENV`` is authoritative when set (launchers bridge
+    ``terminal.backend`` into env at startup). Desktop/TUI in-process gateways
+    skip that bridge, so fall back to the ``terminal.backend`` config key —
+    the same rule ``_terminal_task_cwd`` uses.
+    """
+    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    if not backend or backend == "local":
+        try:
+            terminal_cfg = _load_cfg().get("terminal", {})
+            if isinstance(terminal_cfg, dict):
+                cfg_backend = str(terminal_cfg.get("backend") or "").strip().lower()
+                if cfg_backend and cfg_backend != "local":
+                    backend = cfg_backend
+        except Exception:
+            pass
+    return backend or "local"
 
 
 def _display_session_cwd(session: dict | None) -> str:
@@ -3139,6 +3240,7 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         "clarify.request",
         "terminal.read.request",
         "preview.read.request",
+        "window.read.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -4055,7 +4157,29 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
-def _load_enabled_toolsets() -> list[str] | None:
+def _gui_surface_toolsets(platform: str) -> set[str]:
+    """Toolsets that exist because of the CLIENT on the other end, not the host.
+
+    Both entries are deliberately off ``_HERMES_CORE_TOOLS`` — every other
+    platform would carry their schema for nothing — so this resolver is the one
+    gate that exposes them.
+
+    ``platform`` is the SESSION's source (``session.create``'s ``source``
+    field), never a process env var. The desktop app is a client: it can be
+    driving a local, SSH, URL, or cloud backend, and only the local/SSH spawn
+    paths run with ``HERMES_DESKTOP=1``. Keying GUI capability off that env var
+    silently stripped every pane/browser tool from URL and cloud gateways while
+    the same backend told the model it was "chatting inside the Hermes desktop
+    app". See the surface-capability rule in AGENTS.md.
+    """
+    surfaces = {"project"}
+    if platform == "desktop":
+        surfaces.add("desktop_ui")
+    return surfaces
+
+
+def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
+    session_platform = platform or _resolve_session_platform()
     explicit = [
         item.strip()
         for item in os.environ.get("HERMES_TUI_TOOLSETS", "").split(",")
@@ -4074,13 +4198,13 @@ def _load_enabled_toolsets() -> list[str] | None:
         try:
             from agent.coding_context import coding_selection
 
-            selection = coding_selection(platform=_resolve_session_platform())
+            selection = coding_selection(platform=session_platform)
             if selection is not None:
-                # Fold in `project` here too: this is a GUI-only resolver, and
-                # the focus-mode coding posture returns before the fallback path
-                # that normally adds it — without this the desktop loses the
-                # project tools exactly when sitting in a repo (see below).
-                return sorted({*selection, "project"})
+                # Fold in the client-surface toolsets here too: the focus-mode
+                # coding posture returns before the fallback path that normally
+                # adds them — without this the desktop loses its pane/project
+                # tools exactly when sitting in a repo (see below).
+                return sorted({*selection, *_gui_surface_toolsets(session_platform)})
         except Exception:
             pass
 
@@ -4191,13 +4315,13 @@ def _load_enabled_toolsets() -> list[str] | None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
             return None
-        # The desktop Project tools are off _HERMES_CORE_TOOLS (every other
+        # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
         # platform would carry their schema for nothing), so the platform
         # recovery above — which keys off hermes-cli's tool universe — can't
         # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
-        # folding in the `project` toolset here is the gate that exposes them on
-        # exactly the surface that can follow a project move.
-        return sorted(enabled | {"project"})
+        # folding them in here is the gate that exposes them on exactly the
+        # surface that can answer them.
+        return sorted(enabled | _gui_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:
             print(
@@ -5089,6 +5213,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
+        "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
@@ -5705,6 +5830,16 @@ def _agent_cbs(sid: str) -> dict:
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=45,
         ),
+        # read_window_below tool (desktop GUI): the renderer asks its main
+        # process (which owns native window enumeration) which OS window sits
+        # directly underneath the Hermes window, and answers
+        # window.read.respond with the serialized metadata.
+        "read_window_below_callback": lambda: _block(
+            "window.read.request",
+            sid,
+            {},
+            timeout=30,
+        ),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted
@@ -5979,7 +6114,11 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "model": getattr(agent, "model", None) or _resolve_model(),
         "max_iterations": _cfg_max_turns(cfg, 25),
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None)
-        or _load_enabled_toolsets(),
+        # Detached background tasks declare platform="tui" below: they have no
+        # UI session id, so a renderer-routed event has nowhere to land. Resolve
+        # their toolsets against that same platform rather than the gateway
+        # process's, so they never carry GUI schema they cannot use.
+        or _load_enabled_toolsets("tui"),
         "quiet_mode": True,
         "verbose_logging": False,
         "ephemeral_system_prompt": getattr(agent, "ephemeral_system_prompt", None)
@@ -6352,8 +6491,9 @@ def _make_agent(
         pass
 
     cfg = _load_cfg()
-    agent_cfg = cfg.get("agent") or {}
-    system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+
+    system_prompt = resolve_ephemeral_system_prompt_from_config(cfg)
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -6474,7 +6614,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -7646,6 +7786,22 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     _emit("message.complete", sid, payload)
 
 
+def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
+    """Keep a failed turn's working transcript in the gateway session.
+
+    ``AIAgent`` persists its working messages independently of the gateway's
+    history snapshot. If the turn raises after that persistence, the next
+    prompt must see the working transcript instead of the pre-turn snapshot.
+    """
+    agent_messages = getattr(agent, "_session_messages", None)
+    if not isinstance(agent_messages, list):
+        return False
+    with session["history_lock"]:
+        session["history"] = list(agent_messages)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+    return True
+
+
 def _queued_prompt_snapshot(session: dict) -> dict | None:
     """Return the accepted next-turn prompt without its transport handle.
 
@@ -7868,9 +8024,17 @@ def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
         return _session_info(agent)
-    cwd = _default_session_cwd()
+    # The SESSION's own workspace, not the gateway's launch directory. Reporting
+    # `_default_session_cwd()` here told a lazily-resumed session's client that
+    # its workspace was wherever the gateway process happened to start, so the
+    # desktop Files pane painted the wrong project even after the renderer
+    # rebound correctly (#71254). `branch` is always emitted ("" outside a git
+    # repo) so a client can clear a stale label instead of retaining it — the
+    # same contract `_lazy_session_info` above already follows.
+    cwd = _session_cwd(session)
     return {
         "cwd": cwd,
+        "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),
@@ -9369,6 +9533,33 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+def _hud_surface_note(session: dict) -> str:
+    """The HUD-mode note for this turn, or "" when it was not typed there."""
+    if session.get("client_surface") != "hud":
+        return ""
+    from agent.prompt_builder import hud_surface_note
+
+    return hud_surface_note(getattr(session.get("agent"), "valid_tool_names", None))
+
+
+def _prepend_note(run_message: Any, note: str) -> Any:
+    """Prefix a per-turn note onto the MODEL INPUT, leaving the prompt alone.
+
+    Everything the model needs to know about the turn but the user did not
+    type — an interrupted reply, reactions, the surface they typed into —
+    arrives this way. persist_user_message keeps the clean prompt, so no
+    scaffolding reaches the transcript, and annotating the NEW turn never
+    rewrites an already-sent message, so the cached prefix survives.
+    """
+    if not note:
+        return run_message
+    if isinstance(run_message, str):
+        return f"{note}\n\n{run_message}"
+    if isinstance(run_message, list):
+        return [{"type": "text", "text": note}, *run_message]
+    return run_message
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -9406,6 +9597,12 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        # The conversation runs on a fresh thread, so ContextVars from the RPC
+        # dispatcher do not follow automatically. Rebind the exact transport
+        # stored on this session generation before any tool can commission a
+        # child; delegate_task then captures it as non-serializable authority.
+        transport_token = bind_transport(session.get("transport"))
+        runtime_session_token = _current_runtime_session_record.set(session)
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -9615,21 +9812,14 @@ def _run_prompt_submit(
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
             if take_speech_interrupted():
-                if isinstance(run_message, str):
-                    run_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{run_message}"
-                elif isinstance(run_message, list):
-                    run_message = [{"type": "text", "text": SPEECH_INTERRUPTED_NOTE}, *run_message]
+                run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn ride the MODEL INPUT
-            # only (same enrichment channel as the speech-interrupted note);
-            # persist_user_message below stays the clean prompt, so no
-            # scaffolding reaches the transcript. Cache-safe: annotating the
-            # NEW turn never rewrites an already-sent message.
-            if reaction_notes := _pending_reaction_notes(session):
-                if isinstance(run_message, str):
-                    run_message = f"{reaction_notes}\n\n{run_message}"
-                elif isinstance(run_message, list):
-                    run_message = [{"type": "text", "text": reaction_notes}, *run_message]
+            # Reactions the user added since the last turn.
+            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
+
+            # Which window the message was typed into. HUD mode is per-turn
+            # state, so it cannot live in the (byte-stable) system prompt.
+            run_message = _prepend_note(run_message, _hud_surface_note(session))
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -9679,6 +9869,14 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            # Auto-titling now fires inside the turn prologue (shared by every
+            # surface). Hand the agent this session's live-rename hook so the
+            # sidebar repaints the moment a title lands, rather than waiting
+            # for the next list refresh.
+            _title_key = session.get("session_key") or sid
+            agent._on_session_title = lambda t, _k=_title_key: _emit(
+                "session.title", sid, {"session_id": _k, "title": t}
+            )
             result = agent.run_conversation(run_message, **run_kwargs)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -9962,53 +10160,6 @@ def _run_prompt_submit(
                     # Transient DB failure — keep pending_title for retry.
                     pass
 
-            if (
-                status == "complete"
-                and isinstance(raw, str)
-                and raw.strip()
-                and isinstance(text, str)
-                and text.strip()
-            ):
-                try:
-                    from agent.title_generator import maybe_auto_title
-
-                    _title_key = session.get("session_key") or sid
-                    # Snapshot the runtime identity; the validator lets the
-                    # background titler skip its LLM call if the session's
-                    # model changed before it fires (#19027).
-                    _title_model = getattr(agent, "model", None)
-                    _title_provider = getattr(agent, "provider", None)
-                    maybe_auto_title(
-                        _get_db(),
-                        _title_key,
-                        text,
-                        raw,
-                        session.get("history", []),
-                        # Keep auxiliary auto-detection aligned with the active
-                        # Desktop/Webapp session. Without this, providers that
-                        # rely on runtime auth (for example OpenAI Codex OAuth)
-                        # are skipped and the new session remains untitled.
-                        main_runtime={
-                            "model": getattr(agent, "model", None),
-                            "provider": getattr(agent, "provider", None),
-                            "base_url": getattr(agent, "base_url", None),
-                            "api_key": getattr(agent, "api_key", None),
-                            "api_mode": getattr(agent, "api_mode", None),
-                        },
-                        runtime_validator=lambda: (
-                            getattr(agent, "model", None) == _title_model
-                            and getattr(agent, "provider", None) == _title_provider
-                        ),
-                        # Push the generated title live so the sidebar renames
-                        # without waiting for the next list refresh (the titler
-                        # runs async, after this turn's refresh already fired).
-                        title_callback=lambda t, _k=_title_key: _emit(
-                            "session.title", sid, {"session_id": _k, "title": t}
-                        ),
-                    )
-                except Exception:
-                    pass
-
             # Voice TTS fallback: when the streaming pipeline couldn't start
             # (no provider / missing deps probed at turn start), speak the
             # final text whole (cli.py:_voice_speak_response parity). The
@@ -10048,6 +10199,12 @@ def _run_prompt_submit(
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            # The agent persists its working transcript on normal finalization,
+            # but an exception in that finalizer can otherwise leave the
+            # gateway's separate in-memory history at the turn-start snapshot.
+            # Keep the partial turn available to the next prompt; the durable
+            # inflight record still carries the recoverable error state.
+            _restore_agent_history_after_turn_error(session, agent)
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -10109,6 +10266,8 @@ def _run_prompt_submit(
             if secret_token is not None:
                 reset_secret_scope(secret_token)
             _clear_session_context(session_tokens)
+            _current_runtime_session_record.reset(runtime_session_token)
+            reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
@@ -10368,7 +10527,19 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
 
 
 def _desktop_attachment_dir(session: dict) -> Path:
-    root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
+    """Resolve the file-attachment staging dir against the session's effective home.
+
+    Anchored on the session profile's ``attachments/`` dir (same rule as
+    ``_session_images_dir``): ``file.attach`` runs BEFORE ``prompt.submit``
+    installs the session's profile HERMES_HOME override, while the docker/ssh
+    sandbox mounts are resolved against the *session profile's* home at run
+    time — so the staged file must land where the bind mount points, or the
+    container can never see it (#76577). ``attachments/`` is registered in
+    ``tools.credential_files._CACHE_DIRS`` and auto-mounted into containers.
+    """
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else _hermes_home
+    root = base / "attachments"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -10448,10 +10619,11 @@ def _stage_session_file_attachment(
       1. The path resolves to a file already INSIDE the session workspace — use
          it as-is (no copy, ``uploaded=False``).
       2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into ``.hermes/desktop-attachments/`` so the ``@file:`` ref resolves.
+         it into the session home's ``attachments/`` dir (bind-mounted into
+         container backends) so the ``@file:`` ref resolves inside the sandbox.
       3. The path doesn't exist on the gateway (the common remote case: it's a
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into ``.hermes/desktop-attachments/``.
+         write them into the session home's ``attachments/`` dir.
 
     Returns ``(stored_path, uploaded)``.
     """
@@ -11166,8 +11338,10 @@ def _(rid, params: dict) -> dict:
             elif key == "personality":
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
+                # Personality text is an in-session overlay. Keep the
+                # user-owned global system prompt intact so changing a
+                # personality cannot destroy manual configuration.
                 _write_config_key("display.personality", pname)
-                _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
                     sid_key, session, new_prompt, pname
@@ -11851,6 +12025,7 @@ def _rank_slash_completions(
     origin_of,
     *,
     browsing: bool,
+    score_of=None,
 ) -> list[dict]:
     """Rank and bound slash completions the way the menu should read.
 
@@ -11859,6 +12034,12 @@ def _rank_slash_completions(
     block is reordered, most-used first and A-Z within a tie, so the handful
     of skills someone invokes daily lead the ones that shipped with Hermes
     and were never opened.
+
+    ``score_of`` (optional) is the fuzzy-match scorer from
+    :func:`tui_gateway.slash_fuzzy.fuzzy_rank_slash_items` — when a typed
+    query produced scores, they lead the skill sort so a name match beats a
+    description match before usage breaks ties. Commands arrive already
+    score-sorted and keep their order either way.
 
     The limit is spent PER KIND rather than on one flat truncation. A flat
     cut is positional, not editorial: the completer emits every registry
@@ -11886,7 +12067,12 @@ def _rank_slash_completions(
             if origin_of(name_of(item)) != "bundled" or usage(name_of(item)) > 0
         ]
 
-    skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
+    if score_of is not None:
+        skills.sort(
+            key=lambda item: (score_of(item), -usage(name_of(item)), name_of(item))
+        )
+    else:
+        skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
 
     return commands[:_SLASH_COMPLETION_LIMIT] + skills[:_SLASH_COMPLETION_LIMIT]
 
