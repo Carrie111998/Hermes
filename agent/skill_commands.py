@@ -482,6 +482,51 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     return _skill_commands
 
 
+def get_discoverable_skill_commands() -> Dict[str, Dict[str, Any]]:
+    """Return skill commands safe to advertise in help/completion surfaces.
+
+    Discovery is stricter than explicit dispatch: when governance marks the
+    current task class protected, or governance evaluation cannot be trusted,
+    skills that would be blocked at invocation time are hidden entirely.
+
+    Unprotected task classes preserve the historical behavior and keep the full
+    scan-time command list even if governance evaluation is unavailable.
+    """
+    commands = get_skill_commands()
+    if not commands:
+        return commands
+
+    try:
+        from agent.skill_governance import evaluate_skill_selection_fail_closed
+    except Exception:
+        evaluate_skill_selection_fail_closed = None
+
+    if evaluate_skill_selection_fail_closed is None:
+        try:
+            from agent.skill_governance import probe_protected_task_class
+
+            if probe_protected_task_class().protected_task:
+                return {}
+        except Exception:
+            return {}
+        return commands
+
+    visible: Dict[str, Dict[str, Any]] = {}
+    for cmd_key, info in commands.items():
+        skill_name = str((info or {}).get("name") or cmd_key.lstrip("/") or "").strip()
+        if not skill_name:
+            continue
+        decision = evaluate_skill_selection_fail_closed(
+            skill_name,
+            mode="explicit",
+            historical_intent=False,
+            emit_log=False,
+        )
+        if decision is None or decision.allowed:
+            visible[cmd_key] = info
+    return visible
+
+
 def reload_skills() -> Dict[str, Any]:
     """Re-scan the skills directory and return a diff of what changed.
 

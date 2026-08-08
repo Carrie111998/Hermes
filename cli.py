@@ -4027,9 +4027,9 @@ _skill_bundles = None
 def _ensure_skill_commands() -> dict:
     global _skill_commands
     if _skill_commands is None:
-        from agent.skill_commands import scan_skill_commands
+        from agent.skill_commands import get_discoverable_skill_commands
 
-        _skill_commands = scan_skill_commands()
+        _skill_commands = get_discoverable_skill_commands()
     return _skill_commands
 
 

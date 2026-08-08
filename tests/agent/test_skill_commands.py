@@ -12,6 +12,7 @@ from agent.skill_governance import SkillGovernanceRejectedError
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    get_discoverable_skill_commands,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -144,6 +145,62 @@ class TestScanSkillCommands:
             scan_skill_commands()
             with pytest.raises(SkillGovernanceRejectedError, match="evaluation failed"):
                 build_skill_invocation_message("/tooltrust", "do it")
+
+    def test_discoverable_skill_commands_hide_governance_blocked_skills_when_protected(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _configure_protected_governance(
+            tmp_path,
+            """\
+  - name: ToolTrust
+    classification: COMPATIBILITY_ONLY
+  - name: SafeSkill
+    classification: CURRENT
+""",
+        )
+        _make_skill(tmp_path, "ToolTrust", body="blocked legacy content")
+        _make_skill(tmp_path, "SafeSkill", body="allowed content")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+            commands = get_discoverable_skill_commands()
+
+        assert "/safeskill" in commands
+        assert "/tooltrust" not in commands
+
+    def test_discoverable_skill_commands_fail_closed_when_config_unreadable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "skills:\n  governance: []\n",
+            encoding="utf-8",
+        )
+        _make_skill(tmp_path, "ToolTrust", body="blocked legacy content")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            scan_skill_commands()
+            commands = get_discoverable_skill_commands()
+
+        assert commands == {}
+
+    def test_discoverable_skill_commands_preserve_unprotected_behavior_on_eval_failure(
+        self, tmp_path, monkeypatch
+    ):
+        _make_skill(tmp_path, "ToolTrust", body="still visible when unprotected")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_governance.governance_context",
+                side_effect=RuntimeError("registry unreadable"),
+            ),
+        ):
+            scan_skill_commands()
+            commands = get_discoverable_skill_commands()
+
+        assert "/tooltrust" in commands
 
     def test_get_skill_commands_rescans_when_platform_scope_changes(self, tmp_path):
         """Platform-specific disabled-skill caches must not leak across platforms.

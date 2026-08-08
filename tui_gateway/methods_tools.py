@@ -331,7 +331,7 @@ def _(rid, params: dict) -> dict:
         skill_count = 0
         skills: dict[str, dict] = {}
         try:
-            from agent.skill_commands import scan_skill_commands
+            from agent.skill_commands import get_discoverable_skill_commands
 
             # Usage + origin per skill command. Surfaces here rather than in a
             # second RPC because every consumer that renders the catalog also
@@ -339,7 +339,7 @@ def _(rid, params: dict) -> dict:
             # loaded once per catalog build.
             usage, origin_of = _skill_usage_lookup()
 
-            for k, info in sorted(scan_skill_commands().items()):
+            for k, info in sorted(get_discoverable_skill_commands().items()):
                 d = str(info.get("description", "Skill"))
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 name = str(info.get("name") or k.lstrip("/"))

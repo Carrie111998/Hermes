@@ -6383,7 +6383,7 @@ def _slash_skill_fixtures(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "agent.skill_commands.get_skill_commands",
+        "agent.skill_commands.get_discoverable_skill_commands",
         lambda: {
             "/work": {"description": "Fresh worktree"},
             "/research": {"description": "Look it up"},
@@ -6452,6 +6452,51 @@ def test_complete_slash_leaves_argument_stages_alone(monkeypatch):
     items = _slash_completions("/details c")
 
     assert [item["text"] for item in items] == ["collapsed", "cycle"]
+
+
+def test_complete_slash_hides_governance_blocked_skills_when_protected(
+    monkeypatch, tmp_path
+):
+    import agent.skill_commands as skill_commands_mod
+    import tools.skills_tool as skills_tool_module
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _configure_protected_governance(home)
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: ToolTrust
+    classification: COMPATIBILITY_ONLY
+  - name: SafeSkill
+    classification: CURRENT
+""",
+        encoding="utf-8",
+    )
+    (skills_dir / "ToolTrust").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "ToolTrust" / "SKILL.md").write_text(
+        "---\nname: ToolTrust\ndescription: blocked\n---\n\n# ToolTrust\n\nBlocked.\n",
+        encoding="utf-8",
+    )
+    (skills_dir / "SafeSkill").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "SafeSkill" / "SKILL.md").write_text(
+        "---\nname: SafeSkill\ndescription: allowed\n---\n\n# SafeSkill\n\nAllowed.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+    monkeypatch.setattr("agent.skill_bundles.get_skill_bundles", lambda: {})
+
+    items = _slash_completions("/s")
+    texts = {item["text"].strip() for item in items if item["kind"] == "skill"}
+
+    assert "safeskill" in texts
+    assert "tooltrust" not in texts
 
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
@@ -8160,7 +8205,7 @@ def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        "agent.skill_commands.scan_skill_commands",
+        "agent.skill_commands.get_discoverable_skill_commands",
         lambda: {
             "/research": {"name": "research", "description": "Look it up"},
             "/research-paper-writing": {
@@ -8267,6 +8312,53 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/approve" not in canon
     assert "/deny" not in canon
     assert "/set-home" not in canon
+
+
+def test_commands_catalog_hides_governance_blocked_skills_when_protected(
+    monkeypatch, tmp_path
+):
+    import agent.skill_commands as skill_commands_mod
+    import tools.skills_tool as skills_tool_module
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _configure_protected_governance(home)
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: ToolTrust
+    classification: COMPATIBILITY_ONLY
+  - name: SafeSkill
+    classification: CURRENT
+""",
+        encoding="utf-8",
+    )
+    (skills_dir / "ToolTrust").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "ToolTrust" / "SKILL.md").write_text(
+        "---\nname: ToolTrust\ndescription: blocked\n---\n\n# ToolTrust\n\nBlocked.\n",
+        encoding="utf-8",
+    )
+    (skills_dir / "SafeSkill").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "SafeSkill" / "SKILL.md").write_text(
+        "---\nname: SafeSkill\ndescription: allowed\n---\n\n# SafeSkill\n\nAllowed.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    pairs = dict(resp["result"]["pairs"])
+    assert "/safeskill" in pairs
+    assert "/tooltrust" not in pairs
+    assert "/tooltrust" not in resp["result"]["skills"]
 
 
 def test_session_status_reads_live_gateway_agent(monkeypatch):
