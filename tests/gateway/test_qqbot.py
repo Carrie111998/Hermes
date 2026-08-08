@@ -1222,3 +1222,92 @@ class TestReadEventsClosedWsGuard:
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
 
+
+
+class TestGroupMessageCreateRouting:
+    """Regression: QQ delivers group @-messages as ``GROUP_MESSAGE_CREATE``.
+
+    The dispatch router and ``_on_message`` originally recognised only
+    ``GROUP_AT_MESSAGE_CREATE``, so real group traffic fell through to the
+    "Unhandled dispatch" branch and was silently discarded — the bot appeared
+    connected and healthy but never answered an @-mention in a group.
+
+    Payload below is a real event captured off the live iLink/QQ WebSocket
+    (identifiers anonymised).
+    """
+
+    def _make_adapter(self):
+        from gateway.platforms.qqbot import QQAdapter
+        adapter = QQAdapter(_make_config(
+            app_id="a", client_secret="b",
+            group_policy="allowlist", group_allow_from=["*"],
+        ))
+
+        async def _no_attachments(_):
+            return {
+                "image_urls": [], "image_media_types": [],
+                "voice_transcripts": [], "attachment_info": "",
+            }
+
+        async def _no_quote(_):
+            return {"quote_block": "", "image_urls": [], "image_media_types": []}
+
+        adapter._process_attachments = _no_attachments
+        adapter._process_quoted_context = _no_quote
+        return adapter
+
+    @staticmethod
+    def _payload(message_id):
+        return {
+            "author": {
+                "bot": False, "id": "USER_OPENID",
+                "member_openid": "USER_OPENID", "member_role": "owner",
+            },
+            "content": "<@BOT_OPENID> 111",
+            "group_openid": "GROUP_OPENID",
+            "id": message_id,
+            "timestamp": "2026-08-08T15:02:44+00:00",
+        }
+
+    def _dispatch(self, adapter, event_type, message_id):
+        seen = []
+
+        async def _capture(event):
+            seen.append(event)
+
+        adapter.handle_message = _capture
+        asyncio.run(adapter._on_message(event_type, self._payload(message_id)))
+        return seen
+
+    def test_group_message_create_is_routed(self):
+        adapter = self._make_adapter()
+        seen = self._dispatch(adapter, "GROUP_MESSAGE_CREATE", "m1")
+        assert seen, "GROUP_MESSAGE_CREATE must produce a MessageEvent"
+        assert seen[0].source.chat_id == "GROUP_OPENID"
+        assert seen[0].source.chat_type == "group"
+
+    def test_legacy_group_at_message_create_still_routed(self):
+        adapter = self._make_adapter()
+        assert self._dispatch(adapter, "GROUP_AT_MESSAGE_CREATE", "m2")
+
+    def test_at_mention_prefix_is_stripped(self):
+        adapter = self._make_adapter()
+        seen = self._dispatch(adapter, "GROUP_MESSAGE_CREATE", "m3")
+        assert seen[0].text == "111"
+
+
+class TestStripAtMention:
+    """``<@OPENID>`` is QQ's real mention markup; the original regex only
+    handled a bare ``@name`` prefix and left the raw tag in the prompt."""
+
+    @pytest.mark.parametrize("content,expected", [
+        ("<@BOT_OPENID> 111", "111"),
+        ("<@!12345> hello world", "hello world"),
+        ("@bot hi", "hi"),
+        ("<@ABC>   spaced", "spaced"),
+        ("no mention here", "no mention here"),
+        ("", ""),
+    ])
+    def test_strip(self, content, expected):
+        from gateway.platforms.qqbot import QQAdapter
+        assert QQAdapter._strip_at_mention(content) == expected

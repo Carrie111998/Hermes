@@ -879,6 +879,7 @@ class QQAdapter(BasePlatformAdapter):
             elif t in {
                     "C2C_MESSAGE_CREATE",
                     "GROUP_AT_MESSAGE_CREATE",
+                    "GROUP_MESSAGE_CREATE",
                     "DIRECT_MESSAGE_CREATE",
                     "GUILD_MESSAGE_CREATE",
                     "GUILD_AT_MESSAGE_CREATE",
@@ -978,7 +979,7 @@ class QQAdapter(BasePlatformAdapter):
         # Route by event type
         if event_type == "C2C_MESSAGE_CREATE":
             await self._handle_c2c_message(d, msg_id, content, author, timestamp)
-        elif event_type in {"GROUP_AT_MESSAGE_CREATE",}:
+        elif event_type in {"GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"}:
             await self._handle_group_message(d, msg_id, content, author, timestamp)
         elif event_type in {"GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"}:
             await self._handle_guild_message(d, msg_id, content, author, timestamp)
@@ -3191,8 +3192,8 @@ class QQAdapter(BasePlatformAdapter):
         # QQ group @-messages may have the bot's QQ/ID as prefix
         import re
 
-        stripped = re.sub(r"^@\S+\s*", "", content.strip())
-        return stripped
+        stripped = re.sub(r"^(?:<@!?\d*\w*>|@\S+)\s*", "", content.strip())
+        return stripped.strip()
 
     def _open_dm_opted_in(self) -> bool:
         if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
