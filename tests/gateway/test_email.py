@@ -1238,6 +1238,37 @@ class TestResumeAfterDowntime(unittest.TestCase):
 
             self.assertEqual(adapter._uid_cursor.uid, 5)
 
+    def test_failed_baseline_search_disables_resume_for_the_run(self):
+        """A non-OK baseline search must not record baseline 0.
+
+        Baseline 0 also means "empty mailbox", so recording it would make the
+        first poll search UID 1:* and answer the whole INBOX. The run must
+        degrade to the option-off UNSEEN path and write no cursor file.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            adapter = self._make_adapter(home)
+            mock_imap = self._mock_imap(search=b"")
+            ok_handler = mock_imap.uid.side_effect
+
+            def uid_handler(command, *args):
+                if command == "search" and args == (None, "ALL"):
+                    return ("NO", [])
+                return ok_handler(command, *args)
+
+            mock_imap.uid.side_effect = uid_handler
+
+            self.assertTrue(self._connect(adapter, mock_imap))
+
+            self.assertIsNone(adapter._uid_cursor)
+            self.assertFalse(self._cursor_path(home).exists())
+
+            fetch_imap = self._mock_imap(search=b"")
+            with patch("imaplib.IMAP4_SSL", return_value=fetch_imap):
+                adapter._fetch_new_messages()
+            self.assertEqual(self._search_args(fetch_imap),
+                             ("search", None, "UNSEEN"))
+
     def test_default_keeps_todays_behavior(self):
         """With the option off nothing changes and no state file is written."""
         import tempfile

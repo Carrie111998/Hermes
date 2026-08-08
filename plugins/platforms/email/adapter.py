@@ -613,6 +613,12 @@ class EmailAdapter(BasePlatformAdapter):
         mailbox whose UIDVALIDITY changed — we baseline at the highest UID
         present. That is exactly the default path's promise that mail already in
         the INBOX is never answered.
+
+        A failed baseline search is not an empty mailbox: the 0 it leaves
+        behind is indistinguishable from one, and recording it would make the
+        first poll search UID 1:* and answer the whole INBOX. The run drops
+        the cursor and behaves as if the option were off instead; the next
+        start tries the baseline again.
         """
         uidvalidity = _read_uidvalidity(imap)
         if not uidvalidity:
@@ -630,9 +636,17 @@ class EmailAdapter(BasePlatformAdapter):
             )
             return
 
-        highest = 0
         status, data = imap.uid("search", None, "ALL")
-        if status == "OK" and data and data[0]:
+        if status != "OK":
+            logger.warning(
+                "[Email] Baseline UID search failed (%s) — no resume point "
+                "this run; behaving as if resume_after_downtime were off.",
+                status,
+            )
+            self._uid_cursor = None
+            return
+        highest = 0
+        if data and data[0]:
             for uid in data[0].split():
                 highest = max(highest, _uid_int(uid))
         cursor.baseline(uidvalidity, highest)
