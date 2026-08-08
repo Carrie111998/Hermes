@@ -1370,6 +1370,58 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
+# Every cause bucket classify_persistence_error can return. Consumers that
+# enumerate causes (e.g. the cron scheduler's explainer-variant suppression)
+# must iterate this tuple instead of hardcoding the list, so adding a bucket
+# can never silently desynchronize them.
+PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+
+
+def classify_persistence_error(exc_or_str) -> str:
+    """Classify a session-persistence failure into a coarse cause bucket.
+
+    Fast-failing a turn on a SessionDB write error is deliberate (the
+    transcript would otherwise be lost on restart), but the *guidance* the
+    user gets must match the cause: sustained SQLite write-lock contention
+    ("database is locked" on a shared state.db) needs "storage was busy,
+    send it again", while a full disk or read-only database needs the
+    disk-space/permissions advice. Returns one of PERSISTENCE_ERROR_CAUSES:
+
+    * ``"locked"``  — lock/busy contention (another process holds the write
+      lock, or a live compression lease refused the write); transient,
+      retry-later guidance applies.
+    * ``"disk"``    — disk full / read-only / permission-shaped failures
+      (delegates the disk-full patterns to :func:`is_disk_full_error` so the
+      two classifiers can never drift apart — e.g. ENOSPC).
+    * ``"unknown"`` — anything else (or no visible exception at all).
+    """
+    if exc_or_str is None:
+        return "unknown"
+    # A refused write during a live compression lease is contention, not
+    # storage damage — but its message ("is being compressed by another
+    # writer" / "Compression lease lost") contains neither "locked" nor
+    # "busy", so it must be matched by type and by phrase (for strings that
+    # survived RPC wrapping).
+    if isinstance(exc_or_str, CompressionSessionBusyError):
+        return "locked"
+    text = str(exc_or_str).lower()
+    if (
+        "locked" in text
+        or "busy" in text
+        or "being compressed" in text
+        or "compression lease" in text
+    ):
+        return "locked"
+    if (
+        is_disk_full_error(exc_or_str)
+        or "disk" in text
+        or "readonly" in text
+        or "read-only" in text
+    ):
+        return "disk"
+    return "unknown"
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 
@@ -2163,6 +2215,184 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             pass
         finally:
             handle.close()
+
+
+# ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
+
+
+def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+    """Best-effort, strictly read-only stats snapshot of a state.db file.
+
+    Opens the database with ``mode=ro`` (URI) and a short timeout so it can
+    run against a *live* database held by a gateway without ever taking a
+    write lock or mutating the file. Every field is collected independently:
+    a failed pragma/SELECT yields ``None`` for that field, and the helper
+    itself never raises.
+
+    Deliberately does NOT instantiate :class:`SessionDB` — its constructor
+    runs schema DDL (migrations, FTS table creation), which is exactly the
+    kind of write a diagnostics probe must never perform.
+
+    Returned keys (all present, any may be None on failure):
+
+    - ``page_count``, ``page_size``, ``freelist_count`` — PRAGMA values
+    - ``logical_size_bytes`` — page_count * page_size (post-checkpoint size)
+    - ``wal_size_bytes`` — stat() of ``<db>-wal`` (0 when absent)
+    - ``journal_mode`` — PRAGMA journal_mode string
+    - ``messages`` / ``sessions`` — row counts
+    - ``fts_tables`` — dict of {table_name: bool} presence for
+      messages_fts / messages_fts_trigram / messages_fts_cjk
+    - ``fts_storage_version`` — int from state_meta, None when the marker is
+      absent (legacy pre-v23 inline layout)
+    - ``fts_rebuild_pending`` — True when the deferred v23 backfill has not
+      finished (high_water present and progress < high_water)
+    - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
+    """
+    stats: Dict[str, Any] = {
+        "page_count": None,
+        "page_size": None,
+        "freelist_count": None,
+        "logical_size_bytes": None,
+        "wal_size_bytes": None,
+        "journal_mode": None,
+        "messages": None,
+        "sessions": None,
+        "fts_tables": None,
+        "fts_storage_version": None,
+        "fts_rebuild_pending": None,
+        "fts_rebuild_high_water": None,
+        "fts_rebuild_progress": None,
+    }
+
+    # WAL sidecar size needs no connection at all.
+    try:
+        wal_path = Path(str(db_path) + "-wal")
+        stats["wal_size_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
+    except OSError:
+        pass
+
+    conn = None
+    try:
+        # mode=ro refuses to create the file and refuses every write; a
+        # short timeout keeps doctor snappy when a writer holds the lock.
+        # Route through the tracked connect so byte-probe helpers
+        # (read_header_bytes_preopen) see this connection and refuse raw
+        # opens that could cancel our POSIX locks mid-read.
+        conn = _connect_tracked_db(
+            f"file:{Path(db_path)}?mode=ro",
+            tracking_path=Path(db_path),
+            uri=True,
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.debug("collect_state_db_stats: cannot open %s read-only: %s",
+                     db_path, exc)
+        return stats
+
+    def _scalar(sql: str) -> Any:
+        try:
+            row = conn.execute(sql).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    try:
+        pc = _scalar("PRAGMA page_count")
+        ps = _scalar("PRAGMA page_size")
+        stats["page_count"] = int(pc) if pc is not None else None
+        stats["page_size"] = int(ps) if ps is not None else None
+        if stats["page_count"] is not None and stats["page_size"] is not None:
+            stats["logical_size_bytes"] = stats["page_count"] * stats["page_size"]
+
+        fl = _scalar("PRAGMA freelist_count")
+        stats["freelist_count"] = int(fl) if fl is not None else None
+
+        jm = _scalar("PRAGMA journal_mode")
+        stats["journal_mode"] = str(jm) if jm is not None else None
+
+        msgs = _scalar("SELECT COUNT(*) FROM messages")
+        stats["messages"] = int(msgs) if msgs is not None else None
+        sess = _scalar("SELECT COUNT(*) FROM sessions")
+        stats["sessions"] = int(sess) if sess is not None else None
+
+        # FTS table presence via sqlite_master (never SELECTs from the
+        # virtual tables themselves — a corrupt index must not fail stats).
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN (?, ?, ?)",
+                    ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+                ).fetchall()
+            }
+            stats["fts_tables"] = {
+                t: (t in names)
+                for t in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+            }
+        except Exception:
+            pass
+
+        # Raw state_meta reads — cheap, and independent of SessionDB.
+        def _meta_int(key: str) -> Optional[int]:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+            except Exception:
+                return None
+
+        stats["fts_storage_version"] = _meta_int("fts_storage_version")
+        high_water = _meta_int("fts_rebuild_high_water")
+        progress = _meta_int("fts_rebuild_progress")
+        stats["fts_rebuild_high_water"] = high_water
+        stats["fts_rebuild_progress"] = progress
+        if high_water is None:
+            stats["fts_rebuild_pending"] = False
+        else:
+            stats["fts_rebuild_pending"] = (progress or 0) < high_water
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return stats
+
+
+def count_db_holders(db_path: Path) -> Optional[int]:
+    """Best-effort count of processes holding ``db_path`` open (Linux only).
+
+    Scans ``/proc/*/fd`` symlinks for the resolved database path. Returns
+    the number of distinct PIDs with the file open, or ``None`` on any
+    error or on non-Linux platforms. Never raises; no lsof dependency.
+    Unreadable per-process fd dirs (other users' processes without root)
+    are silently skipped, so the count is a lower bound.
+    """
+    try:
+        if not sys.platform.startswith("linux"):
+            return None
+        target = os.path.realpath(str(db_path))
+        holders = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue  # process gone or not ours
+            for fd in fds:
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") == target:
+                        holders += 1
+                        break  # one hit per PID
+                except OSError:
+                    continue
+        return holders
+    except Exception:
+        return None
 
 
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
