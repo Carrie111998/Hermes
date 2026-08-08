@@ -286,3 +286,102 @@ class TestSkillGist:
         assert wa.skill_gist("remove_file", "demo", file_path="a.py") == "remove a.py from 'demo'"
         assert wa.skill_gist("delete", "demo") == "delete skill 'demo'"
         assert wa.skill_gist("unknown", "demo") == "unknown 'demo'"
+
+
+# ---------------------------------------------------------------------------
+# stage_write dedup — replace/remove with identical old_text (#81671)
+# ---------------------------------------------------------------------------
+
+class TestStageWriteDedup:
+    """stage_write() must not mint a second pending record when a replace/remove
+    with the same subsystem + action + target + old_text is already queued."""
+
+    def test_replace_dedup_returns_existing(self, hermes_home):
+        from tools import write_approval as wa
+
+        first = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "old fact", "content": "new fact v1"},
+            summary="replace old fact",
+            origin="background_review",
+        )
+        second = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "old fact", "content": "new fact v2"},
+            summary="replace old fact again",
+            origin="background_review",
+        )
+        assert first["id"] == second["id"], "Dedup must return the existing record, not mint a new one."
+        assert wa.pending_count("memory") == 1
+
+    def test_remove_dedup_returns_existing(self, hermes_home):
+        from tools import write_approval as wa
+
+        first = wa.stage_write(
+            "memory",
+            {"action": "remove", "target": "user", "old_text": "stale entry"},
+            summary="remove stale",
+            origin="background_review",
+        )
+        second = wa.stage_write(
+            "memory",
+            {"action": "remove", "target": "user", "old_text": "stale entry"},
+            summary="remove stale again",
+            origin="background_review",
+        )
+        assert first["id"] == second["id"]
+        assert wa.pending_count("memory") == 1
+
+    def test_add_is_not_deduplicated(self, hermes_home):
+        from tools import write_approval as wa
+
+        first = wa.stage_write(
+            "memory",
+            {"action": "add", "target": "memory", "content": "fact A"},
+            summary="add fact A",
+            origin="background_review",
+        )
+        second = wa.stage_write(
+            "memory",
+            {"action": "add", "target": "memory", "content": "fact A"},
+            summary="add fact A again",
+            origin="background_review",
+        )
+        assert first["id"] != second["id"], "add actions must never be deduplicated."
+        assert wa.pending_count("memory") == 2
+
+    def test_different_old_text_not_deduplicated(self, hermes_home):
+        from tools import write_approval as wa
+
+        first = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "fact A", "content": "new A"},
+            summary="replace A",
+            origin="background_review",
+        )
+        second = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "fact B", "content": "new B"},
+            summary="replace B",
+            origin="background_review",
+        )
+        assert first["id"] != second["id"]
+        assert wa.pending_count("memory") == 2
+
+    def test_different_target_not_deduplicated(self, hermes_home):
+        from tools import write_approval as wa
+
+        first = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "memory", "old_text": "shared fact", "content": "v1"},
+            summary="replace in memory",
+            origin="background_review",
+        )
+        second = wa.stage_write(
+            "memory",
+            {"action": "replace", "target": "user", "old_text": "shared fact", "content": "v2"},
+            summary="replace in user",
+            origin="background_review",
+        )
+        assert first["id"] != second["id"]
+        assert wa.pending_count("memory") == 2

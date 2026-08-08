@@ -129,6 +129,32 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    # Dedup guard for replace/remove: if an existing pending record targets
+    # the same subsystem + action + target + old_text, return it instead of
+    # minting a new entry. Two background_review passes reaching the same
+    # conclusion should not both land in the queue — the first one wins.
+    # add actions are NOT deduplicated: two independent adds may both be
+    # legitimate (different content, same target).
+    action = payload.get("action", "")
+    if action in ("replace", "remove"):
+        old_text = payload.get("old_text", "")
+        target = payload.get("target", "")
+        try:
+            for existing in list_pending(subsystem):
+                ep = existing.get("payload", {})
+                if (
+                    existing.get("action") == action
+                    and ep.get("target") == target
+                    and ep.get("old_text") == old_text
+                ):
+                    logger.debug(
+                        "stage_write: dedup hit for %s/%s old_text=%r — returning existing id=%s",
+                        subsystem, action, old_text[:60], existing["id"],
+                    )
+                    return existing
+        except Exception as _dedup_err:
+            logger.debug("stage_write: dedup scan failed (non-fatal): %s", _dedup_err)
+
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid,
