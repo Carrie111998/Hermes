@@ -37,15 +37,19 @@ export const $wakeWord = atom<WakeWordState>(INITIAL_WAKE_WORD_STATE)
 
 /** Active client mic stream for remote wake (capture: client). */
 let clientCapture: ClientWakeCaptureHandle | null = null
+let captureGeneration = 0
 
 /** Stop client-side PCM capture (also called on wake.detected before voice). */
 export function stopClientCapture(): void {
+  captureGeneration++
   clientCapture?.stop()
   clientCapture = null
 }
 
 async function maybeStartClientCapture(result: WakeStartResponse | null | undefined): Promise<string> {
-  stopClientCapture()
+  const generation = ++captureGeneration
+  clientCapture?.stop()
+  clientCapture = null
 
   if (!result?.started) {
     return ''
@@ -58,13 +62,25 @@ async function maybeStartClientCapture(result: WakeStartResponse | null | undefi
   }
 
   try {
-    clientCapture = await startClientWakeCapture({
+    const handle = await startClientWakeCapture({
       frameLength: result.frame_length,
       request: gatewayRequester
     })
 
+    if (generation !== captureGeneration) {
+      handle.stop()
+
+      return ''
+    }
+
+    clientCapture = handle
+
     return ''
   } catch (error) {
+    if (generation !== captureGeneration) {
+      return ''
+    }
+
     const current = $wakeWord.get()
     const message = error instanceof Error ? error.message : 'Failed to open the client microphone for wake word'
     $wakeWord.set({

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { startClientWakeCapture } from '@/lib/wake-client-capture'
+import { type ClientWakeCaptureHandle, startClientWakeCapture } from '@/lib/wake-client-capture'
 
 import { $notifications, clearNotifications } from './notifications'
 import {
@@ -11,6 +11,7 @@ import {
   armWakeWord,
   resetWakeWordState,
   resumeWakeAfterVoice,
+  stopClientCapture,
   toggleWakeWord,
   type WakeRequester
 } from './wake-word'
@@ -439,5 +440,30 @@ describe('resumeWakeAfterVoice (post-voice reconcile)', () => {
     await resumeWakeAfterVoice(request)
 
     expect($wakeWord.get()).toMatchObject({ available: false, listening: false })
+  })
+})
+
+describe('client capture race safety', () => {
+  it('discards a capture that resolves after wake word stops', async () => {
+    let resolveCapture: (handle: ClientWakeCaptureHandle) => void = () => undefined
+
+    vi.mocked(startClientWakeCapture).mockReturnValueOnce(
+      new Promise(resolve => {
+        resolveCapture = resolve
+      })
+    )
+
+    applyWakeStartResult({ capture: 'client', frame_length: 1280, started: true })
+    await vi.waitFor(() => expect(startClientWakeCapture).toHaveBeenCalledTimes(1))
+
+    applyWakeStopResult({ stopped: true })
+
+    const handle: ClientWakeCaptureHandle = { active: true, stop: vi.fn() }
+    resolveCapture(handle)
+
+    await vi.waitFor(() => expect(handle.stop).toHaveBeenCalledTimes(1))
+
+    stopClientCapture()
+    expect(handle.stop).toHaveBeenCalledTimes(1)
   })
 })
