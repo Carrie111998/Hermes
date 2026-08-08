@@ -39,6 +39,15 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_computer_use_route_validator_after_gateway_test():
+    """Prevent constructed GatewayRunner instances from leaking global state."""
+    yield
+    from tools.computer_use import set_computer_use_session_validator
+
+    set_computer_use_session_validator(None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _bind_lark_sdk_globals_when_installed():
     """Bind the feishu adapter's lark SDK globals once per test session.

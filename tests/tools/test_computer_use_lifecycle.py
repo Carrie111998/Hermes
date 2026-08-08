@@ -232,6 +232,51 @@ def test_managed_route_publication_registry_reclaims_all_idle_sessions():
         computer_use._get_backend("managed-route-0")
 
 
+def test_stale_caller_cannot_republish_retired_route_after_fence_ends():
+    from tools.computer_use import tool as computer_use
+
+    routes = {"telegram:chat": "retired-session"}
+    computer_use.set_computer_use_session_validator(
+        lambda route_key, sid: routes.get(route_key) == sid
+    )
+    publication = computer_use.publish_computer_use_session(
+        "retired-session", route_key="telegram:chat"
+    )
+    computer_use.unpublish_computer_use_session(publication)
+
+    transition = computer_use.begin_computer_use_terminal_transition(
+        "retired-session"
+    )
+    routes["telegram:chat"] = "replacement-session"
+    computer_use.end_computer_use_terminal_transition(transition, retire=True)
+
+    with pytest.raises(RuntimeError, match="authoritative route"):
+        computer_use.publish_computer_use_session(
+            "retired-session", route_key="telegram:chat"
+        )
+    with pytest.raises(RuntimeError, match="retired or unpublished"):
+        computer_use._get_backend("retired-session")
+
+
+def test_publication_is_bound_to_exact_route_key_not_only_session_id():
+    from tools.computer_use import tool as computer_use
+
+    routes = {"route-a": "shared-session", "route-b": "other-session"}
+    computer_use.set_computer_use_session_validator(
+        lambda route_key, sid: routes.get(route_key) == sid
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative route"):
+        computer_use.publish_computer_use_session(
+            "shared-session", route_key="route-b"
+        )
+    publication = computer_use.publish_computer_use_session(
+        "shared-session", route_key="route-a"
+    )
+    assert publication.route_key == "route-a"
+    computer_use.unpublish_computer_use_session(publication)
+
+
 def test_managed_route_publication_is_reference_counted():
     from tools.computer_use import tool as computer_use
 
@@ -1016,6 +1061,70 @@ def test_async_bridge_run_cancels_and_confirms_timed_out_coroutine():
         assert finalized.wait(timeout=0.5)
     finally:
         bridge.stop()
+
+
+def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
+    tmp_path, monkeypatch
+):
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+
+    from tools.computer_use import tool as computer_use
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    receipt = computer_use.write_computer_use_runtime_attestation()
+    persisted = json.loads(
+        (tmp_path / "runtime" / "cua_gateway_attestation.json").read_text()
+    )
+
+    assert persisted["pid"] == os.getpid() == receipt["pid"]
+    assert persisted["process_create_time"] > 0
+    archive = Path(persisted["archive_path"])
+    assert archive.exists()
+    archived = json.loads(archive.read_text())
+    assert archived == persisted
+    source = str(Path(computer_use.__file__).resolve())
+    assert persisted["modules"][source]["sha256"] == hashlib.sha256(
+        Path(source).read_bytes()
+    ).hexdigest()
+    assert persisted["callables"]["publish_computer_use_session"][
+        "code_sha256"
+    ]
+
+
+def test_unconfirmed_action_timeout_poisons_generation_before_lease_release():
+    from tools.computer_use import tool as computer_use
+    from tools.computer_use.cua_backend import CuaActionTerminationUnconfirmed
+
+    class _TimeoutBackend(_Backend):
+        def __init__(self):
+            super().__init__()
+            self.capture_calls = 0
+
+        def capture(self, **_kwargs):
+            self.capture_calls += 1
+            raise CuaActionTerminationUnconfirmed(
+                "cua-driver action timed out and cancellation was not confirmed"
+            )
+
+    backend = _TimeoutBackend()
+    with patch(
+        "tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend
+    ):
+        first = computer_use.handle_computer_use(
+            {"action": "capture"}, session_id="timeout-poison"
+        )
+        second = computer_use.handle_computer_use(
+            {"action": "capture"}, session_id="timeout-poison"
+        )
+
+    assert "cancellation was not confirmed" in first
+    assert "cleanup failed; retry release" in second
+    assert backend.capture_calls == 1
+    snapshot = computer_use.computer_use_lifecycle_snapshot()["timeout-poison"]
+    assert snapshot["state"] == "FAILED"
 
 
 def test_async_bridge_run_retains_unconfirmed_timeout_until_coroutine_finishes():

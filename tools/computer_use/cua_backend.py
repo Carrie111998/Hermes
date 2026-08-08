@@ -1019,6 +1019,12 @@ def _parse_key_combo(keys: str) -> Tuple[Optional[str], List[str]]:
 # Asyncio bridge — one long-lived loop on a background thread
 # ---------------------------------------------------------------------------
 
+class CuaActionTerminationUnconfirmed(RuntimeError):
+    """The caller returned while its exact driver action may still be live."""
+
+    cua_action_termination_unconfirmed = True
+
+
 class _AsyncBridge:
     """Runs one asyncio loop on a daemon thread; marshals coroutines from the caller."""
 
@@ -1087,7 +1093,7 @@ class _AsyncBridge:
         except concurrent.futures.TimeoutError as exc:
             fut.cancel()
             if not completed.wait(timeout=self._CALL_CANCEL_CONFIRM_TIMEOUT):
-                raise RuntimeError(
+                raise CuaActionTerminationUnconfirmed(
                     "cua-driver action timed out and cancellation was not confirmed"
                 ) from exc
             raise

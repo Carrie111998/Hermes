@@ -42,6 +42,7 @@ from tools.computer_use.tool import (  # noqa: F401
     computer_use_cleanup_snapshot,
     computer_use_lifecycle_snapshot,
     computer_use_process_snapshot,
+    write_computer_use_runtime_attestation,
     drain_computer_use_cleanup,
     end_computer_use_session_reactivation,
     end_computer_use_terminal_transition,

@@ -26,6 +26,38 @@ def _agent(session_id: str):
     )
 
 
+def test_gateway_init_fails_closed_without_clobbering_existing_validator(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from tools.computer_use import (
+        publish_computer_use_session,
+        set_computer_use_session_validator,
+        unpublish_computer_use_session,
+    )
+
+    config = GatewayConfig()
+    config.sessions_dir = tmp_path
+    set_computer_use_session_validator(
+        lambda route_key, sid: route_key == "existing-route" and sid == "existing"
+    )
+    try:
+        with patch(
+            "tools.computer_use.write_computer_use_runtime_attestation",
+            side_effect=OSError("attestation storage unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="runtime attestation"):
+                GatewayRunner(config)
+
+        with pytest.raises(RuntimeError, match="authoritative route"):
+            publish_computer_use_session("existing", route_key="wrong-route")
+        publication = publish_computer_use_session(
+            "existing", route_key="existing-route"
+        )
+        unpublish_computer_use_session(publication)
+    finally:
+        set_computer_use_session_validator(None)
+
+
 def test_soft_evict_hard_release_uses_exact_agent_sid_and_generation(runner):
     from tools.computer_use.tool import ComputerUseReleaseResult
 

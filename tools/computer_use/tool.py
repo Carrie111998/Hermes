@@ -214,6 +214,8 @@ class ComputerUseSessionReactivation:
 @dataclass(eq=False)
 class ComputerUseSessionPublication:
     session_id: str
+    route_key: Optional[str] = None
+    route_epoch: int = 0
     active: bool = True
 
 
@@ -321,7 +323,7 @@ def set_computer_use_session_validator(validator) -> None:
 
 
 def _validate_managed_publication(sid: str) -> tuple[bool, int]:
-    """Validate without lock inversion, retrying across route-epoch changes."""
+    """Validate admission without lock inversion across route epoch changes."""
     while True:
         with _backend_lock:
             epoch = _session_route_epoch_sequence
@@ -331,7 +333,10 @@ def _validate_managed_publication(sid: str) -> tuple[bool, int]:
                 return True, epoch
             validator = _managed_session_validator
         try:
-            allowed = bool(validator(sid)) if callable(validator) else False
+            # ``None`` requests a current-session-id lookup, not authority to
+            # mint a run publication. Publication itself always supplies and
+            # validates an exact route key.
+            allowed = bool(validator(None, sid)) if callable(validator) else False
         except Exception:
             allowed = False
         with _backend_lock:
@@ -341,21 +346,58 @@ def _validate_managed_publication(sid: str) -> tuple[bool, int]:
 
 def publish_computer_use_session(
     session_id: str,
+    *,
+    route_key: Optional[str] = None,
 ) -> ComputerUseSessionPublication:
-    """Publish one run-scoped gateway route lease for CUA acquisition."""
+    """Publish one route-bound run lease after authoritative validation.
+
+    The validator runs outside ``_backend_lock`` to avoid lock inversion with
+    SessionStore.  The scalar route epoch is then rechecked under the lock, so
+    a terminal transition or reactivation that starts during validation makes
+    this attempt retry instead of minting a stale capability.
+    """
     global _managed_routing_enabled
     sid = str(session_id or "")
     if not sid:
         raise ValueError("managed computer_use publication requires a session id")
-    with _backend_lock:
-        _managed_routing_enabled = True
-        if sid in _terminal_transitions or sid in _session_reactivations:
-            raise RuntimeError(
-                f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+    normalized_route_key = str(route_key or "") or None
+    while True:
+        with _backend_lock:
+            epoch = _session_route_epoch_sequence
+            validator = _managed_session_validator
+            validator_required = callable(validator)
+        if validator_required:
+            if normalized_route_key is None:
+                raise ValueError(
+                    "managed computer_use publication requires an exact route key"
+                )
+            try:
+                allowed = bool(validator(normalized_route_key, sid))
+            except Exception:
+                allowed = False
+        else:
+            # Backward-compatible unmanaged CLI/test seam.  The first lease
+            # still enables publication-only admission after it is removed.
+            allowed = True
+        with _backend_lock:
+            if epoch != _session_route_epoch_sequence:
+                continue
+            if sid in _terminal_transitions or sid in _session_reactivations:
+                raise RuntimeError(
+                    f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+                )
+            if not allowed:
+                raise RuntimeError(
+                    f"computer_use session {sid!r} does not match the authoritative route"
+                )
+            _managed_routing_enabled = True
+            publication = ComputerUseSessionPublication(
+                session_id=sid,
+                route_key=normalized_route_key,
+                route_epoch=epoch,
             )
-        publication = ComputerUseSessionPublication(session_id=sid)
-        _managed_session_publications.setdefault(sid, set()).add(publication)
-        return publication
+            _managed_session_publications.setdefault(sid, set()).add(publication)
+            return publication
 
 
 def unpublish_computer_use_session(
@@ -781,6 +823,87 @@ def computer_use_process_snapshot() -> List[Dict[str, Any]]:
     except Exception:
         logger.debug("computer_use process snapshot failed", exc_info=True)
         return []
+
+
+def write_computer_use_runtime_attestation(
+    extra_callables: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Atomically bind the live gateway PID to loaded CUA source/code bytes."""
+    import hashlib
+    import inspect
+    import marshal
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from hermes_constants import get_hermes_home
+
+    callables: Dict[str, Any] = {
+        "publish_computer_use_session": publish_computer_use_session,
+        "_get_backend": _get_backend,
+        "_acquire_backend_for_call": _acquire_backend_for_call,
+        "release_computer_use_session_result": release_computer_use_session_result,
+    }
+    callables.update(extra_callables or {})
+    code_rows = {}
+    module_paths = set()
+    for name, value in callables.items():
+        target = getattr(value, "__func__", value)
+        code = getattr(target, "__code__", None)
+        source_path = inspect.getsourcefile(target)
+        if source_path:
+            module_paths.add(str(Path(source_path).resolve()))
+        code_rows[name] = {
+            "source_path": str(Path(source_path).resolve()) if source_path else None,
+            "first_line": getattr(code, "co_firstlineno", None),
+            "code_sha256": (
+                hashlib.sha256(marshal.dumps(code)).hexdigest()
+                if code is not None
+                else None
+            ),
+        }
+    modules = {}
+    for source_path in sorted(module_paths):
+        path = Path(source_path)
+        modules[source_path] = {
+            "size": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    try:
+        import psutil
+
+        process_create_time = psutil.Process(os.getpid()).create_time()
+    except Exception:
+        # Process creation time is required for PID-reuse-safe external
+        # verification. Fail instead of publishing a weaker receipt.
+        raise RuntimeError("could not attest gateway process creation time")
+    output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
+    archive_dir = output.parent / "cua_gateway_attestations"
+    archive = archive_dir / (
+        f"{os.getpid()}-{int(process_create_time * 1_000_000)}.json"
+    )
+    receipt = {
+        "schema": 2,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "process_create_time": process_create_time,
+        "executable": sys.executable,
+        "argv": list(sys.argv),
+        "modules": modules,
+        "callables": code_rows,
+        "archive_path": str(archive),
+        "path": str(output),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(receipt, indent=2)
+    archive_temporary = archive.with_suffix(".tmp")
+    archive_temporary.write_text(encoded, encoding="utf-8")
+    os.replace(archive_temporary, archive)
+    temporary = output.with_suffix(".tmp")
+    temporary.write_text(encoded, encoding="utf-8")
+    os.replace(temporary, output)
+    return receipt
 
 
 def _cua_permission_mode(session_id: str) -> str:
@@ -1490,6 +1613,21 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     try:
         return _dispatch(backend, action, args)
     except Exception as e:
+        if getattr(e, "cua_action_termination_unconfirmed", False):
+            # The action lease is about to be released, but the exact driver
+            # coroutine may still be running. Poison this generation before
+            # releasing the lock so no successor action can overlap it. Only
+            # exact-generation teardown may clear the failed record.
+            with _backend_lock:
+                record = _backend_records.get(session_id)
+                if (
+                    record is not None
+                    and record.backend is backend
+                    and record.state == BackendLifecycleState.ACTIVE
+                ):
+                    record.state = BackendLifecycleState.FAILED
+                    record.close_reason = "action_termination_unconfirmed"
+                    record.last_error = repr(e)
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
     finally:

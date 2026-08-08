@@ -1587,10 +1587,12 @@ class TestAutoResetPreRotationBoundary:
         store._db = None
         source = self._source()
         original = store.get_or_create_session(source)
+        durable_target = "durable-recovery-target"
         original.metadata["terminal_transition"] = {
             "session_id": original.session_id,
             "reason": "session_reset",
             "token": "crash-recovery-token",
+            "target_session_id": durable_target,
         }
         store._save_entries()
 
@@ -1598,9 +1600,43 @@ class TestAutoResetPreRotationBoundary:
         restarted._db = None
         replacement = restarted.get_or_create_session(source)
 
+        assert replacement.session_id == durable_target
         assert replacement.session_id != original.session_id
         assert replacement.auto_reset_reason == "terminal_transition_recovery"
         assert "terminal_transition" not in replacement.metadata
+
+    def test_terminal_reset_publishes_route_only_after_sqlite_commits(self, tmp_path):
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = None
+        source = self._source()
+        original = store.get_or_create_session(source)
+        events = []
+        fake_db = MagicMock()
+        fake_db.save_gateway_routing_entry.return_value = None
+        fake_db.replace_gateway_routing_entries.return_value = None
+        fake_db.promote_to_session_reset.side_effect = (
+            lambda *_args, **_kwargs: events.append("sqlite:end")
+        )
+        fake_db.create_session.side_effect = (
+            lambda *_args, **_kwargs: events.append("sqlite:create")
+        )
+        fake_db.record_gateway_session_peer.return_value = None
+        store._db = fake_db
+        original_save_entries = store._save_entries
+
+        def _save_entries(*args, **kwargs):
+            current = store._entries[original.session_key]
+            events.append(f"route:{current.session_id}")
+            return original_save_entries(*args, **kwargs)
+
+        store._save_entries = _save_entries
+        replacement = store.reset_session(original.session_key)
+
+        assert replacement is not None
+        assert events.index("sqlite:end") < events.index("sqlite:create")
+        assert events.index("sqlite:create") < events.index(
+            f"route:{replacement.session_id}"
+        )
 
     def test_expiry_reset_cas_does_not_rotate_newer_route(self, tmp_path):
         store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())

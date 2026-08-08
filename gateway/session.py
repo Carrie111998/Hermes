@@ -776,6 +776,7 @@ class _RouteTerminalTransition:
     session_id: str
     callback_token: Any
     rollback_entry_data: Dict[str, Any]
+    allow_route_absent: bool = False
 
 
 @dataclass
@@ -1482,6 +1483,14 @@ class SessionStore:
         recovered_keys = 0
         try:
             for key, entry in self._entries.items():
+                # A durable terminal marker is authoritative even when an
+                # earlier hard phase already ended the old SQLite session.
+                # Preserve it so routing-time recovery can finish publication
+                # instead of silently discarding exact retry state on restart.
+                if isinstance(
+                    entry.metadata.get("terminal_transition"), dict
+                ):
+                    continue
                 row = db.get_session(entry.session_id)
                 # row is None        -> not in DB (legacy / pre-SQLite) — keep
                 # end_reason is None  -> session alive — keep
@@ -2491,6 +2500,9 @@ class SessionStore:
         session_key: str,
         session_id: str,
         reason: str,
+        *,
+        allow_route_absent: bool = False,
+        target_session_id: Optional[str] = None,
     ) -> None:
         before_terminal_reset = getattr(self, "_before_auto_reset_fn", None)
 
@@ -2514,6 +2526,14 @@ class SessionStore:
                 "token": uuid.uuid4().hex,
                 "started_at": _now().isoformat(),
             }
+            existing_marker = current.metadata.get("terminal_transition")
+            if isinstance(existing_marker, dict):
+                target_session_id = (
+                    existing_marker.get("target_session_id")
+                    or target_session_id
+                )
+            if target_session_id:
+                marker["target_session_id"] = target_session_id
             candidate = current.to_dict()
             metadata = dict(candidate.get("metadata") or {})
             metadata["terminal_transition"] = marker
@@ -2542,6 +2562,7 @@ class SessionStore:
                 session_id=session_id,
                 callback_token=callback_token,
                 rollback_entry_data=rollback_entry_data,
+                allow_route_absent=allow_route_absent,
             )
 
     def _run_route_transition(self, session_key: str, operation: Callable[[], Any]) -> Any:
@@ -2584,8 +2605,15 @@ class SessionStore:
                     if terminal_transition is not None:
                         current = self._entries.get(session_key)
                         route_replaced = (
-                            current is not None
-                            and current.session_id != terminal_transition.session_id
+                            (
+                                current is None
+                                and terminal_transition.allow_route_absent
+                            )
+                            or (
+                                current is not None
+                                and current.session_id
+                                != terminal_transition.session_id
+                            )
                         )
                         if not (operation_succeeded and route_replaced):
                             # Restore the durably marked old route. Keep the CUA
@@ -2752,6 +2780,8 @@ class SessionStore:
         # ---- Phase 1: lock read -- get entry snapshot for stale/reset checks ----
         _stale_session_id = None
         _entry_for_checks = None
+        _terminal_target_session_id = None
+        _terminal_recovery_reason = None
         with self._lock:
             self._ensure_loaded_locked()
             if force_new:
@@ -2759,6 +2789,64 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 _entry_for_checks = self._entries[session_key]
                 _stale_session_id = _entry_for_checks.session_id
+                _existing_terminal_marker = _entry_for_checks.metadata.get(
+                    "terminal_transition"
+                )
+                if isinstance(_existing_terminal_marker, dict):
+                    _terminal_target_session_id = _existing_terminal_marker.get(
+                        "target_session_id"
+                    )
+                    _terminal_recovery_reason = _existing_terminal_marker.get(
+                        "reason"
+                    )
+
+        # A crashed prune must first finish its terminal publication of route
+        # absence. Only after that durable boundary may this incoming message
+        # create a fresh route. Treating the marker as a reset would skip the
+        # absence state and blur two independently recoverable transactions.
+        if (
+            _terminal_recovery_reason == "session_prune"
+            and _stale_session_id is not None
+        ):
+            with self._lock:
+                current = self._entries.get(session_key)
+                prune_target_is_current = (
+                    current is not None
+                    and current.session_id == _stale_session_id
+                )
+            if prune_target_is_current:
+                self._arm_route_terminal_transition(
+                    session_key,
+                    _stale_session_id,
+                    "session_prune",
+                    allow_route_absent=True,
+                )
+                if self._db:
+                    try:
+                        self._db.end_session(
+                            _stale_session_id, "session_prune"
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "terminal prune recovery could not close prior "
+                            "SQLite session"
+                        ) from exc
+                with self._lock:
+                    current = self._entries.get(session_key)
+                    if (
+                        current is None
+                        or current.session_id != _stale_session_id
+                    ):
+                        raise RuntimeError(
+                            "prune recovery route changed before absence publication"
+                        )
+                    self._entries.pop(session_key)
+                self._save_entries(require_primary_db=True)
+                _entry_for_checks = None
+                _stale_session_id = None
+                existing_session_id = None
+                canonical_existing_session_id = None
+                _terminal_recovery_reason = None
 
         # ---- Phase 1b: no-lock I/O -- stale check + reset policy ----
         _is_stale = False
@@ -2804,8 +2892,15 @@ class SessionStore:
                     and current.session_id == _stale_session_id
                 )
             if reset_target_is_current:
+                if not _terminal_target_session_id:
+                    _terminal_target_session_id = (
+                        f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                    )
                 self._arm_route_terminal_transition(
-                    session_key, _stale_session_id, _reset_reason
+                    session_key,
+                    _stale_session_id,
+                    _reset_reason,
+                    target_session_id=_terminal_target_session_id,
                 )
 
         # ---- Phase 2: lock write -- apply decisions to _entries ----
@@ -2907,7 +3002,9 @@ class SessionStore:
         if entry is None:
             # Create a candidate outside the lock, then publish only if another
             # worker has not already populated this routing key.
-            session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            session_id = _terminal_target_session_id or (
+                f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            )
             candidate = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
@@ -2950,21 +3047,22 @@ class SessionStore:
         terminal_route_transition = (
             session_key in self._route_terminal_transitions
         )
-        if _needs_save:
+        if _needs_save and not terminal_route_transition:
             if _metadata_only_save:
                 self._save_entry(session_key)
             else:
-                if terminal_route_transition:
-                    self._save_entries(require_primary_db=True)
-                else:
-                    self._save_entries()
+                self._save_entries()
 
         # SQLite operations outside the lock. Terminal transitions fail closed
         if self._db and db_end_session_id:
             # Use the specific reset reason so state.db is auditable (e.g.
             # "resume_pending_expired" is distinguishable from a normal
             # "session_reset" caused by idle/daily expiry).
-            _db_end_reason = auto_reset_reason if auto_reset_reason else "session_reset"
+            _db_end_reason = (
+                _terminal_recovery_reason
+                or auto_reset_reason
+                or "session_reset"
+            )
             try:
                 # promote_to_session_reset, not end_session: the row may
                 # already be ended with a recoverable accidental reason
@@ -2985,7 +3083,10 @@ class SessionStore:
 
         if self._db and db_create_kwargs:
             try:
-                self._db.create_session(**db_create_kwargs)
+                if _terminal_recovery_reason == "session_switch":
+                    self._db.reopen_session(session_id)
+                elif _terminal_recovery_reason != "compression_advance":
+                    self._db.create_session(**db_create_kwargs)
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
@@ -2998,6 +3099,13 @@ class SessionStore:
                         "terminal transition could not create replacement SQLite session"
                     ) from e
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
+
+        # Keep the old-route write-ahead marker durable until all hard SQLite
+        # work commits. Publishing the replacement route is the final durable
+        # step, so process death earlier restarts into exact recovery with the
+        # same target_session_id rather than exposing a partial replacement.
+        if _needs_save and terminal_route_transition:
+            self._save_entries(require_primary_db=True)
 
         return entry
 
@@ -3321,29 +3429,62 @@ class SessionStore:
         from datetime import timedelta
 
         cutoff = _now() - timedelta(days=max_age_days)
-        removed_keys: list[str] = []
-
         with self._lock:
             self._ensure_loaded_locked()
-            active_transitions = getattr(self, "_active_route_transitions", set())
-            for key, entry in list(self._entries.items()):
-                if key in active_transitions:
-                    continue
-                if entry.suspended:
-                    continue
-                # Never prune sessions with an active background process
-                # attached — the user may still be waiting on output.
-                # The callback is keyed by session_key (see process_registry.
-                # has_active_for_session); passing session_id here used to
-                # never match, so active sessions got pruned anyway.
-                if self._has_active_processes_safe(entry.session_key, context="prune"):
-                    continue
-                if entry.updated_at < cutoff:
-                    removed_keys.append(key)
-            for key in removed_keys:
-                self._entries.pop(key, None)
-            if removed_keys:
-                self._save()
+            candidates = [
+                (key, entry.session_id)
+                for key, entry in self._entries.items()
+                if not entry.suspended and entry.updated_at < cutoff
+            ]
+
+        removed_keys: list[str] = []
+
+        def _prune_exact(key: str, expected_sid: str) -> bool:
+            with self._lock:
+                current = self._entries.get(key)
+                if (
+                    current is None
+                    or current.session_id != expected_sid
+                    or current.suspended
+                    or current.updated_at >= cutoff
+                ):
+                    return False
+            # The process check is deliberately inside the per-route
+            # transition reservation, so work cannot be admitted between the
+            # last check and the durable terminal marker.
+            if self._has_active_processes_safe(key, context="prune"):
+                return False
+            self._arm_route_terminal_transition(
+                key,
+                expected_sid,
+                "session_prune",
+                allow_route_absent=True,
+            )
+            if self._db:
+                try:
+                    self._db.end_session(expected_sid, "session_prune")
+                except Exception as exc:
+                    raise RuntimeError(
+                        "terminal prune could not close prior SQLite session"
+                    ) from exc
+            with self._lock:
+                current = self._entries.get(key)
+                if current is None or current.session_id != expected_sid:
+                    raise RuntimeError("prune route changed after SQLite close")
+                self._entries.pop(key)
+            # Route absence is the terminal publication and therefore commits
+            # last. Until this succeeds, the durable marked old route remains
+            # sufficient for fail-closed restart recovery and exact retry.
+            self._save_entries(require_primary_db=True)
+            return True
+
+        for key, expected_sid in candidates:
+            removed = self._run_route_transition(
+                key,
+                lambda key=key, sid=expected_sid: _prune_exact(key, sid),
+            )
+            if removed:
+                removed_keys.append(key)
 
         if removed_keys:
             logger.info(
@@ -3424,16 +3565,33 @@ class SessionStore:
             ):
                 return None
             terminal_session_id = entry.session_id
+            existing_marker = entry.metadata.get("terminal_transition")
+            target_session_id = (
+                existing_marker.get("target_session_id")
+                if isinstance(existing_marker, dict)
+                else None
+            )
+            if not target_session_id:
+                now = _now()
+                target_session_id = (
+                    f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                )
 
         self._arm_route_terminal_transition(
-            session_key, terminal_session_id, reset_reason
+            session_key,
+            terminal_session_id,
+            reset_reason,
+            target_session_id=target_session_id,
         )
-        return self._apply_reset_session_impl(session_key, display_name)
+        return self._apply_reset_session_impl(
+            session_key, display_name, target_session_id
+        )
 
     def _apply_reset_session_impl(
         self,
         session_key: str,
         display_name: Optional[str] = None,
+        target_session_id: Optional[str] = None,
     ) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
@@ -3450,7 +3608,9 @@ class SessionStore:
             db_end_session_id = old_entry.session_id
 
             now = _now()
-            session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            session_id = target_session_id
+            if not session_id:
+                raise RuntimeError("terminal reset is missing its durable target")
 
             new_entry = SessionEntry(
                 session_key=session_key,
@@ -3464,8 +3624,6 @@ class SessionStore:
                 is_fresh_reset=True,
             )
 
-            self._entries[session_key] = new_entry
-            self._save(require_primary_db=True)
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
@@ -3506,6 +3664,13 @@ class SessionStore:
                 raise RuntimeError(
                     "terminal reset could not create replacement SQLite session"
                 ) from e
+
+        with self._lock:
+            current = self._entries.get(session_key)
+            if current is None or current.session_id != db_end_session_id:
+                raise RuntimeError("terminal reset route changed before publication")
+            self._entries[session_key] = new_entry
+        self._save_entries(require_primary_db=True)
 
         return new_entry
 
@@ -3548,6 +3713,7 @@ class SessionStore:
             session_key,
             expected_session_id,
             "compression_advance",
+            target_session_id=target_session_id,
         )
         with self._lock:
             entry = self._entries.get(session_key)
@@ -3600,6 +3766,7 @@ class SessionStore:
             session_key,
             db_end_session_id,
             "session_switch",
+            target_session_id=target_session_id,
         )
         with self._lock:
             current = self._entries.get(session_key)
@@ -3617,8 +3784,6 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
             )
-            self._entries[session_key] = new_entry
-        self._save_entries(require_primary_db=True)
 
         if self._db:
             try:
@@ -3640,6 +3805,13 @@ class SessionStore:
                     "terminal session switch SQLite publication failed"
                 ) from exc
 
+        with self._lock:
+            current = self._entries.get(session_key)
+            if current is None or current.session_id != db_end_session_id:
+                raise RuntimeError("session switch route changed before publication")
+            self._entries[session_key] = new_entry
+        self._save_entries(require_primary_db=True)
+
         return new_entry
 
     def list_sessions(self, active_minutes: Optional[int] = None) -> List[SessionEntry]:
@@ -3655,6 +3827,15 @@ class SessionStore:
         entries.sort(key=lambda e: e.updated_at, reverse=True)
 
         return entries
+
+    def route_matches(self, session_key: str, session_id: str) -> bool:
+        """Atomically validate one exact persisted route binding."""
+        if not session_key or not session_id:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            return bool(entry is not None and entry.session_id == session_id)
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
         """Return the active session entry for a persisted session ID, if any."""

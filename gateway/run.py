@@ -6053,11 +6053,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             ),
         )
+        from tools.computer_use import write_computer_use_runtime_attestation
+
+        session_validator = lambda route_key, sid: (
+            self.session_store.route_matches(route_key, sid)
+            if route_key
+            else self.session_store.lookup_by_session_id(sid) is not None
+        )
+        try:
+            write_computer_use_runtime_attestation({
+                "GatewayRunner._run_agent": self._run_agent,
+                "SessionStore.route_matches": self.session_store.route_matches,
+                "SessionStore._run_route_transition": (
+                    self.session_store._run_route_transition
+                ),
+                "SessionStore.prune_old_entries": (
+                    self.session_store.prune_old_entries
+                ),
+            })
+        except Exception as exc:
+            logger.exception("Could not write CUA gateway runtime attestation")
+            raise RuntimeError(
+                "CUA gateway runtime attestation is required for startup"
+            ) from exc
+        # Publish process-global route authority only after this runner's
+        # required attestation is durable. A failed constructor therefore
+        # cannot overwrite or clear authority owned by an existing runner.
         from tools.computer_use import set_computer_use_session_validator
 
-        set_computer_use_session_validator(
-            lambda sid: self.session_store.lookup_by_session_id(sid) is not None
-        )
+        set_computer_use_session_validator(session_validator)
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
@@ -18296,7 +18320,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             _cua_publication = publish_computer_use_session(
-                _run_start_session_id
+                _run_start_session_id,
+                route_key=session_key,
             )
             try:
                 agent_result = await self._run_agent(
