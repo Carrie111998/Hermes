@@ -1316,4 +1316,137 @@ export const eu = defineLocale({
       viewLog: 'Ekintza-erregistroa'
     }
   },
+
+  messaging: {
+    search: 'Bilatu mezularitza...',
+    loading: 'Mezularitza-plataformak kargatzen...',
+    loadFailed: 'Mezularitza-plataformak kargatzeak huts egin du',
+    states: {
+      connected: 'Konektatuta',
+      connecting: 'Konektatzen',
+      disabled: 'Desgaituta',
+      fatal: 'Errorea',
+      gateway_stopped: 'Mezularitza-gateway-a geldituta',
+      not_configured: 'Konfigurazioa behar du',
+      pending_restart: 'Berrabiarazi behar da',
+      retrying: 'Berriro saiatzen',
+      startup_failed: 'Abioak huts egin du'
+    },
+    unknown: 'Ezezaguna',
+    hintPendingRestart: 'Berrabiarazi gateway-a egoera-barran aldaketa aplikatzeko.',
+    hintGatewayStopped: 'Hasi gateway-a egoera-barran konektatzeko.',
+    credentialsSet: 'Kredentzialak ezarrita',
+    needsSetup: 'Konfigurazioa behar du',
+    gatewayStopped: 'Mezularitza-gateway-a geldituta',
+    getCredentials: 'Lortu zure kredentzialak',
+    openSetupGuide: 'Ireki konfigurazio-gida',
+    required: 'Beharrezkoa',
+    recommended: 'Gomendatua',
+    advanced: count => `Aurreratua (${count})`,
+    noTokenNeeded: 'Plataforma honek ez du tokenik behar hemen. Erabili goiko konfigurazio-gida, gero gaitu behean.',
+    enabled: 'Gaituta',
+    disabled: 'Desgaituta',
+    unsavedChanges: 'Gorde gabeko aldaketak',
+    saving: 'Gordetzen...',
+    saveChanges: 'Gorde aldaketak',
+    saved: 'Gordeta',
+    replaceValue: 'Ordeztu uneko balioa',
+    openDocs: 'Ireki dokumentazioa',
+    clearField: key => `Garbitu ${key}`,
+    enableAria: name => `Gaitu ${name}`,
+    disableAria: name => `Desgaitu ${name}`,
+    platformEnabled: name => `${name} gaituta`,
+    platformDisabled: name => `${name} desgaituta`,
+    restartToApply: 'Aldaketa honek gateway-a berrabiarazi ondoren du eragina.',
+    setupSaved: name => `${name} konfigurazioa gordeta`,
+    restartToReconnect: 'Kredentzial berriek gateway-a berrabiarazi ondoren dute eragina.',
+    keyCleared: key => `${key} garbituta`,
+    setupUpdated: name => `${name} konfigurazioa eguneratu da.`,
+    failedUpdate: name => `${name} eguneratzeak huts egin du`,
+    failedSave: name => `${name} gordetzeak huts egin du`,
+    failedClear: key => `${key} garbitzeak huts egin du`,
+    fieldCopy: {
+      TELEGRAM_BOT_TOKEN: {
+        label: 'Bot tokena',
+        help: 'Sortu bot bat @BotFather-ekin, gero itsatsi ematen dizun tokena.',
+        placeholder: 'Itsatsi Telegram bot tokena'
+      },
+      TELEGRAM_ALLOWED_USERS: {
+        label: 'Baimendutako Telegram erabiltzaile-IDak',
+        help: 'Gomendatua. @userinfobot-etik lortutako ID zenbakiak, komaz bereizita. Hau gabe, edonork bidal ditzake mezuak zure bot-ari.'
+      },
+      TELEGRAM_PROXY: { label: 'Proxy URLa', help: 'Telegram blokeatuta dagoen sareetan soilik behar da.' },
+      DISCORD_BOT_TOKEN: {
+        label: 'Bot tokena',
+        help: 'Sortu aplikazio bat Discord Developer Portal-en, gehitu bot bat, gero itsatsi bere tokena.'
+      },
+      DISCORD_ALLOWED_USERS: {
+        label: 'Baimendutako Discord erabiltzaile-IDak',
+        help: 'Gomendatua. Discord erabiltzaile-IDak, komaz bereizita.'
+      },
+      DISCORD_REPLY_TO_MODE: { label: 'Erantzun-estiloa', help: 'first, all edo off.' },
+      DISCORD_ALLOW_ALL_USERS: {
+        label: 'Baimendu Discord erabiltzaile guztiak',
+        help: 'Garapenerako soilik. Egia denean, edonork bidal ditzake mezuak botari baimen-zerrendarik gabe.'
+      },
+      DISCORD_HOME_CHANNEL: {
+        label: 'Etxeko kanalaren IDa',
+        help: 'Botak mezu proaktiboak bidaltzen dituen kanala (cron irteera, abisuak).'
+      },
+      DISCORD_HOME_CHANNEL_NAME: {
+        label: 'Etxeko kanalaren izena',
+        help: 'Etxeko kanalaren erakusteko izena erregistroetan eta egoera-irteeran.'
+      },
+      BLUEBUBBLES_ALLOW_ALL_USERS: {
+        label: 'Baimendu iMessage erabiltzaile guztiak',
+        help: 'Egia denean, saihestu BlueBubbles baimen-zerrenda.'
+      },
+      MATTERMOST_ALLOW_ALL_USERS: { label: 'Baimendu Mattermost erabiltzaile guztiak' },
+      MATTERMOST_HOME_CHANNEL: { label: 'Etxeko kanala' },
+      QQ_ALLOW_ALL_USERS: { label: 'Baimendu QQ erabiltzaile guztiak' },
+      QQBOT_HOME_CHANNEL: { label: 'QQ etxeko kanala', help: 'Cron banaketarako kanal edo talde lehenetsia.' },
+      QQBOT_HOME_CHANNEL_NAME: { label: 'QQ etxeko kanalaren izena' },
+      SLACK_BOT_TOKEN: {
+        label: 'Slack bot tokena',
+        help: 'Erabili OAuth & Permissions-eko bot tokena zure Slack aplikazioa instalatu ondoren.',
+        placeholder: 'Itsatsi Slack bot tokena'
+      },
+      SLACK_APP_TOKEN: {
+        label: 'Slack app tokena',
+        help: 'Erabili Socket Mode-rako behar den aplikazio-mailako tokena.',
+        placeholder: 'Itsatsi Slack app tokena'
+      },
+      SLACK_ALLOWED_USERS: { label: 'Baimendutako Slack erabiltzaile-IDak', help: 'Gomendatua. Slack erabiltzaile-IDak, komaz bereizita.' },
+      MATTERMOST_URL: { label: 'Zerbitzariaren URLa', placeholder: 'https://mattermost.example.com' },
+      MATTERMOST_TOKEN: { label: 'Bot tokena' },
+      MATTERMOST_ALLOWED_USERS: {
+        label: 'Baimendutako erabiltzaile-IDak',
+        help: 'Gomendatua. Mattermost erabiltzaile-IDak, komaz bereizita.'
+      },
+      MATRIX_HOMESERVER: { label: 'Homeserver URLa', placeholder: 'https://matrix.org' },
+      MATRIX_ACCESS_TOKEN: { label: 'Sarbide-tokena' },
+      MATRIX_USER_ID: { label: 'Bot erabiltzaile-IDa', placeholder: '@hermes:example.org' },
+      MATRIX_ALLOWED_USERS: {
+        label: 'Baimendutako Matrix erabiltzaile-IDak',
+        help: 'Gomendatua. Erabiltzaile-IDak @erabiltzaile:zerbitzari formatuan, komaz bereizita.'
+      },
+      SIGNAL_HTTP_URL: {
+        label: 'Signal bridge URLa',
+        placeholder: 'http://127.0.0.1:8080',
+        help: 'Martxan dagoen signal-cli REST bridge baten URLa.'
+      },
+      SIGNAL_ACCOUNT: { label: 'Telefono-zenbakia', help: 'Zure signal-cli bridge-an erregistratutako zenbakia.' },
+      SIGNAL_ALLOWED_USERS: { label: 'Baimendutako Signal erabiltzaileak', help: 'Gomendatua. Signal identifikatzaileak, komaz bereizita.' },
+      WHATSAPP_ENABLED: {
+        label: 'Gaitu WhatsApp bridge-a',
+        help: 'Beheko etengailuak automatikoki ezartzen du. Ez ukitu ez badakizu behar duzula.'
+      },
+      WHATSAPP_MODE: { label: 'Bridge modua' },
+      WHATSAPP_ALLOWED_USERS: {
+        label: 'Baimendutako WhatsApp erabiltzaileak',
+        help: 'Gomendatua. Telefono-zenbakiak edo WhatsApp IDak, komaz bereizita.'
+      }
+    },
+    platformIntro: {}
+  },
 })
