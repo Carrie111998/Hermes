@@ -350,7 +350,7 @@ async def handle_ws(
     only identity authority for browser-controller registration. Existing
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
-    
+
     ``principal_info`` is retained for callers using the identity-binding
     interface; dashboard callers also pass ``auth_identity`` so the verified
     identity reaches the transport used by browser-control ownership checks.
