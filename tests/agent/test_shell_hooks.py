@@ -9,6 +9,7 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,18 @@ def _write_script(tmp_path: Path, name: str, body: str) -> Path:
     path.write_text(body)
     path.chmod(0o755)
     return path
+
+
+def _bash_path(path: Path) -> str:
+    """Format a fixture path for Git Bash on Windows."""
+    value = str(path)
+    if os.name != "nt":
+        return value
+    drive, separator, tail = value.partition(":")
+    if not separator:
+        return value.replace("\\", "/")
+    tail = tail.lstrip("/\\").replace("\\", "/")
+    return "/" + drive.lower() + "/" + tail
 
 
 def _allowlist_pair(monkeypatch, tmp_path, event: str, command: str) -> None:
@@ -105,6 +118,16 @@ class TestSerializePayload:
 
 
 # ── Matcher behaviour ─────────────────────────────────────────────────────
+
+
+class TestCommandSplitting:
+    def test_windows_path_keeps_backslashes_and_strips_outer_quotes(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        assert shell_hooks._split_command(
+            r'"C:\Program Files\Hermes Hooks\hook.sh" --flag',
+        ) == [r"C:\Program Files\Hermes Hooks\hook.sh", "--flag"]
 
 
 class TestMatcher:
@@ -207,7 +230,7 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "log.sh",
             f"#!/usr/bin/env bash\n"
-            f"echo \"$(cat -)\" >> {calls}\n"
+            f"echo \"$(cat -)\" >> {_bash_path(calls)}\n"
             f"printf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
@@ -227,7 +250,7 @@ class TestCallbackSubprocess:
         capture = tmp_path / "payload.json"
         script = _write_script(
             tmp_path, "capture.sh",
-            f"#!/usr/bin/env bash\ncat - > {capture}\nprintf '{{}}\\n'\n",
+            f"#!/usr/bin/env bash\ncat - > {_bash_path(capture)}\nprintf '{{}}\\n'\n",
         )
         spec = shell_hooks.ShellHookSpec(
             event="pre_tool_call", command=str(script),

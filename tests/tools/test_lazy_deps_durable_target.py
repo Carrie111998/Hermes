@@ -91,11 +91,22 @@ class TestAbiStamp:
         assert stamp.read_text().strip() == ld._python_abi_tag()
 
 
-    def test_readonly_target_reports_error(self, tmp_path):
+    def test_readonly_target_reports_error(self, tmp_path, monkeypatch):
         # A path under a non-writable parent should surface a clean error,
         # not raise.
         ro_parent = tmp_path / "ro"
         ro_parent.mkdir()
+        if os.name == "nt":
+            # chmod does not remove the current user's write ACL on Windows.
+            # Exercise the same filesystem error deterministically instead.
+            def _deny_mkdir(self, *args, **kwargs):
+                raise PermissionError("access denied")
+
+            monkeypatch.setattr(Path, "mkdir", _deny_mkdir)
+            err = ld._ensure_target_ready(ro_parent / "lazy")
+            assert err is not None
+            assert "not writable" in err
+            return
         os.chmod(ro_parent, 0o500)
         try:
             err = ld._ensure_target_ready(ro_parent / "lazy")

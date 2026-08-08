@@ -13,8 +13,8 @@ Design notes
   :func:`hermes_cli.plugins.invoke_hook` and its aggregators.  Python
   plugins are registered first (via ``discover_and_load()``) so their
   block decisions win ties over shell-hook blocks.
-* Subprocess execution uses ``shlex.split(os.path.expanduser(command))``
-  with ``shell=False`` — no shell injection footguns.  Users that need
+* Subprocess execution uses platform-aware command tokenization with
+  ``shell=False`` — no shell injection footguns.  Users that need
   pipes/redirection wrap their logic in a script.
 * First-use consent is gated by the allowlist under
   ``~/.hermes/shell-hooks-allowlist.json``.  Non-TTY callers must pass
@@ -492,6 +492,19 @@ def _parse_single_entry(
 _TOP_LEVEL_PAYLOAD_KEYS = {"tool_name", "args", "session_id", "parent_session_id"}
 
 
+def _split_command(command: str) -> List[str]:
+    """Split a configured command without corrupting Windows paths."""
+    argv = shlex.split(os.path.expanduser(command), posix=not IS_WINDOWS)
+    if not IS_WINDOWS:
+        return argv
+    return [
+        part[1:-1]
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {"'", '"'}
+        else part
+        for part in argv
+    ]
+
+
 def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     """Run ``spec.command`` as a subprocess with ``stdin_json`` on stdin.
 
@@ -511,13 +524,35 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         "error": None,
     }
     try:
-        argv = shlex.split(os.path.expanduser(spec.command))
+        argv = _split_command(spec.command)
     except ValueError as exc:
         result["error"] = f"command {spec.command!r} cannot be parsed: {exc}"
         return result
     if not argv:
         result["error"] = "empty command"
         return result
+
+    # Git for Windows does not use POSIX shebang handling when a ``.sh``
+    # file is launched directly through CreateProcess.  Keep shell=False
+    # (the hook command remains argv-based), but explicitly select the
+    # established Git Bash resolver for bare shell scripts so the same
+    # allowlisted hook works on both platforms.
+    if IS_WINDOWS and Path(argv[0]).suffix.lower() in {".sh", ".bash"}:
+        script_path = Path(argv[0])
+        if not script_path.is_file():
+            result["error"] = "command not found"
+            return result
+        try:
+            from tools.environments.local import _find_bash, _windows_to_msys_path
+
+            argv = [
+                _find_bash(),
+                _windows_to_msys_path(str(script_path)),
+                *argv[1:],
+            ]
+        except (OSError, RuntimeError) as exc:
+            result["error"] = f"Git Bash unavailable for shell hook: {exc}"
+            return result
 
     t0 = time.monotonic()
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
@@ -950,7 +985,7 @@ def _command_script_path(command: str) -> str:
     common bare-path form.
     """
     try:
-        parts = shlex.split(command)
+        parts = _split_command(command)
     except ValueError:
         return command
     if not parts:
@@ -1037,7 +1072,7 @@ def script_is_executable(command: str) -> bool:
     if not os.path.isfile(expanded):
         return False
     try:
-        argv = shlex.split(command)
+        argv = _split_command(command)
     except ValueError:
         return False
     is_bare_invocation = bool(argv) and argv[0] == path

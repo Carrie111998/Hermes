@@ -702,18 +702,23 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
         app = _create_app(adapter)
+        readiness = {"status": "ok", "checks": {"gateway": {"status": "ok"}}}
         with patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
             "platforms": {"telegram": {"state": "connected"}},
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
+            "gateway.platforms.api_server.collect_runtime_readiness",
+            return_value=readiness,
+        ) as readiness_probe:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["status"] == "ok"
+                assert data["readiness"] == readiness
                 assert data["platform"] == "hermes-agent"
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
@@ -724,6 +729,7 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+        readiness_probe.assert_called_once()
 
 
     @pytest.mark.asyncio
