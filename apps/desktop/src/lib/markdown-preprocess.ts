@@ -1,5 +1,6 @@
 import { normalizeMathDelimiters } from '@assistant-ui/react-streamdown'
 
+import { linkifyKanbanCardRefs } from '@/lib/kanban-card-refs'
 import { isLikelyProseFence, sanitizeLanguageTag } from '@/lib/markdown-code'
 import { stripPreviewTargets } from '@/lib/preview-targets'
 import { linkifySessionRefs } from '@/lib/session-refs'
@@ -150,9 +151,11 @@ function normalizeVisibleProse(text: string): string {
     .map(part =>
       part.startsWith('`')
         ? part
-        : linkifySessionRefs(
-            autoLinkRawUrls(
-              part.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+        : linkifyKanbanCardRefs(
+            linkifySessionRefs(
+              autoLinkRawUrls(
+                part.replace(/`{3,}/g, '').replace(LOCAL_PREVIEW_URL_RE, '$1').replace(CITATION_MARKER_RE, '')
+              )
             )
           )
     )
