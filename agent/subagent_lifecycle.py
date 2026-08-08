@@ -352,6 +352,16 @@ class SubagentLifecycleService:
                     self._abort_child_launch(child, parent)
                     child = None
                     raise
+                if getattr(child, "api_mode", None) == "codex_responses" and (
+                    getattr(child, "provider", None) in {"xai", "xai-oauth"}
+                    or getattr(child, "_base_url_hostname", None) == "api.x.ai"
+                ):
+                    self._abort_child_launch(child, parent)
+                    child = None
+                    raise SubagentLifecycleError(
+                        "Exact execution profiles do not support xAI Responses because "
+                        "its provider wire path rewrites tool schemas after launch binding."
+                    )
                 if (
                     profile.execution_backend != "in_process"
                     and getattr(child, "api_mode", None) != "chat_completions"

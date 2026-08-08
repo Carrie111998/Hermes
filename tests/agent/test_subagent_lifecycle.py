@@ -107,6 +107,43 @@ def test_process_profile_refuses_unsupported_api_mode_before_spawn(
     spawned.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("provider", "hostname"),
+    [
+        ("xai", None),
+        ("xai-oauth", None),
+        ("custom", "api.x.ai"),
+    ],
+)
+def test_exact_profile_refuses_xai_responses_schema_rewrite(
+    monkeypatch, provider, hostname
+):
+    parent = SimpleNamespace(session_id="xai-refusal", enabled_toolsets=["file"])
+    child = FakeChild("xai-responses")
+    child.api_mode = "codex_responses"
+    child.provider = provider
+    setattr(child, "_base_url_hostname", hostname)
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile", lambda _id: _profile()
+    )
+
+    def build(**_kwargs):
+        from tools.registry import registry
+
+        child._delegate_tool_registry_generation = registry.generation()
+        return child
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+
+    service = SubagentLifecycleService(lambda: parent)
+    with pytest.raises(
+        SubagentLifecycleError,
+        match="xAI Responses because its provider wire path rewrites tool schemas",
+    ):
+        service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
+    assert child.closed is True
+
+
 def test_profile_workspace_binding_rejects_caller_selected_root_before_spawn(
     monkeypatch, tmp_path
 ):

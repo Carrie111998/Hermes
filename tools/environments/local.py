@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1169,17 +1170,41 @@ def _managed_runtime_path_entries() -> list[str]:
 
 
 def _installed_user_runtime_path_entries(home: str | None = None) -> list[str]:
-    """Return verified standard user-runtime dirs missing from GUI launch PATHs."""
+    """Return detected standard user-runtime dirs missing from GUI launch PATHs.
+
+    This is convenience discovery inside the ambient same-user boundary, not a
+    security verification: executable existence is checked before PATH construction,
+    but no claim is made against same-user replacement between check and use.
+    """
     if _IS_WINDOWS:
         return []
-    user_home = home or os.environ.get("HOME")
-    if not user_home:
+    requested_home = home or os.environ.get("HOME")
+    if not requested_home:
         return []
-    bun_dir = os.path.join(os.path.expanduser(user_home), ".bun", "bin")
+    expected_home = os.path.realpath(os.path.expanduser("~"))
+    user_home = os.path.realpath(os.path.expanduser(requested_home))
+    if user_home != expected_home:
+        return []
+    bun_dir = os.path.join(user_home, ".bun", "bin")
     bun = os.path.join(bun_dir, "bun")
-    if os.path.isfile(bun) and os.access(bun, os.X_OK):
-        return [bun_dir]
-    return []
+    try:
+        home_stat = os.lstat(user_home)
+        directory_stat = os.lstat(bun_dir)
+        bun_stat = os.lstat(bun)
+    except OSError:
+        return []
+    if not stat.S_ISDIR(home_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
+        return []
+    if not stat.S_ISREG(bun_stat.st_mode) or not os.access(bun, os.X_OK):
+        return []
+    if hasattr(os, "getuid"):
+        expected_uid = os.getuid()
+        if any(
+            item.st_uid != expected_uid
+            for item in (home_stat, directory_stat, bun_stat)
+        ):
+            return []
+    return [bun_dir]
 
 
 def _append_missing_sane_path_entries(

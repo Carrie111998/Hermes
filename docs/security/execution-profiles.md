@@ -147,8 +147,11 @@ launches. It records:
 - host creation time.
 
 The receipt is also attached to the terminal `SubagentResult` and included in its
-canonical result hash. It is host evidence about observed launch state, not an OS
-sandbox attestation.
+canonical result hash. Within the direct lifecycle return path, object identity and
+that binding make it host-observed evidence about launch state, not an OS sandbox
+attestation. The receipt and its unkeyed canonical hash are not cryptographically
+authentic after serialization: callers must not treat a copied or externally supplied
+receipt as host evidence.
 
 ## Phase 2 process backends
 
@@ -182,7 +185,9 @@ invoked with the strict child bound as lifecycle parent so nested profile transi
 remain enforced. Unclassified tools, including process, GUI, browser, network,
 credential, and arbitrary plugin tools, fail before spawn. Provider calls remain in
 the parent. Process profiles currently support only `api_mode: chat_completions`;
-other modes fail before spawn.
+other modes fail before spawn. All exact profiles also reject xAI Responses because
+that provider path rewrites tool schemas after the launch digest would otherwise be
+frozen.
 
 `describe_execution(handle)` returns a separate immutable process execution
 receipt. Terminal process results bind both its canonical hash and the unchanged
