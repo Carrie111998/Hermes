@@ -2720,10 +2720,16 @@ def list_authenticated_providers(
                     and _ep_url_norm == _current_base_url_norm
                 )
             )
-            should_probe = _can_probe_custom_provider(row_is_current=_ep_is_current) and bool(api_url) and discover and (
+            # See section 4: when live probing is suppressed for latency, a
+            # warm same-fingerprint cache entry still serves the full catalog
+            # with no network round-trip.
+            _discovery_allowed = bool(api_url) and discover and (
                 bool(api_key) or not has_explicit_models
             )
-            if should_probe:
+            _probe_live = _discovery_allowed and _can_probe_custom_provider(
+                row_is_current=_ep_is_current
+            )
+            if _discovery_allowed:
                 try:
                     from hermes_cli.models import cached_fetch_api_models
                     live_models = cached_fetch_api_models(
@@ -2731,6 +2737,7 @@ def list_authenticated_providers(
                         api_url,
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
                         headers=_extra_headers_from_config(ep_cfg) or None,
+                        cache_only=not _probe_live,
                     )
                     if live_models:
                         models_list = live_models
@@ -2793,19 +2800,22 @@ def list_authenticated_providers(
         )
     ):
         _models = [current_model] if current_model else []
-        if refresh or probe_current_custom_provider:
-            try:
-                from hermes_cli.models import cached_fetch_api_models
+        # As in sections 3 and 4: with live probing suppressed, fall back to
+        # the cached catalog rather than to the single active model.
+        _probe_live = bool(refresh or probe_current_custom_provider)
+        try:
+            from hermes_cli.models import cached_fetch_api_models
 
-                _live_models = cached_fetch_api_models(
-                    "",
-                    str(current_base_url).strip().rstrip("/"),
-                    timeout=1.5 if for_picker else 5.0,  # picker: fail fast on a slow current endpoint
-                )
-                if _live_models:
-                    _models = _live_models
-            except Exception:
-                pass
+            _live_models = cached_fetch_api_models(
+                "",
+                str(current_base_url).strip().rstrip("/"),
+                timeout=1.5 if for_picker else 5.0,  # picker: fail fast on a slow current endpoint
+                cache_only=not _probe_live,
+            )
+            if _live_models:
+                _models = _live_models
+        except Exception:
+            pass
         results.append({
             "slug": "custom",
             "name": "Custom endpoint",
@@ -3031,13 +3041,20 @@ def list_authenticated_providers(
                 and _grp_url_norm == _current_base_url_norm
                 and _current_base_url_group_count == 1
             )
-            should_probe = (
-                _can_probe_custom_provider(row_is_current=_grp_is_current)
-                and bool(api_url)
+            # Discovery is what the user's config asks for; probing is how we
+            # get it. When the caller suppresses live probing for latency, the
+            # already-discovered catalog on disk still answers the question
+            # without a round-trip — skipping it too is what collapsed a
+            # multi-model endpoint to its config-declared subset.
+            _discovery_allowed = (
+                bool(api_url)
                 and (bool(api_key) or not grp.get("has_explicit_models"))
                 and grp.get("discover_models", True)
             )
-            if should_probe:
+            _probe_live = _discovery_allowed and _can_probe_custom_provider(
+                row_is_current=_grp_is_current
+            )
+            if _discovery_allowed:
                 try:
                     from hermes_cli.models import cached_fetch_api_models
 
@@ -3046,6 +3063,7 @@ def list_authenticated_providers(
                         api_url,
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
                         headers=grp.get("extra_headers") or None,
+                        cache_only=not _probe_live,
                     )
                     if live_models:
                         grp["models"] = live_models
@@ -3053,9 +3071,12 @@ def list_authenticated_providers(
                         # Auto-save discovered models back to config so
                         # ``discover_models: false`` has a populated cache
                         # on the next read.  A failed save is non-fatal.
-                        _save_discovered_models_to_config(
-                            api_url, live_models
-                        )
+                        # Only after a real probe: a cache hit is already the
+                        # product of an earlier probe that saved it.
+                        if _probe_live:
+                            _save_discovered_models_to_config(
+                                api_url, live_models
+                            )
                 except Exception:
                     pass
             results.append({
