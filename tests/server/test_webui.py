@@ -170,6 +170,13 @@ def test_phase5_cutover_collapses_nav_and_keeps_every_legacy_bookmark_alive():
     assert "person: r.params.contactId" in main
     assert "message: r.query.message" in main
 
+    # A redirect into a Setup section must name a section Setup actually renders,
+    # otherwise the bookmark lands on Setup with nothing opened.
+    setup = client.get("/js/pages/setup.js").text
+    setup_sections = set(re.findall(r"section:\s*['\"]([^'\"]+)['\"]", setup))
+    for section in re.findall(r"section:\s*['\"]([^'\"]+)['\"]", main):
+        assert section in setup_sections, section
+
     # The superseded page modules are gone, not merely unrouted.
     for path in ("leads", "contacts", "custom-outreach", "email-templates", "integrations",
                  "settings", "company-brain", "onboarding", "outreach", "dashboard"):

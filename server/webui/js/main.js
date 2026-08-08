@@ -119,8 +119,8 @@ const LEGACY_REDIRECTS = [
 
   // Company Brain, Integrations, Email Templates and Settings became Setup sections.
   { path: '/app/company-brain',   to: () => withQuery('/app/setup', { section: 'brain' }) },
-  { path: '/app/integrations',    to: () => withQuery('/app/setup', { section: 'sending' }) },
-  { path: '/app/email-templates', to: () => withQuery('/app/setup', { section: 'sending' }) },
+  { path: '/app/integrations',    to: () => withQuery('/app/setup', { section: 'mailbox' }) },
+  { path: '/app/email-templates', to: () => withQuery('/app/setup', { section: 'email-style' }) },
   { path: '/app/settings',        to: () => withQuery('/app/setup', { section: 'sending' }) },
 
   // Agent Runs is a log viewer: admin-only now. Research configuration moved too.
