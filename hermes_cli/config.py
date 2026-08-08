@@ -2930,6 +2930,75 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
+NEUTRAL_PERSONALITY_NAMES = frozenset({"", "none", "default", "neutral"})
+
+
+def _personality_prompt_text(value: Any) -> str:
+    """Normalize a YAML prompt value (str / list / scalar) to a prompt string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def render_personality_prompt(value: Any) -> str:
+    """Render a personality definition (string or ``{system_prompt, tone, style}``).
+
+    Canonical implementation for the renderer that was previously copy-pasted
+    into ``tui_gateway/server.py``, ``cli.py`` and ``gateway/slash_commands.py``.
+    """
+    if isinstance(value, dict):
+        parts = [value.get("system_prompt", "")]
+        if value.get("tone"):
+            parts.append(f'Tone: {value["tone"]}')
+        if value.get("style"):
+            parts.append(f'Style: {value["style"]}')
+        return "\n".join(str(part).strip() for part in parts if str(part).strip())
+    return _personality_prompt_text(value)
+
+
+def resolve_personality_overlay(cfg: Optional[Dict[str, Any]]) -> str:
+    """Resolve the startup prompt overlay from config.
+
+    ``display.personality`` names the selected personality and is the
+    authoritative record of that selection; ``agent.system_prompt`` is the
+    user's own manual prompt. Both are honored, and when both are present the
+    manual prompt comes first so the personality reads as a modifier on top of
+    the user's standing instructions.
+
+    Historically the personality's *text* was copied into
+    ``agent.system_prompt`` on every selection, which destroyed whatever the
+    user had written there. Configs written by those older builds still carry
+    such a copy, so a manual prompt that exactly matches a known personality's
+    rendered text is treated as that legacy cache and dropped rather than
+    doubled.
+    """
+    manual = _personality_prompt_text(cfg_get(cfg, "agent", "system_prompt", default=""))
+
+    name = str(cfg_get(cfg, "display", "personality", default="") or "").strip().lower()
+    personalities = cfg_get(cfg, "agent", "personalities", default={}) or {}
+    if name in NEUTRAL_PERSONALITY_NAMES or not isinstance(personalities, dict):
+        return manual
+    if name not in personalities:
+        return manual
+
+    personality_prompt = render_personality_prompt(personalities[name])
+    if not personality_prompt:
+        return manual
+
+    if manual:
+        legacy_copies = {
+            render_personality_prompt(value) for value in personalities.values()
+        }
+        if manual in legacy_copies:
+            manual = ""
+
+    return "\n\n".join(part for part in (manual, personality_prompt) if part)
+
+
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
