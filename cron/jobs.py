@@ -104,6 +104,7 @@ TICKER_INTERVAL_SECONDS = 60
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 _contextual_accounting_thread_lock = threading.RLock()
+_contextual_authority_thread_lock = threading.RLock()
 
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
@@ -114,6 +115,7 @@ _contextual_accounting_thread_lock = threading.RLock()
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 _CONTEXTUAL_ACCOUNTING_LOCK_TIMEOUT_SECONDS = 30.0
+_CONTEXTUAL_AUTHORITY_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -448,6 +450,76 @@ def contextual_accounting_lock():
 
 
 @contextlib.contextmanager
+def contextual_authority_lock():
+    """Serialize contextual-authority publication with every jobs replace.
+
+    This lock is intentionally separate from the ordinary jobs lock. The jobs
+    lock may degrade to process-local protection to keep legacy cron alive;
+    this transition lock never degrades because a check/replace race could
+    erase the first contextual job.
+    """
+    with _contextual_authority_thread_lock:
+        ensure_dirs()
+        lock_path = _current_cron_store().cron_dir / ".contextual-authority.lock"
+        lock_fd = open(lock_path, "a+b")
+        acquired = False
+        try:
+            if fcntl is not None:
+                deadline = time.monotonic() + _CONTEXTUAL_AUTHORITY_LOCK_TIMEOUT_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        break
+                    except (OSError, IOError) as exc:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Timed out acquiring contextual authority lock {lock_path}"
+                            ) from exc
+                        time.sleep(0.1)
+            elif msvcrt is not None:
+                if os.fstat(lock_fd.fileno()).st_size == 0:
+                    lock_fd.write(b"\0")
+                    lock_fd.flush()
+                lock_fd.seek(0)
+                deadline = time.monotonic() + _CONTEXTUAL_AUTHORITY_LOCK_TIMEOUT_SECONDS
+                while True:
+                    try:
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+                        )
+                        acquired = True
+                        break
+                    except (OSError, IOError) as exc:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                f"Timed out acquiring contextual authority lock {lock_path}"
+                            ) from exc
+                        time.sleep(0.1)
+            else:  # pragma: no cover - supported hosts provide one primitive
+                raise RuntimeError("No cross-process file-lock primitive is available")
+
+            yield
+        finally:
+            if acquired:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    elif msvcrt is not None:
+                        lock_fd.seek(0)
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                        )
+                except (OSError, IOError):
+                    logger.error(
+                        "Failed to release contextual authority lock %s",
+                        lock_path,
+                        exc_info=True,
+                    )
+            lock_fd.close()
+
+
+@contextlib.contextmanager
 def contextual_transcript_lock():
     """Serialize transcript identity-check, append, and outbox acknowledgement.
 
@@ -463,7 +535,9 @@ def contextual_transcript_lock():
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id", "session_key", "context_binding", "origin"})
+_IMMUTABLE_JOB_FIELDS = frozenset(
+    {"id", "session_key", "context_binding", "origin", "_contextual_binding_version"}
+)
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -664,12 +738,15 @@ def public_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     else:
         public.pop("session_target", None)
     execution = source.get("latest_execution")
-    if public_target == "current" and isinstance(execution, dict):
-        public["latest_execution"] = {
-            key: execution.get(key)
-            for key in _PUBLIC_EXECUTION_FIELDS
-            if execution.get(key) is not None
-        }
+    if public_target == "current":
+        if isinstance(execution, dict):
+            public["latest_execution"] = {
+                key: execution.get(key)
+                for key in _PUBLIC_EXECUTION_FIELDS
+                if execution.get(key) is not None
+            }
+        else:
+            public.pop("latest_execution", None)
     return public
 
 
@@ -742,9 +819,8 @@ def _contextual_jobs_authority_marker() -> Path:
     return _current_cron_store().cron_dir / ".contextual-jobs-authority"
 
 
-def _enable_contextual_jobs_authority() -> None:
-    """Publish contextual authority before its first jobs-lock acquisition."""
-    ensure_dirs()
+def _publish_contextual_jobs_authority_unlocked() -> None:
+    """Publish the marker while the caller holds contextual_authority_lock()."""
     marker = _contextual_jobs_authority_marker()
     fd = os.open(marker, os.O_CREAT | os.O_WRONLY, 0o600)
     try:
@@ -759,8 +835,8 @@ def _enable_contextual_jobs_authority() -> None:
         finally:
             os.close(dir_fd)
     except OSError:
-        # Directory fsync is unavailable on some platforms/filesystems. The
-        # marker itself is still atomically visible to sibling processes.
+        # Directory fsync is unavailable on some platforms/filesystems.
+        # The marker itself is still atomically visible to siblings.
         pass
 
 
@@ -1439,6 +1515,55 @@ def _merge_unexpected_disk_jobs(
     return jobs + recovered
 
 
+def _replace_jobs_payload_with_authority(
+    tmp_path: str,
+    jobs_file: Path,
+    jobs: List[Dict[str, Any]],
+) -> None:
+    """Replace jobs.json while atomically enforcing contextual authority."""
+    publishes_contextual = any(
+        isinstance(job, dict)
+        and job.get("session_target", "isolated") == "current"
+        for job in jobs
+    )
+    marker = _contextual_jobs_authority_marker()
+    with contextual_authority_lock():
+        cross_process_acquired = bool(
+            getattr(_jobs_lock_state, "cross_process_acquired", False)
+        )
+        marker_preexisting = marker.exists()
+        if not cross_process_acquired and (marker_preexisting or publishes_contextual):
+            raise RuntimeError(
+                "Refusing a degraded jobs.json write after contextual jobs "
+                "authority was enabled for this profile"
+            )
+
+        marker_created = publishes_contextual and not marker_preexisting
+        try:
+            if marker_created:
+                _publish_contextual_jobs_authority_unlocked()
+            atomic_replace(tmp_path, jobs_file)
+        except BaseException:
+            if marker_created:
+                try:
+                    marker.unlink()
+                    try:
+                        dir_fd = os.open(marker.parent, os.O_RDONLY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except OSError:
+                        pass
+                except OSError:
+                    logger.error(
+                        "Failed to roll back contextual authority marker %s",
+                        marker,
+                        exc_info=True,
+                    )
+            raise
+
+
 def _save_jobs_unlocked(
     jobs: List[Dict[str, Any]],
     *,
@@ -1530,17 +1655,7 @@ def _save_jobs_unlocked(
                         tmp_path = None
                         continue
 
-            if (
-                not bool(
-                    getattr(_jobs_lock_state, "cross_process_acquired", False)
-                )
-                and _contextual_jobs_authority_marker().exists()
-            ):
-                raise RuntimeError(
-                    "Refusing a degraded jobs.json write after contextual jobs "
-                    "authority was enabled for this profile"
-                )
-            atomic_replace(tmp_path, jobs_file)
+            _replace_jobs_payload_with_authority(tmp_path, jobs_file, jobs)
             tmp_path = None
             _secure_file(jobs_file)
             _preserve_file_ownership(jobs_file, _stat_before)
@@ -1570,15 +1685,7 @@ def _save_jobs_unlocked(
             )
             f.flush()
             os.fsync(f.fileno())
-        if (
-            not bool(getattr(_jobs_lock_state, "cross_process_acquired", False))
-            and _contextual_jobs_authority_marker().exists()
-        ):
-            raise RuntimeError(
-                "Refusing a degraded jobs.json write after contextual jobs "
-                "authority was enabled for this profile"
-            )
-        atomic_replace(tmp_path, jobs_file)
+        _replace_jobs_payload_with_authority(tmp_path, jobs_file, jobs)
         tmp_path = None
         _secure_file(jobs_file)
         _preserve_file_ownership(jobs_file, _stat_before)
@@ -1602,16 +1709,14 @@ def save_jobs(
     See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
     (shrink-merge guard against concurrent-create clobber, #80624).
     """
-    if any(
+    publishes_contextual = any(
         isinstance(job, dict)
         and job.get("session_target", "isolated") == "current"
         for job in jobs
-    ):
-        _enable_contextual_jobs_authority()
+    )
     with _jobs_lock() as cross_process_locked:
-        if (
-            not cross_process_locked
-            and _contextual_jobs_authority_marker().exists()
+        if not cross_process_locked and (
+            publishes_contextual or _contextual_jobs_authority_marker().exists()
         ):
             raise RuntimeError(
                 "Refusing a degraded jobs.json write for a profile with "
@@ -1925,8 +2030,6 @@ def create_job(
     )
     contextual_fields = contextual_fields_for_write(session_target)
     if contextual_fields.get("session_target") == "current":
-        _enable_contextual_jobs_authority()
-        contextual_fields["_contextual_binding_version"] = 1
         from cron.contextual import contextual_origin_from_binding
 
         # Execution identity and delivery identity are one atomic binding. A
@@ -2109,9 +2212,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
 
-    if str(updates.get("session_target") or "").strip().lower() == "current":
-        _enable_contextual_jobs_authority()
-
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -2190,11 +2290,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated["origin"] = contextual_origin_from_binding(
                         fields["context_binding"]
                     )
-                updated["_contextual_binding_version"] = 1
             else:
                 updated.pop("session_target", None)
                 updated.pop("session_key", None)
                 updated.pop("context_binding", None)
+                updated.pop("_contextual_binding_version", None)
             validate_contextual_job_shape(updated)
 
             schedule_changed = "schedule" in updates
