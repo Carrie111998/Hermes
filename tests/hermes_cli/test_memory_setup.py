@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -365,35 +366,46 @@ def test_hindsight_intel_macos_install_smoke_success_is_silent(
     )
 
 
-def test_smoke_import_hindsight_local_reports_missing_class():
+def test_smoke_import_hindsight_local_reports_missing_class(tmp_path):
     """The helper that backs the post-install smoke check must surface the
     #81421 backtrack signature: ``hindsight_api`` importing but
-    ``LocalSTEmbeddings`` absent. We exercise the real helper against the
-    current Python environment — if it happens to have ``hindsight_api``
-    installed (it does on this dev box), we substitute a module that
-    simulates the backtrack shape. Otherwise we skip — the install-time
-    behavior is the same."""
+    ``LocalSTEmbeddings`` absent. The helper runs in a clean subprocess
+    (#81421 round-4) so we drive it via PYTHONPATH stub modules."""
+    import os
+    import subprocess
     import sys
-    import types
 
-    class _FakeHindsightApi:
-        """Stand-in for an ancient hindsight_api release that no longer
-        exposes the configured ONNX embeddings provider."""
-
-    fake_module = types.ModuleType("hindsight_api")
-    fake_module.__dict__["__spec__"] = types.SimpleNamespace(
-        loader=None, name="hindsight_api"
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    (stubs_dir / "hindsight_api.py").write_text(
+        "# Deliberately omit LocalSTEmbeddings to simulate the #81421 backtrack.\n"
     )
-    # Deliberately omit LocalSTEmbeddings to simulate the #81421 backtrack.
-    sys.modules["hindsight_api"] = fake_module
-    try:
-        errors = memory_setup._smoke_import_hindsight_local()
-    finally:
-        sys.modules.pop("hindsight_api", None)
+    (stubs_dir / "hindsight_embed.py").write_text("# stub\n")
 
-    # We only assert on the LocalSTEmbeddings probe line; the
-    # hindsight_embed module is also checked but we don't know whether
-    # it's installed in the test env.
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(stubs_dir) + os.pathsep + env.get("PYTHONPATH", "")
+
+    script = (
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('memory_setup_under_test', "
+        f"{repr(str(Path(memory_setup.__file__).resolve()))})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "errors = mod._smoke_import_hindsight_local()\n"
+        "print(repr(errors))\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"Smoke subprocess exited {completed.returncode}: {completed.stderr}"
+    )
+    errors = eval(completed.stdout.strip())  # noqa: S307 — test fixture
     assert any(
         "LocalSTEmbeddings" in e and "ONNX embeddings provider" in e
         for e in errors
@@ -404,7 +416,9 @@ def test_smoke_import_hindsight_local_reports_missing_class():
     )
 
 
-def test_install_dependencies_import_names_maps_slim_packages():
+def test_install_dependencies_missing_dep_probe_resolves_slim_packages(
+    tmp_path, monkeypatch
+):
     """The slim-stack pip packages have a non-trivial pip-name → import-name
     mapping (``hindsight-all-slim`` → ``hindsight_api``, ``hindsight-api-slim``
     → ``hindsight_api``, ``hindsight-embed`` → ``hindsight_embed``). Without
@@ -414,59 +428,141 @@ def test_install_dependencies_import_names_maps_slim_packages():
     reinstall them indefinitely — defeating the point of the slim-stack
     switch.
 
-    We assert against the mapping directly via the source code's local
-    reference (rather than driving the full `_install_dependencies`
-    path, which depends on the host venv having or not having these
-    packages installed — that makes the test nondeterministic in CI)."""
-    import inspect
+    This is a real-behavior test (no ``inspect.getsource``). It injects
+    fake ``hindsight_api`` / ``hindsight_embed`` modules into
+    ``sys.modules`` so the missing-dep probe sees the slim packages as
+    importable, then drives ``_install_dependencies`` with ``force=False``
+    and asserts that no install call is made."""
+    import sys
+    import types
 
-    source = inspect.getsource(memory_setup._install_dependencies)
-    # The mapping lives inside _install_dependencies; pin the three
-    # slim entries explicitly so a future cleanup pass can't quietly
-    # delete them.
-    for pip_name, import_name in (
-        ("hindsight-all-slim", "hindsight_api"),
-        ("hindsight-api-slim", "hindsight_api"),
-        ("hindsight-embed", "hindsight_embed"),
-    ):
-        assert f'"{pip_name}": "{import_name}"' in source, (
-            f"_IMPORT_NAMES must map '{pip_name}' -> '{import_name}' so "
-            f"the missing-dep probe resolves the slim package, otherwise "
-            f"`hermes update` would reinstall it on every refresh and "
-            f"defeat the #81421 fix. Mapping not found in source."
+    import yaml as _yaml
+
+    plugin_dir = tmp_path / "hindsight"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        _yaml.safe_dump({"pip_dependencies": ["hindsight-client>=0.6.1"]}),
+        encoding="utf-8",
+    )
+
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.write_text('{"mode": "local_embedded"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "plugins.memory.find_provider_dir", lambda name: plugin_dir
+    )
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: tmp_path)
+    # Linux + x86_64 keeps the missing-dep probe path non-Apple-Silicon,
+    # so the slim packages on the Intel-macOS branch are produced but
+    # the smoke check is gated off — we want to test the probe, not
+    # the smoke path.
+    monkeypatch.setattr(
+        memory_setup, "platform", _fake_platform("Linux", "x86_64")
+    )
+
+    # Fake modules that the slim pip names map to.
+    api_module = types.ModuleType("hindsight_api")
+    embed_module = types.ModuleType("hindsight_embed")
+    client_module = types.ModuleType("hindsight_client")
+    # Pop any pre-existing real versions so the fake ones win for the
+    # duration of this test.
+    for name in ("hindsight_api", "hindsight_embed", "hindsight_client"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    sys.modules["hindsight_api"] = api_module
+    sys.modules["hindsight_embed"] = embed_module
+    sys.modules["hindsight_client"] = client_module
+
+    install_calls = []
+
+    def fake_install_specs(specs, timeout=120):
+        install_calls.append(list(specs))
+        return SimpleNamespace(ok=True, blocked=False, reason="", stderr="")
+
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
+
+    try:
+        # The full slim stack on Intel macOS — but we're on Linux so
+        # we get hindsight-all (full bundle) instead. The point is
+        # the missing-dep probe at the top must resolve every dep
+        # through _IMPORT_NAMES, regardless of which branch chose them.
+        # We patch platform to Darwin+x86_64 to get the slim branch,
+        # then rely on the fake modules for resolution.
+        monkeypatch.setattr(
+            memory_setup,
+            "platform",
+            _fake_platform("Darwin", "x86_64"),
+        )
+        # Smoke must succeed on a healthy fake — fake modules don't
+        # ship LocalSTEmbeddings, so we'd raise. Patch smoke to skip.
+        monkeypatch.setattr(
+            memory_setup, "_smoke_import_hindsight_local", lambda: []
         )
 
+        memory_setup._install_dependencies("hindsight", force=False)
+    finally:
+        for name in ("hindsight_api", "hindsight_embed", "hindsight_client"):
+            sys.modules.pop(name, None)
 
-def test_smoke_import_hindsight_local_healthy_path_uses_api_module():
+    assert not install_calls, (
+        "force=False on Intel macOS with all slim packages importable "
+        "in the host venv must NOT trigger pip — every slim package "
+        "must resolve through _IMPORT_NAMES, otherwise `hermes update` "
+        "would reinstall the slim stack on every refresh and defeat "
+        "the #81421 fix."
+    )
+
+
+def test_smoke_import_hindsight_local_healthy_path_uses_api_module(
+    tmp_path, monkeypatch
+):
     """Regression guard for the round-3 #81421 review: the helper that
     probes for the configured embeddings class must read it from
     ``hindsight_api`` specifically, not from the final value of a
     shared loop variable (which was ``hindsight_embed`` after the last
     iteration). A healthy slim install where ``hindsight_api`` exposes
     ``LocalSTEmbeddings`` but ``hindsight_embed`` does not must report
-    *no* errors — the helper used to wrongly reject that case."""
+    *no* errors — the helper used to wrongly reject that case.
+
+    The helper now runs the probe in a clean subprocess (#81421 round-4),
+    so we drive it through ``sys.modules`` injection on a PYTHONPATH-bound
+    directory that contains stub packages."""
+    import os
+    import subprocess
     import sys
-    import types
 
-    class _LocalSTEmbeddings:
-        pass
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    # hindsight_api with LocalSTEmbeddings, hindsight_embed without.
+    (stubs_dir / "hindsight_api.py").write_text(
+        "class LocalSTEmbeddings:\n    pass\n"
+    )
+    (stubs_dir / "hindsight_embed.py").write_text("# intentionally no LocalSTEmbeddings\n")
 
-    api_module = types.ModuleType("hindsight_api")
-    api_module.LocalSTEmbeddings = _LocalSTEmbeddings
-    # Deliberately do NOT give hindsight_embed.LocalSTEmbeddings — this
-    # is the case the round-3 helper got wrong.
-
-    embed_module = types.ModuleType("hindsight_embed")
-    # No LocalSTEmbeddings attribute.
-
-    sys.modules["hindsight_api"] = api_module
-    sys.modules["hindsight_embed"] = embed_module
-    try:
-        errors = memory_setup._smoke_import_hindsight_local()
-    finally:
-        sys.modules.pop("hindsight_api", None)
-        sys.modules.pop("hindsight_embed", None)
-
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(stubs_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    # Import the module that contains the helper and invoke it from
+    # Python so subprocess.run resolves to the same Python interpreter.
+    script = (
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('memory_setup_under_test', "
+        f"{repr(str(Path(memory_setup.__file__).resolve()))})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "errors = mod._smoke_import_hindsight_local()\n"
+        "print(repr(errors))\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"Smoke subprocess exited {completed.returncode}: {completed.stderr}"
+    )
+    errors = eval(completed.stdout.strip())  # noqa: S307 — test fixture
     assert errors == [], (
         "Healthy slim install where hindsight_api exposes "
         "LocalSTEmbeddings must report no errors. The smoke helper "
@@ -475,26 +571,51 @@ def test_smoke_import_hindsight_local_healthy_path_uses_api_module():
     )
 
 
-def test_smoke_import_hindsight_local_ancient_api_only_imports_but_no_class():
+def test_smoke_import_hindsight_local_ancient_api_only_imports_but_no_class(
+    tmp_path,
+):
     """Inverse of the healthy-path test: ancient hindsight_api that
     imports but no longer exposes LocalSTEmbeddings (the exact #81421
     backtrack signature) must be reported as a failure on the
-    ``hindsight_api.LocalSTEmbeddings`` symbol."""
+    ``hindsight_api.LocalSTEmbeddings`` symbol.
+
+    The helper now runs the probe in a clean subprocess (#81421 round-4),
+    so we drive it through stub modules on a controlled PYTHONPATH."""
+    import os
+    import subprocess
     import sys
-    import types
 
-    api_module = types.ModuleType("hindsight_api")
-    # Deliberately omit LocalSTEmbeddings to simulate the #81421 backtrack.
-    embed_module = types.ModuleType("hindsight_embed")
+    stubs_dir = tmp_path / "stubs"
+    stubs_dir.mkdir()
+    (stubs_dir / "hindsight_api.py").write_text(
+        "# Deliberately omit LocalSTEmbeddings to simulate the #81421 backtrack.\n"
+    )
+    (stubs_dir / "hindsight_embed.py").write_text("# stub\n")
 
-    sys.modules["hindsight_api"] = api_module
-    sys.modules["hindsight_embed"] = embed_module
-    try:
-        errors = memory_setup._smoke_import_hindsight_local()
-    finally:
-        sys.modules.pop("hindsight_api", None)
-        sys.modules.pop("hindsight_embed", None)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(stubs_dir) + os.pathsep + env.get("PYTHONPATH", "")
 
+    script = (
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('memory_setup_under_test', "
+        f"{repr(str(Path(memory_setup.__file__).resolve()))})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "errors = mod._smoke_import_hindsight_local()\n"
+        "print(repr(errors))\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"Smoke subprocess exited {completed.returncode}: {completed.stderr}"
+    )
+    errors = eval(completed.stdout.strip())  # noqa: S307 — test fixture
     assert any(
         "LocalSTEmbeddings" in e and "ONNX embeddings provider" in e
         for e in errors
@@ -503,8 +624,6 @@ def test_smoke_import_hindsight_local_ancient_api_only_imports_but_no_class():
         "on the hindsight_api module specifically when that class is "
         "absent — that's the exact #81421 backtrack failure signature."
     )
-    # And the failure must NOT be attributed to hindsight_embed —
-    # the API module is the one that ships the provider class.
     assert not any("hindsight_embed.LocalSTEmbeddings" in e for e in errors), (
         "The smoke check must attribute the missing-provider failure to "
         "hindsight_api, not hindsight_embed — the latter doesn't ship "

@@ -336,59 +336,72 @@ def _smoke_import_hindsight_local() -> list[str]:
     """Validate the Hindsight local runtime is usable and return a list of
     failure descriptions (empty on success).
 
-    Wrapped in a helper so tests can monkeypatch it without touching
-    ``builtins.__import__`` (which pytest uses internally for fixture
-    lookup).
+    Runs the validation in a clean subprocess so cached modules from the
+    updating process can't mask the newly installed environment (#81421).
+    The subprocess exits 0 with JSON ``{"errors": [...]}`` on stdout;
+    non-zero exit is itself treated as a failure (the script crashed
+    before it could report).
 
-    The validation probes more than just module imports (#81421): the
-    reported regression is "pip says ok but the daemon crashes with
+    The validation probes more than just module imports: the reported
+    regression is "pip says ok but the daemon crashes with
     ``Unknown embeddings provider: onnx``", which means a fully
     importable API surface can still expose a runtime that rejects the
-    configured embeddings provider. We import the slim API backend
-    (``hindsight_api``), the embed manager (``hindsight_embed``), and the
-    configured local embeddings class (``hindsight_api.LocalSTEmbeddings``
-    — the SentenceTransformers / ONNX provider that backs
-    ``local_embedded``) and confirm the class symbol resolves. We do not
-    instantiate it because that triggers a model download we can't do
-    in CI; resolving the class is enough to detect the
-    backtrack-to-ancient-API failure mode where ``hindsight_api`` still
-    imports but no longer exposes ``LocalSTEmbeddings``.
+    configured embeddings provider. The subprocess imports the slim API
+    backend (``hindsight_api``), the embed manager (``hindsight_embed``),
+    and the configured local embeddings class
+    (``hindsight_api.LocalSTEmbeddings`` — the SentenceTransformers /
+    ONNX provider that backs ``local_embedded``) and confirms the class
+    symbol resolves. We do not instantiate it because that triggers a
+    model download we can't do in CI; resolving the class is enough to
+    detect the backtrack-to-ancient-API failure mode where
+    ``hindsight_api`` still imports but no longer exposes
+    ``LocalSTEmbeddings``.
     """
-    errors: list[str] = []
-    # Module imports first — catches the most obvious "pip backtracked
-    # to a release that doesn't ship the module at all" failure mode.
-    # Track only the API module — the helper checks for the configured
-    # provider *class* on the API module specifically, not on the embed
-    # manager. Overwriting a single variable in a loop would let the
-    # final iteration's value (the embed manager) replace the API
-    # module reference, which makes the class probe check the wrong
-    # module — a healthy slim install where ``hindsight_api`` exposes
-    # ``LocalSTEmbeddings`` but ``hindsight_embed`` doesn't would be
-    # wrongly rejected (#81421 round-3 review).
-    hindsight_api_module = None
-    for smoke_module in ("hindsight_api", "hindsight_embed"):
-        try:
-            imported = __import__(smoke_module)
-        except Exception as e:  # ImportError + anything else
-            errors.append(f"{smoke_module}: {type(e).__name__}: {e}")
-            continue
-        if smoke_module == "hindsight_api":
-            hindsight_api_module = imported
-    # Symbol probe — catches the subtle backtrack where the module
-    # imports but the configured provider class is gone (this is the
-    # exact regression from #81421: the slim runtime was shadowed by
-    # an ancient API release that exposed `Embeddings` but not
-    # `LocalSTEmbeddings`). Skipped if the module itself failed to
-    # import — that's already in `errors` and a separate diagnostic.
-    if hindsight_api_module is not None and not hasattr(
-        hindsight_api_module, "LocalSTEmbeddings"
-    ):
-        errors.append(
-            "hindsight_api.LocalSTEmbeddings: AttributeError: the slim runtime "
-            "shipped an API release that does not expose the configured ONNX "
-            "embeddings provider — this is the #81421 backtrack failure mode"
+    import subprocess as _sp
+    import sys as _sys
+
+    script = (
+        "import json\n"
+        "errors = []\n"
+        "api_module = None\n"
+        "for mod in ('hindsight_api', 'hindsight_embed'):\n"
+        "    try:\n"
+        "        m = __import__(mod)\n"
+        "    except Exception as e:\n"
+        "        errors.append(f'{mod}: {type(e).__name__}: {e}')\n"
+        "        continue\n"
+        "    if mod == 'hindsight_api':\n"
+        "        api_module = m\n"
+        "if api_module is not None and not hasattr(api_module, 'LocalSTEmbeddings'):\n"
+        "    errors.append(\n"
+        "        'hindsight_api.LocalSTEmbeddings: AttributeError: the slim runtime '\n"
+        "        'shipped an API release that does not expose the configured ONNX '\n"
+        "        'embeddings provider — this is the #81421 backtrack failure mode'\n"
+        "    )\n"
+        "print(json.dumps({'errors': errors}))\n"
+    )
+    try:
+        completed = _sp.run(
+            [_sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
-    return errors
+    except Exception as e:
+        return [f"subprocess invocation failed: {type(e).__name__}: {e}"]
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "")[:200].strip()
+        return [f"smoke subprocess exited {completed.returncode}: {stderr or '<no stderr>'}"]
+    try:
+        import json as _json
+
+        payload = _json.loads(completed.stdout)
+    except Exception as e:
+        return [f"smoke subprocess output not parseable JSON: {type(e).__name__}: {e}"]
+    if not isinstance(payload, dict) or not isinstance(payload.get("errors"), list):
+        return ["smoke subprocess output shape unexpected"]
+    return [str(err) for err in payload["errors"]]
 
 
 def _get_available_providers() -> list:
