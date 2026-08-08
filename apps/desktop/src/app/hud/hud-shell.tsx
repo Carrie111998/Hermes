@@ -41,8 +41,8 @@ const HUD_DIM_MS = Math.round(HUD_FADE_MS * 1.5)
 const HUD_COLLAPSE_MS = Math.round(HUD_FADE_MS * 0.66)
 
 /** Breathing room the sheet keeps above the first row, so the fade has
- *  somewhere to land. Published to CSS, and used here to work out how much of
- *  the window the HUD actually occupies. */
+ *  somewhere to land. Folded into the measured height rather than added in CSS,
+ *  so an empty transcript measures a true zero instead of a 12px strip. */
 const HUD_SHEET_OVERHANG_PX = 12
 
 /** Composer on top, transcript always hanging below it — Spotlight's shape,
@@ -219,6 +219,13 @@ export function HudShell() {
   // carve-out (styles.css): a band with nothing to scroll stays part of the
   // window's drag region, so a short conversation never blocks moving the HUD.
   const [scrollable, setScrollable] = useState(false)
+  // Whether the sheet reaches the top of the window. Gates the frost, which is
+  // native vibrancy and therefore the WINDOW's content view — it fills the whole
+  // rectangle and nothing in the page can clip it to the sheet. Whenever the
+  // sheet is shorter than the window, the difference is frost over empty space:
+  // a grey slab hanging under the bar with nothing in it, worst on a fresh
+  // thread where the sheet is zero and the slab is the entire window.
+  const [filled, setFilled] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -264,11 +271,15 @@ export function HudShell() {
       const span =
         !rows?.length || !box
           ? 0
-          : root.dataset.hudEdge === 'top'
-            ? rows[rows.length - 1].getBoundingClientRect().bottom - box.top
-            : box.bottom - rows[0].getBoundingClientRect().top
+          : HUD_SHEET_OVERHANG_PX +
+            (root.dataset.hudEdge === 'top'
+              ? rows[rows.length - 1].getBoundingClientRect().bottom - box.top
+              : box.bottom - rows[0].getBoundingClientRect().top)
 
       root.style.setProperty('--hud-band-height', `${Math.max(0, Math.round(span))}px`)
+      // The sheet is capped at the window (`min(100%, …)`), so reaching the
+      // window's height is the same question as covering it.
+      setFilled(span >= window.innerHeight)
 
       // …and the bar's real height, which is what the thread has to clear.
       // --composer-measured-height would be the obvious source, but it is a
@@ -297,7 +308,7 @@ export function HudShell() {
     }
   }, [])
 
-  useHudGlass(rootRef, recent || held)
+  useHudGlass(rootRef, recent || held, filled)
   useHudClickThrough(rootRef)
 
   // Force the HOST layers transparent. index.html's pre-paint script writes an
@@ -332,8 +343,7 @@ export function HudShell() {
           '--hud-fade': `${HUD_FADE_MS}ms`,
           '--hud-collapse': `${HUD_COLLAPSE_MS}ms`,
           '--hud-dim': `${HUD_DIM_MS}ms`,
-          '--hud-reveal': `${HUD_REVEAL_MS}ms`,
-          '--hud-sheet-overhang': `${HUD_SHEET_OVERHANG_PX}px`
+          '--hud-reveal': `${HUD_REVEAL_MS}ms`
         } as CSSProperties
       }
     >
