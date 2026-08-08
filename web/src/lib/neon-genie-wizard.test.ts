@@ -20,7 +20,7 @@ describe("buildNeonGeniePrompt", () => {
     const prompt = buildNeonGeniePrompt(baseBrief);
 
     expect(prompt).toContain("commercial model run");
-    expect(prompt).toContain("commercial, evidence_intelligence");
+    expect(prompt).toContain("starting with: commercial.");
     expect(prompt).toContain("OBSERVED, INFERRED, SPECULATIVE, or NOT_COMPUTABLE");
     expect(prompt).toContain("DataRequests");
     expect(prompt).toContain("max_fetches=6");
@@ -41,5 +41,25 @@ describe("buildNeonGeniePrompt", () => {
     expect(prompt).not.toContain("Known evidence and canonical sources:");
     expect(prompt).toContain("Research: enabled=false.");
     expect(prompt).toContain("Authority: research=false");
+  });
+
+  it("uses the smallest declared profile set for routed missions", () => {
+    const expectedProfiles = {
+      opportunity: "opportunity_mining",
+      "zero-option": "zero_option",
+      commercial: "commercial",
+      fragmentation: "fragmentation",
+      evidence: "evidence_intelligence",
+      agentic: "agentic_services",
+      audit: "audit_delivery",
+    } as const;
+
+    for (const [mission, profile] of Object.entries(expectedProfiles)) {
+      const prompt = buildNeonGeniePrompt({
+        ...baseBrief,
+        mission: mission as NeonGenieBrief["mission"],
+      });
+      expect(prompt).toContain(`starting with: ${profile}.`);
+    }
   });
 });

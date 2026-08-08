@@ -57,18 +57,19 @@ export default function NeonGenieWizardPage() {
   const patchBrief = <K extends keyof NeonGenieBrief>(key: K, value: NeonGenieBrief[K]) =>
     setBrief((current) => ({ ...current, [key]: value }));
 
-  const copyPrompt = async () => {
+  const copyPrompt = async (): Promise<boolean> => {
     try {
       await navigator.clipboard.writeText(prompt);
       showToast("Neon Genie prompt copied", "success");
+      return true;
     } catch {
       showToast("Could not copy the prompt. Select it manually below.", "error");
+      return false;
     }
   };
 
   const openChat = async () => {
-    await copyPrompt();
-    navigate("/chat");
+    if (await copyPrompt()) navigate("/chat");
   };
 
   const canContinue = step !== "context" || Boolean(contextValid);
@@ -281,7 +282,11 @@ export default function NeonGenieWizardPage() {
                 value={prompt}
               />
               <div className="flex flex-wrap gap-3">
-                <Button type="button" className="border bg-background text-foreground hover:bg-muted" onClick={copyPrompt}>
+                <Button
+                  type="button"
+                  className="border bg-background text-foreground hover:bg-muted"
+                  onClick={() => void copyPrompt()}
+                >
                   <Clipboard className="mr-2 size-4" /> Copy prompt
                 </Button>
                 <Button type="button" onClick={openChat}>
