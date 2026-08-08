@@ -328,8 +328,38 @@ class TestShellFileOpsHelpers:
         assert file_ops._is_likely_binary("code.py") is False
         assert file_ops._is_likely_binary("readme.md") is False
 
+    def test_is_likely_binary_utf8_truncation_artifact(self, file_ops):
+        """Single trailing U+FFFD from head -c N splitting a multi-byte char
+        must NOT be treated as binary.  This is a regression test for the
+        false-positive that caused UTF-8 text files (e.g. CJK .md notes) to
+        be misclassified as binary when the 1000-byte sample boundary landed
+        inside a multi-byte character."""
+        text_with_trailing_fffd = "你好世界\n" * 100 + "\ufffd"
+        assert file_ops._is_likely_binary("notes.md", text_with_trailing_fffd) is False
 
-    def test_cwd_fallback_to_slash(self):
+    def test_is_likely_binary_multiple_fffd_is_binary(self, file_ops):
+        """Multiple U+FFFD scattered throughout the sample indicates real
+        binary/non-UTF-8 content and should still be caught."""
+        binary_like = "hello\ufffdworld\ufffdtest"
+        assert file_ops._is_likely_binary("data.bin", binary_like) is True
+
+    def test_is_likely_binary_fffd_mid_sample_is_binary(self, file_ops):
+        """A single U+FFFD in the middle of the sample (not at the truncation
+        boundary) should still be treated as binary."""
+        mid_fffd = "hello world" * 20 + "\ufffd" + "more text" * 20
+        assert file_ops._is_likely_binary("data.bin", mid_fffd) is True
+
+    def test_is_likely_binary_clean_utf8_text(self, file_ops):
+        """Clean UTF-8 text without any FFFD should not be binary."""
+        clean_text = "你好世界\n" * 100
+        assert file_ops._is_likely_binary("notes.md", clean_text) is False
+
+    def test_is_likely_binary_clean_ascii_text(self, file_ops):
+        """Clean ASCII text should not be binary."""
+        clean_text = "hello world\n" * 100
+        assert file_ops._is_likely_binary("notes.txt", clean_text) is False
+
+    def test_cwd_fallback_to_slash(self, mock_env):
         env = MagicMock(spec=[])  # no cwd attribute
         ops = ShellFileOperations(env)
         assert ops.cwd == "/"
