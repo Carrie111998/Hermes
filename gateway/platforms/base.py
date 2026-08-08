@@ -2284,6 +2284,7 @@ class MessageType(Enum):
     AUDIO = "audio"
     VOICE = "voice"
     DOCUMENT = "document"
+    VIDEO_NOTE = "video_note"
     STICKER = "sticker"
     COMMAND = "command"  # /command style
 
