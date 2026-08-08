@@ -1060,6 +1060,7 @@ def test_custom_provider_dict_models_pin_requires_discover_false(monkeypatch):
 
 _LOCAL_ENDPOINT = "http://127.0.0.1:8000/v1"
 _LOCAL_CATALOG = [f"omlx-model-{i}" for i in range(1, 9)]
+_SHARED_PROXY_URL = "https://proxy.example.com/v1"
 
 
 def _seed_custom_model_cache(monkeypatch, models, *, age_seconds=10):
@@ -1324,6 +1325,84 @@ def test_keyless_endpoint_with_saved_catalog_is_still_not_probed(monkeypatch):
 
     assert row is not None
     assert row["models"] == ["omlx-model-1"]
+    assert fetched == []
+
+
+def test_api_mode_rows_do_not_share_a_cached_catalog(monkeypatch):
+    """Two rows differing only by ``api_mode`` must not share a cache entry.
+
+    ``api_mode`` selects the wire protocol — ``x-api-key`` +
+    ``anthropic-version`` versus ``Authorization: Bearer`` — so it is part of
+    both the picker's group identity and
+    ``_custom_endpoint_fingerprint()``. The cache read has to pass it through
+    or an ``anthropic_messages`` row renders whatever the OpenAI-mode row
+    cached against the same base_url.
+    """
+    import hermes_cli.models as models_mod
+
+    openai_catalog = ["gpt-oss-a", "gpt-oss-b"]
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    fetched = []
+
+    def fetch(_api_key, base_url, **_kwargs):
+        fetched.append(base_url)
+        return ["should-not-be-reached"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fetch)
+
+    # Only the OpenAI-mode probe (api_mode=None) is on disk.
+    fp = models_mod._custom_endpoint_fingerprint("sk-shared", None, None)
+    cache = {
+        f"custom:{_SHARED_PROXY_URL}": {
+            "fp": fp,
+            "at": time.time() - 10,
+            "models": list(openai_catalog),
+        }
+    }
+    monkeypatch.setattr(models_mod, "_load_provider_models_cache", lambda: cache)
+
+    def _row(entry):
+        providers = list_authenticated_providers(
+            current_provider="nous",
+            user_providers={},
+            custom_providers=[entry],
+            for_picker=True,
+            refresh=False,
+            probe_custom_providers=False,
+            probe_current_custom_provider=True,
+        )
+        return next(
+            (p for p in providers if _SHARED_PROXY_URL in str(p.get("api_url", ""))),
+            None,
+        )
+
+    anthropic_row = _row(
+        {
+            "name": "Proxy Anthropic",
+            "base_url": _SHARED_PROXY_URL,
+            "api_key": "sk-shared",
+            "api_mode": "anthropic_messages",
+            "model": "claude-via-proxy",
+        }
+    )
+    openai_row = _row(
+        {
+            "name": "Proxy OpenAI",
+            "base_url": _SHARED_PROXY_URL,
+            "api_key": "sk-shared",
+            "model": "gpt-via-proxy",
+        }
+    )
+
+    assert anthropic_row is not None and openai_row is not None
+    assert anthropic_row["models"] == ["claude-via-proxy"], (
+        "an anthropic_messages row must not render the OpenAI-mode catalog "
+        "cached against the same base_url"
+    )
+    # ...while the row the entry actually belongs to still resolves.
+    assert openai_row["models"] == openai_catalog
     assert fetched == []
 
 

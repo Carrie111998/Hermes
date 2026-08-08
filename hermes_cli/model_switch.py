@@ -2648,6 +2648,12 @@ def list_authenticated_providers(
                     "models": [],
                     "has_explicit_models": False,
                     "ep_cfg": ep_cfg,  # used below for discover_models / api_key
+                    # Part of group_key, so it is constant across the group.
+                    # The render loop below needs it to key the model cache:
+                    # api_mode changes the wire protocol (``x-api-key`` vs
+                    # ``Authorization: Bearer``), so two rows that differ only
+                    # by it must not share a cached catalog.
+                    "api_mode": api_mode,
                     "raw_names": [],
                     "aliases": set(),
                 }
@@ -2743,6 +2749,7 @@ def list_authenticated_providers(
                         api_key,
                         api_url,
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
+                        api_mode=grp.get("api_mode") or None,
                         headers=_extra_headers_from_config(ep_cfg) or None,
                         cache_only=not _probe_live,
                     )
@@ -2928,6 +2935,11 @@ def list_authenticated_providers(
                     "has_explicit_models": False,
                     "discover_models": discover,
                     "extra_headers": entry_extra_headers,
+                    # Part of group_key, so constant across the group. Needed
+                    # in the render loop to key the model cache — api_mode
+                    # selects the wire protocol, so rows differing only by it
+                    # must not share a cached catalog.
+                    "api_mode": api_mode,
                     "aliases": set(),
                 }
             else:
@@ -3082,6 +3094,7 @@ def list_authenticated_providers(
                         api_key,
                         api_url,
                         timeout=1.5 if for_picker else 5.0,  # picker: fail fast so a slow custom endpoint doesn't block /model
+                        api_mode=grp.get("api_mode") or None,
                         headers=grp.get("extra_headers") or None,
                         cache_only=not _probe_live,
                     )
