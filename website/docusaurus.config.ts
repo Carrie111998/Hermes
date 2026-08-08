@@ -61,7 +61,31 @@ const config: Config = {
         ignoreFiles: [
           /^user-guide\/skills\/bundled\//,
           /^user-guide\/skills\/optional\//,
+          // Community-quote collage page: 527 index documents of scraped
+          // testimonials that pollute results and bloat the index. The page
+          // renders a React component; its text isn't reference material.
+          /^user-stories/,
         ],
+        // Split the lunr index into per-section chunks so the browser only
+        // fetches+hydrates the index for the section being searched instead
+        // of one monolithic multi-MB file (16.3 MB by Aug 2026 — 25-30 s of
+        // blank UI on first search). Searches started outside these paths
+        // (e.g. the docs landing page) fall back to all contexts combined.
+        searchContextByPaths: [
+          { label: 'User Guide', path: 'user-guide' },
+          { label: 'Developer Guide', path: 'developer-guide' },
+          { label: 'Guides', path: 'guides' },
+          { label: 'Reference', path: 'reference' },
+          { label: 'Getting Started', path: 'getting-started' },
+          { label: 'Integrations', path: 'integrations' },
+        ],
+        useAllContextsWithNoSearchContext: true,
+        // Don't index fenced code blocks (<pre>). Config/YAML/shell examples
+        // generate huge high-cardinality token dictionaries in lunr (the
+        // biggest single contributor to index size) and nobody searches for
+        // a literal line of a code sample. Inline <code> (command and config
+        // key names in prose) stays indexed.
+        ignoreCssSelectors: ['pre'],
         // Exact-or-prefix matching only (default is edit distance 1).
         // With fuzzy distance 1, "keet" matched "meetings"/"keep" (one
         // edit away after stemming), and multi-word typo queries against
