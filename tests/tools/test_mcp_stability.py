@@ -708,3 +708,217 @@ class TestMCPLoopDrainOnStop:
             "Timed out waiting for MCP loop drain" in record.getMessage()
             for record in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: stdio subprocess death fail-fast for in-flight tool calls (#81995)
+# ---------------------------------------------------------------------------
+#
+# When the MCP supervisor restarts a stdio server while a tool call is in
+# flight, the SDK's read stream EOFs but ``call_tool`` can sit waiting on the
+# read queue until ``tool_timeout`` (default 300s) elapses. The watchdog in
+# ``_watch_stdio_subprocess`` polls the tracked stdio subprocess PIDs and
+# cancels the in-flight call with ``MCPStdioSubprocessDeadError`` so the
+# caller falls through to the supervisor-reconnect path immediately.
+
+
+class TestStdioSubprocessDeadFailFast:
+    """In-flight MCP stdio tool calls fail-fast when the subprocess dies."""
+
+    def _reset_stdio_pids(self):
+        from tools.mcp_tool import _stdio_pids, _lock
+        with _lock:
+            _stdio_pids.clear()
+
+    def test_stdio_subprocess_dead_returns_none_when_untracked(self):
+        """No tracked PIDs → unknown (do not fail-fast on this signal)."""
+        from tools.mcp_tool import _stdio_subprocess_dead
+        self._reset_stdio_pids()
+        assert _stdio_subprocess_dead("nonexistent-server") is None
+
+    def test_stdio_subprocess_dead_returns_false_when_alive(self):
+        """Tracked PID alive → False (keep waiting on the call_tool)."""
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _stdio_subprocess_dead,
+        )
+        self._reset_stdio_pids()
+        # Use this process's PID — guaranteed alive for the test's duration.
+        own_pid = os.getpid()
+        with _lock:
+            _stdio_pids[own_pid] = "alive-server"
+        try:
+            assert _stdio_subprocess_dead("alive-server") is False
+        finally:
+            with _lock:
+                _stdio_pids.pop(own_pid, None)
+
+    def test_stdio_subprocess_dead_returns_true_when_all_exited(self):
+        """All tracked PIDs exited → True (fail-fast the in-flight call)."""
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _stdio_subprocess_dead,
+        )
+        self._reset_stdio_pids()
+        # PIDs that no longer exist — _pid_exists returns False for them.
+        fake_dead_pids = [999999991, 999999992, 999999993]
+        with _lock:
+            for pid in fake_dead_pids:
+                _stdio_pids[pid] = "dead-server"
+        try:
+            assert _stdio_subprocess_dead("dead-server") is True
+        finally:
+            with _lock:
+                for pid in fake_dead_pids:
+                    _stdio_pids.pop(pid, None)
+
+    def test_stdio_subprocess_dead_mixed_pids(self):
+        """Tracked PIDs split alive/dead → False (subprocess still alive)."""
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _stdio_subprocess_dead,
+        )
+        self._reset_stdio_pids()
+        own_pid = os.getpid()
+        fake_dead_pid = 999999994
+        with _lock:
+            _stdio_pids[own_pid] = "mixed-server"
+            _stdio_pids[fake_dead_pid] = "mixed-server"
+        try:
+            assert _stdio_subprocess_dead("mixed-server") is False
+        finally:
+            with _lock:
+                _stdio_pids.pop(own_pid, None)
+                _stdio_pids.pop(fake_dead_pid, None)
+
+    def test_watch_stdio_subprocess_cancels_call_on_death(self):
+        """Watchdog cancels the in-flight call_tool when the subprocess dies."""
+        import asyncio
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _watch_stdio_subprocess,
+            MCPStdioSubprocessDeadError,
+            _STDIO_FAILFAST_POLL_INTERVAL_S,
+        )
+
+        self._reset_stdio_pids()
+        # Seed a tracked PID that has already exited → fails-fast on the
+        # first poll (no waiting on a real subprocess).
+        fake_dead_pid = 999999995
+        with _lock:
+            _stdio_pids[fake_dead_pid] = "watch-server"
+
+        # call_task that simulates the SDK's hanging call_tool. Awaiting
+        # the cancelled future surfaces ``asyncio.CancelledError``; the
+        # watchdog raises the fail-fast error before the call can return.
+        cancelled = asyncio.Event()
+
+        async def _hangs_forever():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def _run():
+            call_task = asyncio.ensure_future(_hangs_forever())
+            watchdog_task = asyncio.ensure_future(
+                _watch_stdio_subprocess("watch-server", call_task)
+            )
+            try:
+                with pytest.raises(MCPStdioSubprocessDeadError):
+                    await watchdog_task
+            finally:
+                if not call_task.done():
+                    call_task.cancel()
+                assert cancelled.is_set(), (
+                    "watchdog did not cancel the in-flight call_tool future"
+                )
+
+        try:
+            asyncio.run(_run())
+        finally:
+            with _lock:
+                _stdio_pids.pop(fake_dead_pid, None)
+
+    def test_watch_stdio_subprocess_exits_cleanly_on_call_success(self):
+        """Watchdog exits when call_tool completes before subprocess dies."""
+        import asyncio
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _watch_stdio_subprocess,
+            _STDIO_FAILFAST_POLL_INTERVAL_S,
+        )
+
+        self._reset_stdio_pids()
+        # Track this process — alive for the whole test.
+        own_pid = os.getpid()
+        with _lock:
+            _stdio_pids[own_pid] = "healthy-server"
+
+        async def _quick_call():
+            await asyncio.sleep(0.01)
+            return "ok"
+
+        async def _run():
+            call_task = asyncio.ensure_future(_quick_call())
+            watchdog_task = asyncio.ensure_future(
+                _watch_stdio_subprocess("healthy-server", call_task)
+            )
+            try:
+                result = await call_task
+                assert result == "ok"
+                # Watchdog should notice call_task is done and return on
+                # the next poll cycle. Give it up to 3 poll intervals.
+                await asyncio.wait_for(
+                    watchdog_task,
+                    timeout=_STDIO_FAILFAST_POLL_INTERVAL_S * 5 + 1.0,
+                )
+            finally:
+                if not watchdog_task.done():
+                    watchdog_task.cancel()
+                    try:
+                        await watchdog_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+        try:
+            asyncio.run(_run())
+        finally:
+            with _lock:
+                _stdio_pids.pop(own_pid, None)
+
+    def test_watch_stdio_subprocess_noop_for_untracked_server(self):
+        """Watchdog sleeps until cancelled when no PIDs are tracked.
+
+        HTTP transports have no tracked stdio PIDs; ``_stdio_subprocess_dead``
+        returns ``None`` and the watchdog must not fire a false-positive
+        fail-fast on them — just sleep until the call finishes (#81995).
+        """
+        import asyncio
+        from tools.mcp_tool import (
+            _stdio_pids, _lock, _watch_stdio_subprocess,
+        )
+
+        self._reset_stdio_pids()
+
+        async def _quick_call():
+            await asyncio.sleep(0.05)
+            return "ok"
+
+        async def _run():
+            call_task = asyncio.ensure_future(_quick_call())
+            watchdog_task = asyncio.ensure_future(
+                _watch_stdio_subprocess("http-server-no-pids", call_task)
+            )
+            try:
+                result = await call_task
+                assert result == "ok"
+                # Watchdog never observed a dead subprocess; cancel it
+                # explicitly and confirm no exception leaked.
+                if not watchdog_task.done():
+                    watchdog_task.cancel()
+                    try:
+                        await watchdog_task
+                    except asyncio.CancelledError:
+                        pass
+            finally:
+                if not call_task.done():
+                    call_task.cancel()
+
+        asyncio.run(_run())

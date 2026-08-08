@@ -1107,6 +1107,22 @@ class NonMcpEndpointError(ConnectionError):
     """
 
 
+class MCPStdioSubprocessDeadError(ConnectionError):
+    """Raised when a stdio MCP server's tracked subprocess has died.
+
+    Detected during an in-flight tool call: the tracked PID (recorded in
+    ``_stdio_pids`` at spawn time) is no longer alive, so the MCP read stream
+    is dead and the in-flight JSON-RPC response will never arrive. Without
+    fail-fast the call would hang until ``tool_timeout`` (default 300s)
+    elapses, tying up a circuit-breaker strike and an RPC lock for the full
+    window. Surface the death immediately so the model can back off and the
+    supervisor can respawn (#81995).
+
+    Subclasses :class:`ConnectionError` so callers that catch the broad class
+    still treat it as a transport problem.
+    """
+
+
 def _unwrap_exception_group(exc: BaseException) -> BaseException:
     """Extract the root-cause exception from anyio TaskGroup wrappers.
 
@@ -4549,6 +4565,78 @@ def _handle_session_expired_and_retry(
     return None
 
 
+def _handle_subprocess_dead_and_retry(
+    server_name: str,
+    exc: BaseException,
+    retry_call,
+    op_description: str,
+):
+    """Trigger a transport reconnect and retry once when the stdio subprocess
+    died mid-call (#81995).
+
+    When the watchdog in :func:`_watch_stdio_subprocess` detects the tracked
+    subprocess PID has exited, an in-flight ``call_tool`` would otherwise
+    wait until ``tool_timeout`` (default 300s) before reporting failure.
+    Instead: signal a reconnect (the supervisor's lifecycle loop tears down
+    the dead stdio transport and spawns a fresh subprocess), wait briefly
+    for the new session to be ready, and retry the call once. If the retry
+    succeeds the model sees a transparent recovery; if it doesn't we return
+    ``None`` so the caller falls through to the generic error path.
+
+    Only fires for stdio transports: HTTP transports raise the same
+    ``MCPStdioSubprocessDeadError`` from a parallel watchdog branch but
+    ``_stdio_subprocess_dead`` returns ``None`` for them (no tracked PIDs)
+    and the watchdog never fires, so this helper never matches.
+    """
+    if not isinstance(exc, MCPStdioSubprocessDeadError):
+        return None
+
+    with _lock:
+        srv = _servers.get(server_name)
+    if srv is None or not hasattr(srv, "_reconnect_event"):
+        return None
+
+    loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        return None
+
+    logger.info(
+        "MCP server '%s': stdio subprocess died during %s; "
+        "signalling supervisor reconnect and retrying once.",
+        server_name, op_description,
+    )
+
+    if not _signal_reconnect_and_wait(
+        server_name,
+        srv,
+        op_description=op_description,
+        timeout=15,
+    ):
+        logger.warning(
+            "MCP server '%s': reconnect did not ready within 15s after "
+            "stdio subprocess died; falling through to error response.",
+            server_name,
+        )
+        return None
+
+    try:
+        result = retry_call()
+        try:
+            parsed = json.loads(result)
+            if "error" not in parsed:
+                _reset_server_error(server_name)
+                return result
+        except (json.JSONDecodeError, TypeError):
+            _reset_server_error(server_name)
+            return result
+    except Exception as retry_exc:
+        logger.warning(
+            "MCP %s/%s retry after subprocess-dead reconnect failed: %s",
+            server_name, op_description, retry_exc,
+        )
+    return None
+
+
 # Exact raw server names whose ``supports_parallel_tool_calls`` config is True.
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
@@ -4715,6 +4803,85 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # exited and been removed from the active map.  Empty on Windows
 # (``os.getpgid`` is POSIX-only).
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
+
+
+def _stdio_subprocess_pids_for_server(server_name: str) -> List[int]:
+    """Snapshot the tracked stdio subprocess PIDs owned by ``server_name``.
+
+    Returns a snapshot copy (not a live view) so the caller can iterate
+    without holding ``_lock`` and without the list mutating underneath.
+    """
+    with _lock:
+        return [pid for pid, owner in _stdio_pids.items() if owner == server_name]
+
+
+def _stdio_subprocess_dead(server_name: str) -> Optional[bool]:
+    """Return whether the stdio subprocess for ``server_name`` is dead.
+
+    ``True``  — we have at least one tracked PID for this server and every
+                one of them has exited. No response will ever arrive on the
+                MCP read stream; fail-fast the in-flight call (#81995).
+    ``False`` — at least one tracked PID is still alive; keep waiting.
+    ``None``  — no PIDs tracked for this server (e.g. HTTP transport, or the
+                stdio subprocess hasn't been recorded yet). Callers should
+                treat this as "unknown, do not fail-fast on this signal".
+
+    Uses the cross-platform ``gateway.status._pid_exists`` helper (works on
+    both POSIX and Windows). We deliberately do NOT use ``os.kill(pid, 0)`` —
+    that is not a no-op on Windows (bpo-14484).
+    """
+    from gateway.status import _pid_exists
+
+    pids = _stdio_subprocess_pids_for_server(server_name)
+    if not pids:
+        return None
+    return not any(_pid_exists(pid) for pid in pids)
+
+
+# Poll interval for the in-flight ``call_tool`` fail-fast watchdog.
+# Short enough that a respawn is detected promptly (sub-second on POSIX
+# where _pid_exists is a /proc syscall); long enough that the polling
+# itself doesn't become load when the call succeeds quickly.
+_STDIO_FAILFAST_POLL_INTERVAL_S = 0.2
+
+
+async def _watch_stdio_subprocess(
+    server_name: str, call_task: "asyncio.Future"
+) -> None:
+    """Cancel ``call_task`` and raise ``MCPStdioSubprocessDeadError`` if the
+    stdio subprocess for ``server_name`` dies while ``call_task`` is in
+    flight.
+
+    Designed to run as a sibling task on the MCP event loop. Polls every
+    ``_STDIO_FAILFAST_POLL_INTERVAL_S`` until either ``call_task`` completes
+    (the call won — exit cleanly) or every tracked PID exits (the subprocess
+    is dead — cancel the call and signal failure). HTTP transports return
+    ``None`` from ``_stdio_subprocess_dead`` and the watchdog sleeps until
+    cancelled by the caller — zero overhead for non-stdio servers (#81995).
+    """
+    try:
+        while True:
+            await asyncio.sleep(_STDIO_FAILFAST_POLL_INTERVAL_S)
+            if call_task.done():
+                # The call won — let the caller await its result normally.
+                return
+            if _stdio_subprocess_dead(server_name):
+                # Subprocess is gone — no response will arrive. Cancel the
+                # in-flight call_tool future so the SDK's recv loop is
+                # unwound, then signal the failure to the caller.
+                if not call_task.done():
+                    call_task.cancel()
+                raise MCPStdioSubprocessDeadError(
+                    f"MCP stdio subprocess for server '{server_name}' died "
+                    f"during an in-flight tool call; failing fast "
+                    f"(#81995)."
+                )
+    except asyncio.CancelledError:
+        # The caller finished (success, timeout, or error) and cancelled
+        # us — that's the expected exit path on every non-dead-subprocess
+        # outcome. Re-raise so the surrounding ``try/finally`` sees the
+        # cancellation cleanly.
+        raise
 
 
 def _snapshot_child_pids() -> set:
@@ -5408,7 +5575,37 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    # Fail-fast watchdog: when the stdio subprocess dies
+                    # mid-call, the MCP read stream EOFs but the SDK's
+                    # in-flight ``call_tool`` coroutine can sit waiting on
+                    # the read queue until ``tool_timeout`` (default 300s)
+                    # elapses — too long to recover from a respawn, and
+                    # burns circuit-breaker strikes in the meantime.
+                    # Spawn a sibling task on the same MCP loop that polls
+                    # the tracked subprocess PIDs; if every tracked PID
+                    # exits, cancel the call_tool future and raise a
+                    # ``MCPStdioSubprocessDeadError`` so the caller falls
+                    # through to the supervisor-respawn path immediately
+                    # (#81995). HTTP transports have no tracked PIDs, so
+                    # ``_stdio_subprocess_dead`` returns ``None`` and the
+                    # watchdog is a silent no-op.
+                    call_task = asyncio.ensure_future(
+                        server.session.call_tool(tool_name, arguments=args)
+                    )
+                    watchdog_task = asyncio.ensure_future(
+                        _watch_stdio_subprocess(server_name, call_task)
+                    )
+                    try:
+                        result = await call_task
+                    finally:
+                        # Always cancel the watchdog so it doesn't outlive
+                        # the call (and so its ``asyncio.wait`` releases).
+                        if not watchdog_task.done():
+                            watchdog_task.cancel()
+                            try:
+                                await watchdog_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5529,6 +5726,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
+                server_name, exc, _call_once,
+                f"tools/call {tool_name}",
+            )
+            if recovered is not None:
+                return recovered
+
+            # stdio subprocess died mid-call (#81995): the fail-fast
+            # watchdog raised ``MCPStdioSubprocessDeadError`` so we
+            # don't burn the full ``tool_timeout`` waiting on a dead
+            # pipe. Signal a reconnect (supervisor respawns the
+            # subprocess) and retry once before reporting failure.
+            recovered = _handle_subprocess_dead_and_retry(
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
             )
