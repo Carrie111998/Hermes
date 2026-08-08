@@ -3667,6 +3667,7 @@ def run_job(
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
         _model_cfg = {}
+        _config_load_error: Optional[str] = None
         try:
             from hermes_cli.config import read_user_config_raw
             _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -3707,16 +3708,23 @@ def run_job(
                         if _default:
                             model = _default
         except Exception as e:
+            _config_load_error = str(e)
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
         if not (isinstance(model, str) and model.strip()):
+            _config_hint = (
+                f"config.yaml could not be loaded: {_config_load_error}. "
+                "Check file permissions and syntax."
+                if _config_load_error
+                else "config.yaml model.default missing or empty"
+            )
             raise RuntimeError(
                 f"Cron job '{job_name}' has no model configured "
                 f"(job.model={job.get('model')!r}, "
                 f"HERMES_MODEL={os.getenv('HERMES_MODEL', '')!r}, "
-                "config.yaml model.default missing or empty). "
+                f"{_config_hint}). "
                 f"Set a per-job model via "
                 f"`cronjob action=update job_id={job_id} model=<name>` or set a "
                 "default with `hermes model <name>`."
