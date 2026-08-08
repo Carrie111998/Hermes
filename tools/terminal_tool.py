@@ -54,6 +54,13 @@ from utils import env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _redact_terminal_error_text(value: Any) -> str:
+    """Force-redact text before serializing a terminal error envelope."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text("" if value is None else str(value), force=True)
+
+
 # ---------------------------------------------------------------------------
 # Global interrupt event: set by the agent when a user interrupt arrives.
 # The terminal tool polls this during command execution so it can kill
@@ -2669,15 +2676,14 @@ def terminal_tool(
                             host_cwd=config.get("host_cwd"),
                         )
                     except ImportError as e:
-                        return json.dumps(
-                            {
-                                "output": "",
-                                "exit_code": -1,
-                                "error": f"Terminal tool disabled: environment creation failed ({e})",
-                                "status": "disabled",
-                            },
-                            ensure_ascii=False,
-                        )
+                        return json.dumps({
+                            "output": "",
+                            "exit_code": -1,
+                            "error": _redact_terminal_error_text(
+                                f"Terminal tool disabled: environment creation failed ({e})"
+                            ),
+                            "status": "disabled"
+                        }, ensure_ascii=False)
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
@@ -3156,14 +3162,13 @@ def terminal_tool(
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
-                return json.dumps(
-                    {
-                        "output": "",
-                        "exit_code": -1,
-                        "error": f"Failed to start background process: {str(e)}",
-                    },
-                    ensure_ascii=False,
-                )
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": _redact_terminal_error_text(
+                        f"Failed to start background process: {e}"
+                    )
+                }, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
             max_retries = 3
@@ -3229,23 +3234,15 @@ def terminal_tool(
                         time.sleep(wait_time)
                         continue
 
-                    logger.error(
-                        "Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                        max_retries,
-                        _safe_command_preview(command),
-                        type(e).__name__,
-                        e,
-                        effective_task_id,
-                        env_type,
-                    )
-                    return json.dumps(
-                        {
-                            "output": "",
-                            "exit_code": -1,
-                            "error": f"Command execution failed: {type(e).__name__}: {str(e)}",
-                        },
-                        ensure_ascii=False,
-                    )
+                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": -1,
+                        "error": _redact_terminal_error_text(
+                            f"Command execution failed: {type(e).__name__}: {e}"
+                        )
+                    }, ensure_ascii=False)
 
                 # Got a result
                 break
@@ -3464,11 +3461,13 @@ def terminal_tool(
             import traceback
             tb_str = traceback.format_exc()
             logger.error("terminal_tool exception:\n%s", tb_str)
+            # Exception text can embed the failing command line (and any
+            # secrets inline in it) — redact before returning to the model.
             return json.dumps({
                 "output": "",
                 "exit_code": -1,
-                "error": f"Failed to execute command: {str(e)}",
-                "traceback": tb_str,
+                "error": _redact_terminal_error_text(f"Failed to execute command: {e}"),
+                "traceback": _redact_terminal_error_text(tb_str),
                 "status": "error"
             }, ensure_ascii=False)
 
@@ -3494,16 +3493,15 @@ def terminal_tool(
 
         tb_str = traceback.format_exc()
         logger.error("terminal_tool exception:\n%s", tb_str)
-        return json.dumps(
-            {
-                "output": "",
-                "exit_code": -1,
-                "error": f"Failed to execute command: {str(e)}",
-                "traceback": tb_str,
-                "status": "error",
-            },
-            ensure_ascii=False,
-        )
+        # Exception text can embed the failing command line (and any
+        # secrets inline in it) — redact before returning to the model.
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": _redact_terminal_error_text(f"Failed to execute command: {e}"),
+            "traceback": _redact_terminal_error_text(tb_str),
+            "status": "error"
+        }, ensure_ascii=False)
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:
