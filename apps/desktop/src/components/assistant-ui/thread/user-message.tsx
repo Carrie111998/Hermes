@@ -15,8 +15,8 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { $displayTimestampOptions } from '@/store/session'
+import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
 
 /** True when the user has a live text highlight (drag-select / triple-click). */

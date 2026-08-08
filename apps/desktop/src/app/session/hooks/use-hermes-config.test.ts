@@ -8,9 +8,9 @@ import { persistString } from '@/lib/storage'
 import {
   $currentCwd,
   $currentFastMode,
-  $displayTimestampOptions,
   $currentReasoningEffort,
   $defaultReasoningEffort,
+  $displayTimestampOptions,
   markComposerSelectionManual,
   setCurrentCwd,
   setCurrentFastMode,

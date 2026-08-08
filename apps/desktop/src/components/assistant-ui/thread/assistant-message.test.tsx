@@ -8,8 +8,9 @@ import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime }
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { Thread } from '.'
 import { setDisplayTimestampOptions } from '@/store/session'
+
+import { Thread } from '.'
 
 const createdAt = new Date('2026-05-01T00:00:00.000Z')
 
