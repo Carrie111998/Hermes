@@ -195,6 +195,12 @@
     --tool-memory-legendary-icon: color-mix(in srgb, var(--ui-yellow) 55%, var(--ui-purple));
     --tool-memory-legendary-meta: color-mix(in srgb, var(--ui-purple) 58%, var(--ui-text-tertiary));
     --tool-memory-legendary-glow: color-mix(in srgb, var(--ui-purple) 38%, transparent);
+    --tool-palimpsest-legendary-from: color-mix(in srgb, var(--ui-cyan) 78%, #7dd3fc);
+    --tool-palimpsest-legendary-mid: color-mix(in srgb, var(--ui-blue) 52%, var(--ui-purple));
+    --tool-palimpsest-legendary-to: color-mix(in srgb, var(--ui-purple) 80%, #c4b5fd);
+    --tool-palimpsest-legendary-icon: color-mix(in srgb, var(--ui-cyan) 58%, var(--ui-blue));
+    --tool-palimpsest-legendary-meta: color-mix(in srgb, var(--ui-blue) 58%, var(--ui-text-tertiary));
+    --tool-palimpsest-legendary-glow: color-mix(in srgb, var(--ui-cyan) 42%, transparent);
     /* Diff add/remove, derived from the semantic palette so every diff surface
        (tool cards, preview, review pane) tracks the theme's green/red. Only the
        foregrounds need a dark override — they mix toward the page instead of
@@ -886,6 +892,49 @@
 
 .tool-memory-legendary-meta {
   color: var(--tool-memory-legendary-meta);
+}
+
+/* Landed `palimpsest_remember` tool row — cyan "ink" → violet, with a slow
+   shimmer sweep so Palimpsest reads as a distinct, living surface next to
+   the static gold of base memory. */
+.tool-palimpsest-legendary-title {
+  background-image: linear-gradient(
+    105deg,
+    var(--tool-palimpsest-legendary-from) 0%,
+    var(--tool-palimpsest-legendary-mid) 48%,
+    var(--tool-palimpsest-legendary-to) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent !important;
+  font-weight: 600;
+  background-size: 200% 100%;
+  animation: palimpsest-legendary-shimmer 7s ease-in-out infinite;
+}
+
+.tool-palimpsest-legendary-glyph {
+  filter: drop-shadow(0 0 0.28rem var(--tool-palimpsest-legendary-glow));
+}
+
+.tool-palimpsest-legendary-meta {
+  color: var(--tool-palimpsest-legendary-meta);
+}
+
+@keyframes palimpsest-legendary-shimmer {
+  0%,
+  100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-palimpsest-legendary-title {
+    animation: none;
+    background-size: auto;
+  }
 }
 
 .quest-glow {

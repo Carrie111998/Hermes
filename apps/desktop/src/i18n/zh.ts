@@ -3021,6 +3021,8 @@ export const zh: Translations = {
         image_generate: { done: '已生成图片', pending: '正在生成图片', pendingAction: '正在生成' },
         list_files: { done: '已列出文件', pending: '正在列出文件', pendingAction: '正在列出' },
         memory: { done: '已保存到记忆', pending: '正在保存到记忆', pendingAction: '正在保存' },
+        palimpsest_remember: { done: '已保存到 Palimpsest', pending: '正在保存到 Palimpsest', pendingAction: '正在保存' },
+        palimpsest_recall: { done: '已从 Palimpsest 召回', pending: '正在从 Palimpsest 召回', pendingAction: '正在召回' },
         patch: { done: '已修补文件', pending: '正在修补文件', pendingAction: '正在修补' },
         read_file: { done: '已读取文件', pending: '正在读取文件', pendingAction: '正在读取' },
         search_files: { done: '已搜索文件', pending: '正在搜索文件', pendingAction: '正在搜索' },

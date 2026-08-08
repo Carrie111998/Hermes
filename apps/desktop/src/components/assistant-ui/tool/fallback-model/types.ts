@@ -40,6 +40,10 @@ export interface ToolView {
    *  (terminal/execute_code) so the renderer knows to run them through
    *  the ANSI parser instead of printing them as literals. */
   rendersAnsi?: boolean
+  /** Landed memory write (base memory) — gold→purple legendary chrome. */
+  legendary?: 'memory'
+  /** Landed Palimpsest write — cyan→violet ink legendary chrome. */
+  palimpsestLegendary?: boolean
   /** Original query, shown above structured web-search results. */
   searchQuery?: string
   searchHits?: SearchResultRow[]

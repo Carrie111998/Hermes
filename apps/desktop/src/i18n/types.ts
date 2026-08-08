@@ -21,6 +21,8 @@ export type ToolTitleKey =
   | 'image_generate'
   | 'list_files'
   | 'memory'
+  | 'palimpsest_remember'
+  | 'palimpsest_recall'
   | 'patch'
   | 'read_file'
   | 'search_files'
