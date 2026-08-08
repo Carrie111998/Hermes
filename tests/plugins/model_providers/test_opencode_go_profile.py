@@ -129,6 +129,47 @@ class TestOpenCodeGoModelGating:
         assert top_level == {}
 
 
+class TestOpenCodeGoSessionAffinityHeader:
+    """OpenCode Go's chat_completions relay 400s some backends (e.g.
+    deepseek-v4-flash) without a stable per-conversation session-affinity
+    header (#81584)."""
+
+    def test_session_id_sets_affinity_header(self, opencode_go_profile):
+        _, top_level = opencode_go_profile.build_api_kwargs_extras(
+            model="deepseek-v4-flash",
+            session_id="sess-abc123",
+        )
+        assert top_level["extra_headers"]["x-opencode-session"] == "sess-abc123"
+
+    def test_header_normalizes_cron_timestamp(self, opencode_go_profile):
+        _, first = opencode_go_profile.build_api_kwargs_extras(
+            model="deepseek-v4-flash", session_id="cron_job42_20260801_090000",
+        )
+        _, second = opencode_go_profile.build_api_kwargs_extras(
+            model="deepseek-v4-flash", session_id="cron_job42_20260802_090000",
+        )
+        assert first["extra_headers"]["x-opencode-session"] == "cron_job42"
+        assert (
+            first["extra_headers"]["x-opencode-session"]
+            == second["extra_headers"]["x-opencode-session"]
+        )
+
+    def test_no_session_id_omits_header(self, opencode_go_profile):
+        _, top_level = opencode_go_profile.build_api_kwargs_extras(
+            model="deepseek-v4-flash",
+        )
+        assert "extra_headers" not in top_level
+
+    def test_header_coexists_with_reasoning_top_level_kwargs(self, opencode_go_profile):
+        _, top_level = opencode_go_profile.build_api_kwargs_extras(
+            model="kimi-k2.6",
+            reasoning_config={"enabled": True, "effort": "high"},
+            session_id="sess-xyz",
+        )
+        assert top_level["reasoning_effort"] == "high"
+        assert top_level["extra_headers"]["x-opencode-session"] == "sess-xyz"
+
+
 class TestOpenCodeGoFullKwargsIntegration:
     """End-to-end transport kwargs include the profile-provided controls."""
 
