@@ -1,13 +1,56 @@
-# RCA: Missing "Local Dashboard" entry for a configured OAuth client_id
+# RCA: Missing "Local Dashboard" entry for a configured OAuth client_id — CORRECTED
 
-**Status:** root cause confirmed; diagnostic gap closed by `doctor: detect dashboard OAuth client_id configured without Portal login` (commit `c392069a9`). The underlying dashboard is not yet visible for the affected client — that requires a one-time interactive login only the account owner can perform (see "Remaining step," below).
+**⚠️ CORRECTION (2026-08-08):** The original version of this document below
+concluded the client_id was a "phantom" never registered with Portal. **That
+conclusion was wrong.** It was reached entirely from logged-out, unauthenticated
+probes (Portal always looks the same pre-auth, registered or not — see the
+document body) and was never checked against the one source that actually
+proves registration: Portal's own authenticated `/local-dashboards` page.
+
+When actually checked with the user's real, logged-in Portal session
+(`https://portal.nousresearch.com/orgs/c0932c05/local-dashboards`), the
+dashboard **"Atomic Kitten" IS registered and present**, with OAuth client ID
+`agent:cmsjbv9b2000wja09ew5igg2u` — an exact byte-for-byte match with
+`config.yaml`'s `dashboard.oauth.client_id`, verified via clipboard copy from
+the live page, not a screenshot read. (An intermediate vision-model read of a
+screenshot appeared to show the ID one character short, `...igg2` instead of
+`...igg2u` — that was a CSS text-clipping artifact of the narrow input box,
+not the real value. Always verify via clipboard/DOM, never via a vision read
+of a possibly-truncated text field, when a byte-for-byte ID comparison matters.)
+
+**Actual root cause of the user's confusion:** "the board" the user was
+looking for is the `hermes kanban` task board (SQLite-backed, CLI-only in
+this install — confirmed no `/kanban` route exists in
+`web/src/App.tsx`'s `BUILTIN_ROUTES_CORE`, no Kanban `.tsx` page file, no
+plugin registers one; the `kanban.*` i18n strings in `web/src/i18n/*.ts` are
+unused scaffolding for a future page, not a shipped one). Portal's
+"Local Dashboards" page is **purely an OAuth client-ID registry** — a place to
+register/revoke the credential a locally-run `hermes dashboard` process uses
+to authenticate — it has never rendered Kanban board content and was never
+going to, regardless of registration state. The user's actual gap was: no
+`hermes dashboard` (or any other viewer) was ever running locally to look at,
+and no persistent service (LaunchAgent/systemd) exists for it on this machine
+— unlike the gateway, which has `~/Library/LaunchAgents/ai.hermes.gateway.plist`.
+See the follow-up fix task for the resolution actually delivered to the user.
+
+**Everything below this point is the ORIGINAL (incorrect) investigation,
+preserved for the record per the runbook's own "how to avoid this next time"
+value — the mistake pattern (trusting unauthenticated probes + a vision-model
+screenshot read over the real authenticated source) is itself worth keeping
+visible.**
+
+---
+
+**Status (ORIGINAL — SUPERSEDED):** root cause confirmed; diagnostic gap closed by `doctor: detect dashboard OAuth client_id configured without Portal login` (commit `c392069a9`). The underlying dashboard is not yet visible for the affected client — that requires a one-time interactive login only the account owner can perform (see "Remaining step," below).
 **Severity:** P3 — cosmetic/confusing for the operator (dashboard silently absent, no error anywhere), but does not affect any other functionality. No data loss, no security exposure.
 **Affected client:** `agent:cmsjbv9b2000wja09ew5igg2u`
 **Investigation:** 5 kanban tasks (t_7baa2505, t_6e6ca7aa, t_daba1501, t_b919fc3b, t_d19d67f6)
 
-## Summary
+## Summary (ORIGINAL — SUPERSEDED, see correction banner above)
 
 A user reported that the "Local Dashboard" entry for their self-hosted agent was missing from Nous Portal (`portal.nousresearch.com/local-dashboards`). Investigation found **no bug** — local config, local OAuth plugin, entitlements, and logs are all correct and error-free. The dashboard is missing because `dashboard.oauth.client_id` in `config.yaml` was hand-typed rather than obtained from a successful `hermes dashboard register` run, and that command — the only thing that creates the Portal-side row — refuses to run because Nous Portal login was never completed on this machine (`~/.hermes/auth.json` is empty). The client_id sitting in config is a **phantom**: syntactically valid, but never minted server-side.
+
+**This was wrong** — the client_id was registered all along; the investigation never actually looked at the authenticated Portal page that would have shown it (see correction banner above).
 
 The dangerous part of this failure mode is that it is **locally invisible**: the OAuth plugin loads, registers its provider, and the `/auth/login` redirect to Portal 302s correctly with the exact configured client_id, PKCE challenge, and redirect_uri — because all of that is constructed client-side and never touches Portal's registration state. An operator watching the handshake sees nothing wrong. The only symptom is Portal's own dashboard list page coming up empty.
 
