@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,47 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     assert Path(exec_line.split(" ")[0]).is_absolute()
 
 
+def test_exec_falls_back_to_unresolved_venv_interpreter_path(tmp_path, xdg_home, monkeypatch):
+    """The interpreter fallback must keep the invocation path Python was
+    actually started with, not resolve through a ``venv/bin/python ->
+    base-interpreter`` symlink.
+
+    Python's venv detection keys off the *invocation* path (it looks for a
+    ``pyvenv.cfg`` beside it), not the symlink target. Resolving the
+    symlink away therefore loses the venv's site-packages entirely from an
+    unrelated cwd -- exactly what ``hermes desktop`` (launched from a
+    packaged app in another directory) needs to survive.
+    """
+    root = _make_project(tmp_path)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+    interpreter = exec_line.split(" ")[0]
+
+    # Must be made absolute WITHOUT dereferencing a symlink.
+    assert interpreter == os.path.abspath(lde.sys.executable)
+
+    resolved = os.path.realpath(lde.sys.executable)
+    if resolved == interpreter:
+        pytest.skip("current interpreter is not a symlinked venv python; "
+                     "the environment-safe probe needs a real symlink to be meaningful")
+
+    # Environment-safe probe: the retained (unresolved) interpreter path
+    # must still be able to import hermes_cli from a cwd that has nothing
+    # to do with the checkout -- the resolved symlink target could not.
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    probe = subprocess.run(
+        [interpreter, "-c", "import hermes_cli"],
+        cwd=unrelated_cwd,
+        capture_output=True,
+        timeout=30,
+    )
+    assert probe.returncode == 0, probe.stderr.decode("utf-8", "replace")
+
+
 def test_exec_does_not_persist_env_python_source_wrapper(tmp_path, xdg_home, monkeypatch):
     """A raw ``#!/usr/bin/env python3`` source-tree wrapper (e.g. repo-root
     ``hermes``) resolves whatever ``python3`` is first on PATH. A desktop
@@ -110,7 +153,40 @@ def test_exec_does_not_persist_env_python_source_wrapper(tmp_path, xdg_home, mon
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    assert exec_line == f"{Path(lde.sys.executable).resolve()} -m hermes_cli.main desktop"
+    assert exec_line == f"{os.path.abspath(lde.sys.executable)} -m hermes_cli.main desktop"
+
+
+def _write_shebang(path: Path, shebang: str) -> Path:
+    path.write_text(f"{shebang}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_env_python_wrapper_detects_usr_bin_env_python3(tmp_path):
+    wrapper = _write_shebang(tmp_path / "hermes", "#!/usr/bin/env python3")
+    assert lde._is_env_python_source_wrapper(wrapper) is True
+
+
+def test_env_python_wrapper_detects_env_dash_s_python3(tmp_path):
+    wrapper = _write_shebang(tmp_path / "hermes", "#!/usr/bin/env -S python3 -I")
+    assert lde._is_env_python_source_wrapper(wrapper) is True
+
+
+def test_env_python_wrapper_ignores_installed_python_under_envs_dir(tmp_path):
+    """``/env`` appearing as a substring of a directory name (e.g. a real,
+    hardcoded interpreter path under a conda/venv tree literally named
+    ``envs``) is not the ``/usr/bin/env`` PATH-lookup shim. Must not be
+    misclassified as an unsafe wrapper.
+    """
+    venv_bin = tmp_path / "home" / "user" / "envs" / "hermes" / "bin"
+    venv_bin.mkdir(parents=True)
+    wrapper = _write_shebang(tmp_path / "hermes", f"#!{venv_bin / 'python3'}")
+    assert lde._is_env_python_source_wrapper(wrapper) is False
+
+
+def test_env_python_wrapper_ignores_non_python_env_shebang(tmp_path):
+    wrapper = _write_shebang(tmp_path / "hermes", "#!/usr/bin/env bash")
+    assert lde._is_env_python_source_wrapper(wrapper) is False
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):

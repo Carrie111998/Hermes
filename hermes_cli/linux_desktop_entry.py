@@ -67,6 +67,12 @@ def _is_env_python_source_wrapper(path: Path) -> bool:
     risks a launcher that only works in one environment. An installed
     console-script wrapper's shebang instead hardcodes its own venv
     interpreter's absolute path, which has no such PATH dependency.
+
+    Requires the shebang's interpreter *basename* to be exactly ``env``
+    (not merely contain ``/env`` -- a real, hardcoded interpreter path
+    under a directory literally named ``envs`` must not match) and the
+    command it invokes to be a ``python*`` binary, tolerating ``env``'s
+    ``-S`` flag.
     """
     try:
         with path.open("rb") as fh:
@@ -75,8 +81,18 @@ def _is_env_python_source_wrapper(path: Path) -> bool:
         return False
     if not head.startswith(b"#!"):
         return False
-    first_line = head.split(b"\n", 1)[0]
-    return b"/env" in first_line and b"python" in first_line
+    tokens = head.split(b"\n", 1)[0][2:].split()
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0].decode("utf-8", "replace")) != "env":
+        return False
+    args = tokens[1:]
+    if args[:1] == [b"-S"]:
+        args = args[1:]
+    if not args:
+        return False
+    command = os.path.basename(args[0].decode("utf-8", "replace"))
+    return command.startswith("python")
 
 
 def resolve_exec_command() -> str:
@@ -93,7 +109,13 @@ def resolve_exec_command() -> str:
     if bin_path and not _is_env_python_source_wrapper(Path(bin_path)):
         argv = [str(Path(bin_path).resolve()), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        # Absolute WITHOUT resolving a symlink: a venv's `bin/python` is
+        # typically a symlink to the base interpreter, and Python's venv
+        # detection keys off the invocation path (it looks for a
+        # `pyvenv.cfg` beside it), not the symlink target. Resolving it
+        # away would lose the venv's site-packages -- and hermes_cli with
+        # it -- the moment this Exec line runs from an unrelated cwd.
+        argv = [os.path.abspath(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
