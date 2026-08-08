@@ -92,3 +92,15 @@ describe('PaneTab close gestures', () => {
     expect(onPointerDown).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('PaneTab close button', () => {
+  it('renders an accessible close button for a closeable horizontal tab', () => {
+    render(
+      <PaneTab onClose={vi.fn()}>
+        <PaneTabLabel>tab</PaneTabLabel>
+      </PaneTab>
+    )
+
+    expect(screen.getByRole('button', { name: 'Close tab' })).toBeTruthy()
+  })
+})
