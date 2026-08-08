@@ -871,11 +871,16 @@ def write_computer_use_runtime_attestation(
     try:
         import psutil
 
-        process_create_time = psutil.Process(os.getpid()).create_time()
+        process = psutil.Process(os.getpid())
+        process_create_time = process.create_time()
+        process_executable = process.exe()
+        if not process_executable:
+            raise RuntimeError("live gateway process executable is unavailable")
     except Exception:
-        # Process creation time is required for PID-reuse-safe external
-        # verification. Fail instead of publishing a weaker receipt.
-        raise RuntimeError("could not attest gateway process creation time")
+        # Process creation time and the OS-reported executable are required
+        # for PID-reuse-safe external verification. Fail instead of publishing
+        # a weaker receipt.
+        raise RuntimeError("could not attest live gateway process identity")
     output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
     archive_dir = output.parent / "cua_gateway_attestations"
     archive = archive_dir / (
@@ -887,7 +892,8 @@ def write_computer_use_runtime_attestation(
         "pid": os.getpid(),
         "ppid": os.getppid(),
         "process_create_time": process_create_time,
-        "executable": sys.executable,
+        "executable": process_executable,
+        "launcher": sys.executable,
         "argv": list(sys.argv),
         "modules": modules,
         "callables": code_rows,

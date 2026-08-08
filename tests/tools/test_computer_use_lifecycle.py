@@ -1069,6 +1069,7 @@ def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
     import hashlib
     import json
     import os
+    import sys
     from pathlib import Path
 
     from tools.computer_use import tool as computer_use
@@ -1080,6 +1081,12 @@ def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
     )
 
     assert persisted["pid"] == os.getpid() == receipt["pid"]
+    import psutil
+
+    assert Path(persisted["executable"]).resolve() == Path(
+        psutil.Process(os.getpid()).exe()
+    ).resolve()
+    assert Path(persisted["launcher"]).resolve() == Path(sys.executable).resolve()
     assert persisted["process_create_time"] > 0
     archive = Path(persisted["archive_path"])
     assert archive.exists()
