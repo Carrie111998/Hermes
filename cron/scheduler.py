@@ -5324,6 +5324,7 @@ def run_one_job(
             if blocked_config_silent:
                 should_deliver = False
             contextual_delivery_claimed = False
+            contextual_delivery_claim_lost = False
             if contextual_kind == "notify":
                 authorizer = get_contextual_authorizer()
                 authorization_error = None
@@ -5369,6 +5370,7 @@ def run_one_job(
                     if not contextual_delivery_claimed:
                         # A concurrent/replayed scheduler does not own delivery.
                         should_deliver = False
+                        contextual_delivery_claim_lost = True
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
             # old `SILENT_MARKER in ...upper()` substring check, which both leaked
@@ -5412,6 +5414,11 @@ def run_one_job(
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
+
+        if contextual_delivery_claim_lost:
+            # Another worker owns (or already consumed) this delivery CAS.
+            # Leave terminalization and accounting to that owner.
+            return False
 
         # no_action is an explicit successful terminal state, not an empty
         # model response. Preserve the legacy empty-response guard otherwise.

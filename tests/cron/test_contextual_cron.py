@@ -1587,6 +1587,49 @@ def test_recovery_never_retries_a_lost_route_locked_delivery_claim(monkeypatch):
     ) is False
 
 
+def test_live_completion_never_accounts_a_lost_route_locked_claim(monkeypatch):
+    import cron.scheduler as scheduler
+    from gateway.contextual_cron import ContextualCronOutcome
+
+    _patch_scheduler_bookkeeping(monkeypatch, scheduler)
+
+    def authorize(target):
+        target["_contextual_delivery_claim_attempted"] = True
+        return True
+
+    monkeypatch.setattr(scheduler, "_CONTEXTUAL_AUTHORIZER", authorize)
+    monkeypatch.setattr(
+        scheduler,
+        "claim_contextual_delivery",
+        lambda *_a, **_k: pytest.fail("claim retried outside the route lock"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_a, **_k: pytest.fail("lost claim must not deliver"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_account_contextual_job_run",
+        lambda **_k: pytest.fail("non-owner must not account the occurrence"),
+    )
+
+    assert scheduler.run_one_job(
+        {
+            "id": "job",
+            "execution_id": "execution",
+            "session_target": "current",
+            "session_key": "stable",
+            **_physical_binding(),
+            "prompt": "continue",
+            "deliver": "origin",
+        },
+        contextual_dispatch=lambda *_a, **_k: ContextualCronOutcome.notify(
+            "private result"
+        ),
+    ) is False
+
+
 def test_contextual_delivery_exception_is_persisted_unknown_without_retry(monkeypatch):
     import cron.scheduler as scheduler
     from gateway.contextual_cron import ContextualCronOutcome
