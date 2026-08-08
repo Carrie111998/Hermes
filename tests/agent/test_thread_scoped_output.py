@@ -108,6 +108,7 @@ def test_temporary_global_redirects_do_not_allocate_new_sinks(monkeypatch):
         return sink
 
     monkeypatch.setattr(thread_output, "_installed", {})
+    monkeypatch.setattr(thread_output, "_sinks", {})
     monkeypatch.setattr(thread_output, "open", fake_open, raising=False)
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
@@ -115,12 +116,18 @@ def test_temporary_global_redirects_do_not_allocate_new_sinks(monkeypatch):
         with thread_scoped_silence():
             pass
         assert len(opened_sinks) == 2
+        original_proxies = dict(thread_output._installed)
 
         for _ in range(20):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 with thread_scoped_silence():
                     print("hidden")
 
+        # The redirect restores the original proxies. One final entry adopts
+        # them rather than wrapping them in another proxy generation.
+        with thread_scoped_silence():
+            pass
         assert len(opened_sinks) == 2
+        assert thread_output._installed == original_proxies
     finally:
         sys.stdout, sys.stderr = original_stdout, original_stderr

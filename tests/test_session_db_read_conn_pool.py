@@ -384,3 +384,43 @@ def test_close_returns_every_permit(db):
     for _ in range(_READ_POOL_MAX):
         assert db._read_permits.acquire(blocking=False), "close() stranded a permit"
     assert not db._read_permits.acquire(blocking=False), "close() over-released"
+
+
+def test_failed_close_does_not_widen_the_descriptor_ceiling(db):
+    """A connection that failed to close still owns its descriptor permit."""
+
+    class UnclosableConnection:
+        def close(self):
+            raise OSError("simulated close failure")
+
+    db._read_permits = threading.BoundedSemaphore(1)
+    assert db._read_permits.acquire(blocking=False)
+
+    db._close_read_conn(UnclosableConnection())
+
+    assert not db._read_permits.acquire(blocking=False)
+
+
+@pytest.mark.requires_wal
+def test_failed_partial_open_close_keeps_its_descriptor_permit(db, monkeypatch):
+    """A half-open connection with a failed close must also fail closed."""
+    import sqlite3 as _sqlite3
+
+    import hermes_state as _hs
+
+    class UnclosableConnection:
+        row_factory = None
+
+        def close(self):
+            raise OSError("simulated close failure")
+
+    monkeypatch.setattr(_hs, "_connect_tracked_db", lambda *_a, **_k: UnclosableConnection())
+    monkeypatch.setattr(
+        _hs,
+        "apply_database_pragmas",
+        lambda *_a, **_k: (_ for _ in ()).throw(_sqlite3.OperationalError("init failed")),
+    )
+    db._read_permits = threading.BoundedSemaphore(1)
+
+    assert db._get_read_conn() is None
+    assert not db._read_permits.acquire(blocking=False)

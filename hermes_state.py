@@ -2894,13 +2894,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Dropping it on the floor still open leaves a live descriptor the
             # tracking registry still counts: the same leak shape this pool
             # exists to fix, one level further down.
-            self._discard_partial_read_conn(conn)
+            closed = self._discard_partial_read_conn(conn)
             # Back off from retrying the open on every query; the locked
             # writer connection still serves reads until the stamp expires.
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
-            self._read_permits.release()
+            if closed:
+                self._read_permits.release()
             return None
         except BaseException:
             # Anything else (a non-sqlite3 extension-load failure, MemoryError,
@@ -2908,25 +2909,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # strand the permit: a stranded permit is not a transient error, it
             # permanently shrinks the read path by one slot for the life of the
             # process.
-            self._discard_partial_read_conn(conn)
-            self._read_permits.release()
+            closed = self._discard_partial_read_conn(conn)
+            if closed:
+                self._read_permits.release()
             raise
         return conn
 
-    def _discard_partial_read_conn(self, conn) -> None:
+    def _discard_partial_read_conn(self, conn) -> bool:
         """Close a connection that failed between open and hand-off.
 
         Separate from _close_read_conn because that one releases a permit and
         this runs on paths that release their own.
         """
         if conn is None:
-            return
+            return True
         try:
             conn.close()
         except Exception as exc:
             logger.warning(
                 "partially-opened read conn close failed for %s: %s", self.db_path, exc
             )
+            return False
+        return True
 
     def _close_read_conn(self, conn) -> None:
         """Close a pooled read connection and release its descriptor permit.
@@ -2937,10 +2941,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         of the fd leak this pool fixes. A close that fails leaks a tracked
         fd, so it must not be invisible.
 
-        The permit is released even when close() raises: the descriptor is
-        already lost at that point, and withholding the permit too would turn
-        one leaked fd into a permanently narrower read path — failing twice for
-        one fault. The warning is the signal that matters.
+        A failed close keeps the permit consumed. The descriptor may still be
+        live, so releasing its permit would let a replacement connection open
+        and violate the hard descriptor ceiling. Degraded pool capacity is the
+        fail-closed outcome until process shutdown.
 
         Pairs with _get_read_conn(). Calling this on a connection that did not
         come from there over-releases the BoundedSemaphore, which raises
@@ -2950,7 +2954,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.close()
         except Exception as exc:
             logger.warning("read-conn close failed for %s: %s", self.db_path, exc)
-        finally:
+        else:
             self._read_permits.release()
 
     def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:

@@ -30,6 +30,10 @@ _install_lock = threading.Lock()
 # Maps the proxy we installed for a given attribute ("stdout"/"stderr") so we
 # never double-wrap and so we can recover the original stream.
 _installed: dict[str, "_ThreadRoutingStream"] = {}
+# One process-lifetime sink per stream. Temporary process-global redirects can
+# displace and later restore a routing proxy; they must not allocate another
+# permanent /dev/null descriptor every time that happens.
+_sinks: dict[str, TextIO] = {}
 
 
 class _ThreadRoutingStream:
@@ -109,13 +113,22 @@ def _ensure_installed(attr: str, passthrough: TextIO) -> "_ThreadRoutingStream":
     with _install_lock:
         proxy = _installed.get(attr)
         current = getattr(sys, attr, None)
+        if isinstance(current, _ThreadRoutingStream):
+            # A redirect context can restore an older routing proxy after a
+            # temporary replacement. Adopt it instead of wrapping it and
+            # growing an unbounded proxy chain.
+            _installed[attr] = current
+            return current
         if proxy is not None and current is proxy:
             return proxy
         # Capture whatever is currently bound as the passthrough. If a prior
         # global redirect_stdout is active, route non-silenced threads to that
         # stream to preserve the old behavior.
         passthrough = current if current is not None else passthrough
-        sink = open(os.devnull, "w", encoding="utf-8")
+        sink = _sinks.get(attr)
+        if sink is None or sink.closed:
+            sink = open(os.devnull, "w", encoding="utf-8")
+            _sinks[attr] = sink
         proxy = _ThreadRoutingStream(passthrough, sink)
         setattr(sys, attr, proxy)
         _installed[attr] = proxy
