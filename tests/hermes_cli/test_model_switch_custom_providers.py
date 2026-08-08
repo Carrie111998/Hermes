@@ -832,6 +832,74 @@ def test_save_discovered_models_preserves_dict_form(monkeypatch):
     )
 
 
+def test_model_flow_named_custom_persists_discovered_models(monkeypatch):
+    """The ``hermes model`` named-custom-provider flow persists the discovered
+    catalog back to the entry's ``models:`` list.
+
+    No-probe surfaces (dashboard, desktop, ACP) call
+    ``build_models_payload(..., probe_custom_providers=False)`` and only show
+    the configured ``models:`` list. The CLI flow probes and shows the full
+    catalog but (before this fix) never saved it, so a provider added via
+    ``hermes model`` collapsed to the single ``model:`` default everywhere but
+    the CLI. It must persist discovered models the same way the picker path in
+    ``_save_discovered_models_to_config`` does.
+    """
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda api_key, base_url, **kw: [
+            "discovered-a",
+            "discovered-b",
+            "discovered-c",
+        ],
+    )
+    # Non-interactive model selection.
+    monkeypatch.setattr(
+        "hermes_cli.curses_ui.curses_radiolist", lambda *a, **k: 0
+    )
+    # No-op downstream writes so the test never touches a real config.
+    monkeypatch.setattr("hermes_cli.main._save_custom_provider", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {}, "providers": {}, "custom_providers": []},
+    )
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+    save_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.model_switch._save_discovered_models_to_config",
+        lambda api_url, model_ids: save_calls.append((api_url, model_ids)),
+    )
+
+    from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+    _model_flow_named_custom(
+        {},
+        {
+            "name": "Dragomes",
+            "base_url": "http://example.com/v1",
+            "api_mode": "anthropic_messages",
+            "api_key": "sk-test",
+            "key_env": "",
+            "model": "MiniMax-M3",
+            "provider_key": "",
+            "discover_models": True,
+            "models": {},
+        },
+    )
+
+    assert save_calls == [
+        (
+            "http://example.com/v1",
+            ["discovered-a", "discovered-b", "discovered-c"],
+        )
+    ], (
+        "_model_flow_named_custom must persist discovered models "
+        "(base_url, model_ids) after a successful probe"
+    )
+
+
 def test_shared_url_different_display_names_are_separate_rows(monkeypatch):
     """Multiple custom_providers entries sharing base_url + api_key + api_mode
     but with *different* display-name prefixes (e.g. a proxy fronting
