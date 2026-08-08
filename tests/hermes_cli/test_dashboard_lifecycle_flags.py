@@ -35,7 +35,7 @@ class TestDashboardStatus:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "No hermes dashboard processes running" in out
+        assert "No hermes dashboard/serve processes running" in out
 
     def test_status_with_processes(self, capsys):
         processes = [
@@ -53,6 +53,44 @@ class TestDashboardStatus:
         assert "2 hermes dashboard process(es) running" in out
         assert "PID 12345" in out
         assert "PID 12346" in out
+
+    def test_status_reports_serve_mode_backends(self, capsys):
+        """A detached ``hermes serve`` backend (what Desktop spawns) must be
+        visible to --status, matching the stop path which already treats
+        serve and dashboard as one process class (#81564)."""
+        processes = [
+            (12345, "hermes dashboard --port 9119"),
+            (12346, "hermes serve --port 9120"),
+        ]
+        with patch("hermes_cli.main._scan_dashboard_processes", return_value=processes), \
+             patch("gateway.status._pid_exists", return_value=True), \
+             patch("hermes_cli.main._dashboard_listening", return_value=True), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True))
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "1 hermes dashboard process(es) running" in out
+        assert "1 hermes serve process(es) running" in out
+        assert "PID 12345" in out
+        assert "PID 12346" in out
+
+    def test_status_ignores_non_server_processes(self, capsys):
+        """Non-server processes must not be reported, and the mode grouping
+        must stay accurate (#81564)."""
+        processes = [
+            (12345, "hermes dashboard --port 9119"),
+            # Not a server cmdline — must not be parsed as dashboard/serve.
+            (12346, "vim /tmp/hermes_dashboard_notes.txt"),
+        ]
+        with patch("hermes_cli.main._scan_dashboard_processes", return_value=processes), \
+             patch("gateway.status._pid_exists", return_value=True), \
+             patch("hermes_cli.main._dashboard_listening", return_value=True), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True))
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "1 hermes dashboard process(es) running" in out
+        assert "hermes serve process" not in out
 
 
     def test_status_does_not_try_to_import_fastapi(self):
