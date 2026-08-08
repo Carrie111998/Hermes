@@ -147,7 +147,7 @@ class TestNormalizeProducesParseableUrl:
         """
         import httpx
 
-        token = "1234567890:AAGURFJSzXoINq_Fj_Srvuf7mpZ4XRXO6rQ"
+        token = "<TELEGRAM_BOT_TOKEN>"
         normalized = _normalize_telegram_base_url(raw_base)
         # Simulate exactly what PTB does: base + token + /<endpoint>.
         url = f"{normalized}{token}/getMe"
