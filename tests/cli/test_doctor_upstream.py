@@ -12,9 +12,11 @@ self-explanatory.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,11 +60,27 @@ from hermes_cli.doctor_upstream import (
 # --------------------------------------------------------------------------- #
 
 
-def _git(args: list[str], cwd: Path) -> str:
+def _git(args: list[str], cwd: Path, *, env: dict[str, str] | None = None) -> str:
     """Allowlisted helper used only by the test fixture to build
     temporary Git repositories. The module under test never goes
     through this — it uses ``_run_git`` which restricts to the
-    READONLY_GIT_SUBCOMMANDS allowlist at the *module* level."""
+    READONLY_GIT_SUBCOMMANDS allowlist at the *module* level.
+
+    Pass ``env`` to inject extra environment variables (e.g. dated
+    commits via ``GIT_AUTHOR_DATE`` / ``GIT_COMMITTER_DATE``); the
+    default test author/committer identity is preserved.
+    """
+    base_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+    }
+    if env:
+        base_env.update(env)
     p = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
@@ -70,10 +88,7 @@ def _git(args: list[str], cwd: Path) -> str:
         capture_output=True,
         text=True,
         timeout=15,
-        env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t",
-             "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t",
-             "GIT_CONFIG_GLOBAL": "/dev/null",
-             "GIT_CONFIG_SYSTEM": "/dev/null"},
+        env=base_env,
     )
     return p.stdout
 
@@ -81,6 +96,40 @@ def _git(args: list[str], cwd: Path) -> str:
 @pytest.fixture
 def gitrepo(tmp_path: Path):
     """Build a temporary Git repository inside ``tmp_path``."""
+    cwd = tmp_path / "fixture"
+    cwd.mkdir()
+    _git(["init", "-q", "--initial-branch=main"], cwd)
+    _git(["config", "user.email", "test@test"], cwd)
+    _git(["config", "user.name", "test"], cwd)
+    _git(["config", "commit.gpgsign", "false"], cwd)
+
+    (cwd / "README.md").write_text("main\n")
+    _git(["add", "."], cwd)
+    _git(["commit", "-q", "-m", "init main"], cwd)
+
+    bare = tmp_path / "origin.git"
+    bare.mkdir()
+    _git(["init", "--bare", "-q"], bare)
+    _git(["remote", "add", "origin", str(bare)], cwd)
+    _git(["push", "-q", "origin", "main"], cwd)
+    main_sha = _git(["rev-parse", "HEAD"], cwd).strip()
+
+    _git(["branch", "--set-upstream-to=origin/main"], cwd)
+
+    return SimpleNamespace(
+        cwd=cwd,
+        bare=bare,
+        main_sha=main_sha,
+        git=_git,
+    )
+
+
+def _build_minimal_gitrepo(tmp_path: Path):
+    """Reusable factory equivalent to the ``gitrepo`` fixture but taking
+    an explicit ``tmp_path`` so individual tests can mint fresh repos
+    with their own dated commits without depending on fixture injection
+    order. Mirrors the structure of ``gitrepo``.
+    """
     cwd = tmp_path / "fixture"
     cwd.mkdir()
     _git(["init", "-q", "--initial-branch=main"], cwd)
@@ -490,6 +539,205 @@ def test_UH4_divergence_age_over_30_warns() -> None:
     assert verdict(30) == BranchHealth.PASS
     assert verdict(31) == BranchHealth.WARN
     assert verdict(90) == BranchHealth.WARN
+
+
+# =========================================================================== #
+# UH4 — REAL divergence-age regression (real git fixture + deterministic dates)
+# =========================================================================== #
+
+
+_SECONDS_PER_DAY = 86_400
+
+
+def _make_stale_unique_commit(
+    gitrepo,
+    *,
+    age_days: int,
+    message: str,
+) -> None:
+    """Create exactly ONE local-only commit on a feature branch with both
+    GIT_AUTHOR_DATE and GIT_COMMITTER_DATE set to ``now - age_days``.
+
+    Uses Unix timestamps (locale-independent). Verifies the commit's
+    committer timestamp after creation so the fixture cannot silently
+    land at "now" because of a missing date env var.
+    """
+    # Pin "now" once so the test is internally consistent and the
+    # resulting divergence_age_days is exact (no clock drift between
+    # fixture build and assertion).
+    base_now = int(time.time())
+    commit_ts = base_now - (age_days * _SECONDS_PER_DAY)
+    iso_date = datetime.datetime.fromtimestamp(
+        commit_ts, tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    # Default fixture timestamp: now. Override BOTH author and committer.
+    date_env = {
+        "GIT_AUTHOR_DATE": iso_date,
+        "GIT_COMMITTER_DATE": iso_date,
+    }
+
+    gitrepo.git(["checkout", "-q", "-b", "feat/stale-divergence"], gitrepo.cwd)
+    (gitrepo.cwd / "stale_unique.txt").write_text("stale unique divergence\n")
+    gitrepo.git(["add", "."], gitrepo.cwd, env=date_env)
+    gitrepo.git(["commit", "-q", "-m", message], gitrepo.cwd, env=date_env)
+
+    # Verification: confirm HEAD actually has the requested committer date.
+    actual = _git(
+        ["show", "-s", "--format=%ct", "HEAD"], gitrepo.cwd
+    ).strip()
+    expected = str(commit_ts)
+    assert actual == expected, (
+        f"fixture date verification failed: actual={actual} "
+        f"expected={expected} (age_days={age_days})"
+    )
+
+
+def _divergence_age_in(gitrepo, monkeypatch) -> int | None:
+    """Force ``_now_timestamp`` to a deterministic value and call the real
+    ``_divergence_info`` against the fixture repo.
+
+    The monkeypatch is a no-op on OLD production (which has no
+    ``_now_timestamp`` seam) — in that case the production computes
+    ``head_ts - oldest_ts`` and the regression must observe the broken
+    value (zero). The seam is only installed when the symbol exists, so
+    the same test runs causally against both OLD and NEW production.
+    """
+    if hasattr(du, "_now_timestamp"):
+        pinned_now = int(time.time())
+        monkeypatch.setattr(du, "_now_timestamp", lambda: pinned_now)
+    info = du._divergence_info(
+        cwd=str(gitrepo.cwd), upstream_ref="origin/main"
+    )
+    return info.divergence_age_days
+
+
+def test_UH4_REGRESSION_stale_single_commit_warns(monkeypatch, tmp_path) -> None:
+    """UH4 primary reviewer regression: a branch with EXACTLY ONE
+    local-only commit older than 31 days must produce a divergence age
+    greater than 30 and a final WARN verdict.
+
+    Pre-fix: ``divergence_age_days`` is computed as ``head_ts - oldest_ts``
+    which is always 0 on a single-commit branch, so this case was
+    silently misclassified as PASS regardless of real age.
+    """
+    gitrepo = _build_minimal_gitrepo(tmp_path)
+    _make_stale_unique_commit(
+        gitrepo, age_days=45, message="stale single unique commit"
+    )
+
+    age_days = _divergence_age_in(gitrepo, monkeypatch)
+    assert age_days is not None and age_days > 30, (
+        f"stale single-commit divergence_age_days must be >30, got {age_days}"
+    )
+
+    # Final classifier verdict: must be WARN.
+    upstream = UpstreamReference(
+        True,
+        "origin/main",
+        "origin",
+        "main",
+        resolution_chain=["tracking"],
+    )
+    tracking = TrackingInfo(
+        True,
+        "origin/main",
+        "origin",
+        "refs/heads/main",
+        "explicit",
+    )
+    health = classify_branch_health(
+        upstream=upstream,
+        tracking=tracking,
+        ahead_behind=AheadBehind(1, 0),
+        divergence_age_days=age_days,
+        mutual=MutualPaths([], [], [], []),
+        scope=ScopeHealth(1, 1, 1, 0),
+    )
+    assert health == BranchHealth.WARN, (
+        f"stale single-commit branch must classify as WARN, got {health}"
+    )
+
+
+def test_UH4_REGRESSION_exact_30_day_boundary_passes(monkeypatch, tmp_path) -> None:
+    """UH4 boundary: a single unique commit aged EXACTLY 30 days must
+    classify as PASS (threshold is strict ``> 30``).
+    """
+    gitrepo = _build_minimal_gitrepo(tmp_path)
+    _make_stale_unique_commit(
+        gitrepo, age_days=30, message="boundary 30-day single commit"
+    )
+
+    age_days = _divergence_age_in(gitrepo, monkeypatch)
+    assert age_days == 30, (
+        f"exact 30-day boundary must yield divergence_age_days == 30, "
+        f"got {age_days}"
+    )
+
+    upstream = UpstreamReference(
+        True, "origin/main", "origin", "main", resolution_chain=["tracking"]
+    )
+    tracking = TrackingInfo(
+        True, "origin/main", "origin", "refs/heads/main", "explicit"
+    )
+    health = classify_branch_health(
+        upstream=upstream,
+        tracking=tracking,
+        ahead_behind=AheadBehind(1, 0),
+        divergence_age_days=age_days,
+        mutual=MutualPaths([], [], [], []),
+        scope=ScopeHealth(1, 1, 1, 0),
+    )
+    assert health == BranchHealth.PASS, (
+        f"30-day boundary must classify as PASS, got {health}"
+    )
+
+
+def test_UH4_REGRESSION_recent_single_commit_passes(monkeypatch, tmp_path) -> None:
+    """UH4 fresh: a single unique commit younger than 30 days must PASS."""
+    gitrepo = _build_minimal_gitrepo(tmp_path)
+    _make_stale_unique_commit(
+        gitrepo, age_days=5, message="recent single unique commit"
+    )
+
+    age_days = _divergence_age_in(gitrepo, monkeypatch)
+    assert age_days is not None and age_days < 30, (
+        f"recent single-commit divergence_age_days must be <30, got {age_days}"
+    )
+
+    upstream = UpstreamReference(
+        True, "origin/main", "origin", "main", resolution_chain=["tracking"]
+    )
+    tracking = TrackingInfo(
+        True, "origin/main", "origin", "refs/heads/main", "explicit"
+    )
+    health = classify_branch_health(
+        upstream=upstream,
+        tracking=tracking,
+        ahead_behind=AheadBehind(1, 0),
+        divergence_age_days=age_days,
+        mutual=MutualPaths([], [], [], []),
+        scope=ScopeHealth(1, 1, 1, 0),
+    )
+    assert health == BranchHealth.PASS, (
+        f"recent single-commit branch must classify as PASS, got {health}"
+    )
+
+
+def test_UH4_no_divergence_zero_age(gitrepo) -> None:
+    """UH4 no-divergence: when there are no local unique commits,
+    divergence_age_days must be exactly 0.
+    """
+    info = du._divergence_info(
+        cwd=str(gitrepo.cwd), upstream_ref="origin/main"
+    )
+    # On a fully-synced ``gitrepo`` (merge_base == HEAD) the oldest
+    # unique commit lookup returns ``None`` and the no-divergence branch
+    # of ``_divergence_info`` sets age_days = 0 directly.
+    assert info.divergence_age_days == 0, (
+        f"no-divergence fixture must produce divergence_age_days == 0, "
+        f"got {info.divergence_age_days}"
+    )
 
 
 # =========================================================================== #

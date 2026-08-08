@@ -33,6 +33,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Iterable, Optional
@@ -700,6 +701,15 @@ def _timestamp_for(sha: Optional[str], cwd: Optional[str]) -> Optional[int]:
         return None
 
 
+def _now_timestamp() -> int:
+    """Clock seam: returns wall-clock seconds since the epoch.
+
+    Exposed at module scope so tests can monkeypatch a deterministic "now"
+    without scattering ``time.time()`` calls through divergence logic.
+    """
+    return int(time.time())
+
+
 def _oldest_unique_commit(
     cwd: Optional[str], merge_base_sha: Optional[str], head_sha: Optional[str]
 ) -> tuple[Optional[str], Optional[int]]:
@@ -731,9 +741,16 @@ def _divergence_info(cwd: Optional[str], upstream_ref: Optional[str]) -> Diverge
 
     age_days: Optional[int] = None
     if merge_base_sha and head_sha and merge_base_sha == head_sha:
+        # No local divergence: there is no "divergence" to age.
         age_days = 0
-    elif head_ts is not None and oldest_ts is not None:
-        diff_seconds = max(0, head_ts - oldest_ts)
+    elif oldest_ts is not None:
+        # Divergence age is "how long this branch has been diverged from
+        # upstream". The oldest unique commit is the first actual divergent
+        # commit; head_ts - oldest_ts is always zero on a single-commit
+        # branch and understates real age on any branch. Use wall-clock
+        # "now" minus the oldest unique commit's timestamp instead.
+        now_ts = _now_timestamp()
+        diff_seconds = max(0, now_ts - oldest_ts)
         age_days = diff_seconds // 86_400
 
     return DivergenceInfo(
