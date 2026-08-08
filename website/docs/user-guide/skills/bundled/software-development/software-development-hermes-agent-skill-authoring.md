@@ -16,12 +16,12 @@ Author in-repo SKILL.md files: frontmatter and structure.
 |---|---|
 | Source | Bundled (installed by default) |
 | Path | `skills/software-development/hermes-agent-skill-authoring` |
-| Version | `2.0.0` |
-| Author | Hermes Agent |
+| Version | `2.1.0` |
+| Author | tShields (trojandnc), Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `skills`, `authoring`, `hermes-agent`, `conventions`, `skill-md` |
-| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review) |
+| Related skills | [`plan`](/docs/user-guide/skills/bundled/software-development/software-development-plan), [`requesting-code-review`](/docs/user-guide/skills/bundled/software-development/software-development-requesting-code-review), `skill-architecture-patterns` |
 
 ## Reference: full SKILL.md
 
@@ -39,6 +39,8 @@ There are two places a SKILL.md can live:
 2. **In-repo (this skill is about this case):** `skills/<category>/<name>/SKILL.md` or `optional-skills/<category>/<name>/SKILL.md` inside the hermes-agent repo — committed, shipped with the package. Use `write_file` + `git add`. `skill_manage(action='create')` does NOT target this tree.
 
 In-repo skills must meet the repo's **hardline authoring standards** (see AGENTS.md, "Skill authoring standards (HARDLINE)" — that section is the source of truth; this skill is the operational walkthrough). Reviewers reject PRs that violate them, so meeting them up front is cheaper than a salvage pass later.
+
+**Backward compatibility:** The standards below apply to **new skills and skills under active edit in a PR**. Untouched existing in-repo skills are **grandfathered** — no mandatory batch rewrite. Optional hygiene: a separate scan of descriptions >57 chars or weak When to Use sections is not a gate on this standard.
 
 ## When to Use
 
@@ -88,11 +90,17 @@ metadata:
 
 ### `description` rules (HARDLINE — the validator's 1024 is NOT the standard)
 
-- **≤ 60 characters.** One sentence. Ends with a period.
-- State the capability, not the implementation, and don't repeat the skill name.
-- No marketing words ("powerful", "comprehensive", "seamless", "advanced").
-- The system prompt skill index truncates at 57 chars + "..." — the trigger/capability must be self-contained in that window.
-- If the description contains a `:`, wrap it in double quotes or YAML parses it as a mapping and the docs generator crashes. Quotes don't count toward the 60.
+The description is the **highest-leverage always-paid surface** in a skill.
+Every token in it is paid on every turn via the skill index. Write it with
+more care than the body — a beautiful Procedure with a vague description
+is a skill that fails selection.
+
+- **≤ 60 characters** (hardline). One sentence. Ends with a period.
+- **Effective window: 57 characters.** The skill index truncates at 57 + "..." — the trigger/capability must be self-contained in the first 57 even if total length is 58–60.
+- State the **capability**, not the implementation, and don't repeat the skill name.
+- No marketing words ("powerful", "comprehensive", "seamless", "advanced", "robust", "end-to-end"). Use judgment: "advanced" and "comprehensive" are legitimate when they describe scope, not fluff. Flag for review, not auto-reject.
+- Prefer verbs of effect over setup narrative ("Track…", "Author…", "Review…").
+- If the description contains a `:`, wrap it in double quotes or YAML parses it as a mapping and the docs generator crashes.
 
 Good: `Track named companies for material news with cited digests.`
 Bad: `Use when a user asks to monitor named competitors or companies for product launches, pricing changes, funding, ...` (240 chars — rejected in review)
@@ -129,12 +137,16 @@ POSIX-only signals to search for in `scripts/`: `fcntl`, `termios`, `pty`, `os.f
 
 ## Body Structure (modern section order)
 
+For the progressive-disclosure theory underpinning layered section design, see `skill-architecture-patterns`. This section is the operational slot map.
+
 ```
 # <Skill> Skill
 2-3 sentence intro: what it does, what it doesn't do, dependency stance.
 
-## When to Use          — bulleted triggers (+ "Don't use for:" counter-triggers)
+## When to Use          — DEFINITION: bulleted triggers (+ "Don't use for:" counter-triggers)
 ## Prerequisites        — exact env vars, installs, API key sourcing
+## Safety & Enforcement — when side effects / sensitive data (see references/)
+## Dynamic Loading Rules — when 2+ references/*.md  (see references/)
 ## How to Run           — canonical invocation through the `terminal` tool
 ## Quick Reference      — flat command list, no narration
 ## Procedure            — numbered steps, each with a checkable completion criterion
@@ -142,7 +154,7 @@ POSIX-only signals to search for in `scripts/`: `fcntl`, `termios`, `pty`, `os.f
 ## Verification         — how to prove the skill worked
 ```
 
-Not every section applies to every skill (a pure-procedure task skill may have no Quick Reference), but When to Use + actionable body + Pitfalls + Verification are the minimum. Cut marketing intros, "Setup Check" no-ops, and re-explanations of env vars already in Prerequisites.
+Not every section applies to every skill. The minimum is When to Use + actionable body + Pitfalls + Verification. Safety & Enforcement and Dynamic Loading Rules are **required** when their triggers fire (side effects / sensitive data, 2+ reference files), **optional** otherwise. Cut marketing intros, "Setup Check" no-ops, and re-explanations of env vars already in Prerequisites.
 
 ### Reference Hermes tools, not raw shell
 
@@ -157,7 +169,7 @@ Write repo-relative paths (`skills/...`, `tools/skill_manager_tool.py`). A `/hom
 A skill exists to make the agent's process more predictable — the agent reliably follows the same useful discipline.
 
 1. **Optimize for process predictability.** If a line does not change behavior, cut it.
-2. **Choose the right context load.** The description is paid for every turn; details go in the body or linked references.
+2. **Definition-first order.** Polish description + When to Use before body section polish. The description is paid for every turn; details go in the body or linked references.
 3. **End steps with completion criteria.** Checkable and, when it matters, exhaustive: "every modified file accounted for" beats "summarize changes."
 4. **Co-locate rules with the concept they govern.**
 5. **Use strong leading words** ("tight loop," "root cause," "regression test") over long repeated explanations.
@@ -166,15 +178,37 @@ A skill exists to make the agent's process more predictable — the agent reliab
 ## Tests and Docs (required for repo skills)
 
 1. **Tests** live at `tests/skills/test_<skill>_skill.py` — stdlib + pytest + `unittest.mock` only, no live network. Run via `scripts/run_tests.sh tests/skills/test_<skill>_skill.py -q`. (The generic `tests/tools/test_skill_manager_tool.py` passing proves nothing about YOUR skill.)
+   - **Definition tests:** verify description ≤ 60 chars, ends with period, no banned marketing words. Optionally check When to Use section presence.
+   - **Enforcement tests (Safety & Enforcement):** deny + allow + side-effect not called + audit on deny. See `references/safety-enforcement-template.md` for the full skeleton.
+   - **Structural tests (Dynamic Loading Rules):** section present when 2+ references/*.md, backticked paths resolve, no "load all" phrasing, no orphans. See `references/dynamic-loading-rules-template.md` for the full skeleton.
 2. **Docs regen:** run `python3 website/scripts/generate-skill-docs.py`, then apply scope discipline — the generator rewrites EVERY auto-gen page. `git checkout --` everything that isn't yours; the final diff must show only your SKILL.md, your one per-skill docs page, a one-line catalog row, and a one-line `website/sidebars.ts` insertion (verify with `search_files(pattern='<your-slug>', path='website/sidebars.ts')` — exactly one hit, or the page is an orphan).
 3. **`.env.example`** (only if the skill needs new env vars): one clearly delimited commented block; touch nothing else in the file.
+
+## Dynamic Loading Rules
+
+This skill ships two reference files (`references/safety-enforcement-template.md` and
+`references/dynamic-loading-rules-template.md`). Load them **only** when the
+current task involves writing or reviewing enforcement or loading rules.
+
+**Default: load no reference files** until a matching task scope.
+
+| When the task involves… | Load (skill-relative) |
+|---|---|
+| Adding or reviewing policy guards, data-exposure preconditions, or enforcement tests | `references/safety-enforcement-template.md` (not the loading rules template) |
+| Adding or reviewing file-size thresholds, progressive-disclosure rules, or structural loading tests | `references/dynamic-loading-rules-template.md` (not the safety template) |
+| Authoring a new skill with both side effects and multi-reference material | Both reference files (use `read_file` on each separately) |
+
+As a heuristic, limit per-turn loads to 3–4 files. Not a hard rule.
+
+Paths are skill-relative (`references/...`), never machine-local.
 
 ## Workflow
 
 1. **Survey peers** in the target category with `search_files(target='files')` and read 2-3 peer SKILL.md files to match tone and structure. Prefer extending an existing skill over creating a narrow sibling.
 2. **Decide tier and category** (see above). When in doubt, optional — and ask before pushing rather than defaulting.
-3. **Draft** with `write_file` to `skills/<category>/<name>/SKILL.md` (or `optional-skills/...`).
-4. **Validate locally**:
+3. **Define first.** Write `name` + `description` + When to Use / Don't use before drafting the body. Validate description length, period, and banned-word checks before proceeding to body sections.
+4. **Draft** with `write_file` to `skills/<category>/<name>/SKILL.md` (or `optional-skills/...`).
+5. **Validate locally**:
    ```python
    import yaml, re, pathlib
    content = pathlib.Path("skills/<category>/<name>/SKILL.md").read_text()
@@ -188,9 +222,9 @@ A skill exists to make the agent's process more predictable — the agent reliab
    assert len(content) <= 100_000
    ```
    Also verify every `related_skills` entry exists in-repo.
-5. **Add tests + regen docs** (previous section).
-6. **Git add + commit** on the active branch; open a PR.
-7. **Note:** the CURRENT session's skill loader is cached — `skill_view` / `skills_list` will not see the new skill until a new session. This is expected, not a bug.
+6. **Add tests + regen docs** (previous section).
+7. **Git add + commit** on the active branch; open a PR.
+8. **Note:** the CURRENT session's skill loader is cached — `skill_view` / `skills_list` will not see the new skill until a new session. This is expected, not a bug.
 
 ## Editing Existing In-Repo Skills
 
@@ -211,6 +245,11 @@ A skill exists to make the agent's process more predictable — the agent reliab
 8. **Skipping the docs generator or pushing its unrelated drift.** Both directions are wrong: no regen = orphan skill with no docs page; blind regen = a ballooned diff full of other skills' drift.
 9. **Expecting the current session to see the new skill.** The loader is initialized at session start.
 10. **Letting skills accumulate sediment.** When adding a rule, remove the old wording it replaces.
+11. **Implementation dump in description** — "runs pytest then parses JSON…" belongs in body or references, not the always-paid description.
+12. **Vague trigger** — "use when user asks about X" with no capability verb; prefer "Author…", "Track…", "Review…".
+13. **Description only works after reading the body** — the description must be self-contained for catalog selection.
+14. **Missing Don't-use** when a peer skill shares vocabulary — causes false-positive loads.
+15. **Relying on a future router/embedding layer** instead of fixing the definition — precise definitions beat routers at current scale.
 
 ## Verification Checklist
 
@@ -218,13 +257,17 @@ A skill exists to make the agent's process more predictable — the agent reliab
 - [ ] File at `skills/<category>/<name>/SKILL.md` or `optional-skills/<category>/<name>/SKILL.md`
 - [ ] Frontmatter starts at byte 0 with `---`, closes with `\n---\n`
 - [ ] `name`, `description`, `version`, `author`, `license`, `platforms`, `metadata.hermes.{tags, related_skills}` all present
-- [ ] Description ≤ 60 chars, one sentence, ends with a period, no marketing words
+- [ ] Description ≤ 60 chars, one sentence, ends with a period, no marketing words, trigger self-contained in first 57-char window
+- [ ] Description written and validated **before** body section polish (definition-first rule)
+- [ ] When to Use includes counter-triggers when peer skills share vocabulary
 - [ ] `author` credits the human contributor first
 - [ ] `platforms:` audited against actual prose/scripts, not copied from a sibling
 - [ ] Every `related_skills` entry resolves in-repo
 - [ ] Body follows the modern section order; commands framed through Hermes tools
 - [ ] No machine-local paths anywhere in the file
 - [ ] Each ordered step has a checkable completion criterion
+- [ ] Side effects / sensitive data → `## Safety & Enforcement` present with matching policy tests (deny + allow + side-effect not called + audit on deny)
+- [ ] 2+ `references/*.md` → `## Dynamic Loading Rules` present with structural tests (paths resolve, no load-all, no orphans)
 - [ ] Tests at `tests/skills/test_<skill>_skill.py` pass under `scripts/run_tests.sh`
 - [ ] Docs regenerated with scope discipline; sidebar has exactly one entry for the slug
 - [ ] `git add` + commit on the intended branch; PR opened
