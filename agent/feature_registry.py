@@ -52,12 +52,19 @@ class Feature:
     _compiled: tuple = field(default=(), repr=False, compare=False)
 
     def match(self, text: str) -> float:
-        """Return a confidence score in [0, 1] for ``text``.
+        """Return a confidence score for ``text`` — the raw signal hit count.
 
         Keywords/patterns are OR semantics: hitting ANY signal means the
-        feature is relevant. Score = min(1.0, hits) so ``min_confidence``
-        acts as a "how many signals must fire" gate (default 0.7 ≈ at least
-        one hit; raise to 1.5+ to require multiple signals).
+        feature is relevant. The score is the raw number of signals that
+        fired (not capped), so ``min_confidence`` acts as a genuine
+        "how many signals must fire" gate:
+
+          * ``0.7``  → at least 1 hit fires
+          * ``1.5``  → at least 2 hits required
+          * ``2.0``  → at least 2 hits (integer boundaries inclusive)
+
+        Capping at 1.0 would make multi-signal thresholds unreachable
+        (review #81582 issue 1) — do not cap.
         """
         hits = 0
         for kw in self.keywords:
@@ -66,7 +73,7 @@ class Feature:
         for pat in self._compiled:
             if pat.search(text):
                 hits += 1
-        return min(1.0, float(hits))
+        return float(hits)
 
 
 def compile_features(features: List[Feature]) -> List[Feature]:
@@ -121,48 +128,74 @@ def _seed_features() -> List[Feature]:
             name="Parallelize independent subtasks",
             keywords=(
                 "parallel", "batch", "同时", "并行", "批量",
-                "multi-task", "multitask", "several files", "multiple repos",
+                "multi-task", "multitask", "in parallel",
             ),
-            patterns=(r"\b(?:at once|in parallel|all of them|each of)\b",),
+            # Positive signals only; "each of" / "all of them" are dropped
+            # because they match sequential phrasing ("do each of these
+            # sequentially").  "several files"/"multiple repos" alone are
+            # also ambiguous (a single serial task can touch several files).
+            patterns=(
+                r"\b(?:run|execute|do|handle)\s+(?:these|those|all|both)\s+\d+\s+(?:files|tasks|jobs|repos)\b",
+                r"\b(?:in parallel|concurrently|simultaneously)\b",
+                r"(?:这|那|这些|那些|全部)\s*\d+\s*(?:个|份|台|条)?\s*(?:文件|任务|项目|仓库|脚本|目录)",
+            ),
             suggested_capability="delegate_task",
             benefit="Run independent subtasks in parallel (~3x wall-clock reduction on typical batches).",
-            min_confidence=0.6,
+            min_confidence=0.7,
         ),
         Feature(
             id="scheduled_recurring",
             name="Schedule recurring work",
             keywords=(
-                "every day", "daily", "weekly", "every morning", "每", "每天",
-                "recurring", "scheduled", "remind me",
+                "every day", "daily", "weekly", "every morning", "每天",
+                "每周", "recurring", "scheduled", "remind me", "每天早上",
             ),
-            patterns=(r"\b(?:daily|weekly|every\s+\w+)\b",),
+            # Bare 每 matches 每次/每个/每秒 (unrelated); use concrete
+            # time-anchored phrases only.
+            patterns=(
+                r"(?:每天|每日|每周|每个月|every\s+(?:day|morning|week|month|hour)\b)",
+                r"at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)",
+            ),
             suggested_capability="cronjob",
             benefit="Automate recurring checks/pushes without manual re-runs.",
-            min_confidence=0.6,
+            min_confidence=0.7,
         ),
         Feature(
             id="web_research",
             name="Research the web",
             keywords=(
-                "research", "search", "find out", "look up", "查", "搜索",
-                "investigate", "sources", "citations",
+                "research", "web search", "find out", "look up", "搜索",
+                "investigate", "sources", "citations", "上网查", "查一下",
             ),
-            patterns=(r"\b(?:latest|current|today)\b",),
+            # "search" alone is too broad (search the codebase, search the
+            # directory) — require web-ish phrasing.  latest/current/today
+            # also match local tasks ("current directory") so they are only
+            # combined with the web-ish keywords via the pattern below.
+            patterns=(
+                r"\b(?:search|look up|find)\s+(?:the\s+)?(?:web|internet|online|latest|current news|today'?s)\b",
+                r"\b(?:what|who|how|is|are)\s+.*\b(?:latest|recent|today|current)\b",
+            ),
             suggested_capability="web_search",
             benefit="Ground answers in live web sources with citations.",
-            min_confidence=0.5,
+            min_confidence=0.7,
         ),
         Feature(
             id="remember_fact",
             name="Persist a durable fact",
             keywords=(
-                "remember", "don't forget", "always", "prefer", "记住",
-                "我的偏好", "以后", "from now on",
+                "remember", "don't forget", "记住", "我的偏好", "以后",
+                "from now on", "always remember",
             ),
-            patterns=(r"\b(?:i prefer|i like|remember that)\b",),
+            # bare "always"/"prefer" match "the function always returns None"
+            # or "I'd prefer you didn't" — require explicit memory intent.
+            patterns=(
+                r"\b(?:remember that|remember to|remember:)\b",
+                r"\b(?:i|我)\s+(?:prefer|like|喜欢|偏好)\s+.*\b(?:always|以后|from now on)\b",
+                r"\b(?:please|帮我)\s+(?:remember|记住)\b",
+            ),
             suggested_capability="memory",
             benefit="Make the preference persist across sessions.",
-            min_confidence=0.55,
+            min_confidence=0.7,
         ),
         Feature(
             id="release_brief",
@@ -171,10 +204,10 @@ def _seed_features() -> List[Feature]:
                 "what's new", "whats new", "new features", "changelog",
                 "更新了什么", "新功能", "release notes",
             ),
-            patterns=(r"\b(?:version|release)\b",),
+            patterns=(r"\b(?:what's\s+new|new\s+features|changelog|release\s+notes)\b",),
             suggested_capability="/whats-new",
             benefit="See the current release's new features and how to use them.",
-            min_confidence=0.5,
+            min_confidence=0.7,
             auto_apply_safe=True,  # read-only informational command
         ),
     ]

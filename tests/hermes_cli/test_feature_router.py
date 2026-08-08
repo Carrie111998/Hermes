@@ -62,6 +62,14 @@ def test_registry_matches(text, feature_id):
         "hello",
         "今天天气怎么样",
         "git rebase 是什么意思",
+        # Review #81582 issue 2 examples — these must NOT trigger.
+        "do each of these sequentially",           # parallel_subtasks false positive
+        "the function always returns None",        # remember_fact false positive
+        "I'd prefer you didn't do that",           # remember_fact false positive
+        "search the codebase for the bug",         # web_research false positive
+        "the current directory is /tmp",           # web_research false positive
+        "每次提交前都要检查",                        # scheduled_recurring false positive (bare 每)
+        "每个用户都要登录",                          # scheduled_recurring false positive
     ],
 )
 def test_registry_no_false_positive(text):
@@ -74,6 +82,16 @@ def test_high_threshold_requires_multiple_signals():
     # A single keyword hit is below an explicit 1.5 threshold.
     f = reg.suggest("并行处理", min_confidence=1.5)
     assert f is None
+
+
+def test_multi_signal_threshold_actually_fires():
+    """Regression (review #81582 issue 1): with the cap removed, 2+ hits at
+    min_confidence=1.5 must trigger — the old min(1.0, hits) made it impossible."""
+    reg = FeatureRegistry()
+    # "帮我并行处理这3个文件" hits 并行 + the run-N-files pattern = 2 signals.
+    f = reg.suggest("帮我并行处理这3个文件", min_confidence=1.5)
+    assert f is not None
+    assert f.id == "parallel_subtasks"
 
 
 def test_unknown_capability_dropped_at_init():
