@@ -197,7 +197,18 @@ def _import_piper():
     Open Home Foundation). ``pip install piper-tts`` provides cross-platform
     wheels (Linux / macOS / Windows, x86_64 + ARM64) with embedded espeak-ng.
     Voice models (.onnx + .onnx.json) are downloaded on first use.
+
+    Calls :func:`tools.lazy_deps.ensure` first so ``piper-tts`` gets installed
+    on demand — matching the lazy-install pattern used by Edge TTS, ElevenLabs,
+    and Mistral TTS providers.
     """
+    try:
+        from tools.lazy_deps import FeatureUnavailable, ensure
+        ensure("tts.piper", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
     from piper import PiperVoice
     return PiperVoice
 
@@ -2736,7 +2747,9 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
         Path to the saved audio file.
     """
     KittenTTS = _import_kittentts()
-    kt_config = tts_config.get("kittentts", {})
+    # Null-safe subsection read (issue #47318): `tts.kittentts: null` in
+    # config.yaml yields None, not {} — coalesce so .get() doesn't crash.
+    kt_config = tts_config.get("kittentts") or {}
     model_name = kt_config.get("model", DEFAULT_KITTENTTS_MODEL)
     voice = kt_config.get("voice", DEFAULT_KITTENTTS_VOICE)
     speed = kt_config.get("speed", 1.0)
