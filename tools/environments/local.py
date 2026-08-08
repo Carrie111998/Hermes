@@ -719,6 +719,29 @@ def build_subprocess_env(
     return env
 
 
+def _is_windows_system_bash(path: str) -> bool:
+    """Return True for Windows' legacy WSL ``bash.exe`` launcher."""
+    if not path or ntpath.basename(path).lower() != "bash.exe":
+        return False
+
+    normalized = ntpath.normcase(ntpath.normpath(path))
+    system_roots = {
+        root
+        for root in (
+            os.environ.get("SystemRoot"),
+            os.environ.get("WINDIR"),
+            r"C:\Windows",
+        )
+        if root
+    }
+    for root in system_roots:
+        for system_dir in ("System32", "SysWOW64", "Sysnative"):
+            candidate = ntpath.join(root, system_dir, "bash.exe")
+            if normalized == ntpath.normcase(ntpath.normpath(candidate)):
+                return True
+    return False
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:
@@ -767,6 +790,9 @@ def _find_bash() -> str:
             candidates.append(candidate)
 
     found = shutil.which("bash")
+    if found and _is_windows_system_bash(found):
+        logger.debug("Ignoring Windows WSL bash launcher at %s", found)
+        found = None
     if found and found not in candidates:
         candidates.append(found)
 
