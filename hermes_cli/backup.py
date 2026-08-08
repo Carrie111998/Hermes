@@ -477,6 +477,35 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     file degrades to a skipped-with-warning outcome instead of stalling the
     whole backup indefinitely. A non-positive deadline disables bounding
     (retries indefinitely, the pre-fix behavior) for anyone who wants it.
+
+    Thin wrapper over :func:`_safe_copy_db_ex` that keeps this function's
+    long-standing plain-``bool`` contract for existing callers (e.g.
+    :func:`copy_db_and_verify`) that don't need to distinguish *why* a copy
+    failed.
+    """
+    return _safe_copy_db_ex(src, dst)[0]
+
+
+def _safe_copy_db_ex(src: Path, dst: Path) -> "tuple[bool, bool]":
+    """Like :func:`_safe_copy_db` but also reports *why* a copy failed.
+
+    Returns ``(success, was_busy_timeout)``. ``was_busy_timeout`` is True
+    only when the copy failed because the source stayed SQLITE_BUSY/LOCKED
+    past the bounded deadline (see ``_SAFE_COPY_BUSY_DEADLINE_SECONDS``
+    above) -- i.e. the source file itself is fine, just transiently locked
+    by another process. Observed in the wild against Chrome's own small
+    housekeeping databases (``first_party_sets.db``,
+    ``declarative_performance_observer.db``) under a live ``chrome-debug/``
+    profile: with the busy-retry now bounded (instead of hanging
+    indefinitely), an abort past the deadline was still being classified as
+    a hard failure identically to genuine corruption, which flipped
+    ``hermes backup``'s summary to "Backup incomplete" again -- just via a
+    different file than the original ENOENT-based report. Callers that
+    distinguish "benign, skip with a warning" from "genuine failure"
+    (corrupt file, permissions, disk error) should treat a busy-timeout the
+    same as a vanished-file skip, not as a hard error. See
+    docs/rca-chrome-debug-transient-files-backup.md and
+    docs/rca-backup-sqlite-busy-retry-unbounded.md.
     """
     conn = None
     backup_conn = None
@@ -513,14 +542,21 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
             conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
             backup_conn = sqlite3.connect(str(dst))
             conn.backup(backup_conn)
-        return True
+        return True, False
+    except _SafeCopyBusyTimeout as exc:
+        logger.warning("SQLite safe copy skipped for %s (busy/locked): %s", src, exc)
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
         try:
             dst.unlink(missing_ok=True)
         except OSError:
             pass
-        return False
+        return False, False
     finally:
         for connection in (backup_conn, conn):
             if connection is not None:
@@ -880,7 +916,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                         suffix=".db", delete=False, dir=str(out_path.parent)
                     ) as tmp:
                         tmp_db = Path(tmp.name)
-                    if _safe_copy_db(abs_path, tmp_db):
+                    copy_ok, was_busy_timeout = _safe_copy_db_ex(abs_path, tmp_db)
+                    if copy_ok:
                         zf.write(tmp_db, arcname=str(rel_path))
                         total_bytes += tmp_db.stat().st_size
                         tmp_db.unlink(missing_ok=True)
@@ -893,7 +930,23 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                         # if the source is gone right after the failed copy,
                         # it almost certainly vanished mid-copy rather than
                         # being genuinely corrupt.
-                        if abs_path.exists():
+                        #
+                        # A busy-timeout abort (was_busy_timeout=True) is the
+                        # same "benign, not a real failure" story: the file
+                        # is present and healthy, just transiently locked by
+                        # another process (observed against Chrome's own
+                        # first_party_sets.db / declarative_performance_
+                        # observer.db under chrome-debug/). Treat it like a
+                        # vanished-file skip, not a hard error -- otherwise
+                        # the now-bounded busy-retry (previously an
+                        # indefinite hang) just trades one "Backup
+                        # incomplete" cause for another. See
+                        # docs/rca-backup-sqlite-busy-retry-unbounded.md.
+                        if was_busy_timeout:
+                            transient_skipped.append(
+                                f"  {rel_path}: temporarily locked by another process, skipped"
+                            )
+                        elif abs_path.exists():
                             errors.append(f"  {rel_path}: SQLite safe copy failed")
                         else:
                             transient_skipped.append(
@@ -1908,7 +1961,8 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                         ) as tmp:
                             tmp_db = Path(tmp.name)
                         try:
-                            if not _safe_copy_db(abs_path, tmp_db):
+                            copy_ok, was_busy_timeout = _safe_copy_db_ex(abs_path, tmp_db)
+                            if not copy_ok:
                                 # A source file that has vanished since the scan
                                 # phase (most commonly a chrome-debug/*.db file
                                 # rewritten by a live Chrome process racing this
@@ -1918,6 +1972,25 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                                 # failure: only abort the whole archive when the
                                 # file still exists but genuinely couldn't be
                                 # snapshotted (locked, corrupt, permissions).
+                                #
+                                # A busy-timeout abort (was_busy_timeout=True)
+                                # is the same "benign" story: the file is
+                                # present and healthy, just transiently locked
+                                # by another process (observed against
+                                # Chrome's own first_party_sets.db under
+                                # chrome-debug/ once the busy-retry was bounded
+                                # instead of hanging indefinitely -- see
+                                # docs/rca-backup-sqlite-busy-retry-unbounded.md).
+                                # Skip just this file instead of aborting the
+                                # entire archive.
+                                if was_busy_timeout:
+                                    logger.warning(
+                                        "Full-zip backup: %s temporarily locked by "
+                                        "another process, skipping (transient)",
+                                        rel_path,
+                                    )
+                                    transient_skipped += 1
+                                    continue
                                 if not abs_path.exists():
                                     logger.warning(
                                         "Full-zip backup: %s vanished before it "

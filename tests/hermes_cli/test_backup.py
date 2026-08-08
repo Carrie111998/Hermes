@@ -274,9 +274,9 @@ class TestChromeDebugTransientRace:
 
         def vanish_then_fail(src, dst):
             Path(src).unlink(missing_ok=True)
-            return False
+            return False, False
 
-        monkeypatch.setattr(backup_mod, "_safe_copy_db", vanish_then_fail)
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", vanish_then_fail)
 
         out_zip = tmp_path / "backup.zip"
         backup_mod.run_backup(Namespace(output=str(out_zip)))
@@ -371,9 +371,9 @@ class TestChromeDebugTransientRace:
 
         def vanish_then_fail(src, dst):
             Path(src).unlink(missing_ok=True)
-            return False
+            return False, False
 
-        monkeypatch.setattr(backup_mod, "_safe_copy_db", vanish_then_fail)
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", vanish_then_fail)
 
         out_zip = tmp_path / "automatic.zip"
         result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
@@ -1104,6 +1104,126 @@ class TestSafeCopyDbBusyBounding:
 
         assert result is True
         assert elapsed >= 1.2, "disabled bounding should still wait out the lock"
+
+    def test_safe_copy_db_ex_reports_busy_timeout(self, tmp_path, monkeypatch):
+        """``_safe_copy_db_ex`` must flag a busy-deadline abort distinctly
+        from other failures, so callers can treat it as benign (skip with a
+        warning) instead of a hard error. Regression guard for the "Backup
+        incomplete" summary reappearing via a different file (Chrome's own
+        first_party_sets.db / declarative_performance_observer.db) once the
+        busy-retry itself was bounded instead of hanging indefinitely."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db_ex
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0.5")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 3.0, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        success, was_busy_timeout = _safe_copy_db_ex(src, dst)
+        holder.join(timeout=10)
+
+        assert success is False
+        assert was_busy_timeout is True
+        assert not dst.exists()
+
+    def test_safe_copy_db_ex_genuine_corruption_not_flagged_as_busy(self, tmp_path):
+        """A source that's simply not a valid SQLite file (genuine failure,
+        not a lock) must NOT be misreported as a busy-timeout -- that would
+        wrongly downgrade a real corruption/failure into a silently-skipped
+        warning."""
+        from hermes_cli.backup import _safe_copy_db_ex
+
+        src = tmp_path / "corrupt.db"
+        src.write_bytes(b"not-actually-sqlite")
+        dst = tmp_path / "copy.db"
+
+        success, was_busy_timeout = _safe_copy_db_ex(src, dst)
+
+        assert success is False
+        assert was_busy_timeout is False
+
+    def test_backup_treats_busy_timeout_as_transient_not_incomplete(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """End-to-end: when ``_safe_copy_db_ex`` reports a busy-timeout for
+        a .db file, ``hermes backup`` must print "Backup complete" (with
+        the restore hint) and list the file under the harmless transient
+        note, not under "Warnings" / "Backup incomplete". This is the exact
+        symptom from the bug report reappearing via a different file once
+        the busy-retry itself got bounded."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "chrome-debug" / "first_party_sets.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def busy_timeout(src, dst):
+            return False, True
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", busy_timeout)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "Restore with:" in out
+        assert "Warnings" not in out
+        assert "first_party_sets.db" in out
+        assert "temporarily locked" in out
+
+    def test_automatic_backup_treats_busy_timeout_as_transient_not_aborted(
+        self, tmp_path, monkeypatch
+    ):
+        """Same busy-timeout scenario in the automatic backup path
+        (``_write_full_zip_backup``, used by ``hermes update`` / ``claw
+        migrate``): must skip just that file, not abort the entire
+        archive."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "chrome-debug" / "first_party_sets.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def busy_timeout(src, dst):
+            return False, True
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db_ex", busy_timeout)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug/first_party_sets.db" not in zf.namelist()
+            assert "config.yaml" in zf.namelist()
 
 
 # ---------------------------------------------------------------------------
