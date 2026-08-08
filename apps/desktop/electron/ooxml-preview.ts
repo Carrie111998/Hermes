@@ -15,6 +15,14 @@ const MAX_SLIDES = 300
 const MAX_SHEETS = 50
 const MAX_ROWS_PER_SHEET = 2000
 
+// Extraction reads the whole archive into memory before any other cap
+// applies (the ZIP central directory can be anywhere in the file, so there's
+// no way to stream just the parts we need without a full ZIP implementation).
+// Bound that up front by file size so a large archive falls back to the
+// existing bounded (512 KiB) binary-guard read instead of being buffered
+// whole in the Electron main process.
+export const MAX_OOXML_SOURCE_BYTES = 20 * 1024 * 1024
+
 const EOCD_SIGNATURE = 0x06054b50
 const CENTRAL_DIR_SIGNATURE = 0x02014b50
 const LOCAL_HEADER_SIGNATURE = 0x04034b50
@@ -279,8 +287,18 @@ export function extractOoxmlPreviewTextFromBuffer(buffer: Buffer, ext: string): 
  * with a modern extension, encrypted document, unsupported layout) so the
  * caller falls back to the existing binary-file preview guard.
  */
-export async function extractOoxmlPreviewText(filePath: string, ext: string): Promise<string | null> {
+export async function extractOoxmlPreviewText(
+  filePath: string,
+  ext: string,
+  sourceByteSize?: number
+): Promise<string | null> {
   try {
+    const size = sourceByteSize ?? (await fs.promises.stat(filePath)).size
+
+    if (size > MAX_OOXML_SOURCE_BYTES) {
+      return null
+    }
+
     const buffer = await fs.promises.readFile(filePath)
 
     return extractOoxmlPreviewTextFromBuffer(buffer, ext)

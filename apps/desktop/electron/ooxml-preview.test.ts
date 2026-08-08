@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import zlib from 'node:zlib'
 
 import { test } from 'vitest'
 
-import { extractOoxmlPreviewTextFromBuffer } from './ooxml-preview'
+import { extractOoxmlPreviewText, extractOoxmlPreviewTextFromBuffer } from './ooxml-preview'
+
+// Matches MAX_OOXML_SOURCE_BYTES in ooxml-preview.ts — kept as a literal so
+// this test still exercises the cap if that module fails to export it.
+const OVER_SOURCE_CAP_BYTES = 20 * 1024 * 1024 + 1
 
 // Minimal ZIP writer (store + deflate) — just enough to exercise the reader
 // in ooxml-preview.ts against a real archive, without a third-party ZIP lib.
@@ -140,4 +147,25 @@ test('returns null (not a throw) for a docx missing document.xml', () => {
 
 test('throws on a buffer that is not a ZIP archive at all', () => {
   assert.throws(() => extractOoxmlPreviewTextFromBuffer(Buffer.from('not a zip file'), '.docx'))
+})
+
+test('skips reading the file once the known source size exceeds the cap', async () => {
+  const zip = buildZip({ 'word/document.xml': DOCX_DOCUMENT_XML })
+  const tmpFile = path.join(os.tmpdir(), `ooxml-preview-source-cap-${process.pid}.docx`)
+  fs.writeFileSync(tmpFile, zip)
+
+  try {
+    const withinCap = await extractOoxmlPreviewText(tmpFile, '.docx', zip.length)
+
+    assert.equal(withinCap, 'Hello world\nSecond paragraph & more')
+
+    // The file on disk is tiny — only the *declared* size claims it's huge.
+    // A correct implementation must reject on that declared size alone,
+    // without ever reading (let alone successfully extracting from) the file.
+    const overCap = await extractOoxmlPreviewText(tmpFile, '.docx', OVER_SOURCE_CAP_BYTES)
+
+    assert.equal(overCap, null)
+  } finally {
+    fs.rmSync(tmpFile, { force: true })
+  }
 })

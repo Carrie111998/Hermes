@@ -10470,7 +10470,7 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
   const ext = path.extname(resolvedPath).toLowerCase()
 
   if (OOXML_PREVIEW_EXTENSIONS.has(ext)) {
-    const officeText = await extractOoxmlPreviewText(resolvedPath, ext)
+    const officeText = await extractOoxmlPreviewText(resolvedPath, ext, stat.size)
 
     if (officeText != null) {
       const truncated = officeText.length > TEXT_PREVIEW_MAX_BYTES
