@@ -2555,6 +2555,84 @@ def resolve_channel_prompt(
     return None
 
 
+def _normalize_governance_name(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _auto_binding_governance_protected() -> bool:
+    """Return True when channel/topic auto-bindings must fail closed."""
+    try:
+        from agent.skill_utils import yaml_load
+        from hermes_constants import get_config_path
+
+        config_path = get_config_path()
+        if not config_path.exists():
+            return False
+        raw = yaml_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return False
+        skills_cfg = raw.get("skills") if isinstance(raw.get("skills"), dict) else {}
+        gov_cfg = (
+            skills_cfg.get("governance")
+            if isinstance(skills_cfg.get("governance"), dict)
+            else {}
+        )
+        task_class = _normalize_governance_name(gov_cfg.get("task_class") or "")
+        if not task_class:
+            return False
+        protected = gov_cfg.get("protected_task_classes") or []
+        if isinstance(protected, str):
+            protected = [protected]
+        protected_names = {
+            name
+            for name in (_normalize_governance_name(item) for item in protected)
+            if name
+        }
+        return task_class in protected_names
+    except Exception:
+        logger.debug("Failed to inspect governance config for auto-bindings", exc_info=True)
+        return False
+
+
+def _filter_auto_bound_skills(skill_names: list[str]) -> list[str]:
+    """Apply governance filtering to automatic channel/topic skill bindings."""
+    if not skill_names:
+        return []
+
+    protected_task = _auto_binding_governance_protected()
+    try:
+        from agent.skill_governance import evaluate_skill_selection_fail_closed
+    except Exception:
+        if protected_task:
+            logger.warning(
+                "Auto-bound skill governance unavailable for protected task class; denying %s",
+                skill_names,
+            )
+            return []
+        return skill_names
+
+    allowed: list[str] = []
+    for skill_name in skill_names:
+        try:
+            decision = evaluate_skill_selection_fail_closed(
+                skill_name,
+                mode="auto",
+            )
+        except Exception:
+            if protected_task:
+                logger.warning(
+                    "Auto-bound skill governance evaluation failed for protected task class; denying %s",
+                    skill_name,
+                    exc_info=True,
+                )
+                continue
+            allowed.append(skill_name)
+            continue
+        if decision is None or decision.allowed:
+            allowed.append(skill_name)
+    return allowed
+
+
 def resolve_channel_skills(
     config_extra: dict,
     channel_id: str,
@@ -2579,14 +2657,6 @@ def resolve_channel_skills(
     Returns a deduplicated list of skill names (order preserved), or None if
     no match is found.
     """
-    try:
-        from agent.skill_governance import filter_allowed_skill_names, governance_context
-
-        _governance_context = governance_context(mode="auto")
-    except Exception:
-        filter_allowed_skill_names = None
-        _governance_context = None
-
     bindings = config_extra.get("channel_skill_bindings") or []
     if not isinstance(bindings, list) or not bindings:
         return None
@@ -2605,16 +2675,7 @@ def resolve_channel_skills(
             skills = entry.get("skills") or entry.get("skill")
             if isinstance(skills, str):
                 s = skills.strip()
-                resolved = [s] if s else None
-                if (
-                    resolved
-                    and filter_allowed_skill_names is not None
-                    and _governance_context is not None
-                ):
-                    resolved, _decisions = filter_allowed_skill_names(
-                        resolved,
-                        context=_governance_context,
-                    )
+                resolved = _filter_auto_bound_skills([s]) if s else None
                 return resolved or None
             if isinstance(skills, list) and skills:
                 seen: list[str] = []
@@ -2624,15 +2685,8 @@ def resolve_channel_skills(
                     nm = name.strip()
                     if nm and nm not in seen:
                         seen.append(nm)
-                if (
-                    seen
-                    and filter_allowed_skill_names is not None
-                    and _governance_context is not None
-                ):
-                    seen, _decisions = filter_allowed_skill_names(
-                        seen,
-                        context=_governance_context,
-                    )
+                if seen:
+                    seen = _filter_auto_bound_skills(seen)
                 return seen or None
     return None
 
