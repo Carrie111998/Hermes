@@ -738,7 +738,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if not skill_matches_environment(frontmatter):
                     continue
 
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                # Use the directory name as the canonical skill identifier
+                # rather than the SKILL.md `name:` frontmatter field (#81839):
+                # the directory name is the on-disk source of truth that
+                # disable lists, file paths, and shell completion all index
+                # by, so an accidental mismatch in the frontmatter
+                # (whitespace, case, typo, deliberate rebrand) would
+                # otherwise silently bypass disable checks and confuse
+                # path resolution. The frontmatter `name:` is still surfaced
+                # in the listing response as a display label below.
+                name = skill_dir.name[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
                 if name in disabled:
