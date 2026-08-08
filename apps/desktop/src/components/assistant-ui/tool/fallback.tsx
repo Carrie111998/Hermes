@@ -211,6 +211,10 @@ function statusGlyph(status: ToolStatus, copy: ToolStatusCopy): ReactNode {
 // Leading glyph for any tool-row header. Status (running/error/warning)
 // takes precedence; otherwise falls back to the tool's codicon. Returns
 // null when neither applies so callers can render unconditionally.
+// Which legendary chrome (if any) a landed memory write gets: base memory is
+// gold→purple, Palimpsest is cyan→violet ink. Undefined = no chrome.
+type LegendaryVariant = 'memory' | 'palimpsest'
+
 function ToolGlyph({
   copy,
   filePath,
@@ -221,8 +225,9 @@ function ToolGlyph({
   copy: ToolStatusCopy
   filePath?: string
   icon?: string
-  /** Landed memory write — keep the brain glyph, tint it gold→purple. */
-  legendary?: boolean
+  /** Landed memory write — keep the glyph, tint it gold→purple (memory) or
+   *  cyan→violet ink (palimpsest). */
+  legendary?: LegendaryVariant
   status?: ToolStatus
 }) {
   const node = status ? (
@@ -231,14 +236,25 @@ function ToolGlyph({
     <FileTypeIcon className="text-(--ui-text-tertiary)" path={filePath} size="0.875rem" />
   ) : icon ? (
     <ToolIcon
-      className={legendary ? 'text-(--tool-memory-legendary-icon)' : 'text-(--ui-text-tertiary)'}
+      className={
+        legendary
+          ? `text-(--tool-${legendary}-legendary-icon)`
+          : 'text-(--ui-text-tertiary)'
+      }
       name={icon}
       size="0.875rem"
     />
   ) : null
 
   return node ? (
-    <span className={cn(TOOL_HEADER_GLYPH_WRAP_CLASS, legendary && 'tool-memory-legendary-glyph')}>{node}</span>
+    <span
+      className={cn(
+        TOOL_HEADER_GLYPH_WRAP_CLASS,
+        legendary && `tool-${legendary}-legendary-glyph`
+      )}
+    >
+      {node}
+    </span>
   ) : null
 }
 
@@ -291,7 +307,7 @@ function ToolTitle({
   titleAction
 }: {
   isPending: boolean
-  legendary?: boolean
+  legendary?: LegendaryVariant
   status: ToolStatus
   title: string
   titleAction?: ToolTitleAction
@@ -303,7 +319,7 @@ function ToolTitle({
         isPending && 'text-(--conversation-scaffold-meta)',
         status === 'error' && 'text-destructive',
         status === 'warning' && 'text-amber-700 dark:text-amber-300',
-        legendary && !isPending && 'tool-memory-legendary-title text-transparent'
+        legendary && !isPending && `tool-${legendary}-legendary-title text-transparent`
       )}
     >
       {isPending && titleAction ? (
@@ -479,9 +495,18 @@ function ToolEntry({ part }: ToolEntryProps) {
 
   const showDiffStats = !isPending && Boolean(diffStats && (diffStats.added > 0 || diffStats.removed > 0))
 
-  // Landed memory write gets gold→purple chrome instead of the plain scaffold grey.
-  const memoryLegendary = !isPending && part.toolName === 'memory' && view.status === 'success'
-  const memoryMetaClass = memoryLegendary ? 'tool-memory-legendary-meta' : undefined
+  // Landed memory write gets gold→purple chrome instead of the plain scaffold
+  // grey; a landed Palimpsest write gets its own cyan→violet ink chrome.
+  const memoryLegendary: LegendaryVariant | undefined =
+    !isPending && part.toolName === 'memory' && view.status === 'success'
+      ? 'memory'
+      : undefined
+
+  const palimpsestLegendary: LegendaryVariant | undefined =
+    !isPending && view.palimpsestLegendary === true ? 'palimpsest' : undefined
+
+  const legendary = memoryLegendary ?? palimpsestLegendary
+  const legendaryMetaClass = legendary ? `tool-${legendary}-legendary-meta` : undefined
 
   // The header trailing slot only carries the live duration timer while the
   // tool is running. The copy control used to live here too, but an
@@ -559,18 +584,18 @@ function ToolEntry({ part }: ToolEntryProps) {
               copy={copy}
               filePath={isFileEdit ? view.subtitle : undefined}
               icon={view.icon}
-              legendary={memoryLegendary}
+              legendary={legendary}
               status={leadingStatus(isPending, view.status)}
             />
             <ToolTitle
               isPending={isPending}
-              legendary={memoryLegendary}
+              legendary={legendary}
               status={view.status}
               title={view.title}
               titleAction={view.titleAction}
             />
             {!isPending && view.countLabel && (
-              <span className={cn(SCAFFOLD_META_CLASS, memoryMetaClass)}>{view.countLabel}</span>
+              <span className={cn(SCAFFOLD_META_CLASS, legendaryMetaClass)}>{view.countLabel}</span>
             )}
             {showDiffStats && diffStats && (
               <span className="flex shrink-0 items-center gap-1 font-mono text-[0.625rem] tabular-nums">
@@ -583,7 +608,7 @@ function ToolEntry({ part }: ToolEntryProps) {
               </span>
             )}
             {!isFileEdit && !isPending && view.durationLabel && (
-              <span className={cn(SCAFFOLD_META_CLASS, memoryMetaClass)}>{view.durationLabel}</span>
+              <span className={cn(SCAFFOLD_META_CLASS, legendaryMetaClass)}>{view.durationLabel}</span>
             )}
           </span>
         </DisclosureRow>

@@ -2854,6 +2854,16 @@ export const en: Translations = {
         image_generate: { done: 'Generated image', pending: 'Generating image', pendingAction: 'Generating' },
         list_files: { done: 'Listed files', pending: 'Listing files', pendingAction: 'Listing' },
         memory: { done: 'Saved to memory', pending: 'Saving to memory', pendingAction: 'Saving' },
+        palimpsest_remember: {
+          done: 'Saved to Palimpsest',
+          pending: 'Saving to Palimpsest',
+          pendingAction: 'Saving'
+        },
+        palimpsest_recall: {
+          done: 'Recalled from Palimpsest',
+          pending: 'Recalling from Palimpsest',
+          pendingAction: 'Recalling'
+        },
         patch: { done: 'Patched file', pending: 'Patching file', pendingAction: 'Patching' },
         read_file: { done: 'Read file', pending: 'Reading file', pendingAction: 'Reading' },
         search_files: { done: 'Searched files', pending: 'Searching files', pendingAction: 'Searching' },

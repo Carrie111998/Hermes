@@ -189,6 +189,14 @@ const TOOL_META: Record<ToolTitleKey, ToolMetaSpec> = {
     icon: 'brain',
     tone: 'agent'
   },
+  palimpsest_remember: {
+    icon: 'layers',
+    tone: 'agent'
+  },
+  palimpsest_recall: {
+    icon: 'search',
+    tone: 'agent'
+  },
   patch: { icon: 'edit', tone: 'file' },
   read_file: { icon: 'file', tone: 'file' },
   search_files: {
@@ -1044,11 +1052,32 @@ function toolSubtitle(
     return url ? hostnameOf(url) : 'Fetched webpage'
   }
 
-  if (toolName === 'memory') {
+  if (toolName === 'memory' || toolName === 'palimpsest_remember') {
     // The raw payload is bookkeeping the user never needs: usage counters, a
     // note telling the model not to retry, and the full operations array. The
     // human-readable line is the only part worth showing.
-    return firstStringField(resultRecord, ['message', 'error'])
+    const message = firstStringField(resultRecord, ['message', 'error'])
+
+    if (message) {
+      return message
+    }
+
+    // Palimpsest receipts carry episode/fact ids instead of a message —
+    // show the same short ids the desktop pane prints after a save.
+    if (toolName === 'palimpsest_remember') {
+      const episode = firstStringField(resultRecord, ['episode_id'])
+      const fact = firstStringField(resultRecord, ['fact_id'])
+      const parts = [
+        episode ? `episode ${episode.slice(0, 8)}…` : '',
+        fact ? `fact ${fact.slice(0, 8)}…` : ''
+      ].filter(Boolean)
+
+      if (parts.length) {
+        return parts.join(' · ')
+      }
+    }
+
+    return ''
   }
 
   if (toolName === 'cronjob') {
@@ -1140,10 +1169,29 @@ function toolDetailText(
     }
   }
 
-  if (part.toolName === 'memory') {
+  if (part.toolName === 'memory' || part.toolName === 'palimpsest_remember') {
     // Same reasoning as toolSubtitle: without this the generic fallback dumps
     // the whole args + result payload into the expanded row.
-    return firstStringField(resultRecord, ['message', 'error'])
+    const message = firstStringField(resultRecord, ['message', 'error'])
+
+    if (message) {
+      return message
+    }
+
+    if (part.toolName === 'palimpsest_remember') {
+      const episode = firstStringField(resultRecord, ['episode_id'])
+      const fact = firstStringField(resultRecord, ['fact_id'])
+      const parts = [
+        episode ? `episode ${episode.slice(0, 8)}…` : '',
+        fact ? `fact ${fact.slice(0, 8)}…` : ''
+      ].filter(Boolean)
+
+      if (parts.length) {
+        return parts.join(' · ')
+      }
+    }
+
+    return ''
   }
 
   if (isFileEditTool(part.toolName)) {
@@ -1416,6 +1464,10 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
   const error = status === 'success' ? '' : toolErrorText(part, resultRecord)
   // Over-budget memory refusals stay amber — don't claim "Saved".
   const memoryMissed = part.toolName === 'memory' && part.result !== undefined && status !== 'success'
+  // Landed memory write gets gold→purple chrome; a landed Palimpsest write
+  // gets its own cyan→violet ink chrome (see fallback.tsx).
+  const palimpsestLegendary =
+    part.toolName === 'palimpsest_remember' && status === 'success' && part.result !== undefined
 
   const baseTitle =
     part.result === undefined
@@ -1482,6 +1534,7 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
     icon: meta.icon,
     imageUrl: toolImageUrl(argsRecord, resultRecord),
     inlineDiff,
+    palimpsestLegendary: palimpsestLegendary || undefined,
     previewTarget: toolPreviewTarget(part.toolName, argsRecord, resultRecord),
     rendersAnsi: rendersAnsi || undefined,
     searchQuery: searchQuery || undefined,

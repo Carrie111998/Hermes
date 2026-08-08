@@ -450,3 +450,47 @@ describe('buildToolView memory status', () => {
     expect(view.subtitle).toContain('Memory is full')
   })
 })
+
+describe('buildToolView palimpsest_remember', () => {
+  const remember = (overrides: Partial<Parameters<typeof part>[0]> = {}) =>
+    buildToolView(part({ toolName: 'palimpsest_remember', ...overrides }), '')
+
+  it('flags a landed write as palimpsest-legendary', () => {
+    const view = remember({
+      result: {
+        episode_id: '019fdf79-9179-7da0-8966-49dca635d804',
+        fact_id: '019fdf79-919c-7613-81c6-fc79c33e3637',
+        status: 'saved'
+      }
+    })
+
+    expect(view.status).toBe('success')
+    expect(view.title).toBe('Saved to Palimpsest')
+    expect(view.palimpsestLegendary).toBe(true)
+    expect(view.subtitle).toContain('episode 019fdf79…')
+    expect(view.subtitle).toContain('fact 019fdf79…')
+  })
+
+  it('does not flag pending or failed saves', () => {
+    expect(remember({ result: undefined }).palimpsestLegendary).toBeUndefined()
+
+    expect(
+      remember({
+        result: { error: 'palimpsest error: unreachable', status: 'error' }
+      }).palimpsestLegendary
+    ).toBeUndefined()
+  })
+
+  it('shows recall copy for palimpsest_recall', () => {
+    const view = buildToolView(
+      part({
+        toolName: 'palimpsest_recall',
+        result: { items: [] }
+      }),
+      ''
+    )
+
+    expect(view.title).toBe('Recalled from Palimpsest')
+    expect(view.icon).toBe('search')
+  })
+})

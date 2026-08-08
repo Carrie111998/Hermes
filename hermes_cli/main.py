@@ -480,6 +480,7 @@ from hermes_cli.subcommands.insights import build_insights_parser
 from hermes_cli.subcommands.monitoring import build_monitoring_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
+from hermes_cli.subcommands.remote import build_remote_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
@@ -11210,6 +11211,12 @@ def cmd_pairing(args):
     pairing_command(args)
 
 
+def cmd_remote(args):
+    from hermes_cli.remote_commands import remote_command
+
+    remote_command(args)
+
+
 def cmd_plugins(args):
     from hermes_cli.plugins_cmd import plugins_command
 
@@ -11657,6 +11664,11 @@ def main():
     # pairing command  (parser built in hermes_cli/subcommands/pairing.py)
     # =========================================================================
     build_pairing_parser(subparsers, cmd_pairing=cmd_pairing)
+
+    # =========================================================================
+    # remote command  (parser built in hermes_cli/subcommands/remote.py)
+    # =========================================================================
+    build_remote_parser(subparsers, cmd_remote=cmd_remote)
 
     # =========================================================================
     # skills command  (parser built in hermes_cli/subcommands/skills.py)
