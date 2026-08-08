@@ -4,10 +4,15 @@ import json
 import pytest
 from pathlib import Path
 
+from hermes_cli.write_approval_commands import handle_pending_subcommand
+from hermes_constants import get_hermes_home
+from tools import write_approval as wa
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    _detect_policy_claim,
+    MEMORY_SCHEMA,
 )
 
 
@@ -627,3 +632,403 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# Policy claim detection
+# =========================================================================
+
+class TestDetectPolicyClaim:
+    """Tests for _detect_policy_claim, the pre-write classifier that detects
+    unconfirmed operational policy claims (model/provider bans, prohibitions,
+    permanent routing directives) so they can be staged for user confirmation
+    rather than silently persisted (issue #64681).
+    """
+
+    @staticmethod
+    def _detect(content: str):
+        return _detect_policy_claim(content)
+
+    # ── Positive cases: should trigger ──
+
+    def test_ban_model(self):
+        """'User bans gpt-5.6-sol' should be detected as a policy claim."""
+        assert self._detect("User bans gpt-5.6-sol") is not None
+
+    def test_block_provider(self):
+        """'Block OpenAI provider' should be detected."""
+        assert self._detect("Block OpenAI provider from now on") is not None
+
+    def test_never_use_model(self):
+        """'never use claude sonnet' should be detected."""
+        assert self._detect("never use claude sonnet") is not None
+
+    def test_disable_model(self):
+        """'Disable gemini models entirely' should be detected."""
+        assert self._detect("Disable gemini models entirely") is not None
+
+    def test_prohibit_provider(self):
+        """'prohibit anthropic routing' should be detected."""
+        assert self._detect("prohibit anthropic routing") is not None
+
+    def test_permanent_ban(self):
+        """'permanent ban on gpt-5.6-sol' should be detected."""
+        assert self._detect("permanent ban on gpt-5.6-sol") is not None
+
+    def test_going_forward_routing(self):
+        """Absolute durability language about a model should be detected."""
+        assert self._detect("Going forward, use only claude for code review") is not None
+
+    # ── Negative cases: should NOT trigger ──
+
+    def test_normal_preference(self):
+        """A routine preference should not be detected."""
+        assert self._detect("User prefers compact responses") is None
+
+    def test_markdown_preference(self):
+        """A formatting preference should not be detected."""
+        assert self._detect("Use markdown for code blocks") is None
+
+    def test_model_mention_no_directive(self):
+        """Just mentioning a model is fine."""
+        assert self._detect("The gpt-5.6 model is fast") is None
+
+    def test_role_mapping(self):
+        """The role-mapping pattern from the incident should not trigger."""
+        assert self._detect("Sol=complex; Terra=RFQ; Luna=routine") is None
+
+    def test_always_prefer_no_model(self):
+        """'always prefer' without a model/provider name should not trigger."""
+        assert self._detect("always prefer bullet points in responses") is None
+
+    def test_only_speaks(self):
+        """'only speaks' pattern (not routing) should not trigger."""
+        assert self._detect("User only speaks English") is None
+
+    def test_remove_stale_entries(self):
+        """'remove' about old projects (not a model) should not trigger."""
+        assert self._detect("remove stale memory entries about old projects") is None
+
+    def test_ban_without_model_name(self):
+        """'ban' without a model/provider name should not trigger."""
+        assert self._detect("User bans all caps in responses") is None
+
+    def test_empty_content(self):
+        """Empty content should not trigger."""
+        assert self._detect("") is None
+        assert self._detect("   ") is None
+
+    # ── Reviewer-found edge cases ──
+
+    def test_kanban_substring_false_positive(self):
+        """'kanban' should NOT match 'ban' substring (word-boundary regex)."""
+        assert self._detect(
+            "Track claude tasks on the kanban board"
+        ) is None
+
+    def test_codeblock_substring_false_positive(self):
+        """'codeblock' should NOT match 'block' substring."""
+        assert self._detect(
+            "Format gemini output in a codeblock"
+        ) is None
+
+    def test_going_forward_no_routing_verb(self):
+        """Permanence language without a routing verb should not trigger."""
+        assert self._detect(
+            "Going forward, claude gives concise code reviews"
+        ) is None
+
+    def test_going_forward_with_routing_verb(self):
+        """Permanence language WITH a routing verb should trigger."""
+        assert self._detect(
+            "Going forward, use claude for code reviews"
+        ) is not None
+
+    def test_model_with_digits_no_hyphen(self):
+        """'gpt5' without hyphen should be detected."""
+        assert self._detect("stop using gpt5 for routing") is not None
+
+    def test_missing_models(self):
+        """Models like 'qwen', 'groq' added per review should be detected."""
+        assert self._detect("never use qwen for code") is not None
+        assert self._detect("block groq routing") is not None
+
+    def test_dont_use_contraction(self):
+        """Contraction 'don't use' should be detected."""
+        assert self._detect("don't use gemini anymore") is not None
+
+    # ── Past-tense directive forms (#64681 follow-up) ──
+
+    def test_banned_model_past_tense(self):
+        """Past-tense 'User banned gpt-5.6-sol' should be detected."""
+        assert self._detect("User banned gpt-5.6-sol") is not None
+
+    def test_blocked_provider_past_tense(self):
+        """Past-tense 'OpenAI blocked claude 5' should be detected."""
+        assert self._detect("OpenAI blocked claude 5 via API") is not None
+
+    def test_disabled_model_past_tense(self):
+        """Past-tense 'disabled gemini models' should be detected."""
+        assert self._detect("User disabled gemini models last week") is not None
+
+    def test_prohibited_provider_past_tense(self):
+        """Past-tense 'prohibited anthropic routing' should be detected."""
+        assert self._detect("prohibited anthropic routing") is not None
+
+    def test_banning_gerund(self):
+        """Gerund 'banning gpt-5.6-sol' should be detected."""
+        assert self._detect("Consider banning gpt-5.6-sol for code review") is not None
+
+    # ── 'always' permanence (#64681 follow-up) ──
+
+    def test_always_with_routing_verb(self):
+        """'Always use claude for routing' should be detected."""
+        assert self._detect("Always use claude for routing") is not None
+
+    def test_always_without_routing_verb(self):
+        """'Always' + model but NO routing verb should not trigger."""
+        assert self._detect("Always claude for code reviews") is None
+
+    def test_always_without_model(self):
+        """'Always' + routing verb but NO model should not trigger."""
+        assert self._detect("Always use bullet points") is None
+
+    # ── o4 / o4-mini model coverage (#64681 follow-up) ──
+
+    def test_o4_model_detected(self):
+        """'never use o4-mini' should be detected (was missing from o[13])."""
+        assert self._detect("never use o4-mini for this project") is not None
+
+    def test_o4_bare_detected(self):
+        """'ban o4' (bare, no -mini suffix) should be detected."""
+        assert self._detect("ban o4") is not None
+
+    def test_o1_pro_detected(self):
+        """'o1-pro' variant should be detected (o[1-9]\\d* covers it)."""
+        assert self._detect("block o1-pro for routing") is not None
+
+    # ── yi / glm / baichuan provider coverage (#64681 follow-up) ──
+
+    def test_yi_provider_detected(self):
+        """'never use yi for code' should be detected."""
+        assert self._detect("never use yi for code") is not None
+
+    def test_glm_provider_detected(self):
+        """'block glm routing' should be detected."""
+        assert self._detect("block glm routing") is not None
+
+    def test_baichuan_provider_detected(self):
+        """'disable baichuan entirely' should be detected."""
+        assert self._detect("disable baichuan entirely") is not None
+
+
+# =========================================================================
+# Registered-provider coverage for the policy-claim classifier (#64681 review)
+# =========================================================================
+
+class TestPolicyClaimProviderCoverage:
+    """Every registered model-provider plugin identifier must be covered by
+    the policy-claim classifier.  The PR #72988 review flagged that 'never
+    use openrouter' bypassed the gate because the matcher only listed a
+    subset of registered providers.  Enumerating the plugin directory keeps
+    coverage self-maintaining: a provider added to plugins/model-providers/
+    fails this test until its identifier lands in _POLICY_CLAIM_MODEL_RE."""
+
+    PROVIDER_PLUGIN_DIR = (
+        Path(__file__).resolve().parents[2] / "plugins" / "model-providers"
+    )
+
+    def test_all_registered_providers_are_covered(self):
+        assert self.PROVIDER_PLUGIN_DIR.is_dir(), (
+            "provider plugin directory moved — update PROVIDER_PLUGIN_DIR"
+        )
+        providers = sorted(
+            p.name for p in self.PROVIDER_PLUGIN_DIR.iterdir() if p.is_dir()
+        )
+        assert providers, "no provider plugins found — layout changed?"
+        missing = [
+            name for name in providers
+            if _detect_policy_claim(f"never use {name}") is None
+        ]
+        assert missing == [], (
+            "registered provider identifier(s) missing from "
+            f"_POLICY_CLAIM_MODEL_RE: {missing}"
+        )
+
+    def test_compound_provider_names_covered_by_base_word(self):
+        """Hyphenated identifiers match via their base word (\\b...\\b)."""
+        for name in ("openai-codex", "kimi-coding", "qwen-oauth",
+                     "azure-foundry", "copilot-acp"):
+            assert _detect_policy_claim(f"never use {name}") is not None
+
+    def test_colloquial_base_forms_covered(self):
+        """Colloquial names must be caught, not just the exact plugin id:
+        users write 'never use ollama' / 'never use opencode', while the
+        registered identifiers are ollama-cloud / opencode-zen."""
+        assert _detect_policy_claim("never use ollama") is not None
+        assert _detect_policy_claim("never use opencode") is not None
+
+    def test_openrouter_regression(self):
+        """The exact case the review flagged must not bypass the gate."""
+        assert _detect_policy_claim("never use openrouter") is not None
+        assert _detect_policy_claim("never use openrouter/auto") is not None
+
+
+# =========================================================================
+# Policy-claim staging integration (PR #72988 review)
+# =========================================================================
+
+class TestPolicyClaimStagingIntegration:
+    """End-to-end: memory_tool() stages detected policy claims under the
+    default-off write-approval setting; nothing reaches disk before the user
+    approves via the pending handler; approval replays exactly once."""
+
+    def test_policy_claim_add_stages_and_skips_disk(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert result.get("policy_claim") is True
+        assert "pending_id" in result
+        # Nothing on disk / in the live store yet.
+        assert "User bans gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        # The staged record exists with the full replay payload.
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "add"
+        assert records[0]["payload"]["content"] == "User bans gpt-5.6-sol"
+
+    def test_approve_replays_exactly_once(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        pid = result["pending_id"]
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", pid], memory_store=store
+        )
+        assert "Approved 1" in out
+        # Landed exactly once.
+        assert store.memory_entries.count("User bans gpt-5.6-sol") == 1
+        memory_file = tmp_path / "MEMORY.md"
+        assert memory_file.read_text().count("User bans gpt-5.6-sol") == 1
+        # Record consumed.
+        assert wa.list_pending(wa.MEMORY) == []
+        # Re-approval is a no-op.
+        out2 = handle_pending_subcommand(
+            wa.MEMORY, ["approve", pid], memory_store=store
+        )
+        assert "No pending" in out2
+
+    def test_reject_never_lands(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        pid = result["pending_id"]
+        out = handle_pending_subcommand(wa.MEMORY, ["reject", pid])
+        assert "Rejected" in out
+        assert "gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_benign_write_passes_through_ungated(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User prefers compact responses",
+            store=store,
+        ))
+        assert result.get("success") is True
+        assert "staged" not in result
+        assert "User prefers compact responses" in store.memory_entries
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_benign_write_with_provider_word_passes_through(self, store):
+        """A provider identifier WITHOUT a directive/permanence cue is not a
+        policy claim — it must persist normally, not stage."""
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User prefers vertex themes in the dashboard",
+            store=store,
+        ))
+        assert result.get("success") is True
+        assert "staged" not in result
+        assert any("vertex themes" in e for e in store.memory_entries)
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_batch_with_policy_claim_stages_whole_batch(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "User bans gpt-5.6-sol"},
+                {"action": "add", "content": "User prefers bullet points"},
+            ],
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert result.get("policy_claim") is True
+        # Neither op hit disk.
+        assert "gpt-5.6-sol" not in store.memory_entries
+        assert "bullet points" not in store.memory_entries
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "batch"
+        # Approve → the whole batch applies exactly once.
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", result["pending_id"]], memory_store=store
+        )
+        assert "Approved 1" in out
+        assert store.memory_entries.count("User bans gpt-5.6-sol") == 1
+        assert store.memory_entries.count("User prefers bullet points") == 1
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_replace_with_policy_claim_stages(self, store, tmp_path):
+        store.add("memory", "use gpt-5.6-sol for code review")
+        result = json.loads(memory_tool(
+            action="replace", target="memory",
+            old_text="use gpt-5.6-sol for code review",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert "bans gpt-5.6-sol" not in str(store.memory_entries)
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "replace"
+        # Approve → replace replays against the store.
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", result["pending_id"]], memory_store=store
+        )
+        assert "Approved 1" in out
+        assert "bans gpt-5.6-sol" in str(store.memory_entries)
+        assert "for code review" not in str(store.memory_entries)
+
+    def test_staging_failure_fails_closed(self, store, tmp_path, monkeypatch):
+        """If staging raises, a detected policy claim must NOT flow to disk
+        (fail-closed — the triage review's 'fail open' concern)."""
+        import tools.write_approval as wa_mod
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated staging failure")
+
+        monkeypatch.setattr(wa_mod, "stage_write", boom)
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("success") is False
+        assert result.get("policy_claim") is True
+        assert "blocked" in result["error"]
+        # Nothing persisted, nothing staged.
+        assert "gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        assert wa.list_pending(wa.MEMORY) == []
