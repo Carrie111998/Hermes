@@ -285,6 +285,15 @@ def register_from_config(
     return registered
 
 
+def register_from_current_config(
+    *, accept_hooks: bool = False,
+) -> List[ShellHookSpec]:
+    """Load the current profile config and register its shell hooks."""
+    from hermes_cli.config import load_config
+
+    return register_from_config(load_config(), accept_hooks=accept_hooks)
+
+
 def iter_configured_hooks(cfg: Optional[Dict[str, Any]]) -> List[ShellHookSpec]:
     """Return the parsed ``ShellHookSpec`` entries from config without
     registering anything.  Used by ``hermes hooks list`` and ``doctor``."""

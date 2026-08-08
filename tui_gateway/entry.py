@@ -420,6 +420,31 @@ def ensure_mcp_discovery_started() -> None:
 
 def main():
     _install_sidecar_publisher()
+    # Turn-isolation children inherit this profile-scope marker.
+    os.environ["HERMES_PROFILE_SCOPED_UI"] = "1"
+
+    # Preserve CLI security precedence: plugin policy directives run before
+    # shell-hook directives.
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.debug("Plugin discovery failed at TUI gateway startup", exc_info=True)
+
+    # The TUI gateway runs agent turns in this child process. Shell hooks
+    # registered by the parent CLI live in its process-local plugin registry,
+    # so load the current profile's approved hooks again before announcing
+    # readiness.
+    try:
+        from agent.shell_hooks import register_from_current_config
+
+        register_from_current_config(accept_hooks=False)
+    except Exception:
+        logger.debug(
+            "shell-hook registration failed at TUI gateway startup",
+            exc_info=True,
+        )
 
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
