@@ -58,6 +58,7 @@ def test_ingest_pr_draft_is_triage_and_deduplicated(kanban_home):
     assert first["assignee"] == "orion"
 
 
+
 def test_submit_review_cli_defaults_reviewer_and_requires_metadata(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="implementation", assignee="dev")
@@ -417,8 +418,11 @@ def test_submit_review_parser_defaults_orion_for_multi_word_summary():
     args = parser.parse_args([
         "kanban", "submit-review", "t_abc12345", "PR", "opened", "and", "verified"
     ])
-    assert args.reviewer == "orion"
+    # The parser leaves reviewer resolution to the database layer, which
+    # selects a guaranteed installed profile (or the configured reviewer).
+    assert args.reviewer is None
     assert args.summary == ["PR", "opened", "and", "verified"]
+
 
 
 def test_submit_review_parser_accepts_explicit_reviewer_flag():

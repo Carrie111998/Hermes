@@ -134,6 +134,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# This is deliberately an exact, task-scoped opt-in.  It is the only way an
+# implementation task may bypass the duplicate-PR respawn guard.
+EXISTING_PR_REMEDIATION_METADATA_KEY = "remediate_existing_pr"
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -4160,6 +4164,19 @@ def _assert_worker_task_ownership(task_id: str) -> None:
         )
 
 
+def _resolve_reviewer(reviewer: Optional[str]) -> str:
+    """Use Orion when installed, otherwise the guaranteed default profile."""
+    if reviewer:
+        return _canonical_assignee(reviewer) or reviewer
+    try:
+        from hermes_cli.profiles import profile_exists
+        if profile_exists(_DEFAULT_REVIEWER):
+            return _DEFAULT_REVIEWER
+    except Exception:
+        pass
+    return "default"
+
+
 def _canonical_review_metadata(metadata: Optional[dict]) -> tuple[dict, str]:
     """Validate immutable PR identity and return its canonical idempotency key."""
     if not isinstance(metadata, dict):
@@ -4570,6 +4587,7 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                source_status = _latest_requeue_source_status(conn, task_id)
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4597,7 +4615,13 @@ def recompute_ready(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                _append_event(
+                    conn,
+                    task_id,
+                    "promoted",
+                    {"source_status": source_status}
+                    if source_status is not None else None,
+                )
                 promoted += 1
     return promoted
 
@@ -4612,6 +4636,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    source_status: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4667,6 +4692,14 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        # A review-origin card can pass through a generic ``ready`` status
+        # during dashboard/manual recovery.  Preserve that lane even when an
+        # older caller omits ``source_status`` from the claim payload.
+        claim_source_status = (
+            source_status
+            if source_status is not None
+            else _latest_requeue_source_status(conn, task_id)
+        )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4694,8 +4727,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4705,6 +4738,8 @@ def claim_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                json.dumps({"source_status": claim_source_status})
+                if claim_source_status is not None else None,
             ),
         )
         run_id = run_cur.lastrowid
@@ -4712,11 +4747,11 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
-            run_id=run_id,
-        )
+        claim_payload = {"lock": lock, "expires": expires, "run_id": run_id}
+        if claim_source_status is not None:
+            claim_payload["source_status"] = claim_source_status
+            claim_payload["assignee"] = trow["assignee"] if trow else None
+        _append_event(conn, task_id, "claimed", claim_payload, run_id=run_id)
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
@@ -4818,6 +4853,30 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+def _latest_requeue_source_status(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the lane carried by the latest lifecycle transition.
+
+    Requeue/status writers use ``source_status`` as durable provenance.  The
+    explicit changes-requested event is a lane reset: it hands the card back
+    to implementation, so historical review events must not leak into the
+    next omitted-source claim.
+    """
+    for event in reversed(list_events(conn, task_id)):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.kind == "review_changes_requested":
+            return None
+        if "source_status" in payload:
+            source_status = payload.get("source_status")
+            return str(source_status) if source_status is not None else None
+        if event.kind == "claimed":
+            return None
+        if event.kind == "review_submitted":
+            return "review"
+    return None
+
+
 def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the status a requeued task should land in.
 
@@ -4853,21 +4912,15 @@ def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
             meta = None
         if isinstance(meta, dict) and meta.get("source_status") == "review":
             return "review"
-    for event in reversed(list_events(conn, task_id)):
-        if event.kind == "claimed":
-            payload = event.payload if isinstance(event.payload, dict) else {}
-            return "review" if payload.get("source_status") == "review" else "ready"
-        if event.kind == "review_submitted":
-            return "review"
-    return "ready"
+    return "review" if _latest_requeue_source_status(conn, task_id) == "review" else "ready"
 
 
 def submit_for_review(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    reviewer: str,
     summary: str,
+    reviewer: Optional[str] = None,
     metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
@@ -4878,7 +4931,7 @@ def submit_for_review(
     sides of the handoff and preventing the implementation worker from being
     respawned.
     """
-    reviewer = _canonical_assignee(reviewer or _DEFAULT_REVIEWER)
+    reviewer = _resolve_reviewer(reviewer)
     if not reviewer:
         raise ValueError("reviewer is required")
     if not summary or not summary.strip():
@@ -4973,6 +5026,7 @@ def request_review_changes(
     """Return the same card to its implementer for a changes-requested re-review."""
     if not summary or not summary.strip():
         raise ValueError("changes-requested summary is required")
+    _assert_worker_task_ownership(task_id)
     with write_txn(conn):
         row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None or row["status"] != "running":
@@ -5217,6 +5271,8 @@ def release_stale_claims(
                 "heartbeat_stale": bool(heartbeat_stale),
             }
             payload.update(termination)
+            if requeue_status == "review":
+                payload["source_status"] = "review"
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -5283,6 +5339,8 @@ def reclaim_task(
             "prev_lock": prev_lock,
         }
         payload.update(termination)
+        if requeue_status == "review":
+            payload["source_status"] = "review"
         _append_event(
             conn, task_id, "reclaimed",
             payload,
@@ -5460,97 +5518,62 @@ class HallucinatedCardsError(ValueError):
         )
 
 
-# Implementation lanes: cards in these lanes carry coding metadata and their
-# pull requests must pass through the native review lane (a ``review_submitted``
-# event) before the card can be completed — or carry an explicit waiver.
 _IMPLEMENTATION_LANES = frozenset({"dev", "forge", "quill", "chip"})
 _REVIEW_WAIVER_KEYS = ("review_waiver", "review_waived", "skip_review")
 
 
 def _task_metadata(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
-    """Read a task's structured metadata column (or None)."""
-    row = conn.execute(
-        "SELECT metadata FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    row = conn.execute("SELECT metadata FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if not row or not row["metadata"]:
         return None
     return _decode_task_metadata(row["metadata"])
 
 
 def _metadata_declares_pr(metadata: Optional[dict]) -> bool:
-    """True when a handoff metadata dict declares an open pull request.
-
-    Any of the canonical PR-evidence keys (``pr_url``, ``pr``,
-    ``pr_number``, ``review_identity``, ``pull_request``) with a
-    non-empty value counts. This is the same evidence contract the
-    native review handoff uses (``kanban_submit_review``), so a worker
-    that opened a PR and wants to complete the card must either have
-    entered the review lane or pass an explicit waiver.
-    """
     if not isinstance(metadata, dict):
         return False
-    for key in ("pr_url", "pr", "pr_number", "review_identity", "pull_request"):
-        value = metadata.get(key)
-        if value not in (None, ""):
-            return True
-    return False
+    return any(metadata.get(key) not in (None, "") for key in (
+        "pr_url", "pr", "pr_number", "review_identity", "pull_request",
+    ))
 
 
 def _is_implementation_card(metadata: Optional[dict]) -> bool:
-    """True when task metadata marks this card as an implementation card.
-
-    Matches the coding-gate canonical metadata shape (``lane`` in
-    ``_IMPLEMENTATION_LANES``, ``task_type: implementation``, or a
-    ``coding_agent`` present). Research/docs/ops cards do not declare a
-    coding lane and are never gated.
-    """
     if not isinstance(metadata, dict):
         return False
     lane = str(metadata.get("lane") or "").strip().lower()
-    if lane in _IMPLEMENTATION_LANES:
-        return True
-    if str(metadata.get("task_type") or "").strip().lower() == "implementation":
-        return True
-    if metadata.get("coding_agent"):
-        return True
-    return False
+    return (
+        lane in _IMPLEMENTATION_LANES
+        or str(metadata.get("task_type") or "").strip().lower() == "implementation"
+        or bool(metadata.get("coding_agent"))
+    )
 
 
 def _has_review_waiver(metadata: Optional[dict]) -> bool:
-    """True when handoff metadata carries an explicit review waiver."""
-    if not isinstance(metadata, dict):
-        return False
-    return any(metadata.get(key) for key in _REVIEW_WAIVER_KEYS)
+    return isinstance(metadata, dict) and any(metadata.get(key) for key in _REVIEW_WAIVER_KEYS)
 
 
 def _has_review_submitted_event(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the task has entered the review lane at least once."""
-    row = conn.execute(
-        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_submitted' LIMIT 1",
+    return conn.execute(
+        "SELECT 1 FROM task_events submitted "
+        "WHERE submitted.task_id = ? AND submitted.kind = 'review_submitted' "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM task_events changes "
+        "WHERE changes.task_id = submitted.task_id "
+        "AND changes.kind = 'review_changes_requested' "
+        "AND changes.id > submitted.id"
+        ") LIMIT 1",
         (task_id,),
-    ).fetchone()
-    return row is not None
+    ).fetchone() is not None
 
 
 class ReviewRequiredError(ValueError):
-    """Raised by ``complete_task`` when an implementation card declares an
-    open PR but was never submitted for review (no ``review_submitted``
-    event) and carries no explicit waiver.
-
-    Implementation lanes must call ``kanban_submit_review`` (or the
-    submit-review path) when the PR is opened, BEFORE
-    ``kanban_complete``. Kept as ``ValueError`` subclass so existing
-    tool-error handlers treat it as a recoverable user error.
-    """
-
     def __init__(self, completing_task_id: str):
         self.completing_task_id = completing_task_id
         super().__init__(
             "completion blocked: implementation card declares an open PR but "
             "was never submitted for review (no review_submitted event). "
-            "Call kanban_submit_review (or the submit-review path) before "
-            "completing, or pass an explicit review_waiver in completion "
-            "metadata."
+            "Call kanban_submit_review before completing, or pass an explicit "
+            "review_waiver in completion metadata."
         )
 
 
@@ -5625,39 +5648,20 @@ def complete_task(
     else:
         verified_cards = []
 
-    # Gate: implementation cards that declare an open PR must enter the
-    # review lane (a ``review_submitted`` event) before completion — or
-    # carry an explicit waiver. Prevents workers from opening a PR and
-    # then completing the card directly, skipping the native review
-    # handoff (incident class t_3a2a1d3d / PR #391). A rejected
-    # completion emits an auditable ``completion_blocked_review_required``
-    # event and raises ReviewRequiredError; the task state is untouched.
     task_meta = _task_metadata(conn, task_id)
     completion_meta = metadata or {}
     if (
         _is_implementation_card(task_meta)
-        and (
-            _metadata_declares_pr(completion_meta)
-            or _metadata_declares_pr(task_meta)
-        )
+        and (_metadata_declares_pr(completion_meta) or _metadata_declares_pr(task_meta))
         and not _has_review_submitted_event(conn, task_id)
-        and not (
-            _has_review_waiver(completion_meta)
-            or _has_review_waiver(task_meta)
-        )
+        and not (_has_review_waiver(completion_meta) or _has_review_waiver(task_meta))
     ):
         with write_txn(conn):
-            _append_event(
-                conn, task_id, "completion_blocked_review_required",
-                {
-                    "summary_preview": (
-                        (summary or result or "").strip().splitlines()[0][:200]
-                        if (summary or result)
-                        else None
-                    ),
-                    "lane": (task_meta or {}).get("lane"),
-                },
-            )
+            _append_event(conn, task_id, "completion_blocked_review_required", {
+                "summary_preview": ((summary or result or "").strip().splitlines()[0][:200]
+                                     if (summary or result) else None),
+                "lane": (task_meta or {}).get("lane"),
+            })
         raise ReviewRequiredError(task_id)
 
     metadata = _merge_completion_prose_artifacts(
@@ -6422,6 +6426,9 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        source_status = (
+            "review" if _requeue_status(conn, task_id) == "review" else None
+        )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6476,7 +6483,11 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    **({"source_status": source_status} if source_status else {}),
+                }, run_id=run_id,
             )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
@@ -6534,6 +6545,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    **({"source_status": source_status} if source_status else {}),
                 },
                 run_id=run_id,
             )
@@ -6586,7 +6598,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    **({"source_status": source_status} if source_status else {}),
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -6654,6 +6671,10 @@ def promote_task(
     if dry_run:
         return True, None
 
+    source_status = (
+        "review" if _requeue_status(conn, task_id) == "review" else None
+    )
+
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
@@ -6666,7 +6687,12 @@ def promote_task(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {
+                "actor": actor,
+                "reason": reason,
+                "forced": force,
+                **({"source_status": source_status} if source_status else {}),
+            },
         )
 
     return True, None
@@ -6743,10 +6769,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
-        )
+        payload = {"status": new_status}
+        if requeue_status == "review":
+            payload["source_status"] = "review"
+        _append_event(conn, task_id, "unblocked", payload)
         return True
 
 
@@ -7487,6 +7513,7 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        source_status = _requeue_status(conn, task_id)
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -7514,7 +7541,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        payload = {"reason": reason}
+        if source_status == "review":
+            payload["source_status"] = "review"
+        _append_event(conn, task_id, "scheduled", payload, run_id=run_id)
         return True
 
 
@@ -8062,6 +8092,8 @@ def enforce_max_runtime(
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
                 }
+                if requeue_status == "review":
+                    payload["source_status"] = "review"
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8195,6 +8227,8 @@ def detect_stale_running(
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }
+            if requeue_status == "review":
+                payload["source_status"] = "review"
             payload.update(termination)
 
             run_id = _end_run(
@@ -8432,6 +8466,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             requeue_status = _requeue_status(conn, row["id"])
+            if requeue_status == "review":
+                event_payload["source_status"] = "review"
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -8524,8 +8560,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Below-budget: the task is already back at ``ready`` or
+                    # its native ``review`` column (respawn allowed) with
+                    # ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
@@ -8643,6 +8680,7 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        source_status = _requeue_status(conn, task_id)
         failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over both caller-supplied and default
@@ -8665,7 +8703,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -8675,7 +8713,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -8701,6 +8739,8 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
+            if source_status == "review":
+                payload["source_status"] = "review"
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
@@ -8743,7 +8783,11 @@ def _record_task_failure(
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {
+                        "error": error[:500],
+                        "failures": failures,
+                        **({"source_status": "review"} if source_status == "review" else {}),
+                    },
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
@@ -8811,36 +8855,24 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def _is_review_lifecycle_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether a card has entered the native Review lifecycle.
+def _latest_claim_was_review(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether the most recent claim came from the review lane."""
+    return _latest_requeue_source_status(conn, task_id) == "review"
 
-    Review cards can be requeued as ``ready`` for implementer remediation,
-    or can be promoted by recovery code after a failed review spawn.  Their
-    existing PR is expected in both cases, so the ordinary duplicate-PR
-    respawn guard must not strand them in Ready.  This deliberately keys off
-    durable lifecycle events rather than the current status, which is the
-    state that gets lost during the failing transition.
-    """
-    row = conn.execute(
-        "SELECT metadata FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is not None and row["metadata"]:
-        try:
-            metadata = json.loads(row["metadata"])
-        except (TypeError, json.JSONDecodeError):
-            metadata = {}
-        if isinstance(metadata, dict) and metadata.get("existing_pr_remediation") is True:
-            return True
 
-    for event in reversed(list_events(conn, task_id)):
-        if event.kind == "claimed":
-            payload = event.payload if isinstance(event.payload, dict) else {}
-            if payload.get("source_status") == "review":
-                return True
-        if event.kind == "review_submitted":
-            return True
-    return False
+def _is_existing_pr_remediation(row: sqlite3.Row) -> bool:
+    """Return whether a task explicitly opts into existing-PR remediation."""
+    raw_metadata = row["metadata"] if "metadata" in row.keys() else None
+    if not raw_metadata:
+        return False
+    try:
+        metadata = json.loads(raw_metadata)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(metadata, dict)
+        and metadata.get(EXISTING_PR_REMEDIATION_METADATA_KEY) is True
+    )
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -8892,11 +8924,20 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT status, last_failure_error, metadata FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+
+    # Native review cards are already routed to the reviewer lane and must not
+    # be treated as duplicate implementation work merely because the
+    # canonical PR is present in the card's comments.  A reviewer crash is
+    # requeued as ``review``; retain the claimed event's ``source_status`` so
+    # a ready retry can pass the same PR guard after a status transition.
+    review_claim = (
+        row["status"] == "review" or _latest_claim_was_review(conn, task_id)
+    )
 
     now = int(time.time())
 
@@ -8936,6 +8977,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         # crash/completion supersedes it.
         return None
 
+    # A newly submitted review has no prior review claim to identify it, but
+    # it is still not an implementation retry.  Apply the rate-limit check
+    # above, then leave the native review lane alone.
+    if row["status"] == "review":
+        return None
+
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
@@ -8966,18 +9013,28 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
+    # Only an explicit task metadata opt-in may remediate a PR that already
+    # appears in the card's comments. Ordinary implementation work remains
+    # protected by the active-PR guard.
+    existing_pr_remediation = _is_existing_pr_remediation(row)
+    review_changes_requested = any(
+        event.kind == "review_changes_requested"
+        for event in list_events(conn, task_id)
+    )
+
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    # Native Review cards are the exception: returning a review card to Ready
-    # is an intentional review/remediation retry against the existing PR, not
-    # a request to create a duplicate implementation PR.
-    if _is_review_lifecycle_task(conn, task_id):
-        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # A PR opened for a native review belongs to the reviewer, not a
+            # duplicate implementation retry.  Only bypass when the review
+            # claim is newer than the PR comment, so an ordinary implementation
+            # task with an unrelated historical review event remains guarded.
+            if review_claim or existing_pr_remediation or review_changes_requested:
+                return None
             return "active_pr"
 
     return None
@@ -8998,7 +9055,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     the warning still fires in degraded environments.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
@@ -9010,7 +9067,7 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and check_respawn_guard(conn, row["id"]) is None:
             return True
     return False
 
@@ -9029,7 +9086,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     false "no review to spawn" while the card starves invisibly.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND (claim_lock IS NULL OR claim_expires IS NULL OR claim_expires < ?)",
         (int(time.time()),),
@@ -9041,7 +9098,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if profile_exists(row["assignee"]) and check_respawn_guard(conn, row["id"]) is None:
             return True
     return False
 
@@ -9370,7 +9427,11 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+        )
         if claimed is None:
             continue
         try:
@@ -9472,6 +9533,19 @@ def _dispatch_once_locked(
         if not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Review cards bypass the ready-task loop, so apply the respawn guard
+        # here as well.  Otherwise a rate-limited reviewer is claimed again
+        # on every dispatcher tick during its cooldown.
+        guard_reason = check_respawn_guard(conn, row["id"])
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "respawn_guarded",
+                        {"reason": guard_reason, "lane": "review"},
+                    )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
@@ -9502,7 +9576,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

@@ -1,5 +1,6 @@
 """Behavioral tests for the upstream-aligned native review lifecycle."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,132 @@ def test_review_changes_returns_same_card_to_implementer(board):
         assert run["status"] == "ready"
         assert run["outcome"] == "changes_requested"
         assert run["ended_at"] is not None
+
+
+def test_review_changes_requires_worker_ownership(board, monkeypatch):
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "different-task")
+        with pytest.raises(PermissionError, match="refusing to mutate"):
+            kb.request_review_changes(
+                conn, task_id, summary="must not mutate sibling",
+                expected_run_id=review.current_run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_changes_requested_invalidates_historical_review_submission(board):
+    with board as conn:
+        task_id = kb.create_task(
+            conn, title="implement", assignee="dev",
+            metadata={"lane": "dev", "task_type": "implementation"},
+        )
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, reviewer="reviewer", summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, task_id, summary="fix it", expected_run_id=review.current_run_id
+        ) == task_id
+        fix = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert fix is not None
+        with pytest.raises(kb.ReviewRequiredError):
+            kb.complete_task(
+                conn, task_id, summary="done", metadata=REVIEW_METADATA,
+                expected_run_id=fix.current_run_id,
+            )
+
+
+def test_default_review_submission_uses_guaranteed_profile(board, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name in {"dev", "default"})
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="dev")
+        implementation = kb.claim_task(conn, task_id, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn, task_id, summary="ready", metadata=REVIEW_METADATA,
+            expected_run_id=implementation.current_run_id,
+        )
+        assert kb.get_task(conn, task_id).assignee == "default"
+
+
+def test_review_provenance_survives_status_requeue_and_omitted_source_claim(board):
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    with board as conn:
+        task_id = kb.create_task(conn, title="implement", assignee="reviewer", initial_status="review")
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+
+        assert _set_status_direct(conn, task_id, "ready")
+        reclaimed = kb.get_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.status == "ready"
+
+        claimed = kb.claim_task(conn, task_id, claimer="worker:reviewer")
+        assert claimed is not None
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["source_status"] == "review"
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(run["metadata"])["source_status"] == "review"
+
+
+def test_native_review_retry_returns_to_review_dispatch_lane(board):
+    with board as conn:
+        task_id = kb.create_task(
+            conn, title="review retry", assignee="reviewer", initial_status="review"
+        )
+        review = kb.claim_review_task(conn, task_id, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.reclaim_task(conn, task_id, reason="review worker exited")
+        assert kb.get_task(conn, task_id).status == "review"
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert result.spawned == [(task_id, "reviewer", "")]
+
+
+def test_existing_pr_remediation_opt_in_bypasses_only_active_pr_guard(board):
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    with board as conn:
+        ordinary_id = kb.create_task(conn, title="ordinary", assignee="dev")
+        remediation_id = kb.create_task(
+            conn,
+            title="remediation",
+            assignee="dev",
+            metadata={kb.EXISTING_PR_REMEDIATION_METADATA_KEY: True},
+        )
+        for task_id in (ordinary_id, remediation_id):
+            assert kb.add_comment(
+                conn, task_id, author="worker", body="PR: https://github.com/acme/repo/pull/1"
+            )
+            assert _set_status_direct(conn, task_id, "ready")
+
+        assert kb.check_respawn_guard(conn, ordinary_id) == "active_pr"
+        assert kb.check_respawn_guard(conn, remediation_id) is None
+        assert kb.has_spawnable_ready(conn)
 
 
 def test_changes_requested_reuses_same_card_for_implementer_and_re_review(board):
@@ -222,6 +349,7 @@ def test_webhook_draft_is_parked_in_triage_with_source_metadata(board):
         assert task.status == "triage"
         assert task.metadata["source"] == "github_pull_request"
         assert task.metadata["draft"] is True
+
 
 
 def test_webhook_replay_preserves_native_review_claim(board):
