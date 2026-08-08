@@ -372,6 +372,11 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        try:
+            monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
+            monkeypatch.setattr("agent.anthropic_adapter.read_hermes_oauth_credentials", lambda: None)
+        except Exception:
+            pass
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
@@ -485,10 +490,11 @@ class TestFailureAttribution:
 
         from agent.agent_runtime_helpers import recover_with_credential_pool
 
-        recovered, _ = recover_with_credential_pool(
+        recovered, ret_429 = recover_with_credential_pool(
             agent, status_code=401, has_retried_429=False
         )
 
+        print(f"\nDEBUG: recovered={recovered}, ret_429={ret_429}, pool_current={pool.current()}, entries={pool.entries()}")
         assert recovered is False
         assert self._statuses(pool)["cred-0"] != "exhausted"
         agent._swap_credential.assert_not_called()
