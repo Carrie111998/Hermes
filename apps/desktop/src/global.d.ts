@@ -283,6 +283,9 @@ declare global {
       updates: {
         check: () => Promise<DesktopUpdateStatus>
         apply: (opts?: DesktopUpdateApplyOptions) => Promise<DesktopUpdateApplyResult>
+        /** electron-updater rung: restart into the downloaded release binary.
+         *  `{ ok: false }` when no update has been downloaded yet. */
+        installDownloaded: () => Promise<{ ok: boolean; pendingVersion: string | null }>
         getBranch: () => Promise<{ branch: string }>
         setBranch: (name: string) => Promise<{ branch: string }>
         onProgress: (callback: (payload: DesktopUpdateProgress) => void) => () => void
@@ -386,6 +389,13 @@ export interface DesktopUpdateCommit {
 export interface DesktopUpdateStatus {
   supported: boolean
   updateAvailable?: boolean
+  /** True when this status came from the electron-updater rung (packaged
+   *  client + configured feed): sha fields carry app VERSIONS, commits are
+   *  unavailable, and install goes through the download→ready→restart flow. */
+  electronUpdater?: boolean
+  /** electron-updater rung: version downloaded and awaiting restart-to-install
+   *  (survives overlay close/reopen). */
+  pendingVersion?: string | null
   branch?: string
   currentBranch?: string
   reason?: string
@@ -443,6 +453,12 @@ export interface DesktopUpdateApplyResult {
 export type DesktopUpdateStage =
   | 'idle'
   | 'prepare'
+  | 'check'
+  | 'download'
+  /** electron-updater rung: a release binary is downloaded and waiting — the
+   *  overlay offers "restart to update" (installDownloaded). Terminal,
+   *  closeable; the pending version survives via status.pendingVersion. */
+  | 'ready'
   | 'fetch'
   | 'pull'
   | 'pydeps'

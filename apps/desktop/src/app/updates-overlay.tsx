@@ -33,6 +33,7 @@ import {
   applyUpdates,
   checkBackendUpdates,
   checkUpdates,
+  installDownloadedUpdate,
   resetUpdateApplyState,
   setUpdateOverlayOpen,
   type UpdateApplyState
@@ -69,16 +70,18 @@ export function UpdatesOverlay() {
   const behind = status?.behind ?? 0
   const updateAvailable = status?.updateAvailable || behind > 0
 
-  const phase: 'idle' | 'applying' | 'manual' | 'guiSkew' | 'error' =
+  const phase: 'idle' | 'applying' | 'manual' | 'guiSkew' | 'error' | 'ready' =
     apply.stage === 'manual'
       ? 'manual'
       : apply.stage === 'guiSkew'
         ? 'guiSkew'
-        : apply.applying || apply.stage === 'restart'
-          ? 'applying'
-          : apply.stage === 'error'
-            ? 'error'
-            : 'idle'
+        : apply.stage === 'ready'
+          ? 'ready'
+          : apply.applying || apply.stage === 'restart'
+            ? 'applying'
+            : apply.stage === 'error'
+              ? 'error'
+              : 'idle'
 
   const handleClose = (next: boolean) => {
     if (phase === 'applying') {
@@ -116,6 +119,16 @@ export function UpdatesOverlay() {
         )}
 
         {phase === 'guiSkew' && <GuiSkewView message={apply.message} onDone={() => handleClose(false)} />}
+
+        {/* electron-updater rung: binary downloaded, awaiting the user's
+            explicit restart (AGENTS.md: the install is always user-gated). */}
+        {phase === 'ready' && (
+          <ReadyView
+            message={apply.message}
+            onLater={() => handleClose(false)}
+            onRestart={() => void installDownloadedUpdate()}
+          />
+        )}
 
         {phase === 'error' && (
           <ErrorView message={apply.message} onDismiss={() => handleClose(false)} onRetry={handleInstall} />
@@ -266,6 +279,34 @@ function IdleView({
       </div>
 
       {remaining > 0 && <p className="text-center text-xs text-muted-foreground">{u.moreChanges(remaining)}</p>}
+    </div>
+  )
+}
+
+/** electron-updater rung: binary downloaded, waiting for an explicit restart.
+ *  Mirrors ManualView's shape — terminal, closeable, no spinner. Reuses the
+ *  existing updates.* i18n keys so no locale needs new strings. */
+function ReadyView({ message, onLater, onRestart }: { message?: string; onLater: () => void; onRestart: () => void }) {
+  const { t } = useI18n()
+  const u = t.updates
+
+  return (
+    <div className="grid gap-5 px-6 pb-6 pt-7 pr-8">
+      <div className="flex flex-col items-center gap-3 text-center">
+        <BrandMark className="size-12" />
+
+        <DialogTitle className="text-center text-xl">{u.availableTitle}</DialogTitle>
+        <DialogDescription className="text-center text-sm">{message ?? u.availableBody}</DialogDescription>
+      </div>
+
+      <div className="grid gap-2">
+        <Button className="font-semibold" onClick={onRestart} size="lg">
+          {u.updateNow}
+        </Button>
+        <Button className="font-semibold" onClick={onLater} size="lg" variant="secondary">
+          {u.maybeLater}
+        </Button>
+      </div>
     </div>
   )
 }

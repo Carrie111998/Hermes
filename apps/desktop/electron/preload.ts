@@ -325,6 +325,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   updates: {
     check: () => ipcRenderer.invoke('hermes:updates:check'),
     apply: opts => ipcRenderer.invoke('hermes:updates:apply', opts),
+    // electron-updater rung: restart into the downloaded release binary.
+    // Resolves { ok: false } when nothing has been downloaded yet.
+    installDownloaded: () => ipcRenderer.invoke('hermes:updates:install-downloaded'),
     getBranch: () => ipcRenderer.invoke('hermes:updates:branch:get'),
     setBranch: name => ipcRenderer.invoke('hermes:updates:branch:set', name),
     onProgress: callback => {
