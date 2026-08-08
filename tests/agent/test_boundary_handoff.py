@@ -179,6 +179,40 @@ def test_kanban_worker_skips_boundary_handoff_nudge(monkeypatch):
     )
 
 
+def test_kanban_worker_skips_even_when_stop_nudge_disabled(monkeypatch):
+    """Worker identity wins over HERMES_KANBAN_STOP_NUDGE=0."""
+    store = _store(("remaining step", "pending"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    assert (
+        build_boundary_handoff_nudge(
+            todo_store=store,
+            messages=[{"role": "assistant", "content": "Stopped mid-task."}],
+            clarify_available=True,
+        )
+        is None
+    )
+
+
+def test_intent_ack_continue_does_not_reset_clarify_window():
+    store = _store(("remaining step", "pending"))
+    messages = [
+        {"role": "user", "content": "implement the plan"},
+        _clarify_assistant(),
+        {
+            "role": "user",
+            "content": (
+                "[System: Continue now. Execute the required tool calls and only "
+                "send your final answer after completing the task.]"
+            ),
+            "_intent_ack_synthetic": True,
+        },
+        {"role": "assistant", "content": "Paused pending your decision."},
+    ]
+    assert turn_called_clarify(messages) is True
+    assert build_boundary_handoff_nudge(todo_store=store, messages=messages) is None
+
+
 def test_nudge_budget_disable_and_clarify_unavailable():
     store = _store(("remaining step", "pending"))
     assert (

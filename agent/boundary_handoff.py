@@ -149,11 +149,12 @@ def build_boundary_handoff_nudge(
         return None
 
     # Kanban workers must terminate with kanban_complete / kanban_block, not
-    # clarify. Defer to kanban_stop so this guard cannot steal the nudge.
+    # clarify — even when HERMES_KANBAN_STOP_NUDGE disables the kanban stop
+    # nudge itself. Skip on worker identity, not nudge enablement.
     try:
-        from agent.kanban_stop import kanban_stop_nudge_enabled
+        from agent.kanban_stop import is_kanban_worker
 
-        if kanban_stop_nudge_enabled():
+        if is_kanban_worker():
             return None
     except Exception:
         pass

@@ -6939,6 +6939,7 @@ def run_conversation(
                             "[System: Continue now. Execute the required tool calls and only "
                             "send your final answer after completing the task.]"
                         ),
+                        "_intent_ack_synthetic": True,
                     }
                     messages.append(continue_msg)
                     agent._session_messages = messages

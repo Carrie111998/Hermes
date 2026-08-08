@@ -22,6 +22,11 @@ _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 _DEFAULT_MAX_ATTEMPTS = 2
 
 
+def is_kanban_worker() -> bool:
+    """True when this process is a dispatcher-spawned kanban worker."""
+    return bool((os.environ.get("HERMES_KANBAN_TASK") or "").strip())
+
+
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
@@ -31,8 +36,7 @@ def kanban_stop_nudge_enabled() -> bool:
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
-    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    return is_kanban_worker()
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -103,6 +107,7 @@ def build_kanban_stop_nudge(
 
 __all__ = [
     "build_kanban_stop_nudge",
+    "is_kanban_worker",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",
 ]

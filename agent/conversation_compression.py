@@ -1910,6 +1910,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_boundary_handoff_synthetic",
+    "_intent_ack_synthetic",
     "_dropped_toolcall_nudge",
 )
 
