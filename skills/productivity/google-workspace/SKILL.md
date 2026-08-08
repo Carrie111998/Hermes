@@ -1,8 +1,8 @@
 ---
 name: google-workspace
-description: "Google Workspace helpers for Gmail, Calendar, Drive, Docs, Sheets, and Contacts."
-version: 2.0.0
-author: community
+description: "Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python."
+version: 1.2.0
+author: Nous Research
 license: MIT
 platforms: [linux, macos, windows]
 required_credential_files:
@@ -23,13 +23,8 @@ remote sandboxes can mount only the files this skill needs.
 
 ## Setup
 
-1. Save an OAuth desktop client secret as:
-   `${HERMES_HOME:-~/.hermes}/google_client_secret.json`
-2. Generate a consent URL:
-   `python scripts/setup.py --auth-url`
-3. Open the URL, approve the scopes, and copy the redirected URL or auth code.
-4. Exchange it:
-   `python scripts/setup.py --exchange-code "<code-or-redirect-url>"`
+- `references/gmail-search-syntax.md` — Gmail search operators (is:unread, from:, newer_than:, etc.)
+- `references/daily-brief.md` — daily/morning brief procedure: schedule + conflicts + meeting prep + urgent mail from Gmail and Calendar. Load it when the user asks for a morning brief, meeting preparation, or "what's on my calendar and what email needs attention."
 
 The resulting `${HERMES_HOME:-~/.hermes}/google_token.json` is an authorized
 user credential and may be refreshed by `scripts/gws_bridge.py`.
