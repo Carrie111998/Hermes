@@ -229,7 +229,7 @@ class TestStartRun:
                     "/v1/runs",
                     json={
                         "input": "hello",
-                        "runtime_env": {
+                        "environment": {
                             "PAPERCLIP_API_KEY": "scoped-test-token",
                             "PAPERCLIP_RUN_ID": "paperclip-run-1",
                         },
@@ -268,7 +268,12 @@ class TestStartRun:
                 "/v1/runs",
                 json={"input": "hello", "runtime_env": {"PATH": "/tmp/unsafe"}},
             )
+            conflict = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "runtime_env": {}, "environment": {}},
+            )
         assert resp.status == 400
+        assert conflict.status == 400
 
 
     @pytest.mark.asyncio

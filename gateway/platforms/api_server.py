@@ -75,8 +75,10 @@ _RUN_RUNTIME_ENV_KEYS = frozenset({
     "PAPERCLIP_API_URL",
     "PAPERCLIP_AGENT_ID",
     "PAPERCLIP_COMPANY_ID",
+    "PAPERCLIP_ISSUE_WORK_MODE",
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_TASK_ID",
+    "PAPERCLIP_WAKE_REASON",
 })
 _RUN_RUNTIME_ENV_MAX_BYTES = 32 * 1024
 
@@ -84,6 +86,11 @@ _RUN_RUNTIME_ENV_MAX_BYTES = 32 * 1024
 def _parse_run_runtime_env(body: Any) -> tuple[dict[str, str], Optional[str]]:
     """Validate the narrow subprocess environment accepted by ``/v1/runs``."""
     raw = body.get("runtime_env")
+    environment = body.get("environment")
+    if raw is not None and environment is not None:
+        return {}, "provide only one of 'runtime_env' or 'environment'"
+    if raw is None:
+        raw = environment
     if raw is None:
         return {}, None
     if not isinstance(raw, dict):
