@@ -2095,3 +2095,99 @@ def test_iter_custom_providers_seeds_providers_dict_for_legacy_and_modern(
     assert "config:newstyle-endpoint" in sources, (
         f"newstyle-endpoint pool missing config: source (with_legacy_list={with_legacy_list}): {sources!r}"
     )
+
+
+def test_iter_custom_providers_keeps_malformed_legacy_entries(tmp_path, monkeypatch):
+    """Regression for #81182: the legacy ``custom_providers:`` list must keep
+    yielding entries whose base_url the normalizer rejects (placeholders,
+    typos, legacy shapes) — they still seed pool entries today, and dropping
+    them would let load_pool() prune the ``config:<name>`` source as stale.
+    The v12+ ``providers:`` dict entries are appended on top, with the legacy
+    entry winning a normalized-name collision."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+
+    import yaml
+
+    config_payload = {
+        "custom_providers": [
+            {
+                "name": "malformed-legacy",
+                "base_url": "not-a-url",  # rejected by _normalize_custom_provider_entry
+                "api_key": "legacy-key",
+                "model": "legacy-model",
+            },
+            {
+                "name": "placeholder-legacy",
+                "base_url": "${MY_ENDPOINT}",  # unresolved template still seeds
+                "api_key": "placeholder-key",
+            },
+        ],
+        "providers": {
+            "dict-only": {
+                "name": "dict-only",
+                "api": "http://127.0.0.1:9003/v1",
+                "api_key": "dict-key",
+                "transport": "chat_completions",
+            },
+        },
+    }
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config_payload))
+
+    from agent.credential_pool import _iter_custom_providers
+
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    yielded = {name: entry for name, entry in _iter_custom_providers(cfg)}
+
+    # Malformed legacy entries survive (the bug: they vanished through the
+    # compatibility layer's normalizer).
+    assert "malformed-legacy" in yielded, yielded.keys()
+    assert yielded["malformed-legacy"]["base_url"] == "not-a-url"
+    assert "placeholder-legacy" in yielded, yielded.keys()
+    # The providers: dict entry is still appended alongside.
+    assert "dict-only" in yielded, yielded.keys()
+
+
+def test_iter_custom_providers_legacy_wins_name_collision(tmp_path, monkeypatch):
+    """#81182: when a legacy ``custom_providers:`` entry and a v12+
+    ``providers:`` entry normalize to the same pool name, the legacy entry
+    wins — yielding both would put credentials for two endpoints under the
+    same ``custom:<name>`` pool key."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+
+    import yaml
+
+    config_payload = {
+        "custom_providers": [
+            {
+                "name": "shared-name",
+                "base_url": "http://legacy.example/v1",
+                "api_key": "legacy-key",
+            },
+        ],
+        "providers": {
+            "shared-name": {
+                "name": "shared-name",
+                "api": "http://modern.example/v1",
+                "api_key": "modern-key",
+                "transport": "chat_completions",
+            },
+        },
+    }
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump(config_payload))
+
+    from agent.credential_pool import _iter_custom_providers
+
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    yielded = {name: entry for name, entry in _iter_custom_providers(cfg)}
+
+    assert "shared-name" in yielded, yielded.keys()
+    assert yielded["shared-name"]["base_url"] == "http://legacy.example/v1"
+    assert list(yielded).count("shared-name") == 1
