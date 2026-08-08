@@ -4382,11 +4382,32 @@ class TelegramAdapter(BasePlatformAdapter):
                 if task is not None and not task.done():
                     pending_tasks.append(task)
                 self._pending_photo_batch_tasks.pop(key, None)
-        # Media-group coalescing is keyed by media_group_id; match on the
-        # buffered event's source instead.
+        # Media-group coalescing is keyed by media_group_id; the buffered
+        # ``event.source`` carries the SessionSource fields needed to
+        # rebuild the session key (SessionSource itself has no
+        # ``session_key`` attribute — that key is always *derived* via
+        # ``build_session_key``), so we compare on the recomputed key
+        # instead of reading a stale attribute (#81370).
+        from gateway.session import build_session_key
         for media_group_id, event in list(self._media_group_events.items()):
             source = getattr(event, "source", None)
-            if source is not None and getattr(source, "session_key", None) == session_key:
+            if source is None:
+                continue
+            try:
+                event_session_key = build_session_key(
+                    source,
+                    group_sessions_per_user=self.config.extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=self.config.extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=getattr(source, "profile", None)
+                    or getattr(self, "_gateway_profile_name", None),
+                )
+            except Exception:
+                continue
+            if event_session_key == session_key:
                 self._media_group_events.pop(media_group_id, None)
                 task = self._media_group_tasks.pop(media_group_id, None)
                 if task is not None and not task.done():

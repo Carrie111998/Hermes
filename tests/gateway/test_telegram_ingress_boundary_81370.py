@@ -35,6 +35,17 @@ def _make_adapter():
     adapter._text_debounce = {}
     adapter._active_sessions = {}
     adapter._session_tasks = {}
+    # ``build_session_key`` reads ``self.config.extra`` to derive the
+    # ``group_sessions_per_user`` / ``thread_sessions_per_user`` flags.
+    # Default both to True (matches the gateway default and is enough for
+    # DM key derivation).
+    class _Cfg:
+        extra = {
+            "group_sessions_per_user": True,
+            "thread_sessions_per_user": True,
+        }
+    adapter.config = _Cfg()
+    adapter._gateway_profile_name = None
     return adapter
 
 
@@ -99,17 +110,32 @@ class TestDiscardSessionIngress:
 
     def test_media_group_slots_for_session_are_dropped(self):
         adapter = _make_adapter()
-        session_key = "telegram:chat:123"
+        # Build real SessionSource objects so the adapter's media-group
+        # branch has to call ``build_session_key``.  The earlier fixture
+        # used a fabricated ``source.session_key`` attribute that masked
+        # the dead-code defect — SessionSource has no such attribute, so
+        # the cleanup branch never matched in production (#81370).
+        from gateway.config import Platform
+        from gateway.session import SessionSource, build_session_key
+        source_a = SessionSource(platform=Platform.TELEGRAM, chat_id="123")
+        source_b = SessionSource(platform=Platform.TELEGRAM, chat_id="456")
 
         class _Event:
-            def __init__(self, key):
-                self.source = type("Source", (), {"session_key": key})()
+            def __init__(self, source):
+                self.source = source
 
-        adapter._media_group_events["grp_a"] = _Event(session_key)
-        adapter._media_group_events["grp_b"] = _Event("telegram:chat:456")
+        adapter._media_group_events["grp_a"] = _Event(source_a)
+        adapter._media_group_events["grp_b"] = _Event(source_b)
         adapter._media_group_tasks["grp_a"] = None
         adapter._media_group_tasks["grp_b"] = None
 
+        # Compute the key the same way the gateway does so the test
+        # mirrors the production flow end-to-end.
+        session_key = build_session_key(
+            source_a,
+            group_sessions_per_user=True,
+            thread_sessions_per_user=True,
+        )
         adapter._discard_session_ingress(session_key)
 
         assert "grp_a" not in adapter._media_group_events
