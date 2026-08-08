@@ -127,6 +127,11 @@
       "note": "Official nano-pdf skill restored in #68595; fork deleted it during consolidate — take upstream."
     },
     {
+      "pattern": "skills/productivity/maps/**",
+      "action": "upstream",
+      "note": "Official maps skill is the declared dependency of product-price-monitor; restore the maintained implementation when the fork lacks it."
+    },
+    {
       "pattern": "skills/productivity/ocr-and-documents/**",
       "action": "upstream",
       "note": "Official OCR/documents skill restored in #68595; fork deleted it during consolidate — take upstream."
@@ -145,6 +150,12 @@
       "pattern": "apps/desktop/electron/windows-child-process.test.ts",
       "action": "upstream",
       "note": "Official behavior-focused Windows child-process coverage supersedes the legacy source-regex test while retaining the maintained child-process contract."
+    },
+    {
+      "pattern": "apps/desktop/electron/main.ts",
+      "action": "official_with_overlay",
+      "note": "Take the official Desktop main process and three-way reapply the fork-only watchdog prewarm integration; fail closed rather than silently dropping its import.",
+      "context": "overlap_only"
     },
     {
       "pattern": "apps/desktop/src/app/desktop-controller.tsx",

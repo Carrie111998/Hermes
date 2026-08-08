@@ -552,7 +552,7 @@ def is_host_excluded_by_no_proxy(hostname: str, no_proxy_value: str | None = Non
 import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
@@ -1342,10 +1342,24 @@ def _media_delivery_strict_mode() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _media_delivery_home() -> Path:
+    """Return the runtime home, honoring ``HOME`` on every host platform.
+
+    ``os.path.expanduser("~")`` prefers ``USERPROFILE`` on Windows even when
+    a gateway's runtime environment explicitly supplies ``HOME``.  Media-path
+    policy needs the latter so an in-process or container-backed gateway uses
+    the same home boundary as the agent that produced the path.
+    """
+    configured_home = os.environ.get("HOME")
+    if configured_home:
+        return Path(configured_home).expanduser()
+    return Path(os.path.expanduser("~"))
+
+
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    home = _media_delivery_home()
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1417,7 +1431,7 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = _media_delivery_home().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -1460,7 +1474,7 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
+def _parse_docker_volume_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """Parse configured Docker volume mounts into ``(host_path, container_path)``.
 
     Source of truth is ``TERMINAL_DOCKER_VOLUMES`` (JSON list of
@@ -1480,7 +1494,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
     if not isinstance(parsed, list):
         return []
 
-    mounts: List[Tuple[Path, Path]] = []
+    mounts: List[Tuple[Path, PurePosixPath]] = []
     for entry in parsed:
         if not isinstance(entry, str):
             continue
@@ -1505,7 +1519,7 @@ def _parse_docker_volume_mounts() -> List[Tuple[Path, Path]]:
             continue
         try:
             host_path = Path(host_expanded).resolve(strict=False)
-            container_path = Path(container_raw)
+            container_path = PurePosixPath(container_raw)
         except (OSError, RuntimeError, ValueError):
             continue
         if not container_path.is_absolute():
@@ -1574,7 +1588,7 @@ def _docker_persistent_home_host_root() -> Optional[Path]:
     return root if root.is_dir() else None
 
 
-def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
+def _cache_dir_container_mounts() -> List[Tuple[Path, PurePosixPath]]:
     """(host, container) pairs for the auto-mounted Hermes cache dirs.
 
     The agent legitimately sees generated artifacts at ``/root/.hermes/...``
@@ -1589,14 +1603,15 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         from tools.credential_files import get_cache_directory_mounts
 
         return [
-            (Path(m["host_path"]), Path(m["container_path"]))
+            (Path(m["host_path"]), PurePosixPath(m["container_path"]))
             for m in get_cache_directory_mounts()
+            if str(m.get("container_path", "")).startswith("/")
         ]
     except Exception:
         return []
 
 
-def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
+def _translate_docker_container_media_path(candidate: PurePosixPath) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1623,7 +1638,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     # Synthetic /workspace mount for default persistent sandbox / cwd bind.
     default_ws = _default_docker_workspace_host_root()
     if default_ws is not None and not any(c.as_posix() == "/workspace" for _, c in mounts):
-        mounts.append((default_ws, Path("/workspace")))
+        mounts.append((default_ws, PurePosixPath("/workspace")))
     # Synthetic /root mount for the persistent home bind. Cache mounts above
     # are longer prefixes, so /root/.hermes/... still translates to the host
     # cache — this only catches stray home writes like /root/out.png.
@@ -1636,13 +1651,13 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
         # host-side credential denylist prefixes — refuse instead so the
         # normal "container path doesn't exist on host" rejection applies.
         if not candidate.as_posix().startswith("/root/.hermes"):
-            mounts.append((default_home, Path("/root")))
+            mounts.append((default_home, PurePosixPath("/root")))
 
     if not mounts:
         return None
 
     # Longest container-prefix match.
-    best: Optional[Tuple[Path, Path, int]] = None
+    best: Optional[Tuple[Path, PurePosixPath, int]] = None
     candidate_posix = candidate.as_posix()
     for host_root, container_root in mounts:
         container_posix = container_root.as_posix().rstrip("/") or "/"
@@ -1656,7 +1671,7 @@ def _translate_docker_container_media_path(candidate: Path) -> Optional[Path]:
     host_root, container_root, _ = best
     try:
         relative = candidate.relative_to(container_root)
-        translated = (host_root / relative).resolve(strict=True)
+        translated = host_root.joinpath(*relative.parts).resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
     if translated != host_root and not _path_is_within(translated, host_root):
@@ -1695,20 +1710,27 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
         return None
 
     try:
-        expanded = Path(os.path.expanduser(candidate))
+        expanded_raw = os.path.expanduser(candidate)
+        expanded = Path(expanded_raw)
     except (OSError, RuntimeError, ValueError):
         # expanduser raises ValueError("embedded null byte") for a ~\x00 path.
         return None
-    if not expanded.is_absolute():
-        return None
-
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded)
+    container_candidate = (
+        PurePosixPath(expanded_raw) if expanded_raw.startswith("/") else None
+    )
+    translated = (
+        _translate_docker_container_media_path(container_candidate)
+        if container_candidate is not None
+        else None
+    )
     if translated is not None:
         resolved = translated
     else:
+        if not expanded.is_absolute():
+            return None
         try:
             resolved = expanded.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
