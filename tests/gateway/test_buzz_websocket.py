@@ -8,6 +8,7 @@ lifecycle as wired into BuzzAdapter.
 
 import asyncio
 import json
+import sys
 import time
 
 import pytest
@@ -117,5 +118,129 @@ async def test_websocket_auth_raises_on_rejection():
 
     with pytest.raises(ConnectionError):
         await adapter._authenticate_websocket(RejectingWs())
+
+
+# ── Presence (kind 20001 heartbeats) ────────────────────────────────────
+
+
+def test_build_presence_event_shape():
+    event = nostr_auth.build_presence_event(
+        private_key=TEST_PRIVATE_KEY,
+        status="online",
+        created_at=1_700_000_000,
+        auxiliary_randomness=bytes(32),
+    )
+    assert event["kind"] == 20001
+    assert event["content"] == "online"
+    assert event["tags"] == [["status", "online"]]
+    assert event["pubkey"] == nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+    assert len(bytes.fromhex(event["sig"])) == 64
+    # No p-tags — the Desktop's live path trusts author = subject.
+    assert not any(tag[0] == "p" for tag in event["tags"])
+
+
+def test_build_presence_event_rejects_bad_status():
+    with pytest.raises(ValueError):
+        nostr_auth.build_presence_event(private_key=TEST_PRIVATE_KEY, status="brb")
+
+
+@pytest.mark.asyncio
+async def test_publish_presence_sends_event_over_ws():
+    adapter = _make_adapter()
+    ws = _FakeWebSocket()
+    await adapter._publish_presence(ws, "online")
+    assert len(ws.sent) == 1
+    frame = ws.sent[0]
+    assert frame[0] == "EVENT"
+    event = frame[1]
+    assert event["kind"] == 20001
+    assert event["content"] == "online"
+    assert event["pubkey"] == nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+
+
+@pytest.mark.asyncio
+async def test_presence_heartbeat_publishes_immediately_then_cancels():
+    adapter = _make_adapter()
+    ws = _FakeWebSocket()
+    task = asyncio.create_task(adapter._presence_heartbeat(ws, "online"))
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert len(ws.sent) >= 1
+    assert ws.sent[0][1]["content"] == "online"
+
+
+def test_presence_disabled_via_env(monkeypatch):
+    monkeypatch.setenv("BUZZ_NO_PRESENCE", "1")
+    assert _make_adapter()._presence_enabled is False
+    monkeypatch.delenv("BUZZ_NO_PRESENCE")
+    assert _make_adapter()._presence_enabled is True
+
+
+class _ConnectCtx:
+    def __init__(self, ws_factory):
+        self._ws_factory = ws_factory
+
+    async def __aenter__(self):
+        return self._ws_factory()
+
+    async def __aexit__(self, *args):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_publishes_presence_and_cancels_task(monkeypatch):
+    adapter = _make_adapter()
+    adapter._channel_state = {CHANNEL: {"chat_type": "group", "last_ts": 0, "seen": {}}}
+    adapter._membership_since = int(time.time())
+    sent = []
+
+    class LoopWs:
+        def __init__(self):
+            self.sent = sent
+
+        async def recv(self):
+            if not any(f[0] == "AUTH" for f in self.sent):
+                return json.dumps(["AUTH", "relay-challenge"])
+            if self.sent and self.sent[0][0] == "AUTH":
+                auth_event = self.sent[0][1]
+                return json.dumps(["OK", auth_event["id"], True, "ok"])
+            await asyncio.sleep(60)  # hang until the loop is cancelled
+
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(60)  # hang until the loop is cancelled
+            raise StopAsyncIteration
+
+    import types
+
+    fake_websockets = types.SimpleNamespace(connect=lambda *a, **k: _ConnectCtx(LoopWs))
+    monkeypatch.setitem(sys.modules, "websockets", fake_websockets)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        for _ in range(100):
+            if any(
+                f[0] == "EVENT" and f[1].get("kind") == 20001 for f in sent
+            ):
+                break
+            await asyncio.sleep(0.02)
+        presence_frames = [
+            f for f in sent if f[0] == "EVENT" and f[1].get("kind") == 20001
+        ]
+        assert presence_frames, "presence event was never published"
+        assert presence_frames[0][1]["content"] == "online"
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 

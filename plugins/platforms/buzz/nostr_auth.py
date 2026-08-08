@@ -228,3 +228,52 @@ def build_auth_event(
             auxiliary_randomness=auxiliary_randomness,
         ).hex(),
     }
+
+
+# Kind 20001 — ephemeral presence heartbeat (relay stores with a 180s TTL;
+# desktop and agents re-publish every 60s).
+KIND_PRESENCE_UPDATE = 20001
+
+
+def build_presence_event(
+    *,
+    private_key: str,
+    status: str,
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build a self-signed kind 20001 presence event.
+
+    ``status`` must be ``"online"``, ``"away"``, or ``"offline"``. The bare
+    status string is the content (the relay and Desktop read it there); a
+    ``["status", status]`` tag mirrors buzz-sdk's ``build_presence_update``
+    for structured access. No p-tags — the Desktop's live path trusts
+    author = subject.
+
+    Ephemeral kinds (20000-29999) are rejected by the relay's HTTP bridge, so
+    this event must be published over an authenticated WebSocket.
+    """
+    if status not in ("online", "away", "offline"):
+        raise ValueError("status must be online, away, or offline")
+    pubkey = public_key_hex(private_key)
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    tags: list[list[str]] = [["status", status]]
+    serialized = json.dumps(
+        [0, pubkey, timestamp, KIND_PRESENCE_UPDATE, tags, status],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    event_id = hashlib.sha256(serialized).digest()
+    return {
+        "id": event_id.hex(),
+        "pubkey": pubkey,
+        "created_at": timestamp,
+        "kind": KIND_PRESENCE_UPDATE,
+        "tags": tags,
+        "content": status,
+        "sig": schnorr_sign(
+            event_id,
+            private_key,
+            auxiliary_randomness=auxiliary_randomness,
+        ).hex(),
+    }

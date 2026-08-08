@@ -107,6 +107,13 @@ _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
+# Presence heartbeat (kind 20001, ephemeral). The relay stores presence in
+# Redis with a 180s TTL; the Desktop re-publishes every 60s. Matching that
+# cadence (60s) keeps the agent green while the gateway runs — do NOT use
+# 120s+: cron-drift experience showed 2-minute intervals can exceed the TTL.
+_PRESENCE_KIND = 20001
+_PRESENCE_HEARTBEAT_INTERVAL = 60.0
+
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
@@ -426,6 +433,14 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws_connection = None  # live websocket, while connected (presence)
+        # Presence publishing (kind 20001 heartbeats) — disabled via
+        # BUZZ_NO_PRESENCE env var or ``no_presence: true`` in config extra,
+        # for parity with buzz-acp's BUZZ_ACP_NO_PRESENCE.
+        _no_presence = (
+            os.getenv("BUZZ_NO_PRESENCE") or str(extra.get("no_presence", False) or False)
+        ).strip().lower()
+        self._presence_enabled = _no_presence not in ("1", "true", "yes", "on")
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
@@ -580,6 +595,15 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        ws = self._ws_connection
+        if ws is not None and self._presence_enabled:
+            try:
+                await self._publish_presence(ws, "offline")
+            except Exception:
+                # Relay may already be gone; it auto-clears presence when the
+                # last WS connection for the pubkey closes anyway.
+                logger.info("Buzz: offline presence publish skipped (connection closing)")
+        self._ws_connection = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -836,6 +860,46 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
 
+    # ── Presence (kind 20001 heartbeats) ─────────────────────────────────
+
+    async def _publish_presence(self, websocket, status: str) -> None:
+        """Sign and publish a presence event over the authenticated WS.
+
+        Ephemeral kinds are rejected by the relay's HTTP bridge, so presence
+        always goes over the live WebSocket. Fire-and-forget from the caller's
+        perspective: the relay answers OK but we do not wait for it — a missed
+        heartbeat is healed by the next one.
+        """
+        build_presence_event = _load_nostr_auth().build_presence_event
+        # Pure-Python secp256k1 signing is CPU-bound (~50ms/event); run it in
+        # the default executor so the inbound event pump is never stalled.
+        event = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: build_presence_event(
+                private_key=self._private_key, status=status
+            ),
+        )
+        await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+
+    async def _presence_heartbeat(self, websocket, status: str) -> None:
+        """Publish presence immediately, then every 60s until cancelled.
+
+        Runs as a side task on the live WS connection so the inbound event
+        pump is never blocked. Failures are logged and retried on the next
+        tick — presence is best-effort.
+        """
+        try:
+            while True:
+                try:
+                    await self._publish_presence(websocket, status)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Buzz: presence publish failed", exc_info=True)
+                await asyncio.sleep(_PRESENCE_HEARTBEAT_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -859,35 +923,55 @@ class BuzzAdapter(BasePlatformAdapter):
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
+                        self._ws_connection = websocket
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
-                        async for raw in websocket:
-                            try:
-                                message = json.loads(raw)
-                            except (ValueError, TypeError):
-                                logger.warning("Buzz: ignoring malformed WebSocket frame")
-                                continue
-                            if not isinstance(message, list) or not message:
-                                continue
-                            if message[0] == "EVENT" and len(message) >= 3:
-                                subscription_id = str(message[1])
-                                event = message[2]
-                                if not isinstance(event, dict):
+                        # Presence heartbeats run as a side task on this same
+                        # connection (ephemeral kinds must go over WS, never
+                        # the HTTP bridge). It publishes "online" immediately,
+                        # then every 60s; cancelled when the connection drops.
+                        presence_task = None
+                        if self._presence_enabled:
+                            presence_task = asyncio.create_task(
+                                self._presence_heartbeat(websocket, "online")
+                            )
+                        try:
+                            async for raw in websocket:
+                                try:
+                                    message = json.loads(raw)
+                                except (ValueError, TypeError):
+                                    logger.warning("Buzz: ignoring malformed WebSocket frame")
                                     continue
-                                if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    await self._handle_membership_event(websocket, subscriptions, event)
+                                if not isinstance(message, list) or not message:
                                     continue
-                                channel_id = subscriptions.get(subscription_id)
-                                state = self._channel_state.get(channel_id or "")
-                                if channel_id and state is not None:
-                                    await self._handle_event(channel_id, state, event)
-                                    self._trim_seen(state)
-                            elif message[0] == "CLOSED":
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
-                                raise ConnectionError(str(detail))
-                            elif message[0] == "NOTICE":
-                                logger.warning("Buzz: relay notice: %s", message[-1])
+                                if message[0] == "EVENT" and len(message) >= 3:
+                                    subscription_id = str(message[1])
+                                    event = message[2]
+                                    if not isinstance(event, dict):
+                                        continue
+                                    if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+                                        await self._handle_membership_event(websocket, subscriptions, event)
+                                        continue
+                                    channel_id = subscriptions.get(subscription_id)
+                                    state = self._channel_state.get(channel_id or "")
+                                    if channel_id and state is not None:
+                                        await self._handle_event(channel_id, state, event)
+                                        self._trim_seen(state)
+                                elif message[0] == "CLOSED":
+                                    detail = message[-1] if len(message) > 2 else "subscription closed"
+                                    raise ConnectionError(str(detail))
+                                elif message[0] == "NOTICE":
+                                    logger.warning("Buzz: relay notice: %s", message[-1])
+                        finally:
+                            if presence_task is not None:
+                                presence_task.cancel()
+                                try:
+                                    await presence_task
+                                except asyncio.CancelledError:
+                                    pass
+                            if self._ws_connection is websocket:
+                                self._ws_connection = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
