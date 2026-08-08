@@ -65,6 +65,15 @@ def _make_cli():
     return obj
 
 
+def _reset_skill_discovery_caches(monkeypatch) -> None:
+    import agent.skill_commands as skill_commands_mod
+
+    # Clear scan-time discovery state so each test re-resolves the patched
+    # skills dir instead of inheriting a prior governance test's command map.
+    monkeypatch.setattr(skill_commands_mod, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands_mod, "_skill_commands_platform", None)
+
+
 def test_show_help_hides_governance_blocked_skills(monkeypatch, tmp_path):
     import agent.skill_commands as skill_commands_mod
     import cli as cli_mod
@@ -195,6 +204,7 @@ def test_show_help_keeps_bundles_visible_when_unprotected(monkeypatch, tmp_path)
 
 
 def test_slash_exec_help_and_commands_hide_governance_blocked_skills(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands_mod
     from hermes_cli.slash_exec import CommandContext, execute_command
 
     home = tmp_path / "home"
@@ -206,6 +216,8 @@ def test_slash_exec_help_and_commands_hide_governance_blocked_skills(monkeypatch
 
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+    _reset_skill_discovery_caches(monkeypatch)
+    assert skill_commands_mod._skill_commands == {}
 
     help_reply = execute_command("help", CommandContext(surface="gateway"))
     commands_reply = execute_command(
