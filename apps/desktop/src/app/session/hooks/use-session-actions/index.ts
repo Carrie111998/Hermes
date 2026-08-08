@@ -3,7 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -707,7 +707,7 @@ export function useSessionActions({
           // prefetch. Watch mirrors stay live-only by design.
           const persistedTranscriptPromise = isWatchWindow()
             ? null
-            : getSessionMessages(storedSessionId, sessionProfile).catch(() => null)
+            : getLatestSessionMessages(storedSessionId, sessionProfile).catch(() => null)
 
           setFreshDraftReady(false)
           clearNotifications()
@@ -767,8 +767,17 @@ export function useSessionActions({
             } else {
               const runtimeInfo = applyRuntimeInfo(activated.info)
 
-              let activatedMessages =
-                activated.messages.length || activated.inflight || activated.queued
+              // `omit_messages` means the response carries NO transcript, not
+              // an empty one — the cache is the base and the live projection is
+              // a tail to graft onto it. Reconciling against the empty list
+              // instead rebuilds the thread out of the projection alone, so
+              // activating a session that is mid-turn somewhere else (leaving
+              // HUD mode is exactly that) collapsed the whole conversation down
+              // to the in-flight prompt until the turn finished and the
+              // post-turn hydrate restored it.
+              let activatedMessages = activated.messages_omitted
+                ? appendLiveSessionProjection(cachedViewState.messages, activated)
+                : activated.messages.length || activated.inflight || activated.queued
                   ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
                   : cachedViewState.messages
 
@@ -805,7 +814,11 @@ export function useSessionActions({
                   ...(runtimeInfo ?? {}),
                   messages: activatedMessages,
                   busy: running,
-                  awaitingResponse: running
+                  awaitingResponse: running,
+                  // Adopting someone else's turn: we'll stream its reply
+                  // without ever having received its prompt, so the settle
+                  // path must not take the "I saw it all" shortcut.
+                  adoptedRunningTurn: state.adoptedRunningTurn || running
                 }),
                 storedSessionId
               )
@@ -893,7 +906,7 @@ export function useSessionActions({
         // max(prefetch, resume) instead of their sum. The prefetch paints the
         // transcript as soon as it lands; the RPC binds the runtime id.
         // Watch windows skip the prefetch — lazy resume attaches the live mirror.
-        const prefetchPromise = watchWindow ? null : getSessionMessages(storedSessionId, sessionProfile)
+        const prefetchPromise = watchWindow ? null : getLatestSessionMessages(storedSessionId, sessionProfile)
 
         const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
@@ -965,7 +978,15 @@ export function useSessionActions({
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+                // Omitted, not empty — same trap as the activate path above.
+                // The REST prefetch IS the transcript here; the resume payload
+                // only contributes the live tail, so graft rather than rebuild.
+                // (Without a usable prefetch there is nothing better to stand
+                // on, so the projection alone remains the degraded fallback.)
+                const resumedMessages =
+                  resumed.messages_omitted && prefetchApplied && prefetchMatchesResumedSession
+                    ? appendLiveSessionProjection(localSnapshot, resumed)
+                    : reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
@@ -1022,6 +1043,7 @@ export function useSessionActions({
             messages: messagesForView,
             busy: resumedRunning,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
+            adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
             ...(inFlightRecovery.applied
               ? {
                   sawAssistantPayload: true,
@@ -1060,7 +1082,7 @@ export function useSessionActions({
         let fallbackError: unknown = null
 
         try {
-          const fallback = await getSessionMessages(storedSessionId, sessionProfile)
+          const fallback = await getLatestSessionMessages(storedSessionId, sessionProfile)
 
           if (!isCurrentResume()) {
             return
@@ -1318,7 +1340,7 @@ export function useSessionActions({
 
       try {
         await ensureGatewayProfile(profile)
-        const { messages } = await getSessionMessages(storedSessionId, profile)
+        const { messages } = await getAllSessionMessages(storedSessionId, profile)
         const branchMessages = toBranchMessages(toChatMessages(messages))
 
         if (!branchMessages.length) {

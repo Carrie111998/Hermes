@@ -3195,6 +3195,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
             "To add reference files, templates, or scripts, use "
             "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
         )
+        _add_description_prompt_preview(result, content)
+        _attach_lint_findings(result, skill_md)
         return result
 
     if _primary is None:
@@ -3206,6 +3208,34 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         }
     return _combine_cleanup_failure(
         _primary, cleanup_failure, live_mutation_committed=_live_committed
+    )
+
+
+def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
+    """Run the advisory SKILL.md linter and attach any findings to *result*.
+
+    The linter enforces the CONTRIBUTING "Skill authoring standards (HARDLINE)"
+    conventions that the hard validator does not (shell-utility references,
+    missing metadata, dangling reference links, POSIX gating, forbidden files).
+    Findings are ADVISORY — surfaced as guidance so the author can fix them,
+    never a hard block. The hard rejects already ran in _validate_frontmatter.
+    """
+    try:
+        from tools.skill_linter import lint_skill  # local import: optional path
+
+        findings = lint_skill(skill_md)
+    except Exception:
+        return
+    if not findings:
+        return
+    result["lint_warnings"] = [
+        {"severity": f.severity, "rule": f.rule, "message": f.message}
+        for f in findings
+    ]
+    result["lint_hint"] = (
+        "The skill was created. These are advisory authoring-convention "
+        "findings (not blockers) — fix them with skill_manage(action='patch') "
+        "to match Hermes skill standards."
     )
 
 

@@ -190,6 +190,52 @@ class TestCreateSkill:
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "SKILL.md").exists()
 
+    def test_create_skill_surfaces_advisory_lint_findings(self, tmp_path):
+        from tools.skill_linter import LintFinding, WARNING
+
+        finding = LintFinding(
+            WARNING,
+            "test-advisory-rule",
+            "deterministic advisory finding from the linter",
+        )
+
+        with _skill_dir(tmp_path), \
+             patch("tools.skill_linter.lint_skill", return_value=[finding]) as lint_skill:
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        skill_md = tmp_path / "my-skill" / "SKILL.md"
+        assert result["success"] is True, result
+        assert skill_md.exists()
+        lint_skill.assert_called_once_with(skill_md)
+        assert result["lint_warnings"] == [
+            {
+                "severity": WARNING,
+                "rule": "test-advisory-rule",
+                "message": "deterministic advisory finding from the linter",
+            }
+        ]
+        assert result["lint_hint"] == (
+            "The skill was created. These are advisory authoring-convention "
+            "findings (not blockers) — fix them with skill_manage(action='patch') "
+            "to match Hermes skill standards."
+        )
+
+    def test_create_skill_linter_failure_remains_advisory(self, tmp_path):
+        with _skill_dir(tmp_path), \
+             patch(
+                 "tools.skill_linter.lint_skill",
+                 side_effect=RuntimeError("deterministic linter failure"),
+             ) as lint_skill:
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        skill_md = tmp_path / "my-skill" / "SKILL.md"
+        assert result["success"] is True, result
+        assert (tmp_path / "my-skill" / "SKILL.md").exists()
+        assert result["skill_md"] == str(skill_md)
+        lint_skill.assert_called_once_with(skill_md)
+        assert "lint_warnings" not in result
+        assert "lint_hint" not in result
+
     def test_create_duplicate_blocked(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
