@@ -1391,7 +1391,15 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         except (KeyError, TypeError, ValueError):
             existing_pid = None
 
-        if existing_pid == os.getpid() and existing.get("start_time") == record.get("start_time"):
+        # Self-reacquisition: the record names THIS pid, so it is ours to
+        # refresh. Deliberately not conjoined with a start_time match. That
+        # guard exists to catch pid reuse by a *different* process, which
+        # cannot apply to a live process's own pid. Requiring it meant that
+        # whenever the two writes disagreed about start_time (None on macOS /
+        # Windows, where there is no /proc and psutil may fail), a gateway
+        # reacquiring its own lock after a reconnect fell through to the
+        # staleness path and reported itself as a foreign squatter.
+        if existing_pid == os.getpid():
             _write_json_file(lock_path, record)
             return True, existing
 
