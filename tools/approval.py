@@ -4010,7 +4010,11 @@ def check_all_command_guards(command: str, env_type: str,
     # (openai/codex#13860).
     combined_desc_for_goal = "; ".join(desc for _, desc, _ in warnings)
     goal_risk_class, goal_risk_reason = classify_goal_action(command, combined_desc_for_goal)
-    if goal_risk_class == AUTO_EXECUTE:
+    # Tirith findings are content-level security signals, not merely broad
+    # shell-pattern matches. An active goal must never silently bypass them.
+    if goal_risk_class == AUTO_EXECUTE and not any(
+        is_tirith for _, _, is_tirith in warnings
+    ):
         _audit_risk_decision(goal_risk_class, goal_risk_reason)
         return {
             "approved": True,

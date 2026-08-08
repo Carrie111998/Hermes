@@ -128,3 +128,47 @@ def test_twenty_routine_operations_need_zero_prompts_then_risk_change_needs_one(
     assert any(message.startswith("AUTO_EXECUTE reason=") for message in messages)
     assert any(message.startswith("OWNER_APPROVAL reason=") for message in messages)
     assert any(message.startswith("DENY reason=") for message in messages)
+
+
+def test_goal_authorization_does_not_bypass_tirith_warning(monkeypatch) -> None:
+    from tools import approval
+    from tools import tirith_security
+
+    prompt_count = 0
+
+    def approve_once(*_args, **_kwargs):
+        nonlocal prompt_count
+        prompt_count += 1
+        return "once"
+
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        tirith_security,
+        "check_command_security",
+        lambda _command: {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "fixture-content-risk",
+                    "severity": "HIGH",
+                    "title": "Fixture content security risk",
+                    "description": "Requires explicit owner review.",
+                }
+            ],
+            "summary": "fixture warning",
+        },
+    )
+    auth_token = approval.set_goal_authorization(_active_envelope())
+    session_token = approval.set_current_session_key("goal-tirith-e2e")
+    interactive_token = approval.set_hermes_interactive_context(True)
+    try:
+        decision = approval.check_all_command_guards(
+            "printf safe", "local", approval_callback=approve_once
+        )
+        assert decision["approved"] is True
+        assert prompt_count == 1
+        assert decision.get("goal_authorized") is not True
+    finally:
+        approval.reset_hermes_interactive_context(interactive_token)
+        approval.reset_current_session_key(session_token)
+        approval.reset_goal_authorization(auth_token)
