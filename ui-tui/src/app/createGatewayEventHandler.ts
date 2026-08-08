@@ -747,6 +747,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       }
+      case 'usage.update':
+        patchUiState(state => ({ ...state, usage: { ...state.usage, ...ev.payload } }))
+
+        return
 
       case 'thinking.delta': {
         if (!getUiState().busy) {

@@ -5759,6 +5759,12 @@ def _agent_cbs(sid: str) -> dict:
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
+        # A step begins after the preceding API response and tool batch have
+        # updated the agent's token counters. Push that fresh snapshot instead
+        # of leaving the context meter frozen until the entire turn ends.
+        "step_callback": lambda _iteration, _prev_tools: _emit(
+            "usage.update", sid, _session_usage_snapshot(_sessions.get(sid))
+        ),
         # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
         # notification.show WS event; a recovery clear becomes notification.clear.
         # Snake_case payload to match the existing gateway-event convention.
