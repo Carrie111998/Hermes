@@ -1100,7 +1100,12 @@ class QQAdapter(BasePlatformAdapter):
 
         chat_type = parsed.get("chat_type", "")
         chat_id = parsed.get("chat_id", "")
-        if chat_type == "c2c":
+        # QQ session keys are built with chat_type "dm" for 1:1 chats
+        # (``"dm" if is_dm else "group"`` where sessions are created), while QQ's
+        # own API vocabulary calls the same scene "c2c". Accept both, plus the
+        # generic private-chat aliases, or every DM button click is rejected as
+        # unauthorized even when the operator IS the chat owner.
+        if chat_type in {"c2c", "dm", "direct", "private"}:
             return bool(chat_id) and operator == chat_id
 
         if chat_type in {"group", "guild"}:
