@@ -673,3 +673,47 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+class TestUtf8BoundaryCutNotBinary:
+    """U+FFFD density heuristic: a lone replacement char must not flag binary.
+
+    Regression: read_file samples the first 1000 bytes via ``head -c 1000``,
+    and the terminal env decodes stdout with errors="replace". When the
+    1000th byte lands inside a multi-byte UTF-8 char (e.g. a 3-byte CJK
+    char), the truncated tail decodes to exactly one U+FFFD. The old logic
+    treated *any* U+FFFD as binary, so ordinary Chinese text files whose
+    size crossed the 1000-byte boundary were refused as "Binary file".
+    The fix requires U+FFFD density > 2% — a boundary cut yields ~0.1-0.3%.
+    """
+
+    def test_multibyte_utf8_boundary_cut_not_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # 8 * 44 CJK chars = 1056 UTF-8 bytes; byte 1000 cuts inside a char.
+        text = "这是一个中文文本文件，用于验证读取采样在字节边界截断多字节字符时不会被误判为二进制文件。" * 8
+        raw = text.encode("utf-8")
+        assert len(raw) > 1000, "fixture must cross the 1000-byte sample window"
+        # Simulate head -c 1000 + terminal env errors="replace" decoding —
+        # exactly what read_file feeds into _is_likely_binary.
+        sample = raw[:1000].decode("utf-8", errors="replace")
+        fffd = sample.count("\ufffd")
+        assert fffd >= 1, "boundary cut must produce a U+FFFD for this regression"
+        assert fffd / min(len(sample), 1000) < 0.02
+        assert ops._is_likely_binary("notes.txt", sample) is False
+
+    def test_utf16_bytes_high_fffd_density_flagged_binary(self, tmp_path):
+        """UTF-16-encoded text decodes to >2% U+FFFD under errors="replace"
+        and must still be flagged binary (density-based threshold)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        raw = ("这是UTF-16编码的二进制文本文件，包含大量中文字符，用于验证二进制检测逻辑。" * 10).encode("utf-16-le")
+        sample = raw[:1000].decode("utf-8", errors="replace")
+        assert sample.count("\ufffd") / min(len(sample), 1000) > 0.02
+        assert ops._is_likely_binary("notes.txt", sample) is True
+
+    def test_random_binary_bytes_high_fffd_density_flagged_binary(self, tmp_path):
+        """A random byte stream (~50% U+FFFD after replace-decoding) is binary."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = (bytes(range(256)) * 4)[:1000].decode("utf-8", errors="replace")
+        assert sample.count("\ufffd") / min(len(sample), 1000) > 0.02
+        assert ops._is_likely_binary("notes.txt", sample) is True
+
