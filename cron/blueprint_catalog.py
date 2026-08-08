@@ -127,11 +127,15 @@ CATALOG: List[AutomationBlueprint] = [
         schedule_template="{minute} {hour} * * *",
         prompt_template=(
             "Produce a concise morning briefing for the user: today's calendar "
-            "events, the local weather, and any urgent items. Keep it short and "
+            "events, the local weather, and any urgent items. When Gmail/Google "
+            "Calendar are connected, follow the google-workspace skill's "
+            "references/daily-brief.md procedure (exact day window, conflict "
+            "detection, meeting prep, mail-to-meeting links). Keep it short and "
             "scannable. If no data sources are connected, give a brief "
             "good-morning with the date and offer to connect calendar/email."
         ),
         slots=[_TIME("08:00"), _DELIVER],
+        skills=("google-workspace",),
         tags=("daily", "briefing"),
     ),
     AutomationBlueprint(
@@ -162,6 +166,7 @@ CATALOG: List[AutomationBlueprint] = [
             ),
             _DELIVER,
         ],
+        skills=("email-inbox-triage",),
         tags=("email", "monitor"),
     ),
     AutomationBlueprint(
@@ -172,9 +177,12 @@ CATALOG: List[AutomationBlueprint] = [
         category="weekly",
         schedule_template="{minute} {hour} * * {dow}",
         prompt_template=(
-            "Produce a weekly review for the user: what was accomplished this "
-            "week, still-open items, and next week's calendar. Pull from "
-            "connected sources. Keep it tight."
+            "Run the weekly-review-planning skill's procedure for the user: "
+            "review the completed week and coming 1-2 weeks across connected "
+            "calendar, tasks, notes, and email; surface commitments, stalled "
+            "projects, and waiting items; build a capacity-aware plan for next "
+            "week. Recommendations and drafts only — no mutations without "
+            "approval. Keep the output in the skill's seven-section shape."
         ),
         slots=[
             _TIME("18:00"),
@@ -185,6 +193,7 @@ CATALOG: List[AutomationBlueprint] = [
             ),
             _DELIVER,
         ],
+        skills=("weekly-review-planning",),
         tags=("weekly", "review"),
     ),
     AutomationBlueprint(
@@ -298,6 +307,44 @@ CATALOG: List[AutomationBlueprint] = [
             _DELIVER,
         ],
         tags=("reminder", "finance"),
+    ),
+    AutomationBlueprint(
+        key="price-watch",
+        title="Price & availability watch",
+        description="Watch an exact product, flight, hotel, or listing and "
+        "alert when your price or availability condition is met.",
+        category="general",
+        schedule_template="0 */{interval_h} * * *",
+        prompt_template=(
+            "Load the product-price-monitor skill and run the tick for this "
+            "watch: {item}. Alert condition: {condition}. Compare the "
+            "normalized all-in price/availability against stored state, "
+            "suppress duplicate alerts, and never overwrite last-known-good "
+            "state with a failed fetch. If no condition is met, respond with "
+            "[SILENT]. On the first run, execute the skill's setup phase "
+            "first: pin the exact item, verify one live fetch, and write the "
+            "watch contract state file."
+        ),
+        slots=[
+            BlueprintSlot(
+                name="item", type="text", label="What exactly to watch?",
+                default="a product URL or exact flight/hotel/listing description",
+                help="URL or precise description — variant, dates, seller",
+            ),
+            BlueprintSlot(
+                name="condition", type="text", label="Alert me when…",
+                default="the all-in price drops below my target",
+                help="threshold price (state the currency), availability, or terms change",
+            ),
+            BlueprintSlot(
+                name="interval_h", type="enum", label="How often?",
+                default="6", options=("1", "3", "6", "12", "24"),
+                help="hours between checks — be gentle with rate limits",
+            ),
+            _DELIVER,
+        ],
+        skills=("product-price-monitor",),
+        tags=("prices", "shopping", "travel", "monitor"),
     ),
     AutomationBlueprint(
         key="habit-checkin",
