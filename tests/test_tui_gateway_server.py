@@ -774,10 +774,6 @@ def test_reaped_agent_build_does_not_emit_stale_session_info(monkeypatch):
 
     class Agent:
         model = "test"
-        closed = False
-
-        def close(self):
-            self.closed = True
 
     agent = Agent()
 
@@ -811,7 +807,7 @@ def test_reaped_agent_build_does_not_emit_stale_session_info(monkeypatch):
         release.set()
         server._sessions.pop(sid, None)
 
-    assert agent.closed is True
+    assert session["agent"] is agent
     assert not [event for event in emitted if event[1] == sid]
 
 
