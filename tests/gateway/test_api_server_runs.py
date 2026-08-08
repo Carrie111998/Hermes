@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import threading
@@ -240,6 +241,23 @@ class TestStartRun:
         assert captured["child"] == ["scoped-test-token", "paperclip-run-1"]
         from gateway.runtime_context import get_runtime_env
 
+        assert get_runtime_env() == {}
+
+    def test_runtime_env_isolated_between_concurrent_workers(self):
+        from gateway.runtime_context import bind_runtime_env, get_runtime_env
+        from tools.environments.local import _make_run_env
+
+        barrier = threading.Barrier(2)
+
+        def _read_bound_value(value):
+            with bind_runtime_env({"PAPERCLIP_API_KEY": value}):
+                barrier.wait(timeout=10)
+                return _make_run_env({})["PAPERCLIP_API_KEY"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            values = list(pool.map(_read_bound_value, ["run-token-a", "run-token-b"]))
+
+        assert values == ["run-token-a", "run-token-b"]
         assert get_runtime_env() == {}
 
     @pytest.mark.asyncio
