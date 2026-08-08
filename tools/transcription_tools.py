@@ -260,6 +260,32 @@ def _run_ffmpeg_stt_encode(
     )
 
 
+_STT_CONTAINER_REJECTION_HINTS = ("unsupported", "corrupted", "invalid file")
+
+
+def _should_transcode_and_retry(exc) -> bool:
+    """Whether an API rejection earns one transcode-and-retry.
+
+    ``400``: unchanged. The provider names the problem, so the historical
+    keyword gate still decides; an auth or quota 400 must not trigger a
+    pointless transcode.
+
+    ``5xx``: providers disagree about how to say "I cannot read this
+    container". Some answer a bare ``system_error`` with no usable text
+    (#81644), so there is nothing to keyword-match and gating on 400 alone
+    couples the fallback to one vendor's status conventions. One retry in a
+    different container is the only way to tell a container rejection from a
+    real outage, and it is cheap: if it was an outage the retry fails too and
+    the original error still reaches the caller.
+
+    Every other status (401/403/404/429/...) re-raises, as before.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 400:
+        return any(k in str(exc).lower() for k in _STT_CONTAINER_REJECTION_HINTS)
+    return isinstance(status, int) and 500 <= status < 600
+
+
 def _transcode_audio_for_stt(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
     """Transcode ``file_path`` to a compact, broadly-accepted .m4a for STT upload.
 
@@ -2069,6 +2095,7 @@ def _transcribe_openai(
             OpenAI,
             APIError,
             APIConnectionError,
+            APIStatusError,
             APITimeoutError,
             BadRequestError,
         )
@@ -2096,9 +2123,8 @@ def _transcribe_openai(
             with tempfile.TemporaryDirectory(prefix="hermes-stt-") as work_dir:
                 try:
                     transcription = _create_transcription(file_path)
-                except BadRequestError as exc:
-                    message = str(exc).lower()
-                    if not any(k in message for k in ("unsupported", "corrupted", "invalid file")):
+                except APIStatusError as exc:
+                    if not _should_transcode_and_retry(exc):
                         raise
                     # Newer models (e.g. gpt-4o-transcribe) reject some containers
                     # whisper-1 accepted (notably Ogg/Opus voice notes). Transcode

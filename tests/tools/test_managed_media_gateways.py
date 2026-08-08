@@ -164,12 +164,16 @@ def _install_fake_openai_module(captured, transcription_response=None):
         def close(self):
             captured["close_calls"] += 1
 
+    # Mirrors the SDK's real hierarchy: BadRequestError subclasses
+    # APIStatusError, so code that catches the base also catches the 400.
+    _api_status_error = type("APIStatusError", (Exception,), {})
     fake_module = types.SimpleNamespace(
         OpenAI=FakeOpenAI,
         APIError=Exception,
         APIConnectionError=Exception,
         APITimeoutError=Exception,
-        BadRequestError=type("BadRequestError", (Exception,), {}),
+        APIStatusError=_api_status_error,
+        BadRequestError=type("BadRequestError", (_api_status_error,), {}),
     )
     sys.modules["openai"] = fake_module
 
