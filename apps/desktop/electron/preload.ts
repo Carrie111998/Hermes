@@ -8,6 +8,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
+  wakeIndicator: {
+    getState: () => ipcRenderer.invoke('hermes:wake-indicator:get'),
+    setState: state => ipcRenderer.send('hermes:wake-indicator:set', state),
+    onState: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:wake-indicator:state', listener)
+
+      return () => ipcRenderer.removeListener('hermes:wake-indicator:state', listener)
+    }
+  },
   petOverlay: {
     // Main renderer → main process: window lifecycle + drag. `request` is
     // `{ bounds, screen }`; resolves with the screen bounds it actually used.
@@ -34,6 +44,30 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:pet-overlay:control', listener)
 
       return () => ipcRenderer.removeListener('hermes:pet-overlay:control', listener)
+    }
+  },
+  // HUD mode: the chrome-free floating chat. A full app renderer (own gateway)
+  // sized as a floating bar, so it mounts the real composer. Main owns the
+  // window; `onChanged` keeps every window's toggle truthful.
+  hud: {
+    open: request => ipcRenderer.invoke('hermes:hud:open', request),
+    close: () => ipcRenderer.invoke('hermes:hud:close'),
+    setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
+    setVibrancy: on => ipcRenderer.invoke('hermes:hud:vibrancy', on),
+    // The HUD tells main which session it is on; main hands that back to the
+    // app window when the HUD closes, so the app can re-home onto it.
+    setSession: sessionId => ipcRenderer.send('hermes:hud:session', sessionId),
+    onGoto: callback => {
+      const listener = (_event, sessionId) => callback(sessionId)
+      ipcRenderer.on('hermes:hud:goto', listener)
+
+      return () => ipcRenderer.removeListener('hermes:hud:goto', listener)
+    },
+    onChanged: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:hud:changed', listener)
+
+      return () => ipcRenderer.removeListener('hermes:hud:changed', listener)
     }
   },
   // Quick Entry: the global-hotkey mini composer window. Main owns the OS
@@ -105,7 +139,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   },
   readFileText: filePath => ipcRenderer.invoke('hermes:readFileText', filePath),
   selectPaths: options => ipcRenderer.invoke('hermes:selectPaths', options),
+  selectSavePath: options => ipcRenderer.invoke('hermes:selectSavePath', options),
   writeClipboard: text => ipcRenderer.invoke('hermes:writeClipboard', text),
+  readClipboard: () => ipcRenderer.invoke('hermes:readClipboard'),
   saveImageFromUrl: url => ipcRenderer.invoke('hermes:saveImageFromUrl', url),
   saveImageBuffer: (data, ext) => ipcRenderer.invoke('hermes:saveImageBuffer', { data, ext }),
   saveClipboardImage: () => ipcRenderer.invoke('hermes:saveClipboardImage'),
@@ -154,6 +190,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   gitRoot: startPath => ipcRenderer.invoke('hermes:fs:gitRoot', startPath),
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
   openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
+  desktopPluginsRoot: () => ipcRenderer.invoke('hermes:fs:desktopPluginsRoot'),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),
   trashPath: targetPath => ipcRenderer.invoke('hermes:fs:trash', targetPath),
@@ -209,6 +246,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:close-preview-requested', listener)
 
     return () => ipcRenderer.removeListener('hermes:close-preview-requested', listener)
+  },
+  onOpenFolderRequested: callback => {
+    const listener = () => callback()
+    ipcRenderer.on('hermes:open-folder-requested', listener)
+
+    return () => ipcRenderer.removeListener('hermes:open-folder-requested', listener)
   },
   onOpenUpdatesRequested: callback => {
     const listener = () => callback()
@@ -266,6 +309,14 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:power-resume', listener)
 
     return () => ipcRenderer.removeListener('hermes:power-resume', listener)
+  },
+  // AC ↔ battery transitions; renderers slow their backstop polls on battery.
+  getOnBattery: () => ipcRenderer.invoke('hermes:power-battery:get'),
+  onBatteryChanged: callback => {
+    const listener = (_event, onBattery) => callback(Boolean(onBattery))
+    ipcRenderer.on('hermes:power-battery', listener)
+
+    return () => ipcRenderer.removeListener('hermes:power-battery', listener)
   },
   onBootProgress: callback => {
     const listener = (_event, payload) => callback(payload)
