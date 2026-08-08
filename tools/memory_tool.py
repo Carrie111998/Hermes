@@ -1074,6 +1074,24 @@ def memory_tool(
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    # Same strict-provider null-filling issue as target above: action is
+    # documented as optional (omit when using 'operations'), but a model
+    # can pass action: null explicitly, or simply forget it on a single-op
+    # call. Default to "add" when content is supplied without old_text --
+    # the natural reading of a single-op call with only content set -- so
+    # the write succeeds instead of failing with the confusing "Unknown
+    # action 'None'" message (issue #81542). Batch calls (operations set)
+    # are unaffected: this only applies to the single-op path below.
+    if action is None and not operations:
+        if content and not old_text:
+            action = "add"
+        else:
+            return tool_error(
+                "Missing 'action'. Provide action ('add', 'replace', or 'remove') for a "
+                "single-op call, or 'operations' for a batch call.",
+                success=False,
+            )
+
     # --- Batch path -------------------------------------------------------
     if operations:
         if not isinstance(operations, list):

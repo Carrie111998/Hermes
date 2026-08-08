@@ -307,6 +307,42 @@ class TestMemoryToolDispatcher:
         assert "current_entries" not in result
 
 
+    def test_none_action_with_content_defaults_to_add(self, store):
+        """Regression for issue #81542: a strict provider filling the
+        optional 'action' field with JSON null (or a model simply
+        forgetting it on a single-op call) must not fail with the
+        confusing "Unknown action 'None'" message when content is
+        clearly present with no old_text -- the natural single-op shape
+        for adding an entry. Mirrors the existing null-target handling."""
+        result = json.loads(memory_tool(action=None, content="a new fact", store=store))
+        assert result["success"] is True
+        assert "a new fact" in store._entries_for("memory")
+
+    def test_none_action_without_content_gives_actionable_error(self, store):
+        """When there's truly nothing to dispatch on (no action, no
+        operations, no content to imply 'add'), the error must guide the
+        model toward the fix instead of the confusing "Unknown action
+        'None'" message."""
+        result = json.loads(memory_tool(action=None, store=store))
+        assert result["success"] is False
+        assert "Unknown action" not in result["error"]
+        assert "action" in result["error"].lower()
+
+    def test_none_action_is_not_defaulted_in_batch_mode(self, store):
+        """action=None alongside operations= must not trigger the
+        single-op default-to-add path -- the batch path handles its own
+        per-operation action values independently."""
+        result = json.loads(
+            memory_tool(
+                action=None,
+                operations=[{"action": "add", "content": "batched fact"}],
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert "batched fact" in store._entries_for("memory")
+
+
 class TestMemoryBatch:
     """The 'operations' batch shape: atomic, all-or-nothing, final-budget."""
 
