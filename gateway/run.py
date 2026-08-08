@@ -12043,7 +12043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # In-flight agent work on the destination key must never be
         # hijacked, regardless of what the DB row says (a session can
         # be mid-first-turn before any message is persisted).
-        if self.session_store._has_active_processes_safe(
+        if await self.async_session_store._has_active_processes_safe(
             session_key, context="handoff"
         ):
             raise RuntimeError(
