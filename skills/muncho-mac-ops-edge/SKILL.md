@@ -11,24 +11,31 @@ metadata:
 
 # Protected Mac operations edge
 
-Use this edge only when you decide that required evidence is available through
-the separately authenticated Mac browser or an explicitly selected local
-read-only surface. The edge does not interpret the request and does not choose
-whether it is needed; you do.
+Check the normal least-privilege cloud path first. Use this edge only when the
+task depends on concrete Mac-resident state unavailable to the 24/7 cloud
+runtime: an authenticated local browser or app session, explicitly reviewed
+Mac-local files, or Mac-local CLI/private-network state. Code checkout, tests,
+CI, Git/GitLab, GCP API, and generic CLI work are not Mac-only merely because
+they ran on Emil's Mac before. The edge does not interpret the request or
+choose where work runs; you do.
 
 ## Contract
 
 Call `mac_ops_readonly_submit` with:
 
 - one explicit read-only `task_class`;
+- one explicit `mac_only_capability` selected only after the cloud-path check;
 - a stable idempotency key for the exact contract;
-- a complete contract with these headings: `Objective`, `Allowed scope`,
-  `Forbidden actions`, `Secrets handling`, `Verification`, `Expected report`.
+- a complete contract with these headings: `Objective`, `Mac-only basis`,
+  `Allowed scope`, `Forbidden actions`, `Secrets handling`, `Verification`,
+  `Expected report`.
 
-State the concrete evidence to retrieve and its allowed scope. Forbid writes,
-publishing, messaging, approval, configuration, and account changes unless the
-user has separately approved a later mutation protocol. Never include tokens,
-passwords, cookies, or private keys.
+State the concrete Mac-only evidence to retrieve, why a scoped cloud worker
+cannot retrieve it, and its allowed scope. If no listed Mac-only capability is
+required, do not submit the handoff. Forbid writes, publishing, messaging,
+approval, configuration, and account changes unless the user has separately
+approved a later mutation protocol. Never include tokens, passwords, cookies,
+or private keys.
 
 After submission, call `mac_ops_task_read` with the returned issue IID. An open
 issue or a queued receipt is not completion. Read the returned evidence, decide
