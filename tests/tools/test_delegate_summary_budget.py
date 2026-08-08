@@ -69,6 +69,34 @@ def test_batch_overflow_trimmed_and_spilled_losslessly(monkeypatch):
             assert os.path.join("cache", "delegation") in path
 
 
+@pytest.mark.parametrize(
+    ("backend", "visible_prefix"),
+    [
+        ("docker", "/root/.hermes/cache/delegation/"),
+        ("modal", "/root/.hermes/cache/delegation/"),
+        ("ssh", "~/.hermes/cache/delegation/"),
+        ("local", None),
+    ],
+)
+def test_summary_footer_publishes_agent_visible_spill_path(
+    tmp_path, monkeypatch, backend, visible_prefix
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+
+    summary = "HEAD\n" + ("middle\n" * 500) + "TAIL"
+    model_text, host_path = dt._trim_summary_with_footer(summary, 1000, 0)
+
+    assert host_path is not None and os.path.exists(host_path)
+    with open(host_path, encoding="utf-8") as fh:
+        assert fh.read() == summary
+    if visible_prefix is None:
+        assert host_path in model_text
+    else:
+        assert visible_prefix in model_text
+        assert host_path not in model_text
+
+
 def test_empty_results_is_noop():
     # No summaries → nothing to do, must not raise.
     dt._apply_summary_budget([], _FakeParent(131_000, 1_000, 8_000))

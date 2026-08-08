@@ -54,6 +54,36 @@ class TestTruncation:
         assert "UNIQUE_MIDDLE_MARKER" in full
         assert "row 2500" in full  # the omitted-middle row is in the stored file
 
+    @pytest.mark.parametrize(
+        ("backend", "visible_prefix"),
+        [
+            ("docker", "/root/.hermes/cache/web/"),
+            ("modal", "/root/.hermes/cache/web/"),
+            ("ssh", "~/.hermes/cache/web/"),
+            ("local", None),
+        ],
+    )
+    def test_footer_publishes_agent_visible_stored_path(
+        self, tmp_path, monkeypatch, backend, visible_prefix
+    ):
+        hermes_home = tmp_path / ".hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_ENV", backend)
+        body = "\n".join(f"row {i}" for i in range(1000))
+
+        out, truncated = wt._truncate_with_footer(
+            body, "https://example.com/doc", 1000
+        )
+
+        assert truncated is True
+        stored = list((hermes_home / "cache" / "web").glob("*.md"))
+        assert len(stored) == 1 and stored[0].read_text(encoding="utf-8") == body
+        if visible_prefix is None:
+            assert str(stored[0]) in out
+        else:
+            assert visible_prefix in out
+            assert str(stored[0]) not in out
+
 
 class TestCharLimitConfig:
     def test_default_when_unset(self):
