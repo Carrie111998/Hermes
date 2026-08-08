@@ -204,6 +204,26 @@ def test_webhook_rejects_invalid_producer_without_creating_a_card(board):
         assert conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"] == 0
 
 
+def test_webhook_draft_is_parked_in_triage_with_source_metadata(board):
+    with board as conn:
+        task_id = kb.ingest_pull_request(
+            conn,
+            repository="SoLoVisionLLC/SoLoFamilyPlan",
+            number=112,
+            head_sha="d" * 40,
+            title="Draft PR",
+            draft=True,
+            reviewer="reviewer",
+        )
+        assert task_id is not None
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.metadata is not None
+        assert task.status == "triage"
+        assert task.metadata["source"] == "github_pull_request"
+        assert task.metadata["draft"] is True
+
+
 def test_webhook_replay_preserves_native_review_claim(board):
     with board as conn:
         task_id = kb.create_task(conn, title="implement", assignee="dev")

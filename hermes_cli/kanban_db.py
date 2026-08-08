@@ -4462,6 +4462,7 @@ def ingest_pull_request(
         task_id = create_task(
             conn, title=desired_title, body=body, assignee=desired_assignee,
             idempotency_key=key, created_by="github-webhook", initial_status=status,
+            metadata=details,
         )
         _append_event(conn, task_id, "github_pr_ingested", details)
     return task_id
@@ -6429,11 +6430,25 @@ def block_task(
             else 0
         )
 
-        # Dependency blocks never enter the human ``blocked`` bucket — they
-        # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
-        # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
-        if kind == "dependency":
+        # A dependency wait is only safely requeueable when the task actually
+        # has an unfinished parent. Workers sometimes describe an external PR
+        # state ("waiting on DEV") as a dependency even though no Kanban parent
+        # exists. Sending those parentless tasks to ``todo`` makes the
+        # dispatcher immediately respawn the same worker forever.
+        unfinished_parent = conn.execute(
+            """
+            SELECT 1
+              FROM task_links AS l
+              JOIN tasks AS p ON p.id = l.parent_id
+             WHERE l.child_id = ?
+               AND p.status != 'done'
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if kind == "dependency" and unfinished_parent is not None:
+            # Real dependency blocks wait in ``todo`` and let
+            # ``recompute_ready`` gate on the unfinished parent.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -8796,6 +8811,38 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _is_review_lifecycle_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether a card has entered the native Review lifecycle.
+
+    Review cards can be requeued as ``ready`` for implementer remediation,
+    or can be promoted by recovery code after a failed review spawn.  Their
+    existing PR is expected in both cases, so the ordinary duplicate-PR
+    respawn guard must not strand them in Ready.  This deliberately keys off
+    durable lifecycle events rather than the current status, which is the
+    state that gets lost during the failing transition.
+    """
+    row = conn.execute(
+        "SELECT metadata FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is not None and row["metadata"]:
+        try:
+            metadata = json.loads(row["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if isinstance(metadata, dict) and metadata.get("existing_pr_remediation") is True:
+            return True
+
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if payload.get("source_status") == "review":
+                return True
+        if event.kind == "review_submitted":
+            return True
+    return False
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8920,6 +8967,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Native Review cards are the exception: returning a review card to Ready
+    # is an intentional review/remediation retry against the existing PR, not
+    # a request to create a duplicate implementation PR.
+    if _is_review_lifecycle_task(conn, task_id):
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
