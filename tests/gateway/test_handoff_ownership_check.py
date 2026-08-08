@@ -258,7 +258,7 @@ async def test_handoff_rejects_when_dest_has_active_agent_work(tmp_path):
         active_processes=True,
     )
 
-    with pytest.raises(RuntimeError, match="already bound to live gateway session"):
+    with pytest.raises(RuntimeError, match="has active agent work"):
         await runner._process_handoff({
             "id": "cli-session",
             "title": "CLI work",
@@ -292,3 +292,22 @@ async def test_handoff_fails_closed_when_bound_session_state_unverifiable(tmp_pa
 
     assert runner.session_store.switch_calls == []
     runner._handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handoff_proceeds_when_no_session_db(tmp_path):
+    """Without a SessionDB the guard falls back to routing-entry + active-work
+    signals only, and does NOT fail closed on the absent DB (JSONL fallback /
+    memory-only store must still be able to hand off)."""
+    key = _dest_key()
+    runner = _make_qq_runner(None, prebound_entries={key: "in-memory-session"})
+    runner._session_db = None
+
+    await runner._process_handoff({
+        "id": "cli-session",
+        "title": "CLI work",
+        "handoff_platform": "qqbot",
+    })
+
+    assert runner.session_store.switch_calls == [(key, "cli-session")]
+    runner._handle_message.assert_awaited_once()
