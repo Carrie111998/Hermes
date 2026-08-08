@@ -901,6 +901,9 @@ class TestOpenAIModelExecutionGuidance:
         text = OPENAI_MODEL_EXECUTION_GUIDANCE.lower()
         assert "do not resend the same tool call" in text
         assert "change the arguments, selector, path, or strategy" in text
+        assert "github actions log failures" in text
+        assert "job-log api" in text
+        assert "external blocker" in text
 
 
     def test_guidance_is_string(self):
