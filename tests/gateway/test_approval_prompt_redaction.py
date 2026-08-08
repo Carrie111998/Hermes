@@ -62,7 +62,7 @@ class TestRedactApprovalCommand:
 
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
-    1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
+    1. the chat-platform path (_approval_notify_sync in gateway/turn_runner.py), and
     2. the SSE/API path (_approval_notify in gateway/platforms/api_server.py),
     each of which must route the command through _redact_approval_command and
     REASSIGN the redacted value before any send/enqueue (so the raw command
@@ -111,9 +111,11 @@ class TestApprovalCommandWiring:
         )
 
     def test_chat_platform_path_redacts_before_send(self):
-        import gateway.run as run
+        # Slice 15 (#77724) moved the chat-platform approval-notify wiring
+        # into the TurnRunner module; the guard follows the extraction.
+        import gateway.turn_runner as turn_runner
 
-        self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
+        self._assert_redacts_then_uses(turn_runner, "_approval_notify_sync", "send_exec_approval")
 
     def test_sse_api_path_redacts_before_enqueue(self):
         from gateway.platforms import api_server

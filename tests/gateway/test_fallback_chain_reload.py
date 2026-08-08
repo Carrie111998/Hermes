@@ -77,9 +77,11 @@ def test_background_and_main_agent_paths_call_refresh():
     """
     from pathlib import Path
 
-    source = (
-        Path(__file__).resolve().parent.parent.parent / "gateway" / "run.py"
-    ).read_text(encoding="utf-8")
+    # TurnRunner.run_sync moved to gateway/turn_runner.py (issue #54962), so
+    # the source-level invariant spans both gateway modules.
+    gateway_dir = Path(__file__).resolve().parent.parent.parent / "gateway"
+    source = (gateway_dir / "run.py").read_text(encoding="utf-8")
+    source += (gateway_dir / "turn_runner.py").read_text(encoding="utf-8")
     # The agent-construction site inside TurnRunner.run_sync (extracted from
     # the old _run_agent_inner closure) references the runner as
     # ``self._runner``; the background-agent site still uses bare ``self``.
