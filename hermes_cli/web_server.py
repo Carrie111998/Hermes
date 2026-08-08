@@ -60,6 +60,7 @@ from hermes_cli import __version__, __release_date__
 from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
+    NEUTRAL_PERSONALITY_NAMES,
     OPTIONAL_ENV_VARS,
     clear_model_endpoint_credentials,
     get_config_path,
@@ -6959,6 +6960,32 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _validate_web_personality(incoming: Dict[str, Any], existing: Dict[str, Any]) -> None:
+    """Reject an unknown ``display.personality`` from the dashboard.
+
+    The dashboard writes the personality *by name*; the prompt overlay is
+    resolved at startup by ``resolve_personality_overlay``. Writing the
+    personality's text into ``agent.system_prompt`` here would clobber the
+    user's manual prompt, so the name is all that is persisted.
+    """
+    display = incoming.get("display")
+    if not isinstance(display, dict) or "personality" not in display:
+        return
+
+    raw = str(display.get("personality") or "").strip()
+    name = raw.lower()
+    if not name or name in NEUTRAL_PERSONALITY_NAMES:
+        display["personality"] = ""
+        return
+
+    merged_agent = {**(existing.get("agent") or {}), **(incoming.get("agent") or {})}
+    personalities = merged_agent.get("personalities")
+    if not isinstance(personalities, dict) or name not in personalities:
+        raise HTTPException(status_code=400, detail=f"Unknown personality: `{raw}`.")
+
+    display["personality"] = name
+
+
 @app.put("/api/config")
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     def _run():
@@ -6972,6 +6999,7 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             with _CONFIG_MUTATION_LOCK:
                 existing = read_raw_config()
                 incoming = _denormalize_config_from_web(body.config)
+                _validate_web_personality(incoming, existing)
                 save_config(_deep_merge(existing, incoming))
         return {"ok": True}
 

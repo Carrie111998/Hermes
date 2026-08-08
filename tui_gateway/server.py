@@ -5933,14 +5933,32 @@ def _wire_callbacks(sid: str):
 
 
 def _render_personality_prompt(value) -> str:
-    if isinstance(value, dict):
-        parts = [value.get("system_prompt", "")]
-        if value.get("tone"):
-            parts.append(f'Tone: {value["tone"]}')
-        if value.get("style"):
-            parts.append(f'Style: {value["style"]}')
-        return "\n".join(p for p in parts if p)
-    return str(value)
+    """Thin alias for the canonical renderer in ``hermes_cli.config``."""
+    from hermes_cli.config import render_personality_prompt
+
+    return render_personality_prompt(value)
+
+
+def _composed_personality_overlay(pname: str, personality_prompt: str) -> str:
+    """The overlay a restart would resolve for ``pname``.
+
+    Keeps the live session's ephemeral prompt byte-identical to what
+    :func:`hermes_cli.config.resolve_personality_overlay` produces from the
+    saved config, so selecting a personality now and restarting later behave
+    the same.
+    """
+    from hermes_cli.config import resolve_personality_overlay
+
+    try:
+        cfg = _load_cfg()
+    except Exception:
+        return personality_prompt
+    manual = (cfg.get("agent") or {}).get("system_prompt", "")
+    probe = {
+        "agent": {"system_prompt": manual, "personalities": _available_personalities(cfg)},
+        "display": {"personality": pname},
+    }
+    return resolve_personality_overlay(probe)
 
 
 def _available_personalities(cfg: dict | None = None) -> dict:
@@ -5990,7 +6008,11 @@ def _prompt_text(value) -> str:
 
 
 def _apply_personality_to_session(
-    sid: str, session: dict, new_prompt: str, personality: str = ""
+    sid: str,
+    session: dict,
+    new_prompt: str,
+    personality: str = "",
+    overlay: str | None = None,
 ) -> tuple[bool, dict | None]:
     """Apply a personality change to an existing session without resetting history.
 
@@ -5998,6 +6020,13 @@ def _apply_personality_to_session(
     takes effect on the next turn.  The cached base system prompt is left intact
     (ephemeral_system_prompt is appended at API-call time, not baked into the
     cache), which preserves prompt-cache hits.
+
+    ``new_prompt`` is the personality's own text and drives the pivot marker.
+    ``overlay`` is what the agent actually runs with — the manual
+    ``agent.system_prompt`` composed with that personality, matching what
+    :func:`resolve_personality_overlay` returns on the next start so the
+    session does not silently change behavior across a restart.  It defaults
+    to ``new_prompt`` for callers that have no manual prompt to compose.
 
     Also injects a system-role marker into the conversation history so the model
     knows to pivot its style from this point forward (without this, LLMs tend to
@@ -6012,7 +6041,8 @@ def _apply_personality_to_session(
 
     agent = session.get("agent")
     if agent:
-        agent.ephemeral_system_prompt = new_prompt or None
+        effective = new_prompt if overlay is None else overlay
+        agent.ephemeral_system_prompt = effective or None
         # Inject a pivot marker into history so the model sees the change point.
         # This prevents it from pattern-matching its prior style.
         if new_prompt:
@@ -11336,11 +11366,18 @@ def _(rid, params: dict) -> dict:
             elif key == "personality":
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
+                # The selection is recorded by name; the personality's text is
+                # an in-session overlay resolved at startup by
+                # resolve_personality_overlay(). Writing it into
+                # agent.system_prompt would destroy the user's manual prompt.
                 _write_config_key("display.personality", pname)
-                _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
-                    sid_key, session, new_prompt, pname
+                    sid_key,
+                    session,
+                    new_prompt,
+                    pname,
+                    overlay=_composed_personality_overlay(pname, new_prompt),
                 )
             else:
                 _write_config_key(f"display.{key}", value)
