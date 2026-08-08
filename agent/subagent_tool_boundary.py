@@ -10,7 +10,9 @@ from typing import Any
 LOCAL_EVO_TOOL_NAMES = frozenset(
     {"terminal", "read_file", "write_file", "patch", "search_files"}
 )
-HOST_BROKERED_EVO_TOOL_NAMES = frozenset({"scaffolde_evo_agent_dispatch"})
+HOST_BROKERED_EVO_TOOL_NAMES = frozenset(
+    {"scaffolde_evo_agent_dispatch", "scaffolde_evo_run"}
+)
 SUPPORTED_EVO_TOOL_NAMES = LOCAL_EVO_TOOL_NAMES | HOST_BROKERED_EVO_TOOL_NAMES
 
 
