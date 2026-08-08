@@ -1792,6 +1792,9 @@ def test_dump_api_request_debug_redacts_secrets(monkeypatch, tmp_path):
     import agent.redact as redact_mod
 
     monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", False)
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     agent = _build_agent(monkeypatch)
     agent.logs_dir = tmp_path
 
