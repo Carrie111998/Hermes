@@ -152,33 +152,6 @@ def _bang_env() -> dict:
         return os.environ.copy()
 
 
-def _kill_bang_process_tree(proc: subprocess.Popen[str]) -> None:
-    """Best-effort kill of *proc* and every descendant it spawned.
-
-    ``proc.kill()`` alone signals only the shell wrapper, leaving the
-    grandchildren the user actually launched still running — and, because they
-    inherited the write end of our stdout pipe, still holding it open. The
-    command is spawned into its own process group precisely so the whole group
-    can be taken down here, which is also what
-    ``tools/environments/local.py::_kill_process`` already does for the
-    terminal tool's commands.
-    """
-    try:
-        from hermes_cli._subprocess_compat import _kill_git_process_tree
-
-        # Platform-generic despite the name: ``os.killpg`` on POSIX (only when
-        # the child leads its own group, so a shared group is never blasted)
-        # and ``taskkill /T /F`` on Windows.
-        _kill_git_process_tree(proc)
-        return
-    except Exception:
-        pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
-
-
 def run_bang_command(
     command: str,
     *,
@@ -341,4 +314,31 @@ def run_bang_command(
             pass
 
     return int(proc.returncode or 0)
+
+
+def _kill_bang_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Best-effort kill of *proc* and every descendant it spawned.
+
+    ``proc.kill()`` alone signals only the shell wrapper, leaving the
+    grandchildren the user actually launched still running — and, because they
+    inherited the write end of our stdout pipe, still holding it open. The
+    command is spawned into its own process group precisely so the whole group
+    can be taken down here, which is also what
+    ``tools/environments/local.py::_kill_process`` already does for the
+    terminal tool's commands.
+    """
+    try:
+        from hermes_cli._subprocess_compat import _kill_git_process_tree
+
+        # Platform-generic despite the name: ``os.killpg`` on POSIX (only when
+        # the child leads its own group, so a shared group is never blasted)
+        # and ``taskkill /T /F`` on Windows.
+        _kill_git_process_tree(proc)
+        return
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
