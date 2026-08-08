@@ -56,9 +56,9 @@ describe("resolvePageTitle", () => {
 
   it("prefers a plugin's own label when it overrides the root path (#80891)", () => {
     // A plugin with tab: { path: "/example", override: "/" } is registered
-    // in pluginTabs under the "/" key (its own path, not the override
-    // target's) -- resolvePageTitle must consult pluginTabs before
-    // special-casing "/" to the hardcoded "Sessions" title.
+    // in pluginTabs under the "/" key (the override target's path, not
+    // the plugin's own) -- resolvePageTitle must consult pluginTabs
+    // before special-casing "/" to the hardcoded "Sessions" title.
     expect(
       resolvePageTitle("/", t, [{ path: "/", label: "Example Plugin" }]),
     ).toBe("Example Plugin");
