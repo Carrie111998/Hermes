@@ -652,13 +652,14 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
 
     seen = []
     built = threading.Event()
+    release = threading.Event()
 
-    monkeypatch.setattr(
-        server,
-        "_make_agent",
-        lambda *args, **kwargs: built.set()
-        or type("Agent", (), {"model": "test"})(),
-    )
+    def _make_agent(*_args, **_kwargs):
+        built.set()
+        release.wait(timeout=2)
+        return type("Agent", (), {"model": "test"})()
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
     monkeypatch.setattr(
         "tui_gateway.entry.ensure_mcp_discovery_started",
         lambda: seen.append(str(get_hermes_home())),
@@ -667,6 +668,11 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
 
     ready = threading.Event()
     sid = "test-sid"
@@ -679,8 +685,14 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
+        thread = session["_agent_build_thread"]
         assert built.wait(timeout=2)
+        assert server._sessions.pop(sid) is session
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
     finally:
+        release.set()
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
@@ -707,11 +719,13 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
 
     scopes = []
     built = threading.Event()
+    release = threading.Event()
 
     def _fake_make_agent(*args, **kwargs):
         scope = current_secret_scope()
         scopes.append(dict(scope) if scope else None)
         built.set()
+        release.wait(timeout=2)
         return type("Agent", (), {"model": "test"})()
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
@@ -722,6 +736,11 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
 
     ready = threading.Event()
     sid = "test-secret-sid"
@@ -734,11 +753,66 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
+        thread = session["_agent_build_thread"]
         assert built.wait(timeout=2)
+        assert server._sessions.pop(sid) is session
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
     finally:
+        release.set()
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
+
+
+def test_reaped_agent_build_does_not_emit_stale_session_info(monkeypatch):
+    """A build completing after its session is reaped must discard its agent."""
+    entered = threading.Event()
+    release = threading.Event()
+    emitted = []
+
+    class Agent:
+        model = "test"
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = Agent()
+
+    def _make_agent(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, payload)),
+    )
+
+    sid = "reaped-build-sid"
+    session = {"agent_ready": threading.Event(), "session_key": "reaped-build-key"}
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        thread = session["_agent_build_thread"]
+        assert entered.wait(timeout=2)
+        assert server._sessions.pop(sid) is session
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    finally:
+        release.set()
+        server._sessions.pop(sid, None)
+
+    assert agent.closed is True
+    assert not [event for event in emitted if event[1] == sid]
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):

@@ -2249,6 +2249,20 @@ def _start_agent_build(sid: str, session: dict) -> None:
             finally:
                 _clear_session_context(tokens)
 
+            # A close/reaper can detach the session while the agent is still
+            # being constructed. Do not publish a stale session.info frame or
+            # leave that discarded agent alive after its owner has gone away.
+            with _sessions_lock:
+                is_live = _sessions.get(sid) is current
+            if not is_live:
+                try:
+                    close = getattr(agent, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.debug("failed to close discarded agent", exc_info=True)
+                return
+
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
