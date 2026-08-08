@@ -57,6 +57,10 @@ describe('normalizeTimestampMs', () => {
     expect(normalizeTimestampMs(1_700_000_000)).toBe(1_700_000_000_000)
   })
 
+  it('uses the seconds-first contract for ambiguous early positive values', () => {
+    expect(normalizeTimestampMs(1_000)).toBe(1_000_000)
+  })
+
   it('keeps epoch millisecond inputs unchanged', () => {
     expect(normalizeTimestampMs(1_700_000_123_456)).toBe(1_700_000_123_456)
   })

@@ -94,6 +94,23 @@ describe('collectArtifactsForSession', () => {
     expect(artifacts[0]?.timestamp).toBe(1_700_000_123_456)
   })
 
+  it('falls back to the session timestamp when a message timestamp is non-finite', () => {
+    const session = makeSession({ last_active: 1_700_000_000 })
+
+    for (const timestamp of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const artifacts = collectArtifactsForSession(session, [
+        {
+          content: 'Reference: https://example.com/fallback',
+          role: 'assistant',
+          timestamp
+        }
+      ])
+
+      expect(artifacts).toHaveLength(1)
+      expect(artifacts[0]?.timestamp).toBe(1_700_000_000_000)
+    }
+  })
+
   it('resolves remote image artifact thumbnails through the desktop fs bridge', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path.startsWith('/api/fs/read-data-url?')) {

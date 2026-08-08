@@ -251,6 +251,13 @@ function collectRelaunchEnv(env) {
       continue
     }
 
+    // The watcher script is a readable temporary file. The relaunched child
+    // retains this token through its inherited environment, so never export it
+    // into that script.
+    if (key === 'HERMES_DESKTOP_REMOTE_TOKEN') {
+      continue
+    }
+
     if (PRESERVED_ENV_KEYS.includes(key) || PRESERVED_ENV_PREFIXES.some(p => key.startsWith(p))) {
       out[key] = String(value)
     }

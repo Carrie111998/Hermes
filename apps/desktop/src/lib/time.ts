@@ -14,7 +14,8 @@ const EPOCH_MS_THRESHOLD = 100_000_000_000
  *
  * - `null` / `undefined` / `NaN` / non-finite => `null`
  * - `<= 0` => `null` (preserves existing "no timestamp" semantics)
- * - `< EPOCH_MS_THRESHOLD` => treated as Unix seconds
+ * - `< EPOCH_MS_THRESHOLD` => treated as Unix seconds. Bare early-epoch
+ *   values are ambiguous, and follow this seconds-first compatibility contract.
  * - otherwise => treated as epoch milliseconds
  */
 export function normalizeTimestampMs(value: null | number | undefined): null | number {

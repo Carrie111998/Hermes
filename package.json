@@ -53,6 +53,8 @@
     "brace-expansion": "5.0.9",
     "undici": "^7.28.0",
     "fast-uri": "^4.1.2",
+    "js-yaml": "4.3.1",
+    "postcss": "8.5.26",
     "react": "19.2.7",
     "react-dom": "19.2.7"
   },
@@ -66,7 +68,7 @@
     "node-pty@1.1.0": true,
     "electron-winstaller@5.4.0": true,
     "agent-browser@0.26.0": true,
-    "electron@40.10.2": true,
+    "electron@41.10.3": true,
     "fsevents@2.3.2": true,
     "fsevents@2.3.3": true
   }

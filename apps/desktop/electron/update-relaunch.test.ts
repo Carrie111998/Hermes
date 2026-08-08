@@ -155,7 +155,7 @@ test('collectRelaunchArgs drops Electron internals, keeps user/launcher args', (
   assert.deepEqual(collectRelaunchArgs(undefined), [])
 })
 
-test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-out only', () => {
+test('collectRelaunchEnv preserves relaunch context but omits the remote token', () => {
   const env = {
     HERMES_HOME: '/home/u/.hermes',
     HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
@@ -168,14 +168,27 @@ test('collectRelaunchEnv preserves HERMES_HOME + HERMES_DESKTOP_* + sandbox opt-
     UNRELATED: 'x'
   }
 
-  assert.deepEqual(collectRelaunchEnv(env), {
+  const relaunchEnv = collectRelaunchEnv(env)
+
+  assert.deepEqual(relaunchEnv, {
     HERMES_HOME: '/home/u/.hermes',
     HERMES_DESKTOP_REMOTE_URL: 'http://box:9119',
-    HERMES_DESKTOP_REMOTE_TOKEN: 'secret',
     HERMES_DESKTOP_HERMES_ROOT: '/home/u/dev/hermes',
     HERMES_DESKTOP_APP_NAME: 'HermesSandbox',
     ELECTRON_DISABLE_SANDBOX: '1'
   })
+  assert.equal('HERMES_DESKTOP_REMOTE_TOKEN' in relaunchEnv, false)
+
+  const script = buildRelaunchScript({
+    pid: 1,
+    execPath: '/opt/Hermes/Hermes',
+    args: [],
+    env: relaunchEnv,
+    cwd: ''
+  })
+
+  assert.doesNotMatch(script, /HERMES_DESKTOP_REMOTE_TOKEN/)
+  assert.doesNotMatch(script, /secret/)
   assert.deepEqual(collectRelaunchEnv(null), {})
 })
 

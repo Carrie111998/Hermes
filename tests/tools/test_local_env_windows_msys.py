@@ -415,6 +415,59 @@ class TestGitBashCoreutilsOnPath:
 
 
 # ---------------------------------------------------------------------------
+# Managed runtime PATH entries — logical-platform tests must not discard valid
+# POSIX filenames that happen to contain a backslash.
+# ---------------------------------------------------------------------------
+
+class TestManagedRuntimePathEntries:
+    class _ExistingDir:
+        def __init__(self, display: str):
+            self.display = display
+
+        def is_dir(self) -> bool:
+            return True
+
+        def __str__(self) -> str:
+            return self.display
+
+    def test_native_posix_keeps_backslash_named_runtime_dir(self, monkeypatch, tmp_path):
+        import hermes_constants
+
+        home = tmp_path / "hermes"
+        (home / "bin").mkdir(parents=True)
+        runtime_dir = self._ExistingDir(r"/opt/hermes/node\literal/bin")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        monkeypatch.setattr(local_mod, "_HOST_IS_WINDOWS", False)
+        monkeypatch.setattr(hermes_constants, "iter_hermes_node_dirs", lambda: [runtime_dir])
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
+
+        assert str(runtime_dir) in local_mod._managed_runtime_path_entries()
+
+    def test_logical_posix_on_windows_filters_only_native_windows_paths(self, monkeypatch, tmp_path):
+        import hermes_constants
+
+        home = tmp_path / "hermes"
+        (home / "bin").mkdir(parents=True)
+        drive_dir = self._ExistingDir(r"C:\Hermes\node\bin")
+        unc_dir = self._ExistingDir(r"\\server\share\node\bin")
+        posix_dir = self._ExistingDir(r"/opt/hermes/node\literal/bin")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        monkeypatch.setattr(local_mod, "_HOST_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            hermes_constants,
+            "iter_hermes_node_dirs",
+            lambda: [drive_dir, unc_dir, posix_dir],
+        )
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
+
+        entries = local_mod._managed_runtime_path_entries()
+
+        assert str(drive_dir) not in entries
+        assert str(unc_dir) not in entries
+        assert str(posix_dir) in entries
+
+
+# ---------------------------------------------------------------------------
 # Command wrapping — native Windows cwd must be Git Bash-friendly for cd
 # ---------------------------------------------------------------------------
 
