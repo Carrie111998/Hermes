@@ -10283,6 +10283,11 @@ def _report_dashboard_status() -> int:
     so the status path must report both modes too — otherwise a detached
     ``serve`` backend (what Desktop spawns) is invisible to ``--status``
     while still being stopped by ``--stop`` (#81564).
+
+    A process launched with ``--port 0`` (auto-assigned port, the Desktop
+    SSH backend) has no real port in the cmdline, so the listening probe
+    cannot run; the process is still reported when alive so ``--status``
+    stays consistent with ``--stop``, which kills by PID.
     """
     from gateway.status import _pid_exists
 
@@ -10292,7 +10297,12 @@ def _report_dashboard_status() -> int:
         if runtime is None:
             continue
         mode, host, port = runtime
-        if port <= 0 or not _pid_exists(pid):
+        if not _pid_exists(pid):
+            continue
+        # Auto-assigned ports (--port 0) can't be probed from the cmdline;
+        # the process is reported by PID alone.
+        if port <= 0:
+            live.append((mode, pid, command))
             continue
         if not _dashboard_listening(host, port):
             continue

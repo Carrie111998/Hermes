@@ -92,6 +92,23 @@ class TestDashboardStatus:
         assert "1 hermes dashboard process(es) running" in out
         assert "hermes serve process" not in out
 
+    def test_status_reports_autoassigned_port_backends(self, capsys):
+        """A serve backend launched with --port 0 (auto-assigned port, the
+        Desktop SSH backend) has no real port in the cmdline; it must still
+        be reported by PID so --status stays consistent with --stop
+        (#81564 review feedback)."""
+        processes = [
+            (12345, "hermes serve --isolated --host 127.0.0.1 --port 0 --ssh-session-token-file /tmp/tok"),
+        ]
+        with patch("hermes_cli.main._scan_dashboard_processes", return_value=processes), \
+             patch("gateway.status._pid_exists", return_value=True), \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns(status=True))
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "1 hermes serve process(es) running" in out
+        assert "PID 12345" in out
+
 
     def test_status_does_not_try_to_import_fastapi(self):
         """`--status` must not require dashboard runtime deps — it's a
