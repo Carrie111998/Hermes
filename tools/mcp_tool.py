@@ -1962,12 +1962,13 @@ class MCPServerTask:
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
-        "_publish_tools",
+        "_publish_tools", "_breaker_key",
     )
 
     def __init__(self, name: str, *, publish_tools: bool = True):
         self.name = name
         self._publish_tools = publish_tools
+        self._breaker_key: Any = name
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -2663,7 +2664,7 @@ class MCPServerTask:
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
+                    _reset_server_error(getattr(self, "_breaker_key", self.name))
                     # A completed handshake alone is NOT proof of health: a
                     # flapping transport can handshake fine and drop moments
                     # later, forever (#62212). The session must prove itself
@@ -3008,7 +3009,7 @@ class MCPServerTask:
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
+                        _reset_server_error(getattr(self, "_breaker_key", self.name))
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
@@ -3071,7 +3072,7 @@ class MCPServerTask:
                             # Session is live again: clear any breaker state from
                             # a prior outage so the first call after recovery
                             # isn't gated on a stale failure count (#16788).
-                            _reset_server_error(self.name)
+                            _reset_server_error(getattr(self, "_breaker_key", self.name))
                             # Unproven until keepalive/tool-call success (#62212).
                             self._session_proven = False
                             reason = await self._wait_for_lifecycle_event()
@@ -3109,7 +3110,7 @@ class MCPServerTask:
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
+                        _reset_server_error(getattr(self, "_breaker_key", self.name))
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
@@ -3766,8 +3767,8 @@ def _connect_cooldown_active(server_name: str) -> bool:
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+_server_error_counts: Dict[Any, int] = {}
+_server_breaker_opened_at: Dict[Any, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
@@ -3916,28 +3917,28 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     )
 
 
-def _bump_server_error(server_name: str) -> None:
-    """Increment the consecutive-failure count for ``server_name``.
+def _bump_server_error(server_key: Any) -> None:
+    """Increment the consecutive-failure count for one transport key.
 
     When the count crosses :data:`_CIRCUIT_BREAKER_THRESHOLD`, stamp the
     breaker-open timestamp so the cooldown clock starts (or re-starts,
     for probe failures in the half-open state).
     """
-    n = _server_error_counts.get(server_name, 0) + 1
-    _server_error_counts[server_name] = n
+    n = _server_error_counts.get(server_key, 0) + 1
+    _server_error_counts[server_key] = n
     if n >= _CIRCUIT_BREAKER_THRESHOLD:
-        _server_breaker_opened_at[server_name] = time.monotonic()
+        _server_breaker_opened_at[server_key] = time.monotonic()
 
 
-def _reset_server_error(server_name: str) -> None:
-    """Fully close the breaker for ``server_name``.
+def _reset_server_error(server_key: Any) -> None:
+    """Fully close the breaker for one transport key.
 
     Clears both the failure count and the breaker-open timestamp. Call
     this on any unambiguous success signal (successful tool call,
     successful reconnect, manual /mcp refresh).
     """
-    _server_error_counts[server_name] = 0
-    _server_breaker_opened_at.pop(server_name, None)
+    _server_error_counts[server_key] = 0
+    _server_breaker_opened_at.pop(server_key, None)
 
 
 def _signal_reconnect(server: Any) -> bool:
@@ -4135,6 +4136,7 @@ def _handle_auth_error_and_retry(
     retry_call,
     op_description: str,
     server: Optional[MCPServerTask] = None,
+    breaker_key: Any = None,
 ):
     """Attempt auth recovery and one retry; return None to fall through.
 
@@ -4166,6 +4168,8 @@ def _handle_auth_error_and_retry(
     """
     if not _is_auth_error(exc):
         return None
+
+    breaker_key = server_name if breaker_key is None else breaker_key
 
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
@@ -4204,17 +4208,17 @@ def _handle_auth_error_and_retry(
         # _bump_server_error on failure, so a genuinely broken server will
         # re-trip the breaker as normal.
         if reconnected:
-            _reset_server_error(server_name)
+            _reset_server_error(breaker_key)
 
         try:
             result = retry_call()
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
-                    _reset_server_error(server_name)
+                    _reset_server_error(breaker_key)
                     return result
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
+                _reset_server_error(breaker_key)
                 return result
         except Exception as retry_exc:
             logger.warning(
@@ -4225,7 +4229,7 @@ def _handle_auth_error_and_retry(
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops
     # retrying the tool.
-    _bump_server_error(server_name)
+    _bump_server_error(breaker_key)
     return tool_error(
         f"MCP server '{server_name}' requires re-authentication. "
         f"Run `hermes mcp login {server_name}` (or delete the tokens "
@@ -4344,6 +4348,7 @@ def _handle_session_expired_and_retry(
     retry_call,
     op_description: str,
     server: Optional[MCPServerTask] = None,
+    breaker_key: Any = None,
 ):
     """Trigger a transport reconnect and retry once on session expiry.
 
@@ -4370,6 +4375,8 @@ def _handle_session_expired_and_retry(
     """
     if not _is_session_expired_error(exc):
         return None
+
+    breaker_key = server_name if breaker_key is None else breaker_key
 
     srv = server
     if srv is None:
@@ -4408,10 +4415,10 @@ def _handle_session_expired_and_retry(
         try:
             parsed = json.loads(result)
             if "error" not in parsed:
-                _reset_server_error(server_name)
+                _reset_server_error(breaker_key)
                 return result
         except (json.JSONDecodeError, TypeError):
-            _reset_server_error(server_name)
+            _reset_server_error(breaker_key)
             return result
     except Exception as retry_exc:
         logger.warning(
@@ -5200,6 +5207,15 @@ def _workspace_scope_key(server_name: str, task_id: Optional[str]) -> Tuple[str,
     return server_name, os.path.normcase(root)
 
 
+def _server_breaker_key(server_name: str, task_id: Optional[str]) -> Any:
+    """Return breaker identity matching the transport selected for this call."""
+    with _lock:
+        workspace_sensitive = server_name in _workspace_server_configs
+    if workspace_sensitive:
+        return _workspace_scope_key(server_name, task_id)
+    return server_name
+
+
 def _connect_workspace_server(
     server_name: str,
     task_id: Optional[str],
@@ -5246,6 +5262,7 @@ def _connect_workspace_server(
             )
 
         connected = _run_on_mcp_loop(_connect, timeout=wait_timeout)
+        connected._breaker_key = scope_key
         with _lock:
             stale = _workspace_servers.get(scope_key)
             _workspace_servers[scope_key] = connected
@@ -5324,7 +5341,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if gate_error is not None:
             return gate_error
 
-        # Circuit breaker: if this server has failed too many times
+        task_id = kwargs.get("task_id") or kwargs.get("session_id")
+        breaker_key = _server_breaker_key(server_name, task_id)
+
+        # Circuit breaker: if this server transport has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
         #
@@ -5334,24 +5354,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+        if _server_error_counts.get(breaker_key, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = _server_breaker_opened_at.get(breaker_key, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
                 return tool_error(
                     f"MCP server '{server_name}' is unreachable after "
-                    f"{_server_error_counts[server_name]} consecutive "
+                    f"{_server_error_counts[breaker_key]} consecutive "
                     f"failures. Auto-retry available in ~{remaining}s. "
                     f"Do NOT retry this tool yet — use alternative "
                     f"approaches or ask the user to check the MCP server."
                 )
             # Cooldown elapsed → fall through as a half-open probe.
 
-        task_id = kwargs.get("task_id") or kwargs.get("session_id")
         server = _get_connected_server_for_call(server_name, task_id)
         if not server:
-            _bump_server_error(server_name)
+            _bump_server_error(breaker_key)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
         if not server.session:
@@ -5375,7 +5394,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # without burning iterations. The breaker resets once the
                 # fresh session initializes (_run_stdio/_run_http call
                 # _reset_server_error).
-                _bump_server_error(server_name)
+                _bump_server_error(breaker_key)
                 if _signal_reconnect(server):
                     return tool_error(
                         f"MCP server '{server_name}' transport is down; "
@@ -5491,11 +5510,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    _bump_server_error(breaker_key)
                 else:
-                    _reset_server_error(server_name)  # success — reset
+                    _reset_server_error(breaker_key)  # success — reset
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+                _reset_server_error(breaker_key)  # non-JSON = success
             return result
         except InterruptedError:
             return _interrupted_call_result()
@@ -5507,6 +5526,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
                 server=server,
+                breaker_key=breaker_key,
             )
             if recovered is not None:
                 return recovered
@@ -5518,11 +5538,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 server_name, exc, _call_once,
                 f"tools/call {tool_name}",
                 server=server,
+                breaker_key=breaker_key,
             )
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            _bump_server_error(breaker_key)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,

@@ -142,3 +142,49 @@ def test_generated_utility_handlers_forward_the_calling_session(monkeypatch):
         ("filesystem", "workspace-session"),
         ("filesystem", "workspace-session"),
     ]
+
+
+def test_workspace_sensitive_circuit_breaker_is_scoped_by_workspace(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    roots = {
+        "session-alpha": "/projects/alpha",
+        "session-beta": "/projects/beta",
+    }
+    session = MagicMock()
+    session.call_tool = AsyncMock(return_value=_result("beta"))
+    server = mcp_tool.MCPServerTask("filesystem")
+    server.session = session
+    resolved = []
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "_workspace_folder",
+        lambda task_id=None: roots.get(task_id, "/backend/workspace"),
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "_get_connected_server_for_call",
+        lambda server_name, task_id=None: (
+            resolved.append((server_name, task_id))
+            or (server if task_id == "session-beta" else None)
+        ),
+    )
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run_on_loop)
+    mcp_tool._workspace_server_configs["filesystem"] = {
+        "command": "filesystem-server",
+        "args": ["${workspaceFolder}"],
+    }
+    try:
+        handler = mcp_tool._make_tool_handler("filesystem", "root", 120)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+            assert "error" in json.loads(handler({}, task_id="session-alpha"))
+
+        result = handler({}, task_id="session-beta")
+
+        assert resolved[-1] == ("filesystem", "session-beta")
+        assert json.loads(result) == {"result": "beta"}
+    finally:
+        mcp_tool._workspace_server_configs.clear()
+        mcp_tool._server_error_counts.clear()
+        mcp_tool._server_breaker_opened_at.clear()
