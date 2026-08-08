@@ -151,6 +151,39 @@ class TestBuzzAdapterInit:
         assert adapter.poll_interval == 2.0
         assert adapter.home_channel == "ccc"
 
+    def test_outbound_mention_pubkeys_reject_casefold_collisions(self):
+        from gateway.config import PlatformConfig
+
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "relay_url": "https://cfg.relay",
+                "outbound_mention_pubkeys": {
+                    "Reviewer": OTHER_PUBKEY,
+                    "reviewer": SELF_PUBKEY,
+                },
+            },
+        )
+
+        with pytest.raises(ValueError, match="duplicate display name"):
+            BuzzAdapter(cfg)
+
+    def test_validate_config_rejects_invalid_outbound_mention_mapping(
+        self, monkeypatch
+    ):
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1test")
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "relay_url": "https://cfg.relay",
+                "outbound_mention_pubkeys": "not-a-mapping",
+            },
+        )
+
+        assert validate_config(cfg) is False
+
     def test_env_overrides_config(self, monkeypatch):
         monkeypatch.setenv("BUZZ_RELAY_URL", "https://env.relay")
         from gateway.config import PlatformConfig
@@ -2168,6 +2201,114 @@ class TestBuzzAdapterSend:
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
     @pytest.mark.asyncio
+    async def test_send_configured_handoff_uses_exact_pubkey(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        adapter._mention_pubkeys_for = AsyncMock(return_value=[])
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-handoff", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Reviewer please check this")
+
+        assert result.success is True
+        args, text = cli.calls[0]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert text == "@Reviewer please check this"
+
+    @pytest.mark.asyncio
+    async def test_send_configured_handoff_fails_instead_of_downgrading(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        adapter._mention_pubkeys_for = AsyncMock(return_value=[])
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=1,
+            stderr="mention '@Reviewer' does not match a current channel member",
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Reviewer please check this")
+
+        assert result.success is False
+        assert len(cli.calls) == 1
+        args, text = cli.calls[0]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert text == "@Reviewer please check this"
+
+    @pytest.mark.asyncio
+    async def test_send_membership_drift_drops_only_dynamic_mentions(self):
+        dynamic_pubkey = "c" * 64
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        adapter._mention_pubkeys_for = AsyncMock(return_value=[dynamic_pubkey])
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=1,
+            stderr="mentioned pubkeys are not channel members",
+        )
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-handoff", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Reviewer and @Dynamic please check")
+
+        assert result.success is True
+        first_args, _ = cli.calls[0]
+        second_args, _ = cli.calls[1]
+        assert [first_args[i + 1] for i, value in enumerate(first_args) if value == "--mention"] == [
+            OTHER_PUBKEY,
+            dynamic_pubkey,
+        ]
+        assert [second_args[i + 1] for i, value in enumerate(second_args) if value == "--mention"] == [
+            OTHER_PUBKEY,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_send_unresolved_prose_retry_keeps_configured_handoff(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        adapter._mention_pubkeys_for = AsyncMock(return_value=[])
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=1,
+            stderr="mention '@ghost' does not match a current channel member",
+        )
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-handoff", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Reviewer ask @ghost to check")
+
+        assert result.success is True
+        second_args, second_text = cli.calls[1]
+        assert second_args[second_args.index("--mention") + 1] == OTHER_PUBKEY
+        assert second_text == "@Reviewer ask @\u200bghost to check"
+
+    @pytest.mark.asyncio
     async def test_send_metadata_thread_id_uses_reply_to_flag(self):
         adapter = _make_adapter()
         cli = _ScriptedCli()
@@ -3309,6 +3450,41 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_configured_handoff_uses_exact_pubkey(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0
+        ):
+            captured.update(args=list(args), input_text=input_text)
+            return 0, json.dumps(
+                {"accepted": True, "event_id": "evt-handoff", "message": ""}
+            ), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        result = await _standalone_send(
+            PlatformConfig(
+                enabled=True,
+                extra={"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}},
+            ),
+            CHANNEL,
+            "@Reviewer please check this",
+        )
+
+        assert result == {"success": True, "message_id": "evt-handoff"}
+        assert captured["args"][captured["args"].index("--mention") + 1] == OTHER_PUBKEY
+        assert captured["input_text"] == "@Reviewer please check this"
 
     @pytest.mark.asyncio
     async def test_standalone_send_injects_owner_auth_tag_from_credentials_file(
