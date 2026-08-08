@@ -165,7 +165,7 @@ class TestGenerate:
 
         call_kwargs = fake_client.images.generate.call_args.kwargs
         # All tiers hit the single underlying API model.
-        assert call_kwargs["model"] == "gpt-image-2"
+        assert call_kwargs["model"] == "openai/gpt-image-2"
         assert call_kwargs["quality"] == "medium"
         assert call_kwargs["size"] == "1536x1024"
         # gpt-image-2 rejects response_format — we must NOT send it.
@@ -188,7 +188,7 @@ class TestGenerate:
         assert result["quality"] == expected_quality
         assert fake_client.images.generate.call_args.kwargs["quality"] == expected_quality
         # Always the same underlying API model regardless of tier.
-        assert fake_client.images.generate.call_args.kwargs["model"] == "gpt-image-2"
+        assert fake_client.images.generate.call_args.kwargs["model"] == "openai/gpt-image-2"
 
     @pytest.mark.parametrize("aspect,expected_size", [
         ("landscape", "1536x1024"),

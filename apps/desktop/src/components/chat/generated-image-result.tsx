@@ -49,13 +49,29 @@ async function resolveImageSrc(path: string): Promise<string> {
 }
 
 export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({ aspectRatio, result }) => {
+  const images = result === undefined ? [] : generatedImageFromResult(result)
+
+  if (images.length === 0) {
+    // Pending — show a single placeholder.
+    return <SingleImage aspectRatio={aspectRatio} src={null} />
+  }
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {images.map((src, i) => (
+        <SingleImage aspectRatio={aspectRatio} key={i} src={src} />
+      ))}
+    </div>
+  )
+}
+
+const SingleImage: FC<{ aspectRatio?: string; src: string | null }> = ({ aspectRatio, src: initialSrc }) => {
   const { t } = useI18n()
   const copy = t.desktop
-  const image = result === undefined ? null : generatedImageFromResult(result)
-  const pending = result === undefined
+  const pending = initialSrc === null
 
   const [ratio, setRatio] = useState(() => hintedRatio(aspectRatio))
-  const [src, setSrc] = useState(() => (image && isInlineSrc(image) ? image : ''))
+  const [src, setSrc] = useState(() => (initialSrc && isInlineSrc(initialSrc) ? initialSrc : ''))
   const [loaded, setLoaded] = useState(false)
   const [canvasGone, setCanvasGone] = useState(false)
   const [failed, setFailed] = useState(false)
@@ -72,38 +88,38 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
     setFailed(false)
     setLoaded(false)
     setCanvasGone(false)
-    setSrc(image && isInlineSrc(image) ? image : '')
+    setSrc(initialSrc && isInlineSrc(initialSrc) ? initialSrc : '')
 
-    if (!image || isInlineSrc(image)) {
+    if (!initialSrc || isInlineSrc(initialSrc)) {
       return
     }
 
-    void resolveImageSrc(image)
+    void resolveImageSrc(initialSrc)
       .then(resolved => !cancelled && setSrc(resolved))
       .catch(() => !cancelled && setFailed(true))
 
     return () => {
       cancelled = true
     }
-  }, [image])
+  }, [initialSrc])
 
   // Completed but no usable image (generation failed): the agent's prose carries
   // the explanation, so render nothing here.
-  if (!pending && !image) {
+  if (!pending && !initialSrc) {
     return null
   }
 
-  if (failed && image) {
+  if (failed && initialSrc) {
     return (
       <a
         className="mt-2 ref inline-block wrap-anywhere"
         href="#"
         onClick={event => {
           event.preventDefault()
-          void window.hermesDesktop?.openExternal(mediaExternalUrl(image))
+          void window.hermesDesktop?.openExternal(mediaExternalUrl(initialSrc))
         }}
       >
-        {copy.openImage}: {mediaName(image)}
+        {copy.openImage}: {mediaName(initialSrc)}
       </a>
     )
   }

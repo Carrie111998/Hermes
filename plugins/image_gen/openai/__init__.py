@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # ``quality`` setting. ``api_model`` is what gets sent to OpenAI;
 # ``quality`` is the knob that changes generation time and output fidelity.
 
-API_MODEL = "gpt-image-2"
+API_MODEL = "openai/gpt-image-2"
 
 _MODELS: Dict[str, Dict[str, Any]] = {
     "gpt-image-2-low": {

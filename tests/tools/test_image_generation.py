@@ -419,3 +419,77 @@ class TestFalKreaCatalog:
     def test_fal_krea_models_in_fal_catalog(self, image_tool):
         assert "fal-ai/krea/v2/medium/text-to-image" in image_tool.FAL_MODELS
         assert "fal-ai/krea/v2/large/text-to-image" in image_tool.FAL_MODELS
+
+
+# ---------------------------------------------------------------------------
+# Array prompt (parallel multi-image) support
+# ---------------------------------------------------------------------------
+
+class TestArrayPrompt:
+    """``prompt`` now accepts a string (unchanged) or an array of strings."""
+
+    def test_schema_accepts_array_prompt(self, image_tool):
+        """Schema exposes prompt as [string, array] with items."""
+        prompt_schema = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]["prompt"]
+        assert prompt_schema["type"] == ["string", "array"]
+        assert prompt_schema["items"] == {"type": "string"}
+
+    def test_single_string_prompt_still_required(self, image_tool):
+        """Single-string mode: prompt is still required."""
+        assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
+
+    def test_handle_empty_array_rejects(self, image_tool):
+        """Empty array prompt is rejected."""
+        result = image_tool._handle_image_generate(
+            {"prompt": [], "aspect_ratio": "landscape"},
+        )
+        assert "prompt is required" in result.lower()
+
+    def test_handle_array_dispatches_parallel(self, image_tool, monkeypatch):
+        """Array prompt dispatches multiple images via thread pool."""
+        calls = []
+
+        def fake_dispatch(prompt, aspect_ratio, **kw):
+            calls.append(prompt)
+            import json
+            return json.dumps({"success": True, "image": f"/tmp/{prompt[:4]}.png"})
+
+        monkeypatch.setattr(image_tool, "_dispatch_to_plugin_provider", fake_dispatch)
+        monkeypatch.setattr(image_tool, "_maybe_route_managed_krea", lambda *a, **kw: None)
+
+        result = image_tool._handle_image_generate(
+            {"prompt": ["cat on windowsill", "dog in park", "bird on branch"], "aspect_ratio": "landscape"},
+        )
+        assert len(calls) == 3
+        assert "cat on windowsill" in calls
+        assert "dog in park" in calls
+
+        import json
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["image"] is not None
+        assert len(data["images"]) == 3
+
+    def test_array_prompt_handles_partial_failures(self, image_tool, monkeypatch):
+        """One failure in the batch does not lose successful results."""
+        call_count = [0]
+
+        def fake_dispatch(prompt, aspect_ratio, **kw):
+            call_count[0] += 1
+            import json
+            if call_count[0] == 2:
+                return json.dumps({"success": False, "image": None, "error": "simulated failure"})
+            return json.dumps({"success": True, "image": f"/tmp/{prompt[:4]}.png"})
+
+        monkeypatch.setattr(image_tool, "_dispatch_to_plugin_provider", fake_dispatch)
+        monkeypatch.setattr(image_tool, "_maybe_route_managed_krea", lambda *a, **kw: None)
+
+        result = image_tool._handle_image_generate(
+            {"prompt": ["good cat", "bad dog", "good bird"], "aspect_ratio": "landscape"},
+        )
+        import json
+        data = json.loads(result)
+        assert data["success"] is False  # overall: partial failure
+        assert len(data["images"]) == 2  # two succeeded
+        assert len(data["errors"]) == 1  # one error recorded
+        assert data["image"] is not None  # first successful image
