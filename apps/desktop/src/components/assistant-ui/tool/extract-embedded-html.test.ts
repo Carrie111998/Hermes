@@ -14,43 +14,21 @@ describe('extractEmbeddedHtml', () => {
     expect(extractEmbeddedHtml({ content: [] })).toBe('')
   })
 
-  it('extracts HTML from a direct content array with a resource item', () => {
+  it('extracts HTML from a content array with a resource item', () => {
     const result = {
       content: [
-        { type: 'text', text: '{"sol":2.5}' },
+        { type: 'text', text: '{"balance":2.5}' },
         {
           type: 'resource',
           resource: {
-            uri: 'ui://sap/balance-card',
+            uri: 'ui://example/balance-card',
             mimeType: 'text/html',
-            text: '<!DOCTYPE html><html><body>SAP Balance Card</body></html>',
+            text: '<!DOCTYPE html><html><body>Balance Card</body></html>',
           },
         },
       ],
     }
-    expect(extractEmbeddedHtml(result)).toBe('<!DOCTYPE html><html><body>SAP Balance Card</body></html>')
-  })
-
-  it('extracts HTML from a wrapped success envelope', () => {
-    const result = {
-      success: true,
-      tool: 'sol_get_balance',
-      hostedPricing: 'free',
-      data: {
-        content: [
-          { type: 'text', text: '{"sol":2.5}' },
-          {
-            type: 'resource',
-            resource: {
-              uri: 'ui://sap/balance-card',
-              mimeType: 'text/html',
-              text: '<html><body>Wrapped Card</body></html>',
-            },
-          },
-        ],
-      },
-    }
-    expect(extractEmbeddedHtml(result)).toBe('<html><body>Wrapped Card</body></html>')
+    expect(extractEmbeddedHtml(result)).toBe('<!DOCTYPE html><html><body>Balance Card</body></html>')
   })
 
   it('returns empty string for non-HTML resources', () => {
@@ -75,7 +53,7 @@ describe('extractEmbeddedHtml', () => {
         {
           type: 'resource',
           resource: {
-            uri: 'ui://sap/balance-card',
+            uri: 'ui://example/card',
             mimeType: 'text/html',
             text: '',
           },
@@ -85,23 +63,27 @@ describe('extractEmbeddedHtml', () => {
     expect(extractEmbeddedHtml(result)).toBe('')
   })
 
-  it('prefers direct content over wrapped data', () => {
+  it('extracts HTML from a resource with additional unknown fields', () => {
     const result = {
       content: [
+        { type: 'text', text: 'result text' },
         {
           type: 'resource',
-          resource: { mimeType: 'text/html', text: '<html>direct</html>' },
+          resource: {
+            uri: 'ui://example/swap-card',
+            mimeType: 'text/html',
+            text: '<html><body>Swap Card</body></html>',
+            blobs: ['extra-data'],
+          },
         },
       ],
-      data: {
-        content: [
-          {
-            type: 'resource',
-            resource: { mimeType: 'text/html', text: '<html>wrapped</html>' },
-          },
-        ],
-      },
     }
-    expect(extractEmbeddedHtml(result)).toBe('<html>direct</html>')
+    expect(extractEmbeddedHtml(result)).toBe('<html><body>Swap Card</body></html>')
+  })
+
+  it('returns empty string when content is missing', () => {
+    expect(extractEmbeddedHtml({ success: true })).toBe('')
+    expect(extractEmbeddedHtml({ data: { balance: 1 } })).toBe('')
+    expect(extractEmbeddedHtml({})).toBe('')
   })
 })
