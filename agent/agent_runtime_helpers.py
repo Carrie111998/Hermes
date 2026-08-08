@@ -1059,6 +1059,18 @@ def recover_with_credential_pool(
                 if isinstance(_current_id, str) and _current_id:
                     _credential_id = _current_id
 
+    current_entry = None
+    if _credential_id:
+        current_entry = next(
+            (e for e in pool.entries() if e.id == _credential_id),
+            None,
+        )
+    if _api_key_hint and current_entry is None:
+        current_entry = next(
+            (e for e in pool.entries() if e.runtime_api_key == _api_key_hint),
+            None,
+        )
+
     def _rotate_failed_credential(rotate_status: int):
         kwargs = {
             "status_code": rotate_status,
