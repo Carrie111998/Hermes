@@ -197,9 +197,12 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   await syncConfiguredDefaultProjectDir()
   const configured = getConfiguredDefaultProjectDir()
 
+  // Transient: each source below is already remembered or comes from config, so
+  // persisting would only promote a configured default into the per-backend
+  // memory of what the user picked.
   const seedLiveCwd = (cwd: string) => {
     if (cwd && !$activeSessionId.get()) {
-      setCurrentCwd(cwd)
+      setCurrentCwdTransient(cwd)
     }
   }
 
@@ -527,6 +530,12 @@ export const $currentCwd = atom(getRememberedWorkspaceCwd())
 // would collapse the workspace panes and drop file-tree state on every switch,
 // so the path stays put and is simply marked as not-yet-owned.
 export const $workspaceCwdOwner = atom<null | string>(null)
+
+// Terminal execution backend (local | docker | ssh | ...) mirrored from the
+// gateway (session.info). Drives attachment upload decisions: container
+// backends have their own filesystem, so a dropped host path must be uploaded
+// as bytes and staged into a bind-mounted cache dir (#76577).
+export const $terminalBackend = atom('')
 export const $newChatWorkspaceTarget = atom<NewChatWorkspaceTarget>(undefined)
 export const $newChatWorkspaceTargetGeneration = atom(0)
 export const $currentBranch = atom('')
@@ -643,11 +652,26 @@ export const setCurrentFastMode = (next: Updater<boolean>) => {
 
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
+/** Move the live workspace AND remember it as this backend's workspace.
+ *
+ *  Only for a path the user chose — a folder pick, a project/worktree entry, an
+ *  explicit workspace target. The remembered value is where a new chat starts on
+ *  a remote backend, so writing it from a path the user merely *looked at* makes
+ *  every new chat land in the last session's folder (#77496, #80213). To follow
+ *  a conversation's cwd, use `setCurrentCwdTransient`.
+ */
 export const setCurrentCwd = (next: Updater<string>) => {
   updateAtom($currentCwd, next)
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
+export const setTerminalBackend = (next: Updater<string>) => updateAtom($terminalBackend, next)
+
+/** Move the live workspace without claiming it as the user's chosen one.
+ *
+ *  For paths that come from a conversation rather than from the user: resume
+ *  settling, a warm switch, the agent relocating mid-turn, detaching a draft.
+ */
 export const setCurrentCwdTransient = (next: Updater<string>) => updateAtom($currentCwd, next)
 
 // Released-ownership marker: the live path belongs to no conversation. `null`
@@ -680,12 +704,12 @@ export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WOR
  *
  *  The single primitive for "this path IS the selected conversation's" — a folder
  *  pick, a project entry, the agent relocating itself. Prefer it over a bare
- *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
- *  held it before; workspace-derived slices then stay hidden even though the
- *  path is correct (#71254).
+ *  `setCurrentCwdTransient`, which moves the path while leaving ownership naming
+ *  whatever held it before; workspace-derived slices then stay hidden even though
+ *  the path is correct (#71254).
  */
 export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
-  setCurrentCwd(cwd)
+  setCurrentCwdTransient(cwd)
   setWorkspaceCwdOwner($selectedStoredSessionId.get())
 }
 

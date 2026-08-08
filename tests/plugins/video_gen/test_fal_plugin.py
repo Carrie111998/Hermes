@@ -49,6 +49,93 @@ def test_kling_4k_uses_start_image_url():
     assert "image_url" not in payload
 
 
+def test_minimax_h3_int_duration_and_resolution_alias():
+    """MiniMax H3 requires duration as a JSON integer and uses the
+    768P/2K/4K resolution enum — the tool's 720p/1080p values must map."""
+    from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+    meta = FAL_FAMILIES["minimax-h3"]
+    payload = _build_payload(
+        meta,
+        prompt="x",
+        image_url=None,
+        duration=7,
+        aspect_ratio="16:9",
+        resolution="720p",
+        negative_prompt=None,
+        audio=True,
+        seed=None,
+    )
+    assert payload["duration"] == 7 and isinstance(payload["duration"], int)
+    assert payload["resolution"] == "768P"
+    assert payload["aspect_ratio"] == "16:9"
+    # H3 has no generate_audio key (audio is native/always-on)
+    assert "generate_audio" not in payload
+
+    hi = _build_payload(
+        meta, prompt="x", image_url=None, duration=5, aspect_ratio="16:9",
+        resolution="1080p", negative_prompt=None, audio=None, seed=None,
+    )
+    assert hi["resolution"] == "2K"
+
+
+def test_image_drop_keys_strips_aspect_ratio_on_i2v():
+    """Seedance 2.5 / MiniMax H3 / Grok 1.5 i2v endpoints derive the
+    aspect ratio from the input image; sending the key is rejected."""
+    from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+    for fid in ("seedance-2.5", "minimax-h3", "grok-imagine-1.5"):
+        meta = FAL_FAMILIES[fid]
+        i2v = _build_payload(
+            meta, prompt="x", image_url="https://example.com/i.png",
+            duration=5, aspect_ratio="16:9", resolution="480p",
+            negative_prompt=None, audio=None, seed=None,
+        )
+        assert "aspect_ratio" not in i2v, fid
+        # ...but text-to-video keeps it
+        t2v = _build_payload(
+            meta, prompt="x", image_url=None, duration=5,
+            aspect_ratio="16:9", resolution="480p",
+            negative_prompt=None, audio=None, seed=None,
+        )
+        assert t2v.get("aspect_ratio") == "16:9", fid
+
+
+def test_seedance_25_string_duration_up_to_30():
+    """Seedance 2.5 keeps the stringified duration convention and supports
+    the full 4-30s range."""
+    from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
+
+    meta = FAL_FAMILIES["seedance-2.5"]
+    payload = _build_payload(
+        meta, prompt="x", image_url=None, duration=30, aspect_ratio="1:1",
+        resolution="480p", negative_prompt=None, audio=True, seed=None,
+    )
+    assert payload["duration"] == "30"
+    assert payload["generate_audio"] is True
+
+
+def test_gemini_omni_flash_is_image_only():
+    """Gemini Omni Flash has no t2v endpoint on FAL — text jobs must
+    error cleanly instead of submitting to a None endpoint."""
+    from plugins.video_gen.fal import FAL_FAMILIES
+
+    meta = FAL_FAMILIES["gemini-omni-flash"]
+    assert meta.get("text_endpoint") is None
+    assert meta.get("image_endpoint")
+
+
+def test_every_family_has_required_metadata():
+    """Invariant: every family entry carries the picker-facing metadata and
+    at least one endpoint."""
+    from plugins.video_gen.fal import FAL_FAMILIES
+
+    for fid, meta in FAL_FAMILIES.items():
+        assert meta.get("display"), fid
+        assert meta.get("tier") in {"cheap", "premium"}, fid
+        assert meta.get("text_endpoint") or meta.get("image_endpoint"), fid
+
+
 class TestFamilyRouting:
     """The headline behavior: image_url presence picks the endpoint."""
 
@@ -240,8 +327,8 @@ class TestPayloadBuilder:
         assert "seed" not in p
 
     def test_minimax_h3_uses_uppercase_resolution_enum(self):
-        """FAL spells MiniMax H3 resolutions "768P"/"2K"/"4K"; a lowercase
-        "720p" isn't in the enum and must be dropped, not passed through."""
+        """FAL spells MiniMax H3 resolutions "768P"/"2K"/"4K"; tool-style
+        values like "720p" are aliased via resolution_aliases."""
         from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
 
         meta = FAL_FAMILIES["minimax-h3"]
@@ -252,11 +339,11 @@ class TestPayloadBuilder:
         assert accepted["resolution"] == "2K"
         assert accepted["duration"] == 7
 
-        dropped = _build_payload(
+        aliased = _build_payload(
             meta, prompt="x", image_url=None, duration=7, aspect_ratio="16:9",
             resolution="720p", negative_prompt=None, audio=None, seed=None,
         )
-        assert "resolution" not in dropped
+        assert aliased["resolution"] == "768P"
 
     def test_audio_only_sent_for_families_that_declare_it(self):
         """minimax-h3 and the i2v-only families have no generate_audio field."""
@@ -297,13 +384,12 @@ class TestPayloadBuilder:
         assert type(p["duration"]) is type(expected)
 
     def test_i2v_only_families_declare_no_text_endpoint(self):
-        """Catalog invariant: these animate an existing image only."""
+        """Catalog invariant: Gemini Omni Flash animates an existing image only."""
         from plugins.video_gen.fal import FAL_FAMILIES
 
-        for family_id in ("grok-imagine-1.5", "gemini-omni-flash"):
-            meta = FAL_FAMILIES[family_id]
-            assert meta.get("text_endpoint") is None, family_id
-            assert meta["image_endpoint"]
+        meta = FAL_FAMILIES["gemini-omni-flash"]
+        assert meta.get("text_endpoint") is None
+        assert meta["image_endpoint"]
 
     def test_ltx_omits_duration_aspect_resolution(self):
         """LTX 2.3 doesn't declare duration/aspect/resolution enums —
