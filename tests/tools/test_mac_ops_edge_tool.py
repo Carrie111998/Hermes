@@ -76,7 +76,7 @@ def test_submit_requires_explicit_mac_only_capability_before_dispatch(
             "title": "Generic code status",
             "task_class": "code.readonly",
             "contract": "Objective\nCheck code",
-            "idempotency_key": "case:cloud-first",
+            "idempotency_key": "case:mac-only",
         })
     )
 
@@ -96,6 +96,9 @@ def test_submit_schema_exposes_only_concrete_mac_resident_capabilities() -> None
     assert properties["mac_only_capability"]["enum"] == list(
         mac_ops_edge_tool.MAC_ONLY_CAPABILITIES
     )
+    description = mac_ops_edge_tool.SUBMIT_SCHEMA["description"]
+    assert "queued v1 edge is not a generic compute-cost routing path" in description
+    assert "First use the normal 24/7 cloud worker" not in description
 
 
 def test_uncertain_submit_tells_model_to_reconcile_same_key(monkeypatch) -> None:

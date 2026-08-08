@@ -35,7 +35,7 @@ def _mac_only_capability(args: dict[str, Any]) -> str:
 
 def _submit(args: dict[str, Any], **_kwargs: Any) -> str:
     try:
-        # This is a structural cloud-first admission gate, not a prose
+        # This is a structural Mac-only admission gate, not a prose
         # classifier.  The model must select the concrete Mac-resident
         # capability before this service-gated tool can dispatch; the wire
         # protocol remains v1 and the edge still does not infer intent.
@@ -78,12 +78,12 @@ SUBMIT_SCHEMA = {
     "name": "mac_ops_readonly_submit",
     "description": (
         "Submit an exact model-authored read-only task contract to the separately "
-        "authenticated Mac edge. First use the normal 24/7 cloud worker whenever "
-        "least-privilege cloud access can obtain the evidence. Select one concrete "
-        "mac_only_capability only when the task depends on Mac-resident state that "
-        "the cloud runtime cannot access. The edge does not decide what the task "
-        "means. It never accepts mutations or self-asserted approval. Preserve the "
-        "idempotency key for reconciliation and then use mac_ops_task_read."
+        "authenticated Mac edge. Select one concrete mac_only_capability only when "
+        "the task depends on Mac-resident state unavailable outside that Mac. This "
+        "queued v1 edge is not a generic compute-cost routing path. The edge does "
+        "not decide what the task means. It never accepts mutations or self-asserted "
+        "approval. Preserve the idempotency key for reconciliation and then use "
+        "mac_ops_task_read."
     ),
     "parameters": {
         "type": "object",
@@ -102,11 +102,11 @@ SUBMIT_SCHEMA = {
                 "type": "string",
                 "enum": list(MAC_ONLY_CAPABILITIES),
                 "description": (
-                    "Concrete Mac-resident capability required after checking the "
-                    "normal least-privilege cloud path. Generic code, CI, Git/GitLab, "
-                    "GCP API, or CLI work is not Mac-only merely because it ran there "
-                    "before. This selection is an explicit model decision; the edge "
-                    "does not classify the contract prose."
+                    "Concrete Mac-resident capability required by this exact task. "
+                    "Generic code, CI, Git/GitLab, GCP API, or CLI work is not "
+                    "Mac-only merely because it ran there before. This selection is "
+                    "an explicit model decision; the edge does not classify the "
+                    "contract prose or choose the execution location."
                 ),
             },
             "contract": {

@@ -16,10 +16,12 @@ def test_mac_ops_edge_preserves_model_authored_progress_and_steering():
     assert "never copy raw heartbeat lines" in instructions
 
 
-def test_mac_ops_edge_keeps_cloud_capable_work_off_the_local_mac():
+def test_mac_ops_edge_does_not_fake_immediate_cost_routing_over_queued_v1():
     instructions = " ".join(SKILL_PATH.read_text(encoding="utf-8").split())
 
-    assert "Check the normal least-privilege cloud path first" in instructions
-    assert "selected only after the cloud-path check" in instructions
+    assert "always creates a queued task record" in instructions
+    assert "fresh-heartbeat and atomic immediate-claim protocol" in instructions
+    assert "Never submit here and then fall back to cloud" in instructions
+    assert "leave generic execution on its existing path" in instructions
     assert "If no listed Mac-only capability is required, do not submit" in instructions
-    assert "Git/GitLab, GCP API, and generic CLI work are not Mac-only" in instructions
+    assert "First use the normal 24/7 cloud worker" not in instructions
