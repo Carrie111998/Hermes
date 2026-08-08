@@ -4346,7 +4346,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     """UPDATE sessions SET
                       model = ?,
                       model_config = CASE
-                          WHEN model_config IS NULL THEN NULL
+                          WHEN model_config IS NULL THEN json_object('model', ?, 'provider', ?)
                           WHEN json_valid(model_config)
                               THEN json_set(
                                   json_remove(model_config, '$.browser_model_lock'),
@@ -4358,14 +4358,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       system_prompt = NULL,
                       system_prompt_hash = NULL
                       WHERE id = ?""",
-                    (model, model, provider, session_id),
+                    (model, model, provider, model, provider, session_id),
                 )
             else:
                 conn.execute(
                     """UPDATE sessions SET
                       model = ?,
                       model_config = CASE
-                          WHEN model_config IS NULL THEN NULL
+                          WHEN model_config IS NULL THEN json_object('model', ?)
                           WHEN json_valid(model_config)
                               THEN json_set(
                                   json_remove(model_config, '$.browser_model_lock'),
@@ -4376,7 +4376,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       system_prompt = NULL,
                       system_prompt_hash = NULL
                       WHERE id = ?""",
-                    (model, model, session_id),
+                    (model, model, model, session_id),
                 )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
