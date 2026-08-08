@@ -680,3 +680,115 @@ class TestDispatcherFromDict:
 
         cfg = GatewayConfig.from_dict({"dispatcher_commands": ["echo", "forge"]})
         assert cfg.dispatcher_commands == ["echo", "forge"]
+
+
+# --- _handle_message regression tests ------------------------------
+# These verify the full dispatch path falls through correctly when
+# the dispatcher is absent or unreachable (per teknium1 review on
+# PR #76810).
+
+
+class TestHandleMessageDispatcherFallthrough:
+    """Regression: _handle_message must fall through to quick-commands
+    and agent loop when dispatcher is unavailable.
+
+    These tests exercise the REAL GatewayRunner constructor to verify
+    that the dispatcher gating logic in __init__ produces the correct
+    _DISPATCHER_FORWARD_COMMANDS and _dispatcher_client state.
+    """
+
+    @staticmethod
+    def _make_event(command: str, args: str = ""):
+        from unittest.mock import MagicMock
+
+        event = MagicMock()
+        event.get_command.return_value = command
+        event.get_command_args.return_value = args
+        event.text = f"/{command} {args}".strip()
+        event.source = MagicMock()
+        event.source.user_id = "test_user"
+        event.source.user_name = "Test User"
+        event.source.platform.value = "telegram"
+        event.source.chat_type = "dm"
+        event.source.chat_id = "123"
+        return event
+
+    @pytest.mark.asyncio
+    async def test_no_socket_clears_forward_commands(self, monkeypatch, tmp_path):
+        """When no dispatcher socket is configured, __init__ clears
+        _DISPATCHER_FORWARD_COMMANDS so commands are handled locally."""
+        from unittest.mock import MagicMock
+
+        import gateway.run as gateway_run
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        cfg = GatewayConfig.from_dict({})
+        runner = GatewayRunner(cfg)
+
+        # Constructor should have cleared forwarding
+        assert runner._DISPATCHER_FORWARD_COMMANDS == frozenset()
+        assert runner._dispatcher_client is None
+
+        # Commands should fall through to quick-commands
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner.config = {
+            "quick_commands": {
+                "echo": {"type": "exec", "command": "echo local"}
+            }
+        }
+        event = self._make_event("echo")
+        result = await runner._handle_message(event)
+        assert result == "local"
+
+    @pytest.mark.asyncio
+    async def test_configured_socket_creates_client(self, monkeypatch, tmp_path):
+        """When dispatcher socket is configured, __init__ creates
+        a DispatcherClient and sets _DISPATCHER_FORWARD_COMMANDS."""
+        import gateway.run as gateway_run
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        cfg = GatewayConfig.from_dict({
+            "dispatcher_socket": "/tmp/test-dispatcher.sock",
+        })
+        runner = GatewayRunner(cfg)
+
+        # Constructor should have created client and set commands
+        assert runner._dispatcher_client is not None
+        assert len(runner._DISPATCHER_FORWARD_COMMANDS) > 0
+        assert "echo" in runner._DISPATCHER_FORWARD_COMMANDS
+
+    @pytest.mark.asyncio
+    async def test_unreachable_socket_falls_through(self, monkeypatch, tmp_path):
+        """When dispatcher socket is configured but unreachable,
+        _handle_message falls through to quick-commands/agent."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        import gateway.run as gateway_run
+        from gateway.config import GatewayConfig
+        from gateway.dispatcher_client import DispatcherConnectionError
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        cfg = GatewayConfig.from_dict({
+            "dispatcher_socket": "/tmp/test-dispatcher.sock",
+        })
+        runner = GatewayRunner(cfg)
+        # Patch the client to simulate unreachable socket
+        runner._dispatcher_client.dispatch = AsyncMock(
+            side_effect=DispatcherConnectionError("connection refused")
+        )
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner.config = {
+            "quick_commands": {
+                "echo": {"type": "exec", "command": "echo local"}
+            }
+        }
+
+        event = self._make_event("echo")
+        result = await runner._handle_message(event)
+        # Dispatcher failed -> fall through -> quick-command handles it
+        assert result == "local"
