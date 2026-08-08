@@ -110,3 +110,29 @@ def test_cache_key_is_per_config_path(tmp_path, monkeypatch):
     # And switching back still works — both entries coexist in the cache.
     monkeypatch.setenv("HERMES_HOME", str(home_a))
     assert get_external_skills_dirs() == [ext_a.resolve()]
+
+
+def test_managed_external_dir_applies_without_user_config(tmp_path, monkeypatch):
+    """Managed external_dirs reaches a fresh Profile with no config.yaml."""
+    home = tmp_path / "profiles" / "fresh"
+    home.mkdir(parents=True)
+    shared = tmp_path / "shared-skills"
+    shared.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {shared}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    from hermes_cli import managed_scope
+    from hermes_cli.config import _LOAD_CONFIG_CACHE
+
+    managed_scope.invalidate_managed_cache()
+    _LOAD_CONFIG_CACHE.clear()
+    _external_dirs_cache_clear()
+
+    assert not (home / "config.yaml").exists()
+    assert get_external_skills_dirs() == [shared.resolve()]

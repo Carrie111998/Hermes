@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -155,6 +156,220 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+
+
+class TestStaleAgentAdoptsFullCompressionTip:
+    def test_recovery_keeps_single_hop_live_child_behavior(self, tmp_path: Path):
+        """The full-tip resolver must preserve ordinary one-hop adoption."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_SINGLE_HOP"
+        child = "CHILD_SINGLE_HOP"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        db.create_session(child, source="slack", parent_session_id=root)
+        db.append_message(child, "user", "child message")
+
+        agent = _build_agent_with_db(db, root, platform="slack")
+        direct_child = db.find_live_compression_child(root)
+        assert direct_child is not None
+        assert direct_child["id"] == child
+        assert db.get_compression_tip(root) == child
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        recovered = recover_rotated_compression_session(agent)
+
+        assert recovered is not None
+        assert agent.session_id == child
+        assert [m["content"] for m in recovered] == ["child message"]
+
+    def test_recovery_walks_multiple_rotations_before_next_turn(self, tmp_path: Path):
+        """A late async completion can wake an agent pinned two rotations back.
+
+        The direct child is already compression-ended, so recovery must walk to
+        the unique live tip rather than retrying a durable write on the root.
+        """
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_MULTI_HOP"
+        middle = "MIDDLE_MULTI_HOP"
+        tip = "TIP_MULTI_HOP"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        db.create_session(middle, source="slack", parent_session_id=root)
+        db.append_message(middle, "user", "middle message")
+        db.end_session(middle, "compression")
+        db.create_session(tip, source="slack", parent_session_id=middle)
+        db.append_message(tip, "user", "tip message")
+
+        agent = _build_agent_with_db(db, root, platform="slack")
+        assert db.find_live_compression_child(root) is None
+        assert db.get_compression_tip(root) == tip
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        recovered = recover_rotated_compression_session(agent)
+
+        assert recovered is not None
+        assert agent.session_id == tip
+        assert [m["content"] for m in recovered] == ["tip message"]
+        assert agent._flushed_db_message_session_id == tip
+        agent.context_compressor.bind_session_state.assert_called_once_with(
+            session_db=db, session_id=tip
+        )
+
+    def test_recovery_fails_closed_when_lineage_forks(self, tmp_path: Path):
+        """A stale writer must not guess between two canonical continuations."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_AMBIGUOUS"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        for child in ("CHILD_A", "CHILD_B"):
+            db.create_session(child, source="slack", parent_session_id=root)
+            db.append_message(child, "user", child)
+
+        agent = _build_agent_with_db(db, root, platform="slack")
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        assert db.find_live_compression_tip(root) is None
+        assert recover_rotated_compression_session(agent) is None
+        assert agent.session_id == root
+
+    def test_recovery_holds_tip_lease_through_first_append(self, tmp_path: Path):
+        """The adopted tip cannot rotate before the first durable turn write."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_WRITE_FENCE"
+        tip = "TIP_WRITE_FENCE"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        db.create_session(tip, source="slack", parent_session_id=root)
+        db.append_message(tip, "user", "tip message")
+        agent = _build_agent_with_db(db, root, platform="slack")
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        recovered = recover_rotated_compression_session(agent)
+        assert recovered is not None
+        holder = agent._active_compression_lock_holder
+        assert holder
+
+        contender_result = []
+
+        def _contend():
+            contender_result.append(
+                db.try_acquire_compression_lock(tip, "contender", ttl_seconds=60)
+            )
+
+        contender = threading.Thread(target=_contend)
+        contender.start()
+        contender.join(timeout=5)
+        assert contender_result == [False]
+
+        db.append_messages_batch(
+            tip,
+            [{"role": "user", "content": "first adopted write"}],
+            compression_lock_holder=holder,
+        )
+        db.release_compression_lock(tip, holder)
+        agent._active_compression_lock_holder = None
+        agent._compression_recovery_lock_session_id = ""
+        assert [m["content"] for m in db.get_messages(tip)][-1] == "first adopted write"
+
+    def test_recovery_preserves_authoritative_tip_guard_state(self, tmp_path: Path):
+        """Recovery binds the tip without carrying stale root counters forward."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_GUARD_STATE"
+        tip = "TIP_GUARD_STATE"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.set_compression_fallback_streak(root, 1)
+        db.set_compression_ineffective_count(root, 2)
+        db.end_session(root, "compression")
+        db.create_session(tip, source="slack", parent_session_id=root)
+        db.append_message(tip, "user", "tip message")
+        db.set_compression_fallback_streak(tip, 7)
+        db.set_compression_ineffective_count(tip, 8)
+        agent = _build_agent_with_db(db, root, platform="slack")
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            agent.context_compressor = ContextCompressor(
+                model="test/model",
+                threshold_percent=0.85,
+                protect_first_n=2,
+                protect_last_n=2,
+                quiet_mode=True,
+            )
+        agent.context_compressor.bind_session_state(db, root)
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        recovered = recover_rotated_compression_session(agent)
+
+        assert recovered is not None
+        holder = agent._active_compression_lock_holder
+        db.release_compression_lock(tip, holder)
+        agent._active_compression_lock_holder = None
+        assert agent.context_compressor._fallback_compression_streak == 7
+        assert agent.context_compressor._ineffective_compression_count == 8
+        assert db.get_compression_fallback_streak(tip) == 7
+        assert db.get_compression_ineffective_count(tip) == 8
+
+    def test_recovery_accepts_foreign_inherited_delegate_marker(self, tmp_path: Path):
+        """A marker for another parent does not disqualify a continuation."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        marker = {"_delegate_from": "OUTER_PARENT"}
+        root = "ROOT_FOREIGN_MARKER"
+        middle = "MIDDLE_FOREIGN_MARKER"
+        tip = "TIP_FOREIGN_MARKER"
+        db.create_session(root, source="slack", model_config=marker)
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        db.create_session(
+            middle, source="slack", parent_session_id=root, model_config=marker
+        )
+        db.append_message(middle, "user", "middle message")
+        db.end_session(middle, "compression")
+        db.create_session(
+            tip, source="slack", parent_session_id=middle, model_config=marker
+        )
+        db.append_message(tip, "user", "tip message")
+        agent = _build_agent_with_db(db, root, platform="slack")
+
+        from agent.conversation_compression import recover_rotated_compression_session
+
+        recovered = recover_rotated_compression_session(agent)
+
+        assert recovered is not None
+        assert agent.session_id == tip
+
+    def test_recovery_legacy_direct_child_fallback_without_full_tip_api(
+        self, tmp_path: Path
+    ):
+        """Older/custom stores retain the unique direct-child recovery path."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        root = "ROOT_LEGACY_FALLBACK"
+        child = "CHILD_LEGACY_FALLBACK"
+        db.create_session(root, source="slack")
+        db.append_message(root, "user", "root message")
+        db.end_session(root, "compression")
+        db.create_session(child, source="slack", parent_session_id=root)
+        db.append_message(child, "user", "child message")
+        agent = _build_agent_with_db(db, root, platform="slack")
+
+        from agent.conversation_compression import _adopt_live_compression_child
+
+        with patch.object(SessionDB, "find_live_compression_tip", new=None):
+            recovered = _adopt_live_compression_child(agent, db, root)
+
+        assert recovered is not None
+        assert agent.session_id == child
+        assert [m["content"] for m in recovered] == ["child message"]
 
 
 class TestWorkspaceMetadataFollowsRotation:

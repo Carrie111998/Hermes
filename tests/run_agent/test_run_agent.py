@@ -179,6 +179,50 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     assert db.rows == ["exactly once"]
 
 
+def test_flush_retries_once_after_adopted_tip_rotates(agent, tmp_path):
+    """A closed adopted tip is re-resolved before reporting persistence failure."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    root = "ROOT_FLUSH_RETRY"
+    tip = "TIP_FLUSH_RETRY"
+    next_tip = "NEXT_TIP_FLUSH_RETRY"
+    db.create_session(root, source="slack")
+    db.append_message(root, "user", "root message")
+    db.end_session(root, "compression")
+    db.create_session(tip, source="slack", parent_session_id=root)
+    db.append_message(tip, "user", "tip message")
+    agent._session_db = db
+    agent._session_db_created = True
+    agent.session_id = root
+    agent._last_flushed_db_idx = 0
+    agent._flushed_db_message_ids = set()
+    agent._flushed_db_message_session_id = None
+    agent._persist_user_message_idx = None
+    agent._persist_user_message_override = None
+    agent._persist_user_message_timestamp = None
+    agent._persist_disabled = False
+    agent._session_persist_lock = threading.RLock()
+    agent._session_json_enabled = False
+
+    from agent.conversation_compression import recover_rotated_compression_session
+
+    recovered = recover_rotated_compression_session(agent)
+    assert recovered is not None
+    holder = agent._active_compression_lock_holder
+    db.release_compression_lock(tip, holder)
+    agent._active_compression_lock_holder = None
+    db.end_session(tip, "compression")
+    db.create_session(next_tip, source="slack", parent_session_id=tip)
+    db.append_message(next_tip, "user", "next tip message")
+    new_message = {"role": "assistant", "content": "late completion"}
+
+    assert agent._flush_messages_to_session_db(recovered + [new_message], recovered)
+    assert agent.session_id == next_tip
+    assert [m["content"] for m in db.get_messages(next_tip)][-1] == "late completion"
+    db.close()
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""

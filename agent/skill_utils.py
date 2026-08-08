@@ -497,48 +497,62 @@ def _external_dirs_cache_clear() -> None:
 
 
 def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+    """Return configured external skill directories.
 
-    Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
-    path.  Only directories that actually exist are returned.  Duplicates and
-    paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
+    Reads the fully resolved Hermes config so administrator-managed
+    ``skills.external_dirs`` values apply to every Profile, including a newly
+    created Profile with no user ``config.yaml``. Each path is expanded and
+    resolved; missing directories and the Profile-local skill root are skipped.
 
-    Cached in-process, keyed on ``config.yaml`` mtime — the function is
-    called once per skill during banner / tool-registry scans, and YAML
-    parsing a non-trivial config dominates ``hermes`` cold-start time
-    when the cache is absent.
+    The resolved config loader already caches both user and managed config by
+    mtime+size. This function keeps a tiny directory-list cache keyed by those
+    same signatures because banner/tool scans call it once per skill.
     """
     config_path = get_config_path()
-    if not config_path.exists():
-        return []
-
-    # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
-    # the full YAML parse, so the fast path is nearly free.
     try:
-        stat = config_path.stat()
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
+        user_stat = config_path.stat() if config_path.exists() else None
     except OSError:
-        cache_key = None  # type: ignore[assignment]
+        user_stat = None
 
-    if cache_key is not None:
-        cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
-        if cached is not None:
-            # Return a copy so callers can't mutate the cached list.
-            return list(cached)
+    managed_path: Optional[Path] = None
+    managed_sig = (0, 0)
+    try:
+        from hermes_cli import managed_scope
 
-    parsed = _load_raw_config()
-    if not parsed:
-        return []
+        managed_dir = managed_scope.get_managed_dir()
+        managed_path = (managed_dir / "config.yaml") if managed_dir else None
+        managed_stat = managed_path.stat() if managed_path else None
+        if managed_stat:
+            managed_sig = (managed_stat.st_mtime_ns, managed_stat.st_size)
+    except OSError:
+        pass
 
-    skills_cfg = parsed.get("skills")
-    if not isinstance(skills_cfg, dict):
-        return []
+    user_sig = (
+        user_stat.st_mtime_ns if user_stat else 0,
+        user_stat.st_size if user_stat else 0,
+    )
+    cache_key: Tuple[str, int] = (
+        str(config_path),
+        hash((user_sig, managed_sig)),
+    )
+    cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
 
-    raw_dirs = skills_cfg.get("external_dirs")
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        parsed = load_config_readonly()
+    except Exception as exc:
+        logger.debug("Could not load resolved skill config: %s", exc)
+        parsed = _load_raw_config()
+
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    raw_dirs = skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else None
     if not raw_dirs:
         result: List[Path] = []
-        if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+        _EXTERNAL_DIRS_CACHE.clear()
+        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
         return result
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
@@ -551,22 +565,13 @@ def get_external_skills_dirs() -> List[Path]:
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result = []
-
     for entry in raw_dirs:
         entry = str(entry).strip()
         if not entry:
             continue
-        # Expand ~ and environment variables
-        expanded = os.path.expanduser(os.path.expandvars(entry))
-        p = Path(expanded)
-        # Resolve relative paths against HERMES_HOME, not cwd
-        if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
-        if p == local_skills:
-            continue
-        if p in seen:
+        p = Path(os.path.expanduser(os.path.expandvars(entry)))
+        p = (hermes_home / p).resolve() if not p.is_absolute() else p.resolve()
+        if p == local_skills or p in seen:
             continue
         if p.is_dir():
             seen.add(p)
@@ -574,8 +579,8 @@ def get_external_skills_dirs() -> List[Path]:
         else:
             logger.debug("External skills dir does not exist, skipping: %s", p)
 
-    if cache_key is not None:
-        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    _EXTERNAL_DIRS_CACHE.clear()
+    _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 

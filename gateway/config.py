@@ -1273,22 +1273,25 @@ def load_gateway_config() -> GatewayConfig:
         except Exception as e:
             logger.warning("Failed to load %s: %s", gateway_json_path, e)
 
-    # Primary source: config.yaml
+    # Primary source: config.yaml + administrator-managed overlay.
     try:
         import yaml
         config_yaml_path = _home / "config.yaml"
+        yaml_cfg: dict = {}
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
-                yaml_cfg = yaml.safe_load(f) or {}
+                loaded_yaml = yaml.safe_load(f) or {}
+            if isinstance(loaded_yaml, dict):
+                yaml_cfg = loaded_yaml
 
-            # Managed scope: overlay administrator-pinned values so the gateway
-            # honors them too. This loader builds its own dict instead of going
-            # through hermes_cli.config.load_config, so without this a managed
-            # session_reset / quick_commands / stt / model would be ignored by
-            # the messaging gateway. Fail-open via the shared helper.
-            from hermes_cli import managed_scope
-            yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
+        # Managed scope applies even when this is a brand-new profile with no
+        # config.yaml yet. Otherwise administrator-pinned gateway defaults such
+        # as a Slack home channel disappear until the profile writes a local
+        # config file, defeating the purpose of a global managed scope.
+        from hermes_cli import managed_scope
+        yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
 
+        if yaml_cfg:
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`
             # (e.g. via `hermes config set gateway.<key> ...`, which naturally

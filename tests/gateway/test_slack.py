@@ -2104,6 +2104,22 @@ class TestSendTyping:
         )
 
     @pytest.mark.asyncio
+    async def test_stop_typing_clear_failure_logs_identity(self, adapter, caplog):
+        """A failed server-side clear must not be hidden at DEBUG level."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=RuntimeError("clear unavailable")
+        )
+
+        with caplog.at_level("WARNING"):
+            await adapter.stop_typing(
+                "D123",
+                metadata={"thread_id": "171.000", "slack_team_id": "T_ONE"},
+            )
+
+        assert "assistant.threads.setStatus clear failed" in caplog.text
+        assert "team_id=T_ONE channel_id=D123 thread_ts=171.000" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_stop_typing_untracked_fallback_respects_ambiguous_workspaces(
         self, adapter
     ):
@@ -2146,6 +2162,25 @@ class TestSendTyping:
         )
         assert ("", "C123", "parent_ts") not in adapter._active_status_threads
 
+    @pytest.mark.asyncio
+    async def test_status_clear_failure_does_not_reclassify_successful_post(
+        self, adapter, caplog
+    ):
+        """A clear failure after chat.postMessage must not duplicate the reply."""
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(
+            side_effect=RuntimeError("clear unavailable")
+        )
+
+        with caplog.at_level("WARNING"):
+            result = await adapter.send(
+                "C123", "done", metadata={"thread_id": "parent_ts"}
+            )
+
+        assert result.success
+        assert result.message_id == "reply_ts"
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert "assistant.threads.setStatus clear failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_status_tracking_is_per_thread(self, adapter):

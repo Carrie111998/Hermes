@@ -1209,27 +1209,67 @@ def _adopt_live_compression_child(
     session_db: Any,
     parent_session_id: str,
 ) -> Optional[List[Dict[str, Any]]]:
-    """Move a stale compression contender onto the unique durable child.
+    """Move a stale compression contender onto the durable live lineage tip.
 
-    Resolve and load first, then mutate the live agent. This ordering keeps the
-    stale contender fail-closed when lineage is ambiguous or the compacted
-    handoff cannot be read.
+    A cached agent or late async-completion turn can remain pinned to a parent
+    while the same logical conversation compresses more than once. In that
+    case the direct child is already ended, so ``find_live_compression_child``
+    correctly returns nothing even though a unique live descendant exists.
+    Prefer the DB's fail-closed full-lineage resolver when it exists, while
+    retaining the direct-child fallback for older/custom implementations.
+
+    Resolve and load first, then mutate the live agent. Re-resolving the tip
+    after the load keeps the stale contender fail-closed if another rotation
+    races this adoption or the compacted handoff cannot be read.
     """
     finder = getattr(type(session_db), "find_live_compression_child", None)
+    tip_finder = getattr(type(session_db), "find_live_compression_tip", None)
     loader = getattr(type(session_db), "get_messages_as_conversation", None)
-    if not callable(finder) or not callable(loader):
+    if not callable(loader):
         return None
-    child = finder(session_db, parent_session_id)
+
+    # Claim the chosen live tip in the SAME write transaction as full-lineage
+    # resolution. The holder is passed to the first transcript append, fencing
+    # a third compression rotation out of the resolve/load/adopt/write window.
+    recovery_holder = _compression_lock_holder(agent)
+    claimed_session_id = ""
+
+    def _resolve_target() -> Optional[Dict[str, Any]]:
+        if callable(tip_finder):
+            try:
+                live_tip = tip_finder(
+                    session_db,
+                    parent_session_id,
+                    acquire_lease_holder=recovery_holder,
+                    lease_ttl_seconds=60.0,
+                )
+            except TypeError:
+                # Older/custom stores may expose a read-only full-tip resolver
+                # without lease-claim kwargs. Use it, then rely on the guarded
+                # persistence retry if the tip rotates before the write.
+                live_tip = tip_finder(session_db, parent_session_id)
+            if isinstance(live_tip, dict):
+                return live_tip
+        if callable(finder):
+            direct_child = finder(session_db, parent_session_id)
+            return direct_child if isinstance(direct_child, dict) else None
+        return None
+
+    child = _resolve_target()
     if not child or not child.get("id"):
         return None
     child_session_id = str(child["id"])
+    claimed_session_id = child_session_id
+    holder_getter = getattr(session_db, "get_compression_lock_holder", None)
+    lease_claimed = bool(
+        callable(holder_getter)
+        and holder_getter(child_session_id) == recovery_holder
+    )
     recovered = loader(session_db, child_session_id)
     if not isinstance(recovered, list) or not recovered:
-        return None
-    # Revalidate after loading: the child may have rotated or a competing
-    # continuation may have appeared between the two DB reads.
-    confirmed = finder(session_db, parent_session_id)
-    if not confirmed or str(confirmed.get("id") or "") != child_session_id:
+        release = getattr(session_db, "release_compression_lock", None)
+        if callable(release):
+            release(child_session_id, recovery_holder)
         return None
 
     agent.session_id = child_session_id
@@ -1254,27 +1294,19 @@ def _adopt_live_compression_child(
     agent._flushed_db_message_ids = {
         id(message) for message in recovered if isinstance(message, dict)
     }
+    if lease_claimed:
+        agent._active_compression_lock_holder = recovery_holder
+        agent._compression_recovery_lock_session_id = claimed_session_id
 
-    on_session_start = getattr(agent.context_compressor, "on_session_start", None)
-    if callable(on_session_start):
+    # This is adoption of an already-authoritative tip, not publication of a
+    # fresh compression boundary. Bind the tip's own durable guard state; do not
+    # carry stale ancestor counters forward via old_session_id.
+    bind_state = getattr(agent.context_compressor, "bind_session_state", None)
+    if callable(bind_state):
         try:
-            on_session_start(
-                child_session_id,
-                boundary_reason="compression",
-                old_session_id=parent_session_id,
-                session_db=session_db,
-                platform=getattr(agent, "platform", None) or "cli",
-                conversation_id=getattr(agent, "_gateway_session_key", None),
-            )
+            bind_state(session_db=session_db, session_id=child_session_id)
         except Exception as exc:
             logger.debug("context engine compression-child adoption failed: %s", exc)
-    else:
-        bind_state = getattr(agent.context_compressor, "bind_session_state", None)
-        if callable(bind_state):
-            try:
-                bind_state(session_db=session_db, session_id=child_session_id)
-            except Exception:
-                pass
     try:
         if agent._memory_manager:
             agent._memory_manager.on_session_switch(
@@ -1342,6 +1374,19 @@ def recover_rotated_compression_session(
             exc,
         )
         return None
+
+
+def recover_rotated_compression_session_for_write(
+    agent: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """Recover a tip that rotated after turn setup but before persistence."""
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None) or ""
+    if session_db is None or not session_id:
+        return None
+    if not _session_was_rotated_by_compression(session_db, session_id):
+        return None
+    return _adopt_live_compression_child(agent, session_db, session_id)
 
 
 def _compression_lock_holder(agent: Any) -> str:

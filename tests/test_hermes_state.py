@@ -1938,7 +1938,12 @@ class TestCompressionChainProjection:
         db.append_message("root1", "user", "help me refactor auth")
 
         # Delegate subagent spawned while root1 was live (before it ended)
-        db.create_session("delegate1", "cli", parent_session_id="root1")
+        db.create_session(
+            "delegate1",
+            "cli",
+            parent_session_id="root1",
+            model_config={"_delegate_from": "root1"},
+        )
         db._conn.execute(
             "UPDATE sessions SET started_at=?, ended_at=? WHERE id=?",
             (t0 + 600, t0 + 650, "delegate1"),
@@ -1984,6 +1989,39 @@ class TestCompressionChainProjection:
         assert db.get_compression_tip("root1") == "tip1"
         assert db.get_compression_tip("mid1") == "tip1"
         assert db.get_compression_tip("tip1") == "tip1"
+
+    def test_find_live_compression_tip_requires_unique_chain(self, db):
+        import time as _time
+        self._build_compression_chain(db, _time.time() - 3600)
+        row = db.find_live_compression_tip("root1")
+        assert row is not None
+        assert row["id"] == "tip1"
+
+        db._conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id, started_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("ambiguous_sibling", "cli", "root1", _time.time()),
+        )
+        db._conn.commit()
+
+        # UI projection still picks a best tip, but writer recovery fails closed.
+        assert db.get_compression_tip("root1") in {"tip1", "ambiguous_sibling"}
+        assert db.find_live_compression_tip("root1") is None
+
+    def test_find_live_compression_tip_claims_tip_lease_atomically(self, db):
+        import time as _time
+        self._build_compression_chain(db, _time.time() - 3600)
+
+        row = db.find_live_compression_tip(
+            "root1", acquire_lease_holder="recovery-holder", lease_ttl_seconds=60
+        )
+
+        assert row is not None
+        assert row["id"] == "tip1"
+        assert db.get_compression_lock_holder("tip1") == "recovery-holder"
+        assert db.try_acquire_compression_lock(
+            "tip1", "competing-holder", ttl_seconds=60
+        ) is False
 
 
 

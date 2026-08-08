@@ -45,6 +45,35 @@ class TestHomeChannelRoundtrip:
         assert restored.user_id == "user-123"
         assert restored.scope_id == "guild-456"
 
+    def test_managed_home_channel_loads_without_profile_config(self, tmp_path, monkeypatch):
+        """A brand-new profile must still receive an administrator-pinned home."""
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        managed_home = tmp_path / "managed"
+        managed_home.mkdir()
+        (managed_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  slack:\n"
+            "    home_channel:\n"
+            "      platform: slack\n"
+            "      chat_id: C0HOME\n"
+            "      name: hermes-home\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_home))
+
+        from hermes_cli import managed_scope
+        managed_scope.invalidate_managed_cache()
+        try:
+            config = load_gateway_config()
+            home = config.get_home_channel(Platform.SLACK)
+            assert home is not None
+            assert home.chat_id == "C0HOME"
+            assert home.name == "hermes-home"
+        finally:
+            managed_scope.invalidate_managed_cache()
+
 
 class TestPlatformConfigRoundtrip:
     def test_to_dict_from_dict(self):

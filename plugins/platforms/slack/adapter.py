@@ -2292,6 +2292,13 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Slack] Watchdog task raised during disconnect", exc_info=True
                 )
 
+        # Slack Assistant status is server-persistent: closing Socket Mode or
+        # the Web API clients does not dismiss an outstanding "is thinking..."
+        # line. Clear every status we still own while workspace clients are
+        # usable; otherwise a gateway restart loses the in-memory routing map
+        # and can leave Slack showing "still working..." indefinitely.
+        await self._clear_active_status_threads_on_disconnect()
+
         await self._stop_socket_mode_handler()
         await self._close_workspace_clients()
         self._app = None
@@ -2405,22 +2412,27 @@ class SlackAdapter(BasePlatformAdapter):
     async def _clear_thread_status_quietly(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Best-effort assistant-status clear for send() paths that bypass
-        the normal post-delivery clear.
+        """Best-effort assistant-status clear for message-delivery paths.
 
         Issue #24117: the assistant thread can stay stuck "is thinking..."
-        when a turn ends through a path that never reaches the regular
-        ``if thread_ts: stop_typing`` clear — an empty final response, a
-        slash-command ephemeral reply, or an exception raised before
-        ``thread_ts`` was resolved. ``stop_typing`` is already idempotent
-        (clearing an unset status is a no-op on Slack's side), so this just
-        guarantees it runs without letting a cleanup error mask the caller's
-        SendResult.
+        when a turn ends through a path that never reaches the regular clear —
+        an empty final response, a slash-command ephemeral reply, or an
+        exception raised before ``thread_ts`` was resolved. A status-clear
+        failure must never reclassify an already-posted response as failed or
+        trigger a duplicate gateway retry, so cleanup errors are logged here
+        and deliberately do not escape.
         """
         try:
             await self.stop_typing(chat_id, metadata=metadata)
         except Exception as e:  # pragma: no cover - defensive cleanup
-            logger.debug("[Slack] status cleanup failed: %s", e)
+            logger.warning(
+                "[Slack] status cleanup raised unexpectedly "
+                "(team_id=%s channel_id=%s thread_ts=%s): %s",
+                self._metadata_team_id(metadata) or "<unknown>",
+                chat_id,
+                str((metadata or {}).get("thread_id") or (metadata or {}).get("thread_ts") or "<unknown>"),
+                e,
+            )
 
     def _slack_ignored_channels(self) -> set[str]:
         """Configured Slack channels the generic gateway must never touch."""
@@ -2581,9 +2593,13 @@ class SlackAdapter(BasePlatformAdapter):
                     else:
                         raise
 
-            # Clear Slack Assistant status as soon as the final message is posted.
+            # Clear Slack Assistant status as soon as the final message is
+            # posted. Do not let a failed status API call look like a failed
+            # message delivery: the post already succeeded and gateway retry
+            # would duplicate the visible reply. stop_typing remains directly
+            # callable for lifecycle code that wants strict exception behavior.
             if thread_ts:
-                await self.stop_typing(chat_id, metadata=metadata)
+                await self._clear_thread_status_quietly(chat_id, metadata)
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
@@ -3031,7 +3047,50 @@ class SlackAdapter(BasePlatformAdapter):
                 status="",
             )
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+            logger.warning(
+                "[Slack] assistant.threads.setStatus clear failed "
+                "(team_id=%s channel_id=%s thread_ts=%s): %s",
+                team_id or "<unknown>",
+                chat_id,
+                thread_ts,
+                e,
+            )
+
+    async def _clear_active_status_threads_on_disconnect(self) -> None:
+        """Best-effort clear of server-persistent Assistant statuses.
+
+        Entries are removed only after Slack accepts the clear. Failed entries
+        remain tracked until adapter teardown, and the warning preserves the
+        exact workspace/channel/thread identity for diagnosis.
+        """
+        for status_key, active in list(self._active_status_threads.items()):
+            team_id, channel_id, key_thread_ts = status_key
+            thread_ts = (
+                str(active.get("thread_ts") or key_thread_ts)
+                if isinstance(active, dict)
+                else str(active or key_thread_ts)
+            )
+            if not thread_ts:
+                continue
+            try:
+                await self._get_client(
+                    channel_id, team_id=team_id
+                ).assistant_threads_setStatus(
+                    channel_id=channel_id,
+                    thread_ts=thread_ts,
+                    status="",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] Assistant status cleanup during disconnect failed "
+                    "(team_id=%s channel_id=%s thread_ts=%s): %s",
+                    team_id or "<unknown>",
+                    channel_id,
+                    thread_ts,
+                    e,
+                )
+                continue
+            self._active_status_threads.pop(status_key, None)
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.

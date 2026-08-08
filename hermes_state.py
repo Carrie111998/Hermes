@@ -3709,6 +3709,105 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return self._session_row_dict(rows[0]) if len(rows) == 1 else None
 
+    def find_live_compression_tip(
+        self,
+        ancestor_session_id: str,
+        *,
+        acquire_lease_holder: Optional[str] = None,
+        lease_ttl_seconds: float = 60.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the unique live descendant of a compression lineage.
+
+        Unlike :meth:`get_compression_tip`, which is a best-effort UI/resume
+        projection and may choose among stale siblings, this recovery helper
+        fails closed whenever a compression hop has more than one canonical
+        continuation. A stale writer may adopt a descendant only when every
+        durable edge from the closed ancestor to the live tip is unambiguous.
+
+        When ``acquire_lease_holder`` is supplied, resolution and lease claim
+        run in one ``BEGIN IMMEDIATE`` transaction. The returned live tip then
+        cannot rotate before that holder performs the first transcript append
+        and releases the holder-qualified lease.
+        """
+        if not ancestor_session_id:
+            return None
+        def _resolve(conn):
+            current = ancestor_session_id
+            seen = {current}
+            for _ in range(100):
+                parent = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+                if parent is None:
+                    return None
+                if parent["ended_at"] is None:
+                    if current == ancestor_session_id:
+                        return None
+                    row = conn.execute(
+                        """
+                        SELECT s.*,
+                               COALESCE(sp.prompt, s.system_prompt)
+                                   AS _system_prompt_resolved
+                        FROM sessions s
+                        LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
+                        WHERE s.id = ?
+                        """,
+                        (current,),
+                    ).fetchone()
+                    if row is None:
+                        return None
+                    if acquire_lease_holder:
+                        now = time.time()
+                        conn.execute(
+                            "DELETE FROM compression_locks "
+                            "WHERE session_id = ? AND expires_at <= ?",
+                            (current, now),
+                        )
+                        try:
+                            conn.execute(
+                                "INSERT INTO compression_locks "
+                                "(session_id, holder, acquired_at, expires_at) "
+                                "VALUES (?, ?, ?, ?)",
+                                (
+                                    current,
+                                    acquire_lease_holder,
+                                    now,
+                                    now + max(1.0, float(lease_ttl_seconds)),
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            return None
+                    return self._session_row_dict(row) if row else None
+                if parent["end_reason"] != "compression":
+                    return None
+                rows = conn.execute(
+                    """
+                    SELECT s.id
+                    FROM sessions s
+                    WHERE s.parent_session_id = ?
+                    """
+                    + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="s.")
+                    + """
+                    ORDER BY s.started_at ASC, s.id ASC
+                    LIMIT 2
+                    """,
+                    (current, current, current),
+                ).fetchall()
+                if len(rows) != 1:
+                    return None
+                child_id = str(rows[0]["id"] or "")
+                if not child_id or child_id in seen:
+                    return None
+                seen.add(child_id)
+                current = child_id
+            return None
+
+        if acquire_lease_holder:
+            return self._execute_write(_resolve)
+        with self._lock:
+            return _resolve(self._conn)
+
     def reopen_orphaned_compression_session(self, session_id: str) -> bool:
         """Reopen a compression parent only when no continuation was published.
 

@@ -2278,13 +2278,36 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
-                )
+                try:
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                    )
+                except Exception as _append_exc:
+                    from hermes_state import CompressionSessionClosedError
+
+                    if not isinstance(_append_exc, CompressionSessionClosedError):
+                        raise
+                    # The adopted tip can rotate after turn setup if its recovery
+                    # lease expired or an older/custom store could not provide a
+                    # lease. Re-resolve once at the persistence chokepoint, then
+                    # retry the SAME unstamped batch against the new live tip.
+                    from agent.conversation_compression import (
+                        recover_rotated_compression_session_for_write,
+                    )
+
+                    if recover_rotated_compression_session_for_write(self) is None:
+                        raise
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                    )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -2295,6 +2318,20 @@ class AIAgent:
             # Snapshot for the bounded scan above — only on full success, so
             # a partially-processed list can never be treated as settled.
             self._db_flush_scan_prefix = messages[:]
+            _recovery_lock_session_id = getattr(
+                self, "_compression_recovery_lock_session_id", ""
+            )
+            _recovery_lock_holder = getattr(
+                self, "_active_compression_lock_holder", None
+            )
+            if _recovery_lock_session_id and _recovery_lock_holder:
+                try:
+                    self._session_db.release_compression_lock(
+                        _recovery_lock_session_id, _recovery_lock_holder
+                    )
+                finally:
+                    self._compression_recovery_lock_session_id = ""
+                    self._active_compression_lock_holder = None
             return True
         except Exception as e:
             # Force a full re-scan on the next flush: an exception mid-loop

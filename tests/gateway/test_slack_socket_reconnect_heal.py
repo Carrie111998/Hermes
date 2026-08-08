@@ -270,6 +270,67 @@ class TestSocketModeTeardown:
             f"{session.ws_connect_after_close} time(s)"
         )
 
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_tracked_assistant_statuses_before_clients_close(
+        self, adapter
+    ):
+        """A restart must dismiss server-persistent statuses before teardown."""
+        team_client = MagicMock()
+        team_client.closed = False
+
+        async def _set_status(**kwargs):
+            assert not team_client.closed
+            return {"ok": True}
+
+        async def _close():
+            team_client.closed = True
+
+        team_client.assistant_threads_setStatus = AsyncMock(side_effect=_set_status)
+        team_client.close = AsyncMock(side_effect=_close)
+        adapter._team_clients = {"T_ONE": team_client}
+        adapter._active_status_threads[("T_ONE", "D123", "171.000")] = {
+            "thread_ts": "171.000",
+            "team_id": "T_ONE",
+        }
+        adapter._socket_watchdog_task = None
+        adapter._handler = None
+        adapter._socket_mode_task = None
+
+        await adapter.disconnect()
+
+        team_client.assistant_threads_setStatus.assert_awaited_once_with(
+            channel_id="D123", thread_ts="171.000", status=""
+        )
+        assert adapter._active_status_threads == {}
+        assert team_client.closed
+
+    @pytest.mark.asyncio
+    async def test_disconnect_status_clear_failure_is_visible_and_does_not_block_teardown(
+        self, adapter, caplog
+    ):
+        """A failed clear is warning-visible while disconnect still completes."""
+        team_client = MagicMock()
+        team_client.assistant_threads_setStatus = AsyncMock(
+            side_effect=RuntimeError("clear unavailable")
+        )
+        team_client.close = AsyncMock()
+        adapter._team_clients = {"T_ONE": team_client}
+        status_key = ("T_ONE", "D123", "171.000")
+        adapter._active_status_threads[status_key] = {
+            "thread_ts": "171.000",
+            "team_id": "T_ONE",
+        }
+        adapter._socket_watchdog_task = None
+        adapter._handler = None
+        adapter._socket_mode_task = None
+
+        with caplog.at_level("WARNING"):
+            await adapter.disconnect()
+
+        assert "Assistant status cleanup during disconnect failed" in caplog.text
+        assert "team_id=T_ONE channel_id=D123 thread_ts=171.000" in caplog.text
+        team_client.close.assert_awaited_once()
+
 
 class TestSocketModeRestart:
 
