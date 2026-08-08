@@ -3178,7 +3178,13 @@ def test_status_callback_accepts_single_message_argument():
 
 def test_step_callback_emits_live_usage_snapshot(monkeypatch):
     usage = {
+        "model": "gpt-5.6-sol",
         "calls": 7,
+        "input": 100,
+        "output": 20,
+        "prompt": 90,
+        "completion": 18,
+        "total": 120,
         "context_used": 123_456,
         "context_max": 272_000,
         "context_percent": 45,
@@ -3190,7 +3196,19 @@ def test_step_callback_emits_live_usage_snapshot(monkeypatch):
         cb = server._agent_cbs("sid")["step_callback"]
         cb(8, [])
 
-    emit.assert_called_once_with("usage.update", "sid", usage)
+    emit.assert_called_once_with(
+        "usage.update",
+        "sid",
+        {
+            "calls": 7,
+            "input": 100,
+            "output": 20,
+            "total": 120,
+            "context_used": 123_456,
+            "context_max": 272_000,
+            "context_percent": 45,
+        },
+    )
 
 
 def test_resolve_model_uses_inference_model_env(monkeypatch):

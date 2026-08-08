@@ -83,7 +83,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({
       payload: { calls: 3, context_max: 272_000, context_percent: 50, context_used: 136_000, total: 30 },
       type: 'usage.update'
-    } as any)
+    })
 
     expect(getUiState().usage).toMatchObject({
       calls: 3,
