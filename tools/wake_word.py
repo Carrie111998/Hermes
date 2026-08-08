@@ -576,11 +576,12 @@ class _OpenWakeWordEngine(_Engine):
         framework = resolve_inference_framework(cfg)
         # On Intel macOS the ONNX stack is not installable — the pinned
         # onnxruntime==1.27.0 has no x86_64 wheel — so ``wake.openwakeword``
-        # (which includes onnxruntime) can never install there.  The tflite
-        # runtime has macOS wheels for both arches, so the tflite feature is
-        # the one to ensure on that host (#81560).
+        # (which includes onnxruntime) can never install there.  The slim
+        # feature (openwakeword + sounddevice + numpy, no onnxruntime) is the
+        # stack to ensure on that host; the tflite runtime itself is installed
+        # by the ensure_tflite_runtime() block below (#81560).
         if _is_macos_intel():
-            lazy_deps.ensure("wake.openwakeword.tflite", prompt=False)
+            lazy_deps.ensure("wake.openwakeword.slim", prompt=False)
         else:
             lazy_deps.ensure("wake.openwakeword", prompt=False)
 

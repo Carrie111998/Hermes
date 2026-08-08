@@ -300,6 +300,30 @@ def test_explicit_framework_kept_where_onnx_works(monkeypatch):
     assert downloaded == [ww._bundled_wakeword_path("onnx")]
 
 
+def test_intel_macos_engine_ensures_slim_stack(monkeypatch):
+    # On Intel macOS the ONNX stack cannot install (onnxruntime==1.27.0 has no
+    # x86_64 wheel, #81560), so the engine must ensure the slim feature
+    # (openwakeword + sounddevice + numpy, no onnxruntime) — not
+    # ``wake.openwakeword.tflite``, which only carries ai-edge-litert and would
+    # leave ``import openwakeword`` broken on a fresh lazy install.
+    _install_fake_openwakeword(monkeypatch)
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: ensured.append(feature)
+    )
+    # The tflite-runtime alias step is a separate concern (it ensures
+    # ``wake.openwakeword.tflite`` on its own); stub it out so this test only
+    # observes the engine's platform-gated dependency choice.
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    ww._OpenWakeWordEngine(
+        {"provider": "openwakeword", "openwakeword": {"inference_framework": "tflite"}}
+    )
+    assert "wake.openwakeword.slim" in ensured
+    assert "wake.openwakeword.tflite" not in ensured
+
+
 def test_empty_framework_falls_back_to_platform_default(monkeypatch):
     """Empty/missing config defers to ``default_inference_framework()``.
 
