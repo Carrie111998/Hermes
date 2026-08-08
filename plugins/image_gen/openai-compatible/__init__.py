@@ -32,6 +32,12 @@ CONFIG_SECTION = "openai_compatible"
 ENV_PREFIX = "OPENAI_COMPATIBLE_IMAGE"
 DEFAULT_MODEL = "gpt-image-1"
 
+_SIZES = {
+    "landscape": "1536x1024",
+    "square": "1024x1024",
+    "portrait": "1024x1536",
+}
+
 
 def _load_config() -> Dict[str, Any]:
     try:
@@ -193,9 +199,19 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
-            "env": [f"{ENV_PREFIX}_BASE_URL"],
-            "optional_env": [f"{ENV_PREFIX}_API_KEY", f"{ENV_PREFIX}_MODEL"],
-            "tag": "OpenAI-compatible /v1/images/generations endpoint",
+            "tag": "OpenAI-compatible /v1/images/generations endpoint — JSON & SSE",
+            "env_vars": [
+                {
+                    "key": f"{ENV_PREFIX}_BASE_URL",
+                    "prompt": "Base URL (e.g. http://localhost:8000/v1)",
+                    "url": "",
+                },
+                {
+                    "key": f"{ENV_PREFIX}_API_KEY",
+                    "prompt": "API key (optional)",
+                    "url": "",
+                },
+            ],
         }
 
     def generate(
@@ -220,7 +236,7 @@ class OpenAICompatibleImageGenProvider(ImageGenProvider):
             "model": model,
             "prompt": prompt,
             "n": 1,
-            "size": kwargs.get("size") or resolve_aspect_ratio(aspect_ratio),
+            "size": kwargs.get("size") or _SIZES.get(resolve_aspect_ratio(aspect_ratio), _SIZES["square"]),
         }
         for key in ("quality", "background", "image_detail", "output_format", "response_format", "seed"):
             value = kwargs.get(key)

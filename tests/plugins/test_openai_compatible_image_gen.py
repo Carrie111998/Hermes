@@ -34,6 +34,55 @@ class DummyResponse:
         return None
 
 
+def test_get_setup_schema_returns_env_vars(monkeypatch):
+    """get_setup_schema should return env_vars (not env/optional_env) for picker compat."""
+    plugin = load_plugin()
+    schema = plugin.OpenAICompatibleImageGenProvider().get_setup_schema()
+
+    assert "env_vars" in schema, "Picker expects env_vars key"
+    assert isinstance(schema["env_vars"], list)
+    assert len(schema["env_vars"]) >= 1
+
+    keys = [v["key"] for v in schema["env_vars"]]
+    assert "OPENAI_COMPATIBLE_IMAGE_BASE_URL" in keys
+    assert "OPENAI_COMPATIBLE_IMAGE_API_KEY" in keys
+
+    # Every entry must have key, prompt, and url fields
+    for v in schema["env_vars"]:
+        assert "key" in v
+        assert "prompt" in v
+
+
+def test_generate_sends_correct_size_for_aspect_ratio(monkeypatch):
+    """Aspect ratio labels should be translated to OpenAI size strings (e.g. square → 1024x1024)."""
+    plugin = load_plugin()
+    calls = []
+
+    def fake_post(url, *, json, headers, timeout):
+        calls.append((url, json, headers, timeout))
+        return DummyResponse({"data": [{"b64_json": "AAAA"}]})
+
+    monkeypatch.setattr(plugin.requests, "post", fake_post)
+    monkeypatch.setattr(plugin, "save_b64_image", lambda data, **kwargs: "/tmp/test.png")
+    monkeypatch.setenv("OPENAI_COMPATIBLE_IMAGE_BASE_URL", "http://localhost:8000/v1")
+
+    # square → 1024x1024
+    plugin.OpenAICompatibleImageGenProvider().generate("cat", aspect_ratio="square")
+    assert calls[0][1]["size"] == "1024x1024", f"Expected 1024x1024 got {calls[0][1]['size']}"
+
+    # landscape → 1536x1024
+    plugin.OpenAICompatibleImageGenProvider().generate("cat", aspect_ratio="landscape")
+    assert calls[1][1]["size"] == "1536x1024", f"Expected 1536x1024 got {calls[1][1]['size']}"
+
+    # portrait → 1024x1536
+    plugin.OpenAICompatibleImageGenProvider().generate("cat", aspect_ratio="portrait")
+    assert calls[2][1]["size"] == "1024x1536", f"Expected 1024x1536 got {calls[2][1]['size']}"
+
+    # Unknown aspect falls back to landscape (resolve_aspect_ratio default)
+    plugin.OpenAICompatibleImageGenProvider().generate("cat", aspect_ratio="ultrawide")
+    assert calls[3][1]["size"] == "1536x1024", f"Expected fallback 1536x1024 got {calls[3][1]['size']}"
+
+
 def test_provider_is_not_available_without_explicit_base_url(monkeypatch):
     plugin = load_plugin()
     monkeypatch.delenv("OPENAI_COMPATIBLE_IMAGE_BASE_URL", raising=False)
@@ -75,6 +124,7 @@ def test_generate_saves_b64_json_response(monkeypatch, tmp_path):
     assert calls[0][0] == "http://localhost:8000/v1/images/generations"
     assert calls[0][1]["model"] == "test-image-model"
     assert calls[0][1]["n"] == 1
+    assert calls[0][1]["size"] == "1024x1024"
     assert calls[0][2]["Authorization"] == "Bearer test-key"
     assert "text/event-stream" in calls[0][2]["Accept"]
 
