@@ -22,8 +22,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 
 import pytest
+import run_agent as run_agent_module
 
 from run_agent import (
     AIAgent,
@@ -113,6 +115,9 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._turn_file_mutation_fingerprint_bytes = 0
+    agent._turn_file_mutation_fingerprint_budget_exhausted = False
+    agent._turn_file_mutation_fingerprint_lock = threading.Lock()
     return agent
 
 
@@ -173,6 +178,100 @@ class TestRecordFileMutationResult:
         )
 
         assert agent._turn_failed_file_mutations == {}
+
+    @pytest.mark.parametrize(
+        ("failed_path", "successful_path"),
+        [
+            ("src/a.py", "/workspace/src/a.py"),
+            ("/workspace/src/a.py", "src/a.py"),
+        ],
+    )
+    def test_remote_success_clears_lexically_equivalent_alias_only(
+        self, monkeypatch, failed_path, successful_path,
+    ):
+        """Remote alias matching must not depend on host filesystem access."""
+        import tools.file_tools as file_tools
+
+        monkeypatch.setattr(file_tools, "_terminal_env_type_for_task", lambda _task_id: "docker")
+        monkeypatch.setattr(
+            file_tools,
+            "_authoritative_workspace_root",
+            lambda _task_id: "/workspace",
+        )
+        monkeypatch.setattr(
+            run_agent_module,
+            "Path",
+            lambda _path: pytest.fail("remote verifier target touched the host filesystem"),
+        )
+
+        agent = _bare_agent()
+        failed_patch = (
+            f"*** Update File: {failed_path}\n"
+            "*** Update File: src/sibling.py\n"
+        )
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "patch", "patch": failed_patch},
+            json.dumps({"error": "multi-file patch failed"}),
+            is_error=True,
+            task_id="remote-task",
+        )
+
+        assert agent._turn_failed_file_mutations[failed_path]["resolved_path"] == "/workspace/src/a.py"
+        assert agent._turn_failed_file_mutations[failed_path]["fingerprint"] is None
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": successful_path},
+            json.dumps({"success": True, "files_modified": ["/workspace/src/a.py"]}),
+            is_error=False,
+            task_id="remote-task",
+        )
+
+        assert list(agent._turn_failed_file_mutations) == ["src/sibling.py"]
+
+    def test_fingerprint_budget_is_aggregate_and_exhaustion_is_conservative(
+        self, tmp_path, monkeypatch,
+    ):
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        third = tmp_path / "third.txt"
+        first.write_bytes(b"a" * 8)
+        second.write_bytes(b"b" * 8)
+        third.write_bytes(b"c" * 2)
+        monkeypatch.setattr(run_agent_module, "_FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES", 12)
+        monkeypatch.setattr(run_agent_module, "_FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES", 12)
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {
+                "mode": "patch",
+                "patch": (
+                    f"*** Update File: {first}\n"
+                    f"*** Update File: {second}\n"
+                    f"*** Update File: {third}\n"
+                ),
+            },
+            json.dumps({"error": "multi-file patch failed"}),
+            is_error=True,
+        )
+
+        state = agent._turn_failed_file_mutations
+        assert state[str(first)]["fingerprint"] is not None
+        assert state[str(second)]["fingerprint"] is None
+        assert state[str(third)]["fingerprint"] is None
+        assert agent._turn_file_mutation_fingerprint_bytes == 8
+
+        first.write_bytes(b"changed!")
+        second.write_bytes(b"changed!")
+        third.write_bytes(b"changed!")
+        unresolved = agent._unresolved_file_mutation_failures()
+
+        assert list(unresolved) == [str(first), str(second), str(third)]
+        assert agent._turn_file_mutation_fingerprint_bytes <= 12
+        footer = agent._format_file_mutation_failure_footer(unresolved)
+        assert "3 failed file mutation target(s) remain unresolved" in footer
 
 
     def test_landed_paths_prefer_resolved_tool_result(self):

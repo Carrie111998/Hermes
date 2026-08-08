@@ -223,6 +223,12 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
+_FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES = 64 * 1024 * 1024
+# A target may be fingerprinted after failure and again at turn finalization.
+# Keep the complete hidden verifier workload bounded across the whole turn.
+_FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES = 2 * _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES
+
+
 # Internal flags that mark a message as ephemeral empty-response/prefill
 # recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
 # injected after an empty response, the terminal "(empty)" sentinel, and the
@@ -3491,36 +3497,49 @@ class AIAgent:
         *,
         task_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Resolve a verifier target only when it belongs to the local backend."""
+        """Canonicalize a target using the file tool's backend-aware path rules.
+
+        This is lexical identity only: remote targets need canonical aliases so
+        a recognized successful mutation can clear an equivalent failed path,
+        but they must never be inspected through the host filesystem.
+        """
         try:
-            from tools.file_tools import _resolve_path, _terminal_env_type_for_task
+            from tools.file_tools import _resolve_path
 
             effective_task_id = task_id or "default"
-            if _terminal_env_type_for_task(effective_task_id) != "local":
-                return None
-            return str(Path(_resolve_path(str(path), effective_task_id)))
+            return str(_resolve_path(str(path), effective_task_id))
         except Exception:
             return None
 
-    @classmethod
     def _snapshot_file_mutation_target(
-        cls,
+        self,
         path: str,
         *,
         task_id: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[tuple]]:
-        """Return a local target's resolved path and content fingerprint.
+        """Return a canonical target and, when local and budgeted, its fingerprint.
 
-        The verifier deliberately fingerprints only the local terminal
-        backend.  Host-side inspection of Docker/SSH/Modal paths could observe
-        an unrelated file with the same spelling and incorrectly suppress a
-        real warning.  When the target cannot be inspected, ``None`` keeps the
-        original conservative behavior.
+        Canonicalization applies to every backend for alias matching.  Content
+        inspection applies only to the local backend: host-side inspection of
+        Docker/SSH/Modal paths could observe an unrelated file with the same
+        spelling and incorrectly suppress a real warning.
+
+        Fingerprints consume one aggregate per-turn byte budget.  Snapshot
+        requests are serialized in tool-result arrival order and target order
+        within each result.  Once the next regular file does not fit,
+        fingerprinting stops for the turn; that target and every later target
+        remain conservatively unresolved.
         """
-        resolved_text = cls._resolve_file_mutation_target(path, task_id=task_id)
+        resolved_text = self._resolve_file_mutation_target(path, task_id=task_id)
         if not resolved_text:
             return None, None
         try:
+            from tools.file_tools import _terminal_env_type_for_task
+
+            effective_task_id = task_id or "default"
+            if _terminal_env_type_for_task(effective_task_id) != "local":
+                return resolved_text, None
+
             resolved = Path(resolved_text)
             try:
                 stat_result = resolved.stat()
@@ -3536,17 +3555,52 @@ class AIAgent:
             # A failed edit must not trigger an unbounded hidden read of a
             # giant target at both failure time and turn finalization.  For
             # large files, stay conservative and leave the warning unresolved.
-            if stat_result.st_size > 64 * 1024 * 1024:
+            if stat_result.st_size > _FILE_MUTATION_FINGERPRINT_MAX_FILE_BYTES:
                 return resolved_text, None
+
+            budget_lock = getattr(self, "_turn_file_mutation_fingerprint_lock", None)
+            if budget_lock is None:
+                budget_lock = threading.Lock()
+                self._turn_file_mutation_fingerprint_lock = budget_lock
+            with budget_lock:
+                if getattr(self, "_turn_file_mutation_fingerprint_budget_exhausted", False):
+                    return resolved_text, None
+                used = int(getattr(self, "_turn_file_mutation_fingerprint_bytes", 0))
+                remaining_budget = max(
+                    0,
+                    _FILE_MUTATION_FINGERPRINT_TURN_MAX_BYTES - used,
+                )
+                if stat_result.st_size > remaining_budget:
+                    self._turn_file_mutation_fingerprint_budget_exhausted = True
+                    return resolved_text, None
+                # Reserve before reading so concurrent tool-result workers can
+                # never collectively hash beyond the aggregate turn cap.  A
+                # failed/racing read keeps its reservation conservatively.
+                self._turn_file_mutation_fingerprint_bytes = used + stat_result.st_size
 
             digest = hashlib.sha256()
             with resolved.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                bytes_left = stat_result.st_size
+                while bytes_left:
+                    chunk = handle.read(min(1024 * 1024, bytes_left))
+                    if not chunk:
+                        return resolved_text, None
                     digest.update(chunk)
-            return resolved_text, ("file", digest.hexdigest())
+                    bytes_left -= len(chunk)
+
+            # If the file changed while it was read, the digest is not a safe
+            # baseline.  Its reserved bytes still count against the turn
+            # budget.
+            final_stat = resolved.stat()
+            if (
+                final_stat.st_size != stat_result.st_size
+                or final_stat.st_mtime_ns != stat_result.st_mtime_ns
+            ):
+                return resolved_text, None
+            return resolved_text, ("file", stat_result.st_size, digest.hexdigest())
         except Exception:
             # Verification is advisory and must never break turn finalization.
-            return None, None
+            return resolved_text, None
 
     def _unresolved_file_mutation_failures(self) -> Dict[str, Dict[str, Any]]:
         """Filter stale failures whose targets changed after the failed call.
