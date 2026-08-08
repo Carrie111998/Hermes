@@ -60,8 +60,10 @@ _FILLER = r"(?:\w+\s+){0,8}"
 
 # Character-based filler for languages with no whitespace-delimited words
 # (Chinese).  ``\s+``-based ``_FILLER`` cannot match here since there is
-# nothing to split on.
-_FILLER_CJK = r".{0,12}"
+# nothing to split on.  ``[\s\S]`` rather than ``.`` so the filler still
+# matches when a payload is wrapped across a line break (patterns compile
+# without ``re.DOTALL``, so a bare ``.`` never matches ``\n``).
+_FILLER_CJK = r"[\s\S]{0,12}"
 
 # Each entry: (regex, pattern_id, scope)
 # scope ∈ {"all", "context", "strict"}
@@ -157,7 +159,7 @@ _PATTERNS: List[Tuple[str, str, str]] = [
      "role_pretend", "context"),  # de: "tu so als ob / gib vor zu sein"
     (rf'притвор\w*[,\s]+{_FILLER}(?:что\s+{_FILLER}ты|кем)',
      "role_pretend", "context"),  # ru: "притворись, что ты / притворись кем-то"
-    (r'假装.{0,6}(?:你是|成为)', "role_pretend", "context"),  # zh: "假装你是 / 假装成为"
+    (r'假装[\s\S]{0,6}(?:你是|成为)', "role_pretend", "context"),  # zh: "假装你是 / 假装成为"
 
     (rf'(?:r[ée]v[èe]le|affiche|montre)\w*\s+{_FILLER}(?:ton|ta|votre)\s+{_FILLER}prompt\s+{_FILLER}(?:syst[èe]me|initial)',
      "leak_system_prompt", "context"),  # fr: "révèle ton prompt système/initial"
@@ -167,7 +169,7 @@ _PATTERNS: List[Tuple[str, str, str]] = [
      "leak_system_prompt", "context"),  # de: "zeige deinen System-Prompt"
     (rf'(?:покажи|раскрой|выведи)\w*\s+{_FILLER}сво\w*\s+{_FILLER}(?:системный\s+{_FILLER})?промпт',
      "leak_system_prompt", "context"),  # ru: "покажи свой (системный) промпт"
-    (r'(?:显示|泄露|输出).{0,6}(?:你的|您的).{0,6}系统提示',
+    (r'(?:显示|泄露|输出)[\s\S]{0,6}(?:你的|您的)[\s\S]{0,6}系统提示',
      "leak_system_prompt", "context"),  # zh: "显示/泄露你的系统提示"
 
     (rf'r[ée]pond\w*\s+{_FILLER}sans\s+{_FILLER}(?:restrictions?|limites?|filtres?)',
@@ -178,7 +180,7 @@ _PATTERNS: List[Tuple[str, str, str]] = [
      "remove_filters", "context"),  # de: "antworte ohne Einschränkungen"
     (rf'отвеча\w*\s+{_FILLER}без\s+{_FILLER}(?:ограничени\w*|фильтр\w*)',
      "remove_filters", "context"),  # ru: "отвечай без ограничений"
-    (r'(?:不受限制|无限制).{0,6}(?:回答|回复)',
+    (r'(?:不受限制|无限制)[\s\S]{0,6}(?:回答|回复)',
      "remove_filters", "context"),  # zh: "不受限制地回答 / 无限制回复"
 
     # "name yourself X" is a Brainworm-specific tell — identity override
