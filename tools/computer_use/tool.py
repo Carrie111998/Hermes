@@ -41,15 +41,20 @@ from __future__ import annotations
 import atexit
 import base64
 import concurrent.futures
+import hashlib
+import importlib
 import json
 import logging
 import os
+import platform
 import queue
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
+import types
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
@@ -825,81 +830,172 @@ def computer_use_process_snapshot() -> List[Dict[str, Any]]:
         return []
 
 
-def write_computer_use_runtime_attestation(
-    extra_callables: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Atomically bind the live gateway PID to loaded CUA source/code bytes."""
-    import hashlib
-    import inspect
-    import marshal
+_CUA_ATTESTATION_MODULES = (
+    "tools/computer_use/tool.py",
+    "tools/computer_use/cua_backend.py",
+    "tools/computer_use/browser_route.py",
+    "gateway/run.py",
+    "gateway/session.py",
+    "tools/approval.py",
+)
+_CUA_ATTESTATION_CALLABLES = (
+    "tools.computer_use.tool:set_computer_use_session_validator",
+    "tools.computer_use.tool:_validate_managed_publication",
+    "tools.computer_use.tool:publish_computer_use_session",
+    "tools.computer_use.tool:unpublish_computer_use_session",
+    "tools.computer_use.tool:begin_computer_use_terminal_transition",
+    "tools.computer_use.tool:end_computer_use_terminal_transition",
+    "tools.computer_use.tool:_cua_permission_mode",
+    "tools.computer_use.tool:_get_backend",
+    "tools.computer_use.tool:_acquire_backend_for_call",
+    "tools.computer_use.tool:release_computer_use_session_result",
+    "tools.computer_use.tool:handle_computer_use",
+    "tools.computer_use.tool:_dispatch",
+    "tools.computer_use.cua_backend:_AsyncBridge.run",
+    "tools.computer_use.cua_backend:_CuaDriverSession._lifecycle_coro",
+    "tools.computer_use.cua_backend:_CuaDriverSession.call_tool",
+    "tools.computer_use.cua_backend:_CuaDriverSession._call_tool_via_cli",
+    "tools.computer_use.cua_backend:_CuaDriverSession._restart_session_locked",
+    "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.start",
+    "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.stop",
+    "tools.computer_use.cua_backend:CuaDriverBackend.start",
+    "tools.computer_use.cua_backend:CuaDriverBackend.stop",
+    "tools.computer_use.cua_backend:CuaDriverBackend.capture",
+    "tools.computer_use.cua_backend:CuaDriverBackend._apply_delivery",
+    "tools.computer_use.cua_backend:CuaDriverBackend._run_input_action",
+    "tools.computer_use.cua_backend:CuaDriverBackend._action",
+    "tools.computer_use.cua_backend:CuaDriverBackend._maybe_attach_element_token",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_state",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_prepare",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_action",
+    "gateway.run:GatewayRunner._run_agent",
+    "gateway.session:SessionStore.route_matches",
+    "gateway.session:SessionStore._run_route_transition",
+    "gateway.session:SessionStore.prune_old_entries",
+    "tools.approval:get_current_session_key",
+    "tools.approval:is_approval_bypass_active_for_session",
+)
+
+
+def _canonical_code_payload(code: types.CodeType) -> Dict[str, Any]:
+    """Serialize code semantics without marshal's construction-sensitive graph."""
+    def constant(value: Any) -> Any:
+        if isinstance(value, types.CodeType):
+            return {"type": "code", "value": _canonical_code_payload(value)}
+        if value is None or isinstance(value, (bool, int, str)):
+            return {"type": type(value).__name__, "value": value}
+        if isinstance(value, float):
+            return {"type": "float", "value": value.hex()}
+        if isinstance(value, complex):
+            return {"type": "complex", "real": value.real.hex(), "imag": value.imag.hex()}
+        if isinstance(value, bytes):
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, tuple):
+            return {"type": "tuple", "value": [constant(item) for item in value]}
+        if isinstance(value, frozenset):
+            return {"type": "frozenset", "value": sorted(
+                (constant(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True)
+            )}
+        raise TypeError(f"unsupported code constant type: {type(value)!r}")
+
+    return {
+        "argcount": code.co_argcount, "posonlyargcount": code.co_posonlyargcount,
+        "kwonlyargcount": code.co_kwonlyargcount, "nlocals": code.co_nlocals,
+        "stacksize": code.co_stacksize, "flags": code.co_flags,
+        "code": code.co_code.hex(), "consts": [constant(value) for value in code.co_consts],
+        "names": list(code.co_names), "varnames": list(code.co_varnames),
+        "freevars": list(code.co_freevars), "cellvars": list(code.co_cellvars),
+        "filename": code.co_filename, "qualname": code.co_qualname,
+        "firstlineno": code.co_firstlineno, "linetable": code.co_linetable.hex(),
+        "exceptiontable": code.co_exceptiontable.hex(),
+    }
+
+
+def _code_fingerprint(code: types.CodeType) -> str:
+    payload = json.dumps(_canonical_code_payload(code), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _attestation_repo_root() -> "Path":
+    from pathlib import Path
+    return Path(__file__).resolve().parents[2]
+
+
+def _git_output(repo_root: "Path", *args: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(["git", "-C", str(repo_root), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _collect_attested_source_identity(repo_root: "Path", paths: tuple[str, ...], modules: Dict[str, Any]) -> Dict[str, Any]:
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    tree = _git_output(repo_root, "rev-parse", "HEAD^{tree}")
+    rows: Dict[str, Any] = {}
+    all_match = bool(head and tree)
+    for relative_path in paths:
+        head_blob = _git_output(repo_root, "rev-parse", f"HEAD:{relative_path}") if head else None
+        tracked = _git_output(repo_root, "ls-files", "--error-unmatch", "--", relative_path) is not None
+        dirty = _git_output(repo_root, "diff", "--quiet", "HEAD", "--", relative_path)
+        matches_head = bool(head_blob and tracked and dirty == "")
+        all_match = all_match and matches_head
+        rows[relative_path] = {"worktree_sha256": modules[relative_path]["sha256"], "head_blob": head_blob, "matches_head": matches_head}
+    manifest = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if not head or not tree:
+        return {"kind": "unversioned", "attested_paths": rows, "review_source_sha256": hashlib.sha256(manifest.encode("ascii")).hexdigest()}
+    return {"repository": {"vcs": "git", "root": str(repo_root), "head_commit": head, "head_tree": tree}, "kind": "git-clean" if all_match else "dirty-attested-source", "attested_paths": rows, "review_source_sha256": hashlib.sha256(manifest.encode("ascii")).hexdigest()}
+
+
+def _resolve_attested_callable(identity: str, supplied: Dict[str, Any]) -> Any:
+    module_name, qualname = identity.split(":", 1)
+    for value in supplied.values():
+        target = getattr(value, "__func__", value)
+        if getattr(target, "__module__", None) == module_name and getattr(target, "__qualname__", None) == qualname:
+            return target
+    target: Any = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        target = getattr(target, part)
+    return getattr(target, "__func__", target)
+
+
+def write_computer_use_runtime_attestation(extra_callables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Atomically bind the live gateway PID to a fixed CUA code/source surface."""
     from datetime import datetime, timezone
     from pathlib import Path
-
     from hermes_constants import get_hermes_home
 
-    callables: Dict[str, Any] = {
-        "publish_computer_use_session": publish_computer_use_session,
-        "_get_backend": _get_backend,
-        "_acquire_backend_for_call": _acquire_backend_for_call,
-        "release_computer_use_session_result": release_computer_use_session_result,
-    }
-    callables.update(extra_callables or {})
-    code_rows = {}
-    module_paths = set()
-    for name, value in callables.items():
-        target = getattr(value, "__func__", value)
+    importlib.import_module("tools.computer_use.cua_backend")
+    repo_root = _attestation_repo_root()
+    modules: Dict[str, Any] = {}
+    for relative_path in _CUA_ATTESTATION_MODULES:
+        source_path = (repo_root / relative_path).resolve()
+        raw = source_path.read_bytes()
+        modules[relative_path] = {"source_path": str(source_path), "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    supplied = extra_callables or {}
+    callables: Dict[str, Any] = {}
+    for identity in _CUA_ATTESTATION_CALLABLES:
+        target = _resolve_attested_callable(identity, supplied)
         code = getattr(target, "__code__", None)
-        source_path = inspect.getsourcefile(target)
-        if source_path:
-            module_paths.add(str(Path(source_path).resolve()))
-        code_rows[name] = {
-            "source_path": str(Path(source_path).resolve()) if source_path else None,
-            "first_line": getattr(code, "co_firstlineno", None),
-            "code_sha256": (
-                hashlib.sha256(marshal.dumps(code)).hexdigest()
-                if code is not None
-                else None
-            ),
-        }
-    modules = {}
-    for source_path in sorted(module_paths):
-        path = Path(source_path)
-        modules[source_path] = {
-            "size": path.stat().st_size,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
+        if code is None:
+            raise RuntimeError(f"attestation callable has no code: {identity}")
+        source_path = Path(code.co_filename).resolve()
+        try:
+            relative_path = source_path.relative_to(repo_root).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(f"attestation callable outside repository: {identity}") from exc
+        callables[identity] = {"module": target.__module__, "qualname": target.__qualname__, "source_relative_path": relative_path, "first_line": code.co_firstlineno, "code_sha256": _code_fingerprint(code)}
     try:
         import psutil
-
         process = psutil.Process(os.getpid())
-        process_create_time = process.create_time()
-        process_executable = process.exe()
+        process_create_time, process_executable = process.create_time(), process.exe()
         if not process_executable:
             raise RuntimeError("live gateway process executable is unavailable")
-    except Exception:
-        # Process creation time and the OS-reported executable are required
-        # for PID-reuse-safe external verification. Fail instead of publishing
-        # a weaker receipt.
-        raise RuntimeError("could not attest live gateway process identity")
+    except Exception as exc:
+        raise RuntimeError("could not attest live gateway process identity") from exc
     output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
     archive_dir = output.parent / "cua_gateway_attestations"
-    archive = archive_dir / (
-        f"{os.getpid()}-{int(process_create_time * 1_000_000)}.json"
-    )
-    receipt = {
-        "schema": 2,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "pid": os.getpid(),
-        "ppid": os.getppid(),
-        "process_create_time": process_create_time,
-        "executable": process_executable,
-        "launcher": sys.executable,
-        "argv": list(sys.argv),
-        "modules": modules,
-        "callables": code_rows,
-        "archive_path": str(archive),
-        "path": str(output),
-    }
+    archive = archive_dir / f"{os.getpid()}-{int(process_create_time * 1_000_000)}.json"
+    receipt = {"schema": 3, "captured_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
     output.parent.mkdir(parents=True, exist_ok=True)
     archive_dir.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(receipt, indent=2)

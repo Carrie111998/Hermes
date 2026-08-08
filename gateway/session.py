@@ -2358,7 +2358,16 @@ class SessionStore:
         Sessions with active background processes are never reset.
         """
         session_key = self._generate_session_key(source)
-        if entry.metadata.get("terminal_transition"):
+        terminal_transition = entry.metadata.get("terminal_transition")
+        if terminal_transition:
+            # Compression publication already committed the child before the
+            # route marker is armed.  A restart must advance to that exact
+            # child, not turn the marker into a second reset transition.
+            if (
+                isinstance(terminal_transition, dict)
+                and terminal_transition.get("reason") == "compression_advance"
+            ):
+                return None
             return "terminal_transition_recovery"
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
@@ -2495,6 +2504,12 @@ class SessionStore:
                 if entry.users == 0 and locks.get(session_key) is entry:
                     locks.pop(session_key, None)
 
+    def _lifecycle_failpoint(self, stage: str) -> None:
+        """Invoke the private test-only lifecycle crash seam, when installed."""
+        callback = getattr(self, "_test_lifecycle_failpoint", None)
+        if callable(callback):
+            callback(stage)
+
     def _arm_route_terminal_transition(
         self,
         session_key: str,
@@ -2550,6 +2565,16 @@ class SessionStore:
             session_key,
             entry_data=candidate,
             require_primary_db=True,
+        )
+        lifecycle_reason = {
+            "session_reset": "reset",
+            "session_switch": "switch",
+            "session_prune": "prune",
+            "idle": "auto_reset",
+            "daily": "auto_reset",
+        }.get(reason, reason)
+        self._lifecycle_failpoint(
+            f"gateway.{lifecycle_reason}.after_marker_persisted"
         )
 
         callback_token = (
@@ -2929,6 +2954,23 @@ class SessionStore:
                     entry, existing_session_id, canonical_existing_session_id
                 )
 
+                # The compression child is the committed continuation. Once
+                # the stale parent route has been healed to it, retire the
+                # write-ahead marker in the same durable route publication.
+                # Leaving it behind would make a later restart manufacture a
+                # reset boundary instead of preserving the compression lineage.
+                compression_marker = entry.metadata.get("terminal_transition")
+                if (
+                    isinstance(compression_marker, dict)
+                    and compression_marker.get("reason") == "compression_advance"
+                    and (
+                        _healed
+                        or entry.session_id
+                        == compression_marker.get("target_session_id")
+                    )
+                ):
+                    entry.metadata.pop("terminal_transition", None)
+
                 if _is_stale and entry.session_id == _stale_session_id:
                     # Stale routing self-heal (#54878): the in-memory entry
                     # points at a session that has ALREADY been ended in
@@ -3074,6 +3116,10 @@ class SessionStore:
                     _promote(db_end_session_id, _db_end_reason)
                 else:
                     self._db.end_session(db_end_session_id, _db_end_reason)
+                if was_auto_reset:
+                    self._lifecycle_failpoint(
+                        "gateway.auto_reset.after_old_promoted"
+                    )
             except Exception as e:
                 if terminal_route_transition:
                     raise RuntimeError(
@@ -3087,12 +3133,20 @@ class SessionStore:
                     self._db.reopen_session(session_id)
                 elif _terminal_recovery_reason != "compression_advance":
                     self._db.create_session(**db_create_kwargs)
+                if was_auto_reset:
+                    self._lifecycle_failpoint(
+                        "gateway.auto_reset.after_replacement_created"
+                    )
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
                     source,
                     display_name=entry.display_name,
                 )
+                if was_auto_reset:
+                    self._lifecycle_failpoint(
+                        "gateway.auto_reset.after_peer_recorded"
+                    )
             except Exception as e:
                 if terminal_route_transition:
                     raise RuntimeError(
@@ -3106,6 +3160,10 @@ class SessionStore:
         # same target_session_id rather than exposing a partial replacement.
         if _needs_save and terminal_route_transition:
             self._save_entries(require_primary_db=True)
+            if was_auto_reset:
+                self._lifecycle_failpoint(
+                    "gateway.auto_reset.after_final_route_published"
+                )
 
         return entry
 
@@ -3463,6 +3521,7 @@ class SessionStore:
             if self._db:
                 try:
                     self._db.end_session(expected_sid, "session_prune")
+                    self._lifecycle_failpoint("gateway.prune.after_old_closed")
                 except Exception as exc:
                     raise RuntimeError(
                         "terminal prune could not close prior SQLite session"
@@ -3476,6 +3535,7 @@ class SessionStore:
             # last. Until this succeeds, the durable marked old route remains
             # sufficient for fail-closed restart recovery and exact retry.
             self._save_entries(require_primary_db=True)
+            self._lifecycle_failpoint("gateway.prune.after_route_absence_published")
             return True
 
         for key, expected_sid in candidates:
@@ -3646,6 +3706,7 @@ class SessionStore:
                     _promote(db_end_session_id, "session_reset")
                 else:
                     self._db.end_session(db_end_session_id, "session_reset")
+                self._lifecycle_failpoint("gateway.reset.after_old_promoted")
             except Exception as e:
                 raise RuntimeError(
                     "terminal reset could not close prior SQLite session"
@@ -3654,12 +3715,14 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                self._lifecycle_failpoint("gateway.reset.after_replacement_created")
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
                     old_entry.origin,
                     display_name=new_entry.display_name if new_entry else None,
                 )
+                self._lifecycle_failpoint("gateway.reset.after_peer_recorded")
             except Exception as e:
                 raise RuntimeError(
                     "terminal reset could not create replacement SQLite session"
@@ -3671,6 +3734,7 @@ class SessionStore:
                 raise RuntimeError("terminal reset route changed before publication")
             self._entries[session_key] = new_entry
         self._save_entries(require_primary_db=True)
+        self._lifecycle_failpoint("gateway.reset.after_final_route_published")
 
         return new_entry
 
@@ -3727,6 +3791,7 @@ class SessionStore:
                 raise RuntimeError("compression route advance failed ownership check")
             entry.updated_at = _now()
         self._save_entries(require_primary_db=True)
+        self._lifecycle_failpoint("gateway.compression_advance.after_final_route_published")
         return entry
 
     def switch_session(
@@ -3792,7 +3857,9 @@ class SessionStore:
                     _promote(db_end_session_id, "session_switch")
                 else:
                     self._db.end_session(db_end_session_id, "session_switch")
+                self._lifecycle_failpoint("gateway.switch.after_old_promoted")
                 self._db.reopen_session(target_session_id)
+                self._lifecycle_failpoint("gateway.switch.after_target_reopened")
                 self._record_gateway_session_peer(
                     target_session_id,
                     session_key,
@@ -3800,6 +3867,7 @@ class SessionStore:
                     display_name=new_entry.display_name,
                     include_compression_ancestors=True,
                 )
+                self._lifecycle_failpoint("gateway.switch.after_peer_recorded")
             except Exception as exc:
                 raise RuntimeError(
                     "terminal session switch SQLite publication failed"
@@ -3811,6 +3879,7 @@ class SessionStore:
                 raise RuntimeError("session switch route changed before publication")
             self._entries[session_key] = new_entry
         self._save_entries(require_primary_db=True)
+        self._lifecycle_failpoint("gateway.switch.after_final_route_published")
 
         return new_entry
 

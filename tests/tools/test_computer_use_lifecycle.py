@@ -1092,13 +1092,51 @@ def test_runtime_attestation_binds_live_pid_to_loaded_source_bytes(
     assert archive.exists()
     archived = json.loads(archive.read_text())
     assert archived == persisted
-    source = str(Path(computer_use.__file__).resolve())
-    assert persisted["modules"][source]["sha256"] == hashlib.sha256(
-        Path(source).read_bytes()
-    ).hexdigest()
-    assert persisted["callables"]["publish_computer_use_session"][
-        "code_sha256"
-    ]
+    assert persisted["schema"] == 3
+    assert persisted["runtime"]["python_implementation"]
+    assert persisted["runtime"]["python_version"]
+    assert persisted["source_identity"]["kind"] in {
+        "git-clean", "dirty-attested-source", "unversioned"
+    }
+    expected_modules = {
+        "tools/computer_use/tool.py",
+        "tools/computer_use/cua_backend.py",
+        "tools/computer_use/browser_route.py",
+        "gateway/run.py",
+        "gateway/session.py",
+        "tools/approval.py",
+    }
+    assert set(persisted["modules"]) == expected_modules
+    for relative_path, row in persisted["modules"].items():
+        assert row["source_path"].endswith(relative_path.replace("/", "\\"))
+        assert row["sha256"] == hashlib.sha256(
+            Path(row["source_path"]).read_bytes()
+        ).hexdigest()
+    expected_callables = set(computer_use._CUA_ATTESTATION_CALLABLES)
+    assert set(persisted["callables"]) == expected_callables
+    for row in persisted["callables"].values():
+        assert row["code_sha256"]
+        assert row["source_relative_path"] in expected_modules
+    assert "tools.computer_use.cua_backend:CuaDriverBackend._run_input_action" in persisted["callables"]
+    assert "tools.computer_use.cua_backend:_CuaDriverSession.call_tool" in persisted["callables"]
+
+
+def test_runtime_attestation_fails_closed_when_process_identity_is_unavailable(
+    tmp_path, monkeypatch
+):
+    import sys
+    from unittest.mock import MagicMock
+
+    from tools.computer_use import tool as computer_use
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    unavailable = MagicMock()
+    unavailable.Process.side_effect = OSError("denied")
+    monkeypatch.setitem(sys.modules, "psutil", unavailable)
+
+    with pytest.raises(RuntimeError, match="could not attest live gateway process identity"):
+        computer_use.write_computer_use_runtime_attestation()
+    assert not (tmp_path / "runtime" / "cua_gateway_attestation.json").exists()
 
 
 def test_unconfirmed_action_timeout_poisons_generation_before_lease_release():

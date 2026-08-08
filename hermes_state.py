@@ -3068,6 +3068,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _lifecycle_failpoint(self, stage: str) -> None:
+        """Invoke a private test-only crash callback, if the test installed one."""
+        callback = getattr(self, "_test_lifecycle_failpoint", None)
+        if callable(callback):
+            callback(stage)
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -4176,18 +4182,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     time.time(),
                 ),
             )
+            self._lifecycle_failpoint("db.compression.after_child_insert")
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, child_session_id, messages
             )
+            self._lifecycle_failpoint("db.compression.after_handoff_messages")
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            self._lifecycle_failpoint("db.compression.after_child_counts")
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), parent_session_id),
             )
+            self._lifecycle_failpoint("db.compression.after_parent_close")
             if updated.rowcount != 1:
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
