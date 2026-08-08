@@ -712,6 +712,46 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_timeline_command(self, event: MessageEvent) -> str:
+        """Handle /timeline — live step-by-step tool-call timeline.
+
+        Reads the same bounded, file-backed ring buffer that
+        ``tools/session_timeline.py`` writes from ``agent/tool_executor.py``'s
+        ``tool.started`` / ``tool.completed`` hook points. Unlike the
+        persisted message history or ``events.jsonl``, this is an ephemeral,
+        session-scoped "what's happening right now" view: it works whether
+        the turn that produced the steps is still running (a step shows
+        ``running`` with no duration yet) or has already finished.
+        """
+        from tools.session_timeline import read_timeline
+
+        source = event.source
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        data = await asyncio.to_thread(read_timeline, session_entry.session_id)
+        steps = data.get("steps") or []
+
+        if not steps:
+            return "No tool-call timeline recorded for this session yet."
+
+        status_icon = {
+            "running": "…", "succeeded": "✓", "failed": "✗", "blocked": "⛔",
+        }
+        state = "in progress" if data.get("running") else "idle"
+        lines = [f"Session timeline — {len(steps)} step(s), {state}:", ""]
+        # Bounded chat reply: show the most recent 30 even if the ring
+        # buffer (up to 200) holds more.
+        for step in steps[-30:]:
+            status = step.get("status", "?")
+            icon = status_icon.get(status, "?")
+            duration = step.get("duration")
+            dur_text = f"{duration:.2f}s" if isinstance(duration, (int, float)) else "…"
+            digest = step.get("args_digest") or ""
+            suffix = f": {digest}" if digest else ""
+            lines.append(
+                f"{icon} [{step.get('step_n')}] {step.get('tool')} ({dur_text}){suffix}"
+            )
+        return "\n".join(lines)
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""
