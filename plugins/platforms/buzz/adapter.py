@@ -110,7 +110,7 @@ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 # Presence heartbeat: re-publish ``online`` while connected so relay-side
 # TTL expiry never marks a healthy gateway stale.  Published only between
 # connect() and disconnect(), so it always reflects real liveness.
-_PRESENCE_HEARTBEAT_S = 240.0
+_PRESENCE_HEARTBEAT_S = 30.0
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
