@@ -4829,6 +4829,366 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class MergeRequiredError(ValueError):
+    """Raised by ``complete_task`` when a coding task attempts to
+    transition to ``done`` without satisfying the merge-required gate.
+
+    The task body opted into the gate via a ``repo: <owner>/<name>``
+    directive but failed one of the three conditions: missing branch,
+    branch not pushed (or not ahead of ``main`` on origin), or no PR URL
+    referencing the branch in the task's comments.
+
+    Workers that hit this should call
+    ``kanban_block(reason="push-required: <branch> needs +N commits on
+    origin + a PR URL in a comment")`` so a human can review+merge the
+    branch before the kernel flips the task to ``done``. The task stays
+    in its prior status (``running``/``ready``/``blocked``).
+
+    Mirrors :class:`HallucinatedCardsError`: ``ValueError`` subclass so
+    existing tool-error handlers treat it as recoverable user error, and
+    the structured fields are exposed as attributes for callers that
+    want to render their own message.
+    """
+
+    def __init__(
+        self,
+        completing_task_id: str,
+        *,
+        repo: str,
+        branch: Optional[str],
+        local_head: Optional[str],
+        remote_head: Optional[str],
+        reason: str,
+        recovery: str,
+    ):
+        self.completing_task_id = completing_task_id
+        self.repo = repo
+        self.branch = branch
+        self.local_head = local_head
+        self.remote_head = remote_head
+        self.reason = reason
+        self.recovery = recovery
+        super().__init__(
+            f"completion blocked: coding task for {repo} cannot be marked "
+            f"done — {reason}. {recovery}"
+        )
+
+
+# Timeout for any single git subprocess invoked by the merge-required
+# gate. Kept generous (10s) for the first call into a cold worktree but
+# capped so a hung git daemon can never wedge a worker.
+_MERGE_GATE_GIT_TIMEOUT = 10
+
+
+def _resolve_coding_repo(
+    conn: sqlite3.Connection, task_id: str, repo_slug: str
+) -> Optional[Path]:
+    """Locate the on-disk repo directory for a coding task.
+
+    Walks the task row's ``workspace_path`` (or the board's
+    ``default_workdir`` fallback) and returns the git toplevel containing
+    it. Returns ``None`` if the repo cannot be located; the caller treats
+    that as a gate failure (the worker can't have pushed a branch they
+    can't reach).
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, project_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    candidates: list[Path] = []
+    if row["workspace_path"]:
+        candidates.append(Path(row["workspace_path"]).expanduser())
+    # Worktree tasks store the per-task dir; the repo root is two levels
+    # up (.worktrees/<task-id>/.. → repo root).
+    if row["workspace_kind"] == "worktree" and row["workspace_path"]:
+        wt = Path(row["workspace_path"]).expanduser()
+        if wt.parent.name == ".worktrees":
+            candidates.append(wt.parent.parent)
+    # Project-linked tasks have an authoritative repo root in
+    # ``projects_db`` — try that too.
+    if row["project_id"]:
+        try:
+            from hermes_cli import projects_db as _pdb
+
+            with _pdb.connect_closing() as _pconn:
+                proj = _pdb.get_project(_pconn, row["project_id"])
+                if proj and proj.primary_path:
+                    candidates.append(Path(proj.primary_path).expanduser())
+        except Exception:
+            pass
+    for cand in candidates:
+        top = _git_toplevel(cand)
+        if top is not None:
+            return top
+    return None
+
+
+def _gate_local_head(repo_root: Path, branch: str) -> Optional[str]:
+    """Return the local commit SHA for ``branch`` in ``repo_root``, or
+    ``None`` if the branch doesn't exist locally (not committed yet)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", branch],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=_MERGE_GATE_GIT_TIMEOUT,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    sha = (result.stdout or "").strip().splitlines()
+    return sha[0] if sha else None
+
+
+def _gate_remote_head(repo_root: Path, branch: str) -> Optional[str]:
+    """Return the SHA the upstream ``origin/<branch>`` points at, or
+    ``None`` if the branch is absent on origin (``git ls-remote`` exits
+    0 with empty stdout in that case — handle both empty and non-zero)."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-remote", "origin", branch],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=_MERGE_GATE_GIT_TIMEOUT,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return None
+    # ls-remote prints ``<sha>\t<ref>``; first column is the SHA.
+    sha = (result.stdout or "").strip().splitlines()[0].split("\t", 1)[0].strip()
+    return sha or None
+
+
+def _gate_main_sha(repo_root: Path) -> Optional[str]:
+    """Return the SHA ``origin/main`` (or local ``main`` as a fallback)
+    points at, used to check the branch is *strictly ahead of* main."""
+    # Try origin first — workers always push to origin, so the canonical
+    # "where main lives" is the upstream branch.
+    for ref in ("origin/main", "origin/master", "main", "master"):
+        head = _gate_remote_head(repo_root, ref.split("/", 1)[-1] if ref.startswith("origin/") else ref)
+        if head:
+            return head
+    return None
+
+
+def _gate_pr_url_for_branch(conn: sqlite3.Connection, task_id: str, branch: str) -> Optional[str]:
+    """Return the first PR URL in any task comment whose embedded head
+    ref equals ``branch``, or ``None`` if none. The URL is matched
+    permissively — any ``/pull/N`` URL counts — because the strict
+    branch-token match below filters out unrelated PRs.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? "
+        "ORDER BY created_at ASC, id ASC",
+        (task_id,),
+    ).fetchall()
+    target = branch.strip().lower()
+    for r in rows:
+        body = (r["body"] or "") if "body" in r.keys() else ""
+        for url_match in _GATE_PR_URL_RE.finditer(body):
+            url = url_match.group(0)
+            # Extract the head-ref token from any of the supported URL
+            # shapes (/compare/base...head, /pull/N/files#branch,
+            # /head/branch). If none is present, fall back to "no
+            # branch info, accept the URL" — workers commonly paste a
+            # bare /pull/N URL without the ref suffix.
+            branch_token: Optional[str] = None
+            for ref_match in _GATE_PR_BRANCH_RE.finditer(url):
+                branch_token = (
+                    ref_match.group(1)
+                    or ref_match.group(2)
+                    or ref_match.group(3)
+                )
+                if branch_token:
+                    break
+            if branch_token is None or branch_token.strip().lower() == target:
+                return url
+    return None
+
+
+def _enforce_merge_required_gate(
+    conn: sqlite3.Connection, task_id: str
+) -> None:
+    """Hard-gate ``complete_task`` for coding tasks.
+
+    Coding tasks are detected by a ``repo: <owner>/<name>`` line in the
+    task body. For those, ALL of the following must hold before the
+    transition to ``done`` is allowed:
+
+      (a) ``tasks.branch_name`` is set (the worker actually worked on a
+          worktree branch).
+      (b) That branch has at least one commit AHEAD of ``main``/``master``
+          locally AND on ``origin`` (so it can't vanish when the worktree
+          is cleaned up, and so a reviewer can fetch+cherry-pick it).
+      (c) At least one task comment carries a GitHub PR URL whose head
+          ref token equals the branch (so we know the worker actually
+          opened the PR for THIS task, not an unrelated one).
+
+    On failure, emit a ``merge_required`` event with the diagnostic
+    payload and raise :class:`MergeRequiredError`. The task is left in
+    its prior status; no partial state is written.
+
+    Non-coding tasks (no ``repo:`` directive in body) pass through
+    untouched — research, ops, docs, and steward tasks aren't expected
+    to ship a PR per completion.
+    """
+    row = conn.execute(
+        "SELECT body, branch_name, workspace_kind, workspace_path, project_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return  # complete_task handles missing task; gate is a no-op.
+    body = row["body"] or ""
+    repo_match = _CODING_TASK_REPO_RE.search(body)
+    if not repo_match:
+        return  # Not a coding task; gate does not apply.
+
+    repo_slug = repo_match.group(1)
+    branch = (row["branch_name"] or "").strip() or None
+    repo_root = _resolve_coding_repo(conn, task_id, repo_slug)
+
+    def _fail(reason: str, recovery: str, local_head: Optional[str], remote_head: Optional[str]) -> None:
+        payload = {
+            "repo": repo_slug,
+            "required_branch": branch,
+            "local_head": local_head,
+            "remote_head": remote_head,
+            "reason": reason,
+            "recovery": recovery,
+        }
+        with write_txn(conn):
+            _append_event(conn, task_id, "merge_required", payload)
+        raise MergeRequiredError(
+            completing_task_id=task_id,
+            repo=repo_slug,
+            branch=branch,
+            local_head=local_head,
+            remote_head=remote_head,
+            reason=reason,
+            recovery=recovery,
+        )
+
+    if branch is None:
+        _fail(
+            reason="task has no branch_name set",
+            recovery=(
+                "open a worktree branch (git checkout -b <name>) and re-run "
+                "complete_task with branch_name populated"
+            ),
+            local_head=None,
+            remote_head=None,
+        )
+    if repo_root is None:
+        _fail(
+            reason="could not locate git repo on disk for this task",
+            recovery=(
+                "ensure workspace_path points inside a git repo (or use a "
+                "worktree workspace) so the kernel can verify the branch"
+            ),
+            local_head=None,
+            remote_head=None,
+        )
+    # From here on, both are guaranteed non-None by the raises above.
+    # Re-bind to a concrete Path / str so type checkers can narrow and so
+    # a future refactor that drops one of the early checks still
+    # fails loudly instead of silently passing ``None`` to git.
+    assert branch is not None  # noqa: S101  -- narrowed by _fail above
+    assert repo_root is not None  # noqa: S101  -- narrowed by _fail above
+
+    local_head = _gate_local_head(repo_root, branch)
+    if local_head is None:
+        _fail(
+            reason=f"branch {branch!r} has no commits locally",
+            recovery=(
+                f"commit + push at least one commit on {branch!r} before "
+                "calling complete_task"
+            ),
+            local_head=None,
+            remote_head=None,
+        )
+    remote_head = _gate_remote_head(repo_root, branch)
+    if remote_head is None:
+        _fail(
+            reason=f"branch {branch!r} is not pushed to origin",
+            recovery=(
+                f"run `git push -u origin {branch}` (or equivalent) and "
+                "retry complete_task once the remote HEAD is visible"
+            ),
+            local_head=local_head,
+            remote_head="not pushed",
+        )
+
+    # Strictly-ahead check: the local branch must carry at least one
+    # commit not present on origin/main. This is the load-bearing rule —
+    # without it, a worker could "complete" by pushing a no-op branch
+    # that touches nothing.
+    main_sha = _gate_main_sha(repo_root)
+    if main_sha is not None and local_head == main_sha:
+        _fail(
+            reason=f"branch {branch!r} has no commits ahead of origin/main",
+            recovery=(
+                f"make at least one commit on {branch!r} past origin/main "
+                "before calling complete_task"
+            ),
+            local_head=local_head,
+            remote_head=remote_head,
+        )
+    # Remote must be strictly ahead of origin/main too — a branch that
+    # was force-pushed to main and is empty on origin/branch would pass
+    # the local-only check.
+    if main_sha is not None and remote_head == main_sha:
+        _fail(
+            reason=f"origin/{branch} has no commits ahead of origin/main",
+            recovery=(
+                f"push at least one commit on {branch!r} past origin/main "
+                "before calling complete_task"
+            ),
+            local_head=local_head,
+            remote_head=remote_head,
+        )
+
+    pr_url = _gate_pr_url_for_branch(conn, task_id, branch)
+    if pr_url is None:
+        _fail(
+            reason=(
+                f"no GitHub PR URL referencing branch {branch!r} found in "
+                "task comments"
+            ),
+            recovery=(
+                "open a PR and add a comment to this task containing its "
+                f"https://github.com/<owner>/<repo>/pull/<N> URL (the "
+                "URL must include the head ref token for the gate to "
+                "accept it)"
+            ),
+            local_head=local_head,
+            remote_head=remote_head,
+        )
+
+    # All checks passed. Record a single ``merge_required`` event of kind
+    # ``merge_required_cleared`` so the dashboard can confirm a coding
+    # task was allowed through the gate — useful for audit (the previous
+    # behaviour silently passed tasks that "happened" to look like coding
+    # tasks, with no signal that the gate ran at all).
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "merge_required_cleared",
+            {
+                "repo": repo_slug,
+                "branch": branch,
+                "local_head": local_head,
+                "remote_head": remote_head,
+                "pr_url": pr_url,
+            },
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4903,6 +5263,11 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Coding tasks (body carries ``repo: <owner>/<name>``) cannot be
+    # marked ``done`` until the branch is pushed AND a PR is open. See
+    # ``_enforce_merge_required_gate`` for the full contract and the
+    # ``MergeRequiredError`` raised on failure.
+    _enforce_merge_required_gate(conn, task_id)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -6784,6 +7149,60 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    re.IGNORECASE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Completion-time merge-required gate
+# ---------------------------------------------------------------------------
+#
+# Coding tasks (those whose body carries a ``repo: <owner>/<name>`` directive)
+# must land on a remote branch and have an open GitHub PR before
+# ``kanban_complete`` flips the task to ``done``. The advisory prose in
+# ``agent/prompt_builder.py`` was easy to ignore and silently destroyed ~6-12
+# hours of agent output per cycle (the ScriptDeck 2026-08-07 batch is the
+# canonical example: 6 ``done`` tasks, zero commits on ``main``). This kernel
+# gate makes the rule a hard contract: workers must call
+# ``kanban_block(reason="review-required: PR #N opened; awaiting human
+# review+merge")`` and wait for a human to merge.
+#
+# Failure surfaces:
+#
+# * ``MergeRequiredError`` raised by ``complete_task`` for any coding task
+#   that has not yet satisfied all three conditions: (a) a ``branch_name``
+#   on the task, (b) that branch ahead of ``main`` on origin, (c) at least
+#   one task comment containing a PR URL whose branch token matches the
+#   task's branch. The task is left in its prior state.
+# * A ``merge_required`` event is appended before the raise so the rejected
+#   attempt is auditable (mirrors the ``completion_blocked_hallucination``
+#   pattern). The payload includes: ``required_branch``, ``local_head``,
+#   ``remote_head`` (or ``"not pushed"``), and a one-line recovery hint.
+#
+# The gate runs in its own small txn (separate from the completion txn) so a
+# blocked attempt leaves zero state behind — exactly mirroring the hallucinated
+# cards contract above.
+
+# Regex matching the ``repo: <owner>/<name>`` directive that opts a task
+# into the coding-task gate. Anchored at line start (allowing optional
+# leading whitespace) so a body that merely mentions "see repo: x" in prose
+# does not accidentally trip the gate.
+_CODING_TASK_REPO_RE = re.compile(
+    r"(?m)^\s*repo:\s*([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)\s*$"
+)
+
+# Strict PR URL regex used by the gate: requires a ``/head/<branch>`` or
+# ``/compare/<branch>`` token so we can confirm the PR is for THIS task's
+# branch (the loose ``/pull/N`` regex used by the respawn guard isn't
+# enough — workers could reference an unrelated PR).
+_GATE_PR_URL_RE = re.compile(
+    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+(?:[/?#][^\s]*)?",
+    re.IGNORECASE,
+)
+# Branch token extracted from the canonical ``/compare/<base>...<head>`` URL
+# shape or the explicit ``/pull/<n>/files`` link that names the head ref.
+_GATE_PR_BRANCH_RE = re.compile(
+    r"/(?:compare/[^.\s]+(?:\.\.\.)([^/\s?#]+)|pull/\d+/files(?:\?[^#\s]*)?#([^\s?#]+)|head/([^/\s?#]+))",
     re.IGNORECASE,
 )
 
