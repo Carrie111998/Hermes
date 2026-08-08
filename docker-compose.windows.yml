@@ -8,6 +8,11 @@
 #
 # Usage:
 #   docker compose -f docker-compose.windows.yml up -d
+# Supported voice architecture for this lane:
+# - Hermes runtime comes from the published GHCR image in this compose file.
+# - Active voice provider and default voice come from mounted data/config.yaml.
+# - edge-tts and piper-tts are runtime-wired packages, not part of a repo-local build lane.
+# - Qwen3-TTS remains a separate host-side sidecar reached via host.docker.internal:17494.
 #
 services:
   gateway:
@@ -23,6 +28,7 @@ services:
       - HERMES_GID=10000
       - HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
       - GATEWAY_ALLOW_ALL_USERS=true
+    # Voice package availability is currently reinforced at container startup. This does not change the supported runtime lane: the containers still run from the published GHCR image.
     command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes gateway run"]
 
   dashboard:
@@ -40,4 +46,5 @@ services:
       - HERMES_DASHBOARD_HOST=0.0.0.0
     ports:
       - "127.0.0.1:9119:9119"
+    # Voice package availability is currently reinforced at container startup. This does not change the supported runtime lane: the containers still run from the published GHCR image.
     command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure"]

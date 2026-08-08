@@ -1,7 +1,7 @@
 # Plan 004: Document triple TTS switching and runtime behavior
 
 > **RE-SCOPED by Plan 005**: Docs should describe the single
-> ``agent-meow-voice`` provider contract, not three Hermes-owned
+> `agent-meow-voice` provider contract, not three Hermes-owned
 > providers. This plan is kept for reference but should not be executed
 > as written.
 

@@ -1,7 +1,7 @@
 # Plan 003: Stabilize Qwen3-TTS 0.6B model management
 
 > **RE-SCOPED by Plan 005**: Qwen model management now belongs in
-> `agent-meow` (the ``QwenBackend`` in ``hermes_voice_backends.py`` owns
+> `agent-meow` (the `QwenBackend` in `hermes_voice_backends.py` owns
 > model selection and calls the existing host-side bridge). This plan is
 > kept for reference but should not be executed as written.
 

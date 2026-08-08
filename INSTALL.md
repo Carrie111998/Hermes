@@ -4,11 +4,11 @@ Deploy the JZKK720/hermes-agent fork with Ollama, PostgreSQL, and WeChat persona
 
 ## Prerequisites
 
-| Requirement | Install |
-|---|---|
+| Requirement                | Install                             |
+| -------------------------- | ----------------------------------- |
 | Docker + Docker Compose v2 | https://docs.docker.com/get-docker/ |
-| Git | https://git-scm.com/ |
-| Ollama | https://ollama.com/ |
+| Git                        | https://git-scm.com/                |
+| Ollama                     | https://ollama.com/                 |
 
 ### Pull the default model
 
@@ -65,15 +65,21 @@ docker compose -f docker-compose.upstream.yml up -d --pull always --force-recrea
 
 This keeps the local `data/.env`, `data/config.yaml`, sessions, memories, and PostgreSQL data while pulling the fork's GHCR-published image. Use this pulled-image compose path for routine refreshes on this fork; do not switch the machine to a fork-owned build lane for normal updates.
 
+### Voice runtime note
+
+The supported Docker lane still runs the published GHCR Hermes image.
+Voice provider choice, default voice selection, and optional voice backends are layered at runtime through `data/config.yaml` and the startup/lazy-install path.
+`Qwen3-TTS` remains a separate host-side sidecar, not a service baked into the container image.
+
 ---
 
 ## Services
 
-| Service | URL | Description |
-|---|---|---|
-| Hermes Web UI | http://localhost:9119 | Chat interface |
-| WeChat gateway | outbound only | `hermes-gateway` runs the gateway with `weixin` (WeChat personal) enabled. No host port — uses outbound long-poll to Tencent iLink. |
-| PostgreSQL | localhost:5433 | Internal database (host port 5433) |
+| Service        | URL                   | Description                                                                                                                         |
+| -------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Hermes Web UI  | http://localhost:9119 | Chat interface                                                                                                                      |
+| WeChat gateway | outbound only         | `hermes-gateway` runs the gateway with `weixin` (WeChat personal) enabled. No host port — uses outbound long-poll to Tencent iLink. |
+| PostgreSQL     | localhost:5433        | Internal database (host port 5433)                                                                                                  |
 
 ### Connect WeChat (one-shot)
 
@@ -128,17 +134,18 @@ The web UI healthcheck on `:9119` is the primary smoke signal. The WeChat gatewa
 
 ### `data/.env` — secrets (never committed to git)
 
-| Variable | Purpose | Required |
-|---|---|---|
-| `POSTGRES_PASSWORD` | PostgreSQL container password (matches compose default `changeme`) | No — defaults to `changeme` |
-| `TELEGRAM_BOT_TOKEN` | Telegram gateway | Optional |
-| `DISCORD_BOT_TOKEN` | Discord gateway | Optional |
-| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | Slack gateway | Optional |
-| `EXA_API_KEY` | AI-native web search | Optional |
+| Variable                              | Purpose                                                            | Required                    |
+| ------------------------------------- | ------------------------------------------------------------------ | --------------------------- |
+| `POSTGRES_PASSWORD`                   | PostgreSQL container password (matches compose default `changeme`) | No — defaults to `changeme` |
+| `TELEGRAM_BOT_TOKEN`                  | Telegram gateway                                                   | Optional                    |
+| `DISCORD_BOT_TOKEN`                   | Discord gateway                                                    | Optional                    |
+| `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | Slack gateway                                                      | Optional                    |
+| `EXA_API_KEY`                         | AI-native web search                                               | Optional                    |
 
 WeChat personal accounts (`weixin`) do not use tokens — credentials are obtained via the QR wizard and saved to `data/weixin/accounts/`.
 
 > **Weixin "Session expired" fix:** If the gateway logs `Session expired; pausing for 10 minutes`, check `data/.env` for a wrong `WEIXIN_BASE_URL=https://ilinkai.wechat.com` (missing `.qq.com`). The correct URL is `https://ilinkai.weixin.qq.com`. To pin it permanently in `data/config.yaml` (wins over any stale env var):
+>
 > ```bash
 > docker compose -f docker-compose.upstream.yml run --rm --no-deps --entrypoint "" hermes-gateway python3 -c "
 > import yaml
@@ -164,7 +171,7 @@ Edit `data/config.yaml`:
 
 ```yaml
 model:
-  default: "llama3.3:70b"        # any model pulled in Ollama
+  default: 'llama3.3:70b' # any model pulled in Ollama
   context_length: 131072
 ```
 
@@ -193,8 +200,7 @@ This is the normal update path for this fork. Keep regular refreshes pinned to t
 docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans
 ```
 
-This updates the Hermes containers from the published Docker Hub image while keeping your local `data/.env`, `data/config.yaml`, sessions, and other persisted runtime data.
----
+## This updates the Hermes containers from the published Docker Hub image while keeping your local `data/.env`, `data/config.yaml`, sessions, and other persisted runtime data.
 
 ## Troubleshooting
 
@@ -250,13 +256,13 @@ docker compose -f docker-compose.upstream.yml up -d --pull always --force-recrea
 
 ## Ports Reference
 
-| Port (host) | Port (container) | Service |
-|---|---|---|
-| 9119 | 9119 | Hermes Web UI (dashboard) |
-| 8642 | 8642 | API server (OpenAI-compatible `/v1` endpoint) — enable via `API_SERVER_KEY` in `data/.env` |
-| 8789 | 8789 | Gateway health endpoint (`/health`) — used by dashboard for cross-container status |
-| 8644 | 8644 | Webhook inbound — disabled by default; enable in `data/config.yaml` under `platforms.webhook` |
-| 5433 | 5432 | PostgreSQL |
+| Port (host) | Port (container) | Service                                                                                       |
+| ----------- | ---------------- | --------------------------------------------------------------------------------------------- |
+| 9119        | 9119             | Hermes Web UI (dashboard)                                                                     |
+| 8642        | 8642             | API server (OpenAI-compatible `/v1` endpoint) — enable via `API_SERVER_KEY` in `data/.env`    |
+| 8789        | 8789             | Gateway health endpoint (`/health`) — used by dashboard for cross-container status            |
+| 8644        | 8644             | Webhook inbound — disabled by default; enable in `data/config.yaml` under `platforms.webhook` |
+| 5433        | 5432             | PostgreSQL                                                                                    |
 
 > **WeChat (weixin) gateway**: uses outbound long-poll to Tencent iLink — no inbound host port needed.
 > **API server**: disabled by default. Set `API_SERVER_KEY` in `data/.env` to enable the OpenAI-compatible endpoint at `http://localhost:8642/v1`. See `.github/instructions/api-gateway-ports.instructions.md` for full configuration details.

@@ -1,8 +1,8 @@
 # Plan 002: Implement a real TTS fallback chain
 
 > **RE-SCOPED by Plan 005**: The fallback chain is now implemented in
-> `agent-meow` (``agent_meow/hermes_voice_backends.py``) behind the voice
-> gateway, not in ``tools/tts_tool.py``. This plan is kept for reference but
+> `agent-meow` (`agent_meow/hermes_voice_backends.py`) behind the voice
+> gateway, not in `tools/tts_tool.py`. This plan is kept for reference but
 > should not be executed as written. The live implementation is in the
 > `agent-meow` repo under Plan 005 Tasks 1A/1B.
 

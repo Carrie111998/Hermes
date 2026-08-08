@@ -7,6 +7,11 @@
 # Override HERMES_FORK_IMAGE if you want a different fork tag:
 #   HERMES_FORK_IMAGE=ghcr.io/jzkk720/hermes-agent:sha-abc1234 \
 #     docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans
+# Supported voice architecture for this lane:
+# - Hermes runtime comes from the published GHCR image in this compose file.
+# - Active voice provider and default voice come from mounted data/config.yaml.
+# - edge-tts and piper-tts are runtime-wired packages, not part of a repo-local build lane.
+# - Qwen3-TTS remains a separate host-side sidecar reached via host.docker.internal:17494.
 
 x-hermes-common: &hermes-common
   image: ${HERMES_FORK_IMAGE:-ghcr.io/jzkk720/hermes-agent:latest}
@@ -46,6 +51,7 @@ services:
     # Host-side binding is 127.0.0.1 (see ports below) so it's not LAN-exposed.
     # Upstream 0.17+ requires auth for non-loopback binds — basic_auth is
     # configured in data/config.yaml (username=admin, password=hermes).
+    # Voice package availability is currently reinforced at container startup. This does not change the supported runtime lane: the containers still run from the published GHCR image.
     command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes dashboard --host 0.0.0.0 --port 9119 --no-open"]
     environment:
       - GATEWAY_HEALTH_URL=http://hermes-gateway:8642
@@ -71,6 +77,7 @@ services:
     # Runs the gateway with the weixin (WeChat personal / iLink) platform enabled
     # per docker/hermes-config.yaml. weixin uses outbound long-poll to
     # ilinkai.weixin.qq.com — no inbound host port needed.
+    # Voice package availability is currently reinforced at container startup. This does not change the supported runtime lane: the containers still run from the published GHCR image.
     command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes gateway run"]
     environment:
       - API_SERVER_KEY=${API_SERVER_KEY:-28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b216}
