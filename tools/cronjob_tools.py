@@ -1206,8 +1206,6 @@ def cronjob(
         job_id = job["id"]
 
         if normalized in {"get", "show"}:
-            from cron.jobs import get_job
-
             full_job = get_job(job_id) or job
             formatted = _format_job(full_job, include_prompt=True)
             # Include fields that are too verbose or internal for the compact
