@@ -889,11 +889,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if batch_mutation_lock is None:
         batch_mutation_lock = threading.Lock()
         agent._turn_file_mutation_state_lock = batch_mutation_lock
+    mutation_verifier_enabled = (
+        batch_mutation_state is not None
+        and agent._file_mutation_verifier_enabled()
+    )
     recorded_mutation_indices: set[int] = set()
     mutation_completion_events = [
         (
             threading.Event()
-            if name in {"write_file", "patch"} and parse_error is None
+            if (
+                mutation_verifier_enabled
+                and name in {"write_file", "patch"}
+                and parse_error is None
+            )
             else None
         )
         for _tc, name, _args, _trace, parse_error, _scope_block in parsed_calls
@@ -921,7 +929,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         fingerprint_failures: bool = True,
     ) -> None:
         """Record against this batch's turn state, never a later turn's state."""
-        if blocked or batch_mutation_state is None:
+        if blocked or not mutation_verifier_enabled:
             return
         try:
             with batch_mutation_lock:

@@ -2258,6 +2258,55 @@ class TestConcurrentToolExecution:
         assert agent._turn_failed_file_mutations is next_state
         assert next_state[str(target)]["error_preview"] == "next-turn failure"
 
+    def test_disabled_mutation_verifier_does_not_serialize_concurrent_batch(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        target = tmp_path / "disabled.txt"
+        target.write_text("before\n", encoding="utf-8")
+        terminal_started = threading.Event()
+        patch_observed_terminal = threading.Event()
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_state_lock = threading.Lock()
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: False)
+
+        def invoke(name, _args, _task_id, _tool_call_id, **_kwargs):
+            if name == "patch":
+                if terminal_started.wait(timeout=0.5):
+                    patch_observed_terminal.set()
+                return json.dumps({"error": "Could not find old_string"})
+            assert name == "terminal"
+            terminal_started.set()
+            return json.dumps({"success": True})
+
+        monkeypatch.setattr(agent, "_invoke_tool", invoke)
+        patch_call = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            }),
+            call_id="patch-1",
+        )
+        terminal_call = _mock_tool_call(
+            name="terminal",
+            arguments=json.dumps({"command": "independent work"}),
+            call_id="terminal-1",
+        )
+
+        agent._execute_tool_calls_concurrent(
+            _mock_assistant_msg(content="", tool_calls=[patch_call, terminal_call]),
+            [],
+            "task-1",
+        )
+
+        assert patch_observed_terminal.is_set()
+        assert agent._turn_failed_file_mutations == {}
+
     def test_agent_runtime_post_hook_ownership_predicate_covers_agent_tools(self, agent):
         """Sequential and concurrent agent-level paths share post-hook ownership."""
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
