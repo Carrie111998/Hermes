@@ -164,7 +164,24 @@ TOOL_LABEL_STREAM_CHARS = 120
 _CUSTOM_SSE_EVENTS = {
     "__tool_progress__": "hermes.tool.progress",
     "__reasoning__": "hermes.reasoning.delta",
+    "__approval__": "hermes.approval.request",
 }
+
+
+def _approval_timeout_seconds() -> int:
+    """How long a pending approval waits before it is treated as a refusal.
+
+    Sent with the request so a client can show the deadline it is actually
+    working against rather than inventing one — silence here is a denial, not
+    a pause, so a UI that lets it lapse unannounced misleads the user.
+    """
+    try:
+        from tools.approval import _get_approval_config
+
+        raw = (_get_approval_config() or {}).get("timeout", 60)
+        return max(1, int(raw))
+    except Exception:
+        return 60
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -2096,6 +2113,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/approvals/{session_key}/decision", self._handle_session_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -3175,6 +3193,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "approval_decision": {"method": "POST", "path": "/v1/approvals/{session_key}/decision"},
             },
         })
 
@@ -4302,6 +4321,44 @@ class APIServerAdapter(BasePlatformAdapter):
                     return
                 _stream_q.put_threadsafe(("__reasoning__", {"delta": text}))
 
+            # The key the approval is registered under, and the one
+            # /v1/approvals/{key}/decision resolves against. Falls back to the
+            # completion id so a turn with neither a session key nor a session
+            # id still gets a unique one rather than colliding with every other
+            # anonymous turn on the shared "" key.
+            approval_session_key = (
+                gateway_session_key or session_id or f"chatcmpl:{completion_id}"
+            )
+
+            def _on_approval_request(approval_data):
+                """Put a pending approval on the stream for the client to answer.
+
+                Runs on the agent thread, which is blocked inside the tool
+                waiting for the decision — so this only hands the request to
+                the SSE writer and returns. The writer is still pumping (its
+                queue wait times out every 0.5s and keeps sending keepalives),
+                so the frame goes out while the tool is parked.
+                """
+                payload = dict(approval_data or {})
+                # Same egress rule as the /v1/runs notifier: the raw command
+                # can carry credentials, and this one is rendered straight
+                # into a browser.
+                if "command" in payload:
+                    from gateway.run import _redact_approval_command
+
+                    payload["command"] = _redact_approval_command(
+                        payload.get("command")
+                    )
+                payload.update({
+                    "sessionKey": approval_session_key,
+                    "choices": _approval_event_choices(
+                        smart_denied=bool(payload.get("smart_denied")),
+                        allow_permanent=payload.get("allow_permanent") is not False,
+                    ),
+                    "timeoutSeconds": _approval_timeout_seconds(),
+                })
+                _stream_q.put_threadsafe(("__approval__", payload))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -4322,6 +4379,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_agent_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                approval_notify_callback=_on_approval_request,
+                approval_session_key=approval_session_key,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
@@ -6199,6 +6258,8 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        approval_notify_callback=None,
+        approval_session_key: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6224,6 +6285,21 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        *approval_notify_callback* is how a caller offers the user a way to
+        answer a dangerous-command approval. Without one, ``tools.approval``
+        finds no notifier for the session, files the request into an
+        in-process dict nothing reads, and returns ``pending_approval``
+        immediately — which the agent sees as a flat refusal. Every
+        approval-gated tool call therefore fails on any route that does not
+        pass this. The callback runs on the agent thread and must not block;
+        it is expected to hand the request to whatever transport can reach
+        the user (for the SSE routes, the stream itself).
+
+        *approval_session_key* is the key that callback is registered under,
+        and the one a decision endpoint must resolve against. It is bound
+        explicitly rather than inferred so the registration and the lookup
+        ``tools.approval`` performs cannot drift apart.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -6240,6 +6316,21 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
                 )
+                # Contextvars do not follow the executor hop, so the approval
+                # key is bound here, inside the thread that will actually run
+                # the tools — the same reason the profile scope is re-entered
+                # above.
+                approval_token = None
+                if approval_notify_callback is not None and approval_session_key:
+                    from tools.approval import (
+                        register_gateway_notify,
+                        set_current_session_key,
+                    )
+
+                    approval_token = set_current_session_key(approval_session_key)
+                    register_gateway_notify(
+                        approval_session_key, approval_notify_callback
+                    )
                 agent = None
                 try:
                     agent = self._create_agent(
@@ -6407,6 +6498,23 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                    # Unregistering also releases any thread still blocked on
+                    # an approval nobody is going to answer, so a turn that
+                    # crashed mid-prompt cannot leave one parked for the whole
+                    # approval timeout.
+                    if approval_token is not None:
+                        from tools.approval import (
+                            reset_current_session_key,
+                            unregister_gateway_notify,
+                        )
+
+                        try:
+                            unregister_gateway_notify(approval_session_key)
+                        finally:
+                            try:
+                                reset_current_session_key(approval_token)
+                            except Exception:
+                                pass
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -7090,6 +7198,83 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "choice": choice,
+            "resolved": resolved,
+        })
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/approvals/{session_key}/decision — answer a pending approval.
+
+        The run-scoped endpoint above only reaches turns started via /v1/runs,
+        which is not the route the SSE chat surfaces use. This one resolves by
+        the session key carried on the ``hermes.approval.request`` event, so
+        any caller streaming a turn can answer the approval that turn is
+        parked on.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_key = request.match_info["session_key"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        raw_choice = str(body.get("choice", "")).strip().lower()
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        choice = aliases.get(raw_choice, raw_choice)
+        allowed = {"once", "session", "always", "deny"}
+        if choice not in allowed:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        reason = body.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return web.json_response(
+                _openai_error("reason must be a string", code="invalid_approval_reason"),
+                status=400,
+            )
+
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolved = resolve_gateway_approval(
+                session_key,
+                choice,
+                resolve_all=resolve_all,
+                reason=reason or None,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[api_server] approval resolution failed for session %s", session_key
+            )
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if resolved <= 0:
+            # Nothing waiting: the turn already moved on, most likely because
+            # the approval timed out. Distinguished from a bad key on purpose —
+            # both are 409, but the message says which is worth checking.
+            return web.json_response(
+                _openai_error(
+                    "No approval is pending for this session; it may have timed out.",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.approval_response",
+            "session_key": session_key,
             "choice": choice,
             "resolved": resolved,
         })

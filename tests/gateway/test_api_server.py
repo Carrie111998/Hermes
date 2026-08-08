@@ -315,6 +315,9 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+    app.router.add_post(
+        "/v1/approvals/{session_key}/decision", adapter._handle_session_approval
+    )
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
@@ -1514,6 +1517,175 @@ class TestChatCompletionsEndpoint:
             if chunk.get("object") == "chat.completion.chunk":
                 for choice in chunk.get("choices", []):
                     assert "first step" not in (choice.get("delta", {}).get("content") or "")
+
+    @pytest.mark.asyncio
+    async def test_stream_registers_an_approval_notifier(self, adapter):
+        """A streamed turn must give the user a way to answer an approval.
+
+        Without a registered notifier ``tools.approval`` files the request
+        into an in-process dict nothing reads and returns immediately, so
+        every approval-gated tool call fails on this route no matter what the
+        user would have said. The run-scoped notifier does not cover it: that
+        one is registered by /v1/runs, which the SSE chat surfaces don't use.
+        """
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            seen = {}
+
+            async def _mock_run_agent(**kwargs):
+                seen["cb"] = kwargs.get("approval_notify_callback")
+                seen["key"] = kwargs.get("approval_session_key")
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                await resp.text()
+
+        assert callable(seen.get("cb")), "no approval notifier was wired"
+        # The key must be non-empty, or concurrent anonymous turns would all
+        # register under "" and resolve each other's approvals.
+        assert seen.get("key")
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_approval_request(self, adapter):
+        """The pending approval must reach the client as its own event."""
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                approve_cb = kwargs.get("approval_notify_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if approve_cb:
+                    approve_cb({
+                        "command": "rm -rf /tmp/x",
+                        "description": "terminal command",
+                        "pattern_key": "terminal:rm",
+                        "pattern_keys": ["terminal:rm"],
+                        "allow_permanent": True,
+                    })
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("done.")
+                return (
+                    {"final_response": "done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "delete it"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        payloads = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.approval.request":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    payloads.append(_json.loads(follow[len("data: "):]))
+                    break
+
+        assert len(payloads) == 1, payloads
+        req = payloads[0]
+        assert req["description"] == "terminal command"
+        # The key the client has to send back to answer it.
+        assert req["sessionKey"]
+        # Choices drive the buttons; silence is a denial, so the deadline
+        # travels with the request rather than being guessed client-side.
+        assert "deny" in req["choices"] and "once" in req["choices"]
+        assert isinstance(req["timeoutSeconds"], int) and req["timeoutSeconds"] > 0
+
+    @pytest.mark.asyncio
+    async def test_approval_decision_endpoint(self, adapter):
+        """The decision endpoint resolves by session key, not run id."""
+        import tools.approval as A
+
+        app = _create_app(adapter)
+        session_key = "sess_decision_test"
+
+        async with TestClient(TestServer(app)) as cli:
+            # Nothing pending yet — must not report success.
+            resp = await cli.post(
+                f"/v1/approvals/{session_key}/decision",
+                json={"choice": "once"},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["error"]["code"] == "approval_not_pending"
+
+            # A bad choice is rejected before anything is resolved.
+            resp = await cli.post(
+                f"/v1/approvals/{session_key}/decision",
+                json={"choice": "maybe"},
+            )
+            assert resp.status == 400
+
+            # Park a real entry the way a blocked tool would, then answer it.
+            entry = A._ApprovalEntry({"command": "rm -rf /tmp/x"})
+            with A._lock:
+                A._gateway_queues[session_key] = [entry]
+            try:
+                resp = await cli.post(
+                    f"/v1/approvals/{session_key}/decision",
+                    json={"choice": "approve"},  # alias for "once"
+                )
+                assert resp.status == 200
+                assert (await resp.json())["choice"] == "once"
+                # The blocked thread is released with the decision attached.
+                assert entry.event.is_set()
+                assert entry.result == "once"
+            finally:
+                with A._lock:
+                    A._gateway_queues.pop(session_key, None)
+
+    @pytest.mark.asyncio
+    async def test_approval_decision_relays_deny_reason(self, adapter):
+        """A denial with a reason lets the agent adapt instead of just retrying."""
+        import tools.approval as A
+
+        app = _create_app(adapter)
+        session_key = "sess_deny_reason"
+        entry = A._ApprovalEntry({"command": "rm -rf /"})
+        with A._lock:
+            A._gateway_queues[session_key] = [entry]
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    f"/v1/approvals/{session_key}/decision",
+                    json={"choice": "deny", "reason": "wrong directory"},
+                )
+                assert resp.status == 200
+            assert entry.result == "deny"
+            assert entry.reason == "wrong directory"
+        finally:
+            with A._lock:
+                A._gateway_queues.pop(session_key, None)
 
 
 # ---------------------------------------------------------------------------
