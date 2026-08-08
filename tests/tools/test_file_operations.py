@@ -2,6 +2,7 @@
 
 import os
 import re
+import base64
 import pytest
 import subprocess
 from pathlib import Path
@@ -305,7 +306,10 @@ class TestShellFileOpsHelpers:
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
             if command.startswith("head -c"):
-                return {"output": "hello", "returncode": 0}
+                # Byte-accurate sampling contract (#76886): the sampler
+                # pipeline is `head -c 1000 ... | base64` and the env
+                # returns base64 of the raw sample bytes.
+                return {"output": base64.encodebytes(b"hello").decode(), "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
             if command.startswith("wc -l"):
@@ -318,7 +322,7 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null | base64"
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
@@ -346,7 +350,12 @@ class TestShellFileOpsHelpers:
             if command.startswith("wc -c"):
                 return {"output": "12\n", "returncode": 0}
             if command.startswith("head -c"):
-                return {"output": "print('ok')\n", "returncode": 0}
+                # Byte-accurate sampling contract (#76886): base64 of the
+                # raw sample bytes (here: "print('ok')\n").
+                return {
+                    "output": base64.encodebytes(b"print('ok')\n").decode(),
+                    "returncode": 0,
+                }
             if command.startswith("sed -n"):
                 return {"output": leaked, "returncode": 0}
             if command.startswith("wc -l"):
@@ -374,7 +383,12 @@ class TestShellFileOpsHelpers:
             if command.startswith("wc -c"):
                 return {"output": "6\n", "returncode": 0}
             if command.startswith("head -c"):
-                return {"output": "alpha\n", "returncode": 0}
+                # Byte-accurate sampling contract (#76886): base64 of the
+                # raw sample bytes (here: "alpha\n").
+                return {
+                    "output": base64.encodebytes(b"alpha\n").decode(),
+                    "returncode": 0,
+                }
             if command.startswith("cat "):
                 return {"output": leaked, "returncode": 0}
             return {"output": "", "returncode": 0}

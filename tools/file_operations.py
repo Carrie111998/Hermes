@@ -887,6 +887,57 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
+    def _sample_utf8_text(self, path: str, file_size: int) -> Optional[str]:
+        """Return a lossless UTF-8 text sample of the file's first 1000 bytes.
+
+        The terminal env decodes command stdout with ``errors="replace"``,
+        so a raw byte sample can never cross that boundary intact: a
+        1000-byte cut landing inside a multibyte char would arrive here as
+        a synthetic U+FFFD and make valid UTF-8 text look binary (see
+        #76886 — CJK/Korean/Thai/Cyrillic notes misclassified at 20-30%).
+
+        Route the sample through ``base64`` (pure ASCII, survives the lossy
+        decode), then strict-decode the real bytes in Python:
+
+        - Decodes cleanly          -> genuinely valid UTF-8 text
+        - ``unexpected end of data`` AND file is larger than the window
+          -> the cut landed mid-char: trim the incomplete trailing
+             sequence (<=3 bytes) and return the valid prefix
+        - Any other failure        -> genuinely invalid bytes mid-stream,
+             or a small file that itself ends mid-char (true truncation):
+             return None so the caller treats it as binary
+
+        Returns ``""`` if the sample command itself failed (read proceeds,
+        matching pre-existing behavior); ``None`` means "binary".
+        """
+        sample_result = self._exec(
+            f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        )
+        if sample_result.exit_code != 0:
+            return ""
+        compact = "".join(_strip_terminal_fence_leaks(sample_result.stdout).split())
+        try:
+            raw = base64.b64decode(compact, validate=True)
+        except (ValueError, base64.binascii.Error):
+            return None
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as e:
+            if e.reason != "unexpected end of data":
+                return None
+            # Trailing incomplete sequence. If the whole file fits inside
+            # the sample window, the file itself is truncated/corrupt —
+            # keep it binary (the mojibake round-trip guard). Otherwise it
+            # is a sampling artifact: trim the partial char and proceed.
+            if file_size <= 1000:
+                return None
+            for cut in range(1, 4):
+                try:
+                    return raw[:-cut].decode("utf-8", errors="strict")
+                except UnicodeDecodeError:
+                    continue
+            return None
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -1193,12 +1244,12 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        # Read a byte-accurate sample (base64 round-trip avoids the
+        # terminal's lossy errors="replace" decode) and check for binary
+        # content. None = genuinely invalid UTF-8 -> binary.
+        sample_output = self._sample_utf8_text(path, file_size)
         
-        if self._is_likely_binary(path, sample_output):
+        if sample_output is None or self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1312,9 +1363,8 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        sample_output = self._sample_utf8_text(path, file_size)
+        if sample_output is None or self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."

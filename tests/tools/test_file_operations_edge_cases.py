@@ -3,7 +3,13 @@
 Covers:
 - ``_is_likely_binary()`` content-analysis branch (dead-code removal regression guard)
 - ``_check_lint()`` robustness against file paths containing curly braces
+- ``_sample_utf8_text()`` byte-accurate UTF-8 sampling (#76886 — read_file
+  misclassifying valid CJK/Korean/Thai/Cyrillic text as binary when the
+  1000-byte sample boundary cuts a multibyte char)
 """
+
+import base64
+import subprocess
 
 import pytest
 from unittest.mock import MagicMock, patch
@@ -208,7 +214,12 @@ class TestPaginationBounds:
             if command.startswith("wc -c"):
                 return MagicMock(exit_code=0, stdout="12")
             if command.startswith("head -c"):
-                return MagicMock(exit_code=0, stdout="line1\nline2\n")
+                # read_file now samples via `head -c 1000 ... | base64`
+                # (byte-accurate UTF-8 sampling, #76886).
+                return MagicMock(
+                    exit_code=0,
+                    stdout=base64.encodebytes(b"line1\nline2\n").decode(),
+                )
             if command.startswith("sed -n"):
                 return MagicMock(exit_code=0, stdout="line1\n")
             if command.startswith("wc -l"):
@@ -310,3 +321,146 @@ class TestSearchContextParsing:
         assert result.matches[0].path == "dir/file-12-name.py"
         assert result.matches[0].line_number == 8
         assert result.matches[0].content == "context here"
+
+
+# =========================================================================
+# _sample_utf8_text — byte-accurate UTF-8 sampling (#76886)
+# =========================================================================
+
+
+def _make_real_shell_env(cwd: str) -> MagicMock:
+    """Mock env whose execute() runs the command in a real shell.
+
+    Uses ``sh`` explicitly so the ``head | base64`` pipeline in
+    ``_sample_utf8_text`` exercises real coreutils on both POSIX and
+    Windows (git-bash) hosts.
+
+    Faithful to the real Hermes terminal env: subprocess stdout is
+    decoded as UTF-8 with ``errors="replace"`` (NOT the locale codec),
+    because the #76886 bug only manifests when the sample crosses that
+    lossy decode boundary. A locale-decode harness (e.g. cp1252) would
+    turn the cut bytes into mojibake without U+FFFD and silently miss
+    the regression.
+    """
+    env = MagicMock()
+    env.cwd = cwd
+
+    def execute(command, **kwargs):
+        completed = subprocess.run(
+            ["sh", "-c", command],
+            capture_output=True,
+            input=kwargs.get("stdin_data"),
+        )
+        return {
+            "output": completed.stdout.decode("utf-8", errors="replace"),
+            "returncode": completed.returncode,
+        }
+
+    env.execute = execute
+    return env
+
+
+def _b64_sample(raw: bytes) -> str:
+    """Encode raw sample bytes exactly as the shell pipeline returns them:
+    ``head -c 1000 file | base64`` (base64 may wrap lines at 76 cols)."""
+    return base64.encodebytes(raw).decode()
+
+
+class TestSampleUtf8Text:
+    """Unit tests for the byte-accurate UTF-8 sampler."""
+
+    def _ops_with_sample(self, raw: bytes, exit_code: int = 0) -> ShellFileOperations:
+        env = MagicMock()
+        env.cwd = "/tmp"
+        env.execute.return_value = {
+            "output": _b64_sample(raw),
+            "returncode": exit_code,
+        }
+        return ShellFileOperations(env)
+
+    def test_clean_utf8_text_passes_through(self):
+        raw = "plain ascii text\n".encode() * 50  # 800 bytes, all ASCII
+        ops = self._ops_with_sample(raw)
+        sample = ops._sample_utf8_text("/tmp/f.txt", file_size=len(raw))
+        assert sample is not None
+        assert "\ufffd" not in sample
+        assert sample == raw.decode("utf-8")
+
+    def test_boundary_cut_multibyte_char_is_text_not_binary(self):
+        # 998 ASCII bytes + a 3-byte CJK char that starts at byte 998:
+        # ``head -c 1000`` keeps bytes 0..999, i.e. the first 2 bytes of
+        # the CJK char. The old lossy decode produced a synthetic U+FFFD
+        # and flagged the file binary (the #76886 regression).
+        raw = b"a" * 998 + "中".encode("utf-8")[:2]
+        assert len(raw) == 1000  # exactly the sample window
+        ops = self._ops_with_sample(raw)
+        sample = ops._sample_utf8_text("/tmp/f.txt", file_size=len(raw) + 10)
+        assert sample is not None
+        assert sample == "a" * 998
+        assert "\ufffd" not in sample
+
+    def test_genuine_mid_stream_invalid_bytes_still_binary(self):
+        raw = b"ok" + b"\xff\xfe\x00\x01" + b"tail" * 100
+        ops = self._ops_with_sample(raw)
+        sample = ops._sample_utf8_text("/tmp/f.bin", file_size=len(raw) + 10)
+        assert sample is None  # mid-stream corruption -> binary
+
+    def test_small_file_ending_mid_char_is_binary(self):
+        # File smaller than the sample window that genuinely ends with an
+        # incomplete sequence: that is true truncation, not a boundary
+        # artifact — the mojibake round-trip guard must keep it binary.
+        raw = b"abc" + "中".encode("utf-8")[:2]  # 5 bytes, incomplete tail
+        ops = self._ops_with_sample(raw)
+        sample = ops._sample_utf8_text("/tmp/f.txt", file_size=len(raw))
+        assert sample is None
+
+    def test_exec_failure_falls_back_to_empty_sample(self):
+        env = MagicMock()
+        env.cwd = "/tmp"
+        env.execute.return_value = {"output": "", "returncode": 1}
+        ops = ShellFileOperations(env)
+        assert ops._sample_utf8_text("/tmp/f.txt", file_size=10) == ""
+
+
+class TestReadFileUtf8BoundaryE2E:
+    """End-to-end: read_file/read_file_raw must not reject CJK text whose
+    1000-byte boundary cuts a multibyte char (regression for #76886)."""
+
+    def test_read_file_cjk_boundary_cut_not_binary(self, tmp_path):
+        # 998 ASCII bytes, then CJK: byte 999 is the first byte of a
+        # 3-byte char, so head -c 1000 cuts it mid-sequence.
+        body = b"a" * 998 + "中文测试\n".encode("utf-8") * 20
+        p = tmp_path / "cjk_notes.md"
+        p.write_bytes(body)
+
+        ops = ShellFileOperations(_make_real_shell_env(str(tmp_path)))
+        result = ops.read_file(str(p))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "中文测试" in result.content
+
+    def test_read_file_raw_cjk_boundary_cut_not_binary(self, tmp_path):
+        body = b"a" * 998 + "中文测试\n".encode("utf-8") * 20
+        p = tmp_path / "cjk_notes.md"
+        p.write_bytes(body)
+
+        ops = ShellFileOperations(_make_real_shell_env(str(tmp_path)))
+        result = ops.read_file_raw(str(p))
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert "中文测试" in result.content
+
+    def test_read_file_genuine_binary_still_rejected(self, tmp_path):
+        # Invalid UTF-8 mid-stream (not a boundary artifact) must remain
+        # binary after the fix.
+        body = b"a" * 998 + b"\xff\xfe\x00\x01" + b"b" * 200
+        p = tmp_path / "junk.dat"
+        p.write_bytes(body)
+
+        ops = ShellFileOperations(_make_real_shell_env(str(tmp_path)))
+        result = ops.read_file(str(p))
+
+        assert result.is_binary is True
+
