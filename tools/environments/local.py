@@ -1197,8 +1197,9 @@ def _installed_user_runtime_path_entries(home: str | None = None) -> list[str]:
         return []
     if not stat.S_ISREG(bun_stat.st_mode) or not os.access(bun, os.X_OK):
         return []
-    if hasattr(os, "getuid"):
-        expected_uid = os.getuid()
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        expected_uid = getuid()
         if any(
             item.st_uid != expected_uid
             for item in (home_stat, directory_stat, bun_stat)

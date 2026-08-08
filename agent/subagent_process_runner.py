@@ -35,6 +35,7 @@ _VALID_BACKENDS = frozenset({"portable", "linux-strict"})
 _MAX_ARG_BYTES = 128_000
 _DEFAULT_OUTPUT_BYTES = 1_048_576
 _STRICT_WORKER_HOME = Path("/tmp/hermes-worker-home")
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 def _bounded_diagnostic_text(value: object, *, limit: int) -> str:
@@ -525,7 +526,7 @@ def cleanup_cgroup(cgroup: Path, *, timeout_seconds: float) -> CleanupEvidence:
             if pid == os.getpid():
                 continue
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, _SIGKILL)
                 kill_sent = True
             except ProcessLookupError:
                 pass
@@ -554,8 +555,11 @@ def cleanup_cgroup(cgroup: Path, *, timeout_seconds: float) -> CleanupEvidence:
 
 
 def _process_group_exists(pgid: int) -> bool:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return False
     try:
-        os.killpg(pgid, 0)
+        killpg(pgid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -564,8 +568,11 @@ def _process_group_exists(pgid: int) -> bool:
 
 
 def _signal_process_group(pgid: int, sig: signal.Signals) -> bool:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return False
     try:
-        os.killpg(pgid, sig)
+        killpg(pgid, sig)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -634,7 +641,7 @@ def _monitor_process(
                 and not kill_attempted
             ):
                 kill_attempted = True
-                kill_sent = _signal_process_group(group_id, signal.SIGKILL)
+                kill_sent = _signal_process_group(group_id, _SIGKILL)
                 kill_deadline = now + kill_grace_seconds
 
             wait_for = 0.02
@@ -710,7 +717,7 @@ def _cleanup_process_group(
         while _process_group_exists(pgid) and time.monotonic() < end:
             time.sleep(0.01)
     if _process_group_exists(pgid) and not kill_sent:
-        kill_sent = _signal_process_group(pgid, signal.SIGKILL)
+        kill_sent = _signal_process_group(pgid, _SIGKILL)
     try:
         process.wait(timeout=kill_grace_seconds)
         root_reaped = True

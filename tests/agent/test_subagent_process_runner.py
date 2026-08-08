@@ -34,6 +34,13 @@ PYTHON = sys.executable
 SECRET = b"c" * 32
 
 
+def test_process_group_helpers_fail_closed_without_killpg(monkeypatch):
+    monkeypatch.delattr(runner_module.os, "killpg")
+
+    assert runner_module._process_group_exists(12345) is False
+    assert runner_module._signal_process_group(12345, signal.SIGTERM) is False
+
+
 def test_bounded_diagnostic_text_strips_control_characters():
     assert (
         _bounded_diagnostic_text("provider\r\n\x1b[31merror\x00", limit=100)
