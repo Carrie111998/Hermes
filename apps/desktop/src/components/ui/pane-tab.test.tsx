@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { createRef } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { setRuntimeI18nLocale } from '@/i18n/runtime'
@@ -99,14 +100,44 @@ describe('PaneTab close gestures', () => {
 })
 
 describe('PaneTab close button', () => {
-  it('renders an accessible close button for a closeable horizontal tab', () => {
+  it('keeps the tab and its close button as sibling controls in the tablist', () => {
+    const visualWrapperRef = createRef<HTMLDivElement>()
+    const onKeyDown = vi.fn()
+
     render(
-      <PaneTab onClose={vi.fn()}>
-        <PaneTabLabel>tab</PaneTabLabel>
-      </PaneTab>
+      <div role="tablist">
+        <PaneTab
+          aria-controls="panel-a"
+          aria-label="Messages"
+          aria-selected={false}
+          data-tree-tab="pane-a"
+          id="tab-a"
+          onClose={vi.fn()}
+          onKeyDown={onKeyDown}
+          ref={visualWrapperRef}
+          role="tab"
+          style={{ cursor: 'grab' }}
+        >
+          <PaneTabLabel>tab</PaneTabLabel>
+        </PaneTab>
+      </div>
     )
 
-    expect(screen.getByRole('button', { name: 'Close tab' })).toBeTruthy()
+    const tab = screen.getByRole('tab', { name: 'Messages' })
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+
+    expect(tab.contains(closeButton)).toBe(false)
+    expect(tab.parentElement).toBe(closeButton.parentElement)
+    expect(tab.parentElement?.getAttribute('role')).toBe('presentation')
+    expect(tab.id).toBe('tab-a')
+    expect(tab.getAttribute('aria-controls')).toBe('panel-a')
+    expect(tab.getAttribute('aria-selected')).toBe('false')
+    expect(visualWrapperRef.current).toBe(tab.parentElement)
+    expect(visualWrapperRef.current?.dataset.treeTab).toBe('pane-a')
+    expect(visualWrapperRef.current?.style.cursor).toBe('grab')
+
+    fireEvent.keyDown(tab, { key: 'Enter' })
+    expect(onKeyDown).toHaveBeenCalledTimes(1)
   })
 
   it('uses the active locale for the close button label', () => {
@@ -127,17 +158,44 @@ describe('PaneTab close button', () => {
       </PaneTab>
     )
 
-    expect(screen.getByRole('button', { name: 'Close tab' }).className).toContain('focus-visible:opacity-100')
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+    const closeIcon = closeButton.querySelector<HTMLElement>('[data-slot="pane-tab-close-icon"]')!
+
+    expect(closeIcon.style.opacity).toBe('0')
+
+    act(() => closeButton.focus())
+
+    expect(closeButton.ownerDocument.activeElement).toBe(closeButton)
+    expect(closeIcon.style.opacity).toBe('1')
   })
 
-  it('keeps the dirty indicator until hover reveals the close glyph', () => {
+  it('swaps the dirty dot for the close glyph on hover and keyboard focus', () => {
     const { container } = render(
       <PaneTab dirty onClose={vi.fn()}>
         <PaneTabLabel>tab</PaneTabLabel>
       </PaneTab>
     )
 
-    expect(container.querySelector('[data-slot="pane-tab-dirty-indicator"]')).toBeTruthy()
+    const dirtyIndicator = container.querySelector<HTMLElement>('[data-slot="pane-tab-dirty-indicator"]')!
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+    const closeIcon = closeButton.querySelector<HTMLElement>('[data-slot="pane-tab-close-icon"]')!
+    const visualWrapper = closeButton.parentElement!
+
+    expect(dirtyIndicator.style.opacity).toBe('1')
+    expect(closeIcon.style.opacity).toBe('0')
+
+    fireEvent.mouseEnter(visualWrapper)
+    expect(dirtyIndicator.style.opacity).toBe('0')
+    expect(closeIcon.style.opacity).toBe('1')
+
+    fireEvent.mouseLeave(visualWrapper)
+    expect(dirtyIndicator.style.opacity).toBe('1')
+    expect(closeIcon.style.opacity).toBe('0')
+
+    act(() => closeButton.focus())
+    expect(closeButton.ownerDocument.activeElement).toBe(closeButton)
+    expect(dirtyIndicator.style.opacity).toBe('0')
+    expect(closeIcon.style.opacity).toBe('1')
   })
 
   it('clicking the close button calls onClose and stops propagation', () => {
@@ -155,6 +213,47 @@ describe('PaneTab close button', () => {
     expect(onClose).toHaveBeenCalledTimes(1)
     // The tab's own pointerdown handler must NOT fire — the X is a leaf action.
     expect(onTabPointerDown).not.toHaveBeenCalled()
+  })
+
+  it('middle-clicking the close-control area closes once without reaching the tab strip', () => {
+    const onClose = vi.fn()
+    const onStripPointerDown = vi.fn()
+    render(
+      <div onPointerDown={onStripPointerDown}>
+        <PaneTab onClose={onClose}>
+          <PaneTabLabel>tab</PaneTabLabel>
+        </PaneTab>
+      </div>
+    )
+
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+    fireEvent.pointerDown(closeButton, { button: 1 })
+    fireEvent.mouseDown(closeButton, { button: 1 })
+    fireEvent.pointerUp(closeButton, { button: 1 })
+
+    expect(onClose).toHaveBeenCalledTimes(1)
+    expect(onStripPointerDown).not.toHaveBeenCalled()
+  })
+
+  it('leaves right-click and context-menu events over the close control alone', () => {
+    const onClose = vi.fn()
+    const onStripPointerDown = vi.fn()
+    const onContextMenu = vi.fn()
+    render(
+      <div onContextMenu={onContextMenu} onPointerDown={onStripPointerDown}>
+        <PaneTab onClose={onClose}>
+          <PaneTabLabel>tab</PaneTabLabel>
+        </PaneTab>
+      </div>
+    )
+
+    const closeButton = screen.getByRole('button', { name: 'Close tab' })
+    fireEvent.pointerDown(closeButton, { button: 2 })
+    fireEvent.contextMenu(closeButton)
+
+    expect(onClose).not.toHaveBeenCalled()
+    expect(onStripPointerDown).toHaveBeenCalledTimes(1)
+    expect(onContextMenu).toHaveBeenCalledTimes(1)
   })
 
   it('does not render a close button on vertical tabs', () => {
