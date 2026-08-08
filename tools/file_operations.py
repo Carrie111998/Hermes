@@ -901,13 +901,26 @@ class ShellFileOperations(FileOperations):
             # lossy text would let a read→edit→write round-trip silently
             # overwrite the original bytes with mojibake. Treat a file whose
             # sample carries the replacement char as binary (read-only) so the
-            # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # agent can't corrupt it.
+            #
+            # Caveat: `head -c 1000` can slice a multi-byte UTF-8 character
+            # at the sample boundary, and the truncated tail decodes to a
+            # single trailing U+FFFD even for perfectly valid text. That
+            # truncation artifact must NOT be treated as binary evidence —
+            # otherwise legitimate UTF-8 files whose 1000th byte lands mid-
+            # character are refused with "Binary file". Distinguish it from
+            # real undecodable bytes: a true binary sample carries U+FFFD in
+            # the middle of the sample and/or more than once, not a lone
+            # replacement char squeezed against the tail.
+            sample = content_sample[:1000]
+            fffd_count = sample.count("\ufffd")
+            tail_start = max(0, len(sample) - 3)  # UTF-8 seq ≤4 bytes → cut loses ≤3
+            trailing_only = fffd_count == 1 and sample.rfind("\ufffd") >= tail_start
+            if fffd_count and not trailing_only:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     

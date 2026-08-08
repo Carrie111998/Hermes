@@ -51,6 +51,37 @@ class TestIsLikelyBinary:
         sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
+    def test_truncation_artifact_trailing_replacement_char(self, ops):
+        """A lone U+FFFD at the sample tail is a head -c 1000 truncation
+        artifact (multi-byte UTF-8 char sliced at the boundary), not binary
+        evidence — legitimate text must not be refused as 'Binary file'."""
+        # Valid UTF-8 file whose 1000th byte lands mid-character: the sample
+        # is 999 ASCII + one replacement char squeezed against the tail.
+        sample = "a" * 999 + "\ufffd"
+        assert ops._is_likely_binary("file.md", content_sample=sample) is False
+        # A few printable chars after the boundary-cut char (e.g. second
+        # sample pass or line-joined output) must also stay text.
+        sample2 = "a" * 998 + "\ufffd" + "b"
+        assert ops._is_likely_binary("file.md", content_sample=sample2) is False
+
+    def test_replacement_char_in_middle_is_binary(self, ops):
+        """U+FFFD away from the tail = real undecodable bytes = binary."""
+        sample = "a" * 100 + "\ufffd" + "b" * 899
+        assert ops._is_likely_binary("file.xyz", content_sample=sample) is True
+
+    def test_multiple_replacement_chars_is_binary(self, ops):
+        """Two U+FFFDs anywhere (even near the tail) = binary: valid UTF-8
+        cut at one boundary produces at most a single replacement char."""
+        sample = "a" * 998 + "\ufffd" + "\ufffd"
+        assert ops._is_likely_binary("file.xyz", content_sample=sample) is True
+
+    def test_trailing_replacement_char_with_binary_ratio(self, ops):
+        """A trailing U+FFFD does NOT mask real binary content: the
+        non-printable ratio check still catches NUL-heavy samples."""
+        # 301 NULs + 697 'a' + trailing artifact char: ratio > 30% → binary
+        sample = "\x00" * 301 + "a" * 697 + "\ufffd"
+        assert ops._is_likely_binary("file.xyz", content_sample=sample) is True
+
 
 # =========================================================================
 # _check_lint edge cases
