@@ -231,6 +231,152 @@ class TestFallbackChainAdvancement:
         assert agent.api_mode == "chat_completions"
         assert agent.client is not None
 
+    def test_explicit_api_mode_override_honored(self):
+        """Explicit ``api_mode`` on the fallback entry beats host heuristics.
+
+        Regression for #81932: a fallback whose base_url doesn't match the
+        heuristically-recognized host (e.g. an Anthropic-compatible proxy at a
+        path that lacks the ``/anthropic`` suffix, or an OpenAI-compatible
+        provider whose declared transport is Responses) was silently
+        downgraded to ``chat_completions``.  Activation must honor the
+        configured ``api_mode`` / ``transport`` field instead.
+        """
+        portal = "https://inference-api.nousresearch.com/v1"
+        fbs = [
+            {
+                "provider": "nous",
+                "model": "custom/anthropic-proxy-model",
+                "api_mode": "anthropic_messages",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        rebuilt = {"count": 0}
+
+        def _fake_build(api_key, base_url, timeout=None, **kwargs):
+            rebuilt["count"] += 1
+            rebuilt["api_key"] = api_key
+            rebuilt["base_url"] = base_url
+            return MagicMock(name="anthropic-client")
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url=portal, api_key="portal-jwt"),
+                    "custom/anthropic-proxy-model",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=_fake_build,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        # Explicit api_mode honored, native Anthropic client rebuilt.
+        assert agent.api_mode == "anthropic_messages"
+        assert agent.provider == "nous"
+        assert agent.model == "custom/anthropic-proxy-model"
+        assert agent.client is None
+        assert rebuilt["count"] == 1
+
+    def test_transport_alias_honored(self):
+        """The ``transport`` field is the v11→v12 name for ``api_mode``."""
+        portal = "https://inference-api.nousresearch.com/v1"
+        fbs = [
+            {
+                "provider": "nous",
+                "model": "hermes-4-405b",
+                "transport": "anthropic_messages",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        def _fake_build(api_key, base_url, timeout=None, **kwargs):
+            return MagicMock(name="anthropic-client")
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url=portal, api_key="portal-jwt"),
+                    "hermes-4-405b",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=_fake_build,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_invalid_api_mode_falls_back_to_heuristics(self):
+        """An unrecognised ``api_mode`` value must NOT silently apply.
+
+        If the user typos ``api_mode: anthropic_message`` (singular), the
+        activation must behave as if no override was set and use the host
+        heuristics, rather than installing an unknown transport that the
+        client wiring doesn't know how to dispatch.
+        """
+        portal = "https://inference-api.nousresearch.com/v1"
+        fbs = [
+            {
+                "provider": "nous",
+                "model": "anthropic/claude-opus-4.8",
+                "api_mode": "anthropic_message",  # typo — invalid
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        def _fake_build(api_key, base_url, timeout=None, **kwargs):
+            return MagicMock(name="anthropic-client")
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url=portal, api_key="portal-jwt"),
+                    "anthropic/claude-opus-4.8",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=_fake_build,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        # nous anthropic/* still gets anthropic_messages via the heuristic
+        # (nous_api_mode), so the typo'd override is ignored and the
+        # correct wire is selected.
+        assert agent.api_mode == "anthropic_messages"
+
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
 
