@@ -5831,6 +5831,13 @@ def _make_check_fn(server_name: str):
                 server.session is not None or server._is_recycled_stdio()
             ):
                 return True
+            # Workspace-sensitive tools retain one process-global schema, but
+            # their transport is selected (and, when needed, connected) by the
+            # call handler.  A reconnecting/parked primary must not hide that
+            # shared schema while another workspace transport is healthy or a
+            # new caller-specific transport can still be created.
+            if server_name in _workspace_server_configs:
+                return True
             # Lazy (schema-cache registered) servers are available: the
             # first real call spawns/connects them (#56832).
             return server_name in _lazy_server_configs

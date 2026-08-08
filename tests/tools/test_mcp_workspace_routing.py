@@ -203,3 +203,25 @@ def test_shutdown_clears_workspace_scoped_circuit_breakers():
 
     assert workspace_key not in mcp_tool._server_error_counts
     assert workspace_key not in mcp_tool._server_breaker_opened_at
+
+
+def test_workspace_sensitive_check_stays_available_without_primary_transport():
+    import tools.mcp_tool as mcp_tool
+
+    name = "filesystem_check"
+    scoped = mcp_tool.MCPServerTask(name, publish_tools=False)
+    scoped.session = MagicMock()
+    scope_key = (name, "/projects/alpha")
+    with mcp_tool._lock:
+        mcp_tool._servers.pop(name, None)
+        mcp_tool._workspace_server_configs[name] = {
+            "command": "filesystem-server",
+            "args": ["${workspaceFolder}"],
+        }
+        mcp_tool._workspace_servers[scope_key] = scoped
+    try:
+        assert mcp_tool._make_check_fn(name)()
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._workspace_server_configs.pop(name, None)
+            mcp_tool._workspace_servers.pop(scope_key, None)
