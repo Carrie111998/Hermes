@@ -2295,50 +2295,48 @@ function Install-Venv {
                             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
                         }
                 } catch {
-                    Write-Warn "Could not enumerate venv processes: $($_.Exception.Message)"
-                    break
+                    throw "Could not safely enumerate processes running from the venv: $($_.Exception.Message)"
                 }
                 if ($found -eq 0) { $cleanPasses++ } else { $cleanPasses = 0 }
                 Start-Sleep -Milliseconds 400
             }
+
+            # Never begin destructive filesystem work unless the final
+            # enumeration proves that no process still executes from this
+            # venv. A failed Stop-Process, a respawner, or an unreadable
+            # process must leave the original tree intact for retry/forensics.
+            try {
+                $remaining = @(
+                    Get-CimInstance Win32_Process -ErrorAction Stop |
+                        Where-Object {
+                            $_.ProcessId -ne $myPid -and
+                            $_.ExecutablePath -and
+                            $_.ExecutablePath.StartsWith($venvPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+                        }
+                )
+            } catch {
+                throw "Could not verify that the venv is quiescent: $($_.Exception.Message)"
+            }
+            if ($remaining.Count -gt 0) {
+                $details = ($remaining | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.ExecutablePath)" }) -join "; "
+                throw "Cannot safely replace venv; processes still run from it: $details"
+            }
         }
-        # Rename-then-delete: on Windows a directory RENAME succeeds even while
-        # files inside it are mapped as DLLs (only in-place delete/replace of
-        # the mapped file is denied, and only same-volume renames are atomic
-        # moves). Moving the old venv aside means `uv venv` can create a fresh
-        # one immediately even if some straggler still holds a .pyd from the
-        # old tree; the renamed dir is deleted best-effort (now, and by the
-        # cleanup pass below on the NEXT install if a handle outlives this one).
+        # Quarantine first: on Windows a directory RENAME is atomic within the
+        # same volume and does not replace mapped DLLs in place. The old tree
+        # stays available for forensics and rollback until the replacement has
+        # passed dependency, launcher, and runtime validation.
         $staleName = "venv.stale.{0}" -f (Get-Date -Format "yyyyMMddHHmmss")
-        $renamed = $false
         try {
             Rename-Item -Path "venv" -NewName $staleName -ErrorAction Stop
-            $renamed = $true
         } catch {
-            Write-Warn "Could not rename venv aside ($($_.Exception.Message)); falling back to in-place delete"
-        }
-        if ($renamed) {
-            Remove-Item -Recurse -Force $staleName -ErrorAction SilentlyContinue
-            if (Test-Path $staleName) {
-                Write-Warn "Old venv parked at $staleName (a process still holds files in it); it will be cleaned up on the next install"
-            }
-        } else {
-            Remove-Item -Recurse -Force "venv" -ErrorAction SilentlyContinue
-            # A killed process can take a moment to release its file handles, so a
-            # first Remove-Item may still hit a locked .pyd. Retry once after a short
-            # pause before giving up and letting the stage fail loudly.
-            if (Test-Path "venv") {
-                Start-Sleep -Seconds 2
-                Remove-Item -Recurse -Force "venv"
-            }
+            throw "Could not quarantine the existing venv ($($_.Exception.Message)); refusing in-place deletion"
         }
     }
 
-    # Clean up parked venvs from previous installs whose handles have since
-    # been released. Best-effort -- a still-held tree just stays for next time.
-    Get-ChildItem -Directory -Filter "venv.stale.*" -ErrorAction SilentlyContinue | ForEach-Object {
-        Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue
-    }
+    # Do not clean up venv.stale.* here. Retain quarantined trees until the
+    # replacement has passed all post-install validation and an operator has
+    # explicitly accepted cleanup.
     
     # uv creates the venv and pins the Python version in one step.  uv emits
     # normal progress such as "Using CPython ..." on stderr; under Windows
