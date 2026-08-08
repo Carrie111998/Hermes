@@ -131,4 +131,21 @@ describe('session drop targeting for project conversation groups', () => {
 
     expect(assignSessionConversationGroup).toHaveBeenCalledWith('dragged', 'p_sk', 'cg_ito')
   })
+
+  it('moves a session into a project when its overview header is the drop target', () => {
+    document.body.innerHTML = `
+      <div id="row"></div>
+      <div data-conversation-group-drop data-project-id="p_wedding" data-group-id=""></div>
+    `
+    stubRect(document.querySelector('[data-conversation-group-drop]')!, {
+      left: 100,
+      top: 100,
+      right: 400,
+      bottom: 160
+    })
+
+    dragTo(document.getElementById('row')!, 200, 130)
+
+    expect(assignSessionConversationGroup).toHaveBeenCalledWith('dragged', 'p_wedding', null)
+  })
 })
