@@ -172,3 +172,22 @@ def test_goal_authorization_does_not_bypass_tirith_warning(monkeypatch) -> None:
         approval.reset_hermes_interactive_context(interactive_token)
         approval.reset_current_session_key(session_token)
         approval.reset_goal_authorization(auth_token)
+
+
+def test_real_money_language_is_always_owner_gated() -> None:
+    from tools import approval
+
+    token = approval.set_goal_authorization(_active_envelope())
+    try:
+        for action in (
+            "place bet on fixture",
+            "withdraw winnings",
+            "purchase subscription",
+            "transfer funds",
+        ):
+            assert approval.classify_goal_action(action) == (
+                approval.OWNER_APPROVAL,
+                "real-money or payment action",
+            )
+    finally:
+        approval.reset_goal_authorization(token)

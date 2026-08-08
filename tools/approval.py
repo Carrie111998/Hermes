@@ -68,7 +68,7 @@ _OWNER_APPROVAL_COMMAND_RULES = (
     (re.compile(r"\b(?:reboot|shutdown|poweroff|halt)\b", re.I), "host availability disruption"),
     (re.compile(r"\b(?:iptables|nft|ufw|firewall-cmd)\b[^\n]*(?:delete|remove|reset|flush|default|deny|disable)", re.I), "network or firewall lockout risk"),
     (re.compile(r"\b(?:rotate|revoke|invalidate|delete)\b[^\n]*(?:credential|token|password|secret|key)\b", re.I), "credential lifecycle change"),
-    (re.compile(r"\b(?:bet|wager|withdraw|payment|purchase|buy|sell|transfer)\b[^\n]*(?:real|live|cash|money|fund|account|bank)", re.I), "real-money or payment action"),
+    (re.compile(r"\b(?:place\s+(?:a\s+)?bet|bet|wager|withdraw|payment|purchase|buy|sell|transfer)\b", re.I), "real-money or payment action"),
     (re.compile(r"\b(?:rm\s+-[^\n]*r|drop\s+(?:database|table)|truncate\s+table|kubectl\s+delete)\b", re.I), "destructive or irreversible change"),
 )
 
