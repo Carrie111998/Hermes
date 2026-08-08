@@ -147,6 +147,43 @@ def looks_like_telegram_private_chat_id(chat_id: Optional[str]) -> bool:
         return False
 
 
+def _is_telegram_dm_topic_target(
+    platform: Platform,
+    chat_id: Optional[str],
+    thread_id: Optional[str],
+    *,
+    adapter: Any = None,
+) -> bool:
+    """Return True when a target is a Telegram private DM-topic lane.
+
+    Uses the same contract as ``gateway.run.GatewayRunner._is_telegram_dm_topic_target``
+    but lives in the delivery module to avoid circular imports. Detection
+    combines the chat_id heuristic (positive int = private chat) with the
+    adapter's ``_get_dm_topic_info`` classmethod, which confirms operator-
+    declared DM topics. Groups and non-Telegram platforms always return False.
+    """
+    if platform != Platform.TELEGRAM or thread_id is None:
+        return False
+    if not looks_like_telegram_private_chat_id(chat_id):
+        return False
+    # Operator-declared DM topic: ask the adapter class (not the instance,
+    # to avoid MagicMock false positives). Mirrors the guard in
+    # gateway/run.py _is_telegram_dm_topic_target.
+    if adapter is not None and chat_id:
+        get_dm_topic_info = getattr(type(adapter), "_get_dm_topic_info", None)
+        if callable(get_dm_topic_info):
+            try:
+                topic_info = get_dm_topic_info(adapter, str(chat_id), str(thread_id))
+            except Exception:
+                pass
+            else:
+                if isinstance(topic_info, dict):
+                    return True
+    # Fallback: any positive chat_id with a thread_id is treated as a DM-topic
+    # lane. This covers user-created topics that aren't in the operator config.
+    return True
+
+
 def _looks_like_int(value: Optional[str]) -> bool:
     if value is None:
         return False
@@ -469,6 +506,21 @@ class DeliveryRouter:
             raise ValueError(f"No adapter configured for {target.platform.value}")
         adapter = transport.adapter
 
+        # Bare platform targets (e.g. DeliveryTarget.parse("telegram")) carry
+        # chat_id=None to mean "home channel". Resolve that intent before the
+        # chat_id guard so configured home channels route correctly.
+        # target.is_explicit is the safety guard — explicit telegram:123
+        # targets must never be rewritten. When the home channel includes a
+        # thread_id, populate the target so the downstream DM-topic / thread
+        # routing (below) can enrich metadata with the adapter-aware flags
+        # (telegram_dm_topic_reply_fallback, direct_messages_topic_id) that
+        # the Telegram Bot API requires for private DM-topic lane delivery.
+        if not target.chat_id and not target.is_explicit:
+            home = self.config.get_home_channel(target.platform)
+            if home is not None:
+                target.chat_id = home.chat_id
+                target.thread_id = home.thread_id
+
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
         
@@ -560,8 +612,9 @@ class DeliveryRouter:
             )
             target_thread_id = target.thread_id
             is_named_telegram_private_topic = (
-                target.platform == Platform.TELEGRAM
-                and looks_like_telegram_private_chat_id(target.chat_id)
+                _is_telegram_dm_topic_target(
+                    target.platform, target.chat_id, target_thread_id, adapter=adapter,
+                )
                 and not _looks_like_int(target_thread_id)
                 and "thread_id" not in send_metadata
                 and "message_thread_id" not in send_metadata
@@ -583,8 +636,9 @@ class DeliveryRouter:
                 send_metadata["thread_id"] = target_thread_id
                 send_metadata["telegram_dm_topic_created_for_send"] = True
             elif (
-                target.platform == Platform.TELEGRAM
-                and looks_like_telegram_private_chat_id(target.chat_id)
+                _is_telegram_dm_topic_target(
+                    target.platform, target.chat_id, target_thread_id, adapter=adapter,
+                )
                 and "thread_id" not in send_metadata
                 and "message_thread_id" not in send_metadata
                 and not has_explicit_direct_topic
@@ -593,14 +647,15 @@ class DeliveryRouter:
                 # send path may still need a reply anchor to stay visible in the
                 # requested lane. Named targets are created above via
                 # createForumTopic and can use message_thread_id directly.
+                # When no reply anchor is available (e.g. home-channel delivery
+                # or synthetic sends), route via direct_messages_topic_id so the
+                # Bot API places the message in the requested topic lane without
+                # a reply-to anchor.
                 reply_anchor = send_metadata.get("telegram_reply_to_message_id")
-                if reply_anchor is None:
-                    raise RuntimeError(
-                        "Telegram private DM topic delivery requires telegram_reply_to_message_id; "
-                        "send to the bare chat or provide a reply anchor"
-                    )
                 send_metadata["thread_id"] = target_thread_id
                 send_metadata["telegram_dm_topic_reply_fallback"] = True
+                if reply_anchor is None:
+                    send_metadata["direct_messages_topic_id"] = target_thread_id
             elif "thread_id" not in send_metadata and "message_thread_id" not in send_metadata and not has_explicit_direct_topic:
                 send_metadata["thread_id"] = target_thread_id
         result = await transport.send(

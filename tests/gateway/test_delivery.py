@@ -329,3 +329,442 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     assert saved_files[0].read_text() == long_content
 
 
+# ---------------------------------------------------------------------------
+# Bare platform targets resolve configured home channels (issue #13704 / #75066)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bare_platform_target_resolves_configured_home_channel(tmp_path, monkeypatch):
+    """Issue #13704 / #75066: ``DeliveryTarget.parse("telegram")`` must route to
+    the configured home channel rather than raising "No chat ID".
+
+    Regression: the parser correctly produces ``chat_id=None`` to mean
+    "home channel", but ``_deliver_to_platform`` raised before resolving
+    that intent. Verify the fix routes the send through the home channel.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="home123",
+                    name="Home",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    result = await router.deliver("hello", [target])
+
+    # After bare-platform resolution, target.chat_id is rewritten to the home
+    # channel's chat_id, so target.to_string() (which keys results) reads
+    # "telegram:home123".
+    assert result == {"telegram:home123": {"success": True, "result": {"success": True}}}
+    assert adapter.calls == [{"chat_id": "home123", "content": "hello", "metadata": None}]
+
+
+@pytest.mark.asyncio
+async def test_bare_platform_target_propagates_home_channel_thread_id(tmp_path, monkeypatch):
+    """Bare-platform resolution must also propagate ``thread_id`` from the
+    configured home channel so messages land in the right conversation.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="home-discord",
+                    name="Home",
+                    thread_id="thread-99",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord")
+
+    await router._deliver_to_platform(target, "hi", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["chat_id"] == "home-discord"
+    assert adapter.calls[0]["metadata"] == {"thread_id": "thread-99"}
+
+
+@pytest.mark.asyncio
+async def test_bare_platform_target_without_home_channel_still_raises(tmp_path, monkeypatch):
+    """When no home_channel is configured for the platform, preserve the
+    legacy error message verbatim so existing callers don't see a silent
+    behavior change.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.SLACK: adapter})
+    target = DeliveryTarget.parse("slack")
+
+    result = await router.deliver("hello", [target])
+
+    assert result == {
+        "slack": {"success": False, "error": "No chat ID for slack delivery"}
+    }
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_platform_chat_id_overrides_home_channel(tmp_path, monkeypatch):
+    """Explicit ``telegram:123`` targets must continue to use the explicit
+    chat_id, never the configured home channel (sanity guard).
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="home123",
+                    name="Home",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:987")
+
+    await router._deliver_to_platform(target, "explicit", metadata=None)
+
+    assert adapter.calls == [{"chat_id": "987", "content": "explicit", "metadata": None}]
+
+
+@pytest.mark.asyncio
+async def test_explicit_telegram_thread_preserves_behavior_with_anchor(tmp_path, monkeypatch):
+    """Explicit ``telegram:722341991:32344`` with a reply anchor must still
+    produce ``telegram_dm_topic_reply_fallback`` without direct_messages_topic_id
+    (the existing behavior is unchanged).
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:722341991:32344")
+
+    await router._deliver_to_platform(
+        target,
+        "hello",
+        metadata={"telegram_reply_to_message_id": "9001"},
+    )
+
+    assert adapter.calls == [
+        {
+            "chat_id": "722341991",
+            "content": "hello",
+            "metadata": {
+                "telegram_reply_to_message_id": "9001",
+                "thread_id": "32344",
+                "telegram_dm_topic_reply_fallback": True,
+            },
+        }
+    ]
+    # When a reply anchor is present, direct_messages_topic_id must NOT be set.
+    assert "direct_messages_topic_id" not in adapter.calls[0]["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# Telegram DM-topic home channel: adapter-aware metadata contract
+# ---------------------------------------------------------------------------
+
+
+class DmTopicAdapter(RecordingAdapter):
+    """Recording adapter with the real adapter instance-method contract."""
+
+    def _get_dm_topic_info(self, chat_id, thread_id):
+        # Return a dict for the specific chat/thread pair used in tests below.
+        if chat_id == "722341991" and thread_id == "45036":
+            return {"name": "Operator DM Topic"}
+        return None
+
+
+@pytest.mark.asyncio
+async def test_telegram_dm_topic_home_routes_with_direct_topic_id(tmp_path, monkeypatch):
+    """A bare Telegram target with a home channel that carries a numeric
+    thread_id in a private chat must produce metadata with both
+    ``telegram_dm_topic_reply_fallback`` and ``direct_messages_topic_id``
+    so the Bot API places the message in the correct topic lane without
+    a reply anchor.
+
+    This is the core regression for issue #13704 / #75066: generic
+    ``metadata['thread_id']`` was insufficient for DM-topic home delivery.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = DmTopicAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="722341991",  # positive int = private chat
+                    name="Ops Home",
+                    thread_id="45036",  # numeric DM-topic thread id
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    await router._deliver_to_platform(target, "cron output", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["chat_id"] == "722341991"
+    assert adapter.calls[0]["metadata"] == {
+        "thread_id": "45036",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "45036",
+    }
+
+
+@pytest.mark.asyncio
+async def test_telegram_dm_topic_home_no_false_flags_for_group(tmp_path, monkeypatch):
+    """When the home channel's chat_id is a group (negative int), the DM-topic
+    flags must NOT be added — only plain thread_id metadata. Groups use supergroup/
+    forum topics, not DM topics.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="-1001234567890",  # negative = group
+                    name="Group Home",
+                    thread_id="55",  # forum topic id
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    await router._deliver_to_platform(target, "group message", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["chat_id"] == "-1001234567890"
+    assert adapter.calls[0]["metadata"] == {"thread_id": "55"}
+    # DM-topic flags must NOT leak into group delivery.
+    assert "telegram_dm_topic_reply_fallback" not in adapter.calls[0]["metadata"]
+    assert "direct_messages_topic_id" not in adapter.calls[0]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_dm_topic_home_no_false_flags_for_non_telegram(tmp_path, monkeypatch):
+    """Discord threads with a home channel thread_id must receive plain
+    thread_id metadata — never the Telegram-specific DM-topic flags.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="discord-chan",
+                    name="Discord Home",
+                    thread_id="thread-42",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget.parse("discord")
+
+    await router._deliver_to_platform(target, "discord msg", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["metadata"] == {"thread_id": "thread-42"}
+    assert "telegram_dm_topic_reply_fallback" not in adapter.calls[0]["metadata"]
+    assert "direct_messages_topic_id" not in adapter.calls[0]["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_telegram_dm_topic_explicit_target_uses_direct_topic_id_without_anchor(tmp_path, monkeypatch):
+    """An explicit ``telegram:chat:thread`` with a numeric thread_id in a
+    private chat but no reply anchor must use ``direct_messages_topic_id``
+    instead of raising. This covers synthetic/resumed sends where a reply
+    anchor is unavailable.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = DmTopicAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram:722341991:45036")
+
+    await router._deliver_to_platform(target, "synthetic send", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["chat_id"] == "722341991"
+    assert adapter.calls[0]["metadata"] == {
+        "thread_id": "45036",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "45036",
+    }
+
+
+@pytest.mark.asyncio
+async def test_named_telegram_private_topic_home_is_created_before_delivery(tmp_path, monkeypatch):
+    """A bare Telegram target with a home channel that has a named (non-numeric)
+    thread_id must create the DM topic via ensure_dm_topic and then route
+    with the created thread_id.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="722341991",
+                    name="Named Home",
+                    thread_id="My Cron Topic",  # named, not numeric
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    await router._deliver_to_platform(target, "cron named", metadata=None)
+
+    assert adapter.ensure_dm_topic_calls == [
+        {"chat_id": "722341991", "topic_name": "My Cron Topic", "force_create": False}
+    ]
+    assert adapter.calls == [
+        {
+            "chat_id": "722341991",
+            "content": "cron named",
+            "metadata": {
+                "thread_id": "38049",
+                "telegram_dm_topic_created_for_send": True,
+            },
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Adapter-aware DM-topic detection via _get_dm_topic_info
+# ---------------------------------------------------------------------------
+
+
+class NonDmTopicAdapter:
+    """Adapter that returns None from _get_dm_topic_info (no operator-declared
+    DM topic). The heuristic (positive chat_id) still applies, but the adapter
+    itself does not confirm the topic."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return {"success": True}
+
+    def _get_dm_topic_info(self, chat_id, thread_id):
+        return None  # adapter does not know about this topic
+
+
+@pytest.mark.asyncio
+async def test_adapter_aware_dm_topic_falls_back_to_heuristic(tmp_path, monkeypatch):
+    """When the adapter's _get_dm_topic_info returns None, the heuristic
+    (positive chat_id) still treats the thread as a DM-topic lane.
+    User-created topics that aren't in operator config are covered.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = NonDmTopicAdapter()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="722341991",
+                    name="User Topic Home",
+                    thread_id="99999",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    await router._deliver_to_platform(target, "user topic", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["metadata"] == {
+        "thread_id": "99999",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "99999",
+    }
+
+
+class MockAdapterNoDmTopicInfo:
+    """Adapter without _get_dm_topic_info (like a MagicMock or non-Telegram
+    adapter). The check must not crash on missing attribute."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.calls.append({"chat_id": chat_id, "content": content, "metadata": metadata})
+        return {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_adapter_without_get_dm_topic_info_does_not_crash(tmp_path, monkeypatch):
+    """An adapter without _get_dm_topic_info must not cause an AttributeError.
+    The heuristic-based detection still applies.
+    """
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = MockAdapterNoDmTopicInfo()
+    cfg = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="x",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="722341991",
+                    name="NoDM Home",
+                    thread_id="45036",
+                ),
+            )
+        }
+    )
+    router = DeliveryRouter(cfg, adapters={Platform.TELEGRAM: adapter})
+    target = DeliveryTarget.parse("telegram")
+
+    await router._deliver_to_platform(target, "no crash", metadata=None)
+
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0]["metadata"] == {
+        "thread_id": "45036",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "45036",
+    }
