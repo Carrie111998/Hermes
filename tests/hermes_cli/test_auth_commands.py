@@ -546,6 +546,10 @@ def test_auth_remove_codex_migrates_legacy_dict_suppression(tmp_path, monkeypatc
         "manual:device_code",
     ]
 
+    from hermes_cli.auth import unsuppress_credential_source
+
+    assert unsuppress_credential_source("openai-codex", "legacy") is True
+
     from agent.credential_pool import load_pool
 
     assert load_pool("openai-codex").peek() is None

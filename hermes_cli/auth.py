@@ -1763,8 +1763,15 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             return False
-        provider_list = suppressed.get(provider_id)
-        if not isinstance(provider_list, list) or source not in provider_list:
+        raw_sources = suppressed.get(provider_id)
+        if isinstance(raw_sources, dict):
+            provider_list = [str(name) for name in raw_sources]
+            suppressed[provider_id] = provider_list
+        elif isinstance(raw_sources, list):
+            provider_list = raw_sources
+        else:
+            return False
+        if source not in provider_list:
             return False
         provider_list.remove(source)
         if not provider_list:
