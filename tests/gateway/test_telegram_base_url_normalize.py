@@ -99,6 +99,32 @@ class TestNormalizeTelegramBaseUrl:
         # don't have to grep through the retry loop traceback.
         assert "gateway.platforms.telegram.extra.base_url" in msg
 
+    def test_raises_clear_error_on_scheme_less_url(self):
+        """Team-review finding (#81788 follow-up): ``urlparse("//host")``
+        does NOT raise — a scheme-less base_url slipped through the port
+        validation and surfaced later as the same cryptic httpx
+        ``InvalidURL`` at request time. Fail fast instead."""
+        with pytest.raises(RuntimeError) as excinfo:
+            _normalize_telegram_base_url("127.0.0.1:8081")
+        msg = str(excinfo.value)
+        assert "missing URL scheme" in msg
+        assert "gateway.platforms.telegram.extra.base_url" in msg
+
+    def test_passes_through_token_placeholder_suffix(self):
+        """PTB's documented ``.../bot{token}`` form must not get a second
+        ``/bot`` appended (would produce ``/bot{token}/bot``)."""
+        assert (
+            _normalize_telegram_base_url("https://api.telegram.org/bot{token}")
+            == "https://api.telegram.org/bot{token}"
+        )
+
+    def test_appends_bot_when_token_placeholder_has_bare_path(self):
+        """A bare path without the /bot suffix still gets it appended."""
+        assert (
+            _normalize_telegram_base_url("https://example.com")
+            == "https://example.com/bot"
+        )
+
 
 class TestNormalizeProducesParseableUrl:
     """The end-to-end invariant: token append + httpx parse must succeed."""

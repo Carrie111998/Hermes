@@ -82,6 +82,19 @@ def _normalize_telegram_base_url(raw: str) -> str:
         parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
     except Exception:
         return candidate
+    # Fail fast on a scheme-less base_url. `urlparse("//host:port")` does
+    # NOT raise — it parses as a protocol-relative URL with empty scheme —
+    # so without this check a missing scheme slips through the port
+    # validation below and resurfaces later as the same cryptic httpx
+    # InvalidURL at request time (team-review finding, #81788 follow-up).
+    if not parsed.scheme:
+        raise RuntimeError(
+            f"Malformed Telegram base_url {candidate!r}: missing URL scheme "
+            "(expected http:// or https://). Set "
+            "gateway.platforms.telegram.extra.base_url to a valid "
+            "http(s) URL ending in '/bot', or unset it to use the public "
+            "api.telegram.org."
+        )
     # Accessing .port validates the port component — a malformed host:port
     # segment (e.g. "http://127.0.0.1:6153export") raises ValueError, which
     # we surface as a clear error rather than the cryptic httpx one.
@@ -96,7 +109,7 @@ def _normalize_telegram_base_url(raw: str) -> str:
         ) from exc
     # Strip trailing slash(es) so the suffix check is unambiguous.
     trimmed = candidate.rstrip("/")
-    if trimmed.endswith("/bot"):
+    if trimmed.endswith("/bot") or trimmed.endswith("/bot{token}"):
         return candidate
     # PTB needs /bot (or a {token} placeholder) to place the token in the
     # path; without it the token lands in the URL authority and httpx fails.
