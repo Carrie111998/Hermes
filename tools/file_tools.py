@@ -166,6 +166,7 @@ def _resolve_path(filepath: str, task_id: str = "default") -> Path | PurePosixPa
 # sessions get the same protection. See references/worktree-cwd-discipline.md.
 _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
+_REMOTE_POSIX_PATH_BACKENDS = frozenset({"ssh"})
 
 
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
@@ -210,7 +211,8 @@ def _uses_container_paths(task_id: str = "default") -> bool:
         container_backends = _CONTAINER_BACKENDS
     except Exception:
         container_backends = _CONTAINER_PATH_BACKENDS_FALLBACK
-    return _terminal_env_type_for_task(task_id) in container_backends
+    backend = _terminal_env_type_for_task(task_id)
+    return backend in container_backends or backend in _REMOTE_POSIX_PATH_BACKENDS
 
 
 def _normalize_without_host_deref(path: str | Path | PurePosixPath) -> PurePosixPath:
@@ -415,7 +417,11 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
     (no ``cd`` run yet) is warned on the very first write.
     """
     try:
-        if Path(_expand_tilde(filepath)).is_absolute():
+        expanded = _expand_tilde(filepath)
+        if (
+            (_uses_container_paths(task_id) and posixpath.isabs(expanded))
+            or Path(expanded).is_absolute()
+        ):
             return None
         workspace_root = _authoritative_workspace_root(task_id)
         if not workspace_root:

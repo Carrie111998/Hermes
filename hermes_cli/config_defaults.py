@@ -393,6 +393,10 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # OpenSSH ControlMaster connection reuse. Disable on hosts where the
+        # client leaves stale multiplexing sockets (observed with native
+        # Windows OpenSSH), which can contaminate command/file output.
+        "ssh_control_master": True,
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in

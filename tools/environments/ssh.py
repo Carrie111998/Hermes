@@ -47,15 +47,29 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 control_master: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
+        # Keep the constructor safe even when a launcher/worker path bypasses
+        # the normal terminal config bridge. SSH host/key already come from
+        # this same environment in those paths, so an explicit operator value
+        # here must remain authoritative.
+        control_master_env = os.getenv("TERMINAL_SSH_CONTROLMASTER")
+        if control_master_env is not None:
+            self.control_master = control_master_env.strip().lower() in {
+                "true", "1", "yes"
+            }
+        else:
+            self.control_master = bool(control_master)
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
-        self.control_dir.mkdir(parents=True, exist_ok=True)
+        self.control_socket: Path | None = None
+        if self.control_master:
+            self.control_dir.mkdir(parents=True, exist_ok=True)
         # Keep the socket filename short and deterministic so the full path
         # stays under the 104-byte sun_path limit that macOS enforces on
         # Unix domain sockets. A raw ``user@host:port`` — especially with an
@@ -63,11 +77,16 @@ class SSHEnvironment(BaseEnvironment):
         # ControlMaster mode easily exceeds the limit under macOS's
         # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Hashing the
         # triple keeps the path stable across reconnects so ControlMaster
-        # reuse still works.
-        _socket_id = hashlib.sha256(
-            f"{user}@{host}:{port}".encode()
-        ).hexdigest()[:16]
-        self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        # reuse still works. Include the process id: terminal, file, and
+        # execute_code workers can be separate Hermes processes. A globally
+        # shared socket lets one worker's cleanup close another worker's
+        # master, leaving a stale socket and contaminating command output with
+        # mux warnings. Process scoping preserves reuse inside each worker
+        # without cross-process ownership races.
+            _socket_id = hashlib.sha256(
+                f"{user}@{host}:{port}:{os.getpid()}".encode()
+            ).hexdigest()[:16]
+            self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
@@ -86,9 +105,10 @@ class SSHEnvironment(BaseEnvironment):
 
     def _build_ssh_command(self, extra_args: list | None = None) -> list:
         cmd = ["ssh"]
-        cmd.extend(["-o", f"ControlPath={self.control_socket}"])
-        cmd.extend(["-o", "ControlMaster=auto"])
-        cmd.extend(["-o", "ControlPersist=300"])
+        if self.control_master:
+            cmd.extend(["-o", f"ControlPath={self.control_socket}"])
+            cmd.extend(["-o", "ControlMaster=auto"])
+            cmd.extend(["-o", "ControlPersist=300"])
         cmd.extend(["-o", "BatchMode=yes"])
         cmd.extend(["-o", "StrictHostKeyChecking=accept-new"])
         cmd.extend(["-o", "ConnectTimeout=10"])
@@ -186,7 +206,9 @@ class SSHEnvironment(BaseEnvironment):
             stdin=subprocess.DEVNULL,
         )
 
-        scp_cmd = ["scp", "-o", f"ControlPath={self.control_socket}"]
+        scp_cmd = ["scp"]
+        if self.control_master:
+            scp_cmd.extend(["-o", f"ControlPath={self.control_socket}"])
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
         if self.key_path:
@@ -408,7 +430,7 @@ class SSHEnvironment(BaseEnvironment):
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
 
-        if self.control_socket.exists():
+        if self.control_master and self.control_socket and self.control_socket.exists():
             try:
                 cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
                        "-O", "exit", f"{self.user}@{self.host}"]

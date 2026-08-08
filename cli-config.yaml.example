@@ -277,6 +277,9 @@ terminal:
 #   ssh_user: "myuser"
 #   ssh_port: 22
 #   ssh_key: "~/.ssh/id_rsa"  # Optional - uses ssh-agent if not specified
+#   # Disable on native Windows or other clients where stale multiplexing
+#   # sockets cause ControlMaster warnings or cross-process interference.
+#   ssh_control_master: true
 
 # -----------------------------------------------------------------------------
 # OPTION 3: Docker container

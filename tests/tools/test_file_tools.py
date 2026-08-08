@@ -344,6 +344,30 @@ class TestWindowsMsysPathResolution:
         resolved = file_tools._resolve_path_for_task("/home/don/.env")
         assert str(resolved) == "/home/don/.env"
 
+    def test_ssh_uses_remote_posix_paths_on_windows(self, monkeypatch):
+        """SSH bash paths must not be normalized as Windows host paths."""
+        import tools.file_tools as file_tools
+
+        monkeypatch.setattr(file_tools.sys, "platform", "win32")
+        monkeypatch.setattr(
+            file_tools,
+            "_terminal_env_type_for_task",
+            lambda task_id="default": "ssh",
+        )
+        monkeypatch.setattr(
+            file_tools,
+            "_authoritative_workspace_root",
+            lambda task_id="default": "/home/cua/workspace",
+        )
+
+        resolved = file_tools._resolve_path_for_task(
+            "/home/cua/workspace/canary.txt"
+        )
+        assert str(resolved) == "/home/cua/workspace/canary.txt"
+        assert file_tools._path_resolution_warning(
+            "/home/cua/workspace/canary.txt", resolved
+        ) is None
+
 
 # ---------------------------------------------------------------------------
 # Tool result hint tests (#722)

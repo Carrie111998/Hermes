@@ -1661,6 +1661,9 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
         "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_control_master": os.getenv(
+            "TERMINAL_SSH_CONTROLMASTER", "true"
+        ).lower() in {"true", "1", "yes"},
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
@@ -1721,6 +1724,7 @@ def _ssh_config_from_config(config: Dict[str, Any]) -> dict:
         "user": config.get("ssh_user", ""),
         "port": config.get("ssh_port", 22),
         "key": config.get("ssh_key", ""),
+        "control_master": config.get("ssh_control_master", True),
         "persistent": config.get("ssh_persistent", False),
     }
 
@@ -1932,6 +1936,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             user=ssh_config["user"],
             port=ssh_config.get("port", 22),
             key_path=ssh_config.get("key", ""),
+            control_master=ssh_config.get("control_master", True),
             cwd=cwd,
             timeout=timeout,
         )

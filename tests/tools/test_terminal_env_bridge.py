@@ -23,6 +23,7 @@ def _reset_bridge_state(monkeypatch):
         "TERMINAL_CWD",
         "TERMINAL_DOCKER_IMAGE",
         "TERMINAL_SSH_HOST",
+        "TERMINAL_SSH_CONTROLMASTER",
     ):
         monkeypatch.delenv(name, raising=False)
     yield
@@ -95,6 +96,20 @@ def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):
 
     assert os.environ["TERMINAL_CWD"] == "~"
     assert config["cwd"] == "~"
+
+
+def test_explicit_ssh_controlmaster_config_overrides_env(monkeypatch):
+    _write_config(
+        "terminal:\n"
+        "  backend: ssh\n"
+        "  ssh_control_master: false\n"
+    )
+    monkeypatch.setenv("TERMINAL_SSH_CONTROLMASTER", "true")
+
+    config = terminal_tool._get_env_config()
+
+    assert config["ssh_control_master"] is False
+    assert os.environ["TERMINAL_SSH_CONTROLMASTER"] == "False"
 
 
 def test_env_is_preserved_when_config_has_no_terminal_section(monkeypatch):

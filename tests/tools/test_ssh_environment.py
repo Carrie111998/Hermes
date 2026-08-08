@@ -57,6 +57,20 @@ class TestBuildSSHCommand:
         env = SSHEnvironment(host="h", user="u")
         assert env._build_ssh_command()[-1] == "u@h"
 
+    def test_controlmaster_can_be_disabled(self, monkeypatch):
+        monkeypatch.delenv("TERMINAL_SSH_CONTROLMASTER", raising=False)
+        env = SSHEnvironment(host="h", user="u", control_master=False)
+        cmd = " ".join(env._build_ssh_command())
+        assert "ControlPath=" not in cmd
+        assert "ControlMaster=" not in cmd
+        assert "ControlPersist=" not in cmd
+
+    def test_controlmaster_env_is_final_authority(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_SSH_CONTROLMASTER", "false")
+        env = SSHEnvironment(host="h", user="u", control_master=True)
+        cmd = " ".join(env._build_ssh_command())
+        assert "ControlMaster=" not in cmd
+
 
 class TestControlSocketPath:
     """Regression tests for issue #11840.
@@ -112,11 +126,18 @@ class TestControlSocketPath:
         )
 
     def test_path_is_deterministic_across_instances(self):
-        """Same (user, host, port) must yield the same control socket so
-        ControlMaster reuse works across reconnects."""
+        """Same target in one process must reuse the same control socket."""
         first = SSHEnvironment(host="example.com", user="alice", port=2222)
         second = SSHEnvironment(host="example.com", user="alice", port=2222)
         assert first.control_socket == second.control_socket
+
+    def test_path_differs_across_processes(self, monkeypatch):
+        """Separate tool workers must not own the same ControlMaster socket."""
+        monkeypatch.setattr("tools.environments.ssh.os.getpid", lambda: 1001)
+        first = SSHEnvironment(host="example.com", user="alice", port=2222)
+        monkeypatch.setattr("tools.environments.ssh.os.getpid", lambda: 1002)
+        second = SSHEnvironment(host="example.com", user="alice", port=2222)
+        assert first.control_socket != second.control_socket
 
     def test_path_differs_for_different_targets(self):
         """Different (user, host, port) triples must produce different paths."""
@@ -127,6 +148,11 @@ class TestControlSocketPath:
 
 
 class TestTerminalToolConfig:
+    def test_ssh_controlmaster_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_SSH_CONTROLMASTER", "false")
+        from tools.terminal_tool import _get_env_config
+        assert _get_env_config()["ssh_control_master"] is False
+
     def test_ssh_persistent_default_true(self, monkeypatch):
         """SSH persistent defaults to True (via TERMINAL_PERSISTENT_SHELL)."""
         monkeypatch.delenv("TERMINAL_SSH_PERSISTENT", raising=False)
