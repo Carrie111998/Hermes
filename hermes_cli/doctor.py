@@ -123,6 +123,105 @@ def _sqlite_upgrade_hint(install_method: str | None = None) -> str:
     )
 
 
+def _hermes_database_paths(hermes_home: Path) -> list[tuple[str, Path]]:
+    """Return (display name, path) pairs for Hermes-managed SQLite databases."""
+    # backup.py owns the canonical list of per-profile stores; reuse it.
+    from hermes_cli.backup import _QUICK_STATE_FILES
+
+    entries = [
+        (name, hermes_home / name)
+        for name in _QUICK_STATE_FILES
+        if name.endswith(".db")
+    ]
+    # Non-default kanban boards each keep their own kanban.db.
+    for board_db in sorted((hermes_home / "kanban" / "boards").glob("*/kanban.db")):
+        entries.append((board_db.relative_to(hermes_home).as_posix(), board_db))
+    return entries
+
+
+_SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
+
+
+def _read_journal_mode(db_path: Path) -> tuple[str | None, str | None]:
+    """Return (journal mode, error) from the file header without opening the database.
+
+    Header byte 18 is 2 for WAL and 1 for a rollback journal. Opening the
+    database through the SQLite engine — even read-only — creates -wal/-shm
+    sidecar files, which a diagnostic must not do.
+    """
+    try:
+        with open(db_path, "rb") as fh:
+            header = fh.read(20)
+    except OSError as exc:
+        return None, str(exc)
+    if len(header) == 0:
+        return None, "file is empty"
+    if len(header) < 20 or not header.startswith(_SQLITE_HEADER_MAGIC):
+        return None, "file is not a database"
+    if header[18] == 2:
+        return "wal", None
+    if header[18] == 1:
+        return "rollback", None
+    return None, f"unrecognized file-format version {header[18]}"
+
+
+def _format_db_size(db_path: Path) -> str:
+    # backup.py owns human-readable size formatting; reuse it (as with
+    # _QUICK_STATE_FILES above) and keep only the stat-failure wrap here.
+    from hermes_cli.backup import _format_size
+
+    try:
+        nbytes = db_path.stat().st_size
+    except OSError:
+        return "size unknown"
+    return _format_size(nbytes)
+
+
+def _report_database_journal_modes(
+    hermes_home: Path | None = None,
+    version_info: tuple[int, ...] | None = None,
+) -> None:
+    """List each database's journal mode; warn on WAL under a vulnerable SQLite."""
+    from hermes_state import _wal_reset_repair_hint, is_sqlite_wal_reset_vulnerable
+
+    vulnerable = is_sqlite_wal_reset_vulnerable(version_info)
+    home = hermes_home if hermes_home is not None else HERMES_HOME
+    try:
+        databases = _hermes_database_paths(home)
+    except Exception as exc:
+        check_warn(f"Could not list Hermes databases: {exc}")
+        return
+    exposed = []
+    for name, path in databases:
+        if not path.is_file():
+            continue
+        mode, error = _read_journal_mode(path)
+        size = _format_db_size(path)
+        if error is not None:
+            if vulnerable:
+                check_warn(
+                    f"{name}: journal mode could not be read",
+                    f"({error}; cannot rule out WAL exposure)",
+                )
+            else:
+                check_info(f"{name}: journal mode could not be read ({error})")
+        elif mode == "wal":
+            if vulnerable:
+                exposed.append(name)
+                check_warn(
+                    f"{name} is in WAL mode ({size})",
+                    "(exposed to the WAL-reset bug until SQLite is upgraded)",
+                )
+            else:
+                check_info(f"{name}: WAL journal mode ({size})")
+        elif vulnerable:
+            check_info(f"{name}: rollback journal mode ({size}, not exposed)")
+        else:
+            check_info(f"{name}: rollback journal mode ({size})")
+    if exposed:
+        check_info(f"To clear the exposure: {_wal_reset_repair_hint()}")
+
+
 def _safe_which(cmd: str) -> str | None:
     """shutil.which wrapper resilient to platform monkeypatching in tests."""
     try:
@@ -989,6 +1088,7 @@ def run_doctor(args):
             check_ok(f"SQLite {_sqlite_ver}")
         if _sqlite_src_short:
             check_info(f"SQLite source id: {_sqlite_src_short}")
+        _report_database_journal_modes()
     except Exception as e:
         check_warn(f"SQLite version probe failed: {e}")
     # Check if in virtual environment
