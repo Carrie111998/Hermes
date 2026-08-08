@@ -8,7 +8,7 @@ description: "Referência oficial das ferramentas embutidas do Hermes, agrupadas
 
 Esta página documenta as ferramentas embutidas do Hermes, agrupadas por toolset. A disponibilidade varia por plataforma, credenciais e toolsets ativados.
 
-**Contagem rápida (registro atual):** ~73 ferramentas — 10 ferramentas de browser (core) + 2 ferramentas de browser condicionadas por CDP, 4 ferramentas de arquivo, 4 ferramentas do Home Assistant, 3 ferramentas de terminal (`terminal`, `process`, `read_terminal`), 2 ferramentas web, 5 ferramentas do Feishu, 7 ferramentas do Spotify (registradas pelo plugin `spotify` incluído), 5 ferramentas do Yuanbao, 9 ferramentas de kanban (registradas quando o dispatcher do kanban cria o agente), 3 ferramentas de projeto (sessões desktop/GUI), 2 ferramentas do Discord, e um punhado de ferramentas independentes (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `video_generate`, `vision_analyze`, `video_analyze`, `todo`, `computer_use`).
+**Contagem rápida (registro atual):** ~83 ferramentas — 10 ferramentas de browser (core) + 2 ferramentas de browser condicionadas por CDP, 4 ferramentas de arquivo, 4 ferramentas do Home Assistant, 2 ferramentas de terminal (`terminal`, `process`), 7 ferramentas de GUI desktop (`read_terminal`, `close_terminal`, `open_preview`, `read_preview`, `read_window_below`, `focus_pane`, `react_to_message` — apenas sessões do app desktop), 2 ferramentas web, 5 ferramentas do Feishu, 7 ferramentas do Spotify (registradas pelo plugin `spotify` incluído), 5 ferramentas do Yuanbao, 12 ferramentas de kanban (registradas quando o dispatcher do kanban cria o agente), 3 ferramentas de projeto (sessões desktop/GUI), 2 ferramentas do Discord, 3 ferramentas de vídeo (`video_generate`, `xai_video_edit`, `xai_video_extend`), e um punhado de ferramentas independentes (`memory`, `clarify`, `delegate_task`, `execute_code`, `cronjob`, `session_search`, `skill_view`/`skill_manage`/`skills_list`, `text_to_speech`, `image_generate`, `vision_analyze`, `video_analyze`, `todo`, `computer_use`, `x_search`).
 
 :::tip Ferramentas MCP
 Além das ferramentas embutidas, o Hermes pode carregar ferramentas dinamicamente de servidores MCP. As ferramentas MCP aparecem com o prefixo `mcp_<server>_` (ex.: `mcp_github_create_issue` para o servidor MCP `github`). Veja [Integração MCP](/user-guide/features/mcp) para configuração.
@@ -168,7 +168,20 @@ Ferramentas para operar [Projects](../user-guide/cli.md) de desktop — workspac
 |------|-------------|----------------------|
 | `process` | Gerencia processos em segundo plano iniciados com terminal(background=true). Ações: 'list' (mostrar todos), 'poll' (verificar status + nova saída), 'log' (saída completa com paginação), 'wait' (bloquear até concluir ou expirar), 'kill' (terminar), 'write' (env… | — |
 | `terminal` | Executa comandos shell em um ambiente Linux. O sistema de arquivos persiste entre chamadas. Defina `background=true` para servidores de longa duração. Defina `notify_on_complete=true` (com `background=true`) para receber uma notificação automática quando o processo terminar — sem necessidade de polling. NÃO use cat/head/tail — use read_file. NÃO use grep/rg/find — use search_files. | — |
-| `read_terminal` | Lê o que está exibido atualmente no painel de terminal embutido da GUI desktop do Hermes (o shell embutido ao lado deste chat). Apenas no app desktop. | — |
+
+## Toolset `desktop_ui` {#desktop_ui-toolset}
+
+Ativado em sessões cuja origem é o app desktop do Hermes, em qualquer backend ao qual ele esteja conectado (local, SSH, URL ou Hermes Cloud). Ausente de sessões CLI, TUI, mensageria e cron.
+
+| Ferramenta | Descrição | Requer ambiente |
+|------|-------------|----------------------|
+| `read_terminal` | Lê o que está exibido atualmente no painel de terminal embutido da GUI desktop do Hermes (o shell embutido ao lado deste chat). | — |
+| `close_terminal` | Fecha a aba de terminal somente leitura de um processo em segundo plano na GUI desktop do Hermes. NÃO mata o processo — só remove a aba/visão; use process(action='kill') para pará-lo. | — |
+| `open_preview` | Abre uma URL web, URL de servidor de desenvolvimento localhost ou caminho de arquivo no painel de preview ao lado do chat no app desktop do Hermes. | — |
+| `read_preview` | Lê o que está exibido no painel de preview da GUI desktop do Hermes — o texto da página do Browser in-app (URL + título + texto renderizado, paginável com `start`/`count`), ou a identidade de uma aba de arquivo/artefato. | — |
+| `read_window_below` | Identifica a janela do SO diretamente abaixo da janela do Hermes desktop — nome do app, título, bounds (apenas metadados, nunca pixels). No macOS, títulos de outros apps só aparecem quando Screen Recording já foi concedida; a ferramenta nunca solicita a permissão. | — |
+| `focus_pane` | Revela e foca um painel no app desktop do Hermes (chat, files, terminal, review, sessions). | — |
+| `react_to_message` | Reage a uma mensagem com um único emoji, no estilo tapback do iMessage. Opt-in via Settings → Appearance (`display.message_reactions`). | — |
 
 ## Toolset `todo` {#todo-toolset}
 

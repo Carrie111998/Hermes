@@ -130,7 +130,7 @@ A reescrita usa `auxiliary.tts_audio_tags` e usa por padrão seu modelo principa
 
 ### Limites de comprimento de entrada {#input-length-limits}
 
-Cada provider tem um cap documentado de caracteres por requisição. O Hermes trunca texto antes de chamar o provider para que requisições nunca falhem por erro de comprimento:
+Cada provider tem um cap documentado de caracteres por requisição. O Hermes divide respostas mais longas em chunks ordenados e sensíveis a frases antes de chamar o provider, para que o texto normalizado completo seja preservado em vez de truncado em silêncio:
 
 | Provider | Limite padrão (chars) |
 |----------|----------------------|
@@ -163,7 +163,7 @@ tts:
     max_text_length: 8192   # raise or lower the provider cap
 ```
 
-Apenas inteiros positivos são honrados. Zero, negativos, não numéricos ou booleanos caem no padrão do provider, para que config quebrada não desabilite truncamento acidentalmente.
+Apenas inteiros positivos são honrados. Zero, negativos, não numéricos ou booleanos caem no padrão do provider, para que config quebrada não ignore acidentalmente o limite de requisição do provider.
 
 ### Voice bubbles Telegram e ffmpeg {#telegram-voice-bubbles--ffmpeg}
 
@@ -313,7 +313,7 @@ Use `{{` e `}}` para chaves literais.
 | `timeout`            | `120`  | Segundos; a árvore de processos é morta ao expirar (Unix `killpg`, Windows `taskkill /T`).                 |
 | `output_format`      | `mp3`  | Um de `mp3` / `wav` / `ogg` / `flac`. Inferido automaticamente da extensão de saída se o Hermes escolher um caminho. |
 | `voice_compatible`   | `false`| Quando `true`, o Hermes converte saída MP3/WAV para Opus/OGG via ffmpeg para o Telegram renderizar voice bubble. |
-| `max_text_length`    | `5000` | A entrada é truncada a este comprimento antes de renderizar o comando.                                     |
+| `max_text_length`    | `5000` | Máximo de caracteres de entrada por invocação do comando; texto mais longo é dividido em chunks ordenados. |
 | `voice` / `model`    | vazio  | Repassados ao comando apenas como valores de placeholder.                                                  |
 
 #### Notas de comportamento {#behavior-notes}

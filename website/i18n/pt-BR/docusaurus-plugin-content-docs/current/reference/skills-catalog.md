@@ -125,18 +125,19 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | Skill | Descrição | Caminho |
 |-------|-------------|------|
 | [`airtable`](/docs/user-guide/skills/bundled/productivity/productivity-airtable) | API REST do Airtable via curl. CRUD de registros, filtros, upserts. | `productivity/airtable` |
-| [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Cria, lê, edita documentos e templates do Word .docx. | `productivity/docx` |
+| [`document-to-action-items`](/docs/user-guide/skills/bundled/productivity/productivity-document-to-action-items) | Extrai obrigações, prazos e tarefas citadas de documentos. | `productivity/document-to-action-items` |
+| [`docx`](/docs/user-guide/skills/bundled/productivity/productivity-docx) | Cria, lê, edita e usa templates de arquivos Word .docx. | `productivity/docx` |
 | [`google-workspace`](/docs/user-guide/skills/bundled/productivity/productivity-google-workspace) | Gmail, Calendar, Drive, Docs, Sheets via CLI gws ou Python. | `productivity/google-workspace` |
 | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocodificação, POIs, rotas, timezones via OpenStreetMap/OSRM. | `productivity/maps` |
 | [`meeting-action-items`](/docs/user-guide/skills/bundled/productivity/productivity-meeting-action-items) | Transforma notas de reunião em decisões citadas, responsáveis e tickets. | `productivity/meeting-action-items` |
 | [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edita texto/erros de digitação/títulos de PDF via CLI nano-pdf (prompts em linguagem natural). | `productivity/nano-pdf` |
 | [`notion`](/docs/user-guide/skills/bundled/productivity/productivity-notion) | API do Notion + CLI ntn: páginas, bases de dados, markdown, Workers. | `productivity/notion` |
 | [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extrai texto de PDFs/digitalizações (pymupdf, marker-pdf). | `productivity/ocr-and-documents` |
-| [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Cria, une, divide, preenche e protege arquivos PDF. | `productivity/pdf` |
-| [`petdex`](/docs/user-guide/skills/bundled/productivity/productivity-petdex) | Instala e seleciona mascotes petdex animados para o Hermes. | `productivity/petdex` |
-| [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Cria, lê, edita apresentações .pptx, slides, notas, templates. | `productivity/powerpoint` |
+| [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Cria, lê, une, preenche e protege arquivos PDF. | `productivity/pdf` |
+| [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Cria, lê e edita decks .pptx com python-pptx. | `productivity/powerpoint` |
+| [`product-price-monitor`](/docs/user-guide/skills/bundled/productivity/productivity-product-price-monitor) | Monitora preços de produtos, voos ou anúncios; alerta no alvo. | `productivity/product-price-monitor` |
 | [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Opera o pipeline de resumo de reuniões do Teams via CLI do Hermes — resumir reuniões, inspecionar o status do pipeline, reexecutar jobs, gerenciar assinaturas do Microsoft Graph. | `productivity/teams-meeting-pipeline` |
-| [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Cria, lê, edita planilhas Excel .xlsx e CSVs. | `productivity/xlsx` |
+| [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Cria, lê e edita workbooks Excel .xlsx e CSVs. | `productivity/xlsx` |
 
 ## research
 
