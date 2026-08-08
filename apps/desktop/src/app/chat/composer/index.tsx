@@ -2,7 +2,7 @@ import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
 
-import { composerFill, composerFloatingStrip, composerSurfaceGlass } from '@/components/chat/composer-dock'
+import { composerFloatingStrip, composerInputSurface } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
 import { Slot as ContribSlot } from '@/contrib/react/slot'
 import { useI18n } from '@/i18n'
@@ -1183,11 +1183,7 @@ export function ChatBar({
               >
                 <div
                   aria-hidden
-                  className={cn(
-                    'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
-                    composerFill,
-                    composerSurfaceGlass
-                  )}
+                  className={cn('pointer-events-none absolute inset-0 -z-10 rounded-[inherit]', composerInputSurface)}
                 />
                 <CodingStatusRow
                   onBranchOff={handleBranchOff}
@@ -1298,11 +1294,7 @@ export function ChatBarFallback() {
       <div className="composer-fallback-surface relative isolate h-(--composer-fallback-height) w-full rounded-[inherit] border border-[color-mix(in_srgb,var(--dt-composer-ring)_calc(18%*var(--composer-ring-strength)),var(--dt-input))]">
         <div
           aria-hidden
-          className={cn(
-            'pointer-events-none absolute inset-0 -z-10 rounded-[inherit]',
-            composerFill,
-            composerSurfaceGlass
-          )}
+          className={cn('pointer-events-none absolute inset-0 -z-10 rounded-[inherit]', composerInputSurface)}
         />
       </div>
     </div>
