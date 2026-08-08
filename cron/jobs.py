@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -819,6 +820,106 @@ def _contextual_jobs_authority_marker() -> Path:
     return _current_cron_store().cron_dir / ".contextual-jobs-authority"
 
 
+def _contextual_jobs_authority_pending_marker() -> Path:
+    """Crash-recovery receipt for the first contextual jobs-file commit."""
+    return _current_cron_store().cron_dir / ".contextual-jobs-authority.pending"
+
+
+def _fsync_contextual_authority_dir_unlocked() -> None:
+    """Best-effort durability barrier for authority sidecar changes."""
+    marker = _contextual_jobs_authority_marker()
+    try:
+        dir_fd = os.open(marker.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Directory fsync is unavailable on some platforms/filesystems.
+        pass
+
+
+def _jobs_payload_sha256(path: Union[str, Path]) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _publish_contextual_jobs_authority_pending_unlocked(tmp_path: str) -> None:
+    """Durably record the exact payload expected to complete first authority."""
+    pending = _contextual_jobs_authority_pending_marker()
+    atomic_write_text(
+        pending,
+        json.dumps(
+            {
+                "version": 1,
+                "jobs_payload_sha256": _jobs_payload_sha256(tmp_path),
+            },
+            sort_keys=True,
+        ),
+        create_mode=0o600,
+    )
+    _fsync_contextual_authority_dir_unlocked()
+
+
+def _remove_contextual_authority_path_unlocked(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_contextual_authority_dir_unlocked()
+
+
+def _recover_contextual_jobs_authority_unlocked(jobs_file: Path) -> bool:
+    """Resolve a crash-interrupted first-authority transition.
+
+    The pending receipt is durable before the permanent marker is published.
+    Therefore a matching jobs payload proves the first contextual commit
+    crossed the atomic replacement boundary; a mismatch proves that it did
+    not and both sidecars must be rolled back.
+    """
+    marker = _contextual_jobs_authority_marker()
+    pending = _contextual_jobs_authority_pending_marker()
+    if not pending.exists():
+        return marker.exists()
+
+    try:
+        payload = json.loads(pending.read_text(encoding="utf-8"))
+        expected = payload.get("jobs_payload_sha256")
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"Unreadable contextual authority transition receipt {pending}"
+        ) from exc
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise RuntimeError(
+            f"Invalid contextual authority transition receipt {pending}"
+        )
+
+    try:
+        committed = _jobs_payload_sha256(jobs_file) == expected
+    except FileNotFoundError:
+        committed = False
+
+    if committed:
+        if not marker.exists():
+            _publish_contextual_jobs_authority_unlocked()
+        _remove_contextual_authority_path_unlocked(pending)
+        return True
+
+    _remove_contextual_authority_path_unlocked(marker)
+    _remove_contextual_authority_path_unlocked(pending)
+    return False
+
+
+def _contextual_jobs_authority_enabled(jobs_file: Optional[Path] = None) -> bool:
+    """Return committed authority after resolving any interrupted transition."""
+    target = jobs_file or _current_cron_store().jobs_file
+    with contextual_authority_lock():
+        return _recover_contextual_jobs_authority_unlocked(target)
+
+
 def _publish_contextual_jobs_authority_unlocked() -> None:
     """Publish the marker while the caller holds contextual_authority_lock()."""
     marker = _contextual_jobs_authority_marker()
@@ -828,16 +929,7 @@ def _publish_contextual_jobs_authority_unlocked() -> None:
     finally:
         os.close(fd)
     _secure_file(marker)
-    try:
-        dir_fd = os.open(marker.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        # Directory fsync is unavailable on some platforms/filesystems.
-        # The marker itself is still atomically visible to siblings.
-        pass
+    _fsync_contextual_authority_dir_unlocked()
 
 
 # =============================================================================
@@ -1527,11 +1619,12 @@ def _replace_jobs_payload_with_authority(
         for job in jobs
     )
     marker = _contextual_jobs_authority_marker()
+    pending = _contextual_jobs_authority_pending_marker()
     with contextual_authority_lock():
         cross_process_acquired = bool(
             getattr(_jobs_lock_state, "cross_process_acquired", False)
         )
-        marker_preexisting = marker.exists()
+        marker_preexisting = _recover_contextual_jobs_authority_unlocked(jobs_file)
         if not cross_process_acquired and (marker_preexisting or publishes_contextual):
             raise RuntimeError(
                 "Refusing a degraded jobs.json write after contextual jobs "
@@ -1539,26 +1632,24 @@ def _replace_jobs_payload_with_authority(
             )
 
         marker_created = publishes_contextual and not marker_preexisting
+        payload_replaced = False
         try:
             if marker_created:
+                _publish_contextual_jobs_authority_pending_unlocked(tmp_path)
                 _publish_contextual_jobs_authority_unlocked()
             atomic_replace(tmp_path, jobs_file)
-        except BaseException:
+            payload_replaced = True
             if marker_created:
+                _remove_contextual_authority_path_unlocked(pending)
+        except BaseException:
+            if marker_created and not payload_replaced:
                 try:
-                    marker.unlink()
-                    try:
-                        dir_fd = os.open(marker.parent, os.O_RDONLY)
-                        try:
-                            os.fsync(dir_fd)
-                        finally:
-                            os.close(dir_fd)
-                    except OSError:
-                        pass
+                    _remove_contextual_authority_path_unlocked(marker)
+                    _remove_contextual_authority_path_unlocked(pending)
                 except OSError:
                     logger.error(
-                        "Failed to roll back contextual authority marker %s",
-                        marker,
+                        "Failed to roll back contextual authority transition %s",
+                        pending,
                         exc_info=True,
                     )
             raise
@@ -1716,7 +1807,7 @@ def save_jobs(
     )
     with _jobs_lock() as cross_process_locked:
         if not cross_process_locked and (
-            publishes_contextual or _contextual_jobs_authority_marker().exists()
+            publishes_contextual or _contextual_jobs_authority_enabled()
         ):
             raise RuntimeError(
                 "Refusing a degraded jobs.json write for a profile with "

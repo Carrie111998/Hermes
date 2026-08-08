@@ -199,6 +199,8 @@ def test_contextual_authority_marker_and_degraded_replace_are_linearized(
     assert not creator.is_alive()
     assert errors == []
     assert {job["id"] for job in jobs.load_jobs()} == {"ordinary", "contextual"}
+    assert jobs._contextual_jobs_authority_marker().exists()
+    assert not jobs._contextual_jobs_authority_pending_marker().exists()
 
 
 def test_missing_contextual_update_does_not_publish_authority(monkeypatch, tmp_path):
@@ -300,6 +302,93 @@ def test_failed_authority_publication_rolls_back_marker(monkeypatch, tmp_path):
     monkeypatch.setattr(jobs, "_jobs_lock", degraded_jobs_lock)
     jobs.save_jobs([{**ordinary, "name": "after"}])
     assert jobs.load_jobs()[0]["name"] == "after"
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="requires POSIX fork")
+def test_crash_before_first_contextual_commit_does_not_publish_false_authority(
+    monkeypatch, tmp_path
+):
+    import contextlib
+    import os
+
+    import cron.jobs as jobs
+
+    jobs = _point_store(monkeypatch, tmp_path)
+    ordinary = {"id": "ordinary", "session_target": "isolated", "name": "before"}
+    contextual = {"id": "contextual", "session_target": "current"}
+    jobs.save_jobs([ordinary])
+
+    original_replace = jobs.atomic_replace
+
+    def crash_before_replace(_source, _destination):
+        os._exit(73)
+
+    monkeypatch.setattr(jobs, "atomic_replace", crash_before_replace)
+    child = os.fork()
+    if child == 0:  # pragma: no cover - child exits without returning to pytest
+        jobs.save_jobs([ordinary, contextual])
+        os._exit(74)
+
+    _pid, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 73
+    monkeypatch.setattr(jobs, "atomic_replace", original_replace)
+
+    # The durable jobs payload never crossed the replacement boundary, so a
+    # restart must not treat contextual authority as successfully committed.
+    assert [job["id"] for job in jobs.load_jobs()] == ["ordinary"]
+    assert jobs._contextual_jobs_authority_pending_marker().exists()
+
+    @contextlib.contextmanager
+    def degraded_jobs_lock():
+        previous = getattr(jobs._jobs_lock_state, "cross_process_acquired", False)
+        jobs._jobs_lock_state.cross_process_acquired = False
+        try:
+            yield False
+        finally:
+            jobs._jobs_lock_state.cross_process_acquired = previous
+
+    monkeypatch.setattr(jobs, "_jobs_lock", degraded_jobs_lock)
+    jobs.save_jobs([{**ordinary, "name": "after"}])
+
+    assert jobs.load_jobs()[0]["name"] == "after"
+    assert not jobs._contextual_jobs_authority_marker().exists()
+    assert not jobs._contextual_jobs_authority_pending_marker().exists()
+
+
+def test_successful_contextual_commit_keeps_permanent_authority(
+    monkeypatch, tmp_path
+):
+    import contextlib
+
+    import cron.jobs as jobs
+
+    jobs = _point_store(monkeypatch, tmp_path)
+    ordinary = {"id": "ordinary", "session_target": "isolated", "name": "before"}
+    contextual = {"id": "contextual", "session_target": "current"}
+
+    jobs.save_jobs([ordinary, contextual])
+    assert jobs._contextual_jobs_authority_marker().exists()
+    assert not jobs._contextual_jobs_authority_pending_marker().exists()
+
+    # Removing the last contextual job does not revoke the profile's authority.
+    jobs.save_jobs([ordinary])
+
+    @contextlib.contextmanager
+    def degraded_jobs_lock():
+        previous = getattr(jobs._jobs_lock_state, "cross_process_acquired", False)
+        jobs._jobs_lock_state.cross_process_acquired = False
+        try:
+            yield False
+        finally:
+            jobs._jobs_lock_state.cross_process_acquired = previous
+
+    monkeypatch.setattr(jobs, "_jobs_lock", degraded_jobs_lock)
+    with pytest.raises(RuntimeError, match="degraded jobs.json write"):
+        jobs.save_jobs([{**ordinary, "name": "must-not-commit"}])
+
+    assert jobs.load_jobs()[0]["name"] == "before"
+    assert jobs._contextual_jobs_authority_marker().exists()
+    assert not jobs._contextual_jobs_authority_pending_marker().exists()
 
 
 def test_public_job_record_preserves_legacy_isolated_api_shape():
