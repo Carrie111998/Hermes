@@ -13,13 +13,15 @@ Covers the three moving pieces:
 Regression target: the "Ben Eng llm-wiki" session where grok-4.1-fast
 batched parallel patches, half failed, and the model summarised the
 turn claiming every file was edited.  This verifier makes over-claiming
-structurally impossible past the model: the user always sees the real
-list of files that did NOT change.
+structurally impossible past the model while suppressing stale failures
+when a later on-disk change proves recovery through another route.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 
 import pytest
 
@@ -150,6 +152,28 @@ class TestRecordFileMutationResult:
         assert agent._turn_failed_file_mutations == {}
         assert agent._turn_file_mutation_paths == {"/tmp/a.md"}
 
+    def test_success_clears_relative_failure_reported_as_absolute(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        target = tmp_path / "a.md"
+        target.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "a.md", "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "not found"}),
+            is_error=True,
+        )
+
+        target.write_text("after\n", encoding="utf-8")
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "before", "new_string": "after"},
+            json.dumps({"success": True, "files_modified": [str(target)]}),
+            is_error=False,
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
 
     def test_landed_paths_prefer_resolved_tool_result(self):
         paths = _extract_landed_file_mutation_paths(
@@ -227,6 +251,92 @@ class TestRecordFileMutationResult:
         # the initial root cause.
         assert "first error" in agent._turn_failed_file_mutations["/tmp/a.md"]["error_preview"]
 
+    def test_terminal_cli_recovery_is_detected_from_disk(self, tmp_path):
+        target = tmp_path / "config.yaml"
+        target.write_text("enabled: false\n", encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target)},
+            json.dumps({"error": "protected config; use hermes config set"}),
+            is_error=True,
+        )
+
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"Path({str(target)!r}).write_text('enabled: true\\n', encoding='utf-8')"
+                ),
+            ],
+            check=True,
+        )
+
+        assert agent._unresolved_file_mutation_failures() == {}
+
+    def test_created_target_recovers_failed_write_file(self, tmp_path):
+        target = tmp_path / "new.txt"
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "write_file",
+            {"path": str(target), "content": "created later"},
+            json.dumps({"error": "write refused"}),
+            is_error=True,
+        )
+
+        target.write_text("created later", encoding="utf-8")
+
+        assert agent._unresolved_file_mutation_failures() == {}
+
+    def test_unchanged_target_remains_unresolved(self, tmp_path):
+        target = tmp_path / "unchanged.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target)},
+            json.dumps({"error": "old_string not found"}),
+            is_error=True,
+        )
+
+        assert set(agent._unresolved_file_mutation_failures()) == {str(target)}
+
+    def test_v4a_recovery_filters_only_the_changed_sibling(self, tmp_path):
+        changed = tmp_path / "changed.txt"
+        unchanged = tmp_path / "unchanged.txt"
+        changed.write_text("before\n", encoding="utf-8")
+        unchanged.write_text("before\n", encoding="utf-8")
+        patch_body = (
+            f"*** Update File: {changed}\n"
+            f"*** Update File: {unchanged}\n"
+        )
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "patch", "patch": patch_body},
+            json.dumps({"error": "multi-file patch failed"}),
+            is_error=True,
+        )
+
+        changed.write_text("after\n", encoding="utf-8")
+
+        assert set(agent._unresolved_file_mutation_failures()) == {str(unchanged)}
+
+    def test_later_failed_attempt_refreshes_recovery_baseline(self, tmp_path):
+        target = tmp_path / "retry.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+        failed = json.dumps({"error": "old_string not found"})
+        args = {"mode": "replace", "path": str(target)}
+
+        agent._record_file_mutation_result("patch", args, failed, is_error=True)
+        target.write_text("changed between attempts\n", encoding="utf-8")
+        agent._record_file_mutation_result("patch", args, failed, is_error=True)
+
+        assert set(agent._unresolved_file_mutation_failures()) == {str(target)}
+
 
 
 
@@ -244,7 +354,9 @@ class TestFormatFooter:
         out = AIAgent._format_file_mutation_failure_footer(
             {"/tmp/a.md": {"tool": "patch", "error_preview": "Could not find old_string"}},
         )
-        assert "1 file(s) were NOT modified" in out
+        assert "1 failed file mutation target(s) remain unresolved" in out
+        assert "No later change to these targets was detected" in out
+        assert "were NOT modified" not in out
         assert "/tmp/a.md" in out
         assert "Could not find old_string" in out
         assert "git status" in out  # user-actionable hint
@@ -255,7 +367,7 @@ class TestFormatFooter:
             for i in range(15)
         }
         out = AIAgent._format_file_mutation_failure_footer(failed)
-        assert "15 file(s) were NOT modified" in out
+        assert "15 failed file mutation target(s) remain unresolved" in out
         assert "… and 5 more" in out
         # Ten file bullets + header + "and X more" line
         lines = out.split("\n")
