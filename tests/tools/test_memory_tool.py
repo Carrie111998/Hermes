@@ -158,6 +158,28 @@ class TestMemoryStoreAdd:
         assert "disk unavailable" in result["error"]
         assert store.memory_entries == []
 
+    def test_unicode_write_failure_returns_error_without_advancing_live_state(
+        self, store
+    ):
+        store.add("memory", "existing fact")
+        path = store._path_for("memory")
+        before = path.read_text(encoding="utf-8")
+        unpaired_surrogate = json.loads('"\\ud800"')
+
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content=unpaired_surrogate,
+                store=store,
+            )
+        )
+
+        assert result["success"] is False
+        assert "surrogates not allowed" in result["error"]
+        assert store.memory_entries == ["existing fact"]
+        assert path.read_text(encoding="utf-8") == before
+
     def test_success_reports_the_persisted_file(self, store, tmp_path):
         result = json.loads(
             memory_tool(action="add", target="memory", content="durable fact", store=store)

@@ -373,7 +373,7 @@ class MemoryStore:
         path = self._path_for(target)
         try:
             self.save_to_disk(target, entries)
-        except (OSError, IOError, RuntimeError) as exc:
+        except Exception as exc:
             return {
                 "success": False,
                 "error": str(exc),
