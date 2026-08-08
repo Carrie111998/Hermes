@@ -106,7 +106,7 @@ class TestPersistence:
     def test_corrupted_file(self):
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("broken{{{")
+        path.write_text("broken{{{", encoding="utf-8")
         assert _load_subscriptions() == {}
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
@@ -126,7 +126,10 @@ class TestPersistence:
         # Simulate a pre-existing 0o644 file from before this hardening landed.
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
+        path.write_text(
+            json.dumps({"old": {"secret": "stale", "prompt": "x"}}),
+            encoding="utf-8",
+        )
         path.chmod(0o644)
 
         _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})
