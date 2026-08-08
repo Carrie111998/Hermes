@@ -56,6 +56,7 @@ def _make_runner(platform: Platform):
     runner.pairing_store._is_rate_limited.return_value = False
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._active_turn_message_ids = {}
     runner._update_prompt_pending = {}
     return runner, adapter
 

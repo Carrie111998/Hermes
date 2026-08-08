@@ -192,6 +192,7 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner.session_store.reset_session = MagicMock()
 
     runner._running_agents = {}
+    runner._active_turn_message_ids = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._shutdown_event = asyncio.Event()
