@@ -11,6 +11,7 @@ import {
   chatMessageText,
   type GatewayEventPayload,
   mergeFinalAssistantText,
+  normalizeWhitespace,
   reasoningPart,
   renderMediaTags,
   upsertToolPart
@@ -625,7 +626,16 @@ export function useMessageStream({
               existing.interim &&
               finalText &&
               existingText &&
-              (finalText === existingText || finalText.startsWith(existingText) || existingText.startsWith(finalText))
+              (finalText === existingText ||
+                finalText.startsWith(existingText) ||
+                existingText.startsWith(finalText) ||
+                // Tool-heavy turns sometimes produce a final whose whitespace
+                // doesn't match the sealed interim exactly (collapsed runs of
+                // spaces, stray newlines, trailing whitespace from the final
+                // decoder). Treat whitespace-normalized equality as a settle
+                // signal so the live UI agrees with the single DB row instead
+                // of appending a duplicate bubble (#81422).
+                normalizeWhitespace(finalText) === normalizeWhitespace(existingText))
             )
 
             if (existing.pending || (!interimBoundaryPending && finalText && existingText === finalText)) {
