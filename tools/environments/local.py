@@ -1327,9 +1327,15 @@ def _make_run_env(env: dict) -> dict:
 
     # Trusted `/v1/runs` integration values are request-local. Merge them last
     # so they reach tool subprocesses without mutating process-global state.
-    from gateway.runtime_context import get_runtime_env
+    from gateway.runtime_context import TRUSTED_RUNTIME_ENV_KEYS, get_runtime_env
 
-    run_env.update(get_runtime_env())
+    trusted_runtime_env = get_runtime_env()
+    if trusted_runtime_env is not None:
+        # A trusted request scope is authoritative, including an empty scope.
+        # Never fall back to a long-lived inherited value for these names.
+        for key in TRUSTED_RUNTIME_ENV_KEYS:
+            run_env.pop(key, None)
+        run_env.update(trusted_runtime_env)
 
     return run_env
 
@@ -1426,6 +1432,12 @@ class LocalEnvironment(BaseEnvironment):
     """
 
     _profile_scoped_passthrough = True
+
+    def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
+        """Keep request-scoped runtime values out of shared shell snapshots."""
+        from gateway.runtime_context import TRUSTED_RUNTIME_ENV_KEYS
+
+        return tuple(TRUSTED_RUNTIME_ENV_KEYS)
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)

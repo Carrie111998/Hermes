@@ -106,3 +106,40 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
                 assert "HERMES_SESSION_ID" not in f.read()
     finally:
         env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_no_cross_run_runtime_env_leak(tmp_path):
+    """A later run must not source an earlier run's scoped credential."""
+    import threading
+
+    from gateway.runtime_context import bind_runtime_env
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        def run_with_token(token):
+            out = {}
+
+            def worker():
+                with bind_runtime_env({"PAPERCLIP_API_KEY": token}):
+                    out["r"] = env.execute('echo "[$PAPERCLIP_API_KEY]"')
+
+            t = threading.Thread(target=worker)
+            t.start()
+            t.join()
+            return out["r"].get("output", "")
+
+        out_a = run_with_token("run-token-A")
+        out_b = run_with_token("run-token-B")
+
+        assert "run-token-A" in out_a, f"run A saw {out_a!r}"
+        assert "run-token-B" in out_b, f"run B saw {out_b!r}"
+        assert "run-token-A" not in out_b, f"run B leaked A's token: {out_b!r}"
+
+        if os.path.exists(env._snapshot_path):
+            with open(env._snapshot_path) as f:
+                assert "PAPERCLIP_API_KEY" not in f.read()
+    finally:
+        env.cleanup()

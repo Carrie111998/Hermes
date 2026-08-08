@@ -70,16 +70,6 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
-_RUN_RUNTIME_ENV_KEYS = frozenset({
-    "PAPERCLIP_API_KEY",
-    "PAPERCLIP_API_URL",
-    "PAPERCLIP_AGENT_ID",
-    "PAPERCLIP_COMPANY_ID",
-    "PAPERCLIP_ISSUE_WORK_MODE",
-    "PAPERCLIP_RUN_ID",
-    "PAPERCLIP_TASK_ID",
-    "PAPERCLIP_WAKE_REASON",
-})
 _RUN_RUNTIME_ENV_MAX_BYTES = 32 * 1024
 
 
@@ -97,12 +87,21 @@ def _parse_run_runtime_env(body: Any) -> tuple[dict[str, str], Optional[str]]:
         return {}, "'runtime_env' must be an object"
     if any(
         not isinstance(key, str)
-        or key not in _RUN_RUNTIME_ENV_KEYS
+        or key not in TRUSTED_RUNTIME_ENV_KEYS
         or not isinstance(value, str)
         for key, value in raw.items()
     ):
         return {}, "'runtime_env' contains an unsupported name or non-string value"
-    if sum(len(key.encode()) + len(value.encode()) for key, value in raw.items()) > _RUN_RUNTIME_ENV_MAX_BYTES:
+    if any("\x00" in value for value in raw.values()):
+        return {}, "'runtime_env' contains an invalid value"
+    try:
+        encoded_size = sum(
+            len(key.encode("utf-8")) + len(value.encode("utf-8"))
+            for key, value in raw.items()
+        )
+    except UnicodeEncodeError:
+        return {}, "'runtime_env' contains an invalid value"
+    if encoded_size > _RUN_RUNTIME_ENV_MAX_BYTES:
         return {}, "'runtime_env' is too large"
     return dict(raw), None
 
@@ -120,6 +119,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.runtime_context import TRUSTED_RUNTIME_ENV_KEYS
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -127,7 +127,7 @@ from gateway.platforms.base import (
     is_network_accessible,
     validate_media_delivery_path,
 )
-from agent.redact import redact_sensitive_text
+from agent.redact import bind_exact_redactions, redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 
@@ -6394,8 +6394,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        redact_text=None,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        if redact_text is None:
+            redact_text = lambda value: redact_sensitive_text(value, force=True)
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -6418,7 +6426,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "run_id": run_id,
                     "timestamp": ts,
                     "tool": tool_name,
-                    "preview": preview,
+                    "preview": redact_text(preview) if preview is not None else None,
                 })
             elif event_type == "tool.completed":
                 _push({
@@ -6434,7 +6442,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "reasoning.available",
                     "run_id": run_id,
                     "timestamp": ts,
-                    "text": preview or "",
+                    "text": redact_text(preview or ""),
                 })
             elif event_type in {"subagent.start", "subagent.complete"}:
                 event = {
@@ -6443,9 +6451,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                 }
                 if preview is not None:
-                    event["preview"] = redact_sensitive_text(
-                        str(preview), force=True
-                    )
+                    event["preview"] = redact_text(str(preview))
                 for key in (
                     "goal",
                     "task_count",
@@ -6477,7 +6483,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     if key in ("goal", "summary", "output_tail") and isinstance(
                         value, str
                     ):
-                        value = redact_sensitive_text(value, force=True)
+                        value = redact_text(value)
                     event[key] = value
                 _push(event)
             # _thinking, subagent.tool, and subagent_progress are intentionally
@@ -6509,6 +6515,18 @@ class APIServerAdapter(BasePlatformAdapter):
         runtime_env, runtime_env_error = _parse_run_runtime_env(body)
         if runtime_env_error:
             return web.json_response(_openai_error(runtime_env_error), status=400)
+
+        exact_run_secrets = tuple(
+            value
+            for name, value in runtime_env.items()
+            if name == "PAPERCLIP_API_KEY" and value
+        )
+
+        def _redact_run_text(value: Any) -> str:
+            text = redact_sensitive_text(value, force=True)
+            for secret in exact_run_secrets:
+                text = text.replace(secret, "«redacted-secret»")
+            return text
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6594,7 +6612,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(run_id, loop, _redact_run_text)
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
@@ -6605,6 +6623,11 @@ class APIServerAdapter(BasePlatformAdapter):
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
+            # Exact-value redaction is not safe across arbitrary stream chunk
+            # boundaries. Runs carrying an opaque credential emit only the
+            # fully assembled, redacted completion event.
+            if exact_run_secrets:
+                return
             if run_id not in self._run_streams:
                 return
             try:
@@ -6612,7 +6635,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "event": "message.delta",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "delta": delta,
+                    "delta": _redact_run_text(delta),
                 })
             except Exception:
                 pass
@@ -6667,7 +6690,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     if "command" in event:
                         from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
+                        event["command"] = _redact_run_text(
+                            _redact_approval_command(event.get("command"))
+                        )
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -6700,7 +6725,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
-                    with self._profile_scope(request_profile), bind_runtime_env(runtime_env):
+                    with (
+                        self._profile_scope(request_profile),
+                        bind_runtime_env(runtime_env),
+                        bind_exact_redactions(exact_run_secrets),
+                    ):
                         try:
                             # Bind approval/session identity for this API run via
                             # contextvars so concurrent runs do not share process
@@ -6773,7 +6802,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    error_msg = _redact_run_text(
+                        _redact_api_error_text(result.get("error") or "agent run failed")
+                    )
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
@@ -6787,7 +6818,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    final_response = _redact_run_text(
+                        result.get("final_response", "") if isinstance(result, dict) else ""
+                    )
                     _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
@@ -6825,8 +6858,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 # message the other endpoints give a provider auth/credential
                 # failure, instead of falling through to the generic
                 # except-Exception branch below.
-                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
+                error_msg = _redact_run_text(
+                    f"⚠️ Provider authentication failed: {exc}"
+                )
+                logger.warning("Provider authentication failed for run=%s: %s", run_id, error_msg)
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -6843,11 +6878,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
+                error_msg = _redact_run_text(_redact_api_error_text(exc))
+                logger.error("[api_server] run %s failed: %s", run_id, error_msg)
                 self._set_run_status(
                     run_id,
                     "failed",
-                    error=_redact_api_error_text(exc),
+                    error=error_msg,
                     last_event="run.failed",
                 )
                 try:
@@ -6855,7 +6891,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
+                        "error": error_msg,
                     })
                 except Exception:
                     pass

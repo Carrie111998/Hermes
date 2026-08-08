@@ -11,6 +11,9 @@ import logging
 import os
 import re
 import shlex
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterable, Iterator
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -74,6 +77,27 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # warning is logged at gateway and CLI startup so operators see the
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
+
+_EXACT_REDACTION_VALUES: ContextVar[tuple[str, ...]] = ContextVar(
+    "hermes_exact_redaction_values", default=()
+)
+
+
+@contextmanager
+def bind_exact_redactions(values: Iterable[str]) -> Iterator[None]:
+    """Bind opaque secret values that must be redacted in this run only."""
+    cleaned = tuple(
+        sorted(
+            {value for value in values if isinstance(value, str) and value},
+            key=len,
+            reverse=True,
+        )
+    )
+    token = _EXACT_REDACTION_VALUES.set(cleaned)
+    try:
+        yield
+    finally:
+        _EXACT_REDACTION_VALUES.reset(token)
 
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
@@ -820,6 +844,8 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
+    for secret in _EXACT_REDACTION_VALUES.get():
+        text = text.replace(secret, "«redacted-secret»")
     if not (force or _REDACT_ENABLED):
         return text
 

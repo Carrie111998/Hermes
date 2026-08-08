@@ -7,16 +7,28 @@ environment state.
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator, Mapping
+from typing import Iterator, Mapping, Optional
 
-_runtime_env: ContextVar[dict[str, str]] = ContextVar(
-    "hermes_request_runtime_env", default={}
+TRUSTED_RUNTIME_ENV_KEYS = frozenset({
+    "PAPERCLIP_API_KEY",
+    "PAPERCLIP_API_URL",
+    "PAPERCLIP_AGENT_ID",
+    "PAPERCLIP_COMPANY_ID",
+    "PAPERCLIP_ISSUE_WORK_MODE",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_TASK_ID",
+    "PAPERCLIP_WAKE_REASON",
+})
+
+_runtime_env: ContextVar[Optional[dict[str, str]]] = ContextVar(
+    "hermes_request_runtime_env", default=None
 )
 
 
-def get_runtime_env() -> dict[str, str]:
-    """Return a copy of the runtime values bound to the current request."""
-    return dict(_runtime_env.get())
+def get_runtime_env() -> Optional[dict[str, str]]:
+    """Return bound values, or ``None`` outside a trusted request scope."""
+    values = _runtime_env.get()
+    return dict(values) if values is not None else None
 
 
 @contextmanager
