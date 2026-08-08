@@ -365,6 +365,15 @@ function providerResolutionFailure(reason: null | string) {
     : 'Connected, but Hermes still cannot resolve a usable provider.'
 }
 
+// The Accounts catalog exposes Claude Code as a synthetic external-auth row,
+// while inference runs through Hermes' native `anthropic` provider. Keep that
+// boundary translation here so model discovery, assignment, and runtime checks
+// all receive the executable provider slug after the user explicitly selects
+// the connected Claude Code account.
+function modelProviderSlugs(provider: OAuthProvider): string[] {
+  return provider.id === 'claude-code' ? ['anthropic'] : [provider.id]
+}
+
 async function refreshProviders() {
   if (providersRefreshPromise) {
     await providersRefreshPromise
@@ -733,7 +742,7 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
   }
 
   const { provider } = flow
-  await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
+  await completeWithModelConfirm(ctx, provider.name, modelProviderSlugs(provider), reason =>
     setFlow({
       status: 'error',
       provider,

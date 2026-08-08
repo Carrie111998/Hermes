@@ -7,6 +7,7 @@ import {
   $desktopOnboarding,
   type DesktopOnboardingState,
   type OnboardingContext,
+  recheckExternalSignin,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
@@ -415,6 +416,78 @@ describe('OAuth onboarding', () => {
     expect(optionsIndex).toBeGreaterThanOrEqual(0)
     expect(recommendedIndex).toBeGreaterThan(optionsIndex)
     expect(setIndex).toBeGreaterThan(recommendedIndex)
+  })
+
+  it('maps connected Claude Code OAuth to the Anthropic model provider', async () => {
+    const model = 'claude-sonnet-4-6'
+    const calls: { body?: unknown; path: string }[] = []
+
+    installApiMock(async ({ body, path }: { body?: unknown; path: string }) => {
+      calls.push({ body, path })
+
+      if (path.startsWith('/api/model/options')) {
+        return {
+          providers: [
+            { name: 'OpenAI Codex', slug: 'openai-codex', models: ['gpt-5.6-sol'] },
+            { name: 'Anthropic', slug: 'anthropic', models: [model] }
+          ]
+        }
+      }
+
+      if (path.startsWith('/api/model/recommended-default?')) {
+        return { provider: 'anthropic', model, free_tier: null }
+      }
+
+      if (path === '/api/model/set') {
+        return { ok: true, provider: 'anthropic', model, gateway_tools: [] }
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async (method, params) => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        expect(params).toEqual({ provider: 'anthropic' })
+
+        return { ok: true } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    const claudeCode = {
+      ...provider('claude-code', 'Anthropic OAuth'),
+      flow: 'external' as const,
+      status: { logged_in: true }
+    }
+
+    $desktopOnboarding.set(
+      baseState({
+        flow: { status: 'external_pending', provider: claudeCode, copied: false },
+        manual: true,
+        requested: true
+      })
+    )
+
+    await recheckExternalSignin(onboardingContext(requestGateway))
+
+    expect(calls).toContainEqual({
+      path: '/api/model/set',
+      body: { scope: 'main', provider: 'anthropic', model }
+    })
+    expect($desktopOnboarding.get().flow).toMatchObject({
+      status: 'confirming_model',
+      providerSlug: 'anthropic',
+      currentModel: model
+    })
   })
 })
 
