@@ -3,7 +3,9 @@
  * size, position, and maximized flag across launches. Side-effect-free so the
  * part that actually matters (rejecting garbage + off-screen bounds) is
  * unit-testable without booting Electron; main.ts owns the file I/O and the
- * live `screen` displays.
+ * live `screen` displays. Also home to the destroyed-window liveness guards
+ * main.ts reads chrome state through, for the same reason: they are pure, and
+ * the failure they prevent is only reproducible against a fake window.
  */
 
 // Defaults mirror the historical hardcoded BrowserWindow size; MIN_* mirror its
@@ -112,6 +114,64 @@ function computeWindowOptions(state, displays): WindowOptions {
   return opts
 }
 
+// Structural shape of the bits of a BrowserWindow these guards touch. Every
+// method is optional so plain stand-ins (and a window mid-teardown) are handled
+// by probing rather than by trusting the type.
+interface LiveWindow {
+  isDestroyed?: () => boolean
+  isFullScreen?: () => boolean
+  isMinimized?: () => boolean
+  isVisible?: () => boolean
+  getWindowButtonPosition?: () => WindowButtonPosition
+}
+
+interface WindowButtonPosition {
+  x: number
+  y: number
+}
+
+interface WindowChromeState {
+  isFullscreen: boolean
+  isMinimized: boolean
+  isVisible: boolean
+}
+
+// Electron keeps a BrowserWindow's JS wrapper alive after destroy(), so optional
+// chaining is NOT a destroyed-window guard: `win?.isVisible?.()` still finds the
+// method and invokes it, and the native binding throws
+// `TypeError: Object has been destroyed`. Anything reading a window's live state
+// has to ask isDestroyed() first. isDestroyed is itself probed because callers
+// legitimately pass undefined (no window yet) or a plain object stand-in.
+function isWindowLive(win?: LiveWindow): boolean {
+  return Boolean(win) && typeof win.isDestroyed === 'function' && !win.isDestroyed()
+}
+
+// The fullscreen/minimized/visible triple main.ts reports to the renderer. A
+// live window reports exactly what it reported before this guard existed; an
+// absent or destroyed one reports all-false instead of throwing.
+function windowChromeState(win?: LiveWindow): WindowChromeState {
+  if (!isWindowLive(win)) {
+    return { isFullscreen: false, isMinimized: false, isVisible: false }
+  }
+
+  return {
+    isFullscreen: Boolean(win.isFullScreen?.()),
+    isMinimized: Boolean(win.isMinimized?.()),
+    isVisible: Boolean(win.isVisible?.())
+  }
+}
+
+// macOS traffic-light origin for a window, falling back to `fallback` for an
+// absent or destroyed one — the same value the previous
+// `|| WINDOW_BUTTON_POSITION` produced, minus the throw.
+function windowButtonPosition(win: LiveWindow | undefined, fallback: WindowButtonPosition): WindowButtonPosition {
+  if (!isWindowLive(win)) {
+    return fallback
+  }
+
+  return win.getWindowButtonPosition?.() || fallback
+}
+
 // Trailing debounce: collapse a burst of resize/move events (Linux fires many
 // mid-drag) into a single run `delayMs` after the last. `.flush()` runs now and
 // cancels the pending timer — used on close, before the window is gone.
@@ -140,9 +200,12 @@ export {
   debounce,
   DEFAULT_HEIGHT,
   DEFAULT_WIDTH,
+  isWindowLive,
   MIN_HEIGHT,
   MIN_VISIBLE,
   MIN_WIDTH,
   onScreen,
-  sanitizeWindowState
+  sanitizeWindowState,
+  windowButtonPosition,
+  windowChromeState
 }
