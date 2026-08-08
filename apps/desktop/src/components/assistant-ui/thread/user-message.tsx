@@ -109,7 +109,8 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
 export const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
-}> = ({ onCancel, onRequestRestoreConfirm }) => {
+  readOnly?: boolean
+}> = ({ onCancel, onRequestRestoreConfirm, readOnly: forcedReadOnly = false }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const messageId = useAuiState(s => s.message.id)
@@ -177,7 +178,7 @@ export const UserMessage: FC<{
   // Watch windows spectate a subagent run driven elsewhere — prompts can't be
   // edited, restored, or stopped from here. The bubble stays a button that
   // toggles the 2-line clamp so long prompts are still fully readable.
-  const readOnly = isWatchWindow()
+  const readOnly = forcedReadOnly || isWatchWindow()
   const [expanded, setExpanded] = useState(false)
   const clampActive = !(readOnly && expanded)
 
@@ -403,7 +404,7 @@ export const UserMessage: FC<{
                 sent bubble. Overlaying the corner read badly in practice. */}
             <ReactionBadge
               className="justify-end gap-1.5 py-1.5 pr-1.5"
-              onRetract={() => react(null)}
+              onRetract={readOnly ? undefined : () => react(null)}
               reactions={shownReactions}
             />
             <BranchPickerPrimitive.Root

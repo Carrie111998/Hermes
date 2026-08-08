@@ -1933,6 +1933,17 @@ export const en: Translations = {
     loading: 'Loading…',
     loadMore: 'Load more',
     loadCount: step => `Load ${step} more`,
+    lineage: {
+      all: 'View all segments',
+      branch: 'Branch from this segment',
+      current: 'Current segment',
+      error: 'Could not load this segment.',
+      loading: 'Loading segment…',
+      readOnly: 'Read-only historical segment',
+      segment: index => `Segment ${index}`,
+      segments: count => `${count} segments`,
+      title: 'Conversation context'
+    },
     row: {
       pin: 'Pin',
       unpin: 'Unpin',

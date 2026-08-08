@@ -1,6 +1,6 @@
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
-import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import { assistantTextPart, type ChatMessage, chatMessageText, textPart, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -30,7 +30,13 @@ import {
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  SessionRuntimeInfo
+} from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -774,6 +780,38 @@ export const toBranchMessages = (messages: ChatMessage[]): BranchMessage[] =>
   messages
     .map(message => ({ content: chatMessageText(message), role: message.role, source: message }))
     .filter(({ content, role }) => content.trim() && (role === 'assistant' || role === 'user'))
+
+/**
+ * Exact historical segments need two views of the same transcript: internal
+ * compaction checkpoints seed the new branch but stay hidden in its UI, while
+ * ordinary user/assistant turns use the standard display conversion.
+ */
+export function exactSegmentBranchMessages(messages: SessionMessage[]): BranchMessage[] {
+  return messages.flatMap((message, index): BranchMessage[] => {
+    if (message.display_kind !== 'hidden') {
+      return toBranchMessages(toChatMessages([message]))
+    }
+
+    const content = message.content ?? message.text ?? message.context
+
+    if ((message.role !== 'assistant' && message.role !== 'user') || typeof content !== 'string' || !content.trim()) {
+      return []
+    }
+
+    return [
+      {
+        content,
+        role: message.role,
+        source: {
+          hidden: true,
+          id: `hidden-history-${message.id ?? index}`,
+          parts: [textPart(content)],
+          role: message.role
+        }
+      }
+    ]
+  })
+}
 
 export function upsertOptimisticSession(
   created: SessionCreateResponse,

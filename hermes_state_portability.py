@@ -107,6 +107,7 @@ class SessionPortabilityMixin:
                     (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                       AND COALESCE(m.display_kind, '') != 'hidden'
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
@@ -191,6 +192,7 @@ class SessionPortabilityMixin:
                     (SELECT {_PREVIEW_RAW_SELECT}
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                       AND COALESCE(m.display_kind, '') != 'hidden'
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,

@@ -5,6 +5,7 @@ import { ThreadMessageList } from '@/components/assistant-ui/thread/list'
 import { BackgroundResumeNotice, CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { SystemMessage } from '@/components/assistant-ui/thread/system-message'
 import { ThreadTimeline } from '@/components/assistant-ui/thread/timeline'
+import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { UserEditComposer } from '@/components/assistant-ui/thread/user-edit-composer'
 import { UserMessage } from '@/components/assistant-ui/thread/user-message'
@@ -15,6 +16,8 @@ import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
 
 type ThreadLoadingState = 'response' | 'session'
+
+const READ_ONLY_TRANSCRIPT_WINDOW = { expandWindow: () => {}, olderAvailable: false }
 
 interface ThreadEditContextValue {
   cwd: string | null
@@ -42,6 +45,7 @@ interface ThreadProps {
   onCancel?: () => Promise<void> | void
   onDismissError?: (messageId: string) => void
   onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
+  readOnly?: boolean
   sessionId?: string | null
   sessionKey?: string | null
 }
@@ -63,6 +67,7 @@ export const Thread = memo(function Thread({
   onCancel,
   onDismissError,
   onRestoreToMessage,
+  readOnly = false,
   sessionId = null,
   sessionKey
 }: ThreadProps) {
@@ -129,6 +134,7 @@ export const Thread = memo(function Thread({
             hasBranchInNewChat ? messageId => callbacksRef.current.onBranchInNewChat?.(messageId) : undefined
           }
           onDismissError={hasDismissError ? messageId => callbacksRef.current.onDismissError?.(messageId) : undefined}
+          readOnly={readOnly}
         />
       ),
       SystemMessage,
@@ -141,10 +147,11 @@ export const Thread = memo(function Thread({
         <UserMessage
           onCancel={hasCancel ? () => callbacksRef.current.onCancel?.() : undefined}
           onRequestRestoreConfirm={hasRestoreToMessage ? requestRestoreConfirm : undefined}
+          readOnly={readOnly}
         />
       )
     }),
-    [hasBranchInNewChat, hasCancel, hasDismissError, hasRestoreToMessage, requestRestoreConfirm]
+    [hasBranchInNewChat, hasCancel, hasDismissError, hasRestoreToMessage, readOnly, requestRestoreConfirm]
   )
 
   const emptyPlaceholder = intro ? (
@@ -163,15 +170,28 @@ export const Thread = memo(function Thread({
   return (
     <ThreadEditContext.Provider value={editContext}>
       <div className="relative grid h-full min-h-0 max-w-full grid-rows-[minmax(0,1fr)] overflow-hidden bg-transparent contain-[layout_paint]">
-        <ThreadMessageList
-          clampToComposer={clampToComposer}
-          components={messageComponents}
-          emptyPlaceholder={emptyPlaceholder}
-          loadingIndicator={loadingIndicator}
-          sessionKey={sessionKey}
-        />
+        {readOnly ? (
+          <TranscriptWindowProvider value={READ_ONLY_TRANSCRIPT_WINDOW}>
+            <ThreadMessageList
+              clampToComposer={clampToComposer}
+              components={messageComponents}
+              emptyPlaceholder={emptyPlaceholder}
+              loadingIndicator={loadingIndicator}
+              sessionKey={sessionKey}
+              spectator
+            />
+          </TranscriptWindowProvider>
+        ) : (
+          <ThreadMessageList
+            clampToComposer={clampToComposer}
+            components={messageComponents}
+            emptyPlaceholder={emptyPlaceholder}
+            loadingIndicator={loadingIndicator}
+            sessionKey={sessionKey}
+          />
+        )}
         {loading === 'session' && <CenteredThreadSpinner />}
-        <ThreadTimeline />
+        {!readOnly && <ThreadTimeline />}
         <ConfirmDialog
           confirmLabel={copy.restoreConfirm}
           description={copy.restoreBody}

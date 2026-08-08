@@ -1709,6 +1709,17 @@ export const zhHant = defineLocale({
     loading: '載入中…',
     loadMore: '載入更多',
     loadCount: step => `再載入 ${step} 個`,
+    lineage: {
+      all: '檢視全部上下文區段',
+      branch: '從此上下文區段建立分支',
+      current: '目前上下文區段',
+      error: '無法載入此上下文區段。',
+      loading: '正在載入上下文區段…',
+      readOnly: '唯讀歷史上下文區段',
+      segment: index => `上下文區段 ${index}`,
+      segments: count => `${count} 個上下文區段`,
+      title: '對話上下文'
+    },
     row: {
       pin: '釘選',
       unpin: '取消釘選',

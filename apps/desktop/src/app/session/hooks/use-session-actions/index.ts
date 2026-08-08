@@ -3,7 +3,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getCompressionSegmentMessages, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
@@ -68,7 +68,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  UsageStats
+} from '@/types/hermes'
 
 import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -80,6 +86,7 @@ import {
   applyStoredSessionPreviewRuntimeInfo,
   type BranchMessage,
   chatMessageArraysEquivalent,
+  exactSegmentBranchMessages,
   isSessionGoneError,
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
@@ -1157,7 +1164,8 @@ export function useSessionActions({
       sourceSessionId: null | string,
       parentStoredId: null | string,
       cwd?: string,
-      profile?: null | string
+      profile?: null | string,
+      parentContext?: SessionInfo
     ): Promise<boolean> => {
       creatingSessionRef.current = true
 
@@ -1182,17 +1190,30 @@ export function useSessionActions({
               source: 'desktop',
               ...(cwd && { cwd }),
               ...(profile ? { profile } : {}),
-              messages: branchMessages.map(({ content, role }) => ({ content, role })),
+              messages: branchMessages.map(({ content, role, source }) => ({
+                content,
+                ...(source.hidden ? { display_kind: 'hidden' } : {}),
+                role
+              })),
               ...(parentStoredId && { parent_session_id: parentStoredId })
             })
 
         const routedSessionId = branched.stored_session_id ?? branched.session_id
-        const preview = branchMessages.map(({ content }) => content).find(Boolean) ?? null
+
+        const preview =
+          branchMessages
+            .filter(message => !message.source.hidden)
+            .map(({ content }) => content)
+            .find(Boolean) ?? null
+
         // Draft until submit: nest under the parent at the parent's recency so it
         // doesn't bubble to the top until a real message lands (backend persists
         // + auto-names it then). The selected row survives refreshes (sessionsToKeep).
         const rows = $sessions.get()
-        const parent = parentStoredId ? rows.find(session => sessionMatchesStoredId(session, parentStoredId)) : null
+
+        const parent =
+          parentContext ??
+          (parentStoredId ? rows.find(session => sessionMatchesStoredId(session, parentStoredId)) : null)
 
         const siblings = parentStoredId
           ? rows.filter(session => session.parent_session_id?.trim() === parentStoredId).length
@@ -1304,7 +1325,7 @@ export function useSessionActions({
   // transcript directly (no resume/active-session dependency), so it works on
   // right-click and nests under its parent.
   const branchStoredSession = useCallback(
-    async (storedSessionId: string, sessionProfile?: string | null): Promise<boolean> => {
+    async (storedSessionId: string, sessionProfile?: string | null, lineageSessionId?: string): Promise<boolean> => {
       clearNotifications()
 
       // Right-clicking a session outside the paginated sidebar window is a cache
@@ -1314,12 +1335,25 @@ export function useSessionActions({
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
         (sessionProfile ? undefined : await resolveStoredSession(storedSessionId))
 
-      const profile = sessionProfile ?? stored?.profile
+      const lineageOwner = lineageSessionId
+        ? ($sessions.get().find(session => sessionMatchesStoredId(session, lineageSessionId)) ??
+          (sessionProfile ? undefined : await resolveStoredSession(lineageSessionId)))
+        : undefined
+
+      const branchContext = stored ?? lineageOwner
+
+      const profile = sessionProfile ?? branchContext?.profile
 
       try {
         await ensureGatewayProfile(profile)
-        const { messages } = await getSessionMessages(storedSessionId, profile)
-        const branchMessages = toBranchMessages(toChatMessages(messages))
+
+        const { messages } = lineageSessionId
+          ? await getCompressionSegmentMessages(lineageSessionId, storedSessionId, profile)
+          : await getSessionMessages(storedSessionId, profile)
+
+        const branchMessages = lineageSessionId
+          ? exactSegmentBranchMessages(messages)
+          : toBranchMessages(toChatMessages(messages))
 
         if (!branchMessages.length) {
           notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
@@ -1327,7 +1361,14 @@ export function useSessionActions({
           return false
         }
 
-        return await forkBranch(branchMessages, null, stored?.id ?? storedSessionId, stored?.cwd?.trim(), profile)
+        return await forkBranch(
+          branchMessages,
+          null,
+          lineageSessionId ? storedSessionId : (stored?.id ?? storedSessionId),
+          branchContext?.cwd?.trim(),
+          profile,
+          branchContext
+        )
       } catch (err) {
         notifyError(err, copy.branchFailed)
 

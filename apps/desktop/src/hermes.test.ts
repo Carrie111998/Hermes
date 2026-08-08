@@ -7,6 +7,8 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  getCompressionLineage,
+  getCompressionSegmentMessages,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -331,6 +333,89 @@ describe('Hermes REST helpers', () => {
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
     })
+  })
+
+  it('routes read-only lineage metadata and exact segment reads to the owning profile', async () => {
+    api
+      .mockResolvedValueOnce({ root_session_id: 'root', segments: [], tip_session_id: 'tip' })
+      .mockResolvedValueOnce({ messages: [], session_id: 'root' })
+
+    await getCompressionLineage('tip', 'work')
+    await getCompressionSegmentMessages('tip', 'root', 'work')
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      path: '/api/sessions/tip/compression-lineage?profile=work',
+      profile: 'work'
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      path: '/api/sessions/tip/compression-lineage/root/messages?limit=500&offset=0&profile=work',
+      profile: 'work'
+    })
+  })
+
+  it('loads every exact segment message page before returning the transcript', async () => {
+    api.mockImplementation(({ path }: { path: string }) =>
+      Promise.resolve(
+        path.includes('offset=500')
+          ? {
+              messages: [{ content: 'last', id: 501, role: 'assistant', timestamp: 2 }],
+              pagination: { has_more: false, limit: 500, offset: 500, returned: 1, total: 501 },
+              session_id: 'root'
+            }
+          : {
+              messages: [{ content: 'first', id: 1, role: 'user', timestamp: 1 }],
+              pagination: { has_more: true, limit: 500, offset: 0, returned: 500, total: 501 },
+              session_id: 'root'
+            }
+      )
+    )
+
+    const transcript = await getCompressionSegmentMessages('tip', 'root', 'work')
+
+    expect(transcript.messages.map(message => message.content)).toEqual(['first', 'last'])
+    expect(api).toHaveBeenCalledTimes(2)
+    expect((api.mock.calls[0][0] as { path: string }).path).toContain('limit=500&offset=0')
+    expect((api.mock.calls[1][0] as { path: string }).path).toContain('limit=500&offset=500')
+  })
+
+  it('loads every lineage page when the first 100-segment page is full', async () => {
+    const first = Array.from({ length: 100 }, (_, index) => ({
+      id: `segment-${index}`,
+      index: index + 1,
+      is_tip: false,
+      message_count: 0,
+      started_at: index
+    }))
+
+    const last = [
+      { id: 'segment-100', index: 101, is_tip: false, message_count: 0, started_at: 100 },
+      { id: 'segment-101', index: 102, is_tip: true, message_count: 0, started_at: 101 }
+    ]
+
+    api.mockImplementation(({ path }: { path: string }) =>
+      Promise.resolve(
+        path.includes('offset=100')
+          ? {
+              pagination: { limit: 100, offset: 100, returned: 2 },
+              root_session_id: 'segment-0',
+              segments: last,
+              tip_session_id: 'segment-101'
+            }
+          : {
+              pagination: { limit: 100, offset: 0, returned: 100 },
+              root_session_id: 'segment-0',
+              segments: first,
+              tip_session_id: 'segment-101'
+            }
+      )
+    )
+
+    const lineage = await getCompressionLineage('segment-101', 'work')
+
+    expect(lineage.segments).toHaveLength(102)
+    expect(lineage.segments.at(-1)).toMatchObject({ id: 'segment-101', is_tip: true })
+    expect(api).toHaveBeenCalledTimes(2)
+    expect((api.mock.calls[1][0] as { path: string }).path).toContain('offset=100')
   })
 
   it('bounds blocking TTS synthesis timeouts by text length', () => {

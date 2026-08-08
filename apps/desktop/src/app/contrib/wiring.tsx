@@ -862,7 +862,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onBranchInNewChat: messageId => void branchInNewChat(messageId),
-    onBranchSession: sessionId => void branchStoredSession(sessionId),
+    onBranchSession: (sessionId, profile, lineageSessionId) =>
+      void branchStoredSession(sessionId, profile, lineageSessionId),
     onCancel: cancelRun,
     onDeleteSelectedSession: () => {
       const id = $selectedStoredSessionId.get()

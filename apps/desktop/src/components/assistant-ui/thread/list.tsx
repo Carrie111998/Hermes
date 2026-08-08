@@ -101,6 +101,7 @@ interface ThreadMessageListProps {
   emptyPlaceholder?: ReactNode
   loadingIndicator?: ReactNode
   sessionKey?: string | null
+  spectator?: boolean
 }
 
 // Group each user message with the assistant turn(s) that follow it so the
@@ -234,7 +235,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   components,
   emptyPlaceholder,
   loadingIndicator,
-  sessionKey
+  sessionKey,
+  spectator = false
 }) => {
   // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
   // changes only when messages are added/removed/swapped — it keys the error
@@ -404,11 +406,22 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
-  useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
-  useEffect(() => () => resetThreadScroll(), [])
+  useEffect(() => {
+    if (!spectator) {
+      setThreadAtBottom(isAtBottom)
+    }
+  }, [isAtBottom, spectator])
+  useEffect(() => {
+    if (!spectator) {
+      return () => resetThreadScroll()
+    }
+  }, [spectator])
 
   // Floating jump button (outside this subtree) → return to the bottom.
-  useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])
+  useEffect(
+    () => (spectator ? undefined : onScrollToBottomRequest(() => void scrollToBottom())),
+    [scrollToBottom, spectator]
+  )
 
   const endEditHold = useCallback(() => {
     scrollRef.current?.removeAttribute('data-editing')
@@ -428,8 +441,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     el.setAttribute('data-editing', 'true')
   }, [endEditHold, scrollRef, stopScroll])
 
-  useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
-  useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
+  useEffect(() => (spectator ? undefined : onThreadEditOpen(beginEditHold)), [beginEditHold, spectator])
+  useEffect(() => (spectator ? undefined : onThreadEditClose(endEditHold)), [endEditHold, spectator])
   useEffect(() => () => endEditHold(), [endEditHold])
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())

@@ -167,8 +167,63 @@ def workspace_key(row: Dict[str, Any]) -> Optional[str]:
     return cwd or None
 
 
+def _safe_model_config_json(col: str) -> str:
+    return (
+        f"CASE WHEN json_valid(COALESCE({col}, '{{}}')) "
+        f"THEN COALESCE({col}, '{{}}') ELSE '{{}}' END"
+    )
+
+
+def _marker_from_json(col: str, marker: str) -> str:
+    return f"json_extract(({_safe_model_config_json(col)}), '$.{marker}')"
+
+
 def _delegate_from_json(col: str = "model_config") -> str:
-    return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
+    return _marker_from_json(col, "_delegate_from")
+
+
+def _non_continuation_child_sql(
+    alias: str, parent_id_expr: str, parent_ended_at_expr: Optional[str] = None
+) -> str:
+    """SQL predicate shared by listing CTE continuation classification."""
+    config = f"{alias}.model_config"
+    temporal = ""
+    if parent_ended_at_expr is not None:
+        temporal = (
+            f" AND NOT ({alias}.ended_at IS NOT NULL "
+            f"AND {parent_ended_at_expr} IS NOT NULL "
+            f"AND {alias}.ended_at < {parent_ended_at_expr})"
+        )
+    return (
+        f"COALESCE({_marker_from_json(config, '_branched_from')}, '') != {parent_id_expr} "
+        f"AND COALESCE({_marker_from_json(config, '_delegate_from')}, '') != {parent_id_expr} "
+        f"AND COALESCE({alias}.source, '') != 'tool'"
+        f"{temporal}"
+    )
+
+
+def _unique_compression_continuation_sql(
+    child_alias: str = "child", parent_alias: str = "parent"
+) -> str:
+    """Require one unambiguous live/compression child for a recursive CTE edge."""
+    direct = _non_continuation_child_sql(
+        child_alias, f"{parent_alias}.id", f"{parent_alias}.ended_at"
+    )
+    sibling = _non_continuation_child_sql(
+        "sibling", f"{parent_alias}.id", f"{parent_alias}.ended_at"
+    )
+    return f"""
+        AND COALESCE({child_alias}.end_reason, '') != 'ws_orphan_reap'
+        AND ({child_alias}.ended_at IS NULL OR {child_alias}.end_reason = 'compression')
+        AND {direct}
+        AND NOT EXISTS (
+            SELECT 1 FROM sessions sibling
+            WHERE sibling.parent_session_id = {parent_alias}.id
+              AND sibling.id != {child_alias}.id
+              AND COALESCE(sibling.end_reason, '') != 'ws_orphan_reap'
+              AND {sibling}
+        )
+    """
 
 
 # Sentinel returned by SessionDB._merge_model_config_json when the session row
@@ -3659,9 +3714,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # continuations as delegate children (fail-open for orphan reopen,
     # fail-closed for adoption). Bind the parent id for both markers.
     _NON_CONTINUATION_CHILD_FILTER_SQL = (
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        "  AND COALESCE(json_extract(CASE WHEN json_valid({alias}model_config)"
+        " THEN {alias}model_config ELSE '{{}}' END,"
         " '$._branched_from'), '') != ?\n"
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
+        "  AND COALESCE(json_extract(CASE WHEN json_valid({alias}model_config)"
+        " THEN {alias}model_config ELSE '{{}}' END,"
         " '$._delegate_from'), '') != ?\n"
         "  AND COALESCE({alias}source, '') != 'tool'\n"
     )
@@ -6020,6 +6077,76 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
+    def _get_compression_continuation_state(
+        self, session_id: str
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Classify the direct continuation edge of a compression parent."""
+        if not session_id:
+            return None, None
+
+        with self._lock:
+            parent = self._conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if parent is None or parent["end_reason"] != "compression":
+                return None, None
+
+            rows = self._conn.execute(
+                """
+                SELECT child.id, child.ended_at, child.end_reason
+                FROM sessions child
+                WHERE child.parent_session_id = ?
+                  AND COALESCE(child.end_reason, '') != 'ws_orphan_reap'
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="child.")
+                + " ORDER BY child.started_at, child.id",
+                (session_id, session_id, session_id),
+            ).fetchall()
+
+        # Unmarked legacy delegates that ended before their parent compressed
+        # are provably not post-compression continuations. Equal timestamps are
+        # retained because older databases only have coarse timestamp precision.
+        rows = [
+            row
+            for row in rows
+            if not (
+                row["ended_at"] is not None
+                and parent["ended_at"] is not None
+                and row["ended_at"] < parent["ended_at"]
+            )
+        ]
+        valid = [
+            row
+            for row in rows
+            if row["ended_at"] is None or row["end_reason"] == "compression"
+        ]
+        invalid = [
+            row
+            for row in rows
+            if row["ended_at"] is not None and row["end_reason"] != "compression"
+        ]
+        if invalid:
+            return None, {
+                "ok": False,
+                "reason": "invalid_closed_child",
+                "session_id": session_id,
+                "candidate_ids": [row["id"] for row in invalid],
+            }
+        if len(valid) > 1:
+            return None, {
+                "ok": False,
+                "reason": "ambiguous_continuation",
+                "session_id": session_id,
+                "candidate_ids": [row["id"] for row in valid],
+            }
+        return (valid[0]["id"], None) if valid else (None, None)
+
+    def _get_compression_continuation_child(self, session_id: str) -> Optional[str]:
+        """Return the unique fail-closed compression continuation child."""
+        child_id, _integrity = self._get_compression_continuation_state(session_id)
+        return child_id
+
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
@@ -6043,42 +6170,133 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         current = session_id
         seen = {current} if current else set()
-        # Bound the walk defensively — compression chains this deep are
-        # pathological and shouldn't happen in practice. 100 = plenty.
-        for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
-                    f"""
-                    SELECT child.id
-                    FROM sessions parent
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
-                    ORDER BY
-                      CASE
-                        WHEN child.end_reason = 'compression' THEN 0
-                        WHEN child.ended_at IS NULL THEN 1
-                        ELSE 2
-                      END,
-                      {_sql_session_last_active("child")} DESC,
-                      child.started_at DESC,
-                      child.id DESC
-                    LIMIT 1
-                    """,
-                    (current,),
-                )
-                row = cursor.fetchone()
-            if row is None:
+        while current:
+            child_id = self._get_compression_continuation_child(current)
+            if child_id is None:
                 return current
-            child_id = row["id"]
             if not child_id or child_id in seen:
-                return current
+                return session_id
             seen.add(child_id)
             current = child_id
         return current
+
+
+    def get_compression_lineage_metadata(self, session_id: str) -> Dict[str, Any]:
+        """Return deterministic root-to-tip metadata for one compression chain.
+
+        This is intentionally read-only and follows exactly the child-selection
+        rule used by :meth:`get_compression_tip`.  A parent pointer alone is not
+        a lineage edge: explicit branches, delegated subagents, and tool
+        sessions remain separate conversations. Cycles are bounded by the
+        visited-id set; presentation pagination is applied only after the
+        canonical root and tip have been resolved.
+        """
+        if not session_id:
+            return {
+                "root_session_id": session_id,
+                "tip_session_id": session_id,
+                "segments": [],
+                "integrity": {"ok": True},
+            }
+
+        root = session_id
+        seen = {root}
+
+        # Walk upward only through the *selected* compression child.  A stale
+        # sibling of a compressed parent must not inherit the live lineage.
+        while root:
+            with self._lock:
+                parent = self._conn.execute(
+                    """
+                    SELECT parent.id
+                    FROM sessions parent
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE child.id = ? AND parent.end_reason = 'compression'
+                    LIMIT 1
+                    """,
+                    (root,),
+                ).fetchone()
+            if parent is None:
+                break
+            parent_id = parent["id"]
+            if (
+                not parent_id
+                or parent_id in seen
+                or self._get_compression_continuation_child(parent_id) != root
+            ):
+                break
+            seen.add(parent_id)
+            root = parent_id
+
+        segments: List[Dict[str, Any]] = []
+        current = root
+        seen = set()
+        index = 1
+        integrity: Dict[str, Any] = {"ok": True}
+        while current:
+            if current in seen:
+                integrity = {
+                    "ok": False,
+                    "reason": "cycle",
+                    "session_id": current,
+                    "candidate_ids": [current],
+                }
+                break
+            seen.add(current)
+            with self._lock:
+                row = self._conn.execute(
+                    f"""
+                    SELECT s.id, s.parent_session_id, s.title, s.started_at,
+                           s.ended_at, s.end_reason, s.source, s.message_count,
+                           s.input_tokens, s.output_tokens, s.tool_call_count,
+                           {_sql_session_last_active("s")} AS last_active
+                    FROM sessions s WHERE s.id = ?
+                    """,
+                    (current,),
+                ).fetchone()
+            if row is None:
+                break
+            segment = dict(row)
+            segment["index"] = index
+            segment["is_tip"] = False
+            segments.append(segment)
+            current, edge_integrity = self._get_compression_continuation_state(current)
+            if edge_integrity is not None:
+                integrity = edge_integrity
+                break
+            index += 1
+
+        if integrity.get("reason") == "cycle":
+            with self._lock:
+                requested_row = self._conn.execute(
+                    f"""
+                    SELECT s.id, s.parent_session_id, s.title, s.started_at,
+                           s.ended_at, s.end_reason, s.source, s.message_count,
+                           s.input_tokens, s.output_tokens, s.tool_call_count,
+                           {_sql_session_last_active("s")} AS last_active
+                    FROM sessions s WHERE s.id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+            segments = []
+            if requested_row is not None:
+                requested = dict(requested_row)
+                requested["index"] = 1
+                requested["is_tip"] = True
+                segments.append(requested)
+            root = session_id
+            tip = session_id
+        elif segments:
+            segments[-1]["is_tip"] = True
+            tip = segments[-1]["id"]
+        else:
+            tip = root
+        return {
+            "root_session_id": root,
+            "tip_session_id": tip,
+            "segments": segments,
+            "integrity": integrity,
+        }
 
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
@@ -6297,17 +6515,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
-                WITH RECURSIVE chain(root_id, cur_id) AS (
-                    SELECT s.id, s.id FROM sessions s {where_sql}
+                WITH RECURSIVE chain(root_id, cur_id, visited) AS (
+                    SELECT s.id, s.id, '|' || s.id || '|' FROM sessions s {where_sql}
                     UNION ALL
-                    SELECT c.root_id, child.id
+                    SELECT c.root_id, child.id, c.visited || child.id || '|'
                     FROM chain c
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
+                      AND INSTR(c.visited, '|' || child.id || '|') = 0
+                      {_unique_compression_continuation_sql("child", "parent")}
                 ),
                 chain_max AS (
                     SELECT
@@ -6321,6 +6538,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND COALESCE(m.display_kind, '') != 'hidden'
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
@@ -6344,6 +6562,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND COALESCE(m.display_kind, '') != 'hidden'
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
@@ -6383,6 +6602,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND COALESCE(m.display_kind, '') != 'hidden'
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
@@ -7516,9 +7736,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # never hijack the resume. This is the fix for the desktop "I came back
         # and the reply isn't there" report on large sessions.
         try:
-            tip = self.get_compression_tip(session_id)
+            lineage = self.get_compression_lineage_metadata(session_id)
         except Exception:
-            tip = session_id
+            return session_id
+        if not lineage.get("integrity", {}).get("ok", True):
+            return session_id
+        tip = lineage.get("tip_session_id")
         if tip and tip != session_id:
             session_id = tip
 
@@ -8198,15 +8421,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return {str(row["source"]): int(row["count"] or 0) for row in rows}
 
-    def message_count(self, session_id: str = None) -> int:
-        """Count messages, optionally for a specific session."""
+    def message_count(
+        self, session_id: str = None, include_inactive: bool = True
+    ) -> int:
+        """Count messages, optionally excluding soft-deleted rows.
+
+        The historical default includes inactive rows for compatibility with
+        audit/maintenance callers. Pagination paired with :meth:`get_messages`
+        should pass ``include_inactive=False`` so its total uses the same
+        predicate as the returned page.
+        """
         with self._lock:
             if session_id:
                 cursor = self._conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+                    "SELECT COUNT(*) FROM messages WHERE session_id = ?"
+                    + ("" if include_inactive else " AND active = 1"),
+                    (session_id,),
                 )
             else:
-                cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
+                cursor = self._conn.execute(
+                    "SELECT COUNT(*) FROM messages"
+                    + ("" if include_inactive else " WHERE active = 1")
+                )
             return cursor.fetchone()[0]
 
     def has_platform_message_id(
@@ -8231,72 +8467,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Export and cleanup
     # =========================================================================
 
-    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
-        if session.get("source") == "tool":
-            return True
-        raw = session.get("model_config")
-        if not raw:
-            return False
-        try:
-            cfg = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError):
-            return False
-        return isinstance(cfg, dict) and (
-            cfg.get("_branched_from") is not None
-            or cfg.get("_delegate_from") is not None
-        )
 
-    def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
-        parent_id = child.get("parent_session_id")
-        if not parent_id or self._is_explicit_fork_child_row(child):
-            return False
-        parent = self.get_session(parent_id)
-        return bool(parent and parent.get("end_reason") == "compression")
 
     def get_compression_lineage(self, session_id: str) -> List[str]:
-        """Return compression ancestors through tip in chronological order."""
-        session = self.get_session(session_id)
-        if not session or self._is_explicit_fork_child_row(session):
-            return [session_id] if session else []
+        """Return compression ancestors through tip in chronological order.
 
-        root = session
-        ancestors = {root["id"]}
-        while self._is_compression_child_row(root):
-            parent = self.get_session(root["parent_session_id"])
-            if not parent or parent["id"] in ancestors:
-                break
-            root = parent
-            ancestors.add(root["id"])
-
-        lineage = [root["id"]]
-        seen = {root["id"]}
-        current = root
-        while current.get("end_reason") == "compression":
-            with self._lock:
-                rows = self._conn.execute(
-                    """
-                    SELECT * FROM sessions
-                    WHERE parent_session_id = ?
-                    ORDER BY started_at ASC
-                    """,
-                    (current["id"],),
-                ).fetchall()
-            next_child = None
-            for row in rows:
-                candidate = dict(row)
-                if self._is_compression_child_row(candidate):
-                    next_child = candidate
-                    break
-            if not next_child or next_child["id"] in seen:
-                break
-            lineage.append(next_child["id"])
-            seen.add(next_child["id"])
-            current = next_child
-            if current["id"] == session_id:
-                # Continue to include later compression tips only when the
-                # requested session itself was compacted.
-                continue
-        return lineage if session_id in lineage else [session_id]
+        Keep this long-standing list-returning contract for export callers while
+        sharing the same continuation selection as resume and Desktop metadata.
+        """
+        metadata = self.get_compression_lineage_metadata(session_id)
+        return [segment["id"] for segment in metadata["segments"]]
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
@@ -9606,6 +9786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND COALESCE(m.display_kind, '') != 'hidden'
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
@@ -9636,6 +9817,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                           AND COALESCE(m.display_kind, '') != 'hidden'
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,

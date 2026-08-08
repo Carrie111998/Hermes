@@ -343,6 +343,11 @@ function transcriptContent(displayKind: SessionMessage['display_kind'], content:
   return displayKind === 'hidden' ? null : content
 }
 
+/** Internal compressor checkpoint: useful as model context, never as a user bubble. */
+export function isCompactionHandoffText(text: unknown): boolean {
+  return typeof text === 'string' && text.trimStart().startsWith('[CONTEXT COMPACTION')
+}
+
 // A remote backend older than this app serves display_metadata as raw JSON text,
 // and `in` throws on a primitive — which used to fail the whole session resume.
 function parseDisplayMetadata(metadata: SessionMessage['display_metadata']): null | Record<string, unknown> {

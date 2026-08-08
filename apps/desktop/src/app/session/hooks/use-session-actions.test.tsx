@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
+import { getCompressionSegmentMessages, getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
@@ -22,6 +22,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentCwd,
@@ -45,6 +46,7 @@ import { useSessionActions } from './use-session-actions'
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   deleteSession: vi.fn(),
+  getCompressionSegmentMessages: vi.fn(),
   getSession: vi.fn(),
   getSessionMessages: vi.fn(),
   listAllProfileSessions: vi.fn(),
@@ -1018,7 +1020,13 @@ function BranchHarness({
   activeSessionId?: string | null
   navigate?: ReturnType<typeof vi.fn>
   onCurrentReady?: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
-  onReady: (branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>) => void
+  onReady: (
+    branchStoredSession: (
+      storedSessionId: string,
+      sessionProfile?: string | null,
+      lineageSessionId?: string
+    ) => Promise<boolean>
+  ) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -1246,6 +1254,113 @@ describe('branchStoredSession desktop source tagging', () => {
 
     expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
     expect(createParams).toMatchObject({ profile: 'work' })
+  })
+
+  it('branches an exact historical root with exact provenance and a persisted hidden checkpoint', async () => {
+    setSessions([
+      storedSession({
+        _lineage_root_id: 'root',
+        id: 'tip',
+        message_count: 1,
+        profile: 'work'
+      })
+    ])
+    vi.mocked(getCompressionSegmentMessages).mockResolvedValue({
+      messages: [
+        {
+          content: '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns.',
+          display_kind: 'hidden',
+          id: 1,
+          role: 'user',
+          timestamp: 1
+        },
+        { content: 'historical answer', id: 2, role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'root'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession:
+      | ((storedSessionId: string, sessionProfile?: string | null, lineageSessionId?: string) => Promise<boolean>)
+      | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('root', 'work', 'tip')).resolves.toBe(true)
+
+    expect(getCompressionSegmentMessages).toHaveBeenCalledWith('tip', 'root', 'work')
+    expect(createParams).toMatchObject({
+      parent_session_id: 'root',
+      profile: 'work',
+      messages: [
+        {
+          content: '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns.',
+          display_kind: 'hidden',
+          role: 'user'
+        },
+        { content: 'historical answer', role: 'assistant' }
+      ]
+    })
+    expect($sessions.get().find(session => session.id === 'branch-stored')?.preview).toBe('historical answer')
+  })
+
+  it('inherits workspace metadata from the lineage owner when branching an exact middle segment', async () => {
+    setSessions([
+      storedSession({
+        _lineage_root_id: 'root',
+        cwd: '/repo/worktree',
+        id: 'tip',
+        last_active: 42,
+        message_count: 1,
+        profile: 'work'
+      })
+    ])
+    vi.mocked(getCompressionSegmentMessages).mockResolvedValue({
+      messages: [{ content: 'middle prompt', id: 9, role: 'user', timestamp: 9 }],
+      session_id: 'middle'
+    } as never)
+
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    let branchStoredSession:
+      | ((storedSessionId: string, sessionProfile?: string | null, lineageSessionId?: string) => Promise<boolean>)
+      | null = null
+
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+    await expect(branchStoredSession!('middle', 'work', 'tip')).resolves.toBe(true)
+
+    expect(createParams).toMatchObject({
+      cwd: '/repo/worktree',
+      parent_session_id: 'middle',
+      profile: 'work'
+    })
+    expect($sessions.get().find(session => session.id === 'branch-stored')).toMatchObject({
+      last_active: 42,
+      parent_session_id: 'middle'
+    })
   })
 
   it('omits profile for a profile-less parent so single-profile users are unchanged', async () => {
