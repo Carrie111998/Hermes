@@ -296,14 +296,13 @@ def _persist_monitor_state(job: dict, new_hash: str, output: str) -> Optional[bo
                 "last_output_hash": new_hash,
                 "last_changed_at": _hermes_now().isoformat(),
             },
+            monitor_output=output,
         )
         if not persisted:
             logger.info(
                 "Monitor: discarded stale state for %r because its source changed",
                 job_id,
             )
-        else:
-            _write_last_output(job_id, output)
         return persisted
     except Exception as exc:
         logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)

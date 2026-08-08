@@ -1943,6 +1943,7 @@ def update_monitor_state_if_source_matches(
     expected_monitor_url: Optional[str],
     expected_monitor_source_generation: int,
     monitor_state: Dict[str, Any],
+    monitor_output: str,
 ) -> bool:
     """Persist monitor state only while the observed source is still current.
 
@@ -1974,6 +1975,13 @@ def update_monitor_state_if_source_matches(
             job["monitor_state"] = dict(monitor_state)
             jobs[i] = job
             save_jobs(jobs)
+            # Keep the sidecar paired with the state we just committed. The
+            # jobs lock must remain held until this write finishes; otherwise
+            # a stale generation can resume after a source update and
+            # overwrite the current generation's snapshot.
+            from cron.monitor import _write_last_output
+
+            _write_last_output(job_id, monitor_output)
             return True
     return False
 

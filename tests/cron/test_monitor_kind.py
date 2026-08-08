@@ -247,6 +247,36 @@ def test_stale_monitor_run_cannot_commit_after_source_changes_away_and_back(
     assert not _snapshot_path(old_job["id"]).exists()
 
 
+def test_monitor_snapshot_write_stays_inside_generation_commit(
+    hermes_env, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.monitor as monitor
+
+    old_job = jobs.create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+    observed = {}
+
+    def record_write(job_id, output):
+        observed["job_id"] = job_id
+        observed["output"] = output
+        observed["lock_depth"] = getattr(jobs._jobs_lock_state, "depth", 0)
+
+    monkeypatch.setattr(monitor, "_write_last_output", record_write)
+
+    assert monitor._persist_monitor_state(
+        old_job, "current-hash", "current-output"
+    ) is True
+    assert observed == {
+        "job_id": old_job["id"],
+        "output": "current-output",
+        "lock_depth": 1,
+    }
+
+
 def test_source_edit_during_check_suppresses_obsolete_agent_run(
     hermes_env, monkeypatch
 ):
