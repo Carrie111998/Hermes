@@ -1952,18 +1952,31 @@ def _trim_summary_with_footer(
 
     spill_path = _spill_summary_to_file(task_index, summary)
 
+    # Translate the host path to the sandbox-visible path on docker/modal/ssh
+    # backends — the file lives on the host, but the agent doing the read_file
+    # follow-up only sees the container mount, so the hint MUST show the
+    # mounted path or the parent re-dispatches (#81984). Local / singularity
+    # backends return the host path unchanged.
+    try:
+        from tools.credential_files import to_agent_visible_cache_path
+    except Exception:
+        to_agent_visible_cache_path = None  # type: ignore[assignment]
+    display_path = (
+        to_agent_visible_cache_path(spill_path) if (to_agent_visible_cache_path and spill_path) else spill_path
+    )
+
     footer_lines = [
         "",
         "─" * 8 + " [SUMMARY TRUNCATED] " + "─" * 8,
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
         f"of {original_len:,} total — trimmed to protect the parent's context window.",
     ]
-    if spill_path:
+    if display_path:
         # read_file is 1-indexed; +2 moves past the last head line shown.
         middle_start_line = head.count("\n") + 2
-        footer_lines.append(f"Full subagent output saved to: {spill_path}")
+        footer_lines.append(f"Full subagent output saved to: {display_path}")
         footer_lines.append(
-            f'To read the omitted middle: read_file path="{spill_path}" '
+            f'To read the omitted middle: read_file path="{display_path}" '
             f"offset={middle_start_line} limit=200  (the file is the complete "
             f"summary; raise/lower offset to page through it)."
         )
@@ -3561,7 +3574,19 @@ def delegate_task(
             "total_duration_seconds": total_duration,
         }
         if live_paths:
-            combined["live_transcripts"] = list(live_paths)
+            # Translate host paths to the sandbox-visible paths so the parent's
+            # subsequent read_file follow-up lands on the mounted file rather
+            # than the host path the agent cannot see (issue #81984). Local /
+            # singularity backends return the host path unchanged.
+            try:
+                from tools.credential_files import to_agent_visible_cache_path
+            except Exception:
+                to_agent_visible_cache_path = None  # type: ignore[assignment]
+            if to_agent_visible_cache_path is not None:
+                visible_paths = [to_agent_visible_cache_path(p) for p in live_paths]
+            else:
+                visible_paths = list(live_paths)
+            combined["live_transcripts"] = visible_paths
         return combined
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -3772,7 +3797,19 @@ def delegate_task(
                 "note": note,
             }
             if live_paths:
-                payload["live_transcripts"] = list(live_paths)
+                # Translate host paths to the sandbox-visible paths on
+                # docker/modal/ssh backends so the parent's read_file follow-up
+                # lands on the mounted file (issue #81984). Local / singularity
+                # backends return the host path unchanged.
+                try:
+                    from tools.credential_files import to_agent_visible_cache_path
+                except Exception:
+                    to_agent_visible_cache_path = None  # type: ignore[assignment]
+                if to_agent_visible_cache_path is not None:
+                    visible_paths = [to_agent_visible_cache_path(p) for p in live_paths]
+                else:
+                    visible_paths = list(live_paths)
+                payload["live_transcripts"] = visible_paths
                 payload["live_transcripts_hint"] = (
                     "Each subagent streams a human-readable transcript of its "
                     "operations to the file listed above (append-only, one per "

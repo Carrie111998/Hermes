@@ -546,21 +546,34 @@ def _truncate_with_footer(
     total = len(content)
     stored_path = _store_full_text(url, content)
 
+    # Translate the host path to the sandbox-visible path on docker/modal/ssh
+    # backends — the file lives on the host, but the agent doing the read_file
+    # follow-up only sees the container mount, so the hint MUST show the
+    # mounted path or the agent re-extracts the page (#81984). Local /
+    # singularity backends return the host path unchanged.
+    try:
+        from tools.credential_files import to_agent_visible_cache_path
+    except Exception:
+        to_agent_visible_cache_path = None  # type: ignore[assignment]
+    display_path = (
+        to_agent_visible_cache_path(stored_path) if (to_agent_visible_cache_path and stored_path) else stored_path
+    )
+
     footer_lines = [
         "",
         "─" * 8 + " [TRUNCATED] " + "─" * 8,
         f"Showing {len(head):,} chars (head) + {len(tail):,} chars (tail) "
         f"of {total:,} total clean characters.",
     ]
-    if stored_path:
+    if display_path:
         # The omitted middle begins right after the head we're showing. Give
         # the model a concrete starting line (head line count + 1) so its first
         # read_file lands in the gap instead of guessing <line>. read_file is
         # 1-indexed; +1 moves past the last head line we already showed.
         middle_start_line = head.count("\n") + 2
-        footer_lines.append(f"Full text saved to: {stored_path}")
+        footer_lines.append(f"Full text saved to: {display_path}")
         footer_lines.append(
-            f'To read the omitted middle: read_file path="{stored_path}" '
+            f'To read the omitted middle: read_file path="{display_path}" '
             f"offset={middle_start_line} limit=200  (the file is the complete page; "
             f"raise/lower offset to page through it)."
         )
