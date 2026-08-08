@@ -18501,17 +18501,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                _footer_attached = False
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        _footer_attached = await self._deliver_media_from_response(
                             response, event, _media_adapter,
+                            footer_line=_footer_line,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
-                # Send it now as a small trailing message so Telegram/Discord/etc.
-                # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                # When the turn delivered photos, the footer rode the last
+                # photo's caption above (#74547); otherwise send it as a small
+                # trailing message so Telegram/Discord/etc. still surface the
+                # runtime metadata on the final reply.
+                if _footer_line and not _footer_attached:
                     try:
                         _foot_adapter = self._adapter_for_source(source)
                         if _foot_adapter:
@@ -19697,8 +19701,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
+        footer_line: str = "",
+    ) -> bool:
         """Extract explicit MEDIA: tags from a response and deliver them.
+
+        Returns True when ``footer_line`` was delivered as the caption of a
+        successfully sent photo batch, so the caller can skip its trailing
+        footer message (#74547).
 
         Called after streaming has already sent the text to the user, so the
         text itself is already delivered — this only handles file attachments
@@ -19763,14 +19772,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     non_image_media.append((media_path, is_voice))
 
+            footer_attached = False
+            # send_multiple_images returns None across adapters, so caption
+            # delivery can't be confirmed from its result. Gate on the
+            # adapter's declared caption support instead: Signal's batch RPC
+            # drops per-image alt text, so the footer must keep its trailing
+            # message there.
+            _adapter_captions = bool(
+                getattr(adapter, "supports_batch_image_captions", False)
+            )
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    if footer_line and _adapter_captions:
+                        # Ride the runtime footer on the last photo's caption
+                        # instead of a separate trailing message (#74547).
+                        # Platform senders already clamp captions to their
+                        # limits (Telegram: 1024 chars).
+                        images[-1] = (images[-1][0], footer_line)
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    if footer_line and _adapter_captions:
+                        footer_attached = True
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
@@ -19798,8 +19824,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
+            return footer_attached
+
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            return False
 
 
 
