@@ -247,6 +247,115 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     assert isinstance(result.get("error"), str) and result["error"].strip() != ""
 
 
+def test_failed_assistant_persist_after_live_stream_continues_turn():
+    """Live continuation must not die on a session-persist failure (#82001).
+
+    When the assistant content has ALREADY been streamed to the user via the
+    live stream callback, killing the turn on a session-persist failure
+    surfaces a misleading "full disk" / persistence toast while the user has
+    already read the response. The streamed text is gone from the canonical
+    DB but lives in the user's view — the worst of both worlds. The fix is
+    to continue the turn (run tools, retry on the next persist) instead of
+    surfacing ``session_persistence_failed:disk`` and marking ``failed=True``.
+    """
+    import sqlite3
+
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-continue")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="Inspecting the repository now.",
+            finish_reason="tool_calls",
+            tool_calls=[tool_call],
+        ),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+    # Live continuation marker: the conversation loop clears
+    # ``_current_streamed_assistant_text`` at the start of every API call
+    # (via ``_reset_stream_delivery_tracking``). Use a side effect on the
+    # incremental-persist call to re-stamp it before the failure surfaces,
+    # so the live-continuation escape path (#82001) sees the streamed text.
+    _streamed_text = "Inspecting the repository now."
+
+    def _persist_fails_with_live_continuation(messages, conversation_history=None):
+        agent._current_streamed_assistant_text = _streamed_text
+        raise sqlite3.OperationalError("database or disk is full")
+
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=_persist_fails_with_live_continuation
+    )
+    agent.interim_assistant_callback = MagicMock()
+    agent._execute_tool_calls = MagicMock(
+        side_effect=lambda *a, **kw: setattr(
+            agent, "_incremental_persistence_failed", False
+        )
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    # The turn must NOT have been marked failed — the live content is in the
+    # user's view and the agent should continue normally.
+    assert result.get("failed") is not True, (
+        "live-continuation turn died on persist failure; should continue "
+        "instead of surfacing a misleading disk/full error (#82001)"
+    )
+    assert result.get("turn_exit_reason") != "session_persistence_failed"
+    # The machine-readable failure_reason must NOT carry the misleading
+    # 'session_persistence_failed:disk' stamp (that triggers the desktop
+    # toast).
+    assert "session_persistence_failed" not in str(result.get("failure_reason") or "")
+    # Tools must still execute — the canonical DB gap will be repaired by
+    # the next persist (finalizer or the user's next message).
+    assert agent._execute_tool_calls.called, (
+        "live-continuation escape stopped tool execution; should let it run"
+    )
+
+
+def test_failed_assistant_persist_without_live_stream_still_blocks_side_effects():
+    """Without live streamed content, the original blocking behaviour holds.
+
+    Pins the pre-existing safety contract for the live-continuation escape:
+    if NOTHING has been streamed to the user, killing the turn on a
+    persist failure remains correct (running side-effecting tools from
+    state that exists only in-process would lose the user's turn on
+    resume). The new escape path (#82001) is gated on streamed text.
+    """
+    import sqlite3
+
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-not-run")
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=sqlite3.OperationalError("database or disk is full")
+    )
+    # Crucially, NO live streamed text — the user's view is empty.
+    agent._current_streamed_assistant_text = ""
+    agent.interim_assistant_callback = MagicMock()
+    agent._execute_tool_calls = MagicMock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("inspect the repository")
+
+    agent.interim_assistant_callback.assert_not_called()
+    agent._execute_tool_calls.assert_not_called()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "session_persistence_failed"
+    assert result["failure_reason"] == "session_persistence_failed:disk"
+
+
 def test_locked_flush_exception_surfaces_locked_cause_in_result_contract():
     """SQLite write-lock contention must surface as a 'locked' cause.
 

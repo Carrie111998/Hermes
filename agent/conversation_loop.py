@@ -6639,10 +6639,44 @@ def run_conversation(
                     # nothing was recorded, the cause is genuinely unknown.
                     if getattr(agent, "_last_persistence_error_cause", None) is None:
                         agent._last_persistence_error_cause = "unknown"
-                    _turn_exit_reason = "session_persistence_failed"
-                    final_response = ""
-                    failed = True
-                    break
+                    # Live-continuation escape (#82001): if the assistant text
+                    # was already streamed to the user via the live stream
+                    # callback, killing the turn surfaces a misleading "full
+                    # disk" / persistence toast while the user has already
+                    # read the response. The streamed content survives only in
+                    # the user's view; the canonical DB does not. Continue the
+                    # turn — let tools run, let the post-tool compress/finalize
+                    # path retry the persist — instead of stopping here. The
+                    # next per-message persist will repair the gap.
+                    _streamed_already = (
+                        agent._has_content_after_think_block(
+                            getattr(agent, "_current_streamed_assistant_text", "") or ""
+                        )
+                    )
+                    if _streamed_already:
+                        logger.warning(
+                            "Incremental tool-call persistence failed AFTER live "
+                            "streamed content (session=%s cause=%s) — continuing "
+                            "turn instead of surfacing a misleading failure "
+                            "(#82001). Finalizer will retry the persist.",
+                            agent.session_id or "none",
+                            agent._last_persistence_error_cause,
+                        )
+                        agent._buffer_status(
+                            "⚠️ Session storage temporarily unavailable — "
+                            "this turn will retry on its next persist "
+                            "(content already shown to you)."
+                        )
+                        agent._incremental_persistence_failed = True
+                        # Fall through to the normal interim-emit + tool
+                        # execution path below; do NOT set failed=True or
+                        # break. The turn finalizer and the next-turn persist
+                        # will heal the gap.
+                    else:
+                        _turn_exit_reason = "session_persistence_failed"
+                        final_response = ""
+                        failed = True
+                        break
 
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
