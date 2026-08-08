@@ -128,6 +128,10 @@ def _(rid, params: dict) -> dict:
     # or fallback moved the session transport to stdio.
     if (t := current_transport()) is not None:
         session["transport"] = t
+    # Refresh before the busy/claim loop, not between its idle observation and
+    # the final claim. The helper rechecks ``running`` after its DB read, so a
+    # turn that wins while storage is in flight keeps its working history.
+    _refresh_live_model_history(session)
     while True:
         busy_transport = None
         with session["history_lock"]:
@@ -148,13 +152,6 @@ def _(rid, params: dict) -> dict:
         # The old turn finished between the two lock acquisitions. Retry the
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
-
-    # A warm desktop/TUI record can outlive writes from another gateway
-    # process. Refresh before claiming the turn so both the inline snapshot and
-    # the compute-host frame receive the authoritative durable model rows while
-    # retaining any newer live-only tail. Best-effort: storage failures leave
-    # the current in-memory history untouched.
-    _refresh_live_model_history(session)
 
     with session["history_lock"]:
         # A watch session's run lives in the PARENT turn, so its own running

@@ -144,3 +144,82 @@ def test_refresh_failure_leaves_live_history_untouched(monkeypatch):
     assert changed is False
     assert session["history"] == live
     assert session["history_version"] == 0
+
+
+def test_refresh_does_not_mutate_history_when_turn_starts_during_db_read(monkeypatch):
+    initial = [_msg("user", "initial", 1), _msg("assistant", "reply", 2)]
+    external = [_msg("user", "external", 3), _msg("assistant", "external reply", 4)]
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class _BlockingDB(_HistoryDB):
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            read_started.set()
+            assert release_read.wait(5)
+            return super().get_messages_as_conversation(session_id, **kwargs)
+
+    session = _session(initial)
+    monkeypatch.setattr(server, "_get_db", lambda: _BlockingDB(initial + external))
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(server._refresh_live_model_history(session))
+    )
+
+    worker.start()
+    assert read_started.wait(5)
+    with session["history_lock"]:
+        session["running"] = True
+    release_read.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert result == [False]
+    assert session["history"] == initial
+    assert session["history_version"] == 0
+
+
+def test_queued_inline_dispatch_refreshes_external_durable_history(monkeypatch):
+    initial = [_msg("user", "initial", 1), _msg("assistant", "reply", 2)]
+    external = [_msg("user", "external", 3), _msg("assistant", "external reply", 4)]
+    db = _HistoryDB(initial + external)
+    session = _session(initial)
+    session["queued_prompt"] = {"text": "queued", "transport": None}
+    captured = []
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, live, _text, **_kwargs: captured.append(
+            list(live["history"])
+        ),
+    )
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+
+    assert captured == [initial + external]
+    assert len(db.reads) == 1
+
+
+def test_queued_compute_host_frame_refreshes_external_durable_history(monkeypatch):
+    initial = [_msg("user", "initial", 1), _msg("assistant", "reply", 2)]
+    external = [_msg("user", "external", 3), _msg("assistant", "external reply", 4)]
+    db = _HistoryDB(initial + external)
+    session = _session(initial)
+    session["queued_prompt"] = {"text": "queued", "transport": None}
+    captured = []
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda _rid, _sid, live, _text, **_kwargs: (
+            captured.append(list(live["history"]))
+            or {"result": {"status": "streaming"}}
+        ),
+    )
+
+    assert server._drain_queued_prompt("queued", "sid", session) is True
+
+    assert captured == [initial + external]
+    assert len(db.reads) == 1

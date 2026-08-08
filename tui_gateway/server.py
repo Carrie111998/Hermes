@@ -7623,6 +7623,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     lower-priority follow-ups this cycle — the user's message wins). Mirrors the
     claim-under-lock pattern used by the goal-continuation re-fire.
     """
+    # Busy prompt.submit returns before the ordinary idle-turn refresh. Refresh
+    # here as the queued sibling becomes runnable so both inline and compute-host
+    # dispatch see cross-process appends. Re-read the queue under the claim lock:
+    # another submit can win the session while the DB read is in flight.
+    with session["history_lock"]:
+        if not session.get("queued_prompt") or session.get("running"):
+            return False
+    _refresh_live_model_history(session)
     with session["history_lock"]:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
@@ -8155,6 +8163,12 @@ def _refresh_live_model_history(session: dict) -> bool:
     model projection here so inline and compute-host turns see the same current
     segment. DB failures are fail-open and leave the live record untouched.
     """
+    # Never rewrite the working list underneath an active turn. The caller may
+    # observe an idle record and then lose the claim while this SQLite read is
+    # in flight, so guard both sides of the read.
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
     session_key = str(session.get("session_key") or "")
     if not session_key:
         return False
@@ -8173,6 +8187,8 @@ def _refresh_live_model_history(session: dict) -> bool:
         return False
 
     with session["history_lock"]:
+        if session.get("running"):
+            return False
         live = list(session.get("history") or [])
         refreshed = _reconcile_model_with_live(persisted, live)
         if refreshed == live:
