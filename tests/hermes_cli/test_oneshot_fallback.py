@@ -81,7 +81,10 @@ class TestResolveRuntimeWithFallback:
             )
 
         assert err is None
-        assert runtime is fallback_runtime
+        # The fallback entry's ``model`` is now stamped onto a copy of
+        # ``fallback_runtime`` so the helper always returns a fresh dict;
+        # compare by content rather than identity.
+        assert runtime == {**fallback_runtime, "model": "haiku"}
         # First call: primary; second call: first fallback entry.
         assert call_log == ["openai", "anthropic"]
 
@@ -176,5 +179,38 @@ class TestResolveRuntimeWithFallback:
             )
 
         assert err is None
-        assert runtime is openai_runtime
+        assert runtime == {**openai_runtime, "model": "gpt-4o-mini"}
         assert state["calls"] == 3
+
+    def test_fallback_model_is_injected_into_runtime(self, cfg_with_fallback):
+        """The fallback entry's ``model`` must be carried into the returned
+        runtime dict so AIAgent constructs against the fallback's model
+        rather than the originally-requested primary model (#81209)."""
+        primary_err = RuntimeError("primary quota")
+        fallback_runtime = {"provider": "anthropic", "api_key": "anth-key"}
+
+        def fake_resolve(*, requested, **kwargs):
+            if requested == "openai":
+                raise primary_err
+            return fallback_runtime
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=fake_resolve,
+        ), patch(
+            "hermes_cli.fallback_config.resolve_entry_api_key",
+            return_value="key",
+        ):
+            runtime, err = oneshot._resolve_runtime_with_fallback(
+                effective_provider="openai",
+                effective_model="gpt-4o",
+                explicit_base_url=None,
+                cfg=cfg_with_fallback,
+            )
+
+        assert err is None
+        # ``cfg_with_fallback`` declares the first fallback entry with
+        # model ``haiku``; that key must appear on the returned runtime so
+        # AIAgent constructs against the fallback's model instead of the
+        # originally-requested primary model (#81209).
+        assert runtime.get("model") == "haiku"

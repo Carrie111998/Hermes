@@ -372,6 +372,7 @@ def _resolve_runtime_with_fallback(
         try:
             runtime = resolve_runtime_provider(
                 requested=entry.get("provider"),
+                target_model=entry.get("model") or None,
                 explicit_base_url=entry.get("base_url"),
                 explicit_api_key=resolve_entry_api_key(entry),
             )
@@ -383,6 +384,9 @@ def _resolve_runtime_with_fallback(
             # Annotate with the fallback entry's model so AIAgent constructs
             # against the fallback's model, not the originally-requested
             # one — same as the gateway does at run.py:2540.
+            fallback_model = entry.get("model")
+            if fallback_model:
+                runtime = {**runtime, "model": fallback_model}
             return runtime, None
         except Exception as fb_exc:
             logging.debug(
@@ -526,13 +530,18 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        # ``runtime.get("model")`` is set by ``_resolve_runtime_with_fallback``
+        # when the fallback chain supplied a model that differs from the
+        # primary one; honour it so AIAgent constructs against the
+        # fallback's model instead of the originally-requested one.
+        agent_model = runtime.get("model") or effective_model
         agent = AIAgent(
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
-            model=effective_model,
+            model=agent_model,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
