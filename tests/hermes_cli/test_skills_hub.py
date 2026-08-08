@@ -432,3 +432,128 @@ def test_do_browse_keeps_fallback_order_when_unprotected_governance_ranking_fail
     rendered = sink.getvalue()
     assert "No skills found in the Skills Hub." not in rendered
     assert rendered.index("alpha") < rendered.index("zulu")
+
+
+def test_browse_skills_fail_closes_when_protected_governance_ranking_fails(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.skills_hub import browse_skills
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _write_governance_config(home, task_class="medical", protected=["medical"])
+
+    result = type(
+        "R",
+        (),
+        {
+            "name": "current-skill",
+            "description": "Alpha",
+            "source": "community",
+            "identifier": "repo/current-skill",
+            "trust_level": "community",
+            "extra": {},
+        },
+    )()
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "tools.skills_hub.parallel_search_sources",
+        lambda *_a, **_k: ([result], {"community": 1}, []),
+    )
+    monkeypatch.setattr(
+        "agent.skill_governance.rank_skill_search_results",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+    )
+
+    payload = browse_skills()
+
+    assert payload == {"items": [], "page": 1, "total_pages": 1, "total": 0}
+
+
+def test_browse_skills_fail_closes_when_config_is_unreadable(monkeypatch, tmp_path):
+    from hermes_cli.skills_hub import browse_skills
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+
+    result = type(
+        "R",
+        (),
+        {
+            "name": "current-skill",
+            "description": "Alpha",
+            "source": "community",
+            "identifier": "repo/current-skill",
+            "trust_level": "community",
+            "extra": {},
+        },
+    )()
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "tools.skills_hub.parallel_search_sources",
+        lambda *_a, **_k: ([result], {"community": 1}, []),
+    )
+    monkeypatch.setattr(
+        "agent.skill_governance.rank_skill_search_results",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+    )
+
+    payload = browse_skills()
+
+    assert payload == {"items": [], "page": 1, "total_pages": 1, "total": 0}
+
+
+def test_browse_skills_keeps_fallback_order_when_unprotected_governance_ranking_fails(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.skills_hub import browse_skills
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _write_governance_config(home, task_class="general", protected=["medical"])
+
+    trusted = type(
+        "R",
+        (),
+        {
+            "name": "alpha",
+            "description": "Trusted",
+            "source": "community",
+            "identifier": "repo/alpha",
+            "trust_level": "trusted",
+            "extra": {},
+        },
+    )()
+    community = type(
+        "R",
+        (),
+        {
+            "name": "zulu",
+            "description": "Community",
+            "source": "community",
+            "identifier": "repo/zulu",
+            "trust_level": "community",
+            "extra": {},
+        },
+    )()
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "tools.skills_hub.parallel_search_sources",
+        lambda *_a, **_k: ([community, trusted], {"community": 2}, []),
+    )
+    monkeypatch.setattr(
+        "agent.skill_governance.rank_skill_search_results",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+    )
+
+    payload = browse_skills()
+
+    assert [item["name"] for item in payload["items"]] == ["alpha", "zulu"]

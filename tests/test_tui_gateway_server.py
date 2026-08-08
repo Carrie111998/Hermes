@@ -8361,6 +8361,45 @@ skills:
     assert "/tooltrust" not in resp["result"]["skills"]
 
 
+def test_skills_manage_browse_fail_closes_when_config_is_unreadable(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = types.SimpleNamespace(
+        name="current-skill",
+        description="Alpha",
+        source="community",
+        identifier="repo/current-skill",
+        trust_level="community",
+        extra={},
+    )
+
+    monkeypatch.setattr("tools.skills_hub.GitHubAuth", lambda: object())
+    monkeypatch.setattr("tools.skills_hub.create_source_router", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        "tools.skills_hub.parallel_search_sources",
+        lambda *_a, **_k: ([result], {"community": 1}, []),
+    )
+    monkeypatch.setattr(
+        "agent.skill_governance.rank_skill_search_results",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "skills.manage",
+            "params": {"action": "browse", "page": 1, "page_size": 20},
+        }
+    )
+
+    assert resp["result"] == {"items": [], "page": 1, "total_pages": 1, "total": 0}
+
+
 def test_session_status_reads_live_gateway_agent(monkeypatch):
     agent = types.SimpleNamespace(
         model="live-model",
