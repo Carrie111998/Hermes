@@ -14,7 +14,7 @@ import type {
   SessionUndoResponse,
   SystemBatteryResponse
 } from '../../../gatewayTypes.js'
-import { writeClipboardText } from '../../../lib/clipboard.js'
+import { normalizeClipboardText, writeClipboardText } from '../../../lib/clipboard.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
 import {
   configureDetectedTerminalKeybindings,
@@ -407,15 +407,20 @@ export const coreCommands: SlashCommand[] = [
         return sys('nothing to copy — start a conversation first')
       }
 
+      const clipboardText = normalizeClipboardText(target.text)
+      if (!clipboardText) {
+        return sys('nothing textual to copy')
+      }
+
       const shouldUseTerminalClipboard = isRemoteShellSession(process.env)
 
       if (shouldUseTerminalClipboard) {
-        writeOsc52Clipboard(target.text)
+        writeOsc52Clipboard(clipboardText)
 
         return sys('sent OSC52 copy sequence (terminal support required)')
       }
 
-      void writeClipboardText(target.text)
+      void writeClipboardText(clipboardText)
         .then(nativeOk => {
           if (ctx.stale()) {
             return
@@ -424,7 +429,7 @@ export const coreCommands: SlashCommand[] = [
           if (nativeOk) {
             sys('copied to clipboard')
           } else {
-            writeOsc52Clipboard(target.text)
+            writeOsc52Clipboard(clipboardText)
             sys('sent OSC52 copy sequence (terminal support required)')
           }
         })

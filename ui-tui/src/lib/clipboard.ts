@@ -142,6 +142,27 @@ function writeClipboardCommands(platform: NodeJS.Platform, env: NodeJS.ProcessEn
  * Returns true if at least one backend succeeded, false otherwise
  * (callers should fall back to OSC52 on false).
  */
+function textFromUnknown(value: unknown, depth = 0): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined || depth > 4) return "";
+  if (Array.isArray(value)) {
+    return value.map((item) => textFromUnknown(item, depth + 1)).filter(Boolean).join("\n");
+  }
+  if (typeof value !== "object") return "";
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["text", "content", "value", "message"]) {
+    const text = textFromUnknown(record[key], depth + 1);
+    if (text) return text;
+  }
+  return "";
+}
+
+/** Extract only user-visible text before sending it to OSC52/system clipboard. */
+export function normalizeClipboardText(value: unknown): string {
+  return textFromUnknown(value);
+}
+
 export async function writeClipboardText(
   text: string,
   platform: NodeJS.Platform = process.platform,

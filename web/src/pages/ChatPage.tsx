@@ -36,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { shouldScrollToBottomOnChatActivation } from "@/lib/chat-navigation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
@@ -164,6 +165,7 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
+  const prevActiveRef = useRef(isActive);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   // Exposed to the main metrics-sync effect so it can refit the terminal
@@ -333,6 +335,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
     [titleScope],
   );
+
+  useEffect(() => {
+    const wasActive = prevActiveRef.current;
+    prevActiveRef.current = isActive;
+    if (shouldScrollToBottomOnChatActivation(wasActive, isActive)) {
+      termRef.current?.scrollToBottom();
+    }
+  }, [isActive]);
 
   useEffect(() => {
     if (!isActive) {

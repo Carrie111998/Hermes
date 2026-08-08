@@ -19,6 +19,7 @@ import {
   Navigate,
   useLocation,
   useNavigate,
+  useSearchParams,
 } from "react-router";
 import {
   Activity,
@@ -104,6 +105,7 @@ import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { managementTabFromSearch } from "@/lib/chat-navigation";
 import { api } from "@/lib/api";
 import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
 
@@ -132,6 +134,60 @@ function UnknownRouteFallback({ pluginsLoading }: { pluginsLoading: boolean }) {
     return null;
   }
   return <Navigate to="/sessions" replace />;
+}
+
+function ManagePage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const activeTab = managementTabFromSearch(
+    searchParams.toString() ? `?${searchParams.toString()}` : "",
+  );
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto p-4 sm:p-6">
+      <div
+        aria-label="Manage"
+        className="flex w-fit items-center gap-1 rounded-lg border border-current/20 p-1"
+        role="tablist"
+      >
+        <Button
+          aria-selected={activeTab === "profiles"}
+          className={cn(
+            "px-3 py-1.5",
+            activeTab === "profiles" && "bg-current/10",
+          )}
+          ghost
+          onClick={() => setSearchParams({ tab: "profiles" })}
+          role="tab"
+          type="button"
+        >
+          Profiles
+        </Button>
+        <Button
+          aria-selected={activeTab === "settings"}
+          className={cn(
+            "px-3 py-1.5",
+            activeTab === "settings" && "bg-current/10",
+          )}
+          ghost
+          onClick={() => setSearchParams({ tab: "settings" })}
+          role="tab"
+          type="button"
+        >
+          Settings
+        </Button>
+      </div>
+
+      {activeTab === "profiles" ? <ProfilesPage /> : <ConfigPage />}
+    </div>
+  );
+}
+
+function ProfilesRedirect() {
+  return <Navigate replace to="/manage?tab=profiles" />;
+}
+
+function ConfigRedirect() {
+  return <Navigate replace to="/manage?tab=settings" />;
 }
 
 const CHAT_NAV_ITEM: NavItem = {
@@ -167,9 +223,10 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/channels": ChannelsPage,
   "/webhooks": WebhooksPage,
   "/system": SystemPage,
-  "/profiles": ProfilesPage,
+  "/manage": ManagePage,
+  "/profiles": ProfilesRedirect,
   "/profiles/new": ProfileBuilderPage,
-  "/config": ConfigPage,
+  "/config": ConfigRedirect,
   "/env": EnvPage,
   "/docs": DocsPage,
 };
@@ -210,8 +267,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/channels", label: "Channels", icon: Radio },
   { path: "/webhooks", label: "Webhooks", icon: Webhook },
   { path: "/pairing", label: "Pairing", icon: ShieldCheck },
-  { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
-  { path: "/config", labelKey: "config", label: "Config", icon: Settings },
+  { path: "/manage", labelKey: "manage", label: "Manage", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
   { path: "/system", label: "System", icon: Wrench },
   {
