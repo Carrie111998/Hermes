@@ -1,0 +1,48 @@
+# Optional systemd --user unit for running `hermes serve` (the headless
+# JSON-RPC/WebSocket backend the Hermes Desktop app connects to remotely)
+# as an always-on service, separate from hermes-gateway.service.
+#
+# Setup:
+#   1. Set auth credentials in ~/.hermes/.env (never in this unit file):
+#        HERMES_DASHBOARD_BASIC_AUTH_USERNAME=<username>
+#        HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=<scrypt hash>
+#          (compute with: python -c "from plugins.dashboard_auth.basic
+#           import hash_password; print(hash_password(YOUR_PASSWORD))")
+#        HERMES_DASHBOARD_BASIC_AUTH_SECRET=<stable random value>
+#          (e.g. `openssl rand -base64 32` — without this, sessions are
+#          invalidated on every service restart)
+#   2. Edit --host below to the address you want to bind (LAN IP or VPN
+#      interface IP — never 0.0.0.0 unless you understand the exposure).
+#   3. Install:
+#        mkdir -p ~/.config/systemd/user
+#        cp systemd/hermes-serve.service ~/.config/systemd/user/
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now hermes-serve.service
+#
+# See website/docs/user-guide/desktop.md for the full remote-connection
+# walkthrough (Remote URL, sign-in, troubleshooting).
+
+[Unit]
+Description=Hermes Agent Backend - Desktop App Remote Connection
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main serve --host <BIND_ADDRESS> --port 9119 --skip-build
+WorkingDirectory=%h/.hermes
+Environment="PATH=%h/.hermes/hermes-agent/venv/bin:%h/.hermes/hermes-agent/node_modules/.bin:%h/.hermes/node/bin:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=%h/.hermes/hermes-agent/venv"
+Environment="HERMES_HOME=%h/.hermes"
+EnvironmentFile=%h/.hermes/.env
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
