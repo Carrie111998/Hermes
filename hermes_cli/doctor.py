@@ -452,6 +452,122 @@ def _check_s6_supervision(issues: list[str]) -> None:
     )
 
 
+def _check_fork_upstream_drift(issues: list[str]) -> None:
+    """Report the fork/upstream picture: origin vs upstream URLs, ahead/behind
+    counts against both (via the same ``resolve_compare_ref`` rule the
+    startup banner and ``hermes update --check`` use — see update_cmd.py so
+    this never disagrees with either), the skip-upstream-prompt marker, and
+    the last update-check timestamp if available.
+
+    Local-only — no network fetch, matching every other doctor check in this
+    file. Reports whatever the local refs currently reflect (last updated by
+    a banner render, an explicit ``--check``, or a prior ``hermes update``)
+    and says so, rather than presenting possibly-stale numbers as live.
+    """
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        return  # not a git checkout (Docker image, etc.) — nothing to report
+
+    from hermes_cli.update_cmd import (
+        resolve_compare_ref,
+        _get_origin_url,
+        _has_upstream_remote,
+        _count_commits_between,
+        SKIP_UPSTREAM_PROMPT_FILE,
+    )
+
+    git_cmd = ["git", "-c", "windows.appendAtomically=false"] if sys.platform == "win32" else ["git"]
+
+    _section("Fork / Upstream Sync")
+
+    origin_url = _get_origin_url(git_cmd, PROJECT_ROOT)
+    if not origin_url:
+        check_info("No origin remote configured")
+        return
+    check_info(f"origin: {origin_url}")
+
+    has_upstream = _has_upstream_remote(git_cmd, PROJECT_ROOT)
+    if has_upstream:
+        upstream_url = subprocess.run(
+            git_cmd + ["remote", "get-url", "upstream"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        check_info(f"upstream: {upstream_url}")
+    else:
+        check_info("upstream: not configured")
+
+    branch = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=5,
+    ).stdout.strip() or "main"
+
+    compare_ref, remote_name = resolve_compare_ref(git_cmd, PROJECT_ROOT, branch)
+    check_info(
+        f"compare ref: {compare_ref} "
+        f"({'preferred upstream' if remote_name == 'upstream' else 'no upstream remote / non-default branch'})"
+    )
+
+    def _ref_exists(ref: str) -> bool:
+        return subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "--quiet", ref],
+            cwd=PROJECT_ROOT, capture_output=True, timeout=5,
+        ).returncode == 0
+
+    origin_ref = f"origin/{branch}"
+    if _ref_exists(origin_ref):
+        behind_origin = _count_commits_between(git_cmd, PROJECT_ROOT, "HEAD", origin_ref)
+        ahead_origin = _count_commits_between(git_cmd, PROJECT_ROOT, origin_ref, "HEAD")
+        check_info(f"origin: {ahead_origin} ahead, {behind_origin} behind (local refs, not live-fetched)")
+    else:
+        check_info(f"{origin_ref} not fetched locally yet — run 'hermes update --check' to refresh")
+
+    if has_upstream:
+        upstream_ref = f"upstream/{branch}"
+        if _ref_exists(upstream_ref):
+            behind_up = _count_commits_between(git_cmd, PROJECT_ROOT, "HEAD", upstream_ref)
+            ahead_up = _count_commits_between(git_cmd, PROJECT_ROOT, upstream_ref, "HEAD")
+            if behind_up > 0 and ahead_up > 0:
+                check_warn(
+                    f"Fork diverged from upstream: {ahead_up} ahead, {behind_up} behind",
+                    "(local refs, not live-fetched)",
+                )
+                issues.append(
+                    f"Fork diverged from upstream ({ahead_up} ahead, {behind_up} behind) — "
+                    "review and run 'git pull upstream main' if you want to reconcile."
+                )
+            elif behind_up > 0:
+                check_warn(f"{behind_up} commit(s) behind upstream", "(local refs, not live-fetched)")
+                issues.append(f"{behind_up} commit(s) behind upstream — run 'hermes update' to sync.")
+            else:
+                check_ok("Up to date with upstream (as of last fetch)")
+        else:
+            check_info(f"{upstream_ref} not fetched locally yet — run 'hermes update --check' to refresh")
+
+    from hermes_constants import get_hermes_home
+    skip_upstream_marker = get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE
+    if skip_upstream_marker.exists():
+        check_info(
+            f"Upstream-add prompt previously declined ({SKIP_UPSTREAM_PROMPT_FILE} present) "
+            f"— run 'rm {skip_upstream_marker}' to be asked again"
+        )
+
+    # Last update-CHECK timestamp — not the same as "last successfully applied
+    # update" (nothing tracks that; a successful update only invalidates this
+    # cache, it doesn't stamp anything). Labeled honestly rather than implying
+    # more precision than the data supports.
+    cache_file = get_hermes_home() / ".update_check"
+    if cache_file.exists():
+        import json
+        import datetime
+        try:
+            ts = json.loads(cache_file.read_text(encoding="utf-8")).get("ts")
+            if ts:
+                when = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+                check_info(f"Last update check: {when} (not necessarily last applied update)")
+        except Exception:
+            pass
+
+
 def check_certificates(should_fix: bool = False, issues: "list | None" = None) -> None:
     """Verify the certifi CA bundle is loadable.
 
@@ -1622,6 +1738,7 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+    _check_fork_upstream_drift(issues)
 
     if sys.platform != "win32":
         _section("Command Installation")

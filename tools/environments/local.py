@@ -320,6 +320,14 @@ def _build_provider_env_blocklist() -> frozenset:
         "VERCEL_TOKEN",
         "VERCEL_PROJECT_ID",
         "VERCEL_TEAM_ID",
+        # SUDO_PASSWORD used to arrive here automatically via the
+        # OPTIONAL_ENV_VARS loop above (category="setting", password=True).
+        # That config_defaults.py entry was removed along with the
+        # sudo-password-piping mechanism, so it's hardcoded here instead —
+        # Hermes no longer reads SUDO_PASSWORD anywhere, but a stale value
+        # left in .env or the shell environment must still never reach a
+        # spawned command's environment.
+        "SUDO_PASSWORD",
     })
     # CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT stripped.  It is set and
     # owned by the user's Claude Code install (subscription OAuth), not a
@@ -555,6 +563,11 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
     "DAYTONA_API_KEY",
+    # Hermes no longer reads SUDO_PASSWORD anywhere (the sudo-password-piping
+    # mechanism was removed as a process-global-secret risk). Stripped here
+    # too, belt-and-braces, in case a stale value is still sitting in .env or
+    # the shell environment.
+    "SUDO_PASSWORD",
 })
 
 

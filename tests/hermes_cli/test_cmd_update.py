@@ -225,7 +225,9 @@ class TestCmdUpdateBranchFallback:
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
         ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real upstream-vs-origin sync logic, not the staging path.
+            cmd_update(mock_args, approved=True)
 
         expected_git_cmd = (
             ["git", "-c", "windows.appendAtomically=false"] if hm._is_windows() else ["git"]
@@ -254,7 +256,9 @@ class TestCmdUpdateBranchFallback:
                 branch="main", verify_ok=True, commit_count="1"
             )
 
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real non-interactive migration path, not the staging path.
+            cmd_update(mock_args, approved=True)
 
             mock_input.assert_not_called()
             from hermes_cli.config import migrate_config
@@ -295,7 +299,9 @@ class TestCmdUpdateMigrationPrompt:
                 branch="main", verify_ok=True, commit_count="1"
             )
 
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real version-bump migration path, not the staging path.
+            cmd_update(mock_args, approved=True)
 
             mock_input.assert_not_called()
             mock_migrate.assert_called_once_with(interactive=False, quiet=True)
@@ -333,7 +339,9 @@ class TestCmdUpdateMigrationPrompt:
                 branch="main", verify_ok=True, commit_count="1"
             )
 
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real migration prompt path, not the staging path.
+            cmd_update(mock_args, approved=True)
 
             out = capsys.readouterr().out
             # Names, not just counts.
@@ -378,7 +386,9 @@ class TestCmdUpdateProfileSkillSync:
             patch("hermes_cli.profiles.seed_profile_skills", side_effect=fake_seed),
             patch("tools.skills_sync.sync_skills", return_value=empty_sync),
         ):
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real profile-skill-sync path, not the staging path.
+            cmd_update(mock_args, approved=True)
 
         assert active_p.path in synced_paths, (
             f"Active profile 'bit' must be included in skill sync; got: {synced_paths}"
@@ -412,7 +422,9 @@ class TestCmdUpdateProfileSkillSync:
             patch("hermes_cli.profiles.seed_profile_skills", side_effect=fake_seed),
             patch("tools.skills_sync.sync_skills", return_value=empty_sync),
         ):
-            cmd_update(mock_args)
+            # Bypass the update-approval staging gate — this test exercises
+            # the real profile-skill-sync path, not the staging path.
+            cmd_update(mock_args, approved=True)
 
         assert default_p.path in synced_paths
 
@@ -468,7 +480,9 @@ class TestCmdUpdateBranchFlag:
         )
         args = SimpleNamespace(branch="bb/gui")
 
-        cmd_update(args)
+        # Bypass the update-approval staging gate — this test exercises the
+        # real branch-pull path, not the staging path.
+        cmd_update(args, approved=True)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
 
@@ -495,8 +509,10 @@ class TestCmdUpdateBranchFlag:
         )
         args = SimpleNamespace(branch="nonexistent")
 
+        # Bypass the update-approval staging gate — this test exercises the
+        # real missing-branch failure path, not the staging path.
         with pytest.raises(SystemExit) as exc_info:
-            cmd_update(args)
+            cmd_update(args, approved=True)
         assert exc_info.value.code == 1
 
         out = capsys.readouterr().out
@@ -631,6 +647,156 @@ class TestCmdUpdateCheckBranchFlag:
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
 
+class TestSyncWithUpstreamDivergedFork:
+    """The origin_ahead>0 bail-out must report both counts, not just
+    origin_ahead — a diverged fork (ahead AND behind) must never look
+    identical to "nothing to do"."""
+
+    @staticmethod
+    def _side_effect(*, origin_ahead: str, upstream_ahead: str):
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "remote" in joined and "get-url" in joined and "upstream" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="https://github.com/NousResearch/hermes-agent.git\n", stderr=""
+                )
+            if "fetch" in joined and "upstream" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "rev-list" in joined and "upstream/main..origin/main" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{origin_ahead}\n", stderr="")
+            if "rev-list" in joined and "origin/main..upstream/main" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{upstream_ahead}\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    def test_diverged_fork_reports_both_counts(self, capsys):
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        with patch("subprocess.run", side_effect=self._side_effect(origin_ahead="2", upstream_ahead="5")):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        out = capsys.readouterr().out
+        assert "Fork diverged: 2 commit(s) ahead, 5 commit(s) behind upstream" in out
+        assert "manual decision" in out
+        assert "git pull upstream main" in out
+
+    def test_ahead_only_with_no_new_upstream_commits_is_distinct(self, capsys):
+        """Ahead but upstream has nothing new: still a bail-out, but a
+        different message than the diverged-fork case — never silent."""
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        with patch("subprocess.run", side_effect=self._side_effect(origin_ahead="1", upstream_ahead="0")):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        out = capsys.readouterr().out
+        assert "Fork diverged" not in out
+        assert "upstream has nothing new" in out
+
+
+class TestSyncWithUpstreamNonInteractive:
+    """F7: the upstream-remote prompt must never permanently record a
+    decision the user was never actually asked. A non-interactive caller
+    (dashboard spawn, ``hermes update --gateway``) must defer without
+    writing .skip_upstream_prompt; only a real typed 'n' at a real TTY
+    may write it. A Ctrl+C is an abort, not a decline, and must not write
+    it either."""
+
+    @staticmethod
+    def _no_upstream_side_effect():
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "remote" in joined and "get-url" in joined and "upstream" in joined:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No such remote")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    def _marker_path(self, tmp_path):
+        return tmp_path / ".skip_upstream_prompt"
+
+    def test_noninteractive_env_var_skips_without_marker_and_never_calls_input(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_NONINTERACTIVE", "1")
+
+        def _fail_if_called(*_a, **_kw):
+            raise AssertionError("input() must never be called in a non-interactive context")
+
+        monkeypatch.setattr("builtins.input", _fail_if_called)
+
+        with patch("subprocess.run", side_effect=self._no_upstream_side_effect()):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        assert not self._marker_path(tmp_path).exists()
+        out = capsys.readouterr().out
+        assert "Add official repo as 'upstream' remote?" not in out
+
+    def test_closed_stdin_without_env_var_skips_without_marker(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The actual --gateway case: HERMES_NONINTERACTIVE is NOT set
+        (gateway/slash_commands.py's spawn doesn't set it), but stdin is
+        closed (action_spawn.spawn_with_exit_capture always sets
+        stdin=DEVNULL). isatty()-alone must catch this."""
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        def _fail_if_called(*_a, **_kw):
+            raise AssertionError("input() must never be called when stdin is not a tty")
+
+        monkeypatch.setattr("builtins.input", _fail_if_called)
+
+        with patch("subprocess.run", side_effect=self._no_upstream_side_effect()):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        assert not self._marker_path(tmp_path).exists()
+
+    def test_real_tty_explicit_no_writes_marker(self, monkeypatch, tmp_path, capsys):
+        """Unchanged from today's correct behavior: a real interactive
+        session where the user types 'n' must still write the marker."""
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+        with patch("subprocess.run", side_effect=self._no_upstream_side_effect()):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        assert self._marker_path(tmp_path).exists()
+        out = capsys.readouterr().out
+        assert "Skipped." in out
+
+    def test_keyboard_interrupt_during_real_prompt_does_not_write_marker(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_NONINTERACTIVE", raising=False)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+        def _raise_interrupt(_prompt):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("builtins.input", _raise_interrupt)
+
+        with patch("subprocess.run", side_effect=self._no_upstream_side_effect()):
+            _sync_with_upstream_if_needed(["git"], PROJECT_ROOT)
+
+        assert not self._marker_path(tmp_path).exists()
+        out = capsys.readouterr().out
+        assert "Cancelled" in out
+
+
 class TestCmdUpdateZipBranchRefusal:
     """``hermes update --branch=<non-main>`` must refuse on the ZIP fallback path.
 
@@ -717,7 +883,17 @@ class TestNodeRuntimeNpmResolution:
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
         from hermes_cli import main as hm
+        from tools import update_approval as ua
         import hermes_constants
+
+        # This test exercises the real apply path (WSL npm build-skip logic),
+        # not the approval gate — bypass it the same way the "approve" replay
+        # path does, so cmd_update actually reaches _cmd_update_impl instead
+        # of exiting early via the staging branch (UPDATE_EXIT_STAGED_FOR_APPROVAL).
+        # Before that exit code existed, this test's assert_not_called() checks
+        # passed vacuously on the staging path's early return — never actually
+        # reaching (or testing) the WSL skip logic at all.
+        monkeypatch.setenv(ua.BYPASS_ENV, "1")
 
         windows_npm = "/mnt/c/Program Files/nodejs/npm"
         monkeypatch.setattr(hm, "_is_windows", lambda: False)

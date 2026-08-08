@@ -123,7 +123,6 @@ class TestLayoutSlot:
         cli._stash_panel_widget = "stash-panel"
         try:
             children = cli._build_tui_layout_children(
-                sudo_widget="sudo",
                 secret_widget="secret",
                 approval_widget="approval",
                 clarify_widget="clarify",
@@ -146,7 +145,6 @@ class TestLayoutSlot:
     def test_layout_omits_stash_panel_when_absent(self, cli):
         cli._stash_panel_widget = None
         children = cli._build_tui_layout_children(
-            sudo_widget="sudo",
             secret_widget="secret",
             approval_widget="approval",
             clarify_widget="clarify",

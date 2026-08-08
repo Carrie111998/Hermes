@@ -81,6 +81,18 @@ HANDOFF_PID_ENV = "HERMES_UPDATE_HANDOFF_PID"
 # here keeps the concurrent-update refusal on that same understood contract.
 UPDATE_EXIT_CONCURRENT = 2
 
+# Exit code meaning "the update-approval gate (updates.apply_approval) staged
+# this request instead of applying it". Before this existed, a staged update
+# exited 0 — identical to a genuinely completed update — so nothing that
+# only checks the exit code (the dashboard's action-status poll, the
+# gateway's chat notification) could tell "updated" from "awaiting approval"
+# apart. Not currently matched by the Tauri desktop updater's Rust code
+# (apps/bootstrap-installer/src-tauri/src/update.rs only recognizes
+# UPDATE_EXIT_CONCURRENT) — a staged update triggered from the desktop's
+# native updater still reads as a generic failure there until that's
+# updated separately.
+UPDATE_EXIT_STAGED_FOR_APPROVAL = 3
+
 
 def update_marker_path() -> Path:
     """Path of the shared update marker.

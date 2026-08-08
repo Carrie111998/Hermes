@@ -469,31 +469,31 @@ HARDLINE_PATTERNS_COMPILED = [
 # =========================================================================
 # Sudo stdin guard — block password guessing via "sudo -S"
 # =========================================================================
-# When SUDO_PASSWORD is not configured, any explicit "sudo -S" in the
-# command is the LLM piping a guessed password via stdin.  This is a
-# brute-force attack vector: the model iterates through candidate
-# passwords, inspects sudo's "Sorry, try again" output, and refines.
-# Treat this as an unconditional block — there is never a legitimate
-# reason for the agent to pipe passwords to sudo -S when no password
-# has been configured.
+# Any explicit "sudo -S" in the command is the LLM piping a password via
+# stdin.  This is a brute-force attack vector: the model iterates through
+# candidate passwords, inspects sudo's "Sorry, try again" output, and
+# refines.  Treat this as an unconditional block — Hermes itself never
+# writes "sudo -S" into a command (the sudo-password-piping mechanism was
+# removed; see terminal_tool._transform_sudo_command), so there is no
+# longer any legitimate source for this pattern at all.
 _SUDO_STDIN_RE = re.compile(
     r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b',
     re.IGNORECASE)
 
 
 def _check_sudo_stdin_guard(command: str) -> tuple:
-    """Detect ``sudo -S`` (stdin password) without configured SUDO_PASSWORD.
+    """Detect ``sudo -S`` (stdin password) anywhere in *command*.
 
-    When SUDO_PASSWORD is set, ``_transform_sudo_command`` injects ``-S``
-    internally — that path is legitimate and handled elsewhere.  This guard
-    only fires when SUDO_PASSWORD is *not* set, meaning the LLM explicitly
-    wrote ``sudo -S`` to pipe a guessed password.
+    Unconditional — no exemption. This guard used to stand down when
+    SUDO_PASSWORD was configured, because ``_transform_sudo_command`` would
+    inject ``-S`` itself in that case. That mechanism was removed (it was a
+    process-global secret every spawned command could read); Hermes never
+    writes ``sudo -S`` anymore, so any occurrence is the LLM's own doing and
+    there is no longer a legitimate case to exempt.
 
     Returns:
         (is_blocked: bool, description: str | None)
     """
-    if "SUDO_PASSWORD" in os.environ:
-        return (False, None)
     normalized = _normalize_command_for_detection(command).lower()
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "sudo password guessing via stdin (sudo -S)")
@@ -592,9 +592,12 @@ def _sudo_stdin_block_result(description: str) -> dict:
         "message": (
             f"BLOCKED: {description}. "
             "Do not pipe passwords to 'sudo -S' — this is a brute-force "
-            "attack vector. Set SUDO_PASSWORD in your .env file if the "
-            "agent needs passwordless sudo, or run the sudo command "
-            "manually in your own terminal."
+            "attack vector. If sudo needs to run without a password, add "
+            "a scoped NOPASSWD rule for the agent's user in "
+            "/etc/sudoers.d/ (limited to the specific commands it needs, "
+            "via `visudo -f /etc/sudoers.d/hermes`) rather than piping a "
+            "password, or run the sudo command manually in your own "
+            "terminal."
         ),
     }
 
@@ -3392,9 +3395,9 @@ def check_all_command_guards(command: str, env_type: str,
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
+    # legitimate reason for the agent to pipe passwords to sudo -S. This
+    # must fire BEFORE the yolo check so even yolo/smart approval/mode=off
+    # cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
         logger.warning("Sudo stdin guard block: %s (command: %s)",

@@ -1,6 +1,7 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
 import type {
+  ActionPreflightResponse,
   ActionResponse,
   ActionStatusResponse,
   AnalyticsResponse,
@@ -124,6 +125,7 @@ export function audioTranscribeRequestTimeoutMs(dataUrl: string): number {
 }
 
 export type {
+  ActionPreflightResponse,
   ActionResponse,
   ActionStatusResponse,
   AnalyticsDailyEntry,
@@ -1554,6 +1556,18 @@ export function getActionStatus(name: string, lines = 200): Promise<ActionStatus
   return window.hermesDesktop.api<ActionStatusResponse>({
     ...profileScoped(),
     path: `/api/actions/${encodeURIComponent(name)}/status?lines=${Math.max(1, lines)}`
+  })
+}
+
+/** Read-only precheck of a durable action's likely outcome (blocked /
+ *  will_stage / will_apply, plus why) — call before offering the action so
+ *  a button's label/disabled-state can reflect it up front instead of only
+ *  surfacing the outcome after spawning. See hermes_cli/web_server.py's
+ *  `_preflight_durable_action`. */
+export function getActionPreflight(name: string): Promise<ActionPreflightResponse> {
+  return window.hermesDesktop.api<ActionPreflightResponse>({
+    ...profileScoped(),
+    path: `/api/actions/${encodeURIComponent(name)}/preflight`
   })
 }
 

@@ -30,11 +30,13 @@ Session context:
 import atexit
 import copy
 import io
+import json
 import logging
 import os
 import queue
 import sys
 import threading
+from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional, Sequence
@@ -757,6 +759,130 @@ def _add_rotating_handler(
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
     # the rotation-lock wait never runs on the caller's (often event-loop) thread.
     _register_queued_handler(handler)
+
+
+# ---------------------------------------------------------------------------
+# Structured event log — <HERMES_HOME>/logs/events.jsonl
+#
+# One JSON object per line: {ts, event, session_id, action_id, subsystem,
+# outcome, detail}. Reuses the exact same async rotating-file-handler
+# pipeline as agent.log/errors.log (see module docstring) — no new
+# concurrency mechanism, no caller ever blocks on file I/O or the
+# cross-process rotation lock.
+#
+# Redaction: `detail` is passed through redact_sensitive_text() BEFORE
+# json.dumps(), not after. RedactingFormatter run on the whole already-
+# serialized JSON line was tried first and is unsafe: _ENV_ASSIGN_RE's
+# value-matcher is `\S+`, which stops at the first whitespace on an
+# ordinary text log line but on compact JSON has no whitespace before the
+# closing `"`/`}` — so it can consume the JSON string's closing quote and
+# the object's closing brace along with the secret, corrupting the line
+# into invalid JSON. Redacting the raw field first avoids ever running the
+# regex over JSON syntax at all.
+# ---------------------------------------------------------------------------
+
+EVENTS_LOGGER_NAME = "hermes.events"
+_EVENTS_MAX_BYTES = 10 * 1024 * 1024
+_EVENTS_BACKUP_COUNT = 5
+
+_events_handler_lock = threading.Lock()
+_events_handler_registered = False
+
+
+def _ensure_events_handler(max_bytes: int = _EVENTS_MAX_BYTES,
+                            backup_count: int = _EVENTS_BACKUP_COUNT) -> None:
+    """Lazily attach the events.jsonl rotating handler exactly once.
+
+    ``emit_event()`` may be called from many threads/processes before
+    ``setup_logging()`` has run (e.g. a cron job firing during early
+    startup) — this must not race into duplicate handlers or drop events.
+    ``_add_rotating_handler``'s own path-based dedup check-then-append is
+    NOT atomic on its own (no lock spans the check and the append), so this
+    function wraps the whole thing in its own double-checked lock rather
+    than relying on that dedup alone.
+    """
+    global _events_handler_registered
+    if _events_handler_registered:
+        return
+    with _events_handler_lock:
+        if _events_handler_registered:
+            return
+        home = get_hermes_home()
+        log_dir = home / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        _add_rotating_handler(
+            logging.getLogger(),
+            log_dir / "events.jsonl",
+            level=logging.INFO,
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+            # Bare message only — each line IS the JSON object, already
+            # redacted field-by-field in emit_event() before serialization.
+            # NOT RedactingFormatter here — see module comment above for why
+            # pattern-matching the already-serialized JSON line is unsafe.
+            formatter=logging.Formatter("%(message)s"),
+            log_filter=_ComponentFilter((EVENTS_LOGGER_NAME,)),
+        )
+        logging.getLogger(EVENTS_LOGGER_NAME).setLevel(logging.INFO)
+        _events_handler_registered = True
+
+
+def _reset_events_handler_state() -> None:
+    """Test-isolation helper: forget that the handler was registered.
+
+    Does not remove the handler from ``_queued_file_handlers`` itself —
+    callers doing a full reset should also call ``_reset_queued_handlers()``.
+    """
+    global _events_handler_registered
+    with _events_handler_lock:
+        _events_handler_registered = False
+
+
+def emit_event(
+    event: str,
+    *,
+    subsystem: str,
+    outcome: str,
+    action_id: Optional[str] = None,
+    detail: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> None:
+    """Append one structured event to ``<HERMES_HOME>/logs/events.jsonl``.
+
+    Reuses the same session-identity mechanism as ``[session_id]`` log
+    correlation: ``session_id`` defaults to the current thread's
+    ``set_session_context()`` value rather than requiring every caller to
+    pass one explicitly. Pass it explicitly only when emitting off the
+    conversation thread on behalf of a specific session.
+
+    ``detail`` is the only field expected to carry free text (error
+    messages, summaries) — it's redacted before being embedded in the JSON
+    line. The other fields are short, caller-controlled identifiers/enums
+    and aren't run through redaction.
+    """
+    _ensure_events_handler()
+    sid = session_id if session_id is not None else getattr(_session_context, "session_id", None)
+
+    safe_detail = detail
+    if safe_detail:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            safe_detail = redact_sensitive_text(str(safe_detail))
+        except Exception:
+            pass
+
+    payload = {
+        "ts": datetime.now().astimezone().isoformat(),
+        "event": event,
+        "session_id": sid,
+        "action_id": action_id,
+        "subsystem": subsystem,
+        "outcome": outcome,
+        "detail": safe_detail,
+    }
+    logging.getLogger(EVENTS_LOGGER_NAME).info(json.dumps(payload, ensure_ascii=False))
 
 
 def _read_logging_config():

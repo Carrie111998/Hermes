@@ -4202,13 +4202,6 @@ OPTIONAL_ENV_VARS = {
     # ── Agent settings ──
     # NOTE: MESSAGING_CWD was removed here — use terminal.cwd in config.yaml
     # instead.  The gateway reads TERMINAL_CWD (bridged from terminal.cwd).
-    "SUDO_PASSWORD": {
-        "description": "Sudo password for terminal commands requiring root access; set to an explicit empty string to try empty without prompting",
-        "prompt": "Sudo password",
-        "url": None,
-        "password": True,
-        "category": "setting",
-    },
     # HERMES_TOOL_PROGRESS_MODE is deprecated — tool progress is configured via
     # display.tool_progress in config.yaml (off|new|all|verbose|log). The
     # gateway still falls back to HERMES_TOOL_PROGRESS_MODE for backward

@@ -965,6 +965,15 @@ export const api = {
     fetchJSON<ActionStatusResponse>(
       `/api/actions/${encodeURIComponent(name)}/status?lines=${lines}`,
     ),
+  /** Read-only precheck of a durable action's likely outcome (blocked /
+   *  will_stage / will_apply, plus why) — call before offering the action
+   *  so the button's label/disabled-state can reflect it up front instead
+   *  of only surfacing the outcome after spawning. See
+   *  hermes_cli/web_server.py's `_preflight_durable_action`. */
+  getActionPreflight: (name: string) =>
+    fetchJSON<ActionPreflightResponse>(
+      `/api/actions/${encodeURIComponent(name)}/preflight`,
+    ),
 
   // Dashboard plugins
   getPlugins: () =>
@@ -1356,6 +1365,10 @@ export interface ActionResponse {
   name: string;
   ok: boolean;
   pid: number | null;
+  /** Only set by durable actions (currently `hermes-update`) — "spawned"
+   *  means the process launched, nothing more. Poll getActionStatus for
+   *  the real outcome (running / succeeded / failed / staged). */
+  status?: ActionRunStatus;
   error?: string;
   message?: string;
   uploaded_bytes?: number;
@@ -1842,12 +1855,49 @@ interface FetchJSONOptions {
   allowUnauthorized?: boolean;
 }
 
+/** Only meaningful for durable actions (currently `hermes-update`) — other
+ *  actions' status responses carry `status: null`. "staged" is the
+ *  approval-gate outcome: the process exited 0-adjacent but nothing was
+ *  actually applied, so it must never be rendered like "succeeded". */
+export type ActionRunStatus =
+  | "starting"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "staged"
+  | "unknown";
+
 export interface ActionStatusResponse {
   exit_code: number | null;
   lines: string[];
   name: string;
   pid: number | null;
   running: boolean;
+  status: ActionRunStatus | null;
+}
+
+/** Verdict a durable action's preflight check settles on. "blocked" means
+ *  clicking the action would refuse outright (see `reason` for why —
+ *  install method, an update already running, or an unreviewed pending
+ *  request); "will_stage" means it would be accepted but deferred behind
+ *  the update-approval gate rather than applied immediately; "will_apply"
+ *  means nothing stands in the way. */
+export type ActionPreflightVerdict = "blocked" | "will_stage" | "will_apply";
+
+export interface ActionPreflightResponse {
+  name: string;
+  lock_held: boolean;
+  will_stage: boolean;
+  /** Informational only — a dirty checkout does not by itself block the
+   *  action, so this can be true even when verdict is "will_apply". */
+  checkout_dirty: boolean;
+  pending_exists: boolean;
+  install_method: string;
+  verdict: ActionPreflightVerdict;
+  /** Human-readable explanation that differs by cause — distinguishes
+   *  "managed via docker/nix" from "an update is already running" from
+   *  "a pending request needs review first", not just a generic label. */
+  reason: string;
 }
 
 export interface PlatformStatus {

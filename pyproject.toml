@@ -428,7 +428,20 @@ preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
 # which silently corrupts any non-ASCII file content.  We had three
 # separate Windows sandbox regressions in one debug session before
 # adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
+#
+# S110 (try-except-pass) is scoped to cron/, gateway/, hermes_cli/ only —
+# a silent-except audit found a meaningful fraction of except blocks in
+# those directories are bare `pass`/`continue`/`return` with no logging,
+# and on a subset of paths the swallowed error is the only evidence
+# something didn't happen (banner.py's now-fixed silent update-check
+# fetch was a real example before it was corrected). BLE001 (blind broad
+# except) was considered too — deliberately deferred, see backlog note
+# in the per-file-ignores block below; it flags ~2,755 sites across the
+# same scope, the large majority of which are already-correct
+# `except Exception: logger.debug(...)` patterns that just don't use
+# exc_info=True, not silent swallows. Enabling it now would mean an
+# ignore list that's mostly noise-suppression rather than real triage.
+select = ["PLW1514", "S110"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.
@@ -437,3 +450,133 @@ select = ["PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
+
+# S110 is scoped to cron/, gateway/, hermes_cli/ — ignored everywhere else.
+"!{cron,gateway,hermes_cli}/**" = ["S110"]
+
+# cron/jobs.py, hermes_cli/update_cmd.py, and hermes_cli/web_server.py were
+# reviewed in the silent-except audit (update_cmd.py's update paths,
+# web_server.py's action-spawn/status paths, cron/jobs.py's job-execution
+# paths): 30 sites were fixed with logger.debug/warning calls, and the
+# remaining violations in those three files got inline `# noqa: S110`
+# comments at the reviewed site instead of a file-level ignore here — each
+# is a confirmed-deliberate best-effort swallow (cleanup-before-reraise,
+# documented fail-open probe, cosmetic/optional notice), and the file-level
+# route would have silently exempted those files from catching any NEW
+# blind except-pass added later. No entry needed for them below.
+
+# --- S110: existing violations elsewhere in cron/, gateway/, hermes_cli/,
+# not yet reviewed. Mechanically generated from
+# `ruff check --select S110 cron/ gateway/ hermes_cli/` — backlog, not a
+# per-site judgment call. Remove an entry as its file gets audited.
+"cron/executions.py" = ["S110"]
+"cron/scheduler_provider.py" = ["S110"]
+"cron/scheduler.py" = ["S110"]
+"gateway/authz_mixin.py" = ["S110"]
+"gateway/channel_directory.py" = ["S110"]
+"gateway/config.py" = ["S110"]
+"gateway/kanban_watchers.py" = ["S110"]
+"gateway/lifecycle_ledger.py" = ["S110"]
+"gateway/memory_monitor.py" = ["S110"]
+"gateway/pairing.py" = ["S110"]
+"gateway/platforms/api_server.py" = ["S110"]
+"gateway/platforms/base.py" = ["S110"]
+"gateway/platforms/bluebubbles.py" = ["S110"]
+"gateway/platforms/helpers.py" = ["S110"]
+"gateway/platforms/qqbot/chunked_upload.py" = ["S110"]
+"gateway/platforms/signal.py" = ["S110"]
+"gateway/platforms/webhook.py" = ["S110"]
+"gateway/platforms/weixin.py" = ["S110"]
+"gateway/platforms/whatsapp_cloud.py" = ["S110"]
+"gateway/platforms/yuanbao.py" = ["S110"]
+"gateway/relay/adapter.py" = ["S110"]
+"gateway/relay/__init__.py" = ["S110"]
+"gateway/relay/ws_transport.py" = ["S110"]
+"gateway/run.py" = ["S110"]
+"gateway/session_context.py" = ["S110"]
+"gateway/session.py" = ["S110"]
+"gateway/shutdown_flush.py" = ["S110"]
+"gateway/shutdown_forensics.py" = ["S110"]
+"gateway/shutdown_watchdog.py" = ["S110"]
+"gateway/slash_commands.py" = ["S110"]
+"gateway/status.py" = ["S110"]
+"gateway/stream_consumer.py" = ["S110"]
+"gateway/streaming_tts_consumer.py" = ["S110"]
+"gateway/systemd_notify.py" = ["S110"]
+"hermes_cli/active_sessions.py" = ["S110"]
+"hermes_cli/auth_commands.py" = ["S110"]
+"hermes_cli/auth.py" = ["S110"]
+"hermes_cli/backup.py" = ["S110"]
+"hermes_cli/bang_shell.py" = ["S110"]
+"hermes_cli/banner.py" = ["S110"]
+"hermes_cli/blueprint_cmd.py" = ["S110"]
+"hermes_cli/callbacks.py" = ["S110"]
+"hermes_cli/claw.py" = ["S110"]
+"hermes_cli/cli_agent_setup_mixin.py" = ["S110"]
+"hermes_cli/cli_billing_mixin.py" = ["S110"]
+"hermes_cli/cli_commands_mixin.py" = ["S110"]
+"hermes_cli/clipboard.py" = ["S110"]
+"hermes_cli/codex_runtime_plugin_migration.py" = ["S110"]
+"hermes_cli/commands.py" = ["S110"]
+"hermes_cli/config_migrations.py" = ["S110"]
+"hermes_cli/config.py" = ["S110"]
+"hermes_cli/context_switch_guard.py" = ["S110"]
+"hermes_cli/copilot_auth.py" = ["S110"]
+"hermes_cli/credential_lifecycle.py" = ["S110"]
+"hermes_cli/curses_ui.py" = ["S110"]
+"hermes_cli/dashboard_procs.py" = ["S110"]
+"hermes_cli/dashboard_register.py" = ["S110"]
+"hermes_cli/debug.py" = ["S110"]
+"hermes_cli/doctor.py" = ["S110"]
+"hermes_cli/dump.py" = ["S110"]
+"hermes_cli/_early_recovery.py" = ["S110"]
+"hermes_cli/env_loader.py" = ["S110"]
+"hermes_cli/fallback_cmd.py" = ["S110"]
+"hermes_cli/gateway_enroll.py" = ["S110"]
+"hermes_cli/gateway.py" = ["S110"]
+"hermes_cli/gateway_windows.py" = ["S110"]
+"hermes_cli/goals.py" = ["S110"]
+"hermes_cli/kanban_db.py" = ["S110"]
+"hermes_cli/kanban_decompose.py" = ["S110"]
+"hermes_cli/kanban_diagnostics.py" = ["S110"]
+"hermes_cli/kanban.py" = ["S110"]
+"hermes_cli/main.py" = ["S110"]
+"hermes_cli/mcp_config.py" = ["S110"]
+"hermes_cli/mcp_startup.py" = ["S110"]
+"hermes_cli/memory_setup.py" = ["S110"]
+"hermes_cli/model_cost_guard.py" = ["S110"]
+"hermes_cli/model_normalize.py" = ["S110"]
+"hermes_cli/model_setup_flows.py" = ["S110"]
+"hermes_cli/models.py" = ["S110"]
+"hermes_cli/model_switch.py" = ["S110"]
+"hermes_cli/observability/relay_shared_metrics.py" = ["S110"]
+"hermes_cli/observability/shared_metrics_contract.py" = ["S110"]
+"hermes_cli/oneshot.py" = ["S110"]
+"hermes_cli/platforms.py" = ["S110"]
+"hermes_cli/plugins_cmd.py" = ["S110"]
+"hermes_cli/plugins.py" = ["S110"]
+"hermes_cli/profiles.py" = ["S110"]
+"hermes_cli/projects_cmd.py" = ["S110"]
+"hermes_cli/projects_db.py" = ["S110"]
+"hermes_cli/prompt_size.py" = ["S110"]
+"hermes_cli/providers.py" = ["S110"]
+"hermes_cli/pty_bridge.py" = ["S110"]
+"hermes_cli/pty_session.py" = ["S110"]
+"hermes_cli/runtime_provider.py" = ["S110"]
+"hermes_cli/security_audit_startup.py" = ["S110"]
+"hermes_cli/send_cmd.py" = ["S110"]
+"hermes_cli/service_manager.py" = ["S110"]
+"hermes_cli/setup.py" = ["S110"]
+"hermes_cli/skills_hub.py" = ["S110"]
+"hermes_cli/slash_exec.py" = ["S110"]
+"hermes_cli/sqlite_safe_read.py" = ["S110"]
+"hermes_cli/status.py" = ["S110"]
+"hermes_cli/stdio.py" = ["S110"]
+"hermes_cli/_subprocess_compat.py" = ["S110"]
+"hermes_cli/suggestions_cmd.py" = ["S110"]
+"hermes_cli/tools_config.py" = ["S110"]
+"hermes_cli/update_approval_commands.py" = ["S110"]
+"hermes_cli/voice.py" = ["S110"]
+"hermes_cli/web_routers/mcp.py" = ["S110"]
+"hermes_cli/web_routers/sessions.py" = ["S110"]
+"hermes_cli/win_pty_bridge.py" = ["S110"]

@@ -228,7 +228,7 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass  # fall back to the running interpreter
         result = subprocess.run(
             [interpreter, "-c", probe],
@@ -239,8 +239,12 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             errors="replace",
             timeout=120,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as e:
         # Can't run the probe — don't block the update on our own tooling.
+        logger.warning(
+            "Critical-module verification probe could not run — "
+            "treating as verified without actually checking: %s", e
+        )
         return True, None, None
     if result.returncode == 3:
         parts = (result.stdout or "").split("\n", 1)
@@ -441,7 +445,7 @@ def _print_fts_optimize_available_notice() -> None:
         if db is not None:
             try:
                 db.close()
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
     sql = (row[0] if row else "") or ""
     if not sql or ("tool_name" in sql and not interrupted):
@@ -526,7 +530,7 @@ def _print_curator_recent_run_notice() -> None:
         try:
             state["last_run_summary_shown_at"] = last_run_at
             curator.save_state(state)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         return
 
@@ -545,7 +549,7 @@ def _print_curator_recent_run_notice() -> None:
     try:
         state["last_run_summary_shown_at"] = last_run_at
         curator.save_state(state)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 def _format_time_ago(iso_ts: str) -> str:
@@ -977,8 +981,8 @@ def _update_via_zip(args):
             )
         if not result["copied"] and not result.get("updated"):
             print("  ✓ Skills are up to date")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Skills sync during update failed: %s", e)
 
     # Seed the model-catalog disk cache from the freshly-unpacked checkout
     # (same rationale as the git-pull path in _cmd_update_impl). Non-fatal.
@@ -1418,7 +1422,7 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return None
 
@@ -1475,9 +1479,54 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
         )
         if result.returncode == 0:
             return int(result.stdout.strip())
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return -1
+
+def resolve_compare_ref(git_cmd: list[str], cwd: Path, branch: str) -> tuple[str, str]:
+    """Return ``(ref, remote_name)`` to compare ``branch`` against.
+
+    On the default branch ("main"), prefers ``upstream/<branch>`` when an
+    ``upstream`` remote is configured (checked locally, no network cost) —
+    that's what actually determines whether a fork is behind the real
+    project, not just its own origin. Any other branch, or no upstream
+    remote, compares against ``origin/<branch>``.
+
+    This only decides *which ref* to compare against — it does not fetch.
+    Callers remain responsible for fetching the chosen remote/branch and for
+    deciding how to handle a fetch failure (e.g. falling back to origin if
+    the preferred upstream fetch fails).
+    """
+    if branch == "main" and _has_upstream_remote(git_cmd, cwd):
+        return f"upstream/{branch}", "upstream"
+    return f"origin/{branch}", "origin"
+
+def _is_noninteractive_context() -> bool:
+    """True when no human is available to answer a prompt right now.
+
+    Checks both signals — either alone misses a real caller:
+    - ``HERMES_NONINTERACTIVE=1`` is set explicitly by the dashboard spawn
+      paths (``web_server.py``'s ``_spawn_hermes_action`` /
+      ``_spawn_durable_action``). It must win even when stdin happens to be
+      a real tty, e.g. an explicit ``HERMES_NONINTERACTIVE=1 hermes update``
+      override run by a human at their own terminal.
+    - ``sys.stdin.isatty()`` catches every other closed/redirected-stdin
+      caller that does NOT set the env var — notably ``hermes update
+      --gateway`` (spawned via ``action_spawn.spawn_with_exit_capture``,
+      which always sets ``stdin=DEVNULL``) never sets
+      ``HERMES_NONINTERACTIVE``. Env-var-alone would miss it.
+    """
+    if os.environ.get("HERMES_NONINTERACTIVE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    try:
+        return not sys.stdin.isatty()
+    except Exception:
+        # No usable stdin to even ask isatty() about — treat as
+        # non-interactive rather than risk a prompt nothing can answer.
+        return True
+
 
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
@@ -1491,7 +1540,7 @@ def _mark_skip_upstream_prompt():
         from hermes_constants import get_hermes_home
 
         (get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE).touch()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
@@ -1526,6 +1575,21 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         if _should_skip_upstream_prompt():
             return
 
+        if _is_noninteractive_context():
+            # No one to ask right now. Defer, don't decide — writing
+            # SKIP_UPSTREAM_PROMPT_FILE here would permanently answer a
+            # question the user was never actually asked (e.g. a dashboard-
+            # spawned update, or `hermes update --gateway`, running before
+            # upstream is configured).
+            logger.info(
+                "Skipping upstream-remote prompt (non-interactive session); "
+                "not recording a decision. Run 'hermes update' from an "
+                "interactive terminal, or 'git remote add upstream %s' "
+                "manually, to set this up.",
+                OFFICIAL_REPO_URL,
+            )
+            return
+
         # Ask user if they want to add upstream
         print()
         print("ℹ Your fork is not tracking the official Hermes repository.")
@@ -1535,9 +1599,21 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             response = (
                 input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            # Defensive fallback: isatty() said interactive but input()
+            # still hit EOF (stdin closed mid-prompt). Same treatment as
+            # non-interactive — never a permanent decision.
             print()
-            response = "n"
+            logger.info(
+                "Upstream-remote prompt hit EOF; deferring, not recording a decision."
+            )
+            return
+        except KeyboardInterrupt:
+            # Aborted, not declined — a Ctrl+C is not a typed "n" and must
+            # not permanently record a decision either.
+            print()
+            print("  Cancelled.")
+            return
 
         if response in {"", "y", "yes"}:
             print("→ Adding upstream remote...")
@@ -1582,13 +1658,26 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, don't trample — but never
+    # let "refusing to act" look identical to "nothing to do". A fork can be
+    # ahead AND behind at once; report both counts so that's visible instead
+    # of silently dropped.
     if origin_ahead > 0:
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        if upstream_ahead > 0:
+            print(
+                f"⚠ Fork diverged: {origin_ahead} commit(s) ahead, "
+                f"{upstream_ahead} commit(s) behind upstream."
+            )
+            print("  Not syncing automatically — this needs a manual decision.")
+            print("  To pull in upstream changes:")
+            print("    git pull upstream main")
+        else:
+            print(
+                f"ℹ Your fork has {origin_ahead} commit(s) not on upstream "
+                "(upstream has nothing new)."
+            )
+            print("  Nothing to sync.")
         return
 
     # If upstream is not ahead, fork is up to date
@@ -1649,8 +1738,11 @@ def _invalidate_update_cache():
             cache_file = home / ".update_check"
             if cache_file.exists():
                 cache_file.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(
+                "Could not invalidate stale .update_check cache for %s: %s",
+                home, e,
+            )
 
 def _write_marker_file(path: Path, *, label: str) -> None:
     """Drop an update-recovery breadcrumb. Never raises."""
@@ -1937,7 +2029,7 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
         )
         if result.returncode != 0:
             return None
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     # After pip install, check managed path first, then PATH
     return resolve_uv() or shutil.which("uv")
@@ -2156,7 +2248,7 @@ def _log_only_write(text: str) -> None:
     try:
         log_file.write(text if text.endswith("\n") else text + "\n")
         log_file.flush()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 def _run_logged_subprocess(cmd, *, cwd=None, env=None):
@@ -2240,18 +2332,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
         # before spending a network fetch on it. Non-fork installs have no
         # 'upstream' remote, and the old flow burned a failed network attempt
-        # (~0.3-1 s) on every --check before falling back to origin.
-        has_upstream_remote = (
-            subprocess.run(
-                git_cmd + ["remote", "get-url", "upstream"],
-                cwd=_m().PROJECT_ROOT,
-                capture_output=True,
-                text=True, encoding="utf-8", errors="replace",
-            ).returncode
-            == 0
-        )
+        # (~0.3-1 s) on every --check before falling back to origin. This is
+        # the same upstream-vs-origin decision the startup banner now makes
+        # via the same helper — one rule, not two that can disagree.
+        preferred_ref, preferred_remote = resolve_compare_ref(git_cmd, _m().PROJECT_ROOT, branch)
         fetch_result = None
-        if has_upstream_remote:
+        if preferred_remote == "upstream":
             print("→ Fetching from upstream...")
             fetch_result = subprocess.run(
                 git_cmd + ["fetch"] + depth_args + ["upstream", branch],
@@ -2261,7 +2347,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             )
         if fetch_result is not None and fetch_result.returncode == 0:
             upstream_exists = True
-            compare_branch = f"upstream/{branch}"
+            compare_branch = preferred_ref
         else:
             # No upstream remote, or the upstream fetch failed — use origin.
             print("→ Fetching from origin...")
@@ -2728,7 +2814,12 @@ def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
             separators=(",", ":"),
         )
         return True
-    except (OSError, PermissionError):
+    except (OSError, PermissionError) as e:
+        logger.warning(
+            "Could not write gateway planned-stop marker for pid %s in %s: %s — "
+            "an unexpected exit of that gateway may get misreported as a crash",
+            pid, profile_path, e,
+        )
         return False
 
 def _wait_for_windows_update_gateway_exit(
@@ -2757,7 +2848,7 @@ def _wait_for_windows_update_gateway_exit(
         try:
             if _pid_exists(pid):
                 survivors.add(pid)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
     return survivors
 
@@ -2870,7 +2961,7 @@ def _detect_venv_python_processes(
     try:
         for anc in psutil.Process().parents():
             skip.add(int(anc.pid))
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     matches: list[tuple[int, str, str]] = []
@@ -2986,7 +3077,7 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     try:
         for anc in psutil.Process().parents():
             skip.add(int(anc.pid))
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     found: list[int] = []
@@ -3047,7 +3138,7 @@ def _leftover_pausable_gateway_pids(
         if psutil is not None:
             try:
                 argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
         if not _is_pausable_gateway(argv):
             return None
@@ -3436,7 +3527,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
             check=False,
         )
         print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         # Never let lockfile cleanup block an update.
         pass
 
@@ -3519,7 +3610,7 @@ def _normalize_managed_eol(git_cmd, repo_root):
             capture_output=True,
             check=False,
         )
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         # Never let line-ending cleanup block an update.
         pass
 
@@ -4383,8 +4474,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {p.name}: {status}")
                     except Exception as pe:
                         print(f"  {p.name}: error ({pe})")
-        except Exception:
-            pass  # profiles module not available or no profiles
+        except Exception as e:
+            logger.debug(
+                "Bundled-skills seed to all profiles failed "
+                "(profiles module not available, or no profiles): %s", e,
+            )
 
         # Backfill per-profile .env files for profiles created before the
         # .env-seeding fix (#44792). Copies the default install's .env so
@@ -4399,8 +4493,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"→ Seeded .env for {len(backfilled)} profile(s) "
                     f"(copied from default): {', '.join(backfilled)}"
                 )
-        except Exception:
-            pass  # profiles module not available or no profiles
+        except Exception as e:
+            logger.debug(
+                "Per-profile .env backfill failed "
+                "(profiles module not available, or no profiles): %s", e,
+            )
 
         # Sync Honcho host blocks to all profiles
         try:
@@ -4409,7 +4506,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             synced = sync_honcho_profiles_quiet()
             if synced:
                 print(f"\n-> Honcho: synced {synced} profile(s)")
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass  # honcho plugin not installed or not configured
 
         # Check for config migrations
@@ -4673,8 +4770,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _exit_code_path = get_hermes_home() / ".update_exit_code"
             try:
                 _exit_code_path.write_text("0", encoding="utf-8")
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning(
+                    "Could not write success marker to %s — if this process "
+                    "dies during the restart below, the new gateway's update "
+                    "watcher may wait the full timeout instead of seeing "
+                    "success immediately: %s", _exit_code_path, e,
+                )
 
         gateway_fleet_restart_incomplete = False
 
@@ -4853,7 +4955,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                 _cfg_agent = load_config().get("agent") or {}
                 _cfg_drain = _cfg_agent.get("restart_drain_timeout")
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
             try:
                 _drain_budget = (
@@ -4878,7 +4980,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
-                except Exception:
+                except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                     pass
 
                 for scope, scope_cmd in [
@@ -5239,8 +5341,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 if not drained:
                     try:
                         os.kill(pid, _signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError):
-                        pass
+                    except (ProcessLookupError, PermissionError) as e:
+                        logger.warning(
+                            "SIGTERM to gateway pid %s (%s) failed — it may "
+                            "still be running even though it will be reported "
+                            "as restarted below: %s", pid, proc.profile, e,
+                        )
                 # Wait for the old process to fully exit before the watcher
                 # spawns the new gateway.  Telegram holds the previous
                 # getUpdates long-poll session open on its servers for up to
@@ -5268,8 +5374,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 try:
                     os.kill(pid, _signal.SIGTERM)
                     killed_pids.add(pid)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                except (ProcessLookupError, PermissionError) as e:
+                    logger.debug(
+                        "SIGTERM to leftover gateway pid %s failed — it may "
+                        "still be running post-update: %s", pid, e,
+                    )
 
             if restarted_services or killed_pids:
                 print()
@@ -5303,8 +5412,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     _exit_code_path = get_hermes_home() / ".update_exit_code"
                     try:
                         _exit_code_path.write_text("1", encoding="utf-8")
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        logger.warning(
+                            "Could not write failure marker to %s — the new "
+                            "gateway's update watcher may wait the full "
+                            "timeout instead of seeing failure immediately: %s",
+                            _exit_code_path, e,
+                        )
             _warn_incomplete_gateway_fleet_restart(failed_or_stale_units)
 
             if not restarted_services and not killed_pids:

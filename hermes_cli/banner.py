@@ -204,8 +204,23 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
+def _resolve_current_branch(repo_dir: Path) -> str:
+    """Return the checked-out branch name, falling back to "main" on a
+    detached HEAD or a lookup failure."""
+    branch = _git_stdout(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_dir)
+    if not branch or branch == "HEAD":
+        return "main"
+    return branch
+
+
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the resolved compare ref in a local checkout.
+
+    Prefers ``upstream/<branch>`` over ``origin/<branch>`` on the default
+    branch when an upstream remote is configured — see
+    ``update_cmd.resolve_compare_ref`` (the same rule ``hermes update
+    --check`` uses, so the two never disagree about "behind" status).
+    """
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
@@ -214,10 +229,15 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return 1
         return checked
 
+    from hermes_cli.update_cmd import resolve_compare_ref
+
+    branch = _resolve_current_branch(repo_dir)
+    compare_ref, remote_name = resolve_compare_ref(["git"], repo_dir, branch)
+
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
     # unshallow the repo (dragging in the whole history) and
-    # `rev-list --count HEAD..origin/main` would report a huge bogus "behind"
+    # `rev-list --count HEAD..<compare_ref>` would report a huge bogus "behind"
     # number (e.g. "12492 commits behind"). Detect shallow up front: fetch with
     # --depth 1 to preserve the boundary and compare tip SHAs instead of
     # counting. Full clones (developers, Docker dev images) keep the exact
@@ -230,11 +250,10 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
         # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
         # 10 s timeout on slow links. ``cmd_update`` already scopes its fetch
-        # for the same reason. Modern git updates the ``origin/main`` tracking
-        # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
-        # unaffected; the shallow path compares against FETCH_HEAD, which a
-        # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        # for the same reason. Modern git updates the tracking ref on a scoped
+        # fetch, so the count below is unaffected; the shallow path compares
+        # against FETCH_HEAD, which a scoped fetch also updates.
+        fetch_args = ["git", "fetch", remote_name, branch]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -243,17 +262,19 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             capture_output=True, timeout=10,
             cwd=str(repo_dir),
         )
-    except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+    except Exception as e:
+        # Offline or timeout — use stale refs, that's fine. Debug-logged so a
+        # stale banner is diagnosable instead of a silent mystery.
+        logger.debug("banner: fetch %s/%s for update-check failed: %s", remote_name, branch, e)
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
+        # No history to count across the shallow boundary. compare_ref may not
         # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # updated by the fetch above) and fall back to compare_ref.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", compare_ref], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -261,7 +282,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{compare_ref}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -278,7 +299,8 @@ def check_for_updates() -> Optional[int]:
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
     it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    git checkout and count commits behind the resolved compare ref (see
+    ``_check_via_local_git`` / ``update_cmd.resolve_compare_ref``).
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -380,17 +402,24 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
 
 
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
-    """Return upstream/local git hashes for the startup banner.
+    """Return compare-ref/local git hashes for the startup banner.
 
     For source installs and dev images this runs ``git rev-parse`` against
-    the active checkout.  When no checkout is available — the canonical case
-    is the published Docker image, which excludes ``.git`` from the build
-    context — we fall back to the baked-in build SHA (see
-    ``hermes_cli/build_info.py``) and return it as a frozen
-    ``upstream == local`` state with ``ahead=0``.  A built image is by
+    the active checkout, comparing against the same ref
+    ``update_cmd.resolve_compare_ref`` picks (``upstream/<branch>`` when
+    available on the default branch, otherwise ``origin/<branch>``).  When no
+    checkout is available — the canonical case is the published Docker image,
+    which excludes ``.git`` from the build context — we fall back to the
+    baked-in build SHA (see ``hermes_cli/build_info.py``) and return it as a
+    frozen ``upstream == local`` state with ``ahead=0``.  A built image is by
     definition pinned to one commit, so "ahead" is always zero and the
     banner correctly shows ``· upstream <sha>`` with no carried-commits
     annotation.
+
+    The returned dict keeps the ``"upstream"`` key for backward
+    compatibility with callers (e.g. ``format_banner_version_label``) even
+    though the value may actually be the resolved ``origin/<branch>`` SHA
+    when no upstream remote applies.
     """
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
@@ -404,10 +433,15 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    from hermes_cli.update_cmd import resolve_compare_ref
+
+    branch = _resolve_current_branch(repo_dir)
+    compare_ref, _remote_name = resolve_compare_ref(["git"], repo_dir, branch)
+
+    compare_sha = _git_short_hash(repo_dir, compare_ref)
     local = _git_short_hash(repo_dir, "HEAD")
-    if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
+    if not compare_sha or not local:
+        # Live-git lookup failed (e.g. shallow clone without compare_ref).
         # Fall back to the baked build SHA if available.
         try:
             from hermes_cli.build_info import get_build_sha
@@ -421,7 +455,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{compare_ref}..HEAD"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -434,7 +468,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     except Exception:
         ahead = 0
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    return {"upstream": compare_sha, "local": local, "ahead": max(ahead, 0)}
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -847,9 +881,12 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
 
     right_lines.append(f"[dim {dim}]{' · '.join(summary_parts)}[/]")
 
-    # Update check — use prefetched result if available
+    # Update check — use prefetched result if it's already in, but never wait
+    # on it. Rendering the startup banner must not block on the network; a
+    # fetch that hasn't finished yet just means no badge this run (it'll be
+    # cached for next launch instead).
     try:
-        behind = get_update_result(timeout=0.5)
+        behind = get_update_result(timeout=0)
         if behind is not None and behind != 0:
             from hermes_cli.config import get_managed_update_command, recommended_update_command
             if behind > 0:

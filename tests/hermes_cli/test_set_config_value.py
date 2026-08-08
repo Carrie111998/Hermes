@@ -47,7 +47,6 @@ class TestExplicitAllowlist:
         "FIRECRAWL_API_KEY",
         "BROWSERBASE_API_KEY",
         "FAL_KEY",
-        "SUDO_PASSWORD",
         "GITHUB_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "DISCORD_BOT_TOKEN",

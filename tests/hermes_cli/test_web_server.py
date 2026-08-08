@@ -724,7 +724,338 @@ class TestWebServerEndpoints:
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
 
+    def _write_durable_record(self, web_server, *, status="running", action_id="hermes-update-test"):
+        web_server._write_action_record("hermes-update", {
+            "name": "hermes-update", "action_id": action_id, "subcommand": ["update"],
+            "pid": 999999, "spawned_at": "2026-08-02T00:00:00-04:00",
+            "status": status, "exit_code": None, "finished_at": None,
+        })
 
+    def test_reconcile_reports_staged_not_failure(self, monkeypatch):
+        """A staged (exit 3) update must read back as status='staged', not
+        collapse into the generic exit_code!=0 -> 'failed' bucket."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server)
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text(str(UPDATE_EXIT_STAGED_FOR_APPROVAL))
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "staged"
+        assert record["exit_code"] == UPDATE_EXIT_STAGED_FOR_APPROVAL
+        assert ("update.restart_recovered", {
+            "subsystem": "updates", "outcome": "staged",
+            "action_id": "hermes-update-test", "detail": f"exit {UPDATE_EXIT_STAGED_FOR_APPROVAL}",
+        }) in events
+
+    def test_reconcile_survives_simulated_restart(self, monkeypatch):
+        """No live _ACTION_PROCS entry (as after a restart) + the wrapper's
+        independent exit-code file present -> correctly resolved, not stuck
+        reporting 'running' forever."""
+        import hermes_cli.web_server as web_server
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        # Simulate: this process never spawned it (fresh restart) — no
+        # _ACTION_PROCS entry at all — but a prior process's durable record
+        # and the wrapper's own completion signal are both on disk.
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-restart-test")
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text("0")
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "succeeded"
+        assert record["exit_code"] == 0
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert any(e == "update.restart_recovered" for e, _ in events)
+        assert not any(e == "update.reaped" for e, _ in events)
+
+    def test_reconcile_fast_path_uses_live_proc_not_file(self, monkeypatch):
+        """A live (mocked) Popen in _ACTION_PROCS is reaped directly — no
+        need to wait for or even have an exit-code file yet."""
+        import hermes_cli.web_server as web_server
+        from unittest.mock import MagicMock
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        self._write_durable_record(web_server, action_id="hermes-update-fastpath-test")
+        # Deliberately do NOT write an exit-code file — the fast path must
+        # not need it.
+        web_server._action_exit_code_path("hermes-update").unlink(missing_ok=True)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.pid = 12345
+        web_server._ACTION_PROCS["hermes-update"] = mock_proc
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "succeeded"
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert any(e == "update.reaped" for e, _ in events)
+        assert not any(e == "update.restart_recovered" for e, _ in events)
+
+    def test_reconcile_reports_running_when_genuinely_in_flight(self, monkeypatch):
+        """Neither a live proc nor a completed exit-code file -> still
+        reported as running, not guessed at."""
+        import hermes_cli.web_server as web_server
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-inflight-test")
+        web_server._action_exit_code_path("hermes-update").unlink(missing_ok=True)
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "running"
+        assert record["exit_code"] is None
+
+    def test_get_action_status_endpoint_uses_reconcile_for_durable_action(self, monkeypatch):
+        """The HTTP status endpoint for hermes-update goes through the same
+        reconciliation path, not the plain _ACTION_PROCS/_ACTION_RESULTS
+        lookup used for other actions."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-http-test")
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text(str(UPDATE_EXIT_STAGED_FOR_APPROVAL))
+
+        resp = self.client.get("/api/actions/hermes-update/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "staged"
+        assert data["running"] is False
+        assert data["exit_code"] == UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+
+    # ── _preflight_durable_action / GET /api/actions/<name>/preflight ──────
+
+    def test_preflight_will_apply_when_no_blockers(self, monkeypatch):
+        """Approval gate off, non-container install, no lock, no pending ->
+        verdict is will_apply, not will_stage or blocked."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["name"] == "hermes-update"
+        assert result["lock_held"] is False
+        assert result["will_stage"] is False
+        assert result["pending_exists"] is False
+        assert result["install_method"] == "git"
+        assert result["verdict"] == "will_apply"
+        assert "No blockers" in result["reason"]
+
+    def test_preflight_will_stage_when_approval_gate_on(self, monkeypatch):
+        """apply_approval enabled and not bypassed, on a normal install, no
+        lock, no pending -> verdict is will_stage, not will_apply."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: True)
+        monkeypatch.setattr(ua, "approval_bypass_active", lambda: False)
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["will_stage"] is True
+        assert result["verdict"] == "will_stage"
+        assert "staged for approval" in result["reason"]
+
+    def test_preflight_will_stage_false_when_bypass_active(self, monkeypatch):
+        """apply_approval enabled but the thread-local bypass is active ->
+        will_stage must be False (the replay path applies directly)."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: True)
+        monkeypatch.setattr(ua, "approval_bypass_active", lambda: True)
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["will_stage"] is False
+        assert result["verdict"] == "will_apply"
+
+    def test_preflight_lock_held_blocks_with_pid_and_elapsed_in_reason(self, monkeypatch):
+        """A live update-lock marker -> lock_held True, verdict blocked, and
+        the reason names the holder (pid / elapsed), not a generic string."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UpdateHolder
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+
+        holder = UpdateHolder(pid=424242, age_seconds=75.0)
+        monkeypatch.setattr("hermes_cli.update_lock.read_live_update", lambda: holder)
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["lock_held"] is True
+        assert result["verdict"] == "blocked"
+        assert "424242" in result["reason"]
+        assert "already running" in result["reason"]
+
+    def test_preflight_pending_exists_blocks_with_distinct_reason(self, monkeypatch):
+        """A staged pending request already on disk -> pending_exists True,
+        verdict blocked, reason talks about reviewing the pending request
+        (not about a lock or an install method)."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+        ua.stage_update({"branch": "main"}, summary="test pending update")
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["pending_exists"] is True
+        assert result["verdict"] == "blocked"
+        assert "pending update request" in result["reason"]
+        assert "424242" not in result["reason"]
+
+    def test_preflight_docker_install_blocks_with_install_method_reason(self, monkeypatch):
+        """A docker install method -> verdict blocked, reason names the
+        install method specifically."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "docker")
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["install_method"] == "docker"
+        assert result["verdict"] == "blocked"
+        assert "docker" in result["reason"]
+
+    def test_preflight_managed_externally_blocks_with_container_reason(self, monkeypatch):
+        """The dashboard-level container gate (independent of install
+        method) -> verdict blocked, reason distinct from the plain
+        install-method-blocked wording."""
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: True)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "pip")
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["verdict"] == "blocked"
+        assert "outside this dashboard" in result["reason"]
+
+    def test_preflight_distinct_reasons_across_blocked_cases(self, monkeypatch):
+        """The three distinct 'blocked' causes (install method, lock held,
+        pending request) must not share the same reason text."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UpdateHolder
+        from tools import update_approval as ua
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "nix")
+        reason_install_method = web_server._preflight_durable_action("hermes-update")["reason"]
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+        holder = UpdateHolder(pid=555, age_seconds=10.0)
+        monkeypatch.setattr("hermes_cli.update_lock.read_live_update", lambda: holder)
+        reason_lock_held = web_server._preflight_durable_action("hermes-update")["reason"]
+
+        monkeypatch.setattr("hermes_cli.update_lock.read_live_update", lambda: None)
+        ua.stage_update({"branch": "main"}, summary="distinct-reason pending")
+        reason_pending = web_server._preflight_durable_action("hermes-update")["reason"]
+
+        assert len({reason_install_method, reason_lock_held, reason_pending}) == 3
+
+    def test_preflight_checkout_dirty_is_informational_not_blocking(self, monkeypatch, tmp_path):
+        """A dirty PROJECT_ROOT checkout is surfaced in checkout_dirty but,
+        per the real update flow (nothing hard-blocks on it today), does not
+        by itself force verdict to 'blocked'."""
+        import subprocess
+        import hermes_cli.web_server as web_server
+
+        repo = tmp_path / "scratch_repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "file.txt").write_text("dirty", encoding="utf-8")
+
+        monkeypatch.setattr(web_server, "PROJECT_ROOT", repo)
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+
+        result = web_server._preflight_durable_action("hermes-update")
+
+        assert result["checkout_dirty"] is True
+        assert result["verdict"] == "will_apply"
+
+    def test_preflight_route_returns_same_shape_as_direct_call(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        from tools import update_approval as ua
+        monkeypatch.setattr(ua, "apply_approval_enabled", lambda: False)
+
+        resp = self.client.get("/api/actions/hermes-update/preflight")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["name"] == "hermes-update"
+        assert data["verdict"] == "will_apply"
+        assert set(data.keys()) == {
+            "name", "lock_held", "will_stage", "checkout_dirty",
+            "pending_exists", "install_method", "verdict", "reason",
+        }
+
+    def test_preflight_route_404_for_unknown_action(self):
+        resp = self.client.get("/api/actions/not-a-real-action/preflight")
+        assert resp.status_code == 404
+
+    def test_preflight_has_zero_side_effects(self, monkeypatch, tmp_path):
+        """Calling preflight repeatedly must not create a lock marker,
+        write a pending record, or otherwise mutate on-disk state."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import update_marker_path
+        from tools import update_approval as ua
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+
+        marker = update_marker_path()
+        pending_dir = ua._pending_dir()
+
+        assert not marker.exists()
+        before_pending = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
+
+        for _ in range(5):
+            web_server._preflight_durable_action("hermes-update")
+            self.client.get("/api/actions/hermes-update/preflight")
+
+        assert not marker.exists()
+        after_pending = list(pending_dir.glob("*.json")) if pending_dir.exists() else []
+        assert before_pending == after_pending
 
 
 

@@ -2946,14 +2946,13 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
 
     # Emit an `.expire` notification on timeout for every blocking request type
     # whose `*.respond` handler tolerates a late reply (allow_expired=True).
-    # All four blocking bridges — secret, sudo, clarify, terminal.read — share
+    # All three blocking bridges — secret, clarify, terminal.read — share
     # the same lifecycle: the tool gives up on timeout and returns empty, but a
     # slow renderer (or a reconnect that dropped tool.complete) can still answer
     # afterward. Without this the late `*.respond` would hit the generic 4009
     # "no pending request" error and clients would surface a raw JSON-RPC string.
     if not answered and not answer_present and event in {
         "secret.request",
-        "sudo.request",
         "clarify.request",
         "terminal.read.request",
     }:
@@ -2983,7 +2982,7 @@ def _clear_pending(sid: str | None = None) -> None:
 
     When *sid* is provided, only prompts owned by that session are
     released — critical for session.interrupt, which must not
-    collaterally cancel clarify/sudo/secret prompts on unrelated
+    collaterally cancel clarify/secret prompts on unrelated
     sessions sharing the same tui_gateway process.  When *sid* is
     None, every pending prompt is released (used during shutdown).
     """
@@ -5571,11 +5570,9 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
 
 
 def _wire_callbacks(sid: str):
-    from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
 
     def secret_cb(env_var, prompt, metadata=None):
@@ -9212,12 +9209,10 @@ def _run_prompt_submit(
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
-            # The sudo password callback is thread-local (tools.terminal_tool
-            # _callback_tls), so wiring it on the build thread doesn't reach this
-            # turn thread — terminal sudo prompts would fall through to /dev/tty
-            # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
+            # Re-wire the project-workspace and secret-capture callbacks on
+            # the turn thread. Both are module globals, so this is a
+            # harmless no-op most of the time — kept for the rare case a
+            # callback was cleared or replaced between build and turn.
             _wire_callbacks(sid)
             # Skip the config-model sync while a /model --once override is
             # active: the once-model is intentionally not pinned as a session

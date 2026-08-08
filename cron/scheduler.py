@@ -3917,6 +3917,16 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "cron.started", subsystem="cron", outcome="started",
+                action_id=job["id"], detail=job.get("name", job["id"]),
+            )
+        except Exception:
+            pass
+
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
         # gateway profiles / room→profile multiplexing), and cron fires from

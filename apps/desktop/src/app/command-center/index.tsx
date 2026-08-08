@@ -287,7 +287,8 @@ export function CommandCenterView({ initialSection, onClose, onDeleteSession, on
             lines: [cc.actionStartedWaiting],
             name: started.name,
             pid: started.pid,
-            running: true
+            running: true,
+            status: null
           }
 
           setSystemAction(pendingStatus)

@@ -728,7 +728,11 @@ def _recoverable_oneshot_run_at(
 
     try:
         run_at_dt = _ensure_aware(datetime.fromisoformat(run_at))
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "One-shot job has an unparseable run_at %r — treating as never "
+            "eligible to fire/recover: %s", run_at, e,
+        )
         return None
     if run_at_dt >= now - timedelta(seconds=ONESHOT_GRACE_SECONDS):
         return run_at
@@ -763,8 +767,11 @@ def _compute_grace_seconds(schedule: dict) -> int:
                 period_seconds = int((second - first).total_seconds())
                 grace = period_seconds // 2
                 return max(MIN_GRACE, min(grace, MAX_GRACE))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "Could not compute cron period from expr %r for grace "
+                    "window — falling back to MIN_GRACE: %s", expr, e,
+                )
 
     return MIN_GRACE
 
@@ -884,20 +891,21 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     store = _current_cron_store()
     try:
         _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Could not write ticker heartbeat marker: %s", e)
     if success:
         try:
             _atomic_write_epoch(store.cron_dir / "ticker_last_success")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Could not write ticker last-success marker: %s", e)
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:
     try:
         raw = path.read_text(encoding="utf-8").strip()
         return max(0.0, time.time() - float(raw))
-    except Exception:
+    except Exception as e:
+        logger.debug("Could not read epoch marker %s: %s", path, e)
         return None
 
 
@@ -935,8 +943,8 @@ def record_catch_up_occurrence() -> None:
         except (OSError, ValueError):
             value = 0
         _atomic_write_counter(path, max(0, value) + 1)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Could not increment catch-up occurrence counter: %s", e)
 
 
 def record_ticker_error(message: str) -> None:
@@ -970,8 +978,12 @@ def record_ticker_error(message: str) -> None:
             except OSError:
                 pass
             raise
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Could not persist ticker last-error message (original tick "
+            "failure was: %r) — the root cause of that failure will not be "
+            "visible to 'hermes cron status': %s", message, e,
+        )
 
 
 def get_catch_up_occurrence_count() -> int:
@@ -979,7 +991,8 @@ def get_catch_up_occurrence_count() -> int:
     path = _current_cron_store().cron_dir / "catch_up_occurrences"
     try:
         return max(0, int(path.read_text(encoding="utf-8").strip()))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        logger.debug("Could not read catch-up occurrence counter %s: %s", path, e)
         return 0
 
 
@@ -988,8 +1001,11 @@ def clear_ticker_error() -> None:
     store = _current_cron_store()
     try:
         (store.cron_dir / "ticker_last_error").unlink()
-    except OSError:
-        pass
+    except OSError as e:
+        logger.warning(
+            "Could not clear stale ticker_last_error marker — a resolved "
+            "failure may keep being reported by 'hermes cron status': %s", e,
+        )
 
 
 def get_ticker_last_error() -> Optional[str]:
@@ -997,7 +1013,8 @@ def get_ticker_last_error() -> Optional[str]:
     store = _current_cron_store()
     try:
         raw = (store.cron_dir / "ticker_last_error").read_text(encoding="utf-8")
-    except Exception:
+    except Exception as e:
+        logger.debug("Could not read ticker_last_error marker: %s", e)
         return None
     lines = raw.splitlines()
     if len(lines) < 2:
@@ -1157,7 +1174,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         try:
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         cfg = _expand_env_vars(cfg)
         # Mirror run_job's precedence: the explicit cron-fleet default
@@ -1697,6 +1714,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(
+            "cron.outcome", subsystem="cron",
+            outcome="succeeded" if success else "failed",
+            action_id=job_id, detail=error or delivery_error or "",
+        )
+    except Exception as e:
+        logger.warning(
+            "Could not emit cron.outcome event for job %s (outcome=%s) — "
+            "this run's result will not appear in the audit trail: %s",
+            job_id, "succeeded" if success else "failed", e,
+        )
+
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -2011,8 +2043,11 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < claim_ttl_seconds:
                         return False  # someone holds a fresh claim
-                except Exception:
-                    pass  # malformed claim → overwrite
+                except Exception as e:
+                    logger.debug(
+                        "Malformed fire_claim on job %s (%r) — overwriting: %s",
+                        job_id, existing, e,
+                    )  # malformed claim → overwrite
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
@@ -2173,8 +2208,11 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < _run_claim_ttl:
                         continue  # a fresh claim is held by an in-flight run
-                except (KeyError, ValueError, TypeError):
-                    pass  # malformed claim → fall through and (re)claim
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.debug(
+                        "Malformed run_claim on job %s (%r) — falling through "
+                        "to (re)claim: %s", job.get("id"), existing_claim, e,
+                    )
 
             next_run = job.get("next_run_at")
             if not next_run:

@@ -103,6 +103,22 @@ def _normalize_enabled(value: Any) -> bool:
     return False
 
 
+def emit_gate_event(subsystem: str, outcome: str, action_id: str, detail: str) -> None:
+    """Best-effort event-log emit for a write-approval gate decision.
+
+    Shared by every caller of ``evaluate_gate``/``stage_write`` so the
+    boilerplate isn't duplicated at each of the memory/skills call sites.
+    Never lets a logging failure affect the actual gate decision.
+    """
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(f"approval.{outcome}", subsystem=subsystem, outcome=outcome,
+                   action_id=action_id, detail=detail)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Pending store (file-backed)
 # ---------------------------------------------------------------------------

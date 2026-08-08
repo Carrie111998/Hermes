@@ -689,8 +689,6 @@ def load_cli_config() -> Dict[str, Any]:
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
-        # Sudo support (works with all backends)
-        "sudo_password": "SUDO_PASSWORD",
     }
     
     # Bridge config → env vars for terminal_tool. TERMINAL_CWD is force-exported
@@ -959,12 +957,6 @@ def _cleanup_all_terminals(*args, **kwargs):
     from tools.terminal_tool import cleanup_all_environments
 
     return cleanup_all_environments(*args, **kwargs)
-
-
-def set_sudo_password_callback(*args, **kwargs):
-    from tools.terminal_tool import set_sudo_password_callback as _set_sudo_password_callback
-
-    return _set_sudo_password_callback(*args, **kwargs)
 
 
 def set_approval_callback(*args, **kwargs):
@@ -4627,8 +4619,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_freetext = False
         self._clarify_deadline = 0
         self._clarify_multi_base = None
-        self._sudo_state = None
-        self._sudo_deadline = 0
         self._modal_input_snapshot = None
         self._approval_state = None
         self._approval_deadline = 0
@@ -5699,7 +5689,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         awaiting_input = bool(
             self._approval_state
             or self._clarify_state
-            or self._sudo_state
             or self._secret_state
             or getattr(self, "_slash_confirm_state", None)
         )
@@ -6977,7 +6966,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self._command_running:
             _cprint(f"{_DIM}Wait for the current command to finish before opening the editor.{_RST}")
             return False
-        if self._sudo_state or self._secret_state or self._approval_state or getattr(self, "_slash_confirm_state", None) or self._clarify_state:
+        if self._secret_state or self._approval_state or getattr(self, "_slash_confirm_state", None) or self._clarify_state:
             _cprint(f"{_DIM}Finish the active prompt before opening the editor.{_RST}")
             return False
         target_buffer = buffer or getattr(app, "current_buffer", None)
@@ -7113,7 +7102,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Install tool callbacks that need the live prompt UI."""
         if getattr(self, "_tool_callbacks_installed", False):
             return
-        set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)
         set_secret_capture_callback(self._secret_capture_callback)
         try:
@@ -7122,7 +7110,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _set_cu_cb(self._computer_use_approval_callback)
         except ImportError:
             pass
+        self._warn_if_sudo_password_configured()
         self._tool_callbacks_installed = True
+
+    def _warn_if_sudo_password_configured(self) -> None:
+        """One-shot startup warning when a leftover SUDO_PASSWORD is set.
+
+        Hermes removed the sudo-password-piping mechanism: SUDO_PASSWORD
+        was a process-global secret that every agent-spawned command could
+        read from its own environment. It is no longer read anywhere, so a
+        value left in .env or the shell environment is inert — but worth
+        flagging so it gets cleaned up rather than sitting there unused.
+        """
+        if "SUDO_PASSWORD" not in os.environ:
+            return
+        from tools.terminal_tool import _sudo_nopasswd_works
+
+        if _sudo_nopasswd_works():
+            _cprint(
+                f"{_DIM}Note: SUDO_PASSWORD is set but no longer used by Hermes — "
+                f"and sudo already works here without a password (NOPASSWD is "
+                f"configured), so it's safe to remove.{_RST}"
+            )
+        else:
+            _cprint(
+                f"{_DIM}Note: SUDO_PASSWORD is set but no longer used by Hermes — "
+                f"the password-piping mechanism was removed as a security fix. "
+                f"For agent-run sudo commands to work, add a scoped NOPASSWD rule "
+                f"for this user instead, e.g. via "
+                f"`sudo visudo -f /etc/sudoers.d/hermes`.{_RST}"
+            )
 
     def _ensure_tirith_security(self) -> None:
         """Check tirith availability once before tools can run terminal commands."""
@@ -13081,54 +13098,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "Use your best judgement to make the choice and proceed."
         )
 
-    def _sudo_password_callback(self) -> str:
-        """
-        Prompt for sudo password through the prompt_toolkit UI.
-        
-        Called from the agent thread when a sudo command is encountered.
-        Uses the same clarify-style mechanism: sets UI state, waits on a
-        queue for the user's response via the Enter key binding.
-        """
-        import time as _time
-
-        timeout = 45
-        response_queue = queue.Queue()
-
-        self._capture_modal_input_snapshot()
-        self._sudo_state = {
-            "response_queue": response_queue,
-        }
-        self._sudo_deadline = _time.monotonic() + timeout
-
-        # Modal prompt — paint immediately, bypassing the throttle/resize guard
-        # so the prompt can't be dropped and time out unseen (#41098).
-        self._paint_now()
-
-        while True:
-            try:
-                result = response_queue.get(timeout=1)
-                self._sudo_state = None
-                self._sudo_deadline = 0
-                self._restore_modal_input_snapshot()
-                self._paint_now()
-                if result:
-                    _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
-                else:
-                    _cprint(f"\n{_DIM}  ⏭ Skipped{_RST}")
-                return result
-            except queue.Empty:
-                remaining = self._sudo_deadline - _time.monotonic()
-                if remaining <= 0:
-                    break
-                self._paint_now()
-
-        self._sudo_state = None
-        self._sudo_deadline = 0
-        self._restore_modal_input_snapshot()
-        self._paint_now()
-        _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
-        return ""
-
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
                            smart_denied: bool = False) -> str:
@@ -13497,14 +13466,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._clarify_state = None
             self._clarify_freetext = False
             self._clarify_multi_base = None
-        if self._sudo_state:
-            try:
-                self._sudo_state["response_queue"].put("")
-            except Exception:
-                pass
-            self._sudo_state = None
-            self._sudo_deadline = 0
-            self._restore_modal_input_snapshot()
         if self._secret_state:
             try:
                 self._cancel_secret_capture()
@@ -13807,7 +13768,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # registration (run() line ~9046) is invisible here because
                 # _callback_tls is threading.local().  Matches the pattern used
                 # by acp_adapter/server.py for ACP sessions.
-                set_sudo_password_callback(self._sudo_password_callback)
                 set_approval_callback(self._approval_callback)
                 try:
                     set_secret_capture_callback(self._secret_capture_callback)
@@ -13906,7 +13866,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # Clear thread-local callbacks so a reused thread doesn't
                     # hold stale references to a disposed CLI instance.
                     try:
-                        set_sudo_password_callback(None)
                         set_approval_callback(None)
                         set_secret_capture_callback(None)
                     except Exception:
@@ -14651,8 +14610,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return _state_fragment("class:voice-recording", "●", bar)
         if self._voice_processing:
             return _state_fragment("class:voice-processing", "◉")
-        if self._sudo_state:
-            return _state_fragment("class:sudo-prompt", "🔐")
         if self._secret_state:
             return _state_fragment("class:sudo-prompt", "🔑")
         if self._approval_state:
@@ -14757,7 +14714,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _build_tui_layout_children(
         self,
         *,
-        sudo_widget,
         secret_widget,
         approval_widget,
         slash_confirm_widget=None,
@@ -14782,7 +14738,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return [
             item for item in [
                 Window(height=0),
-                sudo_widget,
                 secret_widget,
                 approval_widget,
                 slash_confirm_widget,
@@ -15002,9 +14957,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_freetext = False  # True when user chose "Other" and is typing
         self._clarify_deadline = 0      # monotonic timestamp when the clarify times out
 
-        # Sudo password prompt state (similar mechanism to clarify)
-        self._sudo_state = None         # dict with response_queue when active
-        self._sudo_deadline = 0
         self._modal_input_snapshot = None
 
         # Dangerous command approval state (similar mechanism to clarify)
@@ -15070,9 +15022,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         def handle_enter(event):
             """Handle Enter key - submit input.
-            
+
             Routes to the correct queue based on active UI state:
-            - Sudo password prompt: password goes to sudo response queue
             - Approval selection: selected choice goes to approval response queue
             - Clarify freetext mode: answer goes to the clarify response queue
             - Clarify choice mode: selected choice goes to the clarify response queue
@@ -15081,14 +15032,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             Commands (starting with /) always go to _pending_input so they're
             handled as commands, not sent as interrupt text to the agent.
             """
-            # --- Sudo password prompt: submit the typed password ---
-            if self._sudo_state:
-                text = event.app.current_buffer.text
-                self._sudo_state["response_queue"].put(text)
-                self._sudo_state = None
-                event.app.invalidate()
-                return
-
             # --- Secret prompt: submit the typed secret ---
             if self._secret_state:
                 text = event.app.current_buffer.text
@@ -15383,7 +15326,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # in those IDEs and arrives here as ('escape', 'g') — register it as
         # a fallback so the editor handoff works inside Cursor/VSCode too.
         _editor_filter = Condition(
-            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state
+            lambda: not self._clarify_state and not self._approval_state and not self._secret_state
         )
 
         @kb.add('c-g', filter=_editor_filter)
@@ -15394,12 +15337,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # --- Ctrl+S prompt stash -------------------------------------------
         # Park a half-written draft, send something else, then bring the draft
-        # back.  Suppressed while a modal prompt owns the composer (sudo /
-        # secret / approval / clarify) so Ctrl+S can't stash a password.
+        # back.  Suppressed while a modal prompt owns the composer (secret /
+        # approval / clarify) so Ctrl+S can't stash a secret mid-entry.
         _stash_filter = Condition(
             lambda: not cli_ref._clarify_state
             and not cli_ref._approval_state
-            and not cli_ref._sudo_state
             and not cli_ref._secret_state
             and not cli_ref._slash_confirm_state
             and not cli_ref._model_picker_state
@@ -15684,7 +15626,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
         # history browsing when on the first/last line (or single-line input).
         _normal_input = Condition(
-            lambda: not self._clarify_state and not self._approval_state and not self._slash_confirm_state and not self._sudo_state and not self._secret_state and not self._model_picker_state
+            lambda: not self._clarify_state and not self._approval_state and not self._slash_confirm_state and not self._secret_state and not self._model_picker_state
         )
 
         def _recall_without_recollapse(buf, move):
@@ -15780,8 +15722,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # ever reaching the agent-interrupt branch, leaving the chat frozen
             # (#14026).
             _overlay_cleared = bool(
-                self._sudo_state
-                or self._secret_state
+                self._secret_state
                 or self._approval_state
                 or self._clarify_state
             )
@@ -15867,8 +15808,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the agent-interrupt branch so a single Ctrl+Q both clears a stale
             # overlay and interrupts a still-running agent (#14026).
             _overlay_cleared = bool(
-                self._sudo_state
-                or self._secret_state
+                self._secret_state
                 or self._approval_state
                 or self._clarify_state
             )
@@ -15909,20 +15849,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 event.app.exit()
 
         _modal_prompt_active = Condition(
-            lambda: bool(self._secret_state or self._sudo_state or self._slash_confirm_state)
+            lambda: bool(self._secret_state or self._slash_confirm_state)
         )
 
         @kb.add('escape', filter=_modal_prompt_active, eager=True)
         def handle_escape_modal(event):
-            """ESC cancels active secret/sudo prompts."""
+            """ESC cancels active secret prompts."""
             if self._secret_state:
                 self._cancel_secret_capture()
                 event.app.current_buffer.reset()
-                event.app.invalidate()
-                return
-            if self._sudo_state:
-                self._sudo_state["response_queue"].put("")
-                self._sudo_state = None
                 event.app.invalidate()
                 return
             if self._slash_confirm_state:
@@ -16044,7 +15979,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     event.app.invalidate()
                     return
                 # Guard: don't START recording during interactive prompts
-                if cli_ref._clarify_state or cli_ref._sudo_state or cli_ref._approval_state or cli_ref._slash_confirm_state:
+                if cli_ref._clarify_state or cli_ref._approval_state or cli_ref._slash_confirm_state:
                     return
 
                 # Interrupt TTS if playing, so user can start talking.
@@ -16306,12 +16241,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # --- Input processors for password masking and inline placeholder ---
 
-        # Mask input with '*' when the sudo password prompt is active
+        # Mask input with '*' when the secret capture prompt is active
         input_area.control.input_processors.append(
             ConditionalProcessor(
                 PasswordProcessor(),
                 filter=Condition(
-                    lambda: bool(cli_ref._sudo_state) or bool(cli_ref._secret_state)
+                    lambda: bool(cli_ref._secret_state)
                 ),
             )
         )
@@ -16335,8 +16270,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return f"recording... {_label} to stop, Ctrl+C to cancel"
             if cli_ref._voice_processing:
                 return "transcribing..."
-            if cli_ref._sudo_state:
-                return "type password (hidden), Enter to submit · ESC to skip"
             if cli_ref._secret_state:
                 return "type secret (hidden), Enter to submit · ESC to skip"
             if cli_ref._approval_state:
@@ -16370,16 +16303,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         input_area.control.input_processors.append(_PlaceholderProcessor(_get_placeholder))
 
         # Hint line above input: shown only for interactive prompts that need
-        # extra instructions (sudo countdown, approval navigation, clarify).
+        # extra instructions (secret countdown, approval navigation, clarify).
         # The agent-running interrupt hint is now an inline placeholder above.
         def get_hint_text():
-            if cli_ref._sudo_state:
-                remaining = max(0, int(cli_ref._sudo_deadline - time.monotonic()))
-                return [
-                    ('class:hint', '  password hidden · Enter to skip'),
-                    ('class:clarify-countdown', f'  ({remaining}s)'),
-                ]
-
             if cli_ref._secret_state:
                 remaining = max(0, int(cli_ref._secret_deadline - time.monotonic()))
                 return [
@@ -16428,7 +16354,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running:
+            if cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running:
                 return 1
             # Keep a spacer while the agent runs on roomy terminals, but reclaim
             # the row on narrow/mobile screens where every line matters.
@@ -16721,33 +16647,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             filter=Condition(lambda: cli_ref._clarify_state is not None),
         )
 
-        # --- Sudo password: display widget ---
-
-        def _get_sudo_display():
-            state = cli_ref._sudo_state
-            if not state:
-                return []
-            title = '🔐 Sudo Password Required'
-            body = 'Enter password below (hidden), or press Enter to skip'
-            box_width = _panel_box_width(title, [body])
-            lines = []
-            lines.append(('class:sudo-border', '╭─ '))
-            lines.append(('class:sudo-title', title))
-            lines.append(('class:sudo-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
-            _append_blank_panel_line(lines, 'class:sudo-border', box_width)
-            _append_panel_line(lines, 'class:sudo-border', 'class:sudo-text', body, box_width)
-            _append_blank_panel_line(lines, 'class:sudo-border', box_width)
-            lines.append(('class:sudo-border', '╰' + ('─' * box_width) + '╯\n'))
-            return lines
-
-        sudo_widget = ConditionalContainer(
-            Window(
-                FormattedTextControl(_get_sudo_display),
-                wrap_lines=True,
-            ),
-            filter=Condition(lambda: cli_ref._sudo_state is not None),
-        )
-
         def _get_secret_display():
             state = cli_ref._secret_state
             if not state:
@@ -16977,7 +16876,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         layout = Layout(
             HSplit(
                 self._build_tui_layout_children(
-                    sudo_widget=sudo_widget,
                     secret_widget=secret_widget,
                     approval_widget=approval_widget,
                     slash_confirm_widget=slash_confirm_widget,
@@ -17671,7 +17569,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
             # Unregister callbacks to avoid dangling references
-            set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
             # Flush any in-memory turn transcript before marking the session

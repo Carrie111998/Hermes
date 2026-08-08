@@ -151,11 +151,16 @@ class TestUpdateCommandGatewayFlag:
              patch("subprocess.Popen", mock_popen):
             result = await runner._handle_update_command(event)
 
-        # Check the bash command string contains --gateway and PYTHONUNBUFFERED
+        # Check the bash command string contains --gateway.
+        # PYTHONUNBUFFERED is no longer embedded in the string: since the
+        # spawn moved to the shared hermes_cli.action_spawn helper (also
+        # used by the dashboard's HTTP-triggered update path), it's set via
+        # the Popen `env` kwarg instead of a shell-level `VAR=1 cmd` prefix
+        # — same effective environment, different mechanism.
         call_args = mock_popen.call_args[0][0]
         cmd_string = call_args[-1] if isinstance(call_args, list) else str(call_args)
         assert "--gateway" in cmd_string
-        assert "PYTHONUNBUFFERED" in cmd_string
+        assert mock_popen.call_args.kwargs.get("env", {}).get("PYTHONUNBUFFERED") == "1"
         assert "rc=$?" in cmd_string
         assert "status=$?" not in cmd_string
         assert "stream progress" in result

@@ -833,6 +833,16 @@ class ProcessRegistry:
                 pass
             raise
 
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "process.spawned", subsystem="process", outcome="started",
+                action_id=session.id, detail=session.command[:120],
+            )
+        except Exception:
+            pass
+
         return session
 
     def spawn_via_env(
@@ -932,6 +942,17 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
+
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "process.spawned", subsystem="process",
+                outcome="failed" if session.exited else "started",
+                action_id=session.id, detail=session.command[:120],
+            )
+        except Exception:
+            pass
 
         return session
 
@@ -1190,6 +1211,22 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+
+        # Only emit once, on the FIRST move — same idempotency guard as the
+        # completion notification below (kill_process() and the reader
+        # thread can both call _move_to_finished()).
+        if was_running:
+            try:
+                from hermes_logging import emit_event
+
+                emit_event(
+                    "process.exited", subsystem="process",
+                    outcome="failed" if (session.exit_code or 0) != 0 else "succeeded",
+                    action_id=session.id,
+                    detail=f"{session.completion_reason} (exit {session.exit_code})",
+                )
+            except Exception:
+                pass
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call

@@ -577,6 +577,16 @@ def _begin_tool_execution(
         pass
 
     try:
+        from hermes_logging import emit_event
+
+        emit_event(
+            "tool.started", subsystem="tools", outcome="started",
+            action_id=tool_call_id, detail=function_name,
+        )
+    except Exception:
+        pass
+
+    try:
         from tools.session_timeline import record_start as _timeline_record_start
 
         _timeline_record_start(
@@ -1264,6 +1274,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
         try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "tool.completed", subsystem="tools",
+                outcome="blocked" if blocked else ("failed" if is_error else "succeeded"),
+                action_id=tc.id, detail=f"{name} ({tool_duration:.2f}s)",
+            )
+        except Exception:
+            pass
+
+        try:
             from tools.session_timeline import record_end as _timeline_record_end
 
             _timeline_record_end(
@@ -1930,6 +1951,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "tool.completed", subsystem="tools",
+                outcome="blocked" if _execution_blocked else ("failed" if _is_error_result else "succeeded"),
+                action_id=tool_call.id, detail=f"{function_name} ({tool_duration:.2f}s)",
+            )
+        except Exception:
+            pass
 
         try:
             from tools.session_timeline import record_end as _timeline_record_end

@@ -2,11 +2,13 @@
 
 import os
 import sys
+import subprocess
 import types
 import io
 import contextlib
 from argparse import Namespace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -1411,3 +1413,181 @@ class TestDoctorDeprecatedConfigAndEnv:
         assert "Deprecated: delegation.max_async_children" in out
         assert "Deprecated: HERMES_TOOL_PROGRESS_MODE" in out
         assert "⚠" in out or "Deprecated" in out
+
+
+class TestCheckForkUpstreamDrift:
+    """Coverage for E4: _check_fork_upstream_drift reports the fork picture
+    via resolve_compare_ref (update_cmd.py) rather than reimplementing the
+    upstream-preference rule, and never fetches over the network."""
+
+    @staticmethod
+    def _side_effect(*, has_upstream=True, branch="main", origin_counts=(0, 0),
+                      upstream_counts=(0, 0), origin_ref_exists=True, upstream_ref_exists=True):
+        """origin_counts/upstream_counts are (ahead, behind) pairs."""
+        origin_ahead, origin_behind = origin_counts
+        upstream_ahead, upstream_behind = upstream_counts
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "remote" in joined and "get-url" in joined and "origin" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="https://github.com/jidmirzyah/hermes-agent.git\n", stderr="")
+            if "remote" in joined and "get-url" in joined and "upstream" in joined:
+                rc = 0 if has_upstream else 1
+                out = "https://github.com/NousResearch/hermes-agent.git\n" if has_upstream else ""
+                return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr="")
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+            if "rev-parse" in joined and "--verify" in joined:
+                if f"origin/{branch}" in joined:
+                    rc = 0 if origin_ref_exists else 1
+                elif f"upstream/{branch}" in joined:
+                    rc = 0 if upstream_ref_exists else 1
+                else:
+                    rc = 1
+                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+            if "rev-list" in joined and f"HEAD..origin/{branch}" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{origin_behind}\n", stderr="")
+            if "rev-list" in joined and f"origin/{branch}..HEAD" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{origin_ahead}\n", stderr="")
+            if "rev-list" in joined and f"HEAD..upstream/{branch}" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{upstream_behind}\n", stderr="")
+            if "rev-list" in joined and f"upstream/{branch}..HEAD" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{upstream_ahead}\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        return side_effect
+
+    def test_behind_upstream_warns_and_appends_issue(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        issues = []
+        side_effect = self._side_effect(upstream_counts=(0, 7))
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "7 commit(s) behind upstream" in out
+        assert "⚠" in out
+        assert issues == ["7 commit(s) behind upstream — run 'hermes update' to sync."]
+
+    def test_diverged_from_upstream_warns_with_distinct_message(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        issues = []
+        side_effect = self._side_effect(upstream_counts=(2, 5))
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "Fork diverged from upstream: 2 ahead, 5 behind" in out
+        assert any("diverged" in i for i in issues)
+
+    def test_up_to_date_with_upstream_is_ok_not_warn(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        issues = []
+        side_effect = self._side_effect(upstream_counts=(0, 0))
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "Up to date with upstream" in out
+        assert issues == []
+
+    def test_no_upstream_remote_is_informational_only(self, monkeypatch, tmp_path, capsys):
+        """No upstream configured is a valid, deliberate setup — info, not warn."""
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        issues = []
+        side_effect = self._side_effect(has_upstream=False)
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "upstream: not configured" in out
+        assert "⚠" not in out
+        assert issues == []
+
+    def test_no_git_checkout_is_silent_noop(self, monkeypatch, tmp_path, capsys):
+        """Mirrors _check_version_consistency's graceful skip when there's no
+        git checkout to inspect (e.g. the Docker image path)."""
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)  # no .git dir created
+
+        issues = []
+        with patch("subprocess.run") as mock_run:
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "Fork / Upstream Sync" not in out
+        assert issues == []
+        mock_run.assert_not_called()
+
+    def test_skip_upstream_prompt_marker_reported_when_present(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        (tmp_path / ".skip_upstream_prompt").touch()
+
+        issues = []
+        side_effect = self._side_effect()
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "Upstream-add prompt previously declined" in out
+        # F7: the marker is discoverable AND reversible — a one-line remedy,
+        # not just a silent permanent note.
+        assert f"rm {tmp_path / '.skip_upstream_prompt'}" in out
+
+    def test_last_update_check_timestamp_labeled_honestly(self, monkeypatch, tmp_path, capsys):
+        """The ts field is 'last check', not 'last applied update' — the
+        label must say so, since nothing tracks the latter (see E4 investigation)."""
+        import json
+        import time
+
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        (tmp_path / ".update_check").write_text(
+            json.dumps({"ts": time.time(), "behind": 0, "rev": None, "ver": "0.19.1"})
+        )
+
+        issues = []
+        side_effect = self._side_effect()
+        with patch("subprocess.run", side_effect=side_effect):
+            doctor._check_fork_upstream_drift(issues)
+
+        out = capsys.readouterr().out
+        assert "Last update check:" in out
+        assert "not necessarily last applied update" in out
+
+    def test_uses_resolve_compare_ref_not_a_reimplementation(self, monkeypatch, tmp_path, capsys):
+        """Regression guard: the check must call the real shared helper, not
+        a parallel copy of the upstream-preference rule."""
+        monkeypatch.setattr(doctor, "PROJECT_ROOT", tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+        from hermes_cli import update_cmd
+        calls = []
+        real = update_cmd.resolve_compare_ref
+
+        def spy(git_cmd, cwd, branch):
+            calls.append(branch)
+            return real(git_cmd, cwd, branch)
+
+        issues = []
+        side_effect = self._side_effect()
+        with patch("subprocess.run", side_effect=side_effect), \
+             patch.object(update_cmd, "resolve_compare_ref", side_effect=spy):
+            doctor._check_fork_upstream_drift(issues)
+
+        assert calls == ["main"]
