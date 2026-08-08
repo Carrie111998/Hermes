@@ -19,8 +19,27 @@ from gateway.mac_ops_edge_protocol import MacOpsReadOnlyClass
 from tools.registry import registry, tool_error
 
 
+MAC_ONLY_CAPABILITIES = (
+    "authenticated_local_browser_or_app",
+    "reviewed_mac_local_files",
+    "mac_local_cli_or_private_network",
+)
+
+
+def _mac_only_capability(args: dict[str, Any]) -> str:
+    value = args.get("mac_only_capability")
+    if value not in MAC_ONLY_CAPABILITIES:
+        raise MacOpsEdgeClientError("invalid_mac_only_capability")
+    return str(value)
+
+
 def _submit(args: dict[str, Any], **_kwargs: Any) -> str:
     try:
+        # This is a structural Mac-only admission gate, not a prose
+        # classifier.  The model must select the concrete Mac-resident
+        # capability before this service-gated tool can dispatch; the wire
+        # protocol remains v1 and the edge still does not infer intent.
+        _mac_only_capability(args)
         response = privileged_mac_ops_edge_client().submit_readonly(
             title=args.get("title"),
             task_class=args.get("task_class"),
@@ -32,19 +51,14 @@ def _submit(args: dict[str, Any], **_kwargs: Any) -> str:
         code = getattr(exc, "code", "mac_ops_readonly_submit_invalid")
         uncertain = bool(getattr(exc, "dispatch_uncertain", False))
         return tool_error(
-            json.dumps(
-                {
-                    "error": code,
-                    "dispatch_uncertain": uncertain,
-                    "instruction": (
-                        "Read the same idempotency key before considering another "
-                        "submission. Never create a new key to bypass uncertain state."
-                        if uncertain
-                        else "Correct the explicit request fields or report the blocker."
-                    ),
-                },
-                sort_keys=True,
-            )
+            code,
+            dispatch_uncertain=uncertain,
+            instruction=(
+                "Read the same idempotency key before considering another "
+                "submission. Never create a new key to bypass uncertain state."
+                if uncertain
+                else "Correct the explicit request fields or report the blocker."
+            ),
         )
 
 
@@ -57,18 +71,19 @@ def _read(args: dict[str, Any], **_kwargs: Any) -> str:
         return json.dumps(response, ensure_ascii=False, sort_keys=True)
     except (MacOpsEdgeClientError, TypeError, ValueError) as exc:
         code = getattr(exc, "code", "mac_ops_task_read_invalid")
-        return tool_error(json.dumps({"error": code}, sort_keys=True))
+        return tool_error(code)
 
 
 SUBMIT_SCHEMA = {
     "name": "mac_ops_readonly_submit",
     "description": (
         "Submit an exact model-authored read-only task contract to the separately "
-        "authenticated Mac edge. Use it when the required evidence exists only "
-        "in an explicitly selected local browser session, reviewed local files, "
-        "or local CLI. The edge does not decide what the task means. It never "
-        "accepts mutations or self-asserted approval. Preserve the idempotency key "
-        "for reconciliation and then use mac_ops_task_read."
+        "authenticated Mac edge. Select one concrete mac_only_capability only when "
+        "the task depends on Mac-resident state unavailable outside that Mac. This "
+        "queued v1 edge is not a generic compute-cost routing path. The edge does "
+        "not decide what the task means. It never accepts mutations or self-asserted "
+        "approval. Preserve the idempotency key for reconciliation and then use "
+        "mac_ops_task_read."
     ),
     "parameters": {
         "type": "object",
@@ -83,12 +98,24 @@ SUBMIT_SCHEMA = {
                 "enum": [item.value for item in MacOpsReadOnlyClass],
                 "description": "Explicit mechanical permission class for this read-only handoff.",
             },
+            "mac_only_capability": {
+                "type": "string",
+                "enum": list(MAC_ONLY_CAPABILITIES),
+                "description": (
+                    "Concrete Mac-resident capability required by this exact task. "
+                    "Generic code, CI, Git/GitLab, GCP API, or CLI work is not "
+                    "Mac-only merely because it ran there before. This selection is "
+                    "an explicit model decision; the edge does not classify the "
+                    "contract prose or choose the execution location."
+                ),
+            },
             "contract": {
                 "type": "string",
                 "description": (
-                    "Complete task contract containing Objective, Allowed scope, "
-                    "Forbidden actions, Secrets handling, Verification, and Expected "
-                    "report. Author the actual meaning here; do not include credentials."
+                    "Complete task contract containing Objective, Mac-only basis, "
+                    "Allowed scope, Forbidden actions, Secrets handling, Verification, "
+                    "and Expected report. Author the actual meaning here; do not "
+                    "include credentials."
                 ),
             },
             "idempotency_key": {
@@ -97,7 +124,13 @@ SUBMIT_SCHEMA = {
                 "description": "Stable unique key reused for every retry of this exact contract.",
             },
         },
-        "required": ["title", "task_class", "contract", "idempotency_key"],
+        "required": [
+            "title",
+            "task_class",
+            "mac_only_capability",
+            "contract",
+            "idempotency_key",
+        ],
         "additionalProperties": False,
     },
 }

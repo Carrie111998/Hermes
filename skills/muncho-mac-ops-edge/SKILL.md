@@ -11,24 +11,37 @@ metadata:
 
 # Protected Mac operations edge
 
-Use this edge only when you decide that required evidence is available through
-the separately authenticated Mac browser or an explicitly selected local
-read-only surface. The edge does not interpret the request and does not choose
-whether it is needed; you do.
+Use this edge only when the task depends on concrete Mac-resident state
+unavailable outside that Mac: an authenticated local browser or app session,
+explicitly reviewed Mac-local files, or Mac-local CLI/private-network state.
+The edge does not interpret the request or choose where work runs; you do.
+
+This v1 edge always creates a queued task record, so do not use it merely to
+shift cloud-capable code, tests, CI, Git/GitLab, GCP API, or generic terminal
+work to the Mac for cost. Safe cost-aware Mac preference needs a concrete
+fresh-heartbeat and atomic immediate-claim protocol: no claim means use cloud,
+an expired offer cannot execute, and a claimed offer must suppress the cloud
+duplicate. Until that protocol and its worker consumer exist, leave generic
+execution on its existing path. Never submit here and then fall back to cloud;
+that would leave a duplicate task able to run later.
 
 ## Contract
 
 Call `mac_ops_readonly_submit` with:
 
 - one explicit read-only `task_class`;
+- one explicit `mac_only_capability` required by the task;
 - a stable idempotency key for the exact contract;
-- a complete contract with these headings: `Objective`, `Allowed scope`,
-  `Forbidden actions`, `Secrets handling`, `Verification`, `Expected report`.
+- a complete contract with these headings: `Objective`, `Mac-only basis`,
+  `Allowed scope`, `Forbidden actions`, `Secrets handling`, `Verification`,
+  `Expected report`.
 
-State the concrete evidence to retrieve and its allowed scope. Forbid writes,
-publishing, messaging, approval, configuration, and account changes unless the
-user has separately approved a later mutation protocol. Never include tokens,
-passwords, cookies, or private keys.
+State the concrete Mac-only evidence to retrieve, why it is unavailable outside
+that Mac, and its allowed scope. If no listed Mac-only capability is required,
+do not submit the handoff. Forbid writes, publishing, messaging,
+approval, configuration, and account changes unless the user has separately
+approved a later mutation protocol. Never include tokens, passwords, cookies,
+or private keys.
 
 After submission, call `mac_ops_task_read` with the returned issue IID. An open
 issue or a queued receipt is not completion. Read the returned evidence, decide
