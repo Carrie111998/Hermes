@@ -189,6 +189,19 @@ jobs:
             cp website/build/llms-full.txt _site/llms-full.txt
           fi
 
+      - name: Retain previous deployment's hashed assets
+        # Pages keeps only the newest deploy while the CDN serves cached HTML
+        # (max-age=300 + stale-while-revalidate=3600) that references the
+        # PREVIOUS deploy's content-hashed bundles. At our deploy cadence
+        # (several per hour) that left the site with 404ing JS/CSS — dead
+        # search, broken lazy routes — for much of the day. Union-merge the
+        # prior artifact's assets/ into the new tree so stale HTML keeps
+        # working; 7-day retention manifest bounds growth. Best-effort:
+        # never blocks the deploy.
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python3 scripts/retain_pages_assets.py _site
+
       - name: Upload artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3
         with:
