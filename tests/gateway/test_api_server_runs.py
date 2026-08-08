@@ -196,6 +196,7 @@ class TestStartRun:
     async def test_start_scopes_runtime_env_to_tool_subprocess(self, adapter):
         app = _create_runs_app(adapter)
         captured = {}
+        child_ran = threading.Event()
 
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
@@ -214,6 +215,7 @@ class TestStartRun:
                         env=child_env,
                         text=True,
                     ).splitlines()
+                    child_ran.set()
                     return {"final_response": "done"}
 
                 mock_agent.run_conversation.side_effect = _capture_run
@@ -233,12 +235,7 @@ class TestStartRun:
                     },
                 )
                 assert resp.status == 202
-                run_id = (await resp.json())["run_id"]
-                for _ in range(40):
-                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
-                    if status["status"] == "completed":
-                        break
-                    await asyncio.sleep(0.05)
+                assert await asyncio.to_thread(child_ran.wait, 120)
 
         assert captured["child"] == ["scoped-test-token", "paperclip-run-1"]
         from gateway.runtime_context import get_runtime_env
