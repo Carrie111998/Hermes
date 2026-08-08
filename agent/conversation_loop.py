@@ -4359,7 +4359,11 @@ def run_conversation(
                 
                 error_type = type(api_error).__name__
                 error_msg = str(api_error).lower()
-                _error_summary = agent._summarize_api_error(api_error)
+                _error_summary = agent._summarize_api_error(
+                    api_error,
+                    provider=getattr(agent, "provider", None),
+                    model=getattr(agent, "model", None),
+                )
                 logger.warning(
                     "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                     retry_count,
@@ -5307,7 +5311,11 @@ def run_conversation(
                     # returned ``error`` field and downstream consumers deliver
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
-                    _nonretryable_summary = agent._summarize_api_error(api_error)
+                    _nonretryable_summary = agent._summarize_api_error(
+                        api_error,
+                        provider=getattr(agent, "provider", None),
+                        model=getattr(agent, "model", None),
+                    )
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
@@ -5519,7 +5527,11 @@ def run_conversation(
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
-                    _final_summary = agent._summarize_api_error(api_error)
+                    _final_summary = agent._summarize_api_error(
+                        api_error,
+                        provider=getattr(agent, "provider", None),
+                        model=getattr(agent, "model", None),
+                    )
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
                         agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")

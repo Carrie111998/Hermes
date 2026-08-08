@@ -2516,14 +2516,35 @@ class AIAgent:
         return str(value)
 
     @staticmethod
-    def _summarize_api_error(error: Exception) -> str:
+    def _summarize_api_error(
+        error: Exception,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
         """Extract a human-readable one-liner from an API error.
 
         Handles Cloudflare HTML error pages (502, 503, etc.) by pulling the
         <title> tag instead of dumping raw HTML.  Falls back to a truncated
         str(error) for everything else.
+
+        ``provider``/``model`` are optional context: when supplied, transport
+        timeouts (which stringify to an EMPTY string in httpx) are summarized
+        with the configured timeout value and the exact config knob to raise
+        instead of producing a blank summary.  Ported from block/buzz#4959.
         """
         raw = str(error)
+
+        # Transport timeouts first: httpx's ReadTimeout/ConnectTimeout carry
+        # no message at all, so every later branch would yield a blank
+        # summary ("API call failed after 6 retries: ").  Classify the phase
+        # (connect vs read) from the exception type and say which timer
+        # fired.  Non-timeout errors return None and fall through unchanged.
+        from agent.timeout_error_summary import summarize_timeout_error
+        _timeout_summary = summarize_timeout_error(
+            error, provider=provider, model=model,
+        )
+        if _timeout_summary is not None:
+            return _timeout_summary
 
         if (
             isinstance(error, ValueError)
