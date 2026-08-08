@@ -1440,3 +1440,19 @@ def test_default_config_has_no_duplicate_top_level_keys():
             if "model" in keys and "kanban" in keys:  # the DEFAULT_CONFIG literal
                 dupes = {k for k in keys if keys.count(k) > 1}
                 assert not dupes, f"duplicate DEFAULT_CONFIG keys: {sorted(dupes)}"
+
+
+class TestPasteCollapseDataThreshold:
+    """Whitespace-free single-line data pastes collapse below the char guard."""
+
+    def test_default_config_ships_the_data_threshold(self):
+        assert DEFAULT_CONFIG["paste_collapse_data_threshold"] == 500
+
+    def test_load_config_merges_the_data_threshold(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.safe_dump({"_config_version": DEFAULT_CONFIG["_config_version"]}), encoding="utf-8")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            loaded = load_config()
+
+        assert loaded["paste_collapse_data_threshold"] == 500
