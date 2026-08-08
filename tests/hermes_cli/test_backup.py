@@ -133,6 +133,280 @@ class TestShouldExclude:
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))
 
+    def test_excludes_chrome_debug_transient_subpaths(self):
+        """Chrome's own transient profile churn (metrics buffer, per-tab
+        session-restore state, LevelDB WAL segments) is excluded outright so
+        the scan-then-archive race that produces spurious ENOENT warnings
+        (see docs/rca-chrome-debug-transient-files-backup.md) never fires in
+        the common case."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("chrome-debug/BrowserMetrics-spare.pma"))
+        assert _should_exclude(
+            Path("chrome-debug/Default/Sessions/Session_13430660839007907")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/Default/Sessions/Tabs_13430660850173240")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/Default/shared_proto_db/000003.log")
+        )
+        assert _should_exclude(
+            Path("chrome-debug/BrowserMetrics/BrowserMetrics-6A771AF3-8DD9.pma")
+        )
+
+    def test_chrome_debug_exclusion_is_scoped_to_top_level_dir(self):
+        """The exclusion must not blanket-match ``Sessions``/``shared_proto_db``
+        directories that happen to live somewhere else under HERMES_HOME —
+        only paths actually rooted under the top-level ``chrome-debug/``
+        profile are transient Chrome state."""
+        from hermes_cli.backup import _should_exclude
+        assert not _should_exclude(Path("skills/my-skill/Sessions/keep.txt"))
+        assert not _should_exclude(Path("Sessions/keep.txt"))
+        assert not _should_exclude(
+            Path("profiles/other/chrome-debug/BrowserMetrics-spare.pma")
+        )
+        # A regular, non-transient file inside chrome-debug/ is unaffected.
+        assert not _should_exclude(Path("chrome-debug/Default/Cookies"))
+
+
+# ---------------------------------------------------------------------------
+# Chrome-debug transient-file race: archive loop must warn, not fail
+# ---------------------------------------------------------------------------
+
+class TestChromeDebugTransientRace:
+    """Regression coverage for the backup-failure investigation: a file that
+    existed at scan time but is deleted by a live process (typically the
+    Hermes-managed chrome-debug Chrome) before the archive-write phase
+    reaches it must be logged as a warning and MUST NOT flip the summary to
+    "Backup incomplete" or suppress the restore hint."""
+
+    def test_vanished_file_is_warning_not_fatal(self, tmp_path, monkeypatch, capsys):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        # A file that exists at scan time but is deleted before zf.write()
+        # reaches it, simulating the chrome-debug scan-then-archive race.
+        vanishing = hermes_home / "chrome-debug-sim" / "will-vanish.txt"
+        vanishing.parent.mkdir(parents=True, exist_ok=True)
+        vanishing.write_text("ephemeral")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def flaky_write(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(vanishing):
+                vanishing.unlink()
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", flaky_write)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "Restore with:" in out
+        assert "changed during backup" in out
+        assert "will-vanish.txt" in out
+
+        # The archive itself must still be valid.
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug-sim/will-vanish.txt" not in zf.namelist()
+
+    def test_genuine_permission_error_still_reported_as_warning_error(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A real (non-ENOENT) failure must still land in the ``errors``
+        bucket and flip the summary to incomplete -- only transient
+        vanished-file races are downgraded."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        target = hermes_home / "unreadable.txt"
+        target.write_text("secret")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def boom(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(target):
+                raise PermissionError(13, "Permission denied", str(filename))
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", boom)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup incomplete:" in out
+        assert "Restore with:" not in out
+        assert "Warnings (1 files skipped)" in out
+        assert "unreadable.txt" in out
+
+    def test_vanished_db_file_skipped_not_fatal(self, tmp_path, monkeypatch, capsys):
+        """A .db file that vanishes between scan and the safe-copy attempt
+        (chrome-debug/*.db under a live Chrome process) must be skipped as
+        transient, not reported as a SQLite copy failure."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "vanishing.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def vanish_then_fail(src, dst):
+            Path(src).unlink(missing_ok=True)
+            return False
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", vanish_then_fail)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup complete:" in out
+        assert "Backup incomplete" not in out
+        assert "vanished before it could be safely copied" in out
+
+    def test_still_existing_db_copy_failure_is_fatal_warning(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """A .db file that is present but genuinely fails to safe-copy
+        (locked, corrupt) must still surface as an error, distinguishing it
+        from the vanished-mid-copy case above."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "locked.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", lambda src, dst: False)
+
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        out = capsys.readouterr().out
+        assert "Backup incomplete:" in out
+        assert "SQLite safe copy failed" in out
+        assert "locked.db" in out
+
+    def test_automatic_backup_skips_vanished_file_instead_of_failing(
+        self, tmp_path, monkeypatch
+    ):
+        """The shared pre-update/pre-migration path (_write_full_zip_backup)
+        must tolerate the same scan-then-archive race: a vanished plain file
+        should be skipped, and the archive should still be produced."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        vanishing = hermes_home / "chrome-debug-sim" / "will-vanish.txt"
+        vanishing.parent.mkdir(parents=True, exist_ok=True)
+        vanishing.write_text("ephemeral")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        real_write = zipfile.ZipFile.write
+
+        def flaky_write(self, filename, arcname=None, *a, **kw):
+            if str(filename) == str(vanishing):
+                vanishing.unlink()
+            return real_write(self, filename, arcname, *a, **kw)
+
+        monkeypatch.setattr(zipfile.ZipFile, "write", flaky_write)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "chrome-debug-sim/will-vanish.txt" not in zf.namelist()
+            # Other, non-vanishing files from the tree still made it in.
+            assert "config.yaml" in zf.namelist()
+
+    def test_automatic_backup_skips_vanished_db_instead_of_aborting(
+        self, tmp_path, monkeypatch
+    ):
+        """A vanished .db file in the automatic backup path must be skipped,
+        not raise _SQLiteSnapshotError and abort the whole archive -- that
+        would silently drop every other file behind it in the walk order."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+
+        db_path = hermes_home / "vanishing.db"
+        db_path.write_bytes(b"not-actually-sqlite")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        def vanish_then_fail(src, dst):
+            Path(src).unlink(missing_ok=True)
+            return False
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", vanish_then_fail)
+
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        # Must still succeed and produce a complete archive of everything
+        # else, rather than returning None (the old abort-on-vanish behavior).
+        assert result == out_zip
+        assert out_zip.exists()
+        with zipfile.ZipFile(out_zip) as zf:
+            assert zf.testzip() is None
+            assert "vanishing.db" not in zf.namelist()
+            assert "config.yaml" in zf.namelist()
+
+    def test_automatic_backup_still_aborts_on_genuine_db_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """A .db file that is present but genuinely fails to safe-copy must
+        still abort the automatic backup and preserve the previous archive
+        -- this is the existing #68474-adjacent protection and must not
+        regress just because vanished files are now tolerated."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "state.db").write_bytes(b"not-a-database")
+        archive = tmp_path / "automatic.zip"
+        archive.write_bytes(b"previous-valid-backup")
+
+        monkeypatch.setattr(
+            "hermes_cli.backup._safe_copy_db", lambda _src, _dst: False
+        )
+
+        from hermes_cli.backup import _write_full_zip_backup
+        assert _write_full_zip_backup(archive, hermes_home) is None
+        assert archive.read_bytes() == b"previous-valid-backup"
+
 
 # ---------------------------------------------------------------------------
 # Backup tests

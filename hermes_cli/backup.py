@@ -95,6 +95,54 @@ _EXCLUDED_NAMES = {
     "cron.pid",
 }
 
+# ---------------------------------------------------------------------------
+# Chrome-debug transient state
+# ---------------------------------------------------------------------------
+# The Hermes-managed debug Chrome profile (``chrome-debug/`` at the top level
+# of HERMES_HOME -- see ``chrome_debug_data_dir()`` in
+# ``hermes_cli/browser_connect.py``) is continuously rewritten by Chrome
+# itself while a debug session is active: UMA metrics buffers, per-tab
+# session-restore state, and LevelDB WAL segments are swapped/rotated/deleted
+# with no advance notice. None of this data has restore value -- it's
+# regenerated from scratch on the next Chrome launch -- and the constant
+# churn means a scan-then-archive backup can observe a file that existed at
+# scan time vanish before the archive-write phase reaches it, raising a
+# harmless ``FileNotFoundError`` (see
+# docs/rca-chrome-debug-transient-files-backup.md).
+#
+# Excluding these subpaths up front eliminates the race in the common case
+# *and* lets ``os.walk`` skip descending into them entirely (faster scans).
+# Both are scoped to fire only when rooted under the top-level
+# ``chrome-debug/`` directory so a same-named directory elsewhere under
+# HERMES_HOME (e.g. a skill's own ``Sessions`` folder) is never affected.
+_CHROME_DEBUG_ROOT_DIR = "chrome-debug"
+
+_CHROME_DEBUG_TRANSIENT_DIRS = {
+    "Sessions",         # Default/Sessions/Session_<id>, Tabs_<id> -- tab/session
+                         # restore state, rewritten under a new timestamped
+                         # filename on every navigation/tab event.
+    "shared_proto_db",  # Default/shared_proto_db/*.log, *.ldb -- LevelDB WAL,
+                         # rotated away during compaction.
+    "BrowserMetrics",   # BrowserMetrics/*.pma -- UMA metrics recording buffer.
+}
+
+_CHROME_DEBUG_TRANSIENT_FILES = {
+    # Pre-allocated "spare" metrics buffer Chrome swaps in/out as it rotates
+    # the active BrowserMetrics file.
+    "BrowserMetrics-spare.pma",
+}
+
+
+def _is_chrome_debug_transient_dir(rel_dir: Path, dirname: str) -> bool:
+    """True if *dirname* directly under *rel_dir* is known-transient,
+    regenerable Chrome-internal state that ``os.walk`` should prune before
+    descending (see ``_CHROME_DEBUG_TRANSIENT_DIRS`` above)."""
+    if dirname not in _CHROME_DEBUG_TRANSIENT_DIRS:
+        return False
+    parts = rel_dir.parts
+    return bool(parts) and parts[0] == _CHROME_DEBUG_ROOT_DIR
+
+
 # File names that ``hermes import`` must never overwrite, matched by basename so
 # they're caught for the root profile (``gateway_state.json``) and for named
 # profiles alike (``profiles/<name>/gateway_state.json``).
@@ -307,6 +355,15 @@ def _should_exclude(rel_path: Path) -> bool:
         if part == "hermes-agent" and part != parts[0]:
             continue
         return True
+
+    # Chrome-debug transient state (see ``_CHROME_DEBUG_TRANSIENT_DIRS``
+    # above): scoped to fire only under the top-level ``chrome-debug/`` dir so
+    # a same-named directory elsewhere under HERMES_HOME is never affected.
+    if parts and parts[0] == _CHROME_DEBUG_ROOT_DIR:
+        if any(part in _CHROME_DEBUG_TRANSIENT_DIRS for part in parts[1:]):
+            return True
+        if rel_path.name in _CHROME_DEBUG_TRANSIENT_FILES:
+            return True
 
     name = rel_path.name
 
@@ -633,7 +690,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         orig_dirnames = dirnames[:]
         dirnames[:] = [
             d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+            if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
+            and not _is_chrome_debug_transient_dir(rel_dir, d)
         ]
         for removed in set(orig_dirnames) - set(dirnames):
             skipped_dirs.add(str(rel_dir / removed))
@@ -691,6 +749,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     total_bytes = 0
     errors = []
+    # Files that existed at scan time but vanished (ENOENT) before the slow
+    # archive-write phase reached them -- typically a live process (most
+    # commonly the Hermes-managed chrome-debug profile) rewriting its own
+    # transient state concurrently with the backup. Tracked separately from
+    # ``errors``: these are logged as warnings but must never flip the
+    # summary to "incomplete" or suppress the restore hint, because the
+    # archive itself is still complete and valid for every file that still
+    # existed when we got to it. See
+    # docs/rca-chrome-debug-transient-files-backup.md.
+    transient_skipped = []
     t0 = time.monotonic()
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
@@ -714,11 +782,27 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
                         tmp_db.unlink(missing_ok=True)
                     else:
                         tmp_db.unlink(missing_ok=True)
-                        errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        # sqlite3.connect() raises a generic OperationalError
+                        # for a missing source file (not FileNotFoundError),
+                        # so _safe_copy_db can't tell us "vanished" directly.
+                        # A post-hoc existence check is a good enough proxy:
+                        # if the source is gone right after the failed copy,
+                        # it almost certainly vanished mid-copy rather than
+                        # being genuinely corrupt.
+                        if abs_path.exists():
+                            errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        else:
+                            transient_skipped.append(
+                                f"  {rel_path}: vanished before it could be safely copied"
+                            )
                         continue
                 else:
                     zf.write(abs_path, arcname=str(rel_path))
                     total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                # Benign scan-then-archive race, not a real failure.
+                transient_skipped.append(f"  {rel_path}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {rel_path}: {exc}")
                 continue
@@ -739,6 +823,9 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             try:
                 zf.write(abs_path, arcname=arcname)
                 total_bytes += abs_path.stat().st_size
+            except FileNotFoundError as exc:
+                transient_skipped.append(f"  {arcname}: {exc}")
+                continue
             except (PermissionError, OSError, ValueError) as exc:
                 errors.append(f"  {arcname}: {exc}")
                 continue
@@ -746,10 +833,11 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
     logger.info(
-        "backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
+        "backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d transient_skipped=%d bytes=%d",
         elapsed * 1000,
         file_count,
         len(errors),
+        len(transient_skipped),
         zip_size,
     )
 
@@ -782,6 +870,16 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         print("\n  Excluded directories:")
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
+
+    if transient_skipped:
+        print(
+            f"\n  Note ({len(transient_skipped)} file(s) changed during backup, "
+            "harmless -- nothing to restore there):"
+        )
+        for w in transient_skipped[:10]:
+            print(w)
+        if len(transient_skipped) > 10:
+            print(f"  ... and {len(transient_skipped) - 10} more")
 
     if errors:
         print(f"\n  Warnings ({len(errors)} files skipped):")
@@ -1654,8 +1752,15 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
+            try:
+                rel_dir = dp.relative_to(hermes_root)
+            except ValueError:
+                rel_dir = Path(".")
             # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _EXCLUDED_DIRS and not _is_chrome_debug_transient_dir(rel_dir, d)
+            ]
 
             for fname in filenames:
                 fpath = dp / fname
@@ -1682,6 +1787,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     )
 
     archive_started = time.monotonic()
+    transient_skipped = 0
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
             archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
@@ -1699,6 +1805,23 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                             tmp_db = Path(tmp.name)
                         try:
                             if not _safe_copy_db(abs_path, tmp_db):
+                                # A source file that has vanished since the scan
+                                # phase (most commonly a chrome-debug/*.db file
+                                # rewritten by a live Chrome process racing this
+                                # backup -- see
+                                # docs/rca-chrome-debug-transient-files-backup.md)
+                                # is a benign, already-logged skip, not a real
+                                # failure: only abort the whole archive when the
+                                # file still exists but genuinely couldn't be
+                                # snapshotted (locked, corrupt, permissions).
+                                if not abs_path.exists():
+                                    logger.warning(
+                                        "Full-zip backup: %s vanished before it "
+                                        "could be safely copied, skipping (transient)",
+                                        rel_path,
+                                    )
+                                    transient_skipped += 1
+                                    continue
                                 logger.warning(
                                     "Full-zip backup aborted: SQLite snapshot failed for %s",
                                     rel_path,
@@ -1709,6 +1832,15 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
                             tmp_db.unlink(missing_ok=True)
                     else:
                         zf.write(abs_path, arcname=str(rel_path))
+                except FileNotFoundError as exc:
+                    # Benign scan-then-archive race, not a real failure.
+                    logger.warning(
+                        "Full-zip backup: %s vanished during archiving, skipping (transient): %s",
+                        rel_path,
+                        exc,
+                    )
+                    transient_skipped += 1
+                    continue
                 except (PermissionError, OSError, ValueError) as exc:
                     logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
                     continue
@@ -1726,9 +1858,10 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         return None
 
     logger.info(
-        "automatic backup phase=archive status=complete duration_ms=%.1f files=%d bytes=%d",
+        "automatic backup phase=archive status=complete duration_ms=%.1f files=%d transient_skipped=%d bytes=%d",
         (time.monotonic() - archive_started) * 1000,
         len(files_to_add),
+        transient_skipped,
         out_path.stat().st_size,
     )
 
