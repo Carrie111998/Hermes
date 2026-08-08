@@ -3113,6 +3113,9 @@ class AIAgent:
 
         Called by the gateway timeout handler to report what the agent was doing
         when it was killed, and by the periodic "still working" notifications.
+
+        Includes cumulative token usage totals (R4) so delegation cost is visible
+        per subagent from a single diagnostic call.
         """
         elapsed = time.time() - self._last_activity_ts
         return {
@@ -3124,6 +3127,15 @@ class AIAgent:
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
+            # ── Token flow tracking (R4) ──────────────────────────────────
+            # Cumulative session-level token counters accumulated by the
+            # conversation loop from LLM provider usage responses.
+            "total_input_tokens": getattr(self, "session_prompt_tokens", 0),
+            "total_output_tokens": getattr(self, "session_completion_tokens", 0),
+            "cached_tokens": (
+                getattr(self, "session_cache_read_tokens", 0)
+                + getattr(self, "session_cache_write_tokens", 0)
+            ),
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
@@ -5359,6 +5371,8 @@ class AIAgent:
             context=function_args.get("context"),
             toolsets=function_args.get("toolsets"),
             tasks=function_args.get("tasks"),
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
             max_iterations=function_args.get("max_iterations"),
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),

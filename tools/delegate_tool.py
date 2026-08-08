@@ -1798,6 +1798,19 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            # ── Token flow tracking (R4) ──────────────────────────────────
+            # Best-effort: capture whatever the child accumulated before the
+            # timeout/error.  The child object is still alive here (close()
+            # happens in the finally block of _run_single_child's caller).
+            def _safe_int_tu(val, default=0):
+                return int(val) if isinstance(val, (int, float)) else default
+
+            _tu_in = _safe_int_tu(getattr(child, "session_prompt_tokens", 0))
+            _tu_out = _safe_int_tu(getattr(child, "session_completion_tokens", 0))
+            _tu_cached = _safe_int_tu(
+                getattr(child, "session_cache_read_tokens", 0)
+            ) + _safe_int_tu(getattr(child, "session_cache_write_tokens", 0))
+
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -1808,6 +1821,12 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "token_usage": {
+                    "total_input_tokens": _tu_in,
+                    "total_output_tokens": _tu_out,
+                    "cached_tokens": _tu_cached,
+                    "api_call_count": child_api_calls,
+                },
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -1885,7 +1904,22 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
+        _cache_read_tokens = getattr(child, "session_cache_read_tokens", 0)
+        _cache_write_tokens = getattr(child, "session_cache_write_tokens", 0)
         _model = getattr(child, "model", None)
+
+        # ── Token flow tracking (R4) ──────────────────────────────────────
+        # Surface the per-subagent token cost so delegation is visible.
+        # All values are accumulated by the child agent's conversation loop
+        # (agent/conversation_loop.py) from LLM provider `usage` responses.
+        # This is purely additive — we read data that already exists.
+        def _safe_int(val, default=0):
+            return int(val) if isinstance(val, (int, float)) else default
+
+        _total_input = _safe_int(_input_tokens)
+        _total_output = _safe_int(_output_tokens)
+        _cached = _safe_int(_cache_read_tokens) + _safe_int(_cache_write_tokens)
+        _child_api_calls = _safe_int(getattr(child, "session_api_calls", 0))
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -1902,6 +1936,12 @@ def _run_single_child(
                 "output": (
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
+            },
+            "token_usage": {
+                "total_input_tokens": _total_input,
+                "total_output_tokens": _total_output,
+                "cached_tokens": _cached,
+                "api_call_count": _child_api_calls,
             },
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
@@ -2043,6 +2083,12 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "token_usage": {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "cached_tokens": 0,
+                "api_call_count": 0,
+            },
         }
 
     finally:
@@ -2126,6 +2172,8 @@ def delegate_task(
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     max_iterations: Optional[int] = None,
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
@@ -2137,13 +2185,17 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, toolsets, role, model, provider)
+      - Batch:  provide tasks array [{goal, context, toolsets, role, model, provider}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'model'/'provider' parameters override delegation.model /
+    delegation.provider for this dispatch (per-task values beat top-level
+    values). Omit to use the configured delegation pair or the parent's.
 
     Returns JSON with results array, one entry per task.
     """
@@ -2202,15 +2254,14 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
+    # Resolve delegation credentials (provider:model pair) per task below.
     # When delegation.provider is configured, this resolves the full credential
     # bundle (base_url, api_key, api_mode) via the same runtime provider system
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Per-dispatch `model`/`provider` overrides (schema-exposed) beat config;
+    # per-task overrides beat the top-level ones. Resolving per task keeps the
+    # bundle consistent with the provider actually requested.
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2273,6 +2324,19 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model/provider beat the top-level dispatch overrides,
+            # which beat delegation config. Resolve per task so the credential
+            # bundle matches the provider actually requested.
+            task_model = t.get("model") or model
+            task_provider = t.get("provider") or provider
+            try:
+                creds = _resolve_delegation_credentials(
+                    cfg, parent_agent,
+                    requested_model=task_model,
+                    requested_provider=task_provider,
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2533,9 +2597,31 @@ def delegate_task(
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
+        # ── Aggregate token flow tracking (R4) ──────────────────────────────
+        # Sum per-subagent token_usage into a delegation-level total so the
+        # parent context sees the full delegation cost at a glance.
+        _agg_input = 0
+        _agg_output = 0
+        _agg_cached = 0
+        _agg_api_calls = 0
+        for _r in results:
+            _tu = _r.get("token_usage") if isinstance(_r, dict) else None
+            if not isinstance(_tu, dict):
+                continue
+            _agg_input += int(_tu.get("total_input_tokens", 0) or 0)
+            _agg_output += int(_tu.get("total_output_tokens", 0) or 0)
+            _agg_cached += int(_tu.get("cached_tokens", 0) or 0)
+            _agg_api_calls += int(_tu.get("api_call_count", 0) or 0)
+
         return {
             "results": results,
             "total_duration_seconds": total_duration,
+            "token_usage": {
+                "total_input_tokens": _agg_input,
+                "total_output_tokens": _agg_output,
+                "cached_tokens": _agg_cached,
+                "api_call_count": _agg_api_calls,
+            },
         }
 
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
@@ -2744,7 +2830,13 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    requested_model: Optional[str] = None,
+    requested_provider: Optional[str] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -2770,6 +2862,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
+
+    # Per-dispatch overrides beat config (delegation.model / delegation.provider).
+    # The model may come with a provider (per-task or top-level); a bare model
+    # override with no provider still resolves through the configured provider
+    # path, falling back to the parent's provider when neither is set.
+    effective_model = (requested_model or "").strip() or configured_model
+    effective_provider = (requested_provider or "").strip() or configured_provider
 
     if configured_base_url:
         # When delegation.api_key is not set, return None so _build_child_agent
@@ -2810,31 +2909,31 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             api_mode = configured_api_mode
 
         return {
-            "model": configured_model,
+            "model": effective_model,
             "provider": provider,
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
         }
 
-    if not configured_provider:
+    if not effective_provider:
         # No provider override — child inherits everything from parent
         return {
-            "model": configured_model,
+            "model": effective_model,
             "provider": None,
             "base_url": None,
             "api_key": None,
             "api_mode": None,
         }
 
-    # Provider is configured — resolve full credentials
+    # Provider is configured (or overridden) — resolve full credentials
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
+        runtime = resolve_runtime_provider(requested=effective_provider, target_model=effective_model)
     except Exception as exc:
         raise ValueError(
-            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+            f"Cannot resolve delegation provider '{effective_provider}': {exc}. "
             f"Check that the provider is configured (API key set, valid provider name), "
             f"or set delegation.base_url/delegation.api_key for a direct endpoint. "
             f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
@@ -2843,13 +2942,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     api_key = runtime.get("api_key", "")
     if not api_key:
         raise ValueError(
-            f"Delegation provider '{configured_provider}' resolved but has no API key. "
+            f"Delegation provider '{effective_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."
         )
 
     return {
-        "model": configured_model or runtime.get("model") or None,
-        "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        "model": effective_model or runtime.get("model") or None,
+        "provider": effective_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
@@ -3098,6 +3197,26 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the delegation model for this dispatch (and, in "
+                    "batch mode, the default for tasks that do not specify "
+                    "their own). Resolved via the same runtime provider path "
+                    "as delegation.model in config.yaml. Omit to use "
+                    "delegation.model / the parent's model."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Override the delegation provider for this dispatch (and, "
+                    "in batch mode, the default for tasks that do not specify "
+                    "their own). Credentials are resolved via the runtime "
+                    "provider system, the same path delegation.provider uses. "
+                    "Omit to use delegation.provider / the parent's provider."
+                ),
+            },
             "toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -3142,6 +3261,14 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override. Beats the top-level 'model' for this task only.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task provider override. Beats the top-level 'provider' for this task only.",
                         },
                     },
                     "required": ["goal"],
@@ -3225,6 +3352,8 @@ registry.register(
         context=args.get("context"),
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
+        model=args.get("model"),
+        provider=args.get("provider"),
         max_iterations=args.get("max_iterations"),
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),

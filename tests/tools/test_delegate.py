@@ -2401,6 +2401,96 @@ class TestOrchestratorRoleSchema(unittest.TestCase):
         self.assertNotIn("e.g. \"claude\"", top_acp_desc)
 
 
+# =========================================================================
+# model / provider override plumbing (per-dispatch + per-task)
+# =========================================================================
+
+
+class TestModelProviderOverrides(unittest.TestCase):
+    """Tests that schema model/provider reach the child via dispatch.
+
+    The overrides beat delegation config; per-task values beat top-level
+    values. This mirrors the role-param plumbing tests above: assert on
+    the resolution kwargs and the AIAgent constructor, not on full runs.
+    """
+
+    def test_schema_has_model_and_provider_top_level_and_per_task(self):
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+        props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertIn("model", props)
+        self.assertIn("provider", props)
+        self.assertEqual(props["model"]["type"], "string")
+        self.assertEqual(props["provider"]["type"], "string")
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertIn("model", task_props)
+        self.assertIn("provider", task_props)
+
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={"max_spawn_depth": 2})
+    def _dispatch_with_overrides(self, mock_cfg, mock_creds,
+                                 top_model=None, top_provider=None, tasks=None):
+        mock_creds.return_value = {
+            "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None, "model": None,
+        }
+        parent = _make_mock_parent(depth=0)
+        from tools.delegate_tool import delegate_task
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+                "api_calls": 1, "messages": [],
+            }
+            mock_child._delegate_saved_tool_names = []
+            mock_child._credential_pool = None
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.model = "test"
+            MockAgent.return_value = mock_child
+            kwargs = {"goal": "test", "parent_agent": parent}
+            if top_model is not None:
+                kwargs["model"] = top_model
+            if top_provider is not None:
+                kwargs["provider"] = top_provider
+            if tasks is not None:
+                kwargs["tasks"] = tasks
+                kwargs.pop("goal")
+            delegate_task(**kwargs)
+            return mock_child, mock_creds
+
+    def test_top_level_model_reaches_resolution_and_child(self):
+        child, mock_creds = self._dispatch_with_overrides(top_model="gpt-5.6-sol")
+        _, kwargs = mock_creds.call_args
+        self.assertEqual(kwargs["requested_model"], "gpt-5.6-sol")
+
+    def test_per_task_model_beats_top_level(self):
+        tasks = [{"goal": "a", "model": "per-task-model"}]
+        child, mock_creds = self._dispatch_with_overrides(
+            tasks=tasks, top_model="top-model",
+        )
+        _, kwargs = mock_creds.call_args
+        self.assertEqual(kwargs["requested_model"], "per-task-model")
+
+    def test_no_override_passes_none(self):
+        child, mock_creds = self._dispatch_with_overrides()
+        _, kwargs = mock_creds.call_args
+        self.assertIsNone(kwargs.get("requested_model"))
+        self.assertIsNone(kwargs.get("requested_provider"))
+
+    def test_top_level_provider_reaches_resolution(self):
+        child, mock_creds = self._dispatch_with_overrides(top_provider="openrouter")
+        _, kwargs = mock_creds.call_args
+        self.assertEqual(kwargs["requested_provider"], "openrouter")
+
+    def test_per_task_provider_beats_top_level(self):
+        tasks = [{"goal": "a", "provider": "per-task-provider"}]
+        child, mock_creds = self._dispatch_with_overrides(
+            tasks=tasks, top_provider="top-provider",
+        )
+        _, kwargs = mock_creds.call_args
+        self.assertEqual(kwargs["requested_provider"], "per-task-provider")
+
+
 # Sentinel used to distinguish "role kwarg omitted" from "role=None".
 _SENTINEL = object()
 
