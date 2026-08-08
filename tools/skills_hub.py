@@ -4429,13 +4429,30 @@ def unified_search(query: str, sources: List[SkillSource],
             seen[r.identifier] = r
     deduped = list(seen.values())
     try:
-        from agent.skill_governance import governance_context, rank_skill_search_results
+        from agent.skill_governance import (
+            governance_context,
+            probe_protected_task_class,
+            rank_skill_search_results,
+        )
 
         deduped = rank_skill_search_results(
             deduped,
             context=governance_context(mode="retrieval"),
         )
     except Exception:
+        probe = None
+        try:
+            from agent.skill_governance import probe_protected_task_class
+
+            probe = probe_protected_task_class()
+        except Exception:
+            probe = None
+        if probe is None or probe.protected_task:
+            logger.warning(
+                "Governance-aware ranking unavailable for protected task class; returning no skills",
+                exc_info=True,
+            )
+            return []
         logger.debug("Governance-aware ranking unavailable", exc_info=True)
 
     return deduped[:limit]

@@ -9,6 +9,7 @@ from agent.skill_governance import (
     evaluate_skill_selection,
     filter_allowed_skill_names,
     governance_context,
+    probe_protected_task_class,
     rank_skill_search_results,
 )
 
@@ -205,3 +206,36 @@ def test_retrieval_ranking_prefers_current_entries_for_protected_task_class(tmp_
     assert ranked[0].extra["governance"]["classification"] == "CURRENT"
     assert ranked[1].extra["governance"]["classification"] == "COMPATIBILITY_ONLY"
     assert ranked[2].extra["governance"]["classification"] == "STALE"
+
+
+def test_protected_task_probe_is_self_contained_when_skill_utils_import_fails(
+    tmp_path, monkeypatch
+):
+    import builtins
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _configure_governance(tmp_path)
+    real_import = builtins.__import__
+
+    def _deny_skill_utils(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent.skill_utils":
+            raise ImportError("simulated skill_utils import failure")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _deny_skill_utils)
+
+    probe = probe_protected_task_class()
+
+    assert probe.safe is True
+    assert probe.protected_task is True
+    assert probe.task_class == "ardyn_engineering"
+
+
+def test_protected_task_probe_fails_closed_on_config_parse_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+
+    probe = probe_protected_task_class()
+
+    assert probe.safe is False
+    assert probe.protected_task is True

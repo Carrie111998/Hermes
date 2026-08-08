@@ -465,7 +465,71 @@ class TestBuildPreloadedSkillsPrompt:
         assert loaded == []
         assert missing == ["protected-skill"]
 
-    def test_unprotected_preload_keeps_loading_when_governance_import_fails(self, tmp_path, monkeypatch):
+    def test_protected_preload_denies_when_skill_utils_import_fails_and_governance_eval_errors(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(
+            home,
+            """\
+  - name: protected-skill
+    classification: CURRENT
+""",
+        )
+
+        real_import = builtins.__import__
+
+        def _deny_imports(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent.skill_utils":
+                raise ImportError(f"simulated import failure: {name}")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "nonexistent"):
+            monkeypatch.setattr(
+                "agent.skill_commands._load_skill_payload",
+                lambda identifier, task_id=None: (
+                    {"content": "must not load", "name": identifier},
+                    None,
+                    identifier,
+                ),
+            )
+            monkeypatch.setattr(
+                "agent.skill_governance.evaluate_skill_selection",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    RuntimeError("simulated governance evaluation failure")
+                ),
+            )
+            monkeypatch.setattr(builtins, "__import__", _deny_imports)
+            prompt, loaded, missing = build_preloaded_skills_prompt(["protected-skill"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["protected-skill"]
+
+    def test_protected_preload_denies_when_config_cannot_be_parsed(
+        self, tmp_path, monkeypatch
+    ):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        (home / "config.yaml").parent.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "agent.skill_commands._load_skill_payload",
+            lambda identifier, task_id=None: (
+                {"content": "must not load", "name": identifier},
+                None,
+                identifier,
+            ),
+        )
+
+        prompt, loaded, missing = build_preloaded_skills_prompt(["protected-skill"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["protected-skill"]
+
+    def test_unprotected_preload_keeps_loading_when_config_is_unprotected(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
         skills_dir = tmp_path / "skills"
         skills_dir.mkdir()
@@ -490,15 +554,7 @@ skills:
         )
         _make_skill(skills_dir, "unprotected-skill", body="still loads")
 
-        real_import = builtins.__import__
-
-        def _deny_governance_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "agent.skill_governance":
-                raise ImportError("simulated governance import failure")
-            return real_import(name, globals, locals, fromlist, level)
-
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
-            monkeypatch.setattr(builtins, "__import__", _deny_governance_import)
             prompt, loaded, missing = build_preloaded_skills_prompt(["unprotected-skill"])
 
         assert loaded == ["unprotected-skill"]

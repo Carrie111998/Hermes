@@ -13,6 +13,7 @@ agent's context for that turn if it was stacked behind an allowed one.
 """
 
 import asyncio
+import builtins
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -225,6 +226,65 @@ def test_gateway_skill_dispatch_denies_protected_setup_failure(monkeypatch, tmp_
     assert result is not None
     assert '"/tooltrust"' in result
     assert "denied" in result.lower()
+    assert "protected task class" in result
+
+
+def test_gateway_skill_dispatch_denies_when_skill_utils_import_fails_and_governance_eval_errors(
+    monkeypatch, tmp_path
+):
+    import gateway.run as gateway_run
+
+    home = tmp_path / "home"
+    _configure_protected_governance(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    real_import = builtins.__import__
+
+    def _deny_imports(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent.skill_utils":
+            raise ImportError(f"simulated import failure: {name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        "agent.skill_governance.evaluate_skill_selection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated governance evaluation failure")
+        ),
+    )
+    monkeypatch.setattr(builtins, "__import__", _deny_imports)
+
+    runner = _make_runner()
+    result = asyncio.run(runner._handle_message(_make_event("/tooltrust do something")))
+
+    assert result is not None
+    assert '"/tooltrust"' in result
+    assert "protected task class" in result
+
+
+def test_gateway_skill_dispatch_denies_when_config_cannot_be_parsed(
+    monkeypatch, tmp_path
+):
+    import gateway.run as gateway_run
+
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands",
+        lambda: (_ for _ in ()).throw(RuntimeError("simulated setup failure")),
+    )
+
+    runner = _make_runner()
+    result = asyncio.run(runner._handle_message(_make_event("/tooltrust do something")))
+
+    assert result is not None
+    assert '"/tooltrust"' in result
     assert "protected task class" in result
 
 

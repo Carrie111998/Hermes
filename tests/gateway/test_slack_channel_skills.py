@@ -80,7 +80,7 @@ class TestSlackResolveChannelSkills:
         })
         assert _resolve(adapter, "D0ABC") is None
 
-    def test_protected_binding_denied_when_governance_import_unavailable(self, monkeypatch, tmp_path):
+    def test_protected_binding_denied_when_skill_utils_import_fails_and_governance_eval_errors(self, monkeypatch, tmp_path):
         adapter = _make_adapter({
             "channel_skill_bindings": [
                 {"id": "D0ATH9TQ0G6", "skills": ["legacy-skill"]},
@@ -97,11 +97,30 @@ class TestSlackResolveChannelSkills:
         real_import = builtins.__import__
 
         def _deny_governance_import(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "agent.skill_governance":
-                raise ImportError("simulated governance import failure")
+            if name == "agent.skill_utils":
+                raise ImportError(f"simulated import failure: {name}")
             return real_import(name, globals, locals, fromlist, level)
 
+        monkeypatch.setattr(
+            "agent.skill_governance.evaluate_skill_selection",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("simulated governance evaluation failure")
+            ),
+        )
         monkeypatch.setattr(builtins, "__import__", _deny_governance_import)
+
+        assert _resolve(adapter, "D0ATH9TQ0G6") is None
+
+    def test_protected_binding_denied_when_config_cannot_be_parsed(self, monkeypatch, tmp_path):
+        adapter = _make_adapter({
+            "channel_skill_bindings": [
+                {"id": "D0ATH9TQ0G6", "skills": ["legacy-skill"]},
+            ]
+        })
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("skills: [\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
 
         assert _resolve(adapter, "D0ATH9TQ0G6") is None
 

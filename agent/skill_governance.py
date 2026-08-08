@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_constants import get_config_path, get_hermes_home
+from utils import fast_safe_load
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,14 @@ class GovernanceContext:
 
 
 @dataclass(frozen=True)
+class ProtectedTaskProbe:
+    safe: bool
+    protected_task: bool
+    task_class: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class SkillGovernanceDecision:
     requested_name: str
     canonical_name: str
@@ -84,6 +93,10 @@ _CONFIG_CACHE: tuple[tuple[str, int], GovernanceConfig] | None = None
 _REGISTRY_CACHE: tuple[tuple[str, int], dict[str, SkillRegistryEntry]] | None = None
 
 
+class GovernanceConfigError(RuntimeError):
+    """Raised when skill governance config cannot be read or trusted."""
+
+
 def _normalize_name(value: str) -> str:
     return str(value or "").strip().lower()
 
@@ -95,15 +108,125 @@ def _safe_mtime(path: Path) -> int:
         return -1
 
 
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    try:
+        raw = fast_safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise GovernanceConfigError(f"failed to parse {path}: {exc}") from exc
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise GovernanceConfigError(f"{path} must contain a YAML mapping")
+    return raw
+
+
+def _parse_governance_config(raw: dict[str, Any]) -> GovernanceConfig:
+    skills_raw = raw.get("skills")
+    if skills_raw is None:
+        skills_cfg: dict[str, Any] = {}
+    elif isinstance(skills_raw, dict):
+        skills_cfg = skills_raw
+    else:
+        raise GovernanceConfigError("skills config must be a mapping")
+
+    gov_raw = skills_cfg.get("governance")
+    if gov_raw is None:
+        gov: dict[str, Any] = {}
+    elif isinstance(gov_raw, dict):
+        gov = gov_raw
+    else:
+        raise GovernanceConfigError("skills.governance must be a mapping")
+
+    registry_path = gov.get("registry_path")
+    if registry_path is None:
+        registry_path = ""
+    elif not isinstance(registry_path, str):
+        raise GovernanceConfigError("skills.governance.registry_path must be a string")
+
+    task_class = gov.get("task_class")
+    if task_class is None:
+        normalized_task_class = ""
+    elif isinstance(task_class, str):
+        normalized_task_class = _normalize_name(task_class)
+    else:
+        raise GovernanceConfigError("skills.governance.task_class must be a string")
+
+    protected = gov.get("protected_task_classes")
+    if protected is None:
+        protected_values: list[Any] = []
+    elif isinstance(protected, str):
+        protected_values = [protected]
+    elif isinstance(protected, list):
+        protected_values = protected
+    else:
+        raise GovernanceConfigError(
+            "skills.governance.protected_task_classes must be a string or list"
+        )
+
+    protected_norm: list[str] = []
+    for item in protected_values:
+        if not isinstance(item, str):
+            raise GovernanceConfigError(
+                "skills.governance.protected_task_classes entries must be strings"
+            )
+        normalized = _normalize_name(item)
+        if normalized:
+            protected_norm.append(normalized)
+
+    retrieval_ranking = gov.get("retrieval_ranking", True)
+    if not isinstance(retrieval_ranking, bool):
+        raise GovernanceConfigError(
+            "skills.governance.retrieval_ranking must be a boolean"
+        )
+
+    return GovernanceConfig(
+        registry_path=registry_path.strip(),
+        task_class=normalized_task_class,
+        protected_task_classes=tuple(protected_norm),
+        retrieval_ranking=retrieval_ranking,
+    )
+
+
+def probe_protected_task_class(
+    *,
+    task_class: str | None = None,
+) -> ProtectedTaskProbe:
+    """Conservatively report whether governance failures must deny skill use."""
+    config_path = get_config_path()
+    if not config_path.exists():
+        return ProtectedTaskProbe(
+            safe=True,
+            protected_task=False,
+            task_class=_normalize_name(task_class or ""),
+            reason="missing config",
+        )
+    try:
+        raw = _read_yaml_mapping(config_path)
+        cfg = _parse_governance_config(raw)
+    except GovernanceConfigError as exc:
+        logger.warning("Protected-task governance probe failed", exc_info=True)
+        return ProtectedTaskProbe(
+            safe=False,
+            protected_task=True,
+            task_class=_normalize_name(task_class or ""),
+            reason=str(exc),
+        )
+
+    resolved_task = _normalize_name(task_class) or cfg.task_class
+    return ProtectedTaskProbe(
+        safe=True,
+        protected_task=bool(resolved_task) and (resolved_task in cfg.protected_task_classes),
+        task_class=resolved_task,
+        reason="ok",
+    )
+
+
 def _load_yaml_file(path: Path) -> dict[str, Any]:
     try:
-        from agent.skill_utils import yaml_load
-
-        raw = yaml_load(path.read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except Exception:
+        return _read_yaml_mapping(path)
+    except GovernanceConfigError:
         logger.debug("Failed to load YAML file %s", path, exc_info=True)
-        return {}
+        raise
 
 
 def _load_governance_config() -> GovernanceConfig:
@@ -113,21 +236,8 @@ def _load_governance_config() -> GovernanceConfig:
     if _CONFIG_CACHE and _CONFIG_CACHE[0] == cache_key:
         return _CONFIG_CACHE[1]
 
-    raw = _load_yaml_file(config_path) if config_path.exists() else {}
-    skills_cfg = raw.get("skills") if isinstance(raw.get("skills"), dict) else {}
-    gov = skills_cfg.get("governance") if isinstance(skills_cfg.get("governance"), dict) else {}
-    protected = gov.get("protected_task_classes")
-    if isinstance(protected, str):
-        protected = [protected]
-    protected_norm = tuple(
-        cls for cls in (_normalize_name(v) for v in (protected or [])) if cls
-    )
-    cfg = GovernanceConfig(
-        registry_path=str(gov.get("registry_path") or "").strip(),
-        task_class=_normalize_name(gov.get("task_class") or ""),
-        protected_task_classes=protected_norm,
-        retrieval_ranking=bool(gov.get("retrieval_ranking", True)),
-    )
+    raw = _read_yaml_mapping(config_path) if config_path.exists() else {}
+    cfg = _parse_governance_config(raw)
     _CONFIG_CACHE = (cache_key, cfg)
     return cfg
 
@@ -224,9 +334,10 @@ def is_protected_task_class_configured(
     This helper is safe to use from fail-closed call sites that need to decide
     whether governance/setup failures must deny skill loading.
     """
-    cfg = _load_governance_config()
-    resolved_task = _normalize_name(task_class) or cfg.task_class
-    return bool(resolved_task) and (resolved_task in cfg.protected_task_classes)
+    probe = probe_protected_task_class(task_class=task_class)
+    if not probe.safe:
+        raise GovernanceConfigError(probe.reason)
+    return probe.protected_task
 
 
 def _lookup_entry(skill_name: str) -> tuple[SkillRegistryEntry | None, str | None, str]:
@@ -317,9 +428,8 @@ def evaluate_skill_selection_fail_closed(
             emit_log=emit_log,
         )
     except Exception as exc:
-        cfg = _load_governance_config()
-        protected = is_protected_task_class_configured(task_class=cfg.task_class)
-        if not protected:
+        probe = probe_protected_task_class()
+        if probe.safe and not probe.protected_task:
             logger.debug(
                 "Skill governance evaluation unavailable for %s",
                 skill_name,
@@ -337,10 +447,10 @@ def evaluate_skill_selection_fail_closed(
             allowed=False,
             reason=f"skill governance evaluation failed: {exc}",
             mode=resolved_mode,
-            task_class=cfg.task_class,
+            task_class=probe.task_class,
             protected_task=True,
             historical_intent=bool(historical_intent),
-            registry_path=str(cfg.registry_path or ""),
+            registry_path="",
         )
         if emit_log:
             log_skill_governance_decision(decision)

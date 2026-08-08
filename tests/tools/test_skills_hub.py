@@ -1,5 +1,6 @@
 """Tests for tools/skills_hub.py — source adapters, lock file, taps, dedup logic."""
 
+import builtins
 import json
 import time
 from typing import List, Optional
@@ -650,6 +651,50 @@ class TestUnifiedSearchDedup:
         results = unified_search("skill", [src_a, src_b])
 
         assert [result.name for result in results] == ["alpha-current", "zulu-current"]
+
+    def test_protected_governance_import_failure_returns_no_results(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(home)
+
+        result = SkillMeta(
+            name="alpha-current",
+            description="Alpha",
+            source="a",
+            identifier="repo/alpha-current",
+            trust_level="community",
+        )
+        src = self._make_source("a", [result])
+        real_import = builtins.__import__
+
+        def _deny_governance_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "agent.skill_governance":
+                raise ImportError("simulated governance import failure")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _deny_governance_import)
+
+        assert unified_search("skill", [src]) == []
+
+    def test_protected_governance_eval_failure_returns_no_results(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(home)
+
+        result = SkillMeta(
+            name="alpha-current",
+            description="Alpha",
+            source="a",
+            identifier="repo/alpha-current",
+            trust_level="community",
+        )
+        src = self._make_source("a", [result])
+        monkeypatch.setattr(
+            "agent.skill_governance.rank_skill_search_results",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated ranking failure")),
+        )
+
+        assert unified_search("skill", [src]) == []
 
 
 # ---------------------------------------------------------------------------

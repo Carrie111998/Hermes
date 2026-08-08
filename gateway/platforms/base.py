@@ -2555,53 +2555,18 @@ def resolve_channel_prompt(
     return None
 
 
-def _normalize_governance_name(value: str) -> str:
-    return str(value or "").strip().lower()
-
-
-def _auto_binding_governance_protected() -> bool:
-    """Return True when channel/topic auto-bindings must fail closed."""
-    try:
-        from agent.skill_utils import yaml_load
-        from hermes_constants import get_config_path
-
-        config_path = get_config_path()
-        if not config_path.exists():
-            return False
-        raw = yaml_load(config_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return False
-        skills_cfg = raw.get("skills") if isinstance(raw.get("skills"), dict) else {}
-        gov_cfg = (
-            skills_cfg.get("governance")
-            if isinstance(skills_cfg.get("governance"), dict)
-            else {}
-        )
-        task_class = _normalize_governance_name(gov_cfg.get("task_class") or "")
-        if not task_class:
-            return False
-        protected = gov_cfg.get("protected_task_classes") or []
-        if isinstance(protected, str):
-            protected = [protected]
-        protected_names = {
-            name
-            for name in (_normalize_governance_name(item) for item in protected)
-            if name
-        }
-        return task_class in protected_names
-    except Exception:
-        logger.debug("Failed to inspect governance config for auto-bindings", exc_info=True)
-        return False
-
-
 def _filter_auto_bound_skills(skill_names: list[str]) -> list[str]:
     """Apply governance filtering to automatic channel/topic skill bindings."""
     if not skill_names:
         return []
 
-    protected_task = _auto_binding_governance_protected()
+    protected_task = True
     try:
-        from agent.skill_governance import evaluate_skill_selection_fail_closed
+        from agent.skill_governance import (
+            evaluate_skill_selection_fail_closed,
+            probe_protected_task_class,
+        )
+        protected_task = probe_protected_task_class().protected_task
     except Exception:
         if protected_task:
             logger.warning(

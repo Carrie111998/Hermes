@@ -62,7 +62,6 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
-from hermes_constants import get_config_path
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -119,32 +118,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _protected_skill_governance_configured_fallback() -> bool:
-    """Best-effort config-only fallback when skill governance can't import."""
-    try:
-        from agent.skill_utils import yaml_load
-
-        config_path = get_config_path()
-        if not config_path.exists():
-            return False
-        raw = yaml_load(config_path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return False
-        skills_cfg = raw.get("skills") if isinstance(raw.get("skills"), dict) else {}
-        gov_cfg = skills_cfg.get("governance") if isinstance(skills_cfg.get("governance"), dict) else {}
-        task_class = str(gov_cfg.get("task_class") or "").strip().lower()
-        if not task_class:
-            return False
-        protected = gov_cfg.get("protected_task_classes") or []
-        if isinstance(protected, str):
-            protected = [protected]
-        protected_names = {str(item or "").strip().lower() for item in protected if str(item or "").strip()}
-        return task_class in protected_names
-    except Exception:
-        logger.debug("Failed to inspect protected skill governance fallback", exc_info=True)
-        return False
 
 
 def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
@@ -15389,12 +15362,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Skill bundles take precedence over individual skill commands —
             # /<bundle> loads multiple skills at once. Mirrors CLI dispatch.
             _bundle_handled = False
+            _skill_governance_rejected = ()
             try:
                 from agent.skill_bundles import (
                     build_bundle_invocation_message,
                     resolve_bundle_command_key,
                 )
                 from agent.skill_governance import SkillGovernanceRejectedError
+                _skill_governance_rejected = (SkillGovernanceRejectedError,)
                 bundle_key = resolve_bundle_command_key(command)
                 if bundle_key is not None:
                     user_instruction = event.get_command_args().strip()
@@ -15418,7 +15393,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 bundle_key, ", ".join(missing),
                             )
                         # Fall through to normal message processing with bundle content
-            except SkillGovernanceRejectedError as exc:
+            except _skill_governance_rejected as exc:
                 return str(exc)
             except Exception as exc:
                 logger.warning("Bundle dispatch failed: %s", exc)
@@ -15433,9 +15408,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 from agent.skill_governance import (
                     SkillGovernanceRejectedError,
-                    is_protected_task_class_configured,
+                    probe_protected_task_class,
                 )
-                _protected_skill_governance = is_protected_task_class_configured()
+                _protected_skill_governance = probe_protected_task_class().protected_task
                 skill_cmds = get_skill_commands()
                 cmd_key = resolve_skill_command_key(command)
                 if cmd_key is not None:
@@ -15538,7 +15513,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return str(exc)
             except Exception as e:
                 logger.debug("Skill command check failed", exc_info=True)
-                if _protected_skill_governance or _protected_skill_governance_configured_fallback():
+                if _protected_skill_governance:
                     return (
                         f'The "/{command}" skill command was denied because skill governance '
                         f"could not be evaluated for the protected task class: {e}"
