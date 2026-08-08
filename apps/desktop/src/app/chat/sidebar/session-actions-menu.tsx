@@ -45,6 +45,8 @@ import { canOpenSessionWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
 
+import { sortProjectsByLabel } from './projects/model'
+
 // Rename a session, preferring the gateway's session.title RPC over REST.
 //
 // A freshly *branched* session (and any brand-new chat) lives only in the
@@ -147,7 +149,10 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
   const session = useStore($sessions).find(s => sessionMatchesStoredId(s, sessionId))
   const cwd = session?.cwd?.trim() || ''
   const currentProjectId = cwd ? projectIdForCwd(cwd) : null
-  const targets = tree.filter(node => node.id !== currentProjectId && !node.isNoProject && projectRootCwd(node))
+
+  const targets = sortProjectsByLabel(
+    tree.filter(node => node.id !== currentProjectId && !node.isNoProject && projectRootCwd(node))
+  )
 
   if (targets.length === 0) {
     return <kit.Item disabled>{p.moveNoProjects}</kit.Item>
@@ -157,6 +162,7 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
     <>
       {targets.map(node => (
         <kit.Item
+          className="w-72 max-w-[calc(100vw-2rem)]"
           key={node.id}
           onSelect={() => {
             triggerHaptic('selection')
@@ -165,7 +171,7 @@ function MoveToProjectItems({ kit, sessionId, profile }: { kit: MenuKit; session
               .catch(err => notifyError(err, p.moveFailed))
           }}
         >
-          {node.label}
+          <span className="min-w-0 flex-1 truncate">{node.label}</span>
         </kit.Item>
       ))}
     </>

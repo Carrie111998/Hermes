@@ -4,6 +4,7 @@ export {
   orderProjectsByIds,
   PROJECT_PREVIEW_COUNT,
   projectTreeCwd,
+  sortProjectsByLabel,
   sortProjectsForOverview,
   useRepoWorktreeMap
 } from './model'

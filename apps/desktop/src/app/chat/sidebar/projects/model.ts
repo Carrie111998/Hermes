@@ -33,17 +33,17 @@ const projectSessions = (project: SidebarProjectTree): SessionInfo[] =>
 export const projectTreeCwd = (project: SidebarProjectTree): null | string =>
   project.path || project.repos.find(repo => repo.path)?.path || null
 
-// Overview rows carry their activity stamp from the backend (lanes are empty in
-// overview mode), falling back to loaded session times when present.
-const projectActivityTime = (project: SidebarProjectTree): number =>
-  Math.max(
-    project.lastActive ?? 0,
-    projectSessions(project).reduce((latest, s) => Math.max(latest, sessionRecency(s)), 0)
-  )
-
 // The project's most-recent sessions, for the overview preview under each row.
 export const latestProjectSessions = (project: SidebarProjectTree, limit: number): SessionInfo[] =>
   [...projectSessions(project)].sort((a, b) => sessionRecency(b) - sessionRecency(a)).slice(0, limit)
+
+// One ordering contract for every project picker/list: case-insensitive labels,
+// with id as a deterministic tie-breaker when two projects share a name.
+export const compareProjectsByLabel = (a: SidebarProjectTree, b: SidebarProjectTree): number =>
+  a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }) || a.id.localeCompare(b.id)
+
+export const sortProjectsByLabel = (projects: SidebarProjectTree[]): SidebarProjectTree[] =>
+  [...projects].sort(compareProjectsByLabel)
 
 // Home is a fixture, not a project: it always leads the overview, above the
 // active project and outside any hand-picked order.
@@ -52,37 +52,11 @@ const homeFirst = (projects: SidebarProjectTree[]): SidebarProjectTree[] =>
     ? projects
     : [...projects.filter(project => project.isNoProject), ...projects.filter(project => !project.isNoProject)]
 
-export function sortProjectsForOverview(
-  projects: SidebarProjectTree[],
-  activeProjectId: null | string
-): SidebarProjectTree[] {
-  const sorted = [...projects].sort((a, b) => {
-    const aActive = Boolean(activeProjectId && a.id === activeProjectId && !a.isAuto)
-    const bActive = Boolean(activeProjectId && b.id === activeProjectId && !b.isAuto)
-
-    if (aActive !== bActive) {
-      return aActive ? -1 : 1
-    }
-
-    if (!a.isAuto !== !b.isAuto) {
-      return a.isAuto ? 1 : -1
-    }
-
-    const aHasSessions = a.sessionCount > 0
-    const bHasSessions = b.sessionCount > 0
-
-    if (aHasSessions !== bHasSessions) {
-      return aHasSessions ? -1 : 1
-    }
-
-    return (
-      projectActivityTime(b) - projectActivityTime(a) ||
-      a.label.localeCompare(b.label, undefined, { sensitivity: 'base' })
-    )
-  })
-
-  return homeFirst(sorted)
-}
+// The overview is navigation, not an activity feed. Keep rows stable while
+// sessions start/finish or the active project changes; Home remains the fixed
+// first destination and the user can still override the rest by dragging.
+export const sortProjectsForOverview = (projects: SidebarProjectTree[]): SidebarProjectTree[] =>
+  homeFirst(sortProjectsByLabel(projects))
 
 // Layer the user's manual drag-order over the deterministic sort.
 //
@@ -93,9 +67,8 @@ export function sortProjectsForOverview(
 // anything, every freshly-scanned checkout jumped above the projects they
 // actually work in.
 //
-// Fresh projects keep their place in the deterministic sort instead: ones with
-// real activity go on top (a project you just started still surfaces), and
-// zero-session discoveries sink below the hand-ordered list.
+// Fresh projects append in deterministic label order. They must not jump above
+// rows the user deliberately placed just because a session became active.
 export function orderProjectsByIds(projects: SidebarProjectTree[], orderIds: string[]): SidebarProjectTree[] {
   if (!orderIds.length) {
     return projects
@@ -104,17 +77,13 @@ export function orderProjectsByIds(projects: SidebarProjectTree[], orderIds: str
   const byId = new Map(projects.map(project => [project.id, project]))
   const ordered = orderIds.map(id => byId.get(id)).filter((p): p is SidebarProjectTree => Boolean(p))
   const seen = new Set(ordered.map(project => project.id))
-  const fresh = projects.filter(project => !seen.has(project.id))
+  const fresh = sortProjectsByLabel(projects.filter(project => !seen.has(project.id)))
 
   if (!fresh.length) {
     return homeFirst(ordered)
   }
 
-  return homeFirst([
-    ...fresh.filter(project => project.sessionCount > 0),
-    ...ordered,
-    ...fresh.filter(project => project.sessionCount <= 0)
-  ])
+  return homeFirst([...ordered, ...fresh])
 }
 
 // Project drill-in lanes are git-driven: source them from `git worktree list` so
