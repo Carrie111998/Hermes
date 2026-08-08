@@ -9,6 +9,9 @@ and ``speak_text`` tolerates empty input without touching the provider
 stack.
 """
 
+import sys
+import types
+from pathlib import Path
 
 import pytest
 
@@ -17,13 +20,17 @@ class TestPublicAPI:
     def test_gateway_symbols_importable(self):
         """Match the exact import shape tui_gateway/server.py uses."""
         from hermes_cli.voice import (
+            capture_speech_token,
             speak_text,
             start_recording,
             stop_and_transcribe,
+            stop_speaking,
         )
 
         assert callable(start_recording)
         assert callable(stop_and_transcribe)
+        assert callable(capture_speech_token)
+        assert callable(stop_speaking)
         assert callable(speak_text)
 
 
@@ -210,6 +217,121 @@ class TestSpeakTextGuards:
         assert played == requested_paths
 
 
+@pytest.mark.real_audio_playback
+class TestSpeechCancellation:
+    def test_stop_invalidates_token_captured_before_worker_start(self, monkeypatch):
+        """A PTT stop after queueing but before thread start cancels the job."""
+        import hermes_cli.voice as voice
+
+        calls: list[str] = []
+        monkeypatch.setattr(voice, "_tts_cancel_generation", 0)
+        monkeypatch.setattr(voice, "stop_playback", lambda: calls.append("stop"))
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tts_tool",
+            types.SimpleNamespace(
+                text_to_speech_tool=lambda **_kwargs: calls.append("synthesize")
+            ),
+        )
+
+        token = voice.capture_speech_token()
+        voice.stop_speaking()
+        voice.speak_text("queued speech", cancel_token=token)
+
+        assert calls == ["stop"]
+        assert voice._tts_cancel_generation == 1
+        assert voice._tts_playing.is_set()
+
+    def test_stop_during_synthesis_skips_playback_and_recorder_resume(
+        self, monkeypatch
+    ):
+        import hermes_cli.voice as voice
+
+        played: list[str] = []
+
+        class Recorder:
+            is_recording = True
+
+            def __init__(self):
+                self.cancel_count = 0
+                self.start_count = 0
+
+            def cancel(self):
+                self.cancel_count += 1
+
+            def start(self, **_kwargs):
+                self.start_count += 1
+
+        recorder = Recorder()
+        monkeypatch.setattr(voice, "_tts_cancel_generation", 0)
+        monkeypatch.setattr(voice, "_continuous_active", True)
+        monkeypatch.setattr(voice, "_continuous_paused_for_tts", False)
+        monkeypatch.setattr(voice, "_continuous_recorder", recorder)
+        monkeypatch.setattr(voice, "stop_playback", lambda: None)
+        monkeypatch.setattr(voice, "play_audio_file", lambda path: played.append(path))
+
+        def fake_tts_tool(*, text, output_path):
+            Path(output_path).write_bytes(b"mp3")
+            voice.stop_speaking()
+
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tts_tool",
+            types.SimpleNamespace(text_to_speech_tool=fake_tts_tool),
+        )
+
+        voice.speak_text("hello")
+
+        assert recorder.cancel_count == 1
+        assert recorder.start_count == 0
+        assert played == []
+        assert voice._tts_playing.is_set()
+        # The cancelled worker paused the recorder and did NOT resume it, so it
+        # leaves the orphaned-pause marker set for the next start_continuous
+        # (the PTT record-start) to re-arm — otherwise the mic stays dead.
+        assert voice._continuous_paused_for_tts is True
+
+    def test_normal_tts_completion_clears_paused_marker(self, monkeypatch):
+        """Uncancelled TTS resumes the recorder itself and clears the marker,
+        so a later double-fire still no-ops atomically (no false re-arm)."""
+        import hermes_cli.voice as voice
+
+        class Recorder:
+            is_recording = True
+
+            def __init__(self):
+                self.start_count = 0
+
+            def cancel(self):
+                self.is_recording = False
+
+            def start(self, **_kwargs):
+                self.start_count += 1
+                self.is_recording = True
+
+        recorder = Recorder()
+        monkeypatch.setattr(voice, "_tts_cancel_generation", 0)
+        monkeypatch.setattr(voice, "_continuous_active", True)
+        monkeypatch.setattr(voice, "_continuous_paused_for_tts", False)
+        monkeypatch.setattr(voice, "_continuous_recorder", recorder)
+        monkeypatch.setattr(voice, "stop_playback", lambda: None)
+        monkeypatch.setattr(voice, "play_audio_file", lambda _p: True)
+        monkeypatch.setitem(
+            sys.modules,
+            "tools.tts_tool",
+            types.SimpleNamespace(
+                text_to_speech_tool=lambda **kw: Path(kw["output_path"]).write_bytes(
+                    b"mp3"
+                )
+            ),
+        )
+
+        voice.speak_text("hello there")
+
+        assert recorder.start_count == 1  # worker re-armed the mic itself
+        assert voice._continuous_paused_for_tts is False
+
+
 class TestContinuousAPI:
     """Continuous (VAD) mode API — CLI-parity loop entry points."""
 
@@ -230,13 +352,23 @@ class TestContinuousAPI:
     def test_double_start_is_idempotent(self, monkeypatch):
         """A second start_continuous while already active is a no-op — prevents
         two overlapping capture threads fighting over the microphone when the
-        UI double-fires (e.g. both /voice on and Ctrl+B within the same tick)."""
+        UI double-fires (e.g. both /voice on and Ctrl+B within the same tick).
+
+        The recorder here reports ``is_recording=False`` on purpose: the first
+        caller flips it True only *inside* rec.start(), which runs outside
+        _continuous_lock. The no-op must therefore key off the lock-held
+        _continuous_active flag (not is_recording), so a second caller landing
+        in that pre-start window is still turned away rather than opening a
+        second input stream."""
         import hermes_cli.voice as voice
 
         monkeypatch.setattr(voice, "_continuous_active", True)
+        monkeypatch.setattr(voice, "_continuous_paused_for_tts", False)
         called = {"n": 0}
 
         class FakeRecorder:
+            is_recording = False  # first caller hasn't reached rec.start() yet
+
             def start(self, on_silence_stop=None):
                 called["n"] += 1
 
@@ -251,6 +383,57 @@ class TestContinuousAPI:
         assert started is True
         assert called["n"] == 0
 
+    def test_start_continuous_rearms_tts_paused_recorder(self, monkeypatch):
+        """Active-but-orphaned-paused must re-arm, not silently no-op.
+
+        A PTT barge-in cancels an in-flight TTS worker that had paused the
+        continuous recorder; the worker's resume is gated off by cancellation,
+        leaving _continuous_paused_for_tts set. If start_continuous no-oped on
+        _continuous_active alone the mic would stay dead while the RPC reported
+        "recording". Re-arming also applies this call's fresh callbacks and
+        thresholds and clears the orphan marker."""
+        import hermes_cli.voice as voice
+
+        monkeypatch.setattr(voice, "_continuous_active", True)
+        monkeypatch.setattr(voice, "_continuous_paused_for_tts", True)
+        monkeypatch.setattr(voice, "_continuous_stopping", False, raising=False)
+        monkeypatch.setattr(voice, "_play_beep", lambda *_a, **_k: None)
+
+        captured: dict = {}
+
+        class FakeRecorder:
+            is_recording = False  # paused by the cancelled TTS worker
+            _silence_threshold = 0
+            _silence_duration = 0.0
+
+            def __init__(self):
+                self.start_calls = 0
+
+            def start(self, on_silence_stop=None):
+                self.start_calls += 1
+                self.is_recording = True
+                captured["on_silence_stop"] = on_silence_stop
+
+            def cancel(self):
+                self.is_recording = False
+
+        rec = FakeRecorder()
+        monkeypatch.setattr(voice, "_continuous_recorder", rec)
+
+        started = voice.start_continuous(
+            on_transcript=lambda _t: None,
+            silence_threshold=321,
+            silence_duration=4.5,
+            auto_restart=False,
+        )
+
+        assert started is True
+        assert rec.start_calls == 1  # re-armed, not a dead-mic no-op
+        assert rec._silence_threshold == 321  # fresh config applied (Finding 2)
+        assert rec._silence_duration == 4.5
+        assert captured["on_silence_stop"] is voice._continuous_on_silence
+        # Orphan marker cleared so a following double-fire no-ops atomically.
+        assert voice._continuous_paused_for_tts is False
 
 
 class TestContinuousLoopSimulation:
@@ -479,5 +662,4 @@ class TestSpeakTextStreamingDispatch:
         assert voice.speak_text("Hello streaming world") is None
         assert streamed == ["Hello streaming world"]
         assert synced == [], "sync whole-file path must be skipped when streaming"
-
 
