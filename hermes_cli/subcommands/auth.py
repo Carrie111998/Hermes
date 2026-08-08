@@ -70,7 +70,9 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "usage",
         help=(
             "Show live account usage (Codex / Anthropic / OpenRouter) for a "
-            "provider, fetched outside an interactive session"
+            "provider, fetched outside an interactive session. Pass "
+            "`--reset` to redeem a banked rate-limit reset credit instead "
+            "(Codex only)."
         ),
     )
     auth_usage.add_argument(
@@ -85,10 +87,10 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         action="store_true",
         dest="all_accounts",
         help=(
-            "Render usage for every pool entry of this provider instead of "
-            "just the resolver-selected one. Per-entry failures are reported "
-            "inline; the command exits non-zero only if no entry returned "
-            "usable usage."
+            "Render (or, with --reset, redeem on) every pool entry of this "
+            "provider instead of just the resolver-selected one. "
+            "Per-entry outcomes are reported inline; the command exits "
+            "non-zero only if every entry failed."
         ),
     )
     auth_usage.add_argument(
@@ -97,8 +99,29 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         default="",
         metavar="LABEL",
         help=(
-            "Render usage for the pool entry whose stored label matches "
-            "LABEL. Use `hermes auth list <provider>` to see available labels."
+            "Target the pool entry whose stored label matches LABEL. "
+            "Use `hermes auth list <provider>` to see available labels."
+        ),
+    )
+    auth_usage.add_argument(
+        "--reset",
+        action="store_true",
+        dest="reset_action",
+        help=(
+            "Redeem one banked rate-limit reset credit on the Codex "
+            "backend, instead of rendering the live usage snapshot. "
+            "Mirror of the REPL `/usage reset [--force]` slash command."
+        ),
+    )
+    auth_usage.add_argument(
+        "--force",
+        action="store_true",
+        dest="force",
+        help=(
+            "With --reset: redeem even if the busiest rate-limit window is "
+            "not fully used. A banked reset restores the FULL 5h + weekly "
+            "allowance, so spending it early wastes most of it. Ignored "
+            "without --reset."
         ),
     )
     auth_logout = auth_subparsers.add_parser(

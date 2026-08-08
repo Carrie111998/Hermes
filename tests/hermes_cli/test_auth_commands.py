@@ -1413,3 +1413,322 @@ def test_auth_usage_lists_provider_account_credentials_skips_partial_rows():
     assert all(r["access_token"] for r in rows)
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# `hermes auth usage --reset` — server-side rate-limit reset redemption
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Mirror of the REPL ``/usage reset [--force]`` slash command, exposed as
+# a CLI flag so shell loops and cron jobs can consume banked reset
+# credits without an interactive session. Tests cover the dispatch path
+# and the per-entry message contract; ``redeem_codex_reset_credit`` itself
+# has its own dedicated coverage in ``agent.account_usage``.
+
+
+def test_auth_usage_reset_rejects_unsupported_provider(capsys):
+    """A typo or future provider that has no consume endpoint must fail clean."""
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_reset_command(
+            SimpleNamespace(provider="anthropic", all_accounts=False, account="", force=False)
+        )
+    msg = str(exc_info.value)
+    assert "anthropic" in msg
+    assert "not implemented yet" in msg
+
+
+def test_auth_usage_reset_rejects_missing_provider(capsys):
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_reset_command(
+            SimpleNamespace(provider="", all_accounts=False, account="", force=False)
+        )
+    assert "Provider is required" in str(exc_info.value)
+
+
+def test_auth_usage_reset_requires_logged_in(monkeypatch, capsys):
+    """Fail-fast on no creds, same as the read path."""
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": False},
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_reset_command(
+            SimpleNamespace(
+                provider="openai-codex",
+                all_accounts=False,
+                account="",
+                force=False,
+            )
+        )
+    assert "not logged in" in str(exc_info.value)
+
+
+def test_auth_usage_reset_redeems_when_credit_available(monkeypatch, capsys):
+    """Happy path: backend returns a ``reset`` status, command exits 0."""
+    from agent.account_usage import CodexResetRedeemResult
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [{"label": "codex-current", "access_token": "tok-1"}],
+    )
+
+    good_result = CodexResetRedeemResult(
+        status="reset",
+        message="✅ Reset redeemed — your usage limits have been reset. "
+        "0 banked resets remaining.",
+        available_count=0,
+        windows_reset=2,
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage,
+        "redeem_codex_reset_credit",
+        lambda *a, **kw: good_result,
+    )
+
+    # Must not raise — successful redemption exits 0.
+    auth_usage_reset_command(
+        SimpleNamespace(
+            provider="openai-codex",
+            all_accounts=False,
+            account="",
+            force=False,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "codex-current" in out
+    assert "Reset redeemed" in out
+
+
+def test_auth_usage_reset_no_credits_banked_is_not_an_error(monkeypatch, capsys):
+    """A structured no-op must exit 0 — cron loops must distinguish
+    'nothing to do' from 'could not reach provider'."""
+    from agent.account_usage import CodexResetRedeemResult
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [{"label": "codex-current", "access_token": "tok-1"}],
+    )
+
+    no_credit_result = CodexResetRedeemResult(
+        status="no_credits_banked",
+        message="No banked reset credits on this account — nothing to redeem.",
+        available_count=0,
+        windows_reset=0,
+    )
+
+    class _ImmediatePool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            class _Fut:
+                def result(self, timeout=None):
+                    return fn(*args, **kwargs)
+
+            return _Fut()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _ImmediatePool
+    )
+
+    import agent.account_usage as _account_usage
+
+    monkeypatch.setattr(
+        _account_usage,
+        "redeem_codex_reset_credit",
+        lambda *a, **kw: no_credit_result,
+    )
+
+    # No SystemExit: structured no-op is a 0 exit so shell loops continue.
+    auth_usage_reset_command(
+        SimpleNamespace(
+            provider="openai-codex",
+            all_accounts=False,
+            account="",
+            force=False,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "No banked reset credits" in out
+    assert "codex-current" in out
+
+
+def test_auth_usage_reset_transport_failure_exits_nonzero(monkeypatch, capsys):
+    """A timeout / network error must surface as a non-zero exit so cron
+    loops can retry, distinct from 'backend said no' which exits 0."""
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [{"label": "codex-current", "access_token": "tok-1"}],
+    )
+
+    class _HangingFuture:
+        def result(self, timeout=None):
+            raise concurrent.futures.TimeoutError()
+
+    class _HangingPool:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return _HangingFuture()
+
+    monkeypatch.setattr(
+        "concurrent.futures.ThreadPoolExecutor", _HangingPool
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_reset_command(
+            SimpleNamespace(
+                provider="openai-codex",
+                all_accounts=False,
+                account="",
+                force=False,
+            )
+        )
+    msg = str(exc_info.value)
+    # The CLI surfaces the transport failure distinctly from a structured
+    # no-op: non-zero exit + actionable summary.
+    assert "could not reach the backend" in msg
+    out = capsys.readouterr().out
+    assert "timed out or transport error" in out
+
+
+def test_auth_usage_reset_account_unknown_label_exits_nonzero(monkeypatch, capsys):
+    from hermes_cli.auth_commands import auth_usage_reset_command
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_auth_status",
+        lambda provider: {"logged_in": True},
+    )
+    _seed_pool(
+        monkeypatch,
+        [
+            {"label": "codex-current", "access_token": "tok-1"},
+            {"label": "openai-codex-oauth-2", "access_token": "tok-2"},
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        auth_usage_reset_command(
+            SimpleNamespace(
+                provider="openai-codex",
+                all_accounts=False,
+                account="ghost",
+                force=False,
+            )
+        )
+    msg = str(exc_info.value)
+    assert "ghost" in msg
+    assert "codex-current" in msg
+    assert "openai-codex-oauth-2" in msg
+
+
+def test_auth_usage_reset_dispatches_via_flag(monkeypatch, capsys):
+    """The dispatch layer must route --reset to auth_usage_reset_command."""
+    from hermes_cli.auth_commands import (
+        auth_usage_command,
+        auth_usage_reset_command,
+    )
+
+    captured = {"called": None}
+
+    def _spy_show(args):
+        captured["called"] = "show"
+
+    def _spy_reset(args):
+        captured["called"] = "reset"
+
+    monkeypatch.setattr("hermes_cli.auth_commands.auth_usage_command", _spy_show)
+    monkeypatch.setattr(
+        "hermes_cli.auth_commands.auth_usage_reset_command", _spy_reset
+    )
+
+    from hermes_cli.auth_commands import auth_command
+
+    # Read path: --reset absent.
+    auth_command(
+        SimpleNamespace(
+            auth_action="usage",
+            action="usage",
+            provider="openai-codex",
+            all_accounts=False,
+            account="",
+            reset_action=False,
+            force=False,
+        )
+    )
+    assert captured["called"] == "show"
+
+    # Write path: --reset set.
+    auth_command(
+        SimpleNamespace(
+            auth_action="usage",
+            action="usage",
+            provider="openai-codex",
+            all_accounts=False,
+            account="",
+            reset_action=True,
+            force=False,
+        )
+    )
+    assert captured["called"] == "reset"

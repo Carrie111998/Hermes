@@ -798,6 +798,172 @@ def auth_usage_command(args) -> None:
         )
 
 
+def _redeem_reset_credit_with_timeout(
+    *,
+    provider: str,
+    access_token: str,
+    force: bool,
+) -> "CodexResetRedeemResult | None":
+    """Run ``redeem_codex_reset_credit`` off-thread with the 10s budget.
+
+    Returns the result dataclass, or ``None`` on transport-level failure
+    (timeout / network). The function never raises.
+    """
+    import concurrent.futures
+
+    from agent.account_usage import redeem_codex_reset_credit
+
+    def _call():
+        return redeem_codex_reset_credit(
+            base_url=None,
+            api_key=access_token or None,
+            force=force,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_call)
+        try:
+            return future.result(timeout=_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            return None
+        except Exception:
+            # ``redeem_codex_reset_credit`` is contractually non-raising;
+            # any exception here is a transport / unexpected error.
+            return None
+
+
+def auth_usage_reset_command(args) -> None:
+    """``hermes auth usage reset <provider>`` — redeem banked rate-limit resets.
+
+    Mirror of the REPL ``/usage reset [--force]`` slash command, reachable
+    from any shell without an interactive session. For providers whose
+    backend exposes a ``rate-limit-reset-credits/consume`` endpoint
+    (currently only ``openai-codex``), this consumes one banked reset
+    credit and lifts the pool cooldowns so the credential becomes usable
+    again immediately.
+
+    Multi-account scope mirrors ``auth_usage_command``:
+
+    - default (no flag): single account from the resolver. Refuses if any
+      window is below the exhaustion threshold unless ``--force`` is set,
+      exactly like the REPL slash.
+    - ``--all``: iterate every pool entry. Per-entry outcomes print
+      inline; the command exits non-zero only if every entry failed.
+    - ``--account LABEL``: redeem on the named entry only.
+
+    The handler is intentionally non-mutating on no-credits-banked,
+    not-exhausted, and provider-unavailable states — it prints the
+    structured ``CodexResetRedeemResult.message`` and exits 0 in those
+    cases so cron / shell loops can distinguish "nothing to do" from
+    "could not reach provider".
+
+    This command never clears the local exhaustion flag — that is what
+    ``hermes auth reset <provider>`` is for, and they answer different
+    questions:
+
+    - ``auth reset`` — local: "my pool entry is stuck marked rate-limited;
+      clear the local flag so the resolver can pick it again."
+    - ``auth usage reset`` — server: "I have banked reset credits on the
+      Codex backend; consume one to actually restore quota."
+    """
+    provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if not provider:
+        raise SystemExit(
+            "Provider is required. Example: `hermes auth usage reset openai-codex`."
+        )
+    if provider not in _ACCOUNT_USAGE_PROVIDERS:
+        supported = ", ".join(sorted(_ACCOUNT_USAGE_PROVIDERS))
+        raise SystemExit(
+            f"{provider}: usage reset is not supported. "
+            f"Supported providers: {supported}."
+        )
+
+    # Currently only Codex exposes a consume endpoint; gate so a typo
+    # for a future provider fails with a clear message instead of
+    # silently doing nothing.
+    if provider != "openai-codex":
+        raise SystemExit(
+            f"{provider}: usage reset is not implemented yet "
+            "(only openai-codex exposes a consume endpoint)."
+        )
+
+    show_all = bool(getattr(args, "all_accounts", False))
+    account_filter = str(getattr(args, "account", "") or "").strip()
+    force = bool(getattr(args, "force", False))
+
+    if not auth_mod.get_auth_status(provider).get("logged_in"):
+        raise SystemExit(
+            f"{provider}: not logged in. Run `hermes auth add {provider}` "
+            "or `hermes auth login`, then try again."
+        )
+
+    creds = _list_provider_account_credentials(provider)
+    if not creds:
+        creds = [
+            {
+                "label": "default",
+                "source": "resolver",
+                "access_token": "",
+                "account_id": "",
+            }
+        ]
+
+    if account_filter:
+        matches = [c for c in creds if c["label"] == account_filter]
+        if not matches:
+            known = ", ".join(c["label"] for c in creds) or "(none)"
+            raise SystemExit(
+                f"{provider}: no account labeled {account_filter!r}. "
+                f"Known: {known}."
+            )
+        creds = matches
+
+    if not show_all and len(creds) > 1:
+        first = creds[0]
+        print(
+            f"Note: {provider} has {len(creds)} pool entries; resetting "
+            f"{first['label']!r}. Re-run with --all to reset every account, "
+            "or --account <label> to pick one."
+        )
+        creds = [first]
+
+    any_redeemed = False
+    any_failed = False
+    for cred in creds:
+        if len(creds) > 1:
+            print(f"\n=== {provider}: {cred['label']} ===")
+        result = _redeem_reset_credit_with_timeout(
+            provider=provider,
+            access_token=cred["access_token"],
+            force=force,
+        )
+        if result is None:
+            any_failed = True
+            print(
+                f"  {cred['label']}: timed out or transport error after "
+                f"{_ACCOUNT_USAGE_FETCH_TIMEOUT_SECONDS:.0f}s. Try again, "
+                "or check your network."
+            )
+            continue
+        if result.redeemed:
+            any_redeemed = True
+        print(f"  {cred['label']}: {result.message}")
+
+    # Exit-code contract:
+    # - 0 when at least one entry redeemed, OR every entry reported a
+    #   structured no-op (no_credits_banked / not_exhausted /
+    #   nothing_to_reset / no_credit / already_redeemed) — the operation
+    #   ran to completion, the backend just had nothing to give.
+    # - non-zero only on transport-level failure (timeout / network) for
+    #   every attempted entry, so shell loops can distinguish "nothing
+    #   to do" from "could not reach provider".
+    if not any_redeemed and any_failed:
+        raise SystemExit(
+            f"{provider}: usage reset could not reach the backend for "
+            "any account. Try again, or check your network."
+        )
+
+
 def auth_logout_command(args) -> None:
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
 
@@ -1065,7 +1231,16 @@ def auth_command(args) -> None:
         auth_status_command(args)
         return
     if action == "usage":
-        auth_usage_command(args)
+        # ``auth_usage`` is a flat parser: positional ``provider`` plus
+        # flags ``--all`` / ``--account`` / ``--reset`` / ``--force``. The
+        # ``--reset`` flag toggles between the read path
+        # (``auth_usage_command``) and the redeem path
+        # (``auth_usage_reset_command``) so the legacy form
+        # ``auth usage <provider>`` keeps working byte-for-byte.
+        if getattr(args, "reset_action", False):
+            auth_usage_reset_command(args)
+        else:
+            auth_usage_command(args)
         return
     if action == "logout":
         auth_logout_command(args)
@@ -1083,4 +1258,4 @@ def auth_command(args) -> None:
 # when validating forward references in lazy-import helpers like
 # ``_fetch_account_usage_with_timeout``.
 if TYPE_CHECKING:
-    from agent.account_usage import AccountUsageSnapshot  # noqa: F401
+    from agent.account_usage import AccountUsageSnapshot, CodexResetRedeemResult  # noqa: F401
