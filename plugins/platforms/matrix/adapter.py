@@ -3076,17 +3076,35 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45.0,
                 )
 
-                # mautrix's Client.sync() returns a plain dict on success but
-                # an object carrying a "message" string (not a raised
-                # exception) for auth failures like M_UNKNOWN_TOKEN. Detect
-                # and stop immediately rather than falling through to the
-                # dict-shaped handling below.
+                # Defensive: handle an error *result object* rather than a
+                # raised exception. The pinned mautrix (0.21.0) never does
+                # this: HTTPAPI._send raises make_request_error() for any
+                # non-2xx and otherwise returns parsed JSON (a dict), so a
+                # real M_FORBIDDEN reaches the except branch below. This
+                # branch is inherited from the earlier matrix-nio client,
+                # where SyncError result objects were genuine, and is kept
+                # so a future client swap cannot silently reintroduce the
+                # infinite-resync bug. Classify with the same errcode /
+                # status logic as the exception path instead of a lone
+                # substring test.
                 _sync_msg = getattr(sync_data, "message", None)
                 if _sync_msg and isinstance(_sync_msg, str):
-                    _lower = _sync_msg.lower()
-                    if "m_unknown_token" in _lower or "unknown_token" in _lower:
+                    # A structured errcode/http_status is authoritative. Only
+                    # when the object exposes neither do we scan the message
+                    # text, because str(object) is an opaque repr that hides
+                    # the message. Never let the text scan override a
+                    # structured verdict: a transient 502 whose HTML body
+                    # happens to contain "forbidden" must still be retried.
+                    _structured = isinstance(
+                        getattr(sync_data, "errcode", None), str
+                    ) or isinstance(getattr(sync_data, "http_status", None), int)
+                    if _structured:
+                        _permanent = _is_permanent_matrix_auth_error(sync_data)
+                    else:
+                        _permanent = _is_permanent_matrix_auth_error(_sync_msg)
+                    if _permanent:
                         logger.error(
-                            "Matrix: permanent auth error from sync: %s — stopping",
+                            "Matrix: permanent auth error from sync: %s, stopping",
                             _sync_msg,
                         )
                         return
