@@ -92,6 +92,19 @@ class TestOpenCodeGoV1Strip:
             f"Expected /v1 stripped for anthropic_messages; got {result.base_url}"
         )
 
+    def test_switch_to_gpt_uses_codex_responses_keeps_v1(self):
+        """GPT on opencode-go uses codex_responses api_mode — /v1 kept."""
+        result = _run_opencode_switch(
+            raw_input="gpt-5.6-luna",
+            current_provider="opencode-go",
+            current_model="glm-5",
+            current_base_url="https://opencode.ai/zen/go/v1",
+        )
+
+        assert result.success, f"switch_model failed: {result.error_message}"
+        assert result.api_mode == "codex_responses"
+        assert result.base_url == "https://opencode.ai/zen/go/v1"
+
 
 class TestOpenCodeZenV1Strip:
     """OpenCode Zen: ``/model claude-*`` must strip /v1."""

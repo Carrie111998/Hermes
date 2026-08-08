@@ -4179,6 +4179,10 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     if provider == "opencode-go":
         if normalized.startswith("minimax-"):
             return "anthropic_messages"
+        if normalized.startswith("gpt-"):
+            # GPT-5 models on Go (gpt-5.6-luna) are served via /v1/responses
+            # per the published Go endpoint table.
+            return "codex_responses"
         if normalized.startswith("qwen"):
             # All Qwen models on Go (qwen3.7-max, qwen3.7-plus, qwen3.6-plus)
             # are served via /v1/messages per the published Go endpoint table.
