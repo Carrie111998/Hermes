@@ -139,6 +139,14 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     ranges. This is how ``hermes update`` heals the active memory provider
     after a venv rebuild/sync removed or downgraded its bridge packages
     (#53272, #70636).
+
+    For Hindsight ``local_embedded`` on Intel macOS (#81421), the dep list
+    routes through the slim stack. After install we smoke-check that the
+    configured local runtime actually imports — a resolver backtrack that
+    shadows the working slim API with an older non-ONNX release will fail
+    here, surfacing a clear "installed but broken" message instead of
+    silently succeeding and then crashing the daemon with
+    ``Unknown embeddings provider: onnx``.
     """
     import subprocess
     from plugins.memory import find_provider_dir
@@ -195,6 +203,7 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
     from tools.lazy_deps import install_specs
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
+    outcome = None
     try:
         outcome = install_specs(missing, timeout=120)
         if outcome.ok:
@@ -226,6 +235,65 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
                 if install_cmd:
                     print(f"\n  ⚠ '{dep_name}' not found. Install with:")
                     print(f"    {install_cmd}")
+
+    # Post-install smoke check (#81421): for Hindsight local_embedded on
+    # Intel macOS the dep list now routes through the slim stack, but the
+    # underlying failure mode was the resolver backtracking to ancient API
+    # releases whose files shadow the working slim runtime — pip reports
+    # success while the daemon crashes with
+    # `Unknown embeddings provider: onnx`. Verify the configured local
+    # runtime actually imports before claiming the heal succeeded. We
+    # only smoke-check on the affected code path (Intel macOS +
+    # local_embedded) so non-Intel installs and cloud modes don't pay a
+    # new import cost on every refresh.
+    if (
+        provider_name == "hindsight"
+        and outcome is not None
+        and outcome.ok
+    ):
+        import json
+        try:
+            cfg_path = get_hermes_home() / "hindsight" / "config.json"
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+        except Exception:
+            cfg = {}
+        if cfg.get("mode", "") in {"local", "local_embedded"}:
+            is_intel_macos = (
+                platform.system() == "Darwin"
+                and platform.machine() == "x86_64"
+            )
+            if is_intel_macos:
+                smoke_errors = _smoke_import_hindsight_local()
+                if smoke_errors:
+                    print(
+                        "  ✗ Hindsight slim runtime installed but smoke import failed "
+                        "(#81421). The daemon will not start with this stack; "
+                        "re-running the install will not help until the resolver "
+                        "stops backtracking. Check `pip show hindsight-api-slim` "
+                        "and `pip show hindsight-embed` for overlapping API files."
+                    )
+                    for err in smoke_errors:
+                        print(f"    {err}")
+
+
+def _smoke_import_hindsight_local():
+    """Import the Hindsight local runtime modules and return a list of
+    failure descriptions (empty on success).
+
+    Wrapped in a helper so tests can monkeypatch it without touching
+    ``builtins.__import__`` (which pytest uses internally for fixture
+    lookup). The slim stack wraps the daemon + embedder at the top-level
+    ``hindsight`` import path (matching the existing _IMPORT_NAMES map
+    entry for ``hindsight-all``). The slim API backend lives at
+    ``hindsight_api``; the embed manager at ``hindsight_embed``.
+    """
+    errors: list[str] = []
+    for smoke_module in ("hindsight", "hindsight_api", "hindsight_embed"):
+        try:
+            __import__(smoke_module)
+        except Exception as e:  # ImportError + anything else
+            errors.append(f"{smoke_module}: {type(e).__name__}: {e}")
+    return errors
 
 
 def _get_available_providers() -> list:
