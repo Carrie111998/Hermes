@@ -29,6 +29,16 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
     ``hermes memory setup`` — if the update-time refresh only reinstalled
     the declared ``hindsight-client``, the embedded daemon would stay
     broken after a venv rebuild stripped ``hindsight-embed`` (#70636).
+
+    The bare full bundle is NOT portable to Intel macOS: the current full
+    local-ML dependency set pulls MLX packages that have no x86_64 wheels,
+    so the resolver backtracks to ancient ``hindsight-all``/``hindsight-api``
+    releases whose overlapping ``hindsight_api`` files override the working
+    slim API and crash the daemon with "Unknown embeddings provider: onnx"
+    (#81421).  On that platform the local-embedded mode installs the thin
+    slim stack instead (wrapper installed ``--no-deps`` upstream, so the
+    explicit slim client + api-slim[local-onnx] specs are the portable
+    declaration).
     """
     deps = list(declared or [])
     if provider_name == "hindsight":
@@ -39,10 +49,31 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
             mode = cfg.get("mode", "")
             # "local" is a legacy alias for "local_embedded"
             if mode in {"local", "local_embedded"}:
-                deps.append("hindsight-all")
+                if _is_intel_macos():
+                    deps.append("hindsight-all-slim")
+                    deps.append("hindsight-api-slim[local-onnx]")
+                else:
+                    deps.append("hindsight-all")
         except Exception:
             pass
     return deps
+
+
+def _is_intel_macos() -> bool:
+    """True on macOS running on an Intel (x86_64) CPU.
+
+    The full Hindsight local-ML bundle is not installable there: its
+    current dependencies include MLX packages that ship no x86_64 wheels,
+    so the resolver silently backtracks to ancient releases that break
+    the configured ONNX runtime (#81421).  Apple Silicon (arm64) and
+    every other OS keep the full bundle.
+    """
+    import platform
+    return platform.system() == "Darwin" and platform.machine() in {
+        "x86_64",
+        "i386",
+        "i686",
+    }
 
 
 # ---------------------------------------------------------------------------
