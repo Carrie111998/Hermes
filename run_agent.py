@@ -3699,6 +3699,8 @@ class AIAgent:
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
+        if not self._file_mutation_verifier_enabled():
+            return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
             return
@@ -3879,6 +3881,8 @@ class AIAgent:
         snapshots stay unresolved so the verifier never loses its original
         protection merely because it could not inspect a target.
         """
+        if not self._file_mutation_verifier_enabled():
+            return {}
         failed = getattr(self, "_turn_failed_file_mutations", None) or {}
         unresolved: Dict[str, Dict[str, Any]] = {}
         for path, info in failed.items():
