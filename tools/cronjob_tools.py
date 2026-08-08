@@ -688,11 +688,18 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     raw = script.strip()
 
-    # Reject absolute paths and ~ expansion at the API boundary.
-    # Only relative paths within ~/.hermes/scripts/ are allowed.
-    # The scripts dir is per-profile, so naming ~/.hermes/scripts here is wrong
-    # for every profile but default and sends the reader to the wrong directory.
-    scripts_display = f"{display_hermes_home()}/scripts/"
+    # Reject absolute paths and ~ expansion at the API boundary; only relative
+    # paths inside this profile's scripts dir are allowed.
+    #
+    # The scripts dir is per-profile, so the old hardcoded "~/.hermes/scripts"
+    # named the wrong directory for every profile but default. Report the real
+    # one — and report it as an absolute path, not via display_hermes_home():
+    # that helper renders "~/."
+    # when HERMES_HOME *is* the home directory — the containerised layout —
+    # which turned this hint into the actively unhelpful "~/./scripts/". These
+    # messages exist to answer "which directory?", and only an absolute path
+    # answers that in every layout and every profile.
+    scripts_display = f"{get_hermes_home()}/scripts/"
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
         return (
             f"Script path must be relative to {scripts_display}. "
