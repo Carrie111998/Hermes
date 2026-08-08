@@ -903,11 +903,21 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+            # EXCEPT one place legit UTF-8 text does produce U+FFFD: the
+            # sample itself is `head -c 1000` — an arbitrary BYTE cut. When
+            # the boundary lands inside a multi-byte UTF-8 char (common in
+            # dense CJK documents), errors=replace appends a trailing U+FFFD
+            # that is a sampling artifact, not binary content. Real binary
+            # (UTF-16, compressed data, etc.) yields replacement chars
+            # throughout the sample, never only at the tail. So ignore U+FFFD
+            # in the last 4 chars (max UTF-8 sequence length) before judging.
+            interior = sample[:-4] if len(sample) > 4 else ""
+            if "\ufffd" in interior:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     

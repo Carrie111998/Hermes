@@ -673,3 +673,28 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_cjk_byte_cut_tail_replacement_not_flagged(self, tmp_path):
+        """Regression: the sample is `head -c 1000` — an arbitrary BYTE cut.
+        When the boundary lands inside a multi-byte UTF-8 char (common in
+        dense CJK documents), errors=replace appends a trailing U+FFFD. That
+        tail replacement char is a sampling artifact, not binary content, so
+        it must not flip the file to read-only binary.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Real shape: content_sample is ALREADY the `head -c 1000` output
+        # decoded with errors=replace, so it is <= ~1000 chars with a single
+        # trailing U+FFFD where the byte cut landed mid-sequence. The
+        # [0:1000] re-slice inside _is_likely_binary must not drop it.
+        dense_cjk = "射频天线创新系统与毫米波滤波器设计" * 50  # 950 chars, every char is 3 bytes
+        artifact_sample = dense_cjk + "\ufffd"
+        assert len(artifact_sample) <= 1000 and artifact_sample.endswith("\ufffd")
+        assert ops._is_likely_binary("notes.txt", artifact_sample) is False
+
+    def test_interior_replacement_char_still_flagged_binary(self, tmp_path):
+        """U+FFFD outside the 4-char tail window is still genuine binary
+        content (UTF-16, compressed data, mojibake) and must be flagged.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = "中文中文\ufffd中文中文"  # replacement char sits in the interior
+        assert ops._is_likely_binary("notes.txt", sample) is True
