@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -9,6 +12,8 @@ from hermes_cli.backup import (
     BackupInProgressError,
     _atomic_output_path,
     _backup_operation_lock,
+    _safe_copy_db,
+    _should_exclude,
     _write_full_zip_backup,
     create_quick_snapshot,
     list_quick_snapshots,
@@ -103,3 +108,100 @@ def test_failed_automatic_backup_preserves_previous_archive(tmp_path, monkeypatc
     assert _write_full_zip_backup(archive, home) is None
     assert archive.read_bytes() == b"previous-valid-backup"
     assert list(tmp_path.glob(".*.partial")) == []
+
+
+def test_chrome_runtime_caches_are_excluded_but_profile_state_is_preserved() -> None:
+    assert _should_exclude(Path("chrome-debug/Default/GPUCache/cache.db"))
+    assert _should_exclude(Path("chrome-debug/Default/Code Cache/js/index"))
+    assert _should_exclude(Path("chrome-debug/ShaderCache/GPUCache/data_0"))
+    assert _should_exclude(
+        Path("profiles/coder/chrome-debug/Default/GPUCache/cache.db")
+    )
+    assert not _should_exclude(Path("chrome-debug/Default/Cookies"))
+    assert not _should_exclude(Path("chrome-debug/Default/Login Data"))
+    assert not _should_exclude(
+        Path("profiles/coder/chrome-debug/Default/Login Data")
+    )
+
+
+def test_locked_database_stall_is_bounded_and_cleans_destination(tmp_path) -> None:
+    src = tmp_path / "locked-cache.db"
+    dst = tmp_path / "copy.db"
+    holder = sqlite3.connect(src, timeout=0)
+    holder.execute("CREATE TABLE cache (key TEXT)")
+    holder.commit()
+    holder.execute("BEGIN EXCLUSIVE")
+
+    started = time.monotonic()
+    try:
+        result = _safe_copy_db(src, dst, timeout_seconds=0.1)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert result is False
+    assert time.monotonic() - started < 2.0
+    assert not dst.exists()
+
+
+def test_nonadvancing_sqlite_ok_progress_is_bounded(tmp_path, monkeypatch) -> None:
+    from hermes_cli import backup
+
+    src = tmp_path / "growing.db"
+    dst = tmp_path / "copy.db"
+    src.write_bytes(b"source")
+    dst.write_bytes(b"partial")
+
+    class SourceConnection:
+        def backup(self, _destination, *, progress, **_kwargs) -> None:
+            until = time.monotonic() + 0.2
+            while time.monotonic() < until:
+                progress(sqlite3.SQLITE_OK, 10, 10)
+                time.sleep(0.01)
+
+        def close(self) -> None:
+            pass
+
+    class DestinationConnection:
+        def close(self) -> None:
+            pass
+
+    connections = iter((SourceConnection(), DestinationConnection()))
+    monkeypatch.setattr(
+        backup.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: next(connections),
+    )
+
+    assert _safe_copy_db(src, dst, timeout_seconds=0.05) is False
+    assert not dst.exists()
+
+
+def test_locked_chrome_cache_is_skipped_without_losing_profile_state(tmp_path) -> None:
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "coder" / "chrome-debug" / "Default"
+    gpu_cache = profile / "GPUCache"
+    gpu_cache.mkdir(parents=True)
+    (home / "config.yaml").write_text("model: test\n", encoding="utf-8")
+    (profile / "Cookies").write_bytes(b"persistent-session-state")
+
+    cache_db = gpu_cache / "cache.db"
+    holder = sqlite3.connect(cache_db, timeout=0)
+    holder.execute("CREATE TABLE cache (key TEXT)")
+    holder.commit()
+    holder.execute("BEGIN EXCLUSIVE")
+
+    archive = tmp_path / "pre-update.zip"
+    started = time.monotonic()
+    try:
+        result = _write_full_zip_backup(archive, home)
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert result == archive
+    assert time.monotonic() - started < 2.0
+    with zipfile.ZipFile(archive) as zf:
+        names = set(zf.namelist())
+    assert "profiles/coder/chrome-debug/Default/Cookies" in names
+    assert "profiles/coder/chrome-debug/Default/GPUCache/cache.db" not in names
