@@ -21,11 +21,14 @@
  *  - DECRPM responses: `ESC[?mode;state$y`, visible form, and bare `mode;state$y`
  */
 
+// eslint-disable-next-line no-control-regex
 const SGR_MOUSE_ESC = /\x1b\[<\d+;\d+;\d+[Mm]/g
 const SGR_MOUSE_VISIBLE = /\^\[\[<\d+;\d+;\d+[Mm]/g
 const SGR_MOUSE_BARE = /<\d+;\d+;\d+[Mm]/g
+// eslint-disable-next-line no-control-regex
 const CPR_ESC = /\x1b\[\d+;\d+R/g
 const CPR_VISIBLE = /\^\[\[\d+;\d+R/g
+// eslint-disable-next-line no-control-regex
 const DECRPM_ESC = /\x1b\[\?\d+;\d+\$y/g
 const DECRPM_VISIBLE = /\^\[\[\?\d+;\d+\$y/g
 const DECRPM_BARE = /\d+;\d+\$y/g

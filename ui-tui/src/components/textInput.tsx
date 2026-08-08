@@ -4,7 +4,6 @@ import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'rea
 
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
-import { stripTerminalControlFragments } from '../lib/terminalInputSanitize.js'
 import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
@@ -14,6 +13,7 @@ import {
   isVoiceToggleKey,
   type ParsedVoiceRecordKey
 } from '../lib/platform.js'
+import { stripTerminalControlFragments } from '../lib/terminalInputSanitize.js'
 import { isTermuxTuiMode } from '../lib/termux.js'
 
 type InkExt = typeof Ink & {

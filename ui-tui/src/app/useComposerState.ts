@@ -16,10 +16,10 @@ import { useQueue } from '../hooks/useQueue.js'
 import { isUsableClipboardText, readClipboardText } from '../lib/clipboard.js'
 import { resolveEditor } from '../lib/editor.js'
 import { readOsc52Clipboard } from '../lib/osc52.js'
-import { isRemoteShellSession } from '../lib/terminalSetup.js'
-import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 import { shouldCollapsePaste } from '../lib/pasteCollapse.js'
 import { stripTerminalControlFragments } from '../lib/terminalInputSanitize.js'
+import { isRemoteShellSession } from '../lib/terminalSetup.js'
+import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 
 import type {
   ComposerPasteResult,
@@ -278,6 +278,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       const pasteCollapseLines = getUiState().pasteCollapseLines
       const pasteCollapseChars = getUiState().pasteCollapseChars
       const pasteCollapseDataChars = getUiState().pasteCollapseDataChars
+
       const collapse = shouldCollapsePaste({
         text: cleanedText,
         lineCount,
