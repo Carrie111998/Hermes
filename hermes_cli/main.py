@@ -9914,27 +9914,30 @@ def _report_dashboard_status() -> int:
     """Print live listening dashboard processes and return the count."""
     from gateway.status import _pid_exists
 
-    live: list[tuple[int, str]] = []
+    # Report serve-mode alongside dashboard-mode. ``--stop`` reaps whatever
+    # _scan_dashboard_processes finds, with no mode filter, so a status that
+    # hides serve-mode leaves the Desktop's detached SSH backends invisible to
+    # the only CLI that can clean them up, and contradicts the --status help
+    # text ("Show running Hermes web server processes").
+    live: list[tuple[int, str, str]] = []
     for pid, command in _scan_dashboard_processes():
         runtime = _parse_dashboard_runtime(command)
         if runtime is None:
             continue
         mode, host, port = runtime
-        if mode != "dashboard":
-            continue
         if port <= 0 or not _pid_exists(pid):
             continue
         if not _dashboard_listening(host, port):
             continue
-        live.append((pid, command))
+        live.append((pid, mode, command))
 
     if not live:
-        print("No hermes dashboard processes running.")
+        print("No hermes web server processes running.")
         return 0
 
-    print(f"{len(live)} hermes dashboard process(es) running:")
-    for pid, command in live:
-        print(f"    PID {pid}: {command}")
+    print(f"{len(live)} hermes web server process(es) running:")
+    for pid, mode, command in live:
+        print(f"    PID {pid} [{mode}]: {command}")
     return len(live)
 
 
