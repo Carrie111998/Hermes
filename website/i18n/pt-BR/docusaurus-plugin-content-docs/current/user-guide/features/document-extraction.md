@@ -30,13 +30,16 @@ A extração funciona com backends de terminal remotos (Docker, Modal, SSH): os 
 
 A conversão de PDF lê **somente a camada de texto**. Páginas que são imagens digitalizadas — comuns em documentos jurídicos, pacotes de revenda, contratos assinados, faxes — não têm camada de texto e silenciosamente convertem para nada. A assinatura típica são cabeçalhos de seção com corpos vazios.
 
-Quando uma parcela significativa de páginas não produz texto (mais de 20% do documento, ou 10+ páginas em absoluto), o `read_file` antepõe um aviso à extração:
+Quando uma parcela significativa de páginas não produz texto (mais de 20% do documento, ou 10+ páginas em absoluto), o `read_file` antepõe um aviso à extração. Cada lacuna ilegível é rotulada com o último texto extraído antes dela — em geral um divisor de seção — para que o agente possa mirar só as lacunas de que realmente precisa, em vez de fazer OCR do documento inteiro:
 
 ```
 [EXTRACTION COVERAGE WARNING: 198 of 311 pages in this PDF yielded no
-text (pages 2-29, 33-35, 42-77, 79-85, 92-213, 224, 226). Those pages
-are likely scanned images (or blank) — their content is MISSING from
-the extracted text below ...]
+text. ... Unreadable gaps, each labeled with the last text extracted
+before it:
+  pages 42-77 (36 pages) — after "Antigua Maintenance Corp Bylaws" (p41)
+  pages 92-213 (122 pages) — after "... Covenants, Codes and Regulations" (p91)
+  page 224 (1 page) — after "... Insurance Declaration Pages" (p223)
+Decide which gaps you actually need — do NOT OCR or render everything. ...]
 ```
 
 O aviso lista as faixas de páginas exatas e os caminhos de recuperação:
