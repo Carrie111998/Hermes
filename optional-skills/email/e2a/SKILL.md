@@ -1,6 +1,6 @@
 ---
 name: e2a
-description: "Use e2a for Hermes-owned email over hosted MCP."
+description: "Operate Hermes-owned email through a hosted MCP server."
 version: 1.0.0
 author: Josh Zhang (jiashuoz)
 license: Apache-2.0
@@ -99,8 +99,8 @@ skill when the server's `tools/list` result is available.
    authenticate it before continuing.
 2. **Select the inbox.** For agent scope, use the returned `agent_email`. For
    account scope, call `list_agents` and select the inbox explicitly. If no
-   inbox exists, create one on the shared domain, such as
-   `hermes-agent@agents.e2a.dev`; the shared domain requires no DNS setup.
+   inbox exists, create one on the hosted shared domain; it requires no DNS
+   setup.
 3. **Read mail.** Call `list_messages`, then `get_message` for the complete
    body and sender-authentication evidence. Fetch attachment bytes only when
    needed with `get_attachment`.
@@ -145,7 +145,7 @@ skill when the server's `tools/list` result is available.
 Run:
 
 ```bash
-hermes --toolsets mcp -q "Call e2a whoami and report the credential scope without changing anything"
+hermes --toolsets skills,mcp-e2a -q "Use the e2a skill to call whoami and report the credential scope without changing anything"
 ```
 
 Verification succeeds when Hermes discovers the e2a MCP tools, `whoami`
