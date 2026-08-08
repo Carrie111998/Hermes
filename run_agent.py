@@ -3635,11 +3635,13 @@ class AIAgent:
     def _unresolved_file_mutation_failures(self) -> Dict[str, Dict[str, Any]]:
         """Filter stale failures whose targets changed after the failed call.
 
-        A changed fingerprint is direct filesystem evidence of recovery via a
-        route the file-tool result tracker cannot see (for example ``hermes
-        config set`` executed through ``terminal``).  Missing or unreadable
-        snapshots stay unresolved so the verifier never loses its original
-        protection merely because it could not inspect a target.
+        A changed, still-present fingerprint is evidence of follow-up mutation
+        via a route the file-tool result tracker cannot see (for example
+        ``hermes config set`` executed through ``terminal``). The verifier
+        intentionally does not parse arbitrary shell/helper semantics; the
+        task contract treats an observed post-failure target change as the
+        recovery signal. Deleted, missing, or unreadable targets stay
+        unresolved so unrelated removal cannot suppress the warning.
         """
         if not self._file_mutation_verifier_enabled():
             return {}
@@ -3655,7 +3657,12 @@ class AIAgent:
                 resolved_path,
                 task_id=info.get("task_id"),
             )
-            if current_resolved != resolved_path or current is None or current == baseline:
+            if (
+                current_resolved != resolved_path
+                or current is None
+                or current == ("missing",)
+                or current == baseline
+            ):
                 unresolved[path] = info
         return unresolved
 

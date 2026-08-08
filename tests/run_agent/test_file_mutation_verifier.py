@@ -510,6 +510,21 @@ class TestRecordFileMutationResult:
 
         assert set(agent._unresolved_file_mutation_failures()) == {str(target)}
 
+    def test_deleted_target_remains_unresolved(self, tmp_path):
+        target = tmp_path / "deleted.txt"
+        target.write_text("before\n", encoding="utf-8")
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target)},
+            json.dumps({"error": "old_string not found"}),
+            is_error=True,
+        )
+
+        target.unlink()
+
+        assert set(agent._unresolved_file_mutation_failures()) == {str(target)}
+
     def test_v4a_recovery_filters_only_the_changed_sibling(self, tmp_path):
         changed = tmp_path / "changed.txt"
         unchanged = tmp_path / "unchanged.txt"
