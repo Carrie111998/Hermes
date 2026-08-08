@@ -1674,9 +1674,6 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
-        # Report the logical UTF-8 payload supplied by the caller. The
-        # on-disk representation may differ when preserving CRLF or a BOM.
-        requested_bytes = len(content.encode("utf-8"))
 
         # Block writes to sensitive paths
         denied = _write_denied_error(path, verb="Write")
