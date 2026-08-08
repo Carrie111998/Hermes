@@ -5725,7 +5725,7 @@ class TurnRunner:
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
-                        title,
+                        f"✅ Done · {title}",
                     )
                 maybe_auto_title(
                     getattr(self._runner._session_db, "_db", self._runner._session_db),
@@ -17860,6 +17860,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                # Internal adapter handle for trusted in-process hooks. Hooks
+                # must treat this as optional and never serialize it.
+                "adapter": self._adapter_for_source(source),
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -18500,6 +18503,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            try:
+                _error_hook_ctx = dict(locals().get("hook_ctx") or {})
+                if _error_hook_ctx:
+                    _error_hook_ctx["failed"] = True
+                    _error_hook_ctx["error"] = str(e)[:500]
+                    await self.hooks.emit("agent:end", _error_hook_ctx)
+            except Exception:
+                pass
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -20114,13 +20125,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return cleaned
 
     def _is_discord_auto_thread_lane(self, source: SessionSource) -> bool:
-        """Return True only for Discord threads Hermes just auto-created."""
+        """Return True for Discord threads receiving an agent turn.
+
+        This includes both threads Hermes auto-created and threads created
+        manually by a user. The lifecycle title feature is intentionally based
+        on the active Discord thread context, not on who created the thread.
+        """
+        platform = getattr(source.platform, "value", source.platform)
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        chat_id = str(getattr(source, "chat_id", "") or "")
         return (
-            source.platform == Platform.DISCORD
-            and source.chat_type == "thread"
-            and bool(getattr(source, "auto_thread_created", False))
-            and bool(source.thread_id)
-            and bool(getattr(source, "auto_thread_initial_name", None))
+            str(platform).lower() == Platform.DISCORD.value
+            and bool(thread_id)
+            and (
+                source.chat_type == "thread"
+                or chat_id == thread_id
+            )
         )
 
     def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
@@ -20287,6 +20307,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prefer_connector_created=use_connector_guard,
                 only_if_current_name=guard_name,
                 parent_chat_id=parent_chat_id,
+                **(
+                    {}
+                    if use_connector_guard
+                    else {
+                        "allow_current_name_prefixes": (
+                            "⏳ Working · ",
+                            "✅ Done · ",
+                            "❌ Failed · ",
+                        )
+                    }
+                ),
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
@@ -20295,6 +20326,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
+
+    def _schedule_discord_thread_lifecycle_title(
+        self,
+        source: SessionSource,
+        status: str,
+        prompt: str,
+    ) -> None:
+        """Rename a native Hermes-created Discord thread at turn boundaries."""
+        if not self._is_discord_auto_thread_lane(source) or not prompt:
+            return
+        adapter = self._adapter_for_source(source)
+        rename_thread = getattr(adapter, "rename_thread", None) if adapter else None
+        if not callable(rename_thread):
+            return
+
+        lifecycle_emoji = status.split(" ", 1)[0]
+        expected_name = (
+            getattr(source, "auto_thread_initial_name", None)
+            if status == "⏳ Working"
+            else None
+        )
+        if not source.thread_id:
+            return
+
+        async def _rename() -> None:
+            try:
+                await rename_thread(
+                    str(source.thread_id),
+                    "",
+                    only_if_current_name=expected_name,
+                    lifecycle_emoji=lifecycle_emoji,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to update Discord thread lifecycle title",
+                    exc_info=True,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is not None and not loop.is_closed():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is loop:
+                asyncio.create_task(_rename())
+            else:
+                safe_schedule_threadsafe(
+                    _rename(),
+                    loop,
+                    logger=logger,
+                    log_message="Discord thread lifecycle rename failed to schedule",
+                )
 
     def _schedule_discord_semantic_thread_rename(
         self,
@@ -20305,6 +20392,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Schedule Discord auto-thread rename from the auto-title background thread."""
         relay_info = None
         if not title:
+            return
+        # Native Discord lifecycle titles preserve the current thread name and
+        # only change its status emoji; do not let semantic auto-title replace
+        # that name later in the turn.
+        if self._is_discord_auto_thread_lane(source):
             return
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the

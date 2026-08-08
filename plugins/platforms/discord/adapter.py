@@ -26,7 +26,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, List, Optional, Any, Tuple, Sequence
 from urllib.parse import quote, urljoin
 
 from agent.async_utils import (
@@ -6880,6 +6880,8 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        allow_current_name_prefixes: Optional[Sequence[str]] = None,
+        lifecycle_emoji: Optional[str] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
@@ -6894,15 +6896,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
 
-        cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
-        if not cleaned:
-            return False
-        # Discord thread names are budgeted in UTF-16 code units (emoji count
-        # double) — truncate with the UTF-16 helpers, not code-point slices.
-        from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
-        if utf16_len(cleaned) > 80:
-            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
-
         try:
             thread = self._client.get_channel(thread_id_int)
             if thread is None:
@@ -6912,7 +6905,39 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
-        if only_if_current_name is not None and current_name != only_if_current_name:
+        if lifecycle_emoji:
+            base_name = str(current_name or "").strip()
+            for prefix in (
+                "⏳ Working · ",
+                "✅ Done · ",
+                "❌ Failed · ",
+                "⏳ ",
+                "✅ ",
+                "❌ ",
+            ):
+                if base_name.startswith(prefix):
+                    base_name = base_name[len(prefix):].lstrip()
+                    break
+            cleaned = f"{lifecycle_emoji} {base_name}".strip()
+        else:
+            cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not cleaned:
+            return False
+        # Discord thread names are budgeted in UTF-16 code units (emoji count
+        # double) — truncate with the UTF-16 helpers, not code-point slices.
+        from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
+        if utf16_len(cleaned) > 80:
+            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
+
+        if (
+            only_if_current_name is not None
+            and current_name != only_if_current_name
+            and not any(
+                current_name.startswith(prefix)
+                for prefix in (allow_current_name_prefixes or ())
+                if isinstance(current_name, str)
+            )
+        ):
             logger.info(
                 "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
                 self.name, thread_id, current_name, only_if_current_name,
