@@ -174,8 +174,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Open-vocabulary keyword spotting: any typed phrase, zero training.
     # sentencepiece is required by sherpa_onnx.text2token (runtime phrase
     # tokenization) even though sherpa-onnx doesn't declare it.
+    # sherpa-onnx-core is sherpa-onnx's native core (onnxruntime bindings);
+    # the committed lock omitted it, making is_available() report the
+    # backend as present while the native import failed (see #77936).
     "wake.sherpa": (
         "sherpa-onnx==1.13.4",
+        "sherpa-onnx-core==1.13.4",
         "sentencepiece==0.2.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
