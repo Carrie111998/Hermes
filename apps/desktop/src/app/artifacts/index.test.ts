@@ -106,6 +106,23 @@ describe('collectArtifactsForSession', () => {
     expect(artifacts[0]?.timestamp).toBe(1_700_000_000_125)
   })
 
+  it('falls back to the session timestamp when a message timestamp is non-finite', () => {
+    const session = makeSession({ last_active: 1_700_000_000 })
+
+    for (const timestamp of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const artifacts = collectArtifactsForSession(session, [
+        {
+          content: 'Reference: https://example.com/fallback',
+          role: 'assistant',
+          timestamp
+        }
+      ])
+
+      expect(artifacts).toHaveLength(1)
+      expect(artifacts[0]?.timestamp).toBe(1_700_000_000_000)
+    }
+  })
+
   it('treats numeric epochs before 1973 as seconds at the unit boundary', () => {
     const before1973 = 94_694_399
     const millisecondsAt1973 = 94_694_400_000
