@@ -9,7 +9,12 @@ import time
 
 import hermes_cli.providers as providers_mod
 import pytest
-from hermes_cli.model_switch import list_authenticated_providers, switch_model
+import yaml
+from hermes_cli.model_switch import (
+    _save_discovered_models_to_config,
+    list_authenticated_providers,
+    switch_model,
+)
 from hermes_cli.providers import resolve_provider_full
 
 
@@ -1244,3 +1249,118 @@ def test_cached_catalog_is_not_written_back_to_config(monkeypatch):
 
     assert row["models"] == _LOCAL_CATALOG
     assert saves == []
+
+
+def test_keyless_endpoint_with_saved_catalog_still_reads_cache(monkeypatch):
+    """A keyless local server must not be pinned by Hermes' own auto-save.
+
+    ``_save_discovered_models_to_config()`` writes a plain list into
+    ``models:``, which ``_models_config_is_allowlist()`` reads back as an
+    explicit allowlist. Combined with the no-key discovery gate, a keyless
+    endpoint (the common local-model-server shape) froze on the catalog of
+    its first probe and could never widen again — the exact "lineup changes
+    after config was written" case. The cache read must not be subject to the
+    probe's network-cost gate.
+    """
+    _seed_custom_model_cache(monkeypatch, _LOCAL_CATALOG)
+
+    row, fetched = _no_probe_local_row(
+        monkeypatch,
+        custom_providers=[
+            {
+                "name": "Local (127.0.0.1:8000)",
+                "base_url": _LOCAL_ENDPOINT,
+                "model": "omlx-model-1",
+                # No api_key, and a models: list of the shape our own
+                # auto-save writes after a successful probe.
+                "models": ["omlx-model-1"],
+            }
+        ],
+    )
+
+    assert row is not None
+    assert row["models"] == _LOCAL_CATALOG
+    assert fetched == []
+
+
+def test_keyless_endpoint_with_saved_catalog_is_still_not_probed(monkeypatch):
+    """...but the network-cost gate it rides on must survive intact.
+
+    The no-key + declared-catalog combination exists to keep Hermes from
+    probing an endpoint it cannot authenticate to. Serving that endpoint from
+    a warm cache is free; hitting the network is not. With a cold cache and
+    live probing fully enabled, this row must still make zero fetches.
+    """
+    _seed_custom_model_cache(monkeypatch, [])  # cold: only a probe could answer
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    fetched = []
+
+    def fetch(_api_key, base_url, **_kwargs):
+        fetched.append(base_url)
+        return ["should-not-be-reached"]
+
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fetch)
+
+    providers = list_authenticated_providers(
+        current_provider="nous",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Local (127.0.0.1:8000)",
+                "base_url": _LOCAL_ENDPOINT,
+                "model": "omlx-model-1",
+                "models": ["omlx-model-1"],
+            }
+        ],
+        for_picker=True,
+        refresh=False,
+        probe_custom_providers=True,  # live probing fully enabled
+    )
+    row = next(
+        (p for p in providers if _LOCAL_ENDPOINT in str(p.get("api_url", ""))), None
+    )
+
+    assert row is not None
+    assert row["models"] == ["omlx-model-1"]
+    assert fetched == []
+
+
+def test_auto_saved_catalog_round_trips_without_pinning(tmp_path, monkeypatch):
+    """End-to-end: the shape we persist must not read back as a user pin.
+
+    Guards the whole chain rather than one branch — probe saves a catalog,
+    config is reloaded, and the endpoint must still be discoverable. If a
+    future change makes the saved shape look like an intentional allowlist
+    again, this fails even if the gate logic above is refactored away.
+    """
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "custom_providers:\n"
+        f"  - name: Local MLX\n    base_url: {_LOCAL_ENDPOINT}\n"
+        "    model: omlx-model-1\n"
+    )
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", str(cfg_path), raising=False)
+
+    _save_discovered_models_to_config(_LOCAL_ENDPOINT, list(_LOCAL_CATALOG))
+
+    saved = yaml.safe_load(cfg_path.read_text())["custom_providers"][0]
+    assert saved["models"] == _LOCAL_CATALOG, "probe result should be persisted"
+
+    # The persisted shape is what the picker will read on the next open. It
+    # must not, on a keyless entry, suppress discovery of a wider catalog.
+    _seed_custom_model_cache(monkeypatch, [*_LOCAL_CATALOG, "omlx-model-9"])
+    row, fetched = _no_probe_local_row(
+        monkeypatch, custom_providers=[saved]
+    )
+
+    assert row is not None
+    assert row["models"] == [*_LOCAL_CATALOG, "omlx-model-9"], (
+        "an auto-saved catalog must not pin the endpoint against a newer "
+        "cached lineup"
+    )
+    assert fetched == []
