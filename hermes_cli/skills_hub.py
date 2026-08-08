@@ -41,6 +41,42 @@ def _display_source(r) -> str:
     return r.source
 
 
+def _rank_retrieval_results(
+    results,
+    *,
+    fallback_key=None,
+):
+    """Governance-aware retrieval ordering with protected-task fail-closed.
+
+    Retrieval may fall back to the pre-governance ordering only when the active
+    config parsed safely and does not mark the current task class protected.
+    """
+    ranked = list(results or [])
+    if not ranked:
+        return ranked
+
+    try:
+        from agent.skill_governance import governance_context, rank_skill_search_results
+
+        return rank_skill_search_results(
+            ranked,
+            context=governance_context(mode="retrieval"),
+        )
+    except Exception:
+        probe = None
+        try:
+            from agent.skill_governance import probe_protected_task_class
+
+            probe = probe_protected_task_class()
+        except Exception:
+            probe = None
+        if probe is None or not probe.safe or probe.protected_task:
+            return []
+        if fallback_key is not None:
+            ranked.sort(key=fallback_key)
+        return ranked
+
+
 # ---------------------------------------------------------------------------
 # Shared do_* functions
 # ---------------------------------------------------------------------------
@@ -402,22 +438,18 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
             seen[r.identifier] = r
     deduped = list(seen.values())
 
-    try:
-        from agent.skill_governance import governance_context, governance_sort_tuple
+    deduped = _rank_retrieval_results(
+        deduped,
+        fallback_key=lambda r: (
+            -_TRUST_RANK.get(r.trust_level, 0),
+            r.source != "official",
+            r.name.lower(),
+        ),
+    )
 
-        _governance_context = governance_context(mode="retrieval")
-        deduped.sort(key=lambda r: (
-            *governance_sort_tuple(r, context=_governance_context),
-            -_TRUST_RANK.get(r.trust_level, 0),
-            r.source != "official",
-            r.name.lower(),
-        ))
-    except Exception:
-        deduped.sort(key=lambda r: (
-            -_TRUST_RANK.get(r.trust_level, 0),
-            r.source != "official",
-            r.name.lower(),
-        ))
+    if not deduped:
+        c.print("[dim]No skills found in the Skills Hub.[/]\n")
+        return
 
     # Paginate
     total = len(deduped)
