@@ -266,15 +266,22 @@ class TestStartRun:
 
         monkeypatch.setenv("PAPERCLIP_API_KEY", "ambient-token")
         monkeypatch.setenv("PAPERCLIP_RUN_ID", "ambient-run")
+        monkeypatch.setenv("Paperclip_Api_Key", "mixed-case-ambient-token")
 
         with bind_runtime_env({}):
             empty_scope = _make_run_env({})
         with bind_runtime_env({"PAPERCLIP_API_KEY": "scoped-token"}):
             scoped = _make_run_env({})
 
-        assert "PAPERCLIP_API_KEY" not in empty_scope
-        assert "PAPERCLIP_RUN_ID" not in empty_scope
+        assert not any(
+            key.upper() in {"PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID"}
+            for key in empty_scope
+        )
         assert scoped["PAPERCLIP_API_KEY"] == "scoped-token"
+        assert not any(
+            key != "PAPERCLIP_API_KEY" and key.upper() == "PAPERCLIP_API_KEY"
+            for key in scoped
+        )
         assert "PAPERCLIP_RUN_ID" not in scoped
 
     @pytest.mark.asyncio

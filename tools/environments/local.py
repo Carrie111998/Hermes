@@ -1333,8 +1333,12 @@ def _make_run_env(env: dict) -> dict:
     if trusted_runtime_env is not None:
         # A trusted request scope is authoritative, including an empty scope.
         # Never fall back to a long-lived inherited value for these names.
-        for key in TRUSTED_RUNTIME_ENV_KEYS:
-            run_env.pop(key, None)
+        # Environment names are case-insensitive on Windows. Remove every
+        # spelling of the reserved names before injecting canonical keys so a
+        # mixed-case ambient value cannot survive or conflict with this scope.
+        for key in tuple(run_env):
+            if key.upper() in TRUSTED_RUNTIME_ENV_KEYS:
+                run_env.pop(key, None)
         run_env.update(trusted_runtime_env)
 
     return run_env

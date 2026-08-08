@@ -499,6 +499,29 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _casefold_unset_env_names(names: Iterable[str]) -> str:
+    """Return bash that unsets every case spelling of valid env names."""
+    patterns = []
+    for name in sorted(set(names)):
+        if not isinstance(name, str) or not _SHELL_ENV_NAME_RE.fullmatch(name):
+            continue
+        patterns.append(
+            "".join(
+                f"[{char.lower()}{char.upper()}]" if char.isalpha() else char
+                for char in name
+            )
+        )
+    if not patterns:
+        return ""
+    joined = "|".join(patterns)
+    return (
+        "for __hermes_env_name in $(compgen -A variable); do "
+        f'case "$__hermes_env_name" in {joined}) '
+        'unset "$__hermes_env_name" ;; esac; done; '
+        "unset __hermes_env_name; "
+    )
+
+
 def _export_dump_excluding_session_vars(
     tmp_path: str,
     excluded_names: Iterable[str] = (),
@@ -535,10 +558,16 @@ def _export_dump_excluding_session_vars(
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
+    # Windows environment names are case-insensitive, while bash variable
+    # names and snapshots retain their spelling. Remove every case variant of
+    # caller-supplied reserved names before export so a mixed-case alias cannot
+    # persist and conflict with a later canonical request value.
+    casefold_unset = _casefold_unset_env_names(safe_names)
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"{casefold_unset}"
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -848,6 +877,10 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+            # Old snapshots may predate reserved-name filtering and contain a
+            # mixed-case alias. Remove every spelling before restoring the
+            # canonical current-process values below.
+            parts.append(_casefold_unset_env_names(passthrough_names))
 
         for name, present, value in saved_names:
             parts.append(

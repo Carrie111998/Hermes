@@ -99,6 +99,11 @@ def bind_exact_redactions(values: Iterable[str]) -> Iterator[None]:
     finally:
         _EXACT_REDACTION_VALUES.reset(token)
 
+
+def get_exact_redactions() -> tuple[str, ...]:
+    """Return the opaque values bound to the current execution context."""
+    return _EXACT_REDACTION_VALUES.get()
+
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
     r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / OpenRouter / Anthropic (sk-ant-*)
@@ -1220,4 +1225,9 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
+        # Async logging formats on a QueueListener thread, where ContextVars
+        # from the emitting worker are unavailable. Queue handlers attach the
+        # emitter's exact values to their shallow record copy before enqueue.
+        for secret in getattr(record, "_hermes_exact_redactions", ()):
+            original = original.replace(secret, "«redacted-secret»")
         return redact_sensitive_text(original)

@@ -589,7 +589,11 @@ class _NonFormattingQueueHandler(QueueHandler):
     """
 
     def prepare(self, record: logging.LogRecord) -> logging.LogRecord:
-        return copy.copy(record)
+        prepared = copy.copy(record)
+        from agent.redact import get_exact_redactions
+
+        prepared._hermes_exact_redactions = get_exact_redactions()
+        return prepared
 
 
 def _stop_queue_listener_locked() -> None:
