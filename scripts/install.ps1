@@ -911,8 +911,26 @@ function Test-ManagedNodeInUse {
     # tree open, and rewriting it then fails with WinError 5 (Access denied)
     # on npm.cmd (#80926).  Cheap pre-check used to skip destructive steps;
     # the rename/move itself remains the authoritative guard.
-    return @(Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like "$NodeDir\*" }).Count -gt 0
+    #
+    # Check both the process exe path AND every cmdline argument, matching
+    # the Python managed_node_tree_in_use() -- a process running
+    # cmd.exe /c C:\hermes\node\npm.cmd would be missed by an exe-only check
+    # because cmd.exe lives in System32.
+    $procs = @(Get-Process -ErrorAction SilentlyContinue)
+    foreach ($proc in $procs) {
+        try {
+            if ($proc.Path -and $proc.Path -like "$NodeDir\*") { return $true }
+        } catch { }
+        try {
+            $cmdline = $proc | Select-Object -ExpandProperty CommandLine -ErrorAction SilentlyContinue
+            if ($cmdline) {
+                foreach ($arg in $cmdline) {
+                    if ($arg -like "$NodeDir\*") { return $true }
+                }
+            }
+        } catch { }
+    }
+    return $false
 }
 
 # Re-discover uv without re-installing it.  Cross-process stage drivers
@@ -1532,11 +1550,19 @@ function Test-Node {
                     Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) } |
                     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
                 $stamp = [Guid]::NewGuid().ToString("N")
+                $staged = "$HermesHome\node.new-$stamp"
+                $backup = "$HermesHome\node.old-$stamp"
+                # Stage to a sibling directory so the final swap is a
+                # same-volume rename (atomic), not a cross-volume Move-Item
+                # (copy+delete, non-atomic -- a partial copy would leave a
+                # broken tree).  Move from $env:TEMP here, rename below.
+                Move-Item $extractedDir.FullName $staged -ErrorAction Stop
                 if (Test-Path "$HermesHome\node") {
                     try {
-                        Rename-Item "$HermesHome\node" "$HermesHome\node.old-$stamp" -ErrorAction Stop
+                        Rename-Item "$HermesHome\node" $backup -ErrorAction Stop
                     } catch {
                         Write-Warn "Hermes-managed Node.js is in use by a running app; deferring its upgrade. Close the app and re-run the update."
+                        Remove-Item -Recurse -Force $staged -ErrorAction SilentlyContinue
                         Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
                         Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
                         return $false
@@ -1546,24 +1572,29 @@ function Test-Node {
                     # the litter-sweep cutoff to a concurrent heal.  Touch it
                     # (best-effort) so the in-flight backup is never swept.
                     try {
-                        (Get-Item "$HermesHome\node.old-$stamp").LastWriteTime = Get-Date
+                        (Get-Item $backup).LastWriteTime = Get-Date
                     } catch { }
-                }
-                try {
-                    Move-Item $extractedDir.FullName "$HermesHome\node" -ErrorAction Stop
-                } catch {
-                    # Restore the live tree before bailing.  A cross-volume
-                    # Move-Item may have left a partial target, so clear it
-                    # first (best-effort) before renaming the old tree back.
-                    if (Test-Path "$HermesHome\node.old-$stamp") {
-                        Remove-Item -Recurse -Force "$HermesHome\node" -ErrorAction SilentlyContinue
-                        Rename-Item "$HermesHome\node.old-$stamp" "$HermesHome\node" -ErrorAction SilentlyContinue
+                    try {
+                        Rename-Item $staged "$HermesHome\node" -ErrorAction Stop
+                    } catch {
+                        # Restore the live tree before bailing.
+                        Rename-Item $backup "$HermesHome\node" -ErrorAction SilentlyContinue
+                        Remove-Item -Recurse -Force $staged -ErrorAction SilentlyContinue
+                        Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+                        Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                        return $false
                     }
-                    Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
-                    Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
-                    return $false
+                    Remove-Item -Recurse -Force $backup -ErrorAction SilentlyContinue
+                } else {
+                    try {
+                        Rename-Item $staged "$HermesHome\node" -ErrorAction Stop
+                    } catch {
+                        Remove-Item -Recurse -Force $staged -ErrorAction SilentlyContinue
+                        Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+                        Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                        return $false
+                    }
                 }
-                Remove-Item -Recurse -Force "$HermesHome\node.old-$stamp" -ErrorAction SilentlyContinue
 
                 # Session PATH so the rest of this run sees node/npm.
                 $env:Path = "$HermesHome\node;$env:Path"

@@ -582,13 +582,11 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
             return None
         # A rename preserves the directory's mtime, so a backup renamed from
         # a long-lived tree would instantly look older than the litter-sweep
-        # cutoff to a concurrent heal.  Touch it (best-effort — a failure
-        # must not abort the swap, which already succeeded) so the in-flight
-        # backup is never swept mid-swap.
-        try:
-            os.utime(backup, None)
-        except OSError:
-            pass
+        # cutoff to a concurrent heal.  Touch it AFTER the swap succeeds (a
+        # failure must not abort the swap, which already succeeded) so the
+        # in-flight backup is never swept mid-swap.  If the swap fails and the
+        # rollback also fails, the untouched-old-mtime backup is less likely
+        # to be swept by the 10-minute litter cutoff, giving recovery more time.
         try:
             os.replace(str(staged), str(target))
         except OSError:
@@ -599,6 +597,10 @@ def _heal_managed_node_windows(home: Path | None = None) -> bool | None:
                 pass
             shutil.rmtree(staged, ignore_errors=True)
             return False
+        try:
+            os.utime(backup, None)
+        except OSError:
+            pass
         # The old tree is no longer canonical; locked files may keep it on
         # disk until the next heal attempt, which is safe.
         shutil.rmtree(backup, ignore_errors=True)
