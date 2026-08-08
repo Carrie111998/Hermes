@@ -48,8 +48,16 @@ def test_disabled_in_delegated_child_process_context(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=[]) is None
 
 
+def test_disabled_in_non_dispatcher_owned_context(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
 
+    from agent.delegation_context import non_dispatcher_owned_context
 
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+    assert kanban_stop_nudge_enabled() is True
 
 
 def test_env_can_disable(clear_kanban_env):

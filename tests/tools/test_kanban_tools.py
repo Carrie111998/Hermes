@@ -390,6 +390,27 @@ def test_auto_heartbeat_skips_delegated_child_process(monkeypatch, worker_env):
     assert kt._auto_heartbeat_last_attempt == 0.0
 
 
+def test_auto_heartbeat_skips_non_dispatcher_owned_context(monkeypatch, worker_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+    from tools import kanban_tools as kt
+
+    attempts = []
+
+    def unexpected_connect(*_args, **_kwargs):
+        attempts.append(True)
+        raise AssertionError("non-owner context must not connect to the Kanban DB")
+
+    monkeypatch.setattr(kt, "_connect", unexpected_connect)
+    monkeypatch.setattr(kt, "_AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(kt, "_auto_heartbeat_last_attempt", 0.0)
+
+    with non_dispatcher_owned_context():
+        assert kt.heartbeat_current_worker_from_env() is False
+
+    assert attempts == []
+    assert kt._auto_heartbeat_last_attempt == 0.0
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({
