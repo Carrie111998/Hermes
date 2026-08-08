@@ -181,7 +181,11 @@ describe('refreshReview on a remote gateway', () => {
   // desktopGit() → remoteGit, which mirrors the Electron bridge over
   // /api/git/* — so with a remote connection the review ops must arrive as
   // REST calls and never touch the local Electron git bridge.
-  const api = vi.fn(async () => ({ files: [], diff: '', ok: true }))
+  const api = vi.fn(async (_request: { path: string }): Promise<Record<string, unknown>> => ({
+    files: [],
+    diff: '',
+    ok: true
+  }))
   const localReview = {
     list: vi.fn(async () => ({ files: [] })),
     stage: vi.fn(async () => undefined)
