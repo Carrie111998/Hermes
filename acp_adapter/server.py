@@ -78,6 +78,7 @@ from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
 )
+from agent.interrupt_compat import request_hard_interrupt
 from tools.approval import (
     reset_hermes_interactive_context,
     set_hermes_interactive_context,
@@ -113,7 +114,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
             is_provider_enabled,
             load_config,
         )
-        from hermes_cli.models import fetch_api_models
+        from hermes_cli.models import cached_fetch_api_models
         from hermes_cli.providers import custom_provider_slug
     except ImportError:
         return []
@@ -175,7 +176,7 @@ def _named_custom_provider_catalogs() -> list[tuple[str, str, list[tuple[str, st
             discover = discover.lower() not in {"false", "no", "0"}
         if discover and api_key:
             try:
-                live = fetch_api_models(
+                live = cached_fetch_api_models(
                     api_key, base_url, api_mode=entry.get("api_mode")
                 )
             except Exception:
@@ -1547,8 +1548,8 @@ class HermesACPAgent(acp.Agent):
                 # redirectable work.
                 state.cancel_event.set()
                 try:
-                    if getattr(state, "agent", None) and hasattr(state.agent, "interrupt"):
-                        state.agent.interrupt()
+                    if getattr(state, "agent", None):
+                        request_hard_interrupt(state.agent)
                 except Exception:
                     logger.debug(
                         "Failed to interrupt ACP session %s",
@@ -1867,8 +1868,11 @@ class HermesACPAgent(acp.Agent):
                 # while the tools are rooted at the client's project, so the
                 # model emits absolute paths under ~/.hermes/workspace and the
                 # edit silently lands outside the editor's workspace.
+                # cron_session="" explicitly marks this as a non-cron context,
+                # masking any leaked process-global HERMES_CRON_SESSION (#37968).
                 session_tokens = set_session_vars(
                     session_key=session_id, session_id=session_id, cwd=state.cwd,
+                    cron_session="",
                 )
             except Exception:
                 session_tokens = None
