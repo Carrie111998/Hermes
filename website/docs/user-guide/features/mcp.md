@@ -154,6 +154,30 @@ from environment variables (which include everything in `~/.hermes/.env`).
 This is useful when a catalog entry wants to reference a value the user
 configured elsewhere — e.g. `${HOME}/foo` or `${MY_PROVIDER_TOKEN}`.
 
+The same substitution applies to `mcp_servers.<name>` entries you write
+yourself in `config.yaml` — including the `env`, `headers`, `args`, and `url`
+keys. This means secrets can live only in `~/.hermes/.env` and be referenced
+by name, instead of being duplicated into `config.yaml`:
+
+```yaml
+mcp_servers:
+  github:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
+```
+
+`stdio` MCP servers otherwise run with a filtered environment (see
+[Stdio env filtering](#stdio-env-filtering) below), so this is the supported
+way to give a specific server access to a secret without exposing the
+gateway's entire environment to it.
+
+If a `${VAR}` placeholder can't be resolved (the variable isn't set), it is
+left in the config as a literal string rather than raising an error — a
+typo'd variable name fails silently, so double-check the resolved value if a
+server can't authenticate.
+
 Note this is distinct from `${INSTALL_DIR}` in catalog manifests, which is
 substituted at install-time with the path the catalog cloned the entry's
 repo into.
@@ -188,7 +212,7 @@ mcp_servers:
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
 ```
 
 Use stdio servers when:
@@ -478,7 +502,7 @@ mcp_servers:
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
     tools:
       include: [create_issue, list_issues]
 ```
@@ -552,7 +576,7 @@ mcp_servers:
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
     tools:
       include: [create_issue, list_issues, search_code]
       prompts: false
@@ -635,7 +659,7 @@ mcp_servers:
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-github"]
     env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN}
     tools:
       include: [list_issues, create_issue, update_issue]
       prompts: false
