@@ -20,6 +20,7 @@ import threading
 import time
 from contextlib import contextmanager
 from concurrent.futures import Future, TimeoutError
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -88,6 +89,10 @@ class SubagentLaunchRequest:
     # (config.yaml: delegation.execution_profiles.<id>).  With the default
     # None, launch behavior is byte-for-byte the legacy path.
     profile_id: Optional[str] = None
+    # Optional caller claim that must match the host-resolved profile workspace.
+    # This does not select a workspace; it binds typed plugin inputs to the
+    # authority the host already declared in the named execution profile.
+    required_workspace_root: Optional[str] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -249,6 +254,7 @@ class SubagentLifecycleService:
             )
         self._validate_request(request, parent)
         profile = self._resolve_profile_for_launch(request, parent)
+        self._validate_profile_workspace_binding(request, profile)
         parent_session_id = str(getattr(parent, "session_id", "") or "") or None
         if request.parent_session_id and request.parent_session_id != parent_session_id:
             raise SubagentLifecycleError(
@@ -478,6 +484,28 @@ class SubagentLifecycleService:
         except ExecutionProfileError as exc:
             raise SubagentLifecycleError(str(exc)) from exc
         return profile
+
+    @staticmethod
+    def _validate_profile_workspace_binding(
+        request: SubagentLaunchRequest,
+        profile: Optional[ResolvedExecutionProfile],
+    ) -> None:
+        claimed_root = request.required_workspace_root
+        if claimed_root is None:
+            return
+        if profile is None or profile.workspace_root is None:
+            raise SubagentLifecycleError(
+                "required_workspace_root requires a named profile with a host-owned workspace_root."
+            )
+        claimed = Path(claimed_root).expanduser()
+        if not claimed.is_absolute():
+            raise SubagentLifecycleError(
+                "required_workspace_root must be an absolute path."
+            )
+        if claimed.resolve() != Path(profile.workspace_root).expanduser().resolve():
+            raise SubagentLifecycleError(
+                "required_workspace_root does not match the host-owned execution profile workspace."
+            )
 
     @staticmethod
     def _enforce_profile_contract(

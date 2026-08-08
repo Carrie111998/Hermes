@@ -87,6 +87,7 @@ def test_process_profile_refuses_unsupported_api_mode_before_spawn(
             execution_backend="portable", workspace_root=str(tmp_path)
         ),
     )
+
     def build(**_kwargs):
         from tools.registry import registry
 
@@ -98,10 +99,42 @@ def test_process_profile_refuses_unsupported_api_mode_before_spawn(
     monkeypatch.setattr("agent.subagent_process_runner.run_owned_process", spawned)
 
     service = SubagentLifecycleService(lambda: parent)
-    with pytest.raises(SubagentLifecycleError, match="only api_mode 'chat_completions'"):
+    with pytest.raises(
+        SubagentLifecycleError, match="only api_mode 'chat_completions'"
+    ):
         service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
     assert child.closed is True
     spawned.assert_not_called()
+
+
+def test_profile_workspace_binding_rejects_caller_selected_root_before_spawn(
+    monkeypatch, tmp_path
+):
+    parent = SimpleNamespace(session_id="workspace-refusal", enabled_toolsets=["file"])
+    host_workspace = tmp_path / "host-owned"
+    caller_workspace = tmp_path / "caller-selected"
+    host_workspace.mkdir()
+    caller_workspace.mkdir()
+    monkeypatch.setattr(
+        "agent.subagent_lifecycle.resolve_execution_profile",
+        lambda _id: _profile(workspace_root=str(host_workspace)),
+    )
+    build = Mock()
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+
+    service = SubagentLifecycleService(lambda: parent)
+    with pytest.raises(
+        SubagentLifecycleError,
+        match="does not match the host-owned execution profile workspace",
+    ):
+        service.launch(
+            SubagentLaunchRequest(
+                goal="review",
+                profile_id="reviewer",
+                required_workspace_root=str(caller_workspace),
+            )
+        )
+    build.assert_not_called()
 
 
 @pytest.fixture
@@ -134,10 +167,6 @@ def lifecycle(monkeypatch):
     return SubagentLifecycleService(lambda: parent)
 
 
-
-
-
-
 def test_cancel_is_cooperative_and_forged_handle_is_unknown(lifecycle):
     handle = lifecycle.launch(SubagentLaunchRequest(goal="x"))
     assert lifecycle.cancel(handle, reason="test").accepted
@@ -162,12 +191,6 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
     lifecycle.wait(handle, timeout_seconds=1)
 
 
-
-
-
-
-
-
 def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     memory = Mock()
     parent = SimpleNamespace(
@@ -183,7 +206,9 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     child.session_id = "child-session"
     hook = Mock()
 
-    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._build_child_agent", lambda **_kwargs: child
+    )
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
         lambda *_args, **_kwargs: {
@@ -222,8 +247,6 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     assert parent.session_estimated_cost_usd == 3.5
     assert parent.session_cost_source == "subagent"
     assert parent.session_cost_status == "estimated"
-
-
 
 
 def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
@@ -344,9 +367,7 @@ def test_profile_blocked_tools_are_removed_before_exact_freeze(monkeypatch):
     )
     service = SubagentLifecycleService(lambda: parent)
 
-    handle = service.launch(
-        SubagentLaunchRequest(goal="review", profile_id="reviewer")
-    )
+    handle = service.launch(SubagentLaunchRequest(goal="review", profile_id="reviewer"))
     receipt = service.describe(handle)
 
     assert receipt is not None
@@ -398,7 +419,9 @@ def test_profile_rejects_dynamic_context_engine_dispatch():
         _profile(), expected_tool_names=frozenset({"lcm_grep"})
     )
 
-    with pytest.raises(SubagentLifecycleError, match="without frozen dispatch adapters"):
+    with pytest.raises(
+        SubagentLifecycleError, match="without frozen dispatch adapters"
+    ):
         SubagentLifecycleService._enforce_profile_contract(
             child,
             profile,
@@ -536,8 +559,9 @@ def test_profile_worker_waits_for_deferred_observers(monkeypatch):
     monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
-        lambda *_args, **_kwargs: order.append("run")
-        or {"status": "completed", "summary": "ok"},
+        lambda *_args, **_kwargs: (
+            order.append("run") or {"status": "completed", "summary": "ok"}
+        ),
     )
 
     def submit(fn, *args):
