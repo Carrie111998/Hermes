@@ -147,7 +147,8 @@ def test_exec_does_not_persist_env_python_source_wrapper(tmp_path, xdg_home, mon
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    assert exec_line == f"{os.path.abspath(lde.sys.executable)} -m hermes_cli.main desktop"
+    interpreter = lde._quote_exec_arg(os.path.abspath(lde.sys.executable))
+    assert exec_line == f"{interpreter} -m hermes_cli.main desktop"
 
 
 def _write_shebang(path: Path, shebang: str) -> Path:
