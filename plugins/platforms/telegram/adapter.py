@@ -564,8 +564,23 @@ def _rich_normalize_linebreaks(text: str) -> str:
     pos = 0
     for m in _RICH_PROTECTED_REGION_RE.finditer(text):
         prose = text[pos:m.start()]
+        region = m.group(0)
+        # Telegram's GFM parser only recognizes a pipe table when a BLANK line
+        # precedes the header row. Cheap models routinely emit a table directly
+        # after prose (a single \n, no blank line); the hard-break pass above
+        # turns that into '  \n' which is STILL not a blank line, so the table
+        # degrades to escaped pipes. Insert the missing blank line (\n) before
+        # a table unless one already exists. Fenced code blocks don't need it
+        # and are left verbatim.
+        if region.lstrip().startswith("```"):
+            sep = ""
+        elif prose and not prose.endswith("\n\n"):
+            sep = "\n"
+        else:
+            sep = ""
         out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', prose))
-        out.append(m.group(0))  # protected region kept verbatim
+        out.append(sep)
+        out.append(region)
         pos = m.end()
     tail = text[pos:]
     out.append(re.sub(r'(?<!\n)\n(?!\n)', '  \n', tail))

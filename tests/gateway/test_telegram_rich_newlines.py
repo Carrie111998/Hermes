@@ -76,3 +76,28 @@ class TestRichMessageTableProtection:
         assert "  \n" not in md
         assert md == content
 
+    def test_table_after_prose_gets_blank_line(self, adapter):
+        """A table emitted directly after prose (no blank line) must get one.
+
+        Telegram's GFM parser only recognizes a pipe table when a BLANK line
+        precedes the header row. The hard-break injected into the prose above
+        ('  \\n') is not a blank line, so the normalizer must insert one.
+        """
+        content = "Heading\n| Col A | Col B |\n|-------|-------|\n| 1 | 2 |"
+        md = adapter._rich_message_payload(content)["markdown"]
+        assert md == "Heading  \n\n| Col A | Col B |\n|-------|-------|\n| 1 | 2 |"
+        # table rows keep bare newlines (no hard breaks inside the table)
+        assert "  \n" not in md[len("Heading  \n\n"):]
+
+    def test_table_after_paragraph_break_untouched(self, adapter):
+        """A table already preceded by a blank line must not be altered."""
+        content = "Heading\n\n| Col A | Col B |\n|-------|-------|\n| 1 | 2 |"
+        md = adapter._rich_message_payload(content)["markdown"]
+        assert md == content
+
+    def test_table_at_document_start_untouched(self, adapter):
+        """A table at the start of content needs no blank line."""
+        content = "| Col A | Col B |\n|-------|-------|\n| 1 | 2 |"
+        md = adapter._rich_message_payload(content)["markdown"]
+        assert md == content
+
