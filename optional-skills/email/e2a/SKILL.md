@@ -15,22 +15,28 @@ metadata:
     related_skills: []
 ---
 
-# e2a — Authenticated Email for AI Agents
+# e2a Skill
 
-e2a gives Hermes its own verified email identity and inbox. This is for mail
-the agent owns and operates, not for reading a user's personal mailbox.
+Give Hermes a verified email identity and inbox through e2a's hosted MCP
+server. Operate mail owned by the agent; do not use this skill to read a
+user's personal mailbox.
 
 ## When to Use
 
-Use this skill when Hermes needs to create or operate an e2a inbox, read
-incoming agent mail, send a new email, reply in an existing thread, or connect
-e2a to a backend through its SDKs and webhooks.
+Use this skill to:
 
-## Setup
+- Create or select an e2a agent inbox.
+- Read incoming agent mail and attachments.
+- Send a new message or reply in an existing email thread.
+- Configure a custom domain owned by the user.
+- Direct a backend integration toward e2a's SDKs and webhooks.
 
-### 1. Add the hosted MCP server
+## Prerequisites
 
-Add this to `~/.hermes/config.yaml`:
+Use the hosted e2a MCP server at `https://api.e2a.dev/mcp`.
+
+For an interactive Hermes installation, add this entry to
+`~/.hermes/config.yaml`:
 
 ```yaml
 mcp_servers:
@@ -39,12 +45,11 @@ mcp_servers:
     auth: oauth
 ```
 
-Restart Hermes, then complete the browser authorization when prompted. Hermes
-stores the OAuth credentials locally and refreshes them as needed. Do not paste
-an API key into chat or commit one to a configuration file.
+Complete authorization with `hermes mcp login e2a`. Hermes stores and refreshes
+the OAuth credentials locally.
 
-For headless deployments, use an e2a API key supplied through a secret manager
-and an environment reference instead:
+For a headless deployment, supply an e2a API key through a secret manager and
+reference the environment variable:
 
 ```yaml
 mcp_servers:
@@ -54,26 +59,71 @@ mcp_servers:
       Authorization: "Bearer ${E2A_API_KEY}"
 ```
 
-API keys are scoped either to one agent inbox or to the account. Prefer an
-agent-scoped key for a deployed Hermes instance.
+Prefer an agent-scoped key for a deployed Hermes instance. Never paste an API
+key into chat or commit one to a configuration file.
 
-## Operating the inbox
+## How to Run
 
-Before the first operation, call `whoami` to learn the credential scope:
+Install the optional skill and authenticate the MCP server through the
+`terminal` tool:
 
-- An **agent-scoped** credential is already bound to one inbox; use the
-  returned `agent_email`.
-- An **account-scoped** credential can manage multiple inboxes; call
-  `list_agents` and choose the inbox explicitly. Never guess a default.
+```bash
+hermes skills install official/email/e2a
+hermes mcp login e2a
+hermes chat
+```
 
-The inbox belongs to Hermes. Use `list_messages` and `get_message` to read mail,
-`send_message` for a new conversation, and `reply_to_message` when responding
-to a message. Replies preserve the email client's thread; reusing
-`conversation_id` alone does not.
+After setup, ask Hermes to use e2a for inbox work. Hermes discovers the e2a
+tools from the connected MCP server; do not infer tool signatures from this
+skill when the server's `tools/list` result is available.
 
-### Send safely
+## Quick Reference
 
-- A response to existing mail should use `reply_to_message`, not a fresh send.
+| Task | e2a tool | Notes |
+|---|---|---|
+| Identify credential scope | `whoami` | Call first |
+| List account inboxes | `list_agents` | Account scope only |
+| Create an inbox | `create_agent` | Account scope only |
+| List inbound mail | `list_messages` | Defaults to unread inbound mail |
+| Read a message | `get_message` | Returns body, headers, and attachment metadata |
+| Download an attachment | `get_attachment` | Use the message's zero-based attachment index |
+| Start a new thread | `send_message` | Do not use for a reply |
+| Reply in-thread | `reply_to_message` | Preserves email threading headers |
+| Start custom-domain setup | `register_domain` | Returns DNS records to publish |
+| Verify custom-domain DNS | `verify_domain` | Call after DNS propagation |
+
+## Procedure
+
+1. **Confirm the connection.** Call `whoami` before the first operation. If
+   the e2a tools are absent, configure the MCP server under Prerequisites and
+   authenticate it before continuing.
+2. **Select the inbox.** For agent scope, use the returned `agent_email`. For
+   account scope, call `list_agents` and select the inbox explicitly. If no
+   inbox exists, create one on the shared domain, such as
+   `hermes-agent@agents.e2a.dev`; the shared domain requires no DNS setup.
+3. **Read mail.** Call `list_messages`, then `get_message` for the complete
+   body and sender-authentication evidence. Fetch attachment bytes only when
+   needed with `get_attachment`.
+4. **Continue an existing conversation.** Call `reply_to_message` with the
+   original `message_id`. Keep the subject stable. Use `conversation_id` only
+   for application correlation; it does not preserve an email-client thread.
+5. **Start a new conversation.** Call `send_message` with the selected inbox,
+   recipients, subject, and a complete plain-text body. Include equivalent
+   HTML only when it improves structured content.
+6. **Configure a custom domain only when requested.** Call `register_domain`,
+   have the user publish every returned DNS record verbatim, wait for DNS
+   propagation, then call `verify_domain`. Poll `get_domain` before promising
+   branded outbound sending because inbound and outbound verification are
+   separate.
+7. **Use SDKs for backend integrations.** When a service—not Hermes itself—must
+   receive or send mail, follow e2a's SDK and webhook documentation instead of
+   treating MCP as a deployed webhook receiver.
+
+## Pitfalls
+
+- Do not guess an inbox for an account-scoped credential. Call `list_agents`
+  and select one explicitly.
+- Use `reply_to_message`, not a fresh send, when responding to existing mail.
 - Treat `accepted`, `scheduled`, and `pending_review` as successful durable
   acceptance. Do not resend; inspect the message later or consume webhook
   events for the terminal outcome.
@@ -83,24 +133,25 @@ to a message. Replies preserve the email client's thread; reusing
 - For attachments, pass base64 returned by an attachment/file tool; do not
   invent or hand-edit encoded bytes. Use `get_attachment` when bytes are
   needed.
+- Do not call `verify_domain` immediately after registration. DNS propagation
+  is asynchronous.
+- Do not treat an e2a inbox as the user's personal email account. The agent is
+  the mailbox owner and the visible sender.
+- Do not expose API keys in chat, logs, source files, or committed Hermes
+  configuration.
 
-### Create an inbox
+## Verification
 
-With an account-scoped session, call `create_agent` with an address on the
-shared `agents.e2a.dev` domain, such as `hermes-agent@agents.e2a.dev`. The
-shared domain requires no DNS setup. Use a custom domain only when the user
-owns it: `register_domain` returns DNS records, and `verify_domain` must be
-called after publication and propagation. Inbound and outbound custom-domain
-verification are separate; check `get_domain` before promising branded sending.
+Run:
 
-## Common use cases
+```bash
+hermes --toolsets mcp -q "Call e2a whoami and report the credential scope without changing anything"
+```
 
-- Give Hermes a durable identity for agent-to-human or agent-to-agent email.
-- Monitor an inbox with `list_messages` and inspect full messages with
-  `get_message`.
-- Send concise plain-text or HTML updates and continue conversations in-thread.
-- Use e2a webhooks and SDKs for a backend service; MCP is for Hermes operating
-  the inbox interactively.
+Verification succeeds when Hermes discovers the e2a MCP tools, `whoami`
+returns the credential scope, and no mutating tool is called. For account
+scope, a subsequent read-only `list_agents` call should return the available
+inboxes.
 
 ## References
 
