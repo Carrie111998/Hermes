@@ -114,7 +114,16 @@ class EvaosLeaseSource:
         self._secret_reader = secret_reader or _default_secret_reader
         self._profile_resolver = profile_resolver or _default_profile_resolver
         self._root_uid = root_uid
-        self._service_uid = os.geteuid() if service_uid is None else service_uid
+        get_effective_uid = getattr(os, "geteuid", None)
+        self._service_uid = (
+            (
+                get_effective_uid()
+                if callable(get_effective_uid)
+                else root_uid
+            )
+            if service_uid is None
+            else service_uid
+        )
 
     def __repr__(self) -> str:
         return (

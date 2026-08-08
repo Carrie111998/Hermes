@@ -12,6 +12,7 @@ half-open / cooldown / reconnect-resets-breaker behavior that fixes
 that.
 """
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -84,6 +85,15 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
 
     mcp_tool_module._servers[name] = server
     mcp_tool_module._server_error_counts.pop(name, None)
+    mcp_tool_module._record_tool_approval_metadata(
+        name,
+        [
+            SimpleNamespace(
+                name="tool1",
+                annotations={"readOnlyHint": True},
+            )
+        ],
+    )
     if hasattr(mcp_tool_module, "_server_breaker_opened_at"):
         mcp_tool_module._server_breaker_opened_at.pop(name, None)
     return server
@@ -92,6 +102,7 @@ def _install_stub_server(mcp_tool_module, name: str, call_tool_impl):
 def _cleanup(mcp_tool_module, name: str) -> None:
     mcp_tool_module._servers.pop(name, None)
     mcp_tool_module._server_error_counts.pop(name, None)
+    mcp_tool_module._tool_read_only_hints.pop(name, None)
     if hasattr(mcp_tool_module, "_server_breaker_opened_at"):
         mcp_tool_module._server_breaker_opened_at.pop(name, None)
 

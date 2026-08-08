@@ -79,6 +79,22 @@ def _lease_payload(expires_at: datetime, token="lease-token-1"):
     }
 
 
+def test_source_defaults_service_uid_to_root_uid_without_geteuid(
+    monkeypatch,
+):
+    monkeypatch.delattr(os, "geteuid", raising=False)
+
+    source = EvaosLeaseSource(
+        profile_key="profile-a",
+        app_slug="google_sheets",
+        secret_reader=lambda _name: None,
+        profile_resolver=lambda: "profile-a",
+        root_uid=4321,
+    )
+
+    assert source._service_uid == 4321
+
+
 @pytest.mark.asyncio
 async def test_lease_request_body_contains_only_action_and_app_slug(tmp_path):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)

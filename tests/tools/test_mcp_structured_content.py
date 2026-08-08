@@ -58,6 +58,10 @@ def _patch_mcp_server():
     # fresh loop that _fake_run_on_mcp_loop spins up, not at fixture import.
     fake_server = SimpleNamespace(session=fake_session, _rpc_lock=None)
     with patch.dict(mcp_tool._servers, {"test-server": fake_server}), \
+         patch.dict(
+             mcp_tool._tool_read_only_hints,
+             {"test-server": {"my-tool": True}},
+         ), \
          patch("tools.mcp_tool._run_on_mcp_loop", side_effect=_fake_run_on_mcp_loop):
         yield fake_session
 

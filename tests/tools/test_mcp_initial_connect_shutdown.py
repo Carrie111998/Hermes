@@ -141,6 +141,7 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
             self._tools = [SimpleNamespace(
                 name="ping",
                 description="Return a deterministic revival result",
+                annotations={"readOnlyHint": True},
                 inputSchema={
                     "type": "object",
                     "properties": {"value": {"type": "string"}},
