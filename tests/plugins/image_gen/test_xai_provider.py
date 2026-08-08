@@ -83,11 +83,24 @@ class TestXAIImageGenProvider:
         assert schema["post_setup"] == "xai_grok"
 
     def test_capabilities_expose_total_source_image_limit(self):
+        from plugins.image_gen.xai import (
+            MAX_REFERENCE_IMAGES,
+            MAX_SOURCE_IMAGES,
+            XAIImageGenProvider,
+        )
+
+        caps = XAIImageGenProvider().capabilities()
+        assert MAX_SOURCE_IMAGES > 0
+        assert MAX_REFERENCE_IMAGES == MAX_SOURCE_IMAGES - 1
+        assert caps["max_reference_images"] == MAX_REFERENCE_IMAGES
+        assert caps["max_source_images"] == MAX_SOURCE_IMAGES
+
+    def test_capabilities_gate_unreleased_imagine_image_2_api(self):
         from plugins.image_gen.xai import XAIImageGenProvider
 
         caps = XAIImageGenProvider().capabilities()
-        assert caps["max_reference_images"] == 2
-        assert caps["max_source_images"] == 3
+        assert caps["imagine_image_2_api"] == "coming_soon"
+        assert caps["imagine_image_2_source"] == "https://x.ai/news/grok-imagine-image-2"
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +272,27 @@ class TestGenerate:
             f"resolution must be the literal '1k' or '2k', got {payload['resolution']!r}"
         )
 
+    def test_image_edit_rejects_more_sources_than_the_current_api_supports(self):
+        from plugins.image_gen.xai import MAX_SOURCE_IMAGES, XAIImageGenProvider
+
+        sources = [
+            f"https://example.com/source-{index}.png"
+            for index in range(MAX_SOURCE_IMAGES + 1)
+        ]
+        with patch("plugins.image_gen.xai.requests.post") as mock_post:
+            result = XAIImageGenProvider().generate(
+                prompt="combine these images",
+                image_url=sources[0],
+                reference_image_urls=sources[1:],
+            )
+
+        assert result["success"] is False
+        assert result["error_type"] == "too_many_references"
+        assert f"at most {MAX_SOURCE_IMAGES} source images" in result["error"]
+        assert "not API-available" in result["error"]
+        assert "https://x.ai/news/grok-imagine-image-2" in result["error"]
+        mock_post.assert_not_called()
+
     def test_image_edit_rejects_bare_file_id_input(self):
         from plugins.image_gen.xai import XAIImageGenProvider
 
@@ -402,5 +436,3 @@ class TestXAIImageFieldReadGuard:
 
         with pytest.raises(ValueError, match="credential store"):
             _xai_image_field(str(auth_json))
-
-

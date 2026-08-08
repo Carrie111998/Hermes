@@ -1,13 +1,21 @@
 """xAI image generation backend.
 
-Exposes xAI's ``grok-imagine-image`` model as an
+Exposes xAI's ``grok-imagine-image`` / ``grok-imagine-image-quality`` models as an
 :class:`ImageGenProvider` implementation.
 
-Features:
+Features (API-available today):
 - Text-to-image generation
+- Image edit + multi-image edit (≤3 total sources — plugin/API limit)
 - Multiple aspect ratios (1:1, 16:9, 9:16, etc.)
 - Multiple resolutions (1K, 2K)
-- Base64 output saved to cache
+- Base64 / URL output saved to cache
+
+**Imagine Image 2.0:** xAI's announcement describes consumer Quality Mode and
+states **API access is coming soon**
+(https://x.ai/news/grok-imagine-image-2). Do **not** raise multi-ref to 5 or add
+Magic Wand / Segmentation / Smart Resize tool routes until docs.x.ai documents
+them. ``grok-imagine-image-quality`` is the closest existing API stand-in for
+Quality Mode.
 
 Selection precedence (first hit wins):
 1. ``XAI_IMAGE_MODEL`` env var
@@ -53,14 +61,25 @@ _MODELS: Dict[str, Dict[str, Any]] = {
     "grok-imagine-image": {
         "display": "Grok Imagine Image",
         "speed": "~5-10s",
-        "strengths": "Fast, high-quality",
+        "strengths": "Fast stills; API live. Not Image 2.0 consumer product.",
     },
     "grok-imagine-image-quality": {
         "display": "Grok Imagine Image (Quality)",
         "speed": "~10-20s",
-        "strengths": "Higher fidelity / detail; slower than the standard model.",
+        # Closest API stand-in for consumer "Quality Mode" / Image 2.0 until
+        # xAI ships a dedicated Image 2.0 model id on the API.
+        "strengths": (
+            "Higher fidelity / detail; preferred for production stills. "
+            "Image 2.0 consumer tools (wand/segment/5-ref) are not on API yet."
+        ),
     },
 }
+
+# xAI's Image 2.0 announcement describes multi-ref up to 5; the live API/plugin
+# stay at 3 until xAI documents API availability and a higher limit:
+# https://x.ai/news/grok-imagine-image-2
+MAX_SOURCE_IMAGES = 3
+MAX_REFERENCE_IMAGES = max(0, MAX_SOURCE_IMAGES - 1)
 
 DEFAULT_MODEL = "grok-imagine-image"
 
@@ -203,12 +222,15 @@ class XAIImageGenProvider(ImageGenProvider):
         }
 
     def capabilities(self) -> Dict[str, Any]:
-        # xAI's /v1/images/edits supports image editing via grok-imagine-image
-        # -quality, including up to 3 total source images.
+        # xAI /v1/images/edits (quality model). Cap is API-documented 3 sources —
+        # Image 2.0 consumer multi-ref (5) is not available on API yet (2026-08-08).
         return {
             "modalities": ["text", "image"],
-            "max_reference_images": 2,
-            "max_source_images": 3,
+            "max_reference_images": MAX_REFERENCE_IMAGES,
+            "max_source_images": MAX_SOURCE_IMAGES,
+            # Surface honesty for tool-description builders / agents.
+            "imagine_image_2_api": "coming_soon",
+            "imagine_image_2_source": "https://x.ai/news/grok-imagine-image-2",
         }
 
     def generate(
@@ -251,9 +273,13 @@ class XAIImageGenProvider(ImageGenProvider):
         refs = normalize_reference_images(reference_image_urls)
         if refs:
             source_images.extend(refs)
-        if len(source_images) > 3:
+        if len(source_images) > MAX_SOURCE_IMAGES:
             return error_response(
-                error="xAI image editing supports at most 3 source images",
+                error=(
+                    f"xAI image editing supports at most {MAX_SOURCE_IMAGES} source "
+                    "images on the current API. Image 2.0 consumer multi-ref (up to 5) "
+                    "is not API-available yet — see https://x.ai/news/grok-imagine-image-2"
+                ),
                 error_type="too_many_references",
                 provider=provider_name,
                 model="grok-imagine-image-quality",
