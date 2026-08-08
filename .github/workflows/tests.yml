@@ -249,3 +249,51 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  # Smoke-check the newly-admitted interpreter: `uv sync --locked` fails if
+  # any locked dependency lacks a cp314 wheel for this platform, so this
+  # keeps the `requires-python = ">=3.11,<3.15"` ceiling honest as deps
+  # evolve (a future pin bump without cp314 wheels fails here, not on user
+  # machines). Windows-specific cp314 wheels (e.g. pywinpty) are validated
+  # by the lock's own win32 wheel entries — this repo has no Windows
+  # runners. Full 3.14 test-matrix coverage remains a follow-up.
+  py314-smoke:
+    name: Python 3.14 smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          # Pin the uv version: unpinned, setup-uv resolves "latest" by
+          # fetching a manifest from raw.githubusercontent.com on EVERY job —
+          # a transient fetch failure fails the whole job (2026-07-28 slice-5
+          # incident). Pinned, the binary downloads directly; no manifest hop.
+          version: "0.9.28"
+          # Persist uv's download/wheel cache (~/.cache/uv) across runs.
+          # Keyed on the dependency manifests, so the cache is reused until
+          # pyproject.toml or uv.lock changes. `uv sync` still runs every
+          # time, but resolves from the warm cache instead of re-downloading
+          # and re-building wheels.
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Locked sync on Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.14 --extra all --extra dev
+
+      - name: Import smoke — C-extension core
+        run: |
+          source .venv/bin/activate
+          python -c "import pydantic_core, PIL, cryptography, cffi, uvloop, watchfiles, yarl, psutil; print('cp314 import smoke OK:', pydantic_core.__version__)"
