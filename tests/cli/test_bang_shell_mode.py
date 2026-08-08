@@ -8,6 +8,8 @@ byte-identical because it never becomes a turn.
 import copy
 import json
 import os
+import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -120,6 +122,98 @@ class TestBangExecution:
         )
         assert code == 0
         assert "ok" in lines
+
+
+# ── timeout / backgrounded-child containment ───────────────────────────────
+
+class TestBangTimeout:
+    """``timeout`` must be a real wall-clock ceiling on the composer.
+
+    The module comment above ``DEFAULT_TIMEOUT`` states the invariant these
+    pin: an accidental ``!sleep 999`` "should not wedge the composer".
+    Draining the output pipe on the calling thread defeats that — the pipe
+    only reaches EOF once the shell *and every descendant that inherited its
+    write end* have closed stdout, so the deadline could only ever be applied
+    after the work was already over.
+    """
+
+    def test_timeout_is_enforced_on_a_silent_command(self):
+        lines = []
+        started = time.monotonic()
+        code = run_bang_command("sleep 5", timeout=1, writer=lines.append)
+        elapsed = time.monotonic() - started
+
+        assert code == 124  # GNU `timeout` convention
+        assert any("timed out after 1s" in line for line in lines)
+        assert elapsed < 3, f"deadline not enforced — returned after {elapsed:.1f}s"
+
+    def test_returns_when_the_shell_exits_with_a_background_child(self):
+        """A backgrounded grandchild must not hold the composer.
+
+        ``(sleep 5 &) ; echo started`` exits immediately, but the grandchild
+        inherited the write end of our stdout pipe via ``fork()`` — so reading
+        to EOF holds the caller for the grandchild's whole lifetime. This is
+        the hang ``tools/environments/base.py`` documents for the terminal
+        tool. The generous ``timeout`` is deliberate: this pins the "stop
+        draining once the shell itself is gone" contract, not the deadline.
+        """
+        lines = []
+        started = time.monotonic()
+        code = run_bang_command(
+            "(sleep 5 &) ; echo started", timeout=60, writer=lines.append
+        )
+        elapsed = time.monotonic() - started
+
+        assert code == 0
+        assert "started" in lines
+        assert elapsed < 3, f"blocked on the grandchild's pipe for {elapsed:.1f}s"
+
+    def test_a_tail_printed_after_a_silence_is_streamed_in_full(self):
+        """No-regression guard on bounding the drain.
+
+        Not a red-before case — unpatched code streams this correctly too. It
+        pins the risk the fix itself introduces: the post-exit flush window is
+        measured from the last line seen *or* the shell's exit, whichever is
+        later, so a command that goes quiet for longer than the idle grace and
+        then prints on its way out still has its whole tail delivered, in
+        order, rather than truncated by the new deadline.
+        """
+        lines = []
+        code = run_bang_command(
+            "sleep 1; for i in 1 2 3; do echo tail-$i; done",
+            timeout=30,
+            writer=lines.append,
+        )
+        assert code == 0
+        assert [ln for ln in lines if ln.startswith("tail-")] == [
+            "tail-1",
+            "tail-2",
+            "tail-3",
+        ]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    def test_timeout_kills_descendants_not_just_the_shell(self, tmp_path):
+        """The deadline must stop the whole tree, not just the shell wrapper.
+
+        Mirrors ``tools/environments/local.py``, which runs terminal commands
+        with ``start_new_session=True`` and kills the process *group*: killing
+        only the direct child leaves grandchildren doing the work the user
+        just asked to abort.
+        """
+        marker = tmp_path / "grandchild-survived"
+        started = time.monotonic()
+        code = run_bang_command(
+            f"( sleep 2 && : > '{marker}' ) & sleep 8",
+            timeout=1,
+            writer=lambda line: None,
+        )
+        elapsed = time.monotonic() - started
+
+        assert code == 124
+        assert elapsed < 3, f"deadline not enforced — returned after {elapsed:.1f}s"
+        # The grandchild writes the marker ~2s in if it outlived the kill.
+        time.sleep(3)
+        assert not marker.exists(), "grandchild survived the timeout kill"
 
 
 # ── CLI handler: approval gate, usage hint, exit codes ─────────────────────
