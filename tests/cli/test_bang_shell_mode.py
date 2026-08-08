@@ -191,6 +191,40 @@ class TestBangTimeout:
             "tail-3",
         ]
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGPIPE semantics")
+    def test_a_backgrounded_descendant_survives_the_composer_returning(self, tmp_path):
+        """Handing the composer back must not kill what `!cmd &` launched.
+
+        Once the deadline or the shell's exit has returned control, later
+        output must not be printed into the composer — but the read end has to
+        stay open regardless. Closing it hands EPIPE to the descendant on its
+        next write, which would kill the very `!npm run dev &` server the user
+        backgrounded. Output is discarded, not cut off.
+        """
+        marker = tmp_path / "descendant-finished"
+        started = time.monotonic()
+        lines = []
+        # The two writes are spaced so the second one lands *after* any close
+        # the drain thread might do on seeing the first — that second write is
+        # what would take EPIPE.
+        code = run_bang_command(
+            f"( sleep 1; echo late-one; sleep 1; echo late-two; : > '{marker}' ) "
+            f"& echo started",
+            timeout=60,
+            writer=lines.append,
+        )
+        elapsed = time.monotonic() - started
+
+        assert code == 0
+        assert "started" in lines
+        assert elapsed < 3, f"blocked on the descendant for {elapsed:.1f}s"
+
+        time.sleep(3.5)
+        # Writes after the composer returned are dropped, never printed...
+        assert not any(ln.startswith("late-") for ln in lines)
+        # ...but the descendant ran to completion instead of dying on EPIPE.
+        assert marker.exists(), "descendant was killed by the read end closing"
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
     def test_timeout_kills_descendants_not_just_the_shell(self, tmp_path):
         """The deadline must stop the whole tree, not just the shell wrapper.

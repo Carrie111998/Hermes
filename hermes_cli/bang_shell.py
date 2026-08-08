@@ -252,15 +252,21 @@ def run_bang_command(
         try:
             for line in stream:
                 if stop.is_set():
-                    # Deadline already reported: a grandchild that outlived
-                    # the shell must not keep writing into the composer.
-                    break
+                    # Control has already returned to the composer, so this
+                    # line must not be printed into it. Keep draining anyway
+                    # rather than closing the read end: a descendant the user
+                    # deliberately left running (`!npm run dev &`) would take
+                    # EPIPE on its next write, or block once the pipe filled.
+                    # Discarding costs one blocked daemon thread, released as
+                    # soon as that descendant exits.
+                    continue
                 last_output = time.monotonic()
                 emit(line.rstrip("\n"))
         except Exception:
             pass
         finally:
-            # This thread owns the stream — see the note in the outer finally.
+            # This thread owns the stream and closes it once the last writer
+            # is gone — see the note in the outer finally.
             try:
                 stream.close()
             except Exception:
@@ -276,9 +282,13 @@ def run_bang_command(
     def _flush_tail() -> None:
         """Drain what the shell already wrote, then stop draining.
 
-        Keeps waiting while output is still arriving, so a large tail is not
-        truncated, but gives up once the pipe has gone idle — an EOF that
-        depends on a backgrounded grandchild may never come at all.
+        Keeps waiting while output is still arriving, so an ordinary tail is
+        delivered in full, but gives up once the pipe has gone idle for
+        ``_DRAIN_IDLE_GRACE`` — an EOF that depends on a backgrounded
+        grandchild may never come at all. ``_DRAIN_MAX_TAIL`` is a hard cap on
+        top of that: output still streaming that long after the shell exited
+        is coming from a descendant, not the command, and is dropped rather
+        than allowed to hold the composer indefinitely.
 
         The idle window is measured from whichever is later: the last line
         seen, or entry to this function. A command that is silent for a minute
