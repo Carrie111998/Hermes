@@ -643,6 +643,67 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_spawn_local_pipe_uses_authoritative_request_scope(self, registry):
+        from gateway.runtime_context import bind_runtime_env
+
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/user",
+                "PAPERCLIP_API_KEY": "ambient-token",
+                "PAPERCLIP_RUN_ID": "ambient-run",
+            },
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch(
+            "subprocess.Popen", side_effect=fake_popen
+        ), patch("threading.Thread", return_value=MagicMock()), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env({"PAPERCLIP_API_KEY": "scoped-token"}):
+                registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert captured["env"]["PAPERCLIP_API_KEY"] == "scoped-token"
+        assert "PAPERCLIP_RUN_ID" not in captured["env"]
+
+    def test_spawn_local_pty_uses_authoritative_empty_request_scope(self, registry):
+        from gateway.runtime_context import bind_runtime_env
+
+        pty_proc = MagicMock()
+        pty_proc.pid = 4321
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/user",
+                "PAPERCLIP_API_KEY": "ambient-token",
+                "PAPERCLIP_RUN_ID": "ambient-run",
+            },
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch(
+            "ptyprocess.PtyProcess.spawn", return_value=pty_proc
+        ) as spawn, patch("threading.Thread", return_value=MagicMock()), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env({}):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        child_env = spawn.call_args.kwargs["env"]
+        assert "PAPERCLIP_API_KEY" not in child_env
+        assert "PAPERCLIP_RUN_ID" not in child_env
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 

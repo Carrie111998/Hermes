@@ -43,7 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _resolve_safe_cwd
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -966,6 +966,14 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        # Build one authoritative local child environment for both PTY and
+        # pipe mode.  This applies trusted request-local values and, for an
+        # explicitly empty managed scope, removes ambient PAPERCLIP_* values
+        # instead of inheriting a stale gateway identity.
+        from tools.environments.local import _make_run_env
+
+        spawn_env = _make_run_env(env_vars or {})
+
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -984,7 +992,7 @@ class ProcessRegistry:
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                pty_env = dict(spawn_env)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
 
@@ -1069,7 +1077,7 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env = dict(spawn_env)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
