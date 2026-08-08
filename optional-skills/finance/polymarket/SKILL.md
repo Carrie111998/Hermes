@@ -1,30 +1,11 @@
 ---
-title: "Polymarket — Query Polymarket: markets, prices, orderbooks, history"
-sidebar_label: "Polymarket"
-description: "Query Polymarket: markets, prices, orderbooks, history"
+name: polymarket
+description: "Query Polymarket: markets, prices, orderbooks, history."
+version: 1.0.0
+author: Hermes Agent + Teknium
+tags: [polymarket, prediction-markets, market-data, trading]
+platforms: [linux, macos, windows]
 ---
-
-{/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
-
-# Polymarket
-
-Query Polymarket: markets, prices, orderbooks, history.
-
-## Skill metadata
-
-| | |
-|---|---|
-| Source | Bundled (installed by default) |
-| Path | `skills/research/polymarket` |
-| Version | `1.0.0` |
-| Author | Hermes Agent + Teknium |
-| Platforms | linux, macos, windows |
-
-## Reference: full SKILL.md
-
-:::info
-The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
-:::
 
 # Polymarket — Prediction Market Data
 
