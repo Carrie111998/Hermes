@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -376,6 +377,67 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     )
 
 
+def _smoke_run_new_script_job(
+    job: Dict[str, Any], no_agent: bool
+) -> Optional[Dict[str, Any]]:
+    """Run a newly created ``no_agent`` script job once, and report what happened.
+
+    A schedule receipt is not evidence that an automation works. Creation used
+    to return ``success: true`` for a job whose script had never been executed,
+    so the first proof of life was the first scheduled fire — a month away for a
+    monthly job, by which time the agent that created it had long since told the
+    user it was done. Everything needed to run it is available here, so run it
+    here and return the real outcome.
+
+    A failing smoke run does NOT roll the job back. The job is a valid,
+    correctly-registered schedule; what failed is the script. Deleting it would
+    throw away the user's intent along with the diagnosis, and leave nothing on
+    the board to fix. Report and keep.
+
+    Returns ``None`` when there is nothing to smoke-run (agent-mode jobs, or no
+    script), so the caller can omit the field entirely.
+    """
+    if not no_agent:
+        return None  # Agent-mode jobs need a live model turn; not a smoke test.
+    script = (job.get("script") or "").strip()
+    if not script:
+        return None
+
+    try:
+        from cron.scheduler import _run_job_script
+
+        ok, output = _run_job_script(script, workdir=job.get("workdir") or None)
+    except Exception as exc:  # never let verification break creation
+        logger.warning("cron smoke run failed to execute for %s: %s", job.get("id"), exc)
+        return {
+            "ran": False,
+            "ok": False,
+            "message": (
+                f"Could not smoke-run the script ({exc}); the job is scheduled "
+                f"but unverified."
+            ),
+        }
+
+    text = (output or "").strip()
+    truncated = text if len(text) <= 2000 else text[:2000] + "… (truncated)"
+    if ok:
+        return {
+            "ran": True,
+            "ok": True,
+            "output": truncated,
+            "message": f"Smoke run succeeded; output: {truncated!r}",
+        }
+    return {
+        "ran": True,
+        "ok": False,
+        "error": truncated,
+        "message": (
+            f"WARNING: the job is scheduled but its first run FAILED: {truncated}. "
+            f"Fix this before reporting the automation as working."
+        ),
+    }
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -532,11 +594,14 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
     # Reject absolute paths and ~ expansion at the API boundary.
     # Only relative paths within ~/.hermes/scripts/ are allowed.
+    # The scripts dir is per-profile, so naming ~/.hermes/scripts here is wrong
+    # for every profile but default and sends the reader to the wrong directory.
+    scripts_display = f"{display_hermes_home()}/scripts/"
     if raw.startswith(("/", "~")) or (len(raw) >= 2 and raw[1] == ":"):
         return (
-            f"Script path must be relative to ~/.hermes/scripts/. "
+            f"Script path must be relative to {scripts_display}. "
             f"Got absolute or home-relative path: {raw!r}. "
-            f"Place scripts in ~/.hermes/scripts/ and use just the filename."
+            f"Place scripts in {scripts_display} and use just the filename."
         )
 
     # Validate containment after resolution
@@ -548,6 +613,24 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     if containment_error:
         return (
             f"Script path escapes the scripts directory via traversal: {raw!r}"
+        )
+
+    # The script must exist NOW, not at first fire. Shape validation alone let a
+    # job be created against a missing file and still return success: true — the
+    # scheduler only discovers the truth when it runs ("Script not found: ..."),
+    # so a monthly job sat broken for a month while its author reported it done.
+    # Whether the file is there is knowable at this point, so decide here.
+    resolved = scripts_dir / raw
+    if not resolved.is_file():
+        profile = (os.environ.get("HERMES_PROFILE") or "default").strip() or "default"
+        return (
+            f"Script not found: {resolved}. Cron resolves `script` under "
+            f"HERMES_HOME/scripts for the profile that owns the job (profile "
+            f"{profile!r}, {scripts_display}), and that is the only directory it "
+            f"will look in — there is no search path and no fallback. Write the "
+            f"script to that exact path first, then create the job. If this "
+            f"profile cannot write there, hand the work to one that can rather "
+            f"than scheduling a job that cannot run."
         )
 
     return None
@@ -1148,22 +1231,25 @@ def cronjob(
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
                 _create_message = f"{_create_message} {_local_notice}"
-            return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": _create_message,
-                },
-                indent=2,
-            )
+            _smoke = _smoke_run_new_script_job(job, _no_agent)
+            if _smoke is not None:
+                _create_message = f"{_create_message} {_smoke['message']}"
+            _payload = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "message": _create_message,
+            }
+            if _smoke is not None:
+                _payload["smoke_run"] = _smoke
+            return json.dumps(_payload, indent=2)
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]

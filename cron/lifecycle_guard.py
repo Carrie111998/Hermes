@@ -656,6 +656,19 @@ def _read_script_for_scanning(script_path: str) -> str:
     resolved = _resolve_script_path(script_path)
     if resolved is None:
         return ""
+    if not resolved.exists():
+        # Creation now rejects a job whose script is missing, so reaching the
+        # scanner with no file means something bypassed that check (a direct
+        # CLI/store write, or the file vanished between validation and scan).
+        # Still return "" — failing closed here would change the guard's
+        # security contract and reject legitimate agent-mode jobs — but say so,
+        # because "nothing to scan" and "nothing there" used to look identical
+        # in the logs, and that is how the empty-script job stayed invisible.
+        logger.warning(
+            "cron lifecycle scan: script %s does not exist; scanning prompt only",
+            resolved,
+        )
+        return ""
     script_text, unsafe = _read_referenced_script(resolved)
     if unsafe:
         return "hermes gateway restart"
