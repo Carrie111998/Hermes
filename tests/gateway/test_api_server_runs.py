@@ -293,7 +293,11 @@ class TestStartRun:
         assert conflict.status == 400
 
     def test_start_rejects_invalid_runtime_env_values(self):
-        from gateway.platforms.api_server import _parse_run_runtime_env
+        from gateway.platforms.api_server import (
+            _RUN_RUNTIME_ENV_MAX_BYTES,
+            _parse_run_runtime_env,
+        )
+        from gateway.runtime_context import TRUSTED_RUNTIME_ENV_KEYS
 
         _, nul_error = _parse_run_runtime_env(
             {"runtime_env": {"PAPERCLIP_API_KEY": "bad\u0000value"}}
@@ -301,9 +305,24 @@ class TestStartRun:
         _, surrogate_error = _parse_run_runtime_env(
             {"runtime_env": {"PAPERCLIP_API_KEY": "\ud800"}}
         )
+        key = "PAPERCLIP_API_KEY"
+        boundary_value = "x" * (_RUN_RUNTIME_ENV_MAX_BYTES - len(key.encode("utf-8")))
+        _, boundary_error = _parse_run_runtime_env(
+            {"runtime_env": {key: boundary_value}}
+        )
+        _, oversized_error = _parse_run_runtime_env(
+            {"runtime_env": {key: boundary_value + "x"}}
+        )
+        accepted, allowlist_error = _parse_run_runtime_env(
+            {"runtime_env": {name: "value" for name in TRUSTED_RUNTIME_ENV_KEYS}}
+        )
 
         assert nul_error is not None
         assert surrogate_error is not None
+        assert boundary_error is None
+        assert oversized_error is not None
+        assert allowlist_error is None
+        assert set(accepted) == TRUSTED_RUNTIME_ENV_KEYS
 
     @pytest.mark.asyncio
     async def test_run_output_exactly_redacts_scoped_api_key(self, adapter):
