@@ -134,14 +134,17 @@ def default_inference_framework() -> str:
     microphone works, and no phrase can ever cross the threshold. Prefer the
     tflite backend there; ONNX stays the default everywhere else.
 
-    On Intel macOS the ONNX stack cannot be installed at all: the pinned
-    ``onnxruntime==1.27.0`` has no x86_64 wheel, so the lazy install fails
-    before a detector can arm (#81560). The tflite backend installs and works
-    on both macOS arches, so it is the default there too.
+    On Intel macOS the pinned ``onnxruntime==1.27.0`` has no x86_64 wheel
+    so the lazy install fails. The previously-suggested tflite route is
+    not viable either: ``ai-edge-litert==2.1.6`` only publishes arm64
+    macOS wheels (no x86_64 either, no sdist). Pin ``onnxruntime==1.23.2``
+    — the last release with an x86_64 macOS wheel — for the Intel-macOS
+    path, and keep the ONNX backend as the default there (#81560,
+    #81577).
 
     Upstream: https://github.com/dscripka/openWakeWord/issues/336
     """
-    return "tflite" if (_is_macos_arm64() or _is_macos_intel()) else "onnx"
+    return "tflite" if _is_macos_arm64() else "onnx"
 
 
 _warned_onnx_coerced = False
@@ -157,13 +160,17 @@ def resolve_inference_framework(cfg: Dict[str, Any]) -> str:
       phrase cross threshold (upstream #336). Existing macOS users who pinned
       ``onnx`` before the tflite fix landed would otherwise keep a wake word
       that arms but never fires.
-    - explicit ``onnx`` on macOS Intel: the pinned ``onnxruntime==1.27.0``
-      has no x86_64 wheel, so the lazy install fails before a detector can
-      arm (#81560).
+    - explicit ``onnx`` on macOS ARM64: the embedding model never fires
+      (upstream #336). Existing macOS users who pinned ``onnx`` before the
+      tflite fix landed would otherwise keep a wake word that arms but
+      never fires.
 
-    Coerce those cases to tflite (with a one-time warning) instead of
-    silently shipping a dead ear. Every other explicit value is respected
-    as-is; empty falls back to the platform default.
+    Coerce that case to tflite (with a one-time warning) instead of
+    silently shipping a dead ear. macOS Intel is left to the platform
+    default (onnx with the platform-pinned onnxruntime wheel) — both
+    ``onnxruntime==1.27.0`` *and* the tflite runtime have no x86_64
+    macOS wheel, so the previous "coerce to tflite" route gave the user
+    a dead ear too (#81577).
     """
     global _warned_onnx_coerced
 
@@ -173,23 +180,15 @@ def resolve_inference_framework(cfg: Dict[str, Any]) -> str:
     if not framework:
         return default_inference_framework()
 
-    if framework == "onnx" and (_is_macos_arm64() or _is_macos_intel()):
+    if framework == "onnx" and _is_macos_arm64():
         if not _warned_onnx_coerced:
             _warned_onnx_coerced = True
-            if _is_macos_arm64():
-                logger.warning(
-                    "wake: openwakeword.inference_framework='onnx' is set but ONNX's "
-                    "embedding model never fires on macOS ARM64 (openWakeWord #336) — "
-                    "using tflite instead. Set inference_framework to '' (auto) or "
-                    "'tflite' in config.yaml to silence this."
-                )
-            else:
-                logger.warning(
-                    "wake: openwakeword.inference_framework='onnx' is set but "
-                    "onnxruntime==1.27.0 has no x86_64 macOS wheel (#81560) — "
-                    "using tflite instead. Set inference_framework to '' (auto) or "
-                    "'tflite' in config.yaml to silence this."
-                )
+            logger.warning(
+                "wake: openwakeword.inference_framework='onnx' is set but ONNX's "
+                "embedding model never fires on macOS ARM64 (openWakeWord #336) — "
+                "using tflite instead. Set inference_framework to '' (auto) or "
+                "'tflite' in config.yaml to silence this."
+            )
         return "tflite"
 
     return framework
@@ -574,16 +573,12 @@ class _OpenWakeWordEngine(_Engine):
         from tools import lazy_deps
 
         framework = resolve_inference_framework(cfg)
-        # On Intel macOS the ONNX stack is not installable — the pinned
-        # onnxruntime==1.27.0 has no x86_64 wheel — so ``wake.openwakeword``
-        # (which includes onnxruntime) can never install there.  The slim
-        # feature (openwakeword + sounddevice + numpy, no onnxruntime) is the
-        # stack to ensure on that host; the tflite runtime itself is installed
-        # by the ensure_tflite_runtime() block below (#81560).
-        if _is_macos_intel():
-            lazy_deps.ensure("wake.openwakeword.slim", prompt=False)
-        else:
-            lazy_deps.ensure("wake.openwakeword", prompt=False)
+        # The platform-correct onnxruntime wheel is pinned in pyproject.toml:
+        # 1.23.2 on Intel macOS (the last release with a Darwin x86_64 wheel),
+        # 1.27.0 elsewhere. The default feature installs `onnxruntime`, so
+        # ``wake.openwakeword`` resolves on every supported platform (#81560,
+        # #81577).
+        lazy_deps.ensure("wake.openwakeword", prompt=False)
 
         import openwakeword
         from openwakeword.model import Model
@@ -954,9 +949,10 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
     elif provider in ("sherpa", "sherpa-onnx", "kws", "open"):
         feature = "wake.sherpa"
     else:
-        # Intel macOS cannot install the onnx stack (onnxruntime has no
-        # x86_64 macOS wheel, #81560); the slim feature is its equivalent.
-        feature = "wake.openwakeword.slim" if _is_macos_intel() else "wake.openwakeword"
+        # All supported platforms install the default wake.openwakeword
+        # feature; pyproject.toml pins the right onnxruntime wheel per
+        # platform (1.23.2 on Intel macOS, 1.27.0 elsewhere — #81560, #81577).
+        feature = "wake.openwakeword"
     deps_ok = lazy_deps.is_available(feature)
     lazy_ok = lazy_deps._allow_lazy_installs()
     # The audio probe imports sounddevice + numpy — two of the very packages
