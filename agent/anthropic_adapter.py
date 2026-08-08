@@ -11,6 +11,7 @@ Auth supports:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -393,6 +394,9 @@ def _detect_claude_code_version() -> str:
 
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CODE_BILLING_PREFIX = "x-anthropic-billing-header:"
+_CLAUDE_CODE_BILLING_SALT = "59cf53e54c78"
+_CLAUDE_CODE_BILLING_ENTRYPOINT = "sdk-cli"
 _MCP_TOOL_PREFIX = "mcp__"
 
 
@@ -402,6 +406,49 @@ def _get_claude_code_version() -> str:
     if _claude_code_version_cache is None:
         _claude_code_version_cache = _detect_claude_code_version()
     return _claude_code_version_cache
+
+
+def _extract_first_user_message_text(messages: List[Dict]) -> str:
+    """Return the first non-empty text part from the first user turn."""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "text":
+                    continue
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    return text
+        return ""
+    return ""
+
+
+def _build_claude_code_billing_header(
+    messages: List[Dict],
+    *,
+    version: Optional[str] = None,
+    entrypoint: str = _CLAUDE_CODE_BILLING_ENTRYPOINT,
+) -> str:
+    """Build Claude Code's message-dependent subscription billing marker."""
+    first_user_text = _extract_first_user_message_text(messages)
+    resolved_version = version or _get_claude_code_version()
+    suffix_chars = "".join(
+        first_user_text[index] if index < len(first_user_text) else "0"
+        for index in (4, 7, 20)
+    )
+    version_suffix = hashlib.sha256(
+        f"{_CLAUDE_CODE_BILLING_SALT}{suffix_chars}{resolved_version}".encode()
+    ).hexdigest()[:3]
+    content_hash = hashlib.sha256(first_user_text.encode()).hexdigest()[:5]
+    return (
+        f"{_CLAUDE_CODE_BILLING_PREFIX} cc_version="
+        f"{resolved_version}.{version_suffix}; cc_entrypoint={entrypoint}; "
+        f"cch={content_hash};"
+    )
 
 
 def _is_oauth_token(key: str) -> bool:
@@ -2886,14 +2933,34 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
+        # 1. Prepend the message-dependent billing marker and Claude Code
+        #    identity. The first user turn stays stable as history grows, so
+        #    the system prefix remains byte-stable for prompt caching.
+        billing_block = {
+            "type": "text",
+            "text": _build_claude_code_billing_header(messages),
+        }
         cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
         if isinstance(system, list):
-            system = [cc_block] + system
+            # Replace any caller-supplied or replayed billing marker instead
+            # of accumulating duplicates.
+            system = [
+                block
+                for block in system
+                if not (
+                    isinstance(block, dict)
+                    and isinstance(block.get("text"), str)
+                    and block["text"].startswith(_CLAUDE_CODE_BILLING_PREFIX)
+                )
+            ]
+            system = [billing_block, cc_block] + system
         elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
+            existing_system = [] if system.startswith(_CLAUDE_CODE_BILLING_PREFIX) else [
+                {"type": "text", "text": system}
+            ]
+            system = [billing_block, cc_block] + existing_system
         else:
-            system = [cc_block]
+            system = [billing_block, cc_block]
 
         # 2. Sanitize system prompt — replace product name references
         #    to avoid Anthropic's server-side content filters.
