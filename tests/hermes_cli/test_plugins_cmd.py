@@ -194,14 +194,14 @@ class TestReadManifest:
         assert result == {}
 
     def test_invalid_yaml_returns_empty_and_logs(self, tmp_path, caplog):
-        (tmp_path / "plugin.yaml").write_text(": : : bad yaml [[[")
+        (tmp_path / "plugin.yaml").write_text(": : : bad yaml [[[", encoding="utf-8")
         with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins_cmd"):
             result = _read_manifest(tmp_path)
         assert result == {}
         assert any("Failed to read plugin.yaml" in r.message for r in caplog.records)
 
     def test_empty_file_returns_empty(self, tmp_path):
-        (tmp_path / "plugin.yaml").write_text("")
+        (tmp_path / "plugin.yaml").write_text("", encoding="utf-8")
         result = _read_manifest(tmp_path)
         assert result == {}
 
@@ -393,7 +393,7 @@ class TestCopyExampleFiles:
 
         # Create example file
         example_file = tmp_path / "config.yaml.example"
-        example_file.write_text("key: value")
+        example_file.write_text("key: value", encoding="utf-8")
 
         _copy_example_files(tmp_path, console)
 
@@ -409,7 +409,7 @@ class TestCopyExampleFiles:
 
         # Create example file
         example_file = tmp_path / "config.yaml.example"
-        example_file.write_text("key: value")
+        example_file.write_text("key: value", encoding="utf-8")
 
         # Mock shutil.copy2 to raise an error
         with patch(
@@ -550,16 +550,19 @@ class TestSubdirInstallE2E:
 
         repo_root.mkdir(parents=True, exist_ok=True)
         # Root-level noise: docs + tests that should NOT be installed.
-        (repo_root / "README.md").write_text("# Monorepo docs\n")
+        (repo_root / "README.md").write_text("# Monorepo docs\n", encoding="utf-8")
         (repo_root / "tests").mkdir()
-        (repo_root / "tests" / "test_x.py").write_text("def test_x():\n    pass\n")
+        (repo_root / "tests" / "test_x.py").write_text(
+            "def test_x():\n    pass\n", encoding="utf-8"
+        )
         # The actual plugin in a subdirectory.
         plugin_dir = repo_root / "my-plugin"
         plugin_dir.mkdir()
         (plugin_dir / "plugin.yaml").write_text(
-            "name: my-plugin\nmanifest_version: 1\ndescription: A subdir plugin\n"
+            "name: my-plugin\nmanifest_version: 1\ndescription: A subdir plugin\n",
+            encoding="utf-8",
         )
-        (plugin_dir / "__init__.py").write_text("# plugin entry\n")
+        (plugin_dir / "__init__.py").write_text("# plugin entry\n", encoding="utf-8")
 
         env = {
             **os.environ,
