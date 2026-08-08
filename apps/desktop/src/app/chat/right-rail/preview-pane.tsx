@@ -6,7 +6,7 @@ import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { guardGuestPointers } from '@/lib/guest-pointer-guard'
-import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
+import { isWorkspaceLiveReloadUrl, openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -433,7 +433,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
     lastReloadRequestRef.current = reloadRequest
 
-    if (target.kind !== 'url') {
+    if (target.kind !== 'url' || !isWorkspaceLiveReloadUrl(currentUrl)) {
       return
     }
 
@@ -442,7 +442,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       message: copy.workspaceReloading
     })
     reloadPreview()
-  }, [appendConsoleEntry, copy.workspaceReloading, reloadPreview, reloadRequest, target.kind])
+  }, [appendConsoleEntry, copy.workspaceReloading, currentUrl, reloadPreview, reloadRequest, target.kind])
 
   useEffect(() => {
     if (
