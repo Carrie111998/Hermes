@@ -1085,6 +1085,21 @@ def memory_tool(
         return json.dumps(result, ensure_ascii=False)
 
     # --- Single-op path ---------------------------------------------------
+    # Some models omit ``action`` on single-op calls (the schema leaves it
+    # optional to accommodate the batch shape).  When content is supplied and
+    # no old_text is present, the only sensible intent is an add — default to
+    # it instead of rejecting with "Unknown action 'None'" (#81542).
+    if not action:
+        if content and not old_text:
+            action = "add"
+        else:
+            return tool_error(
+                "Unknown action 'None'. Use: add, replace, remove — or pass "
+                "'operations' for a batch. Omit 'action' only when adding with "
+                "'content'.",
+                success=False,
+            )
+
     # Validate required params BEFORE the gate so an invalid write is rejected
     # immediately instead of being staged and only failing at approve time.
     if action == "add" and not content:

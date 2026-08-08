@@ -296,6 +296,30 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
         assert "not available" in result["error"]
 
+    def test_missing_action_with_content_defaults_to_add(self, store):
+        """A single-op call that omits ``action`` (strict schemas leave it
+        optional for the batch shape) but supplies ``content`` must default to
+        add instead of failing with 'Unknown action None' (#81542)."""
+        result = json.loads(memory_tool(content="preference: user likes dark mode", store=store))
+        assert result["success"] is True
+        assert "preference: user likes dark mode" in store._entries_for("memory")
+
+    def test_missing_action_without_content_errors_helpfully(self, store):
+        """No action and no content: still a clear error (can't guess intent),
+        but the message must not be the bare 'Unknown action None'."""
+        result = json.loads(memory_tool(store=store))
+        assert result["success"] is False
+        assert "Unknown action 'None'" in result["error"]
+        assert "operations" in result["error"]
+
+    def test_missing_action_with_old_text_errors(self, store):
+        """No action but old_text present: ambiguous (replace or remove?) —
+        keep the explicit error rather than guessing."""
+        store.add("memory", "fact A")
+        result = json.loads(memory_tool(old_text="fact A", store=store))
+        assert result["success"] is False
+        assert "Unknown action 'None'" in result["error"]
+
 
     def test_replace_missing_content_still_distinct_error(self, store):
         # When old_text IS present but content is missing, keep the original
