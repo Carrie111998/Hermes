@@ -13,7 +13,11 @@ def test_play_audio_file_scrubbed_env(tmp_path, monkeypatch):
     captured = {}
 
     def fake_popen(cmd, **kwargs):
-        captured["env"] = kwargs.get("env")
+        # The #53587 duration probe (ffprobe/ffplay -v error) also spawns via
+        # Popen internally, and it does not carry a scrubbed env. Only the
+        # system-player call is under test here — identify it by its flags.
+        if "-nodisp" in cmd or "-autoexit" in cmd:
+            captured["env"] = kwargs.get("env")
         proc = MagicMock()
         proc.wait.return_value = 0
         proc.returncode = 0
