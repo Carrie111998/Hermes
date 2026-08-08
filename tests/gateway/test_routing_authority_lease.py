@@ -17,7 +17,7 @@ def _passive_fork_owner(path: str, queue) -> None:
     from gateway.session import _acquire_routing_authority_lease
 
     _acquire_routing_authority_lease(Path(path))
-    child_pid = os.fork()
+    child_pid = os.fork()  # windows-footgun: ok - test is skip-gated on os.fork
     if child_pid == 0:
         time.sleep(10)
         os._exit(0)

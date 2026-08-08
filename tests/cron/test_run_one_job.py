@@ -78,7 +78,9 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     from agent import secret_scope as ss
 
     # Point cron's home resolution at a profile whose .env carries a secret.
-    (tmp_path / ".env").write_text("OPENROUTER_BASE_URL=https://openrouter.ai/api/v1\n")
+    (tmp_path / ".env").write_text(
+        "OPENROUTER_BASE_URL=https://openrouter.ai/api/v1\n", encoding="utf-8"
+    )
     monkeypatch.setattr(s, "_get_hermes_home", lambda: tmp_path)
 
     scope_during_run = {}

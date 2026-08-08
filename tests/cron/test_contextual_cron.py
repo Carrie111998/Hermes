@@ -324,7 +324,7 @@ def test_crash_before_first_contextual_commit_does_not_publish_false_authority(
         os._exit(73)
 
     monkeypatch.setattr(jobs, "atomic_replace", crash_before_replace)
-    child = os.fork()
+    child = os.fork()  # windows-footgun: ok - test is skip-gated on os.fork
     if child == 0:  # pragma: no cover - child exits without returning to pytest
         jobs.save_jobs([ordinary, contextual])
         os._exit(74)

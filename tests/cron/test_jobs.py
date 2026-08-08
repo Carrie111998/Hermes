@@ -1029,7 +1029,7 @@ class TestCronOutputRetention:
         d.mkdir(parents=True, exist_ok=True)
         names = [f"2026-06-25_10-00-{i:02d}.md" for i in range(count)]
         for n in names:
-            (d / n).write_text("x")
+            (d / n).write_text("x", encoding="utf-8")
         return names
 
     def test_prune_keeps_newest_n(self, tmp_path):
