@@ -35,10 +35,10 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
-    def test_same_toolset_reregistration_is_scoped_to_one_home(
-        self, tmp_path, caplog, monkeypatch
+    def test_same_tool_name_is_discovered_and_dispatched_per_profile_home(
+        self, tmp_path, monkeypatch
     ):
-        """Same-home reloads work; a second profile home cannot replace them."""
+        """Equal display names resolve only to the active profile's handler."""
         from hermes_constants import (
             reset_hermes_home_override,
             set_hermes_home_override,
@@ -52,6 +52,7 @@ class TestRegisterAndDispatch:
 
         home_a = tmp_path / "profile-a"
         home_b = tmp_path / "profile-b"
+        home_c = tmp_path / "profile-c"
         monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
 
         token = set_hermes_home_override(str(home_a))
@@ -68,34 +69,84 @@ class TestRegisterAndDispatch:
                 schema=_make_schema("profile_tool"),
                 handler=_handler("a-reload"),
             )
+            assert [entry["function"]["name"] for entry in reg.get_definitions(
+                {"profile_tool"}
+            )] == ["profile_tool"]
+            assert json.loads(reg.dispatch("profile_tool", {})) == {
+                "owner": "a-reload"
+            }
         finally:
             reset_hermes_home_override(token)
 
-        assert json.loads(reg.dispatch("profile_tool", {})) == {"owner": "a-reload"}
         assert reg._generation == 2
 
         token = set_hermes_home_override(str(home_b))
         try:
-            with caplog.at_level(logging.ERROR, logger="tools.registry"):
-                with pytest.raises(PermissionError, match="different Hermes home"):
-                    reg.register(
-                        name="profile_tool",
-                        toolset="profile-tools",
-                        schema=_make_schema("profile_tool"),
-                        handler=_handler("b"),
-                    )
+            assert reg.get_definitions({"profile_tool"}) == []
+            assert json.loads(reg.dispatch("profile_tool", {}))["error"].startswith(
+                "Unknown tool"
+            )
+            reg.register(
+                name="profile_tool",
+                toolset="profile-tools",
+                schema=_make_schema("profile_tool"),
+                handler=_handler("b"),
+            )
+            assert [entry["function"]["name"] for entry in reg.get_definitions(
+                {"profile_tool"}
+            )] == ["profile_tool"]
+            assert json.loads(reg.dispatch("profile_tool", {})) == {"owner": "b"}
+            reg.deregister("profile_tool")
+            assert reg.get_definitions({"profile_tool"}) == []
+            assert json.loads(reg.dispatch("profile_tool", {}))["error"].startswith(
+                "Unknown tool"
+            )
         finally:
             reset_hermes_home_override(token)
 
-        assert json.loads(reg.dispatch("profile_tool", {})) == {"owner": "a-reload"}
-        assert reg._generation == 2
-        assert any(
-            "REJECTED" in record.message
-            and "different Hermes home" in record.message
-            and str(home_a) in record.message
-            and str(home_b) in record.message
-            for record in caplog.records
+        assert reg._generation == 4
+
+        token = set_hermes_home_override(str(home_a))
+        try:
+            assert json.loads(reg.dispatch("profile_tool", {})) == {
+                "owner": "a-reload"
+            }
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(str(home_c))
+        try:
+            assert reg.get_definitions({"profile_tool"}) == []
+            assert json.loads(reg.dispatch("profile_tool", {}))["error"].startswith(
+                "Unknown tool"
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_unscoped_registration_remains_visible_in_multiplex_mode(
+        self, tmp_path, monkeypatch
+    ):
+        """Process-global built-ins retain their existing visibility."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
         )
+        from agent import secret_scope
+
+        reg = ToolRegistry()
+        reg.register(
+            name="global_tool",
+            toolset="core",
+            schema=_make_schema("global_tool"),
+            handler=_dummy_handler,
+        )
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+
+        token = set_hermes_home_override(str(tmp_path / "profile-b"))
+        try:
+            assert json.loads(reg.dispatch("global_tool", {})) == {"ok": True}
+        finally:
+            reset_hermes_home_override(token)
 
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):

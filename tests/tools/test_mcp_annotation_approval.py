@@ -93,6 +93,43 @@ def test_cached_annotation_metadata_has_live_path_parity():
     }
 
 
+def test_annotation_metadata_is_isolated_by_profile_home(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+
+    token = set_hermes_home_override(str(home_a))
+    try:
+        mcp_tool._record_tool_approval_metadata(
+            "evaos-pipedream-google_sheets",
+            [_annotation_tool("rows", True)],
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(str(home_b))
+    try:
+        mcp_tool._record_tool_approval_metadata(
+            "evaos-pipedream-google_sheets",
+            [_annotation_tool("rows", False)],
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert mcp_tool._tool_read_only_hints[
+        (str(home_a.resolve()), "evaos-pipedream-google_sheets")
+    ] == {"rows": True}
+    assert mcp_tool._tool_read_only_hints[
+        (str(home_b.resolve()), "evaos-pipedream-google_sheets")
+    ] == {"rows": False}
+
+
 def test_lazy_cache_registration_restores_annotation_before_tool_handler():
     entry = {
         "tools": [

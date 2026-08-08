@@ -384,6 +384,15 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: Dict[str, ToolEntry] = {}
+        # Profile-owned registrations in a multiplexing gateway.  The public
+        # tool name intentionally remains unchanged (the model still calls
+        # ``mcp__server__tool``), while the owning Hermes home is part of the
+        # internal identity so two profiles may safely register the same
+        # display name without replacing or invoking one another's handler.
+        # Registrations made outside multiplex mode remain in ``_tools`` and
+        # are process-global for backward-compatible built-in/single-profile
+        # behavior.
+        self._profile_tools: Dict[tuple[str, str], ToolEntry] = {}
         # Durable map: plugin module namespace (handler.__globals__["__name__"])
         # -> operator opt-in for built-in override. Populated at plugin load and
         # never cleared, so a plugin's override authorization is bound to the
@@ -406,7 +415,19 @@ class ToolRegistry:
     def _snapshot_state(self) -> tuple[List[ToolEntry], Dict[str, Callable]]:
         """Return a coherent snapshot of registry entries and toolset checks."""
         with self._lock:
-            return list(self._tools.values()), dict(self._toolset_checks)
+            visible = dict(self._tools)
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                home = _current_registration_home()
+                visible.update(
+                    {
+                        name: entry
+                        for (owner_home, name), entry in self._profile_tools.items()
+                        if owner_home == home
+                    }
+                )
+            return list(visible.values()), dict(self._toolset_checks)
 
     def _snapshot_entries(self) -> List[ToolEntry]:
         """Return a stable snapshot of registered tool entries."""
@@ -436,9 +457,26 @@ class ToolRegistry:
                 return True
         return False
 
-    def get_entry(self, name: str) -> Optional[ToolEntry]:
+    def get_entry(
+        self,
+        name: str,
+        registration_home_override: Optional[str] = None,
+    ) -> Optional[ToolEntry]:
         """Return a registered tool entry by name, or None."""
         with self._lock:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                home = (
+                    str(Path(registration_home_override).expanduser().resolve())
+                    if registration_home_override is not None
+                    else _current_registration_home()
+                )
+                scoped = self._profile_tools.get(
+                    (home, name)
+                )
+                if scoped is not None:
+                    return scoped
             return self._tools.get(name)
 
     def get_registered_toolset_names(self) -> List[str]:
@@ -541,6 +579,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        registration_home_override: Optional[str] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -549,30 +588,22 @@ class ToolRegistry:
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites. While multiplex
-        mode is active, re-registration from a different Hermes home is
-        rejected so profile discovery cannot silently replace another
-        profile's handler.
+        mode is active, registrations are stored under their canonical Hermes
+        home so equal display names remain isolated between profiles.
         """
         with self._lock:
-            registration_home = _current_registration_home()
-            existing = self._tools.get(name)
+            registration_home = (
+                str(Path(registration_home_override).expanduser().resolve())
+                if registration_home_override is not None
+                else _current_registration_home()
+            )
             from agent.secret_scope import is_multiplex_active
 
-            if (
-                existing
-                and is_multiplex_active()
-                and existing.registration_home != registration_home
-            ):
-                logger.error(
-                    "Tool registration REJECTED: %r from different Hermes home "
-                    "%r would replace the registration owned by %r.",
-                    name, registration_home, existing.registration_home,
-                )
-                raise PermissionError(
-                    f"Tool {name!r} from different Hermes home "
-                    f"{registration_home!r} cannot replace the registration "
-                    f"owned by {existing.registration_home!r}."
-                )
+            multiplex = is_multiplex_active()
+            profile_key = (registration_home, name)
+            existing = self._tools.get(name)
+            if multiplex:
+                existing = self._profile_tools.get(profile_key) or existing
             if existing and existing.toolset != toolset:
                 if override:
                     _owner = self._plugin_owner_of(handler)
@@ -609,7 +640,7 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
-            self._tools[name] = ToolEntry(
+            entry = ToolEntry(
                 name=name,
                 toolset=toolset,
                 schema=schema,
@@ -623,6 +654,10 @@ class ToolRegistry:
                 dynamic_schema_overrides=dynamic_schema_overrides,
                 registration_home=registration_home,
             )
+            if multiplex:
+                self._profile_tools[profile_key] = entry
+            else:
+                self._tools[name] = entry
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
             # get_toolset_requirements -> TOOLSET_REQUIREMENTS["check_fn"], which
@@ -633,7 +668,11 @@ class ToolRegistry:
                 self._toolset_checks[toolset] = check_fn
             self._generation += 1
 
-    def deregister(self, name: str) -> None:
+    def deregister(
+        self,
+        name: str,
+        registration_home_override: Optional[str] = None,
+    ) -> None:
         """Remove a tool from the registry.
 
         Also cleans up the toolset check if no other tools remain in the
@@ -650,7 +689,23 @@ class ToolRegistry:
         every refresh and has no plugin-override concept.
         """
         with self._lock:
-            entry = self._tools.get(name)
+            from agent.secret_scope import is_multiplex_active
+
+            registration_home = (
+                str(Path(registration_home_override).expanduser().resolve())
+                if registration_home_override is not None
+                else _current_registration_home()
+            )
+            profile_key = (registration_home, name)
+            scoped = (
+                self._profile_tools.get(profile_key)
+                if (
+                    is_multiplex_active()
+                    or registration_home_override is not None
+                )
+                else None
+            )
+            entry = scoped or self._tools.get(name)
             if entry is None:
                 return
             if not entry.toolset.startswith("mcp-"):
@@ -684,11 +739,16 @@ class ToolRegistry:
                         f"{name!r} (toolset {entry.toolset!r}) without operator "
                         f"opt-in (allow_tool_override)."
                     )
-            del self._tools[name]
+            if scoped is not None:
+                del self._profile_tools[profile_key]
+            else:
+                del self._tools[name]
             # Drop the toolset check and aliases if this was the last tool in
             # that toolset.
             toolset_still_exists = any(
                 e.toolset == entry.toolset for e in self._tools.values()
+            ) or any(
+                e.toolset == entry.toolset for e in self._profile_tools.values()
             )
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset, None)
@@ -847,9 +907,13 @@ class ToolRegistry:
         entry = self.get_entry(name)
         return entry.schema if entry else None
 
-    def get_toolset_for_tool(self, name: str) -> Optional[str]:
+    def get_toolset_for_tool(
+        self,
+        name: str,
+        registration_home_override: Optional[str] = None,
+    ) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""
-        entry = self.get_entry(name)
+        entry = self.get_entry(name, registration_home_override)
         return entry.toolset if entry else None
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:

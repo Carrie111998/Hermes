@@ -120,6 +120,91 @@ class TestLoadMCPConfig:
 
 
 class TestMCPParallelSafetyProvenance:
+    def test_same_display_server_state_and_handlers_are_profile_scoped(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+        from agent import secret_scope
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        server_name = "evaos-pipedream-google_sheets"
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+
+        token = set_hermes_home_override(str(home_a))
+        try:
+            server_a = mcp_tool.MCPServerTask(server_name)
+            server_a.session = object()
+            handler_a = mcp_tool._make_tool_handler(
+                server_name,
+                "list_rows",
+                5,
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(str(home_b))
+        try:
+            server_b = mcp_tool.MCPServerTask(server_name)
+            server_b.session = object()
+            handler_b = mcp_tool._make_tool_handler(
+                server_name,
+                "list_rows",
+                5,
+            )
+        finally:
+            reset_hermes_home_override(token)
+
+        lease_a = object()
+        lease_b = object()
+        server_a._evaos_lease_manager = lease_a
+        server_b._evaos_lease_manager = lease_b
+
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            mcp_tool._servers.clear()
+            mcp_tool._servers[server_a.state_key] = server_a
+            mcp_tool._servers[server_b.state_key] = server_b
+
+        try:
+            assert server_a.state_key != server_b.state_key
+            assert server_a.registration_home == str(home_a.resolve())
+            assert server_b.registration_home == str(home_b.resolve())
+
+            token = set_hermes_home_override(str(home_a))
+            try:
+                assert (
+                    mcp_tool._get_connected_server_for_call(server_name)
+                    is server_a
+                )
+                cross_error = json.loads(handler_b({}))
+                assert "not registered for the active profile" in cross_error["error"]
+            finally:
+                reset_hermes_home_override(token)
+
+            token = set_hermes_home_override(str(home_b))
+            try:
+                assert (
+                    mcp_tool._get_connected_server_for_call(server_name)
+                    is server_b
+                )
+                cross_error = json.loads(handler_a({}))
+                assert "not registered for the active profile" in cross_error["error"]
+            finally:
+                reset_hermes_home_override(token)
+
+            assert server_a._evaos_lease_manager is lease_a
+            assert server_b._evaos_lease_manager is lease_b
+            assert handler_a is not handler_b
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+
     def test_parallel_safe_servers_keep_exact_raw_names(self, monkeypatch):
         import tools.mcp_tool as mcp_tool
 
