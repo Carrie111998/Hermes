@@ -40,7 +40,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from plugins.platforms.telegram import adapter as telegram_mod  # noqa: E402
+from plugins.platforms.telegram import media_send_mixin  # noqa: E402
 from plugins.platforms.telegram.adapter import (  # noqa: E402
     TelegramAdapter,
     _coerce_duration_seconds,
@@ -115,8 +115,10 @@ def _make_adapter() -> TelegramAdapter:
 
 @pytest.mark.asyncio
 async def test_voice_send_forwards_duration(monkeypatch, tmp_path):
+    # send_voice lives in MediaSendMixin, so the probe helper must be stubbed
+    # in that module (the adapter re-export is a separate binding).
     monkeypatch.setattr(
-        telegram_mod, "_probe_voice_duration_seconds", lambda _p: 314
+        media_send_mixin, "_probe_voice_duration_seconds", lambda _p: 314
     )
     audio = tmp_path / "reply.ogg"
     audio.write_bytes(b"\x00" * 16)
