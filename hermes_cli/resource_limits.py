@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -20,7 +20,14 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover - Windows only
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_NOFILE_SOFT_LIMIT = int(DEFAULT_CONFIG["runtime"]["nofile_soft_limit"])
+_runtime_defaults_raw = DEFAULT_CONFIG.get("runtime")
+assert isinstance(_runtime_defaults_raw, Mapping)
+_runtime_defaults = cast(Mapping[str, Any], _runtime_defaults_raw)
+_default_nofile_soft_limit = _runtime_defaults.get("nofile_soft_limit")
+assert isinstance(_default_nofile_soft_limit, int) and not isinstance(
+    _default_nofile_soft_limit, bool
+)
+DEFAULT_NOFILE_SOFT_LIMIT = _default_nofile_soft_limit
 _MISSING = object()
 
 
