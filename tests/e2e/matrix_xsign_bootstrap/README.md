@@ -1,7 +1,9 @@
 # Matrix cross-signing bootstrap — E2E test
 
-Self-contained end-to-end test for the auto-bootstrap behavior added in
-`gateway/platforms/matrix.py`. Spins up a real Continuwuity homeserver
+Self-contained end-to-end test for the auto-bootstrap behavior in the Matrix
+adapter, `plugins/platforms/matrix/adapter.py` (this moved out of the old
+gateway-builtin location when Matrix became a plugin).
+Spins up a real Continuwuity homeserver
 in Docker, registers a fresh bot, runs the patched bootstrap path
 against it, and asserts:
 
@@ -35,12 +37,19 @@ busy locally.
 ## What the test exercises
 
 The test mirrors the bootstrap snippet from
-`gateway/platforms/matrix.py` (the "if MATRIX_RECOVERY_KEY else
-get_own_cross_signing_public_keys / generate_recovery_key" branch)
-inline so it runs without importing the entire hermes gateway and its
-many dependencies. **If the source diverges from what's in
-`_connect_with_bootstrap`, this test must be updated to match.** A
-small price for not requiring the full hermes-agent runtime in CI.
+`MatrixAdapter.connect()` in `plugins/platforms/matrix/adapter.py` (the
+"if MATRIX_RECOVERY_KEY else get_own_cross_signing_public_keys /
+generate_recovery_key" branch) inline so it runs without importing the
+entire hermes gateway and its many dependencies. The copy lives in this
+test's own `_connect_with_bootstrap()` helper — that name exists **only
+here**, not in production. **If `connect()` diverges from the mirrored
+snippet, this test must be updated to match.** A small price for not
+requiring the full hermes-agent runtime in CI.
+
+> **Known gap:** nothing mechanically enforces the mirror. The production
+> bootstrap has already moved once (module → plugin, and out of a dedicated
+> method into `connect()`) without this test noticing, so treat drift here
+> as likely rather than hypothetical.
 
 ## Skipped when
 

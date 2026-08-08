@@ -94,14 +94,15 @@ npm run test:watch
 ### Slash command subsystem (`src/app/slash/`)
 
 - `types.ts` — `SlashCommand` interface and `SlashRunCtx` execution context (gateway rpc, transcript helpers, session refs, stale-guard)
-- `registry.ts` — assembles `SLASH_COMMANDS` from all command files in registration order (core → billing → credits → session → ops → setup → debug) and exposes `findSlashCommand(name)` for case-insensitive lookup
-- `commands/core.ts` — general TUI commands
-- `commands/billing.ts` — `/billing`: manage Nous remote spending — buy credits, auto-reload, limits
-- `commands/credits.ts` — `/credits`
-- `commands/session.ts` — session and agent commands
-- `commands/ops.ts` — operations commands
+- `registry.ts` — assembles `SLASH_COMMANDS` from all command files in registration order (core → topup → session → subscription → ops → wake → setup → debug) and exposes `findSlashCommand(name)` for case-insensitive lookup
+- `commands/core.ts` — general TUI commands (`/help`, `/quit`, `/clear`, `/status`, `/copy`, `/paste`, `/logs`, `/queue`, `/steer`, `/undo`, `/retry`, …)
+- `commands/topup.ts` — `/topup`: buy Nous credits
+- `commands/session.ts` — session and agent commands (`/model`, `/sessions`, `/compress`, `/branch`, `/skin`, `/reasoning`, `/usage`, …)
+- `commands/subscription.ts` — `/subscription`: manage the Nous subscription
+- `commands/ops.ts` — operations commands (`/stop`, `/reload`, `/reload-mcp`, `/browser`, `/agents`, `/replay`, `/skills`, `/plugins`, `/tools`, …)
+- `commands/wake.ts` — `/wake`: wake-word control
 - `commands/setup.ts` — `/setup`
-- `commands/debug.ts` — `/heapdump`, `/mem`
+- `commands/debug.ts` — `/heapdump`, `/mem`, `/widgets-reload`, `/theme-info`
 
 The top-level `app.tsx` composes these into the Ink tree with `Static` transcript output, a live streaming assistant row, prompt overlays, queue preview, status rule, input line, and completion list.
 
@@ -122,7 +123,7 @@ The intro panel is driven by `session.info` and rendered through `branding.tsx`.
 
 ## Hotkeys and interactions
 
-Current input behavior is split across `app.tsx`, `components/textInput.tsx`, and the prompt/picker components.
+Current input behavior is split across `src/app.tsx`, `src/components/textInput.tsx`, and the prompt/picker components.
 
 ### Main chat input
 
@@ -179,7 +180,7 @@ Notes:
 
 Notes:
 
-- Clarify free-text mode and masked prompts use `ink-text-input`, so text editing there follows the library's default bindings rather than `components/textInput.tsx`.
+- Clarify free-text mode and masked prompts use `ink-text-input`, so text editing there follows the library's default bindings rather than `src/components/textInput.tsx`.
 - When a blocking prompt is open, the main chat input hotkeys are suspended.
 - Clarify mode has no dedicated cancel shortcut in the current client. Sudo and secret prompts only expose `Ctrl+C` cancellation from the app-level blocked handler.
 
@@ -201,7 +202,7 @@ Notes:
 Assistant output is rendered in one of two ways:
 
 - if the payload already contains ANSI, `messageLine.tsx` prints it directly
-- otherwise `components/markdown.tsx` renders a small Markdown subset into Ink components
+- otherwise `src/components/markdown.tsx` renders a small Markdown subset into Ink components
 
 The Markdown renderer handles headings, lists, block quotes, tables, fenced code blocks, diff coloring, inline code, emphasis, links, and plain URLs.
 
