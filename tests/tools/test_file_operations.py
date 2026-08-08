@@ -673,3 +673,48 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_char_from_sample_cut_not_binary(self, tmp_path):
+        """`head -c 1000` can cut inside a multi-byte UTF-8 char; the terminal
+        decode turns the truncated tail byte into a TRAILING U+FFFD. That is a
+        sampling artifact — a valid UTF-8 CJK document must not be flagged
+        binary (#81651)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # 998 ASCII bytes + a truncated 3-byte CJK char → one trailing U+FFFD.
+        sample = ("x" * 998) + "\ufffd"
+        assert ops._is_likely_binary("notes.md", sample) is False
+
+    def test_internal_replacement_char_still_flagged_binary(self, tmp_path):
+        """A genuine non-UTF-8 byte anywhere EXCEPT the sample's trailing edge
+        is still binary — only the cut-artifact U+FFFD chars are ignored."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        assert ops._is_likely_binary("notes.txt", "\ufffd" + "ok" * 500) is True
+
+    def test_read_file_cjk_cut_mid_char_returns_text(self, tmp_path):
+        """End-to-end: a UTF-8 CJK file whose 1000-byte sample cut lands
+        inside a character reads as text, not binary."""
+        # The production terminal env decodes stdout with errors="replace"
+        # (a truncated UTF-8 tail byte arrives as U+FFFD); mirror that here.
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+
+        def execute(command, **kwargs):
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+                errors="replace",
+                input=kwargs.get("stdin_data"),
+            )
+            return {"output": completed.stdout, "returncode": completed.returncode}
+
+        env.execute = execute
+        ops = ShellFileOperations(env)
+        path = tmp_path / "doc.md"
+        # 998 ASCII bytes then a 3-byte CJK char = 1001 bytes total; the
+        # `head -c 1000` sample ends one byte into the CJK char.
+        path.write_text(("x" * 998) + "中", encoding="utf-8")
+        result = ops.read_file(str(path))
+        assert result.is_binary is False
+        assert result.error is None

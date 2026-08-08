@@ -903,11 +903,22 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # Exception: `head -c 1000` can cut INSIDE a multi-byte UTF-8
+            # character (CJK chars are 3 bytes), and the terminal decode turns
+            # that truncated tail byte into a U+FFFD at the very END of the
+            # sample. That replacement char is a sampling artifact, not file
+            # content — a valid UTF-8 CJK document would be flagged binary on
+            # every read (#81651). A real U+FFFD is visible in the read
+            # content, so stripping trailing ones does not create silent
+            # corruption; genuine non-UTF-8 bytes in the middle of the sample
+            # are still caught below.
+            sample = content_sample.rstrip("\ufffd")
+            if "\ufffd" in sample[:1000]:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     
