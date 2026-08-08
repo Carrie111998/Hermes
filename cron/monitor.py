@@ -169,20 +169,28 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
     """Text compatibility wrapper around the exact-byte URL fetcher."""
     ok, result = _fetch_monitor_url_bytes(url)
     if not ok:
-        return False, str(result)
+        return False, _redact_monitor_text(result)
     return True, bytes(result).decode("utf-8", errors="replace")
+
+
+def _redact_monitor_text(text: object) -> str:
+    """Redact every monitor egress even when global redaction is disabled."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(
+            str(text),
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception as exc:
+        logger.warning("Monitor: failed to redact source data: %s", exc)
+        return "[REDACTED - redaction failed]"
 
 
 def _redact_monitor_output(raw_output: bytes) -> str:
     """Decode source bytes for prompt/snapshot use without hashing this view."""
-    output = raw_output.decode("utf-8", errors="replace")
-    try:
-        from agent.redact import redact_sensitive_text
-
-        return redact_sensitive_text(output)
-    except Exception as exc:
-        logger.warning("Monitor: failed to redact source output: %s", exc)
-        return "[REDACTED - redaction failed]"
+    return _redact_monitor_text(raw_output.decode("utf-8", errors="replace"))
 
 
 def _run_monitor_source(job: dict) -> tuple[bool, str, bytes]:
@@ -199,14 +207,14 @@ def _run_monitor_source(job: dict) -> tuple[bool, str, bytes]:
             raw_output=True,
         )
         if not ok:
-            return False, str(result), b""
+            return False, _redact_monitor_text(result), b""
         raw_output = bytes(result)
         return True, _redact_monitor_output(raw_output), raw_output
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
         ok, result = _fetch_monitor_url_bytes(monitor_url)
         if not ok:
-            return False, str(result), b""
+            return False, _redact_monitor_text(result), b""
         raw_output = bytes(result)
         return True, _redact_monitor_output(raw_output), raw_output
     return False, "monitor job has neither monitor_script nor monitor_url", b""
@@ -271,15 +279,19 @@ def check_monitor(job: dict) -> MonitorOutcome:
 
 
 def _persist_monitor_state(job: dict, new_hash: str, output: str) -> Optional[bool]:
-    from cron.jobs import _hermes_now, update_monitor_state_if_source_matches
+    from cron.jobs import (
+        _hermes_now,
+        _monitor_source_generation,
+        update_monitor_state_if_source_matches,
+    )
 
     job_id = job["id"]
-    _write_last_output(job_id, output)
     try:
         persisted = update_monitor_state_if_source_matches(
             job_id,
             expected_monitor_script=job.get("monitor_script"),
             expected_monitor_url=job.get("monitor_url"),
+            expected_monitor_source_generation=_monitor_source_generation(job),
             monitor_state={
                 "last_output_hash": new_hash,
                 "last_changed_at": _hermes_now().isoformat(),
@@ -290,6 +302,8 @@ def _persist_monitor_state(job: dict, new_hash: str, output: str) -> Optional[bo
                 "Monitor: discarded stale state for %r because its source changed",
                 job_id,
             )
+        else:
+            _write_last_output(job_id, output)
         return persisted
     except Exception as exc:
         logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)

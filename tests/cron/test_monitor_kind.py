@@ -223,6 +223,30 @@ def test_stale_monitor_run_cannot_overwrite_new_source_baseline(hermes_env):
     assert current["monitor_state"] is None
 
 
+def test_stale_monitor_run_cannot_commit_after_source_changes_away_and_back(
+    hermes_env,
+):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _persist_monitor_state, _snapshot_path
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    old_job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+
+    update_job(old_job["id"], {"monitor_script": "two.sh"})
+    update_job(old_job["id"], {"monitor_script": "one.sh"})
+
+    assert _persist_monitor_state(old_job, "stale-hash", "old output") is False
+    current = get_job(old_job["id"])
+    assert current["monitor_state"] is None
+    assert current["monitor_source_generation"] == 2
+    assert not _snapshot_path(old_job["id"]).exists()
+
+
 def test_source_edit_during_check_suppresses_obsolete_agent_run(
     hermes_env, monkeypatch
 ):
@@ -261,6 +285,65 @@ def test_hash_is_exact_bytes(hermes_env):
     assert hash_monitor_output("a\nb") == hash_monitor_output("a\nb")
     # Exact-bytes contract: even whitespace-only differences are changes.
     assert hash_monitor_output("a\nb") != hash_monitor_output("a\nb ")
+
+
+def test_monitor_display_and_snapshot_force_strict_url_credential_redaction(
+    hermes_env, monkeypatch
+):
+    import agent.redact as redact
+    from cron.jobs import create_job
+    from cron.monitor import _snapshot_path, check_monitor
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    _write_script(
+        hermes_env,
+        "credentials.sh",
+        "printf '%s' 'https://alice:secret@example.com/path?token=opaque&public=visible'",
+    )
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="credentials.sh",
+    )
+
+    outcome = check_monitor(job)
+    output = outcome.context_block or ""
+    snapshot = _snapshot_path(job["id"]).read_text(encoding="utf-8")
+
+    for surfaced in (output, snapshot):
+        assert "secret" not in surfaced
+        assert "opaque" not in surfaced
+        assert "alice:***@example.com" in surfaced
+        assert "token=***" in surfaced
+        assert "public=visible" in surfaced
+
+
+def test_monitor_failure_forces_strict_url_credential_redaction(
+    hermes_env, monkeypatch
+):
+    import agent.redact as redact
+    import cron.monitor as monitor
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    monkeypatch.setattr(
+        monitor,
+        "_fetch_monitor_url_bytes",
+        lambda _url: (
+            False,
+            "fetch failed for https://alice:secret@example.com/?token=opaque",
+        ),
+    )
+
+    ok, error, raw_output = monitor._run_monitor_source(
+        {"monitor_url": "https://example.com"}
+    )
+
+    assert ok is False
+    assert raw_output == b""
+    assert "secret" not in error
+    assert "opaque" not in error
+    assert "alice:***@example.com" in error
+    assert "token=***" in error
 
 
 def test_monitor_url_rejects_ssrf_blocked_target(hermes_env, monkeypatch):
