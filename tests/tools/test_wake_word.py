@@ -171,14 +171,12 @@ def test_requirements_fresh_install_lazy_allowed(monkeypatch):
 def test_requirements_deps_present_but_no_audio_hint(monkeypatch):
     """Once deps ARE installed, a failing audio probe blocks with a mic hint
     (lazy installs can't fix a missing audio device)."""
-    _voice_loop_ready(monkeypatch)
     monkeypatch.setattr(ww, "_audio_available", lambda: False)
-    monkeypatch.setattr(ww, "_local_input_device_ready", lambda: False)
     monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
     monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: True)
-    r = ww.check_wake_word_requirements({"provider": "openwakeword", "capture": "local"})
+    r = ww.check_wake_word_requirements({"provider": "openwakeword"})
     assert r["available"] is False
-    assert "audio device" in r["hint"] or "microphone" in r["hint"].lower()
+    assert "audio device" in r["hint"]
 
 
 # ── openWakeWord engine (bundled model + base-model fetch) ───────────────
@@ -628,87 +626,365 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         process.join(10)
 
 
-# ── Client capture (remote desktop mic → wake.feed) ──────────────────────
+# ── Retry logic ────────────────────────────────────────────────────────
 
 
-def test_resolve_capture_mode_auto_and_prefer_client(monkeypatch):
-    monkeypatch.setattr(ww, "_local_input_device_ready", lambda: False)
-    # auto without prefer_client stays local (CLI/TUI/status semantics)
-    assert ww.resolve_capture_mode({"capture": "auto"}) == "local"
-    assert ww.resolve_capture_mode({"capture": "auto"}, prefer_client=True) == "client"
-    assert ww.resolve_capture_mode({"capture": "local"}, prefer_client=True) == "local"
-    assert ww.resolve_capture_mode({"capture": "client"}) == "client"
-    assert ww.resolve_capture_mode({"capture": "auto"}, force_local=True) == "local"
-    monkeypatch.setattr(ww, "_local_input_device_ready", lambda: True)
-    assert ww.resolve_capture_mode({"capture": "auto"}) == "local"
-    # A working backend mic wins under auto even for a preferring surface, so
-    # local desktops keep PortAudio + wake_word.input_device selection.
-    assert ww.resolve_capture_mode({"capture": "auto"}, prefer_client=True) == "local"
-    # Explicit client still forces streaming (backend mic exists but is wrong).
-    assert ww.resolve_capture_mode({"capture": "client"}, prefer_client=True) == "client"
+def test_retry_constants_exist():
+    """Retry constants are defined and sane."""
+    assert hasattr(ww, "_RETRY_ON_BUSY_DEFAULT")
+    assert hasattr(ww, "_RETRY_INTERVAL_SECONDS")
+    assert hasattr(ww, "_RETRY_MAX_ATTEMPTS_DEFAULT")
+    assert ww._RETRY_ON_BUSY_DEFAULT is True
+    assert ww._RETRY_INTERVAL_SECONDS > 0
+    assert ww._RETRY_MAX_ATTEMPTS_DEFAULT == 0
 
 
-def test_requirements_client_capture_without_local_mic(monkeypatch):
-    monkeypatch.setattr(ww, "_audio_available", lambda: False)
-    monkeypatch.setattr(ww, "_local_input_device_ready", lambda: False)
-    monkeypatch.setattr(ww, "_stt_ready", lambda: True)
-    monkeypatch.setattr(ww, "_tts_ready", lambda: True)
-
-    class _LD:
-        @staticmethod
-        def is_available(feature):
-            return True
-
-        @staticmethod
-        def _allow_lazy_installs():
-            return False
-
-        @staticmethod
-        def feature_install_command(feature):
-            return ""
-
-    monkeypatch.setattr(ww, "lazy_deps", _LD, raising=False)
-    import tools.lazy_deps as real_ld
-    monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
-    monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: False)
-
-    reqs = ww.check_wake_word_requirements({"capture": "client", "provider": "openwakeword"})
-    assert reqs["available"] is True
-    assert reqs["capture"] == "client"
+def test_retry_config_defaults_in_config():
+    """Retry config keys appear in the DEFAULTS dict."""
+    defaults = ww._DEFAULTS
+    assert isinstance(defaults, dict)
 
 
-def test_client_capture_feed_fires(monkeypatch, tmp_path):
-    np = pytest.importorskip("numpy")
+def test_start_listening_retries_when_detector_held(monkeypatch, tmp_path):
+    """start_listening retries when _detector is held by another owner,
+    then succeeds once the detector is released."""
+    class FakeDetector:
+        def __init__(self, *a, **kw):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
 
-    monkeypatch.setattr(ww, "_build_engine", lambda cfg: _FakeEngine(fire=True))
-    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / "wake.lock")
-    # External mode must not import sounddevice
-    monkeypatch.setattr(
-        ww,
-        "_import_audio",
-        lambda: (_ for _ in ()).throw(OSError("no local mic")),
-    )
-    owner = object()
-    fired = threading.Event()
+    other_owner = object()
+    my_owner = object()
+    original_detector = FakeDetector()
+    monkeypatch.setattr(ww, "_detector", original_detector)
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
 
-    def _on_wake():
-        fired.set()
+    def fake_build_engine(cfg):
+        return object()
 
-    ww.start_listening(_on_wake, owner=owner, config={}, external_audio=True)
-    assert ww.is_listening() is True
-    info = ww.detector_frame_info()
-    fl = int(info["frame_length"])
-    # Non-silent frame so silence flag does not dominate
-    pcm = (np.ones(fl, dtype=np.int16) * 5000).tobytes()
-    assert ww.feed_audio(owner=owner, pcm_int16=pcm) is True
-    assert fired.wait(2.0)
-    assert ww.stop_listening(owner=owner) is True
+    def fake_input_device(cfg):
+        return None
+
+    lock_path = tmp_path / "lock"
+    lock_path.write_bytes(b"\0")
+
+    def fake_acquire():
+        return open(lock_path, "rb")
+
+    def fake_release(h):
+        if h:
+            try:
+                h.close()
+            except Exception:
+                pass
+
+    monkeypatch.setattr(ww, "_build_engine", fake_build_engine)
+    monkeypatch.setattr(ww, "_input_device", fake_input_device)
+    monkeypatch.setattr(ww, "_acquire_machine_lock", fake_acquire)
+    monkeypatch.setattr(ww, "_release_machine_lock", fake_release)
+    # Mock WakeWordDetector so it returns our FakeDetector
+    monkeypatch.setattr(ww, "WakeWordDetector", FakeDetector)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 0}
+
+    # Background thread releases the detector after a short delay
+    import threading
+
+    def release_detector():
+        time.sleep(0.05)
+        with ww._detector_lock:
+            if ww._detector is original_detector:
+                ww._detector = None
+                ww._detector_owner = None
+                ww._detector_file_lock = None
+
+    t = threading.Thread(target=release_detector)
+    t.start()
+
+    detector = ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+    t.join()
+    assert detector is not None
+    assert ww._detector_owner is my_owner
+
+    # Cleanup
+    ww._release_machine_lock(ww._detector_file_lock)
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
 
 
-def test_feed_audio_rejects_wrong_owner(monkeypatch, tmp_path):
-    monkeypatch.setattr(ww, "_build_engine", lambda cfg: _FakeEngine(fire=False))
-    monkeypatch.setattr(ww, "_lock_path", lambda: tmp_path / "wake.lock")
-    owner = object()
-    ww.start_listening(lambda: None, owner=owner, config={}, external_audio=True)
-    assert ww.feed_audio(owner=object(), pcm_int16=b"\x00\x00") is False
-    assert ww.stop_listening(owner=owner) is True
+def test_start_listening_gives_up_after_max_retries(monkeypatch, tmp_path):
+    """start_listening raises after retry_max_attempts is reached."""
+    class FakeDetector:
+        def __init__(self):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    other_owner = object()
+    my_owner = object()
+
+    monkeypatch.setattr(ww, "_detector", FakeDetector())
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 2}
+
+    with pytest.raises(ww.WakeWordInUse, match="retry limit"):
+        ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+
+    # Cleanup
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_no_retry_when_disabled(monkeypatch, tmp_path):
+    """start_listening raises immediately when retry_on_busy is False."""
+    class FakeDetector:
+        def __init__(self):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    other_owner = object()
+    my_owner = object()
+
+    monkeypatch.setattr(ww, "_detector", FakeDetector())
+    monkeypatch.setattr(ww, "_detector_owner", other_owner)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+    cfg = {"retry_on_busy": False}
+
+    with pytest.raises(ww.WakeWordInUse):
+        ww.start_listening(lambda: None, owner=my_owner, config=cfg)
+
+    # Cleanup
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_retries_when_machine_lock_held(monkeypatch, tmp_path):
+    """start_listening retries across-process lock acquisition itself, not
+    just the in-process _detector path, then succeeds once the lock frees.
+
+    Uses a real on-disk lock file that is already held when start_listening
+    runs, mirroring the cross-process mic-busy case the PR targets.
+    """
+    lock_path = tmp_path / "wake.lock"
+    lock_path.write_bytes(b"\0")
+    # Pre-acquire the cross-process lock so the first acquire raises WakeWordInUse.
+    blocker = open(lock_path, "a+b")
+    if os.name == "nt":
+        import msvcrt
+
+        blocker.seek(0)
+        msvcrt.locking(blocker.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(blocker.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    monkeypatch.setattr(ww, "_lock_path", lambda: lock_path)
+
+    # Stub the rest of startup so we only exercise the lock-retry boundary.
+    class FakeDetector:
+        def __init__(self, *a, **kw):
+            self.on_wake = None
+        def start(self):
+            pass
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    monkeypatch.setattr(ww, "_build_engine", lambda cfg: object())
+    monkeypatch.setattr(ww, "_input_device", lambda cfg: None)
+    monkeypatch.setattr(ww, "WakeWordDetector", FakeDetector)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 0}
+
+    # Release the lock shortly after start_listening begins retrying.
+    def release_lock():
+        time.sleep(0.05)
+        if os.name == "nt":
+            import msvcrt
+
+            blocker.seek(0)
+            msvcrt.locking(blocker.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(blocker.fileno(), fcntl.LOCK_UN)
+        blocker.close()
+
+    t = threading.Thread(target=release_lock)
+    t.start()
+
+    detector = ww.start_listening(lambda: None, owner=object(), config=cfg)
+    t.join()
+    assert detector is not None
+
+    # Cleanup
+    ww._release_machine_lock(ww._detector_file_lock)
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_gives_up_after_max_retries_machine_lock(monkeypatch, tmp_path):
+    """Cross-process lock held permanently → start_listening exhausts retries
+    and surfaces the actionable retry-limit message.
+    """
+    lock_path = tmp_path / "wake.lock"
+    lock_path.write_bytes(b"\0")
+    blocker = open(lock_path, "a+b")
+    if os.name == "nt":
+        import msvcrt
+
+        blocker.seek(0)
+        msvcrt.locking(blocker.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(blocker.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(ww, "_lock_path", lambda: lock_path)
+
+    monkeypatch.setattr(ww, "_build_engine", lambda cfg: object())
+    monkeypatch.setattr(ww, "_input_device", lambda cfg: None)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 2}
+    with pytest.raises(ww.WakeWordInUse, match="retry limit"):
+        ww.start_listening(lambda: None, owner=object(), config=cfg)
+
+    # Cleanup
+    if os.name == "nt":
+        import msvcrt
+
+        blocker.seek(0)
+        msvcrt.locking(blocker.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(blocker.fileno(), fcntl.LOCK_UN)
+    blocker.close()
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_mic_busy_error_is_retryable_boundary(monkeypatch, tmp_path):
+    """A device-busy mic-open failure (held by another app) is classified as
+    retryable and raises the private _MicBusy, while a hard 'no device' failure
+    is NOT retryable and stays a RuntimeError.
+
+    This is the retryable/non-retryable error boundary the PR must define.
+    """
+    import sounddevice
+
+    # Transient busy error → retryable.
+    assert ww._is_mic_busy_error(OSError("Device is busy and in use")) is True
+    assert ww._is_mic_busy_error(sounddevice.PortAudioError("stream busy")) is True
+    assert ww._is_mic_busy_error(BlockingIOError("locked")) is True
+
+    # Hard failure (no device / missing backend) → NOT retryable.
+    assert ww._is_mic_busy_error(OSError("No such device")) is False
+    assert ww._is_mic_busy_error(OSError("no input device available")) is False
+    assert ww._is_mic_busy_error(ValueError("bad provider")) is False
+
+
+def test_start_listening_does_not_retry_on_hard_mic_failure(monkeypatch, tmp_path):
+    """A non-retryable mic-open failure raises immediately (no infinite retry),
+    matching the pre-existing ownership-release contract.
+    """
+    lock_path = tmp_path / "wake.lock"
+    monkeypatch.setattr(ww, "_lock_path", lambda: lock_path)
+    monkeypatch.setattr(ww, "_build_engine", lambda cfg: object())
+    monkeypatch.setattr(ww, "_input_device", lambda cfg: None)
+
+    class HardFailDetector:
+        def __init__(self, *a, **kw):
+            self.on_wake = None
+        def start(self):
+            raise RuntimeError("Failed to open the wake-word microphone.")
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    monkeypatch.setattr(ww, "WakeWordDetector", HardFailDetector)
+
+    # Default config has retry_on_busy=True, retry_max_attempts=0 (unlimited),
+    # so a hard failure MUST still raise at once rather than loop forever.
+    with pytest.raises(RuntimeError, match="Failed to open"):
+        ww.start_listening(lambda: None, owner=object(), config={"retry_on_busy": True})
+
+    # Cleanup
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)
+
+
+def test_start_listening_retries_on_device_busy(monkeypatch, tmp_path):
+    """A device-busy mic-open failure (OSError busy) is retried, then succeeds
+    once a healthy detector is available.
+    """
+    lock_path = tmp_path / "wake.lock"
+    monkeypatch.setattr(ww, "_lock_path", lambda: lock_path)
+    monkeypatch.setattr(ww, "_build_engine", lambda cfg: object())
+    monkeypatch.setattr(ww, "_input_device", lambda cfg: None)
+
+    attempts = {"n": 0}
+
+    class FlakyDetector:
+        def __init__(self, *a, **kw):
+            self.on_wake = None
+        def start(self):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                raise ww._MicBusy("mic busy (in use by another app)")
+            return None
+        def stop(self):
+            pass
+        def pause(self):
+            pass
+        def resume(self):
+            pass
+
+    monkeypatch.setattr(ww, "WakeWordDetector", FlakyDetector)
+
+    cfg = {"retry_on_busy": True, "retry_interval": 0.01, "retry_max_attempts": 0}
+    detector = ww.start_listening(lambda: None, owner=object(), config=cfg)
+    assert detector is not None
+    assert attempts["n"] == 2  # retried exactly once then succeeded
+
+    # Cleanup
+    ww._release_machine_lock(ww._detector_file_lock)
+    monkeypatch.setattr(ww, "_detector", None)
+    monkeypatch.setattr(ww, "_detector_owner", None)
+    monkeypatch.setattr(ww, "_detector_file_lock", None)

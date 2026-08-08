@@ -125,6 +125,9 @@ wake_word:
   sensitivity: 0.6            # 0.0-1.0 — higher = stricter (fewer false triggers), consistent across all engines
   confirmation_frames: 3      # openWakeWord only — consecutive over-threshold frames required to fire
   start_new_session: true     # start a fresh session on wake vs. continue the current one
+  retry_on_busy: true         # auto-retry while the mic is held by another app/Hermes instance
+  retry_interval: 10          # seconds between retry attempts
+  retry_max_attempts: 0       # 0 = retry forever until the mic is freed
   openwakeword:
     model: hey_hermes         # bundled default; OR a built-in name OR a path to a custom .onnx/.tflite
     inference_framework: ""   # "" (auto) | "onnx" | "tflite"
@@ -139,6 +142,26 @@ wake_word:
 (`sounddevice`) stream. Use either a numeric device index or an unambiguous
 device-name substring. This setting only changes wake-word capture; desktop
 push-to-talk still uses the desktop application's microphone path.
+
+### Retrying when the microphone is busy
+
+If the wake-word microphone is already held when Hermes tries to arm — by
+another Hermes instance, the desktop GUI at startup, or a conferencing app like
+Teams/Discord/Zoom — `start_listening` retries instead of failing immediately:
+
+- **`retry_on_busy`** (default `true`) — back off and retry while the mic is
+  busy. Set to `false` to fail immediately with an actionable error naming the
+  likely culprit and the `hermes config set wake_word.enabled false` workaround.
+- **`retry_interval`** (default `10`) — seconds to wait between attempts.
+- **`retry_max_attempts`** (default `0`) — cap on attempts; `0` means retry
+  indefinitely until the mic frees up.
+
+This retry only applies to *acquiring* the listener. It does **not** change the
+[sticky-ownership contract](#surfaces-cli-tui-gui): when the mic is held by
+another Hermes **surface** in the same process, the claimant still waits (and
+retries) rather than silently failing over to a different surface. The retry
+gives the current owner time to release the mic; it never transfers ownership to
+a competing surface.
 
 ### Reducing false triggers on ambient speech
 

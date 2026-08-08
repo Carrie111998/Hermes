@@ -1626,6 +1626,9 @@ DEFAULT_CONFIG = {
         "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
         "confirmation_frames": 3,     # openWakeWord only: consecutive over-threshold frames required to fire (higher = fewer false triggers on ambient speech, slightly more latency; 1 = old single-frame behavior)
         "start_new_session": True,    # start a fresh session on wake vs. continue the current one
+        "retry_on_busy": True,           # auto-retry when mic is busy (another process / Hermes instance)
+        "retry_interval": 10,            # seconds between retries
+        "retry_max_attempts": 0,         # 0 = unlimited retries
         "profile_routing": True,      # sherpa only: also listen for every wake-enabled profile's phrase and route the wake to the matching profile
         "openwakeword": {
             # "hey_hermes" (the bundled, works-out-of-the-box default) OR a
