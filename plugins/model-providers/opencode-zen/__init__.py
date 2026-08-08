@@ -146,6 +146,7 @@ opencode_go = OpenCodeGoProfile(
     # ("Upstream request failed: [400] Provider returned error"). Hermes
     # defers those image parts to a follow-up user-role message instead.
     supports_vision_tool_messages=False,
+    supports_vision_user_messages=True,
 )
 
 register_provider(opencode_zen)

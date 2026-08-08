@@ -6680,6 +6680,26 @@ class AIAgent:
             pass
         return True  # default: assume compatible
 
+    def _provider_supports_vision_user_messages(self) -> bool:
+        """Return True if the active provider accepts multimodal USER messages.
+
+        Some providers (e.g. opencode-go / Console Go) reject ``image_url``
+        parts inside tool-role messages but accept them in user-role
+        messages.  When True, deferred image parts are appended as a
+        user-role message after the tool batch instead of downgrading the
+        whole tool result to a text summary.  This checks the provider
+        profile's ``supports_vision_user_messages`` field.
+        """
+        try:
+            from providers import get_provider_profile
+            provider = (getattr(self, "provider", "") or "").strip()
+            profile = get_provider_profile(provider)
+            if profile is not None:
+                return getattr(profile, "supports_vision_user_messages", False)
+        except Exception:
+            pass
+        return False  # default: assume no multimodal user-message support
+
     def _preprocess_anthropic_content(self, content: Any, role: str) -> Any:
         if not self._content_has_image_parts(content):
             return content
@@ -6836,12 +6856,18 @@ class AIAgent:
                 # image parts to a follow-up user-role message (appended by
                 # _append_pending_tool_images_as_user_message after the whole
                 # tool batch), so a vision-capable model still sees the
-                # pixels natively.
+                # pixels natively. Providers that do not declare multimodal
+                # user-message support (e.g. Xiaomi MiMo) keep the safe
+                # text-summary downgrade.
                 image_parts = [
                     p for p in content
-                    if isinstance(p, dict) and p.get("type") == "image_url"
+                    if isinstance(p, dict) and p.get("type") in {"image_url", "input_image"}
                 ]
-                if image_parts and self._model_supports_vision():
+                if (
+                    image_parts
+                    and self._model_supports_vision()
+                    and self._provider_supports_vision_user_messages()
+                ):
                     pending = list(
                         getattr(self, "_pending_tool_image_parts", None) or []
                     )
@@ -6849,7 +6875,7 @@ class AIAgent:
                     self._pending_tool_image_parts = pending
                     text_parts = [
                         p for p in content
-                        if not (isinstance(p, dict) and p.get("type") == "image_url")
+                        if not (isinstance(p, dict) and p.get("type") in {"image_url", "input_image"})
                     ]
                     if text_parts:
                         return text_parts
