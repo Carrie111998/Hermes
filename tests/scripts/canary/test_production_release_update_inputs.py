@@ -751,7 +751,7 @@ def test_signed_plan_rejects_substituted_valid_host_mutation_authority() -> None
 
 
 @pytest.mark.parametrize("offset_seconds", (-10 * 365 * 24 * 60 * 60, 31))
-def test_host_mutation_authority_rejects_stale_and_future_replay(
+def test_initial_collector_rejects_stale_and_future_replay(
     offset_seconds: int,
 ) -> None:
     fixture = _fixture()
@@ -779,6 +779,72 @@ def test_host_mutation_authority_rejects_stale_and_future_replay(
         inputs.validate_host_mutation_authority(
             authority,
             initial_collector_receipt=initial,
+            release_revision=TARGET,
+            host_artifact_manifest=fixture.documents[
+                "host_artifact_manifest_sha256"
+            ],
+            host_inventory=inventory_receipt,
+            now_unix=NOW,
+        )
+
+
+@pytest.mark.parametrize("offset_seconds", (-10 * 365 * 24 * 60 * 60, 31))
+def test_host_mutation_authority_rejects_stale_and_future_replay(
+    offset_seconds: int,
+) -> None:
+    fixture = _fixture()
+    observed_at = NOW + offset_seconds
+    authority = deepcopy(
+        fixture.documents["host_mutation_authority_sha256"]
+    )
+    authority["observed_at_unix"] = observed_at
+    _rehash(authority, "receipt_sha256")
+    inventory_receipt = deepcopy(
+        fixture.documents["host_inventory_sha256"]
+    )
+    inventory_receipt["observed_at_unix_ns"] = observed_at * 1_000_000_000
+    _rehash(inventory_receipt, "receipt_sha256")
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match="release_update_inputs_host_mutation_authority_invalid",
+    ):
+        inputs.validate_host_mutation_authority(
+            authority,
+            initial_collector_receipt=fixture.documents[
+                "host_mutation_initial_collector_receipt_sha256"
+            ],
+            release_revision=TARGET,
+            host_artifact_manifest=fixture.documents[
+                "host_artifact_manifest_sha256"
+            ],
+            host_inventory=inventory_receipt,
+            now_unix=NOW,
+        )
+
+
+@pytest.mark.parametrize("offset_seconds", (-10 * 365 * 24 * 60 * 60, 31))
+def test_host_inventory_rejects_stale_and_future_replay(
+    offset_seconds: int,
+) -> None:
+    fixture = _fixture()
+    inventory_receipt = deepcopy(
+        fixture.documents["host_inventory_sha256"]
+    )
+    inventory_receipt["observed_at_unix_ns"] = (
+        NOW + offset_seconds
+    ) * 1_000_000_000
+    _rehash(inventory_receipt, "receipt_sha256")
+
+    with pytest.raises(
+        inputs.ProductionReleaseUpdateInputsError,
+        match="release_update_inputs_host_mutation_authority_invalid",
+    ):
+        inputs.validate_host_mutation_authority(
+            fixture.documents["host_mutation_authority_sha256"],
+            initial_collector_receipt=fixture.documents[
+                "host_mutation_initial_collector_receipt_sha256"
+            ],
             release_revision=TARGET,
             host_artifact_manifest=fixture.documents[
                 "host_artifact_manifest_sha256"
