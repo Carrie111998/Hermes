@@ -111,9 +111,9 @@ def _recheck_package_availability() -> None:
     But a long-lived gateway process must also pick up packages installed
     *after* startup: without this refresh, ``hermes doctor`` / the voice UI
     keep reporting the provider as unavailable until a manual restart
-    (#81235).  Callers that resolve the STT provider (``_get_provider``,
-    ``transcribe_audio``) invoke this once per resolution — cheap enough
-    that the refresh itself is never on the audio path.
+    (#81235).  Status/arming callers (``check_voice_requirements`` and
+    ``wake_word._stt_ready``) invoke this once per resolution — cheap
+    enough that the refresh itself is never on the audio path.
     """
     global _HAS_FASTER_WHISPER, _HAS_OPENAI, _HAS_MISTRAL, _HAS_PILK
     try:
