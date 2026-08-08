@@ -396,19 +396,123 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 # SQLite safe copy
 # ---------------------------------------------------------------------------
 
+# ``sqlite3.Connection.backup()`` retries SQLITE_BUSY/SQLITE_LOCKED with
+# ``time.sleep()`` inside CPython's C implementation
+# (Modules/_sqlite/connection.c: a ``do { sqlite3_backup_step(); if (BUSY or
+# LOCKED) sqlite3_sleep(); } while (OK or BUSY or LOCKED)`` loop) with NO
+# overall deadline. The ``timeout=`` a connection is opened with only bounds
+# the *initial* lock acquisition for ordinary statements -- it has no effect
+# on this loop at all, confirmed empirically: opening both sides with
+# timeout=2 and holding an external BEGIN EXCLUSIVE for 8s still blocks
+# backup() for the full 8s. Left unbounded, a source `.db` that stays
+# SQLITE_BUSY (observed in the wild against Chrome's own
+# ``first_party_sets.db`` under ``chrome-debug/``, including a live 61s
+# in-situ hang against a real lock, and even against the user's separate
+# personal Chrome profile's copy of the same file -- so this is a Chrome/
+# SQLite locking characteristic, not specific to the Hermes-managed
+# profile) can stall the entire ``hermes backup`` run for as long as the
+# lock is held.
+#
+# Bounded via the ``progress=`` callback, which CPython invokes after
+# *every* ``sqlite3_backup_step()`` call including ones that returned BUSY/
+# LOCKED, and which can raise to abort the backup cleanly (CPython's own
+# comment: "Callback failed: abort backup and bail" -- it still calls
+# ``sqlite3_backup_finish()`` internally, so no handle is leaked). The
+# deadline check is gated on ``status in (SQLITE_BUSY, SQLITE_LOCKED)``,
+# NOT on raw elapsed time: with the default ``pages=-1`` a healthy,
+# uncontended copy -- however large -- completes in a single
+# ``sqlite3_backup_step()`` call, and the progress callback only fires
+# *after* that (possibly slow, for a many-GB state.db) step finishes. A
+# time-only check would wrongly discard an already-successful large,
+# non-busy copy; gating on status keeps the deadline meaningful only for
+# genuine lock contention. Confirmed both properties experimentally: a
+# genuinely-busy source is aborted well before an 8-10s external lock would
+# clear, while an 87 MB non-busy source completes normally even against a
+# 1ms deadline.
+#
+# See the ``timeout=0`` comment inside ``_safe_copy_db`` below for a
+# second, easy-to-miss piece this fix depends on: the connections used in
+# the bounded path must NOT use ``sqlite3.connect()``'s default 5s
+# ``timeout=``, or SQLite's own internal busy-handler silently absorbs the
+# wait *inside* a single backup_step() call before our callback ever runs.
+_SAFE_COPY_BUSY_DEADLINE_SECONDS = 30.0
+_SQLITE_BUSY_STATUSES = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
+
+class _SafeCopyBusyTimeout(Exception):
+    """Raised from the backup() progress callback past the busy deadline.
+
+    Plain ``Exception`` subclass so it's caught by the existing
+    ``except Exception as exc:`` in :func:`_safe_copy_db` with no change to
+    that function's control flow or return contract -- a busy-timeout abort
+    degrades to the same "safe copy failed" warning + ``False`` return as
+    any other backup() failure.
+    """
+
+
+def _resolve_safe_copy_busy_deadline_seconds() -> float:
+    """Busy/locked retry deadline for :func:`_safe_copy_db`, in seconds.
+
+    Override via ``HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS`` (e.g. for
+    tests, or to disable bounding entirely with a non-positive value).
+    """
+    raw = os.environ.get("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return _SAFE_COPY_BUSY_DEADLINE_SECONDS
+
+
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while
     the DB is being written to. Fail closed if a consistent snapshot cannot
     be created: copying only the live main file can omit committed WAL data.
+
+    Bounded against a sustained SQLITE_BUSY/SQLITE_LOCKED source (see
+    ``_SAFE_COPY_BUSY_DEADLINE_SECONDS`` above) so one persistently-locked
+    file degrades to a skipped-with-warning outcome instead of stalling the
+    whole backup indefinitely. A non-positive deadline disables bounding
+    (retries indefinitely, the pre-fix behavior) for anyone who wants it.
     """
     conn = None
     backup_conn = None
+    deadline_seconds = _resolve_safe_copy_busy_deadline_seconds()
     try:
-        conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-        backup_conn = sqlite3.connect(str(dst))
-        conn.backup(backup_conn)
+        if deadline_seconds > 0:
+            # timeout=0 on BOTH sides is load-bearing here, not cosmetic:
+            # the connect()-level default (5.0) installs SQLite's own
+            # internal busy-handler, which silently retries *inside a
+            # single* sqlite3_backup_step() call for up to that many
+            # seconds before ever returning SQLITE_BUSY back to Python --
+            # i.e. before our progress callback below gets a chance to run
+            # at all. Measured directly: with the default timeout, an 8s
+            # external lock produced exactly ONE progress callback (after
+            # ~8s, because SQLite's own retries absorbed almost the whole
+            # wait), so a 2s deadline was checked too late to matter. With
+            # timeout=0, each step call fails fast on contention and
+            # control returns to the progress callback roughly every
+            # backup()'s own sleep= cadence (default 250ms), so the
+            # deadline below is enforced with the intended granularity.
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0)
+            backup_conn = sqlite3.connect(str(dst), timeout=0)
+            deadline = time.monotonic() + deadline_seconds
+
+            def _abort_past_deadline(status: int, remaining: int, total: int) -> None:
+                if status in _SQLITE_BUSY_STATUSES and time.monotonic() > deadline:
+                    raise _SafeCopyBusyTimeout(
+                        f"source stayed SQLITE_BUSY/SQLITE_LOCKED for over "
+                        f"{deadline_seconds:.0f}s (remaining={remaining}, total={total})"
+                    )
+
+            conn.backup(backup_conn, progress=_abort_past_deadline)
+        else:
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+            backup_conn = sqlite3.connect(str(dst))
+            conn.backup(backup_conn)
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)

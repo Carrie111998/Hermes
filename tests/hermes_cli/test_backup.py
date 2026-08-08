@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import time
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -908,6 +909,201 @@ class TestSafeCopyDb:
         p = tmp_path / "state.db"
         p.write_bytes(bytes(4096))  # all NULs
         assert is_zeroed_sqlite_file(p) is True
+
+
+class TestSafeCopyDbBusyBounding:
+    """Regression tests for the unbounded SQLITE_BUSY retry in
+    ``_safe_copy_db``: ``sqlite3.Connection.backup()`` retries a busy/locked
+    source with ``time.sleep()`` inside CPython's C implementation with no
+    overall deadline, independent of any connection-level ``timeout=``. A
+    source that stays locked (observed in the wild against Chrome's own
+    ``first_party_sets.db`` under a live ``chrome-debug/`` profile) could
+    previously stall the entire backup for as long as the lock was held.
+    """
+
+    @staticmethod
+    def _make_source_db(path, nrows: int = 50) -> None:
+        conn = sqlite3.connect(str(path))
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        conn.executemany(
+            "INSERT INTO t (v) VALUES (?)", [(f"row{i}",) for i in range(nrows)]
+        )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _hold_exclusive_lock(path, hold_seconds: float, ready_evt) -> None:
+        """Runs in a background thread: holds BEGIN EXCLUSIVE on *path*
+        for *hold_seconds*, then releases. Mirrors the task's suggested
+        deterministic repro (a separate connection holding an exclusive
+        write transaction while ``_safe_copy_db`` runs against it)."""
+        conn = sqlite3.connect(str(path), timeout=0)
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("INSERT INTO t (v) VALUES ('locker')")
+        ready_evt.set()
+        time.sleep(hold_seconds)
+        conn.rollback()
+        conn.close()
+
+    def test_busy_source_is_bounded_not_indefinite(self, tmp_path, monkeypatch):
+        """A source locked LONGER than the deadline must return False in
+        roughly the deadline window, not block until the lock clears."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "1")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 5.0, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5), "background thread failed to acquire lock"
+
+        t0 = time.monotonic()
+        result = _safe_copy_db(src, dst)
+        elapsed = time.monotonic() - t0
+        holder.join(timeout=10)
+
+        assert result is False, "busy copy should fail closed, not hang until unlocked"
+        assert elapsed < 3.0, (
+            f"_safe_copy_db took {elapsed:.2f}s against a 1s deadline and a 5s "
+            "lock hold -- the busy-retry loop is not bounded"
+        )
+        assert not dst.exists(), "failed copy must not leave a partial destination file"
+
+    def test_short_busy_window_still_succeeds(self, tmp_path, monkeypatch):
+        """A lock that clears BEFORE the deadline must not be penalized --
+        the bounding must not make normal WAL-mode contention fail."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "5")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 0.5, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        result = _safe_copy_db(src, dst)
+        holder.join(timeout=10)
+
+        assert result is True
+        conn = sqlite3.connect(str(dst))
+        count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        conn.close()
+        # The locker thread rolls back its own INSERT on release (it only
+        # needs the exclusive lock, not a durable write), so the copy
+        # reflects just the original seed rows.
+        assert count == 50
+
+    def test_connection_timeout_parameter_does_not_bound_backup_loop(self, tmp_path):
+        """Documents *why* the fix can't just be 'pass timeout= to connect()':
+        a connection's timeout= only bounds the initial lock acquisition for
+        ordinary statements, not backup()'s own internal busy-retry loop."""
+        import threading
+
+        monkeypatch_env_backup = os.environ.pop(
+            "HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", None
+        )
+        try:
+            src = tmp_path / "locked.db"
+            dst = tmp_path / "copy.db"
+            self._make_source_db(src)
+
+            ready_evt = threading.Event()
+            holder = threading.Thread(
+                target=self._hold_exclusive_lock, args=(src, 2.0, ready_evt), daemon=True
+            )
+            holder.start()
+            assert ready_evt.wait(timeout=5)
+
+            t0 = time.monotonic()
+            # A short connection timeout does NOT bound Connection.backup().
+            conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=0.2)
+            backup_conn = sqlite3.connect(str(dst), timeout=0.2)
+            try:
+                conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
+                conn.close()
+            elapsed = time.monotonic() - t0
+            holder.join(timeout=10)
+
+            assert elapsed >= 1.5, (
+                f"backup() returned after only {elapsed:.2f}s despite a 0.2s "
+                "connection timeout -- if this now fails, sqlite3's behavior "
+                "changed and the bounding fix in _safe_copy_db may need "
+                "revisiting"
+            )
+        finally:
+            if monkeypatch_env_backup is not None:
+                os.environ["HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS"] = (
+                    monkeypatch_env_backup
+                )
+
+    def test_large_non_busy_copy_is_unaffected_by_bounding(self, tmp_path, monkeypatch):
+        """The deadline must be gated on BUSY/LOCKED status, not raw elapsed
+        time: a large, uncontended copy must never be aborted just because
+        it took a while (see DEFAULT_INTEGRITY_CHECK_MAX_BYTES's own comment
+        on multi-GB state.db files being a normal, supported case)."""
+        from hermes_cli.backup import _safe_copy_db
+
+        # Deliberately absurd deadline: if bounding were time-based instead
+        # of status-gated, this would abort a perfectly healthy copy.
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0.001")
+
+        src = tmp_path / "big.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src, nrows=20_000)
+
+        result = _safe_copy_db(src, dst)
+
+        assert result is True
+        conn = sqlite3.connect(str(dst))
+        count = conn.execute("SELECT COUNT(*) FROM t").fetchone()[0]
+        conn.close()
+        assert count == 20_000
+
+    def test_negative_deadline_disables_bounding(self, tmp_path, monkeypatch):
+        """A non-positive deadline is an explicit escape hatch back to the
+        pre-fix behavior (retry indefinitely until the lock clears)."""
+        import threading
+
+        from hermes_cli.backup import _safe_copy_db
+
+        monkeypatch.setenv("HERMES_BACKUP_SQLITE_BUSY_DEADLINE_SECONDS", "0")
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        self._make_source_db(src)
+
+        ready_evt = threading.Event()
+        holder = threading.Thread(
+            target=self._hold_exclusive_lock, args=(src, 1.5, ready_evt), daemon=True
+        )
+        holder.start()
+        assert ready_evt.wait(timeout=5)
+
+        t0 = time.monotonic()
+        result = _safe_copy_db(src, dst)
+        elapsed = time.monotonic() - t0
+        holder.join(timeout=10)
+
+        assert result is True
+        assert elapsed >= 1.2, "disabled bounding should still wait out the lock"
 
 
 # ---------------------------------------------------------------------------
