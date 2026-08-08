@@ -3554,6 +3554,35 @@ class TestRunConversation:
         # bricks the session with deterministic empty responses (July 2026).
         assert "I should implement this with SQLite." not in correction
         assert "Reasoning shown before the interruption" not in correction
+        # The wire content for the user correction row carries the api_content
+        # sidecar (set by _apply_active_turn_redirect for both the if- and
+        # else-branch user rows so #81841 can merge consecutive redirects).
+        # substitute_api_content promotes that sidecar into the wire content,
+        # so the model sees the checkpoint scaffold AND the user's correction
+        # in one coherent message — accept either ordering.
+        user_correction = replay[-1]["content"]
+        assert "No, use Postgres instead." in user_correction
+        assert "interrupted by a user correction" in user_correction
+        # ...and the transcript-visible content field stored on the live list
+        # still holds only the user's words (no scaffold leakage). The user
+        # correction is the second-to-last user row (the last user row is the
+        # original turn input).
+        user_correction_rows = [
+            m for m in result["messages"]
+            if isinstance(m, dict) and m.get("role") == "user"
+            and m.get("content") == "No, use Postgres instead."
+        ]
+        assert user_correction_rows, (
+            "user correction row missing from result messages: "
+            f"{[m.get('content') for m in result['messages']]!r}"
+        )
+        assert user_correction_rows[-1]["content"] == "No, use Postgres instead."
+        for marker in (
+            "This response was interrupted",
+            "Visible response before the interruption",
+            "Context from the interrupted assistant response",
+        ):
+            assert marker not in user_correction_rows[-1]["content"]
         assert agent._pending_redirect is None
         assert any(
             snapshot[-1].get("content") == "No, use Postgres instead."

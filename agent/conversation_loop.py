@@ -250,6 +250,33 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         f"{text}"
     )
 
+    # Repeated drain: a previous redirect in this same turn already produced
+    # a user correction row whose api_content carries the checkpoint scaffold
+    # (from either the if-branch below or a prior else-branch on an empty
+    # tail). Fold the new text into that existing row instead of creating a
+    # second assistant checkpoint + a second user row (the #81841 ghost
+    # duplicate). The visible draft from THIS drain cannot differ from the
+    # first (the stream resets between drains), so re-using the original
+    # checkpoint is faithful — only the user-visible correction tail grows.
+    if (
+        messages
+        and messages[-1].get("role") == "user"
+        and isinstance(messages[-1].get("api_content"), str)
+        and _INTERRUPT_SCAFFOLD_MARKER in messages[-1]["api_content"]
+    ):
+        _existing_user = messages[-1]
+        _existing_user["content"] = (
+            f"{_existing_user.get('content', '')}\n\n"
+            f"[Additional user correction]\n{text}"
+        )
+        _existing_user["api_content"] = (
+            f"{_existing_user['api_content']}\n\n"
+            f"[Additional user correction]\n{text}"
+        )
+        agent._current_streamed_assistant_text = ""
+        agent._stream_needs_break = True
+        return
+
     # The normal live tail is user or tool, so an assistant placeholder
     # followed by the correction preserves strict alternation. If a transport
     # already committed an assistant item, attribute the checkpoint inside the

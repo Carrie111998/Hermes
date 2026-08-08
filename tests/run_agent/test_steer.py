@@ -361,6 +361,117 @@ class TestActiveTurnRedirectCheckpoint:
             "[This response was interrupted by a user correction.]"
         )
 
+    def test_consecutive_redirects_merge_instead_of_self_replicating(self):
+        """Two _apply_active_turn_redirect calls in one turn must produce ONE
+        checkpoint, not two. (#81841 — #73146 fix was incomplete.)
+
+        Scenario: a user steers mid-stream, the drain applies the redirect
+        (creating the assistant checkpoint row + a user correction), then a
+        second redirect lands *after* the drain (e.g. the model had already
+        completed its response and the next loop iteration drains again).
+        Without the merge guard, the second call sees messages[-1]=='user'
+        (the correction we just appended), falls into the else branch, and
+        creates a SECOND assistant checkpoint row — the "ghost self-replicating"
+        row that doubled every subsequent redirect.
+
+        The fix detects the existing redirect-correction tail (a user row
+        whose ``api_content`` carries the checkpoint scaffold) and folds the
+        new text into it instead of appending a fresh checkpoint + user pair.
+        """
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        # Nothing has been streamed yet, so each redirect produces a hidden
+        # (no-visible) checkpoint row — the worst case for self-replication
+        # since the model can never see what was on screen.
+        messages = [{"role": "user", "content": "start"}]
+
+        _apply_active_turn_redirect(agent, messages, "first correction")
+        _apply_active_turn_redirect(agent, messages, "second correction")
+
+        # Exactly one assistant checkpoint row was produced, not two.
+        assistant_rows = [m for m in messages if m.get("role") == "assistant"]
+        assert len(assistant_rows) == 1, (
+            "second redirect created a duplicate checkpoint row: "
+            f"{[m.get('content') for m in assistant_rows]!r}"
+        )
+        hidden_rows = [m for m in assistant_rows if m.get("display_kind") == "hidden"]
+        assert len(hidden_rows) == 1
+
+        # Both corrections appear on a single user row (visible text only),
+        # in chronological order, with the original second correction last.
+        # (The initial "start" user message is excluded from the count.)
+        initial_user_count = 1
+        user_rows = [m for m in messages if m.get("role") == "user"]
+        # Exactly one user correction row was produced, not two.
+        assert len(user_rows) == initial_user_count + 1, (
+            f"second redirect created a duplicate user row: "
+            f"{[m.get('content') for m in user_rows]!r}"
+        )
+        visible = user_rows[-1]["content"]
+        assert visible.startswith("first correction")
+        assert "[Additional user correction]" in visible
+        assert visible.endswith("second correction")
+        # The provider-replay sidecar carries BOTH corrections plus the single
+        # checkpoint scaffold, so the model still sees one interrupted context.
+        replayed = user_rows[-1].get("api_content", "")
+        assert replayed.count("[This response was interrupted by a user correction.]") == 1
+        assert "first correction" in replayed
+        assert "second correction" in replayed
+        # The transcript side of the row stays scaffolding-free.
+        for marker in (
+            "This response was interrupted",
+            "Visible response before the interruption",
+            "Context from the interrupted assistant response",
+        ):
+            assert marker not in visible
+
+    def test_consecutive_redirects_merge_preserves_visible_draft(self):
+        """When the first redirect in a turn had visible streamed text, a
+        second redirect must not create a second checkpoint with a duplicate
+        "Visible response before the interruption:" header. (#81841)
+
+        The single visible draft from the first call belongs to that
+        checkpoint; the second redirect should fold into the existing user
+        correction, leaving the visible draft intact and the headers
+        unduplicated.
+        """
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _bare_agent()
+        agent._current_streamed_assistant_text = "Visible draft."
+        messages = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "committed assistant item"},
+        ]
+
+        _apply_active_turn_redirect(agent, messages, "first correction")
+        _apply_active_turn_redirect(agent, messages, "second correction")
+
+        # Still one assistant row (no duplicate checkpoint).
+        assistant_rows = [m for m in messages if m.get("role") == "assistant"]
+        assert len(assistant_rows) == 1
+        # The visible draft survived in the merged api_content exactly once.
+        replayed = messages[-1].get("api_content", "")
+        assert replayed.count("Visible draft.") == 1
+        assert replayed.count(
+            "Visible response before the interruption:"
+        ) == 1
+        assert "first correction" in replayed
+        assert "second correction" in replayed
+        # And the visible transcript content stays clean, with both corrections
+        # merged under the [Additional user correction] marker.
+        visible = messages[-1]["content"]
+        assert "first correction" in visible
+        assert "[Additional user correction]" in visible
+        assert visible.endswith("second correction")
+        for marker in (
+            "This response was interrupted",
+            "Visible response before the interruption",
+            "Context from the interrupted assistant response",
+        ):
+            assert marker not in visible
+
 
 class TestSteerInjection:
     def test_appends_to_last_tool_result(self):
