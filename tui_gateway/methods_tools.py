@@ -511,12 +511,15 @@ def _(rid, params: dict) -> dict:
 
     if bundle_key is not None:
         try:
+            from agent.skill_governance import SkillGovernanceRejectedError
             bundle_result = build_bundle_invocation_message(
                 bundle_key,
                 arg,
                 task_id=session.get("session_key", "") if session else "",
                 platform=_resolve_session_platform(),
             )
+        except SkillGovernanceRejectedError as exc:
+            return _err(rid, 4018, str(exc))
         except Exception as exc:
             return _err(rid, 4018, f"bundle dispatch failed: {exc}")
 
@@ -546,6 +549,7 @@ def _(rid, params: dict) -> dict:
             scan_skill_commands,
             build_skill_invocation_message,
         )
+        from agent.skill_governance import SkillGovernanceRejectedError
 
         cmds = scan_skill_commands()
         key = f"/{name}"
@@ -565,6 +569,8 @@ def _(rid, params: dict) -> dict:
                         "display": _skill_scaffold_projection(msg),
                     },
                 )
+    except SkillGovernanceRejectedError as exc:
+        return _err(rid, 4018, str(exc))
     except Exception:
         pass
 

@@ -31,6 +31,33 @@ from tools.skills_hub import (
 )
 
 
+def _configure_protected_governance(home):
+    (home / "governance").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: ardyn_engineering
+    protected_task_classes:
+      - ardyn_engineering
+    retrieval_ranking: true
+""",
+        encoding="utf-8",
+    )
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: alpha-current
+    classification: CURRENT
+  - name: zulu-current
+    classification: CURRENT
+""",
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # GitHubSource._parse_frontmatter_quick
 # ---------------------------------------------------------------------------
@@ -597,6 +624,32 @@ class TestUnifiedSearchDedup:
         ])
         results = unified_search("query", [failing, ok])
         assert len(results) == 1
+
+    def test_governance_sort_is_deterministic_within_equal_class(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(home)
+
+        alpha = SkillMeta(
+            name="alpha-current",
+            description="Alpha",
+            source="b",
+            identifier="repo/alpha-current",
+            trust_level="community",
+        )
+        zulu = SkillMeta(
+            name="zulu-current",
+            description="Zulu",
+            source="a",
+            identifier="repo/zulu-current",
+            trust_level="community",
+        )
+        src_a = self._make_source("a", [zulu])
+        src_b = self._make_source("b", [alpha])
+
+        results = unified_search("skill", [src_a, src_b])
+
+        assert [result.name for result in results] == ["alpha-current", "zulu-current"]
 
 
 # ---------------------------------------------------------------------------

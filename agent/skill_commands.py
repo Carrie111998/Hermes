@@ -592,6 +592,19 @@ def build_skill_invocation_message(
 
     loaded_skill, skill_dir, skill_name = loaded
 
+    from agent.skill_governance import (
+        SkillGovernanceRejectedError,
+        evaluate_skill_selection_fail_closed,
+    )
+
+    decision = evaluate_skill_selection_fail_closed(
+        skill_name,
+        mode="explicit",
+        historical_intent=False,
+    )
+    if decision is not None and not decision.allowed:
+        raise SkillGovernanceRejectedError(decision)
+
     # Track active usage for Curator lifecycle management (#17782)
     try:
         from tools.skill_usage import bump_use
@@ -699,6 +712,19 @@ def build_stacked_skill_invocation_message(
             missing.append(cmd_key.lstrip("/"))
             continue
         loaded_skill, skill_dir, skill_name = loaded
+
+        from agent.skill_governance import (
+            SkillGovernanceRejectedError,
+            evaluate_skill_selection_fail_closed,
+        )
+
+        decision = evaluate_skill_selection_fail_closed(
+            skill_name,
+            mode="explicit",
+            historical_intent=False,
+        )
+        if decision is not None and not decision.allowed:
+            raise SkillGovernanceRejectedError(decision)
 
         # Track active usage for Curator lifecycle management (#17782)
         try:

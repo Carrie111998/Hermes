@@ -12,6 +12,8 @@ for a given platform still had its full SKILL.md content injected into the
 agent's context for that turn if it was stacked behind an allowed one.
 """
 
+import asyncio
+
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -93,6 +95,30 @@ def _make_skill(skills_dir, name, body="content"):
     )
 
 
+def _configure_protected_governance(home):
+    (home / "governance").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: ardyn_engineering
+    protected_task_classes:
+      - ardyn_engineering
+""",
+        encoding="utf-8",
+    )
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: ToolTrust
+    classification: COMPATIBILITY_ONLY
+""",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def skills_env(tmp_path, monkeypatch):
     skills_dir = tmp_path / "skills"
@@ -135,3 +161,28 @@ async def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch
     assert "disabled for telegram" in result
 
 
+def test_gateway_skill_dispatch_denies_governance_blocked_skill(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+    import tools.skills_tool as skills_tool_module
+    import agent.skill_commands as skill_commands_mod
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _make_skill(skills_dir, "ToolTrust", body="blocked legacy content")
+    home = tmp_path / "home"
+    _configure_protected_governance(home)
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    runner = _make_runner()
+    result = asyncio.run(runner._handle_message(_make_event("/tooltrust do something")))
+
+    assert result is not None
+    assert "ToolTrust" in result
+    assert "historical intent" in result

@@ -72,6 +72,14 @@ class SkillGovernanceDecision:
     registry_path: str = ""
 
 
+class SkillGovernanceRejectedError(RuntimeError):
+    """Raised when an explicit skill load is denied by governance."""
+
+    def __init__(self, decision: SkillGovernanceDecision, message: str | None = None):
+        self.decision = decision
+        super().__init__(message or format_skill_governance_denial(decision))
+
+
 _CONFIG_CACHE: tuple[tuple[str, int], GovernanceConfig] | None = None
 _REGISTRY_CACHE: tuple[tuple[str, int], dict[str, SkillRegistryEntry]] | None = None
 
@@ -279,6 +287,57 @@ def evaluate_skill_selection(
     return decision
 
 
+def evaluate_skill_selection_fail_closed(
+    skill_name: str,
+    *,
+    mode: GovernanceMode | str,
+    historical_intent: bool = False,
+    emit_log: bool = True,
+) -> SkillGovernanceDecision | None:
+    """Evaluate selection, denying on evaluation failure for protected tasks."""
+    try:
+        context = governance_context(
+            mode=mode,
+            historical_intent=historical_intent,
+        )
+        return evaluate_skill_selection(
+            skill_name,
+            context=context,
+            emit_log=emit_log,
+        )
+    except Exception as exc:
+        cfg = _load_governance_config()
+        protected = bool(cfg.task_class) and (
+            _normalize_name(cfg.task_class) in cfg.protected_task_classes
+        )
+        if not protected:
+            logger.debug(
+                "Skill governance evaluation unavailable for %s",
+                skill_name,
+                exc_info=True,
+            )
+            return None
+        try:
+            resolved_mode = mode if isinstance(mode, GovernanceMode) else GovernanceMode(str(mode))
+        except Exception:
+            resolved_mode = GovernanceMode.EXPLICIT
+        decision = SkillGovernanceDecision(
+            requested_name=skill_name,
+            canonical_name=skill_name,
+            classification=GovernanceClassification.UNKNOWN,
+            allowed=False,
+            reason=f"skill governance evaluation failed: {exc}",
+            mode=resolved_mode,
+            task_class=cfg.task_class,
+            protected_task=True,
+            historical_intent=bool(historical_intent),
+            registry_path=str(cfg.registry_path or ""),
+        )
+        if emit_log:
+            log_skill_governance_decision(decision)
+        return decision
+
+
 def evaluate_skill_selections(
     skill_names: Iterable[str],
     *,
@@ -356,7 +415,7 @@ def rank_skill_search_results(
         _normalize_name(context.task_class) in cfg.protected_task_classes
     )
 
-    decorated: list[tuple[int, int, Any]] = []
+    decorated: list[tuple[tuple[int, int, str, str, str, str], int, Any]] = []
     for idx, result in enumerate(results):
         name = str(getattr(result, "name", "") or "")
         identifier = str(getattr(result, "identifier", "") or "")
@@ -380,10 +439,7 @@ def rank_skill_search_results(
             )
         decorated.append(
             (
-                -_classification_rank(
-                    decision.classification,
-                    protected_task=protected,
-                ),
+                governance_sort_tuple(result, context=context),
                 idx,
                 result,
             )
@@ -396,9 +452,11 @@ def governance_sort_tuple(
     result: Any,
     *,
     context: GovernanceContext,
-) -> tuple[int, int]:
+) -> tuple[int, int, str, str, str, str]:
     name = str(getattr(result, "name", "") or "")
     identifier = str(getattr(result, "identifier", "") or "")
+    source = str(getattr(result, "source", "") or "")
+    trust_level = str(getattr(result, "trust_level", "") or "")
     decision = evaluate_skill_selection(
         name or identifier,
         context=context,
@@ -410,4 +468,16 @@ def governance_sort_tuple(
             protected_task=decision.protected_task,
         ),
         0 if decision.allowed else 1,
+        _normalize_name(name),
+        _normalize_name(identifier),
+        _normalize_name(source),
+        _normalize_name(trust_level),
+    )
+
+
+def format_skill_governance_denial(decision: SkillGovernanceDecision) -> str:
+    task_class = decision.task_class or "protected task"
+    return (
+        f'The "{decision.canonical_name}" skill is blocked by governance for '
+        f'"{task_class}": {decision.reason}'
     )

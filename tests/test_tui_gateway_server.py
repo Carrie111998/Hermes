@@ -3589,6 +3589,30 @@ def _session(agent=None, **extra):
     }
 
 
+def _configure_protected_governance(home: Path) -> None:
+    (home / "governance").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: ardyn_engineering
+    protected_task_classes:
+      - ardyn_engineering
+""",
+        encoding="utf-8",
+    )
+    (home / "governance" / "skills-registry.yaml").write_text(
+        """\
+version: 1
+skills:
+  - name: ToolTrust
+    classification: COMPATIBILITY_ONLY
+""",
+        encoding="utf-8",
+    )
+
+
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     calls = {"hooks": []}
 
@@ -8357,6 +8381,42 @@ def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
 
     assert "error" in resp
     assert "failed" in resp["error"]["message"]
+
+
+def test_command_dispatch_skill_denies_governance_blocked_skill(monkeypatch, tmp_path):
+    import agent.skill_commands as skill_commands_mod
+    import tools.skills_tool as skills_tool_module
+
+    home = tmp_path / "home"
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    _configure_protected_governance(home)
+    (skills_dir / "ToolTrust").mkdir(parents=True, exist_ok=True)
+    (skills_dir / "ToolTrust" / "SKILL.md").write_text(
+        "---\nname: ToolTrust\ndescription: blocked\n---\n\n# ToolTrust\n\nBlocked.\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", skills_dir)
+    skill_commands_mod._skill_commands = {}
+    skill_commands_mod._skill_commands_platform = None
+
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {"name": "tooltrust", "arg": "do it", "session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "error" in resp
+    assert "ToolTrust" in resp["error"]["message"]
+    assert "historical intent" in resp["error"]["message"]
 
 
 def test_plugins_list_surfaces_loader_error(monkeypatch):

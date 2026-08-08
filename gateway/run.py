@@ -15367,6 +15367,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     build_bundle_invocation_message,
                     resolve_bundle_command_key,
                 )
+                from agent.skill_governance import SkillGovernanceRejectedError
                 bundle_key = resolve_bundle_command_key(command)
                 if bundle_key is not None:
                     user_instruction = event.get_command_args().strip()
@@ -15390,6 +15391,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 bundle_key, ", ".join(missing),
                             )
                         # Fall through to normal message processing with bundle content
+            except SkillGovernanceRejectedError as exc:
+                return str(exc)
             except Exception as exc:
                 logger.warning("Bundle dispatch failed: %s", exc)
 
@@ -15400,6 +15403,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     build_skill_invocation_message,
                     resolve_skill_command_key,
                 )
+                from agent.skill_governance import SkillGovernanceRejectedError
                 skill_cmds = get_skill_commands()
                 cmd_key = resolve_skill_command_key(command)
                 if cmd_key is not None:
@@ -15498,6 +15502,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"or resend without the leading slash to send "
                             f"as a regular message."
                         )
+            except SkillGovernanceRejectedError as exc:
+                return str(exc)
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from agent.skill_governance import SkillGovernanceRejectedError
 
 from agent.skill_bundles import (
     _slugify,
@@ -17,6 +18,25 @@ from agent.skill_bundles import (
     save_bundle,
     scan_bundles,
 )
+
+
+def _configure_protected_governance(home: Path, registry_entries: str) -> None:
+    (home / "governance").mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        """\
+skills:
+  governance:
+    registry_path: governance/skills-registry.yaml
+    task_class: ardyn_engineering
+    protected_task_classes:
+      - ardyn_engineering
+""",
+        encoding="utf-8",
+    )
+    (home / "governance" / "skills-registry.yaml").write_text(
+        "version: 1\nskills:\n" + registry_entries,
+        encoding="utf-8",
+    )
 
 
 def _make_bundle_yaml(
@@ -227,6 +247,29 @@ class TestBuildBundleInvocationMessage:
         msg2, loaded2, _ = result2
         assert set(loaded2) == {"skill-a", "skill-b"}
         assert "SECRET DISABLED CONTENT." in msg2
+
+    def test_bundle_denies_when_member_is_governance_blocked(
+        self, bundles_env, monkeypatch
+    ):
+        bundles_dir, skills_dir = bundles_env
+        home = bundles_dir.parent / "home"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        _configure_protected_governance(
+            home,
+            """\
+  - name: skill-a
+    classification: CURRENT
+  - name: skill-b
+    classification: COMPATIBILITY_ONLY
+""",
+        )
+        _make_skill(skills_dir, "skill-a", body="safe")
+        _make_skill(skills_dir, "skill-b", body="blocked")
+        _make_bundle_yaml(bundles_dir, "combo", ["skill-a", "skill-b"])
+        scan_bundles()
+
+        with pytest.raises(SkillGovernanceRejectedError, match="skill-b"):
+            build_bundle_invocation_message("/combo")
 
 
 

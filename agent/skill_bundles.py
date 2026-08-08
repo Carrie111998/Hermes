@@ -313,6 +313,19 @@ def build_bundle_invocation_message(
             continue
         loaded_skill, skill_dir, skill_name = loaded
 
+        from agent.skill_governance import (
+            SkillGovernanceRejectedError,
+            evaluate_skill_selection_fail_closed,
+        )
+
+        decision = evaluate_skill_selection_fail_closed(
+            skill_name,
+            mode="explicit",
+            historical_intent=False,
+        )
+        if decision is not None and not decision.allowed:
+            raise SkillGovernanceRejectedError(decision)
+
         # Per-platform / global disabled gate. Checked against the loaded
         # skill's canonical name (identifiers may be paths or aliases).
         if skill_name in disabled_names or identifier in disabled_names:
