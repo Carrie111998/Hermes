@@ -82,6 +82,7 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | [`codebase-inspection`](/docs/user-guide/skills/bundled/github/github-codebase-inspection) | Inspeciona bases de código com pygount: LOC, linguagens, proporções. | `github/codebase-inspection` |
 | [`github-auth`](/docs/user-guide/skills/bundled/github/github-github-auth) | Configuração de autenticação no GitHub: tokens HTTPS, chaves SSH, login no CLI gh. | `github/github-auth` |
 | [`github-code-review`](/docs/user-guide/skills/bundled/github/github-github-code-review) | Revisa PRs: diffs, comentários inline via gh ou REST. | `github/github-code-review` |
+| [`github-issue-to-pr`](/docs/user-guide/skills/bundled/github/github-github-issue-to-pr) | Leva uma issue do GitHub até um PR verificado com estado de CI honesto. | `github/github-issue-to-pr` |
 | [`github-issues`](/docs/user-guide/skills/bundled/github/github-github-issues) | Cria, triagem, rotula, atribui issues do GitHub via gh ou REST. | `github/github-issues` |
 | [`github-pr-workflow`](/docs/user-guide/skills/bundled/github/github-github-pr-workflow) | Ciclo de vida de PR no GitHub: branch, commit, abrir, CI, merge. | `github/github-pr-workflow` |
 | [`github-repo-management`](/docs/user-guide/skills/bundled/github/github-github-repo-management) | Clona/cria/faz fork de repositórios; gerencia remotes, releases. | `github/github-repo-management` |

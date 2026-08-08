@@ -1,29 +1,29 @@
 ---
 sidebar_position: 6
 title: "Hooks de Eventos"
-description: "Execute código personalizado em pontos-chave do ciclo de vida — registre atividades, envie alertas, publique em webhooks"
+description: "Execute código customizado em pontos-chave do ciclo de vida — registre atividade, envie alertas, publique em webhooks"
 ---
 
-# Hooks de Eventos
+# Hooks de Eventos {#event-hooks}
 
-O Hermes tem quatro sistemas de hooks que executam código personalizado em pontos-chave do ciclo de vida:
+O Hermes tem quatro sistemas de hooks que executam código customizado em pontos-chave do ciclo de vida:
 
-| Sistema | Registrado via | Executa em | Caso de uso |
+| Sistema | Registrado via | Roda em | Caso de uso |
 |--------|---------------|---------|----------|
-| **[Hooks de gateway](#gateway-event-hooks)** | `HOOK.yaml` + `handler.py` em `~/.hermes/hooks/` | Somente gateway | Registro de logs, alertas, webhooks |
-| **[Hooks de plugin](#plugin-hooks)** | `ctx.register_hook()` em um [plugin](/user-guide/features/plugins) | CLI + Gateway | Interceptação de tools, métricas, guardrails |
-| **[Hooks de shell](#shell-hooks)** | bloco `hooks:` em `~/.hermes/config.yaml` apontando para scripts shell | CLI + Gateway | Scripts prontos para uso — bloqueio, formatação automática, injeção de contexto |
-| **[Webhooks de saída](#outbound-webhooks)** | lista `hooks.outbound:` em `~/.hermes/config.yaml` | CLI + Gateway | Enviar eventos de ciclo de vida assinados para endpoints HTTP externos — CI, dashboards, outros agentes |
+| **[Gateway hooks](#gateway-event-hooks)** | `HOOK.yaml` + `handler.py` in `~/.hermes/hooks/` | Gateway only | Logging, alerts, webhooks |
+| **[Plugin hooks](#plugin-hooks)** | `ctx.register_hook()` in a [plugin](/user-guide/features/plugins) | CLI + Gateway | Tool interception, metrics, guardrails |
+| **[Shell hooks](#shell-hooks)** | `hooks:` block in `~/.hermes/config.yaml` pointing at shell scripts | CLI + Gateway | Drop-in scripts for blocking, auto-formatting, context injection |
+| **[Outbound webhooks](#outbound-webhooks)** | `hooks.outbound:` list in `~/.hermes/config.yaml` | CLI + Gateway | Push signed lifecycle events to external HTTP endpoints — CI, dashboards, other agents |
 
-Os quatro sistemas são não bloqueantes — erros em qualquer hook são capturados e registrados em log, nunca derrubando o agente.
+Os quatro sistemas são non-blocking — erros em qualquer hook são capturados e logados, nunca derrubando o agente.
 
 ## Hooks de Eventos do Gateway {#gateway-event-hooks}
 
-Hooks de gateway disparam automaticamente durante a operação do gateway (Telegram, Discord, Slack, WhatsApp, Teams) sem bloquear o pipeline principal do agente.
+Gateway hooks disparam automaticamente durante operação do gateway (Telegram, Discord, Slack, WhatsApp, Teams) sem bloquear o pipeline principal do agente.
 
-### Criando um Hook {#creating-a-hook}
+### Criando um hook {#creating-a-hook}
 
-Cada hook é um diretório sob `~/.hermes/hooks/` contendo dois arquivos:
+Cada hook é um diretório em `~/.hermes/hooks/` contendo dois arquivos:
 
 ```text
 ~/.hermes/hooks/
@@ -43,7 +43,7 @@ events:
   - agent:step
 ```
 
-A lista `events` determina quais eventos disparam seu handler. Você pode se inscrever em qualquer combinação de eventos, incluindo wildcards como `command:*`.
+A lista `events` determina quais eventos disparam seu handler. Você pode assinar qualquer combinação de eventos, incluindo wildcards como `command:*`.
 
 #### handler.py {#handlerpy}
 
@@ -68,38 +68,38 @@ async def handle(event_type: str, context: dict):
 **Regras do handler:**
 - Deve se chamar `handle`
 - Recebe `event_type` (string) e `context` (dict)
-- Pode ser `async def` ou `def` normal — ambos funcionam
-- Erros são capturados e registrados em log, nunca derrubando o agente
+- Pode ser `async def` ou `def` regular — ambos funcionam
+- Erros são capturados e logados, nunca derrubando o agente
 
-### Eventos Disponíveis {#available-events}
+### Eventos disponíveis {#available-events}
 
 | Evento | Quando dispara | Chaves de contexto |
-|-------|---------------|--------------|
-| `gateway:startup` | Processo do gateway inicia | `platforms` (lista de nomes das plataformas ativas) |
-| `session:start` | Nova sessão de mensageria criada | `platform`, `user_id`, `session_id`, `session_key` |
+|--------|----------------|-------------------|
+| `gateway:startup` | Processo do gateway inicia | `platforms` (lista de nomes de plataformas ativas) |
+| `session:start` | Nova sessão de mensagens criada | `platform`, `user_id`, `session_id`, `session_key` |
 | `session:end` | Sessão encerrada (antes do reset) | `platform`, `user_id`, `session_key` |
-| `session:reset` | Usuário executou `/new` ou `/reset` | `platform`, `user_id`, `session_key` |
-| `session:compress` | Compressão de contexto concluída para uma sessão | `platform`, `session_id`, `old_session_id` (vazio quando compactado no local), `in_place` (bool — `true` = transcrição compactada no mesmo id, `false` = rotacionado a partir de `old_session_id`), `compression_count` |
-| `agent:start` | Agente começa a processar uma mensagem | `platform`, `user_id`, `chat_id`, `thread_id` (id do tópico do fórum / raiz da thread; vazio quando não está em uma thread), `chat_type` (`"dm"` \| `"group"` \| `"forum"`; vazio se desconhecido), `session_id`, `message` (truncado em 500 caracteres) |
-| `agent:step` | Cada iteração do loop de chamadas de tool | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
-| `agent:end` | Agente termina de processar | mesmas chaves de `agent:start`, mais `response` (truncado em 500 caracteres) |
-| `reaction:added` | Uma reação de emoji foi adicionada a uma mensagem que o bot pode ver (atualmente o adaptador do Slack). Requer o escopo `reactions:read` + a inscrição no evento de bot `reaction_added`; o bot precisa ser membro do canal. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
-| `reaction:removed` | Uma reação de emoji foi removida de uma mensagem que o bot pode ver. Requer a inscrição no evento de bot `reaction_removed`. | mesmo formato de `reaction:added` |
-| `command:*` | Qualquer comando de barra executado | `platform`, `user_id`, `command`, `args` |
+| `session:reset` | Usuário rodou `/new` ou `/reset` | `platform`, `user_id`, `session_key` |
+| `session:compress` | Compressão de contexto concluída para uma sessão | `platform`, `session_id`, `old_session_id` (vazio quando compactado in place), `in_place` (bool — `true` = transcrição compactada no mesmo id, `false` = rotacionado de `old_session_id`), `compression_count` |
+| `agent:start` | Agente começa a processar uma mensagem | `platform`, `user_id`, `chat_id`, `thread_id` (id de tópico de fórum / raiz de thread; vazio fora de thread), `chat_type` (`"dm"` \| `"group"` \| `"forum"`; vazio se desconhecido), `session_id`, `message` (truncado a 500 chars) |
+| `agent:step` | Cada iteração do loop de tool-calling | `platform`, `user_id`, `session_id`, `iteration`, `tool_names` |
+| `agent:end` | Agente termina processamento | mesmas chaves que `agent:start`, mais `response` (truncado a 500 chars) |
+| `reaction:added` | Reação emoji adicionada a mensagem que o bot vê (adaptador Slack atualmente). Requer scope `reactions:read` + subscription do evento bot `reaction_added`; o bot deve ser membro do canal. | `platform`, `reaction`, `user_id`, `item_user_id`, `item_type`, `channel_id`, `message_ts`, `team_id`, `event_ts`, `raw_event` |
+| `reaction:removed` | Reação emoji removida de mensagem que o bot vê. Requer subscription do evento bot `reaction_removed`. | mesma forma que `reaction:added` |
+| `command:*` | Qualquer comando slash executado | `platform`, `user_id`, `command`, `args` |
 
-#### Correspondência de Wildcard {#wildcard-matching}
+#### Correspondência com wildcard {#wildcard-matching}
 
-Handlers registrados para `command:*` disparam para qualquer evento `command:` (`command:model`, `command:reset`, etc.). Monitore todos os comandos de barra com uma única inscrição.
+Handlers registrados para `command:*` disparam para qualquer evento `command:` (`command:model`, `command:reset`, etc.). Monitore todos os comandos slash com uma única assinatura.
 
 :::tip Respostas em thread
-Um handler que publica uma mensagem de acompanhamento no mesmo tópico de fórum do Telegram deve incluir `message_thread_id=int(thread_id)` quando `chat_type == "forum"` e `thread_id` não estiver vazio.
+Um handler postando mensagem de follow-up no mesmo tópico de fórum Telegram deve incluir `message_thread_id=int(thread_id)` quando `chat_type == "forum"` e `thread_id` não estiver vazio.
 :::
 
 ### Exemplos {#examples}
 
-#### Alerta no Telegram para Tarefas Longas {#telegram-alert-on-long-tasks}
+#### Alerta Telegram em tarefas longas {#telegram-alert-on-long-tasks}
 
-Envie uma mensagem para si mesmo quando o agente executar mais de 10 passos:
+Envie uma mensagem a si mesmo quando o agente levar mais de 10 passos:
 
 ```yaml
 # ~/.hermes/hooks/long-task-alert/HOOK.yaml
@@ -130,9 +130,9 @@ async def handle(event_type: str, context: dict):
             )
 ```
 
-#### Registrador de Uso de Comandos {#command-usage-logger}
+#### Logger de uso de comandos {#command-usage-logger}
 
-Rastreie quais comandos de barra são usados:
+Rastreie quais comandos slash são usados:
 
 ```yaml
 # ~/.hermes/hooks/command-logger/HOOK.yaml
@@ -163,9 +163,9 @@ def handle(event_type: str, context: dict):
         f.write(json.dumps(entry) + "\n")
 ```
 
-#### Webhook de Início de Sessão {#session-start-webhook}
+#### Webhook de início de sessão {#session-start-webhook}
 
-Faça um POST para um serviço externo em novas sessões:
+POST para um serviço externo em novas sessões:
 
 ```yaml
 # ~/.hermes/hooks/session-webhook/HOOK.yaml
@@ -190,21 +190,21 @@ async def handle(event_type: str, context: dict):
         }, timeout=5)
 ```
 
-### Tutorial: BOOT.md — Execute uma Checklist de Inicialização a Cada Boot do Gateway {#tutorial-bootmd--run-a-startup-checklist-on-every-gateway-boot}
+### Tutorial: BOOT.md — Executar checklist de startup em todo boot do gateway {#tutorial-bootmd--run-a-startup-checklist-on-every-gateway-boot}
 
-Um padrão popular da comunidade: coloque uma checklist em Markdown em `~/.hermes/BOOT.md` e faça o agente executá-la uma vez toda vez que o gateway iniciar. Útil para "a cada boot, verifique falhas de cron durante a noite e me avise no Discord se algo falhou", ou "resuma as últimas 24h de deploy.log e publique no Slack #ops".
+Um padrão popular da comunidade: coloque um checklist Markdown em `~/.hermes/BOOT.md` e faça o agente executá-lo uma vez toda vez que o gateway iniciar. Útil para "a cada boot, verifique falhas de cron overnight e me avise no Discord se algo falhou", ou "resuma as últimas 24h de deploy.log e poste no Slack #ops".
 
-Este tutorial mostra como construir isso você mesmo como um hook definido pelo usuário. O Hermes não vem com um hook BOOT.md embutido — você monta exatamente o comportamento que quiser.
+Este tutorial mostra como construí-lo como hook definido pelo usuário. O Hermes não envia um hook BOOT.md built-in — você conecta exatamente o comportamento que quiser.
 
-#### O que vamos construir {#what-were-building}
+#### O que estamos construindo {#what-were-building}
 
-1. Um arquivo em `~/.hermes/BOOT.md` com instruções de inicialização em linguagem natural.
-2. Um hook de gateway que dispara em `gateway:startup`, cria um agente único (one-shot) com o modelo/credenciais resolvidos do seu gateway, e executa as instruções do BOOT.md.
-3. Uma convenção `[SILENT]` para que o agente possa optar por não enviar uma mensagem quando não houver nada a relatar.
+1. Um arquivo em `~/.hermes/BOOT.md` com instruções de startup em linguagem natural.
+2. Um gateway hook que dispara em `gateway:startup`, gera um agente one-shot com model/credenciais resolvidos do gateway e executa as instruções do BOOT.md.
+3. Uma convenção `[SILENT]` para o agente optar por não enviar mensagem quando não houver nada a reportar.
 
-#### Passo 1: Escreva sua checklist {#step-1-write-your-checklist}
+#### Passo 1: Escreva seu checklist {#step-1-write-your-checklist}
 
-Crie `~/.hermes/BOOT.md`. Escreva como se estivesse dando instruções para um assistente humano:
+Crie `~/.hermes/BOOT.md`. Escreva como se estivesse dando instruções a um assistente humano:
 
 ```markdown
 # Startup Checklist
@@ -215,7 +215,7 @@ Crie `~/.hermes/BOOT.md`. Escreva como se estivesse dando instruções para um a
 4. If nothing went wrong, reply with only `[SILENT]` so no message is sent.
 ```
 
-O agente vê isso como parte do seu prompt, então qualquer coisa que você conseguir descrever em linguagem simples funciona — chamadas de tool, comandos de shell, envio de mensagens, resumo de arquivos.
+O agente vê isso como parte do prompt, então qualquer coisa que você descrever em linguagem simples funciona — chamadas de ferramentas, comandos shell, envio de mensagens, resumo de arquivos.
 
 #### Passo 2: Crie o hook {#step-2-create-the-hook}
 
@@ -313,10 +313,10 @@ async def handle(event_type: str, context: dict) -> None:
 
 As duas linhas-chave:
 
-- `_resolve_gateway_model()` lê o modelo atualmente configurado do gateway.
-- `_resolve_runtime_agent_kwargs()` resolve as credenciais do provedor da mesma forma que um turno normal do gateway faz — incluindo chaves de API, URLs base, tokens OAuth e pools de credenciais.
+- `_resolve_gateway_model()` lê o model atualmente configurado do gateway.
+- `_resolve_runtime_agent_kwargs()` resolve credenciais de provider da mesma forma que um turno normal do gateway — incluindo API keys, base URLs, tokens OAuth e credential pools.
 
-Sem elas, um `AIAgent()` simples cai nos padrões embutidos e vai retornar 401 contra qualquer endpoint que não seja o padrão.
+Sem elas, um `AIAgent()` bare cai nos padrões built-in e dará 401 contra qualquer endpoint não padrão.
 
 #### Passo 3: Teste {#step-3-test-it}
 
@@ -326,41 +326,41 @@ Reinicie o gateway:
 hermes gateway restart
 ```
 
-Observe os logs:
+Acompanhe os logs:
 
 ```bash
 hermes logs --follow --level INFO | grep boot-md
 ```
 
-Você deve ver `Running BOOT.md (N chars)` seguido de `boot-md completed: ...` (resumo do que o agente fez) ou `boot-md completed (nothing to report)` quando o agente responder com um token de silêncio exato como `[SILENT]`.
+Você deve ver `Running BOOT.md (N chars)` seguido de `boot-md completed: ...` (resumo do que o agente fez) ou `boot-md completed (nothing to report)` quando o agente respondeu com um token de silêncio exato como `[SILENT]`.
 
-Exclua `~/.hermes/BOOT.md` para desativar a checklist — o hook continua carregado, mas é silenciosamente ignorado quando o arquivo não está presente.
+Exclua `~/.hermes/BOOT.md` para desabilitar o checklist — o hook permanece carregado mas pula silenciosamente quando o arquivo não existe.
 
 #### Estendendo o padrão {#extending-the-pattern}
 
-- **Checklists sensíveis ao horário:** baseie-se em `datetime.now().weekday()` dentro das instruções do BOOT.md ("se for segunda-feira, verifique também o log de deploy semanal"). As instruções são texto livre, então qualquer coisa sobre a qual o agente consiga raciocinar é válida.
-- **Múltiplas checklists:** aponte o hook para um arquivo diferente (`STARTUP.md`, `MORNING.md`, etc.) e registre diretórios de hook separados para cada um.
-- **Variante sem agente:** se você não precisa de um loop completo de agente, pule o `AIAgent` por completo e faça o handler publicar uma notificação fixa diretamente via `httpx`. Mais barato, mais rápido e sem dependência de provedor.
+- **Checklists sensíveis a schedule:** use `datetime.now().weekday()` dentro das instruções do BOOT.md ("se for segunda, verifique também o log de deploy semanal"). As instruções são texto livre, então qualquer coisa que o agente possa raciocinar vale.
+- **Vários checklists:** aponte o hook para outro arquivo (`STARTUP.md`, `MORNING.md`, etc.) e registre diretórios de hook separados para cada um.
+- **Variante sem agente:** se não precisa de um loop completo de agente, pule `AIAgent` e faça o handler postar notificação fixa diretamente via `httpx`. Mais barato, mais rápido e sem dependência de provider.
 
-#### Por que isso não é um recurso embutido {#why-this-isnt-a-built-in}
+#### Por que isso não é built-in {#why-this-isnt-a-built-in}
 
-Uma versão anterior do Hermes trazia isso como um hook embutido e criava silenciosamente um agente com padrões básicos a cada boot do gateway. Isso surpreendia usuários com endpoints customizados e tornava o recurso invisível para quem não sabia que ele estava rodando. Mantê-lo como um padrão documentado — construído por você, no seu diretório de hooks — significa que você vê exatamente o que ele faz e opta por usá-lo ao escrever os arquivos.
+Uma versão anterior do Hermes enviava isso como hook built-in e spawnava silenciosamente um agente com defaults bare a cada boot do gateway. Isso surpreendia usuários com endpoints customizados e tornava a feature invisível para quem não sabia que estava rodando. Mantê-la como padrão documentado — construído por você, no seu diretório de hooks — significa que você vê exatamente o que faz e opta escrevendo os arquivos.
 
-### Como Funciona {#how-it-works}
+### Como funciona {#how-it-works}
 
-1. Na inicialização do gateway, `HookRegistry.discover_and_load()` varre `~/.hermes/hooks/`
+1. No startup do gateway, `HookRegistry.discover_and_load()` escaneia `~/.hermes/hooks/`
 2. Cada subdiretório com `HOOK.yaml` + `handler.py` é carregado dinamicamente
-3. Os handlers são registrados para seus eventos declarados
+3. Handlers são registrados para seus eventos declarados
 4. Em cada ponto do ciclo de vida, `hooks.emit()` dispara todos os handlers correspondentes
-5. Erros em qualquer handler são capturados e registrados em log — um hook quebrado nunca derruba o agente
+5. Erros em qualquer handler são capturados e logados — um hook quebrado nunca derruba o agente
 
 :::info
-Hooks de gateway só disparam no **gateway** (Telegram, Discord, Slack, WhatsApp, Teams). A CLI não carrega hooks de gateway. Para hooks que funcionam em todo lugar, use [hooks de plugin](#plugin-hooks).
+Gateway hooks só disparam no **gateway** (Telegram, Discord, Slack, WhatsApp, Teams). O CLI não carrega gateway hooks. Para hooks que funcionam em todo lugar, use [plugin hooks](#plugin-hooks).
 :::
 
 ## Hooks de Plugin {#plugin-hooks}
 
-[Plugins](/user-guide/features/plugins) podem registrar hooks que disparam em sessões de **CLI e gateway**. Eles são registrados de forma programática via `ctx.register_hook()` na função `register()` do seu plugin.
+[Plugins](/user-guide/features/plugins) podem registrar hooks que disparam em sessões **CLI e gateway**. São registrados programaticamente via `ctx.register_hook()` na função `register()` do seu plugin.
 
 Para detalhes de empacotamento e registro de plugins, veja
 o [guia de Plugins](/docs/user-guide/features/plugins).
@@ -381,38 +381,38 @@ def register(ctx):
 
 **Regras gerais para todos os hooks:**
 
-- Callbacks recebem **argumentos nomeados (keyword arguments)**. Sempre aceite `**kwargs` para compatibilidade futura — novos parâmetros podem ser adicionados em versões futuras sem quebrar seu plugin.
-- Se um callback **falhar**, ele é registrado em log e ignorado. Outros hooks e o agente continuam normalmente. Um plugin com comportamento inadequado nunca consegue quebrar o agente.
-- Os valores de retorno de dois hooks afetam o comportamento: [`pre_tool_call`](#pre_tool_call) pode **bloquear** a tool, e [`pre_llm_call`](#pre_llm_call) pode **injetar contexto** na chamada ao LLM. Todos os outros hooks são observadores do tipo fire-and-forget.
-- Callbacks observadores recebem `telemetry_schema_version` automaticamente. Quando presente, `turn_id`, `api_request_id`, `task_id`, `session_id` e `api_call_count` são campos de correlação separados. Trate `api_request_id` como um identificador opaco; não faça parsing do seu formato de string.
+- Callbacks recebem **argumentos nomeados**. Sempre aceite `**kwargs` para compatibilidade futura — novos parâmetros podem ser adicionados em versões futuras sem quebrar seu plugin.
+- Se um callback **travar**, é logado e ignorado. Outros hooks e o agente continuam normalmente. Um plugin mal-comportado nunca pode quebrar o agente.
+- Dois retornos de hook afetam comportamento: [`pre_tool_call`](#pre_tool_call) pode **bloquear** a ferramenta, e [`pre_llm_call`](#pre_llm_call) pode **injetar contexto** na chamada LLM. Todos os outros hooks são observadores fire-and-forget.
+- Callbacks observadores recebem `telemetry_schema_version` automaticamente. Quando presente, `turn_id`, `api_request_id`, `task_id`, `session_id` e `api_call_count` são campos de correlação separados. Trate `api_request_id` como identificador opaco; não parseie seu formato de string.
 
 ### Referência rápida {#quick-reference}
 
-| Hook | Dispara quando | Retorna |
-|------|-----------|---------|
-| [`pre_tool_call`](#pre_tool_call) | Antes de qualquer tool executar | `{"action": "block", "message": str}` para vetar a chamada |
-| [`post_tool_call`](#post_tool_call) | Depois que qualquer tool retorna | ignorado |
-| [`pre_llm_call`](#pre_llm_call) | Uma vez por turno, antes do loop de chamadas de tool | `{"context": str}` para inserir contexto antes da mensagem do usuário |
-| [`post_llm_call`](#post_llm_call) | Uma vez por turno, depois do loop de chamadas de tool | ignorado |
-| [`pre_verify`](#pre_verify) | Uma vez por turno quando o agente edita código, antes de verificar/finalizar | `{"action": "continue", "message": str}` para continuar |
-| [`on_session_start`](#on_session_start) | Nova sessão criada (apenas no primeiro turno) | ignorado |
+| Hook | Quando dispara | Retorno |
+|------|----------------|---------|
+| [`pre_tool_call`](#pre_tool_call) | Antes de qualquer ferramenta executar | `{"action": "block", "message": str}` para vetar a chamada |
+| [`post_tool_call`](#post_tool_call) | Depois que qualquer ferramenta retorna | ignorado |
+| [`pre_llm_call`](#pre_llm_call) | Uma vez por turno, antes do loop de tool-calling | `{"context": str}` para prepender contexto à mensagem de usuário |
+| [`post_llm_call`](#post_llm_call) | Uma vez por turno, após o loop de tool-calling | ignorado |
+| [`pre_verify`](#pre_verify) | Uma vez por turno quando o agente editou código, antes de verificar/terminar | `{"action": "continue", "message": str}` para continuar |
+| [`on_session_start`](#on_session_start) | Nova sessão criada (só primeiro turno) | ignorado |
 | [`on_session_end`](#on_session_end) | Sessão termina | ignorado |
-| [`on_session_finalize`](#on_session_finalize) | CLI/gateway desmonta uma sessão ativa (flush, salvar, estatísticas) | ignorado |
-| [`on_session_reset`](#on_session_reset) | Gateway troca para uma nova chave de sessão (ex.: `/new`, `/reset`) | ignorado |
-| [`subagent_start`](#subagent_start) | Um filho de `delegate_task` foi construído e está prestes a rodar | ignorado |
-| [`subagent_stop`](#subagent_stop) | Um filho de `delegate_task` terminou | ignorado |
-| [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway recebeu uma mensagem do usuário, antes de auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` para influenciar o fluxo |
-| [`pre_approval_request`](#pre_approval_request) | Uma decisão de aprovação é solicitada, incluindo decisões automáticas do modo smart | ignorado |
-| [`post_approval_response`](#post_approval_response) | Uma decisão de aprovação é tomada (ou um prompt expira) | ignorado |
-| [`transform_tool_result`](#transform_tool_result) | Depois que qualquer tool retorna, antes do resultado ser devolvido ao modelo | `str` para substituir o resultado, `None` para deixar inalterado |
-| [`transform_terminal_output`](#transform_terminal_output) | Dentro da tool `terminal`, antes da truncagem/remoção de ANSI/redação | `str` para substituir a saída bruta, `None` para deixar inalterado |
-| [`transform_llm_output`](#transform_llm_output) | Depois que o loop de chamadas de tool termina, antes da resposta final ser entregue | `str` para substituir o texto da resposta, `None`/vazio para deixar inalterado |
+| [`on_session_finalize`](#on_session_finalize) | CLI/gateway desmonta sessão ativa (flush, save, stats) | ignorado |
+| [`on_session_reset`](#on_session_reset) | Gateway troca para session key fresca (ex.: `/new`, `/reset`) | ignorado |
+| [`subagent_start`](#subagent_start) | Filho `delegate_task` foi construído e está prestes a rodar | ignorado |
+| [`subagent_stop`](#subagent_stop) | Filho `delegate_task` saiu | ignorado |
+| [`pre_gateway_dispatch`](#pre_gateway_dispatch) | Gateway recebeu mensagem de usuário, antes de auth + dispatch | `{"action": "skip" \| "rewrite" \| "allow", ...}` para influenciar fluxo |
+| [`pre_approval_request`](#pre_approval_request) | Decisão de aprovação solicitada, incluindo decisões auto smart-mode | ignorado |
+| [`post_approval_response`](#post_approval_response) | Decisão de aprovação tomada (ou prompt expirou) | ignorado |
+| [`transform_tool_result`](#transform_tool_result) | Depois que ferramenta retorna, antes do resultado ir ao model | `str` para substituir resultado, `None` para deixar inalterado |
+| [`transform_terminal_output`](#transform_terminal_output) | Dentro da ferramenta `terminal`, antes de truncation/ANSI-strip/redact | `str` para substituir saída bruta, `None` para deixar inalterado |
+| [`transform_llm_output`](#transform_llm_output) | Após loop de tool-calling completar, antes da resposta final ser entregue | `str` para substituir texto de resposta, `None`/vazio para deixar inalterado |
 
 ---
 
-### `pre_tool_call` {#pre_tool_call}
+### `pre_tool_call`
 
-Dispara **imediatamente antes** de cada execução de tool — tools embutidas e tools de plugin igualmente.
+Dispara **imediatamente antes** de toda execução de ferramenta — built-in e de plugin.
 
 **Assinatura do callback:**
 
@@ -422,11 +422,11 @@ def my_callback(tool_name: str, args: dict, task_id: str, **kwargs):
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `tool_name` | `str` | Nome da tool que está prestes a executar (ex.: `"terminal"`, `"web_search"`, `"read_file"`) |
-| `args` | `dict` | Os argumentos que o modelo passou para a tool |
-| `task_id` | `str` | Identificador de sessão/tarefa. String vazia se não definido. |
+| `tool_name` | `str` | Name of the tool about to execute (e.g. `"terminal"`, `"web_search"`, `"read_file"`) |
+| `args` | `dict` | The arguments the model passed to the tool |
+| `task_id` | `str` | Session/task identifier. Empty string if not set. |
 
-**Dispara:** Em `model_tools.py`, dentro de `handle_function_call()`, antes do handler da tool rodar. Dispara uma vez por chamada de tool — se o modelo chamar 3 tools em paralelo, isso dispara 3 vezes.
+**Dispara:** Em `model_tools.py`, dentro de `handle_function_call()`, antes do handler da ferramenta rodar. Dispara uma vez por chamada de ferramenta — se o model chamar 3 ferramentas em paralelo, dispara 3 vezes.
 
 **Valor de retorno — vetar a chamada:**
 
@@ -434,11 +434,11 @@ def my_callback(tool_name: str, args: dict, task_id: str, **kwargs):
 return {"action": "block", "message": "Reason the tool call was blocked"}
 ```
 
-O agente interrompe a tool com `message` como o erro retornado ao modelo. A primeira diretiva de bloqueio correspondente vence (plugins Python registrados primeiro, depois hooks de shell). Qualquer outro valor de retorno é ignorado, então callbacks apenas observadores existentes continuam funcionando sem alteração.
+O agente encurta a ferramenta com `message` como erro retornado ao model. A primeira diretiva de block correspondente vence (plugins Python registrados primeiro, depois shell hooks). Qualquer outro valor de retorno é ignorado, então callbacks observadores existentes continuam funcionando inalterados.
 
-**Casos de uso:** Registro de logs, trilhas de auditoria, contadores de chamadas de tool, bloqueio de operações perigosas, limitação de taxa (rate limiting), aplicação de políticas por usuário.
+**Casos de uso:** Logging, trilhas de auditoria, contadores de chamadas de ferramentas, bloqueio de operações perigosas, rate limiting, enforcement de política por usuário.
 
-**Exemplo — log de auditoria de chamadas de tool:**
+**Exemplo — log de auditoria de chamadas de ferramentas:**
 
 ```python
 import json, logging
@@ -454,7 +454,7 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", audit_tool_call)
 ```
 
-**Exemplo — avisar sobre tools perigosas:**
+**Exemplo — aviso em ferramentas perigosas:**
 
 ```python
 DANGEROUS = {"terminal", "write_file", "patch"}
@@ -469,9 +469,9 @@ def register(ctx):
 
 ---
 
-### `post_tool_call` {#post_tool_call}
+### `post_tool_call`
 
-Dispara **imediatamente depois** que cada execução de tool retorna.
+Dispara **imediatamente após** toda execução de ferramenta retornar.
 
 **Assinatura do callback:**
 
@@ -482,19 +482,19 @@ def my_callback(tool_name: str, args: dict, result: str, task_id: str,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `tool_name` | `str` | Nome da tool que acabou de executar |
-| `args` | `dict` | Os argumentos que o modelo passou para a tool |
-| `result` | `str` | O valor de retorno da tool (sempre uma string JSON) |
-| `task_id` | `str` | Identificador de sessão/tarefa. String vazia se não definido. |
-| `duration_ms` | `int` | Quanto tempo o dispatch da tool levou, em milissegundos (medido com `time.monotonic()` em torno de `registry.dispatch()`). |
+| `tool_name` | `str` | Name of the tool that just executed |
+| `args` | `dict` | The arguments the model passed to the tool |
+| `result` | `str` | The tool's return value (always a JSON string) |
+| `task_id` | `str` | Session/task identifier. Empty string if not set. |
+| `duration_ms` | `int` | How long the tool's dispatch took, in milliseconds (measured with `time.monotonic()` around `registry.dispatch()`). |
 
-**Dispara:** Em `model_tools.py`, dentro de `handle_function_call()`, depois que o handler da tool retorna. Dispara uma vez por chamada de tool. **Não** dispara se a tool lançar uma exceção não tratada (o erro é capturado e retornado como uma string JSON de erro, e `post_tool_call` dispara com essa string de erro como `result`).
+**Dispara:** Em `model_tools.py`, dentro de `handle_function_call()`, após o handler da ferramenta retornar. Dispara uma vez por chamada de ferramenta. **Não** dispara se a ferramenta levantou exceção não tratada (o erro é capturado e retornado como string JSON de erro, e `post_tool_call` dispara com essa string de erro como `result`).
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Registro de resultados de tools, coleta de métricas, rastreamento de taxas de sucesso/falha das tools, dashboards de latência, alertas de orçamento por tool, envio de notificações quando tools específicas terminam.
+**Casos de uso:** Logging de resultados de ferramentas, coleta de métricas, rastreamento de taxas de sucesso/falha, dashboards de latência, alertas de budget por ferramenta, notificações quando ferramentas específicas completam.
 
-**Exemplo — rastrear métricas de uso de tools:**
+**Exemplo — rastrear métricas de uso de ferramentas:**
 
 ```python
 from collections import Counter, defaultdict
@@ -520,9 +520,9 @@ def register(ctx):
 
 ---
 
-### `pre_llm_call` {#pre_llm_call}
+### `pre_llm_call`
 
-Dispara **uma vez por turno**, antes do loop de chamadas de tool começar. Este é o **único hook cujo valor de retorno é usado** — ele pode injetar contexto na mensagem do usuário do turno atual.
+Dispara **uma vez por turno**, antes do loop de tool-calling começar. Este é o **único hook cujo valor de retorno é usado** — pode injetar contexto na mensagem de usuário do turno atual.
 
 **Assinatura do callback:**
 
@@ -533,16 +533,16 @@ def my_callback(session_id: str, user_message: str, conversation_history: list,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | Identificador único para a sessão atual |
-| `user_message` | `str` | A mensagem original do usuário para este turno (antes de qualquer injeção de skill) |
-| `conversation_history` | `list` | Cópia da lista completa de mensagens (formato OpenAI: `[{"role": "user", "content": "..."}]`) |
-| `is_first_turn` | `bool` | `True` se este for o primeiro turno de uma nova sessão, `False` nos turnos seguintes |
-| `model` | `str` | O identificador do modelo (ex.: `"anthropic/claude-sonnet-4.6"`) |
-| `platform` | `str` | Onde a sessão está rodando: `"cli"`, `"telegram"`, `"discord"`, etc. |
+| `session_id` | `str` | Unique identifier for the current session |
+| `user_message` | `str` | The user's original message for this turn (before any skill injection) |
+| `conversation_history` | `list` | Copy of the full message list (OpenAI format: `[{"role": "user", "content": "..."}]`) |
+| `is_first_turn` | `bool` | `True` if this is the first turn of a new session, `False` on subsequent turns |
+| `model` | `str` | The model identifier (e.g. `"anthropic/claude-sonnet-4.6"`) |
+| `platform` | `str` | Where the session is running: `"cli"`, `"telegram"`, `"discord"`, etc. |
 
-**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, depois da compressão de contexto mas antes do loop `while` principal. Dispara uma vez por chamada de `run_conversation()` (ou seja, uma vez por turno do usuário), não uma vez por chamada de API dentro do loop de tools.
+**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, após compressão de contexto mas antes do loop `while` principal. Dispara uma vez por chamada `run_conversation()` (ou seja, uma vez por turno de usuário), não uma vez por chamada API dentro do loop de ferramentas.
 
-**Valor de retorno:** Se o callback retornar um dict com uma chave `"context"`, ou uma string simples não vazia, o texto é anexado à mensagem do usuário do turno atual. Retorne `None` para não injetar nada.
+**Valor de retorno:** Se o callback retornar um dict com chave `"context"`, ou string não vazia simples, o texto é anexado à mensagem de usuário do turno atual. Retorne `None` para sem injeção.
 
 ```python
 # Inject context
@@ -555,15 +555,15 @@ return "Recalled memories:\n- User likes Python"
 return None
 ```
 
-**Onde o contexto é injetado:** Sempre na **mensagem do usuário**, nunca no system prompt. Isso preserva o cache de prompt — o system prompt permanece idêntico entre turnos, então os tokens em cache são reutilizados. O system prompt é território do Hermes (orientação do modelo, aplicação de tools, personalidade, skills). Plugins contribuem com contexto ao lado da entrada do usuário.
+**Onde o contexto é injetado:** Sempre na **mensagem de usuário**, nunca no system prompt. Isso preserva o prompt cache — o system prompt permanece idêntico entre turnos, então tokens em cache são reutilizados. O system prompt é território do Hermes (orientação de model, enforcement de ferramentas, personalidade, skills). Plugins contribuem contexto junto ao input do usuário.
 
-Todo contexto injetado é **efêmero** — adicionado apenas no momento da chamada de API. A mensagem original do usuário no histórico de conversa nunca é alterada, e nada é persistido no banco de dados da sessão.
+Todo contexto injetado é **efêmero** — adicionado só no momento da chamada API. A mensagem de usuário original no histórico nunca é mutada, e nada é persistido no banco de sessão.
 
-Quando **múltiplos plugins** retornam contexto, suas saídas são unidas com quebras de linha duplas na ordem de descoberta dos plugins (alfabética por nome de diretório).
+Quando **vários plugins** retornam contexto, suas saídas são unidas com quebras de linha duplas na ordem de descoberta de plugins (alfabética por nome de diretório).
 
-**Casos de uso:** Recuperação de memória, injeção de contexto RAG, guardrails, analytics por turno.
+**Casos de uso:** Recall de memória, injeção de contexto RAG, guardrails, analytics por turno.
 
-**Exemplo — recuperação de memória:**
+**Exemplo — recall de memória:**
 
 ```python
 import httpx
@@ -602,9 +602,9 @@ def register(ctx):
 
 ---
 
-### `post_llm_call` {#post_llm_call}
+### `post_llm_call`
 
-Dispara **uma vez por turno**, depois que o loop de chamadas de tool termina e o agente produziu uma resposta final. Só dispara em turnos **bem-sucedidos** — não dispara se o turno foi interrompido.
+Dispara **uma vez por turno**, após o loop de tool-calling completar e o agente produzir resposta final. Só dispara em turnos **bem-sucedidos** — não dispara se o turno foi interrompido.
 
 **Assinatura do callback:**
 
@@ -615,18 +615,18 @@ def my_callback(session_id: str, user_message: str, assistant_response: str,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | Identificador único para a sessão atual |
-| `user_message` | `str` | A mensagem original do usuário para este turno |
-| `assistant_response` | `str` | A resposta final em texto do agente para este turno |
-| `conversation_history` | `list` | Cópia da lista completa de mensagens depois que o turno terminou |
-| `model` | `str` | O identificador do modelo |
-| `platform` | `str` | Onde a sessão está rodando |
+| `session_id` | `str` | Unique identifier for the current session |
+| `user_message` | `str` | The user's original message for this turn |
+| `assistant_response` | `str` | The agent's final text response for this turn |
+| `conversation_history` | `list` | Copy of the full message list after the turn completed |
+| `model` | `str` | The model identifier |
+| `platform` | `str` | Where the session is running |
 
-**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, depois que o loop de tools termina com uma resposta final. Protegido por `if final_response and not interrupted` — então **não** dispara quando o usuário interrompe no meio do turno ou o agente atinge o limite de iterações sem produzir uma resposta.
+**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, após o loop de ferramentas sair com resposta final. Guardado por `if final_response and not interrupted` — então **não** dispara quando o usuário interrompe mid-turn ou o agente atinge o limite de iterações sem produzir resposta.
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Sincronizar dados de conversa com um sistema de memória externo, calcular métricas de qualidade de resposta, registrar resumos de turnos, disparar ações de acompanhamento.
+**Casos de uso:** Sincronizar dados de conversa com sistema de memória externo, calcular métricas de qualidade de resposta, logar resumos de turno, disparar ações de follow-up.
 
 **Exemplo — sincronizar com memória externa:**
 
@@ -665,11 +665,11 @@ def register(ctx):
 
 ---
 
-### `pre_verify` {#pre_verify}
+### `pre_verify`
 
-Dispara **uma vez por turno quando o agente editou código**, pouco antes de terminar (depois da proteção embutida de verificação ao parar). Este é um portão de política do usuário/plugin: um callback pode manter o agente continuando — rodar uma verificação, adiá-la, organizar o diff — em vez de deixá-lo parar.
+Dispara **uma vez por turno quando o agente editou código**, logo antes de terminar (após o guard verify-on-stop built-in). Este é um gate de política usuário/plugin: um callback pode manter o agente rodando — executar check, adiar, arrumar o diff — em vez de deixá-lo parar.
 
-A orientação de verificação que acompanha o Hermes não é um hook `pre_verify` padrão. Ela é anexada ao empurrão (nudge) de verificação ao parar baseado em evidências quando o código editado carece de evidência de verificação recente, então não cria um segundo caminho padrão de continuação. Defina `agent.verify_guidance: false` para manter esse empurrão de evidência embutido conciso.
+A orientação de verificação enviada pelo Hermes não é um hook `pre_verify` padrão. Ela é anexada ao nudge verify-on-stop baseado em evidência quando código editado carece de evidência de verificação fresca, então não cria um segundo caminho padrão de continuação. Defina `agent.verify_guidance: false` para manter aquele nudge de evidência built-in conciso.
 
 **Assinatura do callback:**
 
@@ -680,33 +680,33 @@ def my_callback(session_id: str, platform: str, model: str, coding: bool,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | Identificador único para a sessão atual |
-| `platform` | `str` | Onde a sessão está rodando (`"cli"`, `"telegram"`, …) |
-| `model` | `str` | O identificador do modelo |
-| `coding` | `bool` | Se o turno está na postura de codificação (em um workspace de código) — escopeie seu hook nisso |
-| `attempt` | `int` | Quantas vezes este turno já recebeu um empurrão (0 na primeira) — autolimite-se com base nisso |
-| `final_response` | `str` | A resposta que o agente está prestes a entregar |
-| `changed_paths` | `list` | Arquivos que o agente editou neste turno (ordenados, sempre não vazio aqui) |
+| `session_id` | `str` | Unique identifier for the current session |
+| `platform` | `str` | Where the session is running (`"cli"`, `"telegram"`, …) |
+| `model` | `str` | The model identifier |
+| `coding` | `bool` | Whether the turn is in the coding posture (in a code workspace) — scope your hook on this |
+| `attempt` | `int` | How many times this turn has already been nudged (0 on the first) — self-throttle on this |
+| `final_response` | `str` | The answer the agent is about to deliver |
+| `changed_paths` | `list` | Files the agent edited this turn (sorted, always non-empty here) |
 
-Escopeie um hook ao contexto de codificação verificando `coding` e torne-o de disparo único usando `attempt` (hooks de shell leem ambos de `.extra`), da mesma forma que um hook `pre_tool_call` se escopeia em `tool_name` — assim você pode registrar vários hooks `pre_verify`, cada um disparando apenas onde deveria.
+Escopo um hook ao contexto de coding verificando `coding` e faça one-shot com `attempt` (shell hooks leem ambos de `.extra`), da mesma forma que um hook `pre_tool_call` escopa em `tool_name` — assim você pode registrar vários hooks `pre_verify`, cada um disparando só onde deve.
 
-**Dispara:** Em `agent/conversation_loop.py`, no ponto em que o agente aceitaria uma resposta final, imediatamente depois da verificação de verificar-ao-parar — mas apenas quando o agente editou código neste turno e pelo menos um hook `pre_verify` está registrado.
+**Dispara:** Em `agent/conversation_loop.py`, no ponto em que o agente aceitaria resposta final, imediatamente após o check verify-on-stop — mas só quando o agente editou código neste turno e pelo menos um hook `pre_verify` está registrado.
 
-**Valor de retorno — manter o agente continuando:**
+**Valor de retorno — manter o agente rodando:**
 
 ```python
 return {"action": "continue", "message": "Run the formatter on your changes, then finish."}
 ```
 
-A `message` é anexada como um turno de usuário sintético e o loop roda novamente. O formato Stop do Claude-Code (`{"decision": "block", "reason": "..."}`, onde bloquear a parada significa *continuar*) também é aceito. Uma diretiva sem mensagem — ou qualquer outro retorno — deixa o turno terminar.
+A `message` é anexada como turno de usuário sintético e o loop roda de novo. A forma Stop do Claude-Code (`{"decision": "block", "reason": "..."}`, onde bloquear o stop significa *continuar*) também é aceita. Uma diretiva sem mensagem — ou qualquer outro retorno — deixa o turno terminar.
 
-**Limitado:** diretivas consecutivas de continuar em um turno são limitadas por `agent.max_verify_nudges` (padrão 3), então um hook que sempre diz para continuar nunca consegue prender o loop. A resposta tentada é mantida no histórico, mas não é exibida ao usuário enquanto o agente está sendo empurrado.
+**Limitado:** diretivas continue consecutivas em um turno são limitadas por `agent.max_verify_nudges` (padrão 3), então um hook que sempre diz continue nunca pode prender o loop. A resposta tentada fica no histórico mas não é mostrada ao usuário enquanto o agente está sendo nudged.
 
-**Torne-o idempotente:** o hook dispara novamente depois de cada empurrão, então proteja usando `attempt` (`if attempt: return None`) — caso contrário ele só vai empurrando até o limite ser atingido.
+**Torne idempotente:** o hook re-dispara após cada nudge, então gate em `attempt` (`if attempt: return None`) — senão só nudges até o limite.
 
-**Casos de uso:** adiar testes/lints durante iteração criativa, exigir checagens verdes para certos caminhos, bloquear "concluído" até que exista uma entrada de changelog, executar uma checklist de verificação específica do projeto.
+**Casos de uso:** adiar tests/lints durante iteração criativa, exigir checks verdes para certos caminhos, bloquear "done" até existir entrada de changelog, executar checklist de verificação específico do projeto.
 
-**Exemplo — adiar checagens em trabalho criativo de UI, escopado + disparo único:**
+**Exemplo — adiar checks em trabalho UI criativo, escopado + one-shot:**
 
 ```python
 UI = (".tsx", ".jsx", ".css", ".scss")
@@ -726,13 +726,13 @@ def register(ctx):
     ctx.register_hook("pre_verify", defer_ui_checks)
 ```
 
-Para orientação permanente que deve moldar o empurrão embutido de evidência ausente, use `agent.verify_guidance`. Para regras mais amplas de postura de codificação que não precisam *bloquear* a verificação, prefira `agent.coding_instructions` em `config.yaml` — ela acompanha o briefing de codificação e não custa um turno extra.
+Para orientação permanente que deve moldar o nudge built-in de evidência faltante, use `agent.verify_guidance`. Para regras mais amplas de postura de coding que não precisam *gatear* verificação, prefira `agent.coding_instructions` em `config.yaml` — vai no coding brief e não custa turno extra.
 
 ---
 
-### `on_session_start` {#on_session_start}
+### `on_session_start`
 
-Dispara **uma vez** quando uma sessão totalmente nova é criada. **Não** dispara na continuação de sessão (quando o usuário envia uma segunda mensagem em uma sessão existente).
+Dispara **uma vez** quando uma sessão totalmente nova é criada. **Não** dispara na continuação de sessão (quando o usuário envia segunda mensagem em sessão existente).
 
 **Assinatura do callback:**
 
@@ -742,17 +742,17 @@ def my_callback(session_id: str, model: str, platform: str, **kwargs):
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | Identificador único para a nova sessão |
-| `model` | `str` | O identificador do modelo |
-| `platform` | `str` | Onde a sessão está rodando |
+| `session_id` | `str` | Unique identifier for the new session |
+| `model` | `str` | The model identifier |
+| `platform` | `str` | Where the session is running |
 
-**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, durante o primeiro turno de uma nova sessão — especificamente depois que o system prompt é construído mas antes do loop de tools começar. A verificação é `if not conversation_history` (sem mensagens anteriores = nova sessão).
+**Dispara:** Em `run_agent.py`, dentro de `run_conversation()`, durante o primeiro turno de nova sessão — especificamente após o system prompt ser construído mas antes do loop de ferramentas iniciar. O check é `if not conversation_history` (sem mensagens anteriores = nova sessão).
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Inicializar estado com escopo de sessão, aquecer caches, registrar a sessão em um serviço externo, registrar em log o início de sessões.
+**Casos de uso:** Inicializar estado escopado à sessão, aquecer caches, registrar a sessão com serviço externo, logar inícios de sessão.
 
-**Exemplo — inicializar um cache de sessão:**
+**Exemplo — inicializar cache de sessão:**
 
 ```python
 _session_caches = {}
@@ -771,9 +771,9 @@ def register(ctx):
 
 ---
 
-### `on_session_end` {#on_session_end}
+### `on_session_end`
 
-Dispara no **exato final** de cada chamada de `run_conversation()`, independente do resultado. Também dispara a partir do handler de saída da CLI se o agente estava no meio de um turno quando o usuário saiu.
+Dispara no **fim absoluto** de toda chamada `run_conversation()`, independentemente do resultado. Também dispara do handler de exit do CLI se o agente estava mid-turn quando o usuário saiu.
 
 **Assinatura do callback:**
 
@@ -784,21 +784,21 @@ def my_callback(session_id: str, completed: bool, interrupted: bool,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | Identificador único para a sessão |
-| `completed` | `bool` | `True` se o agente produziu uma resposta final, `False` caso contrário |
-| `interrupted` | `bool` | `True` se o turno foi interrompido (usuário enviou nova mensagem, `/stop`, ou saiu) |
-| `model` | `str` | O identificador do modelo |
-| `platform` | `str` | Onde a sessão está rodando |
+| `session_id` | `str` | Unique identifier for the session |
+| `completed` | `bool` | `True` if the agent produced a final response, `False` otherwise |
+| `interrupted` | `bool` | `True` if the turn was interrupted (user sent new message, `/stop`, or quit) |
+| `model` | `str` | The model identifier |
+| `platform` | `str` | Where the session is running |
 
 **Dispara:** Em dois lugares:
-1. **`run_agent.py`** — no final de cada chamada de `run_conversation()`, depois de toda a limpeza. Sempre dispara, mesmo se o turno teve erro.
-2. **`cli.py`** — no handler atexit da CLI, mas **somente** se o agente estava no meio de um turno (`_agent_running=True`) quando a saída ocorreu. Isso captura Ctrl+C e `/exit` durante o processamento. Nesse caso, `completed=False` e `interrupted=True`.
+1. **`run_agent.py`** — no fim de toda chamada `run_conversation()`, após todo cleanup. Sempre dispara, mesmo se o turno deu erro.
+2. **`cli.py`** — no handler atexit do CLI, mas **só** se o agente estava mid-turn (`_agent_running=True`) quando o exit ocorreu. Isso captura Ctrl+C e `/exit` durante processamento. Neste caso, `completed=False` e `interrupted=True`.
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Descarregar (flush) buffers, fechar conexões, persistir estado de sessão, registrar em log a duração da sessão, limpeza de recursos inicializados em `on_session_start`.
+**Casos de uso:** Flush de buffers, fechar conexões, persistir estado de sessão, logar duração de sessão, cleanup de recursos inicializados em `on_session_start`.
 
-**Exemplo — flush e limpeza:**
+**Exemplo — flush e cleanup:**
 
 ```python
 _session_caches = {}
@@ -839,9 +839,9 @@ def register(ctx):
 
 ---
 
-### `on_session_finalize` {#on_session_finalize}
+### `on_session_finalize`
 
-Dispara quando a CLI ou o gateway **desmonta** uma sessão ativa — por exemplo, quando o usuário executa `/new`, o gateway faz o GC de uma sessão ociosa, ou a CLI é encerrada com um agente ativo. Esta é a última chance de fazer flush do estado ligado à sessão que está saindo antes que sua identidade se perca.
+Dispara quando o CLI ou gateway **desmonta** uma sessão ativa — por exemplo, quando o usuário roda `/new`, o gateway fez GC de sessão idle, ou o CLI saiu com agente ativo. Esta é a última chance de flush de estado ligado à sessão saindo antes que sua identidade se vá.
 
 **Assinatura do callback:**
 
@@ -851,20 +851,20 @@ def my_callback(session_id: str | None, platform: str, **kwargs):
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` ou `None` | O ID da sessão que está saindo. Pode ser `None` se não havia sessão ativa. |
-| `platform` | `str` | `"cli"` ou o nome da plataforma de mensageria (`"telegram"`, `"discord"`, etc.). |
+| `session_id` | `str` or `None` | The outgoing session ID. May be `None` if no active session existed. |
+| `platform` | `str` | `"cli"` or the messaging platform name (`"telegram"`, `"discord"`, etc.). |
 
-**Dispara:** Em `cli.py` (em `/new` / saída da CLI) e `gateway/run.py` (quando uma sessão é resetada ou passa por GC). Sempre emparelhado com `on_session_reset` do lado do gateway.
+**Dispara:** Em `cli.py` (em `/new` / exit do CLI) e `gateway/run.py` (quando sessão é resetada ou GC'd). Sempre pareado com `on_session_reset` no lado gateway.
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Persistir métricas finais da sessão antes que o ID da sessão seja descartado, fechar recursos por sessão, emitir um evento final de telemetria, drenar escritas enfileiradas.
+**Casos de uso:** Persistir métricas finais de sessão antes do session ID ser descartado, fechar recursos por sessão, emitir evento final de telemetria, drenar writes enfileirados.
 
 ---
 
-### `on_session_reset` {#on_session_reset}
+### `on_session_reset`
 
-Dispara quando o gateway **troca para uma nova chave de sessão** em um chat ativo — o usuário invocou `/new`, `/reset`, `/clear`, ou o adaptador escolheu uma sessão nova depois de uma janela de inatividade. Isso permite que plugins reajam ao fato de que o estado da conversa foi apagado, sem esperar pelo próximo `on_session_start`.
+Dispara quando o gateway **troca para uma nova session key** em chat ativo — o usuário invocou `/new`, `/reset`, `/clear`, ou o adaptador escolheu sessão fresca após janela idle. Isso deixa plugins reagirem ao fato de o estado de conversa ter sido apagado sem esperar o próximo `on_session_start`.
 
 **Assinatura do callback:**
 
@@ -874,26 +874,26 @@ def my_callback(session_id: str, platform: str, **kwargs):
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `session_id` | `str` | O ID da nova sessão (já rotacionado para o novo valor). |
-| `platform` | `str` | O nome da plataforma de mensageria. |
+| `session_id` | `str` | The new session's ID (already rotated to the fresh value). |
+| `platform` | `str` | The messaging platform name. |
 
-**Dispara:** Em `gateway/run.py`, imediatamente depois que a nova chave de sessão é alocada, mas antes que a próxima mensagem de entrada seja processada. No gateway, a ordem é: `on_session_finalize(old_id)` → troca → `on_session_reset(new_id)` → `on_session_start(new_id)` no primeiro turno de entrada.
+**Dispara:** Em `gateway/run.py`, imediatamente após a nova session key ser alocada mas antes da próxima mensagem inbound ser processada. No gateway, a ordem é: `on_session_finalize(old_id)` → swap → `on_session_reset(new_id)` → `on_session_start(new_id)` no primeiro turno inbound.
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Resetar caches por sessão indexados por `session_id`, emitir analytics de "sessão rotacionada", preparar um novo bucket de estado.
+**Casos de uso:** Resetar caches por sessão keyed por `session_id`, emitir analytics "session rotated", preparar bucket de estado fresco.
 
 ---
 
-Veja o **[guia de Construção de um Plugin](/developer-guide/plugins)** para o passo a passo completo incluindo schemas de tool, handlers e padrões avançados de hooks.
+Veja o **[guia Construir um Plugin](/developer-guide/plugins)** para o walkthrough completo incluindo schemas de ferramentas, handlers e padrões avançados de hooks.
 
 ---
 
-### `subagent_start` {#subagent_start}
+### `subagent_start`
 
-Dispara **uma vez por agente filho** depois que `delegate_task` construiu o `AIAgent` filho e antes que esse filho seja executado. Seja você delegando uma única tarefa ou um lote de três, este hook dispara uma vez para cada filho.
+Dispara **uma vez por agente filho** após `delegate_task` ter construído o `AIAgent` filho e antes desse filho rodar. Se você delegar uma tarefa ou um batch de três, este hook dispara uma vez para cada filho.
 
-Este hook é específico do ciclo de vida de delegação/subagente. Não é um portão universal de "antes de qualquer invocação de agente" para execuções de agente originadas de gateway, CLI, cron, batch, MoA ou outros executores.
+Este hook é específico ao ciclo de vida de delegação/subagente. Não é um gate universal "antes de qualquer invocação de agente" para gateway, CLI, cron, batch, MoA ou outras execuções de agente originadas por runners.
 
 **Assinatura do callback:**
 
@@ -910,21 +910,21 @@ def my_callback(parent_session_id: str | None,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `parent_session_id` | `str \| None` | ID de sessão do agente pai que está delegando. |
-| `parent_turn_id` | `str` | ID do turno do agente pai que solicitou a delegação, se disponível. |
-| `parent_subagent_id` | `str \| None` | ID do subagente pai quando este filho foi criado por outro subagente; `None` para agentes pais de nível superior. |
-| `child_session_id` | `str \| None` | ID de sessão alocado para o agente filho. |
-| `child_subagent_id` | `str` | ID de subagente estável usado por observabilidade e controles de delegação. |
-| `child_role` | `str` | Papel efetivo do filho depois que a política de delegação é aplicada, por exemplo `"leaf"` ou `"orchestrator"`. |
-| `child_goal` | `str` | Objetivo/prompt delegado que o agente filho vai executar. |
+| `parent_session_id` | `str \| None` | Session ID of the delegating parent agent. |
+| `parent_turn_id` | `str` | Turn ID of the parent agent turn that requested delegation, if available. |
+| `parent_subagent_id` | `str \| None` | Parent subagent ID when this child was spawned by another subagent; `None` for top-level parent agents. |
+| `child_session_id` | `str \| None` | Session ID allocated for the child agent. |
+| `child_subagent_id` | `str` | Stable subagent ID used by delegation observability and controls. |
+| `child_role` | `str` | Effective child role after delegation policy is applied, for example `"leaf"` or `"orchestrator"`. |
+| `child_goal` | `str` | Delegated goal/prompt that the child agent will execute. |
 
-**Dispara:** Em `tools/delegate_tool.py`, dentro de `_build_child_agent()`, depois que o `AIAgent` filho foi construído e anotado com metadados de identidade de subagente, e antes que `_run_single_child()` execute o filho.
+**Dispara:** Em `tools/delegate_tool.py`, dentro de `_build_child_agent()`, após o `AIAgent` filho ter sido construído e anotado com metadata de identidade de subagente, e antes de `_run_single_child()` rodar o filho.
 
-**Valor de retorno:** Ignorado. Este é apenas um hook observador; retornar um valor não bloqueia nem altera a execução do agente filho.
+**Valor de retorno:** Ignorado. Este é hook observador apenas; retornar valor não bloqueia nem muta a execução do agente filho.
 
-**Casos de uso:** Registrar em log a criação de subagentes, mapear relações de sessão pai/filho, rastrear árvores de delegação aninhadas, emitir registros de auditoria pré-execução, pré-alocar recursos de observabilidade por filho.
+**Casos de uso:** Logging de criação de subagente, mapear relações de sessão pai/filho, rastrear árvores de delegação aninhadas, emitir registros de auditoria pre-run, pré-alocar recursos de observabilidade por filho.
 
-**Exemplo — registrar em log a criação de subagente:**
+**Exemplo — log de criação de subagente:**
 
 ```python
 import logging
@@ -955,14 +955,14 @@ def register(ctx):
 ```
 
 :::info
-`subagent_start` é útil para observabilidade de delegação, mas não é um hook de política bloqueante. Para bloquear a delegação antes que um filho seja construído, use [`pre_tool_call`](#pre_tool_call) para bloquear a chamada da tool `delegate_task`.
+`subagent_start` é útil para observabilidade de delegação, mas não é hook de política bloqueante. Para bloquear delegação antes de um filho ser construído, use [`pre_tool_call`](#pre_tool_call) para bloquear a chamada da ferramenta `delegate_task`.
 :::
 
 ---
 
-### `subagent_stop` {#subagent_stop}
+### `subagent_stop`
 
-Dispara **uma vez por agente filho** depois que `delegate_task` termina. Seja você tendo delegado uma única tarefa ou um lote de três, este hook dispara uma vez para cada filho, serializado na thread do pai.
+Dispara **uma vez por agente filho** após `delegate_task` terminar. Se você delegou uma tarefa ou batch de três, este hook dispara uma vez para cada filho, serializado na thread pai.
 
 **Assinatura do callback:**
 
@@ -974,20 +974,20 @@ def my_callback(parent_session_id: str, child_role: str | None,
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `parent_session_id` | `str` | ID de sessão do agente pai que está delegando |
-| `child_role` | `str \| None` | Tag de papel de orquestrador definida no filho (`None` se o recurso não estiver habilitado) |
-| `child_summary` | `str \| None` | A resposta final que o filho retornou ao pai |
-| `child_status` | `str` | `"completed"`, `"failed"`, `"interrupted"`, ou `"error"` |
-| `tool_call_history` | `list[dict]` | Chamadas de tool ordenadas, apenas com metadados: `tool_name`, `tool_input` limitado, `input_bytes`, `output_bytes` e `status`; entradas e saídas brutas são excluídas |
-| `duration_ms` | `int` | Tempo real gasto executando o filho, em milissegundos |
+| `parent_session_id` | `str` | Session ID of the delegating parent agent |
+| `child_role` | `str \| None` | Orchestrator role tag set on the child (`None` if the feature isn't enabled) |
+| `child_summary` | `str \| None` | The final response the child returned to the parent |
+| `child_status` | `str` | `"completed"`, `"failed"`, `"interrupted"`, or `"error"` |
+| `tool_call_history` | `list[dict]` | Ordered metadata-only tool calls: `tool_name`, bounded `tool_input`, `input_bytes`, `output_bytes`, and `status`; raw inputs and outputs are excluded |
+| `duration_ms` | `int` | Wall-clock time spent running the child, in milliseconds |
 
-**Dispara:** Em `tools/delegate_tool.py`, depois que `ThreadPoolExecutor.as_completed()` drena todos os futures dos filhos. O disparo é encaminhado para a thread do pai, para que autores de hooks não precisem raciocinar sobre execução concorrente de callbacks.
+**Dispara:** Em `tools/delegate_tool.py`, após `ThreadPoolExecutor.as_completed()` drenar todos os futures filhos. O disparo é marshalled para a thread pai para autores de hook não precisarem raciocinar sobre execução concorrente de callbacks.
 
 **Valor de retorno:** Ignorado.
 
-**Casos de uso:** Registrar em log a atividade de orquestração, acumular durações dos filhos para faturamento, escrever registros de auditoria pós-delegação.
+**Casos de uso:** Logging de atividade de orquestração, acumular durações de filhos para billing, escrever registros de auditoria pós-delegação.
 
-**Exemplo — registrar em log a atividade do orquestrador:**
+**Exemplo — log de atividade de orquestrador:**
 
 ```python
 import logging
@@ -1004,14 +1004,14 @@ def register(ctx):
 ```
 
 :::info
-Com delegação pesada (ex.: papéis de orquestrador × 5 folhas × profundidade aninhada), `subagent_stop` dispara muitas vezes por turno. Mantenha seu callback rápido; empurre trabalho caro para uma fila em segundo plano.
+Com delegação pesada (ex.: roles orchestrator × 5 leaves × profundidade aninhada), `subagent_stop` dispara muitas vezes por turno. Mantenha seu callback rápido; empurre trabalho caro para fila em background.
 :::
 
 ---
 
-### `pre_gateway_dispatch` {#pre_gateway_dispatch}
+### `pre_gateway_dispatch`
 
-Dispara **uma vez por `MessageEvent` recebido** no gateway, depois da proteção de eventos internos mas **antes** de auth/pairing e do dispatch do agente. Este é o ponto de interceptação para políticas de fluxo de mensagens em nível de gateway (janelas de apenas escuta, transferência para humano, roteamento por chat, etc.) que não se encaixam perfeitamente em nenhum adaptador de plataforma específico.
+Dispara **uma vez por `MessageEvent` inbound** no gateway, após o guard de evento interno mas **antes** de auth/pairing e dispatch do agente. Este é o ponto de interceptação para políticas de fluxo de mensagens no nível gateway (janelas listen-only, handover humano, roteamento por chat, etc.) que não encaixam limpo em um único adaptador de plataforma.
 
 **Assinatura do callback:**
 
@@ -1021,23 +1021,23 @@ def my_callback(event, gateway, session_store, **kwargs):
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `event` | `MessageEvent` | A mensagem de entrada normalizada (tem `.text`, `.source`, `.message_id`, `.internal`, etc.). |
-| `gateway` | `GatewayRunner` | O executor de gateway ativo, para que plugins possam chamar `gateway.adapters[platform].send(...)` para respostas por canal lateral (notificações ao dono, etc.). |
-| `session_store` | `SessionStore` | Para ingestão silenciosa de transcrição via `session_store.append_to_transcript(...)`. |
+| `event` | `MessageEvent` | The normalized inbound message (has `.text`, `.source`, `.message_id`, `.internal`, etc.). |
+| `gateway` | `GatewayRunner` | The active gateway runner, so plugins can call `gateway.adapters[platform].send(...)` for side-channel replies (owner notifications, etc.). |
+| `session_store` | `SessionStore` | For silent transcript ingestion via `session_store.append_to_transcript(...)`. |
 
-**Dispara:** Em `gateway/run.py`, dentro de `GatewayRunner._handle_message()`, imediatamente depois que `is_internal` é calculado. **Eventos internos pulam o hook por completo** (eles são gerados pelo sistema — conclusões de processos em segundo plano, etc. — e não devem ser controlados por política voltada ao usuário).
+**Dispara:** Em `gateway/run.py`, dentro de `GatewayRunner._handle_message()`, imediatamente após `is_internal` ser computado. **Eventos internos pulam o hook inteiramente** (são gerados pelo sistema — conclusões de processo em background, etc. — e não devem ser gate-kept por política user-facing).
 
-**Valor de retorno:** `None` ou um dict. O primeiro dict de ação reconhecido vence; os demais resultados de plugin são ignorados. Exceções em callbacks de plugin são capturadas e registradas em log; o gateway sempre cai no dispatch normal em caso de erro.
+**Valor de retorno:** `None` ou dict. O primeiro dict de ação reconhecido vence; resultados restantes de plugin são ignorados. Exceções em callbacks de plugin são capturadas e logadas; o gateway sempre cai para dispatch normal em erro.
 
 | Retorno | Efeito |
 |--------|--------|
-| `{"action": "skip", "reason": "..."}` | Descarta a mensagem — sem resposta do agente, sem fluxo de pairing, sem auth. Assume-se que o plugin já a tratou (ex.: ingerida silenciosamente na transcrição). |
-| `{"action": "rewrite", "text": "new text"}` | Substitui `event.text`, então continua o dispatch normal com o evento modificado. Útil para colapsar mensagens ambiente armazenadas em buffer em um único prompt. |
-| `{"action": "allow"}` / `None` | Dispatch normal — executa a cadeia completa de auth / pairing / loop do agente. |
+| `{"action": "skip", "reason": "..."}` | Descarta a mensagem — sem resposta do agente, sem fluxo de pareamento, sem auth. Assume-se que o plugin tratou (ex.: ingestão silenciosa na transcrição). |
+| `{"action": "rewrite", "text": "new text"}` | Substitui `event.text`, depois continua dispatch normal com o evento modificado. Útil para colapsar mensagens ambientes em buffer num único prompt. |
+| `{"action": "allow"}` / `None` | Dispatch normal — executa a cadeia completa auth / pairing / agent-loop. |
 
-**Casos de uso:** Grupos de chat apenas de escuta (só responder quando marcado; armazenar mensagens ambiente em buffer como contexto); transferência para humano (ingerir silenciosamente mensagens do cliente enquanto o dono lida com o chat manualmente); limitação de taxa por perfil; roteamento orientado por política.
+**Casos de uso:** Chats em grupo listen-only (só responder quando marcado; buffer mensagens ambientes no contexto); handover humano (ingestão silenciosa de mensagens de cliente enquanto dono trata o chat manualmente); rate limiting por perfil; roteamento driven por política.
 
-**Exemplo — descartar DMs não autorizadas silenciosamente sem disparar o código de pairing:**
+**Exemplo — descartar DMs não autorizadas silenciosamente sem disparar código de pareamento:**
 
 ```python
 def deny_unauthorized_dms(event, **kwargs):
@@ -1050,7 +1050,7 @@ def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", deny_unauthorized_dms)
 ```
 
-**Exemplo — reescrever um buffer de mensagens ambiente em um único prompt ao ser mencionado:**
+**Exemplo — reescrever buffer de mensagens ambientes em prompt único ao mencionar:**
 
 ```python
 _buffers = {}
@@ -1071,11 +1071,11 @@ def register(ctx):
 
 ---
 
-### `pre_approval_request` {#pre_approval_request}
+### `pre_approval_request`
 
-Dispara antes que uma decisão de aprovação seja solicitada. Cobre superfícies com prompt — CLI interativa, TUI Ink, plataformas de gateway e clientes ACP — e decisões `approvals.mode=smart` tomadas sem um prompt humano (`surface="smart"`). No modo smart, o hook roda antes do LLM auxiliar ser chamado.
+Dispara antes de uma decisão de aprovação ser solicitada. Cobre superfícies prompted — CLI interativo, Ink TUI, plataformas gateway e clientes ACP — e decisões `approvals.mode=smart` feitas sem prompt humano (`surface="smart"`). Em smart mode, o hook roda antes do LLM auxiliar ser chamado.
 
-Este é o lugar certo para conectar um notificador customizado — por exemplo, um app de barra de menu do macOS que exibe uma notificação de permitir/negar, ou um log de auditoria que registra cada solicitação de aprovação com contexto.
+Este é o lugar certo para conectar um notificador customizado — por exemplo, app de menu-bar macOS que exibe notificação allow/deny, ou log de auditoria que registra toda requisição de aprovação com contexto.
 
 **Assinatura do callback:**
 
@@ -1093,18 +1093,18 @@ def my_callback(
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `command` | `str` | Comando de terminal ou script `execute_code` sendo avaliado. Payloads smart e de gateway são redigidos (redacted) antes do dispatch ao observador. A redação do observador smart é obrigatória mesmo quando `security.redact_secrets` está desabilitado; se a redação falhar, os hooks smart são pulados. |
-| `description` | `str` | Motivo(s) legível(is) por humanos pelos quais o comando foi sinalizado (combinados quando múltiplos padrões correspondem) |
-| `pattern_key` | `str` | Chave de padrão principal que disparou a aprovação (ex.: `"rm_rf"`, `"sudo"`) |
-| `pattern_keys` | `list[str]` | Todas as chaves de padrão que corresponderam |
-| `session_key` | `str` | Identificador de sessão, útil para escopar notificações por chat |
-| `surface` | `str` | `"cli"` para prompts interativos de CLI/TUI, `"gateway"` para aprovações assíncronas de plataforma, ou `"smart"` para decisões automáticas de aprovar/negar do LLM auxiliar |
+| `command` | `str` | Terminal command or `execute_code` script being assessed. Smart and gateway payloads are redacted before observer dispatch. Smart observer redaction is mandatory even when `security.redact_secrets` is disabled; if redaction fails, smart hooks are skipped. |
+| `description` | `str` | Human-readable reason(s) the command is flagged (combined when multiple patterns match) |
+| `pattern_key` | `str` | Primary pattern key that triggered the approval (e.g. `"rm_rf"`, `"sudo"`) |
+| `pattern_keys` | `list[str]` | All pattern keys that matched |
+| `session_key` | `str` | Session identifier, useful for scoping notifications per-chat |
+| `surface` | `str` | `"cli"` for interactive CLI/TUI prompts, `"gateway"` for async platform approvals, or `"smart"` for auxiliary-LLM auto approve/deny decisions |
 
-**Valor de retorno:** ignorado. Hooks aqui são apenas observadores; não podem vetar ou pré-responder a aprovação. Use [`pre_tool_call`](#pre_tool_call) para bloquear uma tool antes que ela chegue ao sistema de aprovação.
+**Valor de retorno:** ignorado. Hooks aqui são observadores apenas; não podem vetar ou pré-responder a aprovação. Use [`pre_tool_call`](#pre_tool_call) para bloquear ferramenta antes de chegar ao sistema de aprovação.
 
-**Casos de uso:** Notificações no desktop, alertas push, registro de auditoria, webhooks do Slack, roteamento de escalonamento, métricas.
+**Casos de uso:** Notificações desktop, alertas push, audit logging, Slack webhooks, roteamento de escalation, métricas.
 
-**Exemplo — notificação no desktop no macOS:**
+**Exemplo — notificação desktop no macOS:**
 
 ```python
 import subprocess
@@ -1123,9 +1123,9 @@ def register(ctx):
 
 ---
 
-### `post_approval_response` {#post_approval_response}
+### `post_approval_response`
 
-Dispara depois de uma decisão de aprovação com prompt ou smart (ou depois que um prompt expira).
+Dispara após decisão de aprovação prompted ou smart (ou após timeout de prompt).
 
 **Assinatura do callback:**
 
@@ -1142,16 +1142,16 @@ def my_callback(
 ):
 ```
 
-Mesmos kwargs de `pre_approval_request`, mais:
+Mesmos kwargs que `pre_approval_request`, mais:
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `choice` | `str` | Superfícies com prompt usam `"once"`, `"session"`, `"always"`, `"deny"`, ou `"timeout"`; decisões smart usam `"smart_approve"` ou `"smart_deny"` |
-| `decided_by` | `str` | `"aux_llm"` para decisões smart; ausente em superfícies com prompt |
+| `choice` | `str` | Prompted surfaces use `"once"`, `"session"`, `"always"`, `"deny"`, or `"timeout"`; smart decisions use `"smart_approve"` or `"smart_deny"` |
+| `decided_by` | `str` | `"aux_llm"` for smart decisions; absent on prompted surfaces |
 
 **Valor de retorno:** ignorado.
 
-**Casos de uso:** Fechar a notificação de desktop correspondente, registrar a decisão final em um log de auditoria, atualizar métricas, avançar um limitador de taxa.
+**Casos de uso:** Fechar notificação desktop correspondente, registrar decisão final em log de auditoria, atualizar métricas, avançar rate limiter.
 
 ```python
 def log_decision(command, choice, session_key, **kwargs):
@@ -1163,9 +1163,9 @@ def register(ctx):
 
 ---
 
-### `transform_tool_result` {#transform_tool_result}
+### `transform_tool_result`
 
-Dispara **depois** que uma tool retorna e **antes** que o resultado seja anexado à conversa. Permite que um plugin reescreva a string de resultado de QUALQUER tool — não apenas a saída do terminal — antes que o modelo a veja.
+Dispara **depois** que uma ferramenta retorna e **antes** do resultado ser anexado à conversa. Deixa um plugin reescrever a string de resultado de QUALQUER ferramenta — não só saída de terminal — antes do model ver.
 
 **Assinatura do callback:**
 
@@ -1181,14 +1181,14 @@ def my_callback(
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `tool_name` | `str` | Tool que produziu o resultado (`read_file`, `web_extract`, `delegate_task`, …). |
-| `arguments` | `dict` | Argumentos com os quais o modelo chamou a tool. |
-| `result` | `str` | A string de resultado bruta da tool, após truncagem e após remoção de ANSI. |
-| `task_id` | `str \| None` | ID de tarefa/sessão quando rodando dentro de ambientes de RL/benchmark. |
+| `tool_name` | `str` | Tool that produced the result (`read_file`, `web_extract`, `delegate_task`, …). |
+| `arguments` | `dict` | Arguments the model called the tool with. |
+| `result` | `str` | The tool's raw result string, post-truncation and post-ANSI-strip. |
+| `task_id` | `str \| None` | Task/session ID when running inside RL/benchmark environments. |
 
-**Valor de retorno:** `str` para substituir o resultado (a string retornada é o que o modelo vê), `None` para deixá-lo inalterado.
+**Valor de retorno:** `str` para substituir o resultado (a string retornada é o que o model vê), `None` para deixar inalterado.
 
-**Casos de uso:** Redigir PII específico da organização da saída de `web_extract`, envolver respostas longas de tool em JSON com um cabeçalho de resumo, injetar dicas de retrieval-augmented nos resultados de `read_file`, reescrever relatórios de subagente de `delegate_task` em um schema específico do projeto.
+**Casos de uso:** Redigir PII específico da organização de saída `web_extract`, envolver respostas JSON longas de ferramentas em header de resumo, injetar hints retrieval-augmented em resultados `read_file`, reescrever relatórios de subagente `delegate_task` em schema específico do projeto.
 
 ```python
 import re
@@ -1203,13 +1203,13 @@ def register(ctx):
     ctx.register_hook("transform_tool_result", redact_secrets)
 ```
 
-Aplica-se a toda tool. Para reescrita apenas do terminal, veja `transform_terminal_output` abaixo — é mais restrito e roda mais cedo no pipeline (antes da truncagem, antes da redação).
+Aplica-se a toda ferramenta. Para reescrita só de terminal veja `transform_terminal_output` abaixo — é mais estreito e roda mais cedo no pipeline (pre-truncation, pre-redaction).
 
 ---
 
-### `transform_terminal_output` {#transform_terminal_output}
+### `transform_terminal_output`
 
-Dispara dentro do pipeline de saída em primeiro plano da tool `terminal`, **antes** da truncagem padrão de 50 KB, da remoção de ANSI e da redação de segredos. Permite que plugins reescrevam o stdout/stderr bruto de um comando de shell antes que qualquer processamento posterior o toque.
+Dispara dentro do pipeline de saída foreground da ferramenta `terminal`, **antes** da truncação padrão de 50 KB, strip ANSI e redação de secrets. Deixa plugins reescrever stdout/stderr bruto de comando shell antes de qualquer processamento downstream tocá-lo.
 
 **Assinatura do callback:**
 
@@ -1226,14 +1226,14 @@ def my_callback(
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `command` | `str` | O comando de shell que produziu a saída. |
-| `output` | `str` | stdout/stderr bruto combinado (pode ser muito grande — a truncagem acontece depois do hook). |
-| `exit_code` | `int` | Código de saída do processo. |
-| `cwd` | `str` | Diretório de trabalho em que o comando rodou. |
+| `command` | `str` | The shell command that produced the output. |
+| `output` | `str` | Raw combined stdout/stderr (may be very large — truncation happens after the hook). |
+| `exit_code` | `int` | Process exit code. |
+| `cwd` | `str` | Working directory the command ran in. |
 
-**Valor de retorno:** `str` para substituir a saída, `None` para deixá-la inalterada.
+**Return value:** `str` to replace the output, `None` to leave it unchanged.
 
-**Casos de uso:** Injetar resumos para comandos que produzem saída massiva (`du -ah`, `find`, `tree`), marcar a saída com um indicador específico do projeto para que hooks posteriores saibam como tratá-la, remover ruído de tempo que varia entre execuções e prejudica o cache de prompt.
+**Casos de uso:** Injetar resumos para comandos que produzem saída massiva (`du -ah`, `find`, `tree`), marcar saída com marker específico do projeto para hooks downstream saberem como tratar, remover ruído de timing que varia entre runs e derrota prompt caching.
 
 ```python
 def summarize_find(command, output, **kwargs):
@@ -1247,13 +1247,13 @@ def register(ctx):
     ctx.register_hook("transform_terminal_output", summarize_find)
 ```
 
-Combina bem com `transform_tool_result` (que cobre todas as outras tools).
+Combina bem com `transform_tool_result` (que cobre toda outra ferramenta).
 
 ---
 
-### `transform_llm_output` {#transform_llm_output}
+### `transform_llm_output`
 
-Dispara **uma vez por turno** depois que o loop de chamadas de tool termina e o modelo produziu uma resposta final, **antes** que essa resposta seja entregue ao usuário (CLI, gateway, ou chamador programático). Permite que um plugin reescreva o texto final do assistente usando métodos de programação clássica — sem gastar tokens extras de inferência em texto de sabor SOUL ou uma transformação orientada por skill.
+Dispara **uma vez por turno** após o loop de tool-calling completar e o model produzir resposta final, **antes** dessa resposta ser entregue ao usuário (CLI, gateway ou caller programático). Deixa um plugin reescrever o texto final do assistente com métodos de programação clássica — sem tokens extras de inferência gastos em texto SOUL flavor ou transform driven por skill.
 
 **Assinatura do callback:**
 
@@ -1269,14 +1269,19 @@ def my_callback(
 
 | Parâmetro | Tipo | Descrição |
 |-----------|------|-------------|
-| `response_text` | `str` | O texto de resposta final do assistente para este turno. |
-| `session_id` | `str` | ID de sessão para esta conversa (pode estar vazio em execuções one-shot). |
-| `model` | `str` | Nome do modelo que produziu a resposta (ex.: `anthropic/claude-sonnet-4.6`). |
-| `platform` | `str` | Plataforma de entrega (`cli`, `telegram`, `discord`, …; vazio quando não definido). |
+| `response_text` | `str` | The assistant's final response text for this turn. |
+| `session_id` | `str` | Session ID for this conversation (may be empty for one-shot runs). |
+| `model` | `str` | Model name that produced the response (e.g. `anthropic/claude-sonnet-4.6`). |
+| `platform` | `str` | Delivery platform (`cli`, `telegram`, `discord`, …; empty when unset). |
 
-**Valor de retorno:** `str` não vazio para substituir o texto da resposta, `None` ou string vazia para deixá-lo inalterado. **A primeira string não vazia vence** quando múltiplos plugins se registram — espelhando `transform_tool_result`.
+**Valor de retorno:** `str` não vazia para substituir o texto de resposta, `None` ou string vazia para deixar inalterado. **Primeira string não vazia vence** quando vários plugins registram — espelhando `transform_tool_result`.
 
-**Casos de uso:** Aplicar uma transformação de personalidade/vocabulário (fala de pirata, Bob Esponja), redigir identificadores específicos do usuário do texto final, anexar um rodapé de assinatura específico do projeto, aplicar um guia de estilo interno sem gastar tokens em instruções SOUL.
+**Casos de uso:** Aplicar transform de personalidade/vocabulário (pirate-speak, Spongebob), redigir identificadores específicos do usuário do texto final, anexar footer de assinatura específico do projeto, impor guia de estilo house sem gastar tokens em instruções SOUL.
+
+Quando streaming CLI está habilitado, um transform append-only é impresso após o
+corpo streamed. Um transform que substitui a resposta é impresso por completo após
+o corpo streamed, rotulado como transformação pós-stream, para conteúdo de substituição
+nunca ser perdido silenciosamente.
 
 ```python
 import os, re
@@ -1290,36 +1295,36 @@ def register(ctx):
     ctx.register_hook("transform_llm_output", spongebob)
 ```
 
-O hook é protegido para uma resposta não vazia e não interrompida — não vai disparar em interrupções pelo botão de parar ou em turnos vazios. Exceções são registradas em log como avisos e não quebram a execução do agente.
+O hook é guardado em resposta não vazia e não interrompida — não dispara em interrupções de botão stop ou turnos vazios. Exceções são logadas como warnings e não quebram execução do agente.
 
 ---
 
 ## Hooks de Shell {#shell-hooks}
 
-Declare hooks de script shell no seu `~/.hermes/config.yaml` e o Hermes vai executá-los como subprocessos sempre que o evento de hook de plugin correspondente disparar — tanto em sessões de CLI quanto de gateway. Não é necessário escrever plugins Python.
+Declare shell-script hooks no seu `~/.hermes/config.yaml` e o Hermes os executará como subprocessos sempre que o evento plugin-hook correspondente disparar — em sessões CLI e gateway. Não é necessário escrever plugin Python.
 
-Use hooks de shell quando quiser um script de arquivo único, pronto para uso (Bash, Python, qualquer coisa com shebang) para:
+Use shell hooks quando quiser um script drop-in de arquivo único (Bash, Python, qualquer coisa com shebang) para:
 
-- **Bloquear uma chamada de tool** — rejeitar comandos `terminal` perigosos, aplicar políticas por diretório, exigir aprovação para operações destrutivas de `write_file` / `patch`.
-- **Rodar depois de uma chamada de tool** — formatar automaticamente arquivos Python ou TypeScript que o agente acabou de escrever, registrar em log chamadas de API, disparar um workflow de CI.
-- **Injetar contexto no próximo turno do LLM** — inserir a saída de `git status`, o dia da semana atual, ou documentos recuperados antes da mensagem do usuário (veja [`pre_llm_call`](#pre_llm_call)).
-- **Observar eventos de ciclo de vida** — escrever uma linha de log quando um subagente termina (`subagent_stop`) ou uma sessão inicia (`on_session_start`).
+- **Bloquear chamada de ferramenta** — rejeitar comandos `terminal` perigosos, impor políticas por diretório, exigir aprovação para operações destrutivas `write_file` / `patch`.
+- **Rodar após chamada de ferramenta** — auto-formatar arquivos Python ou TypeScript que o agente acabou de escrever, logar chamadas API, disparar workflow CI.
+- **Injetar contexto no próximo turno LLM** — prepender saída de `git status`, dia da semana atual ou documentos recuperados à mensagem de usuário (veja [`pre_llm_call`](#pre_llm_call)).
+- **Observar eventos de ciclo de vida** — escrever linha de log quando subagente completa (`subagent_stop`) ou sessão inicia (`on_session_start`).
 
-Hooks de shell são registrados chamando `agent.shell_hooks.register_from_config(cfg)` tanto na inicialização da CLI (`hermes_cli/main.py`) quanto na inicialização do gateway (`gateway/run.py`). Eles se compõem naturalmente com hooks de plugin Python — ambos fluem pelo mesmo dispatcher.
+Shell hooks são registrados chamando `agent.shell_hooks.register_from_config(cfg)` tanto no startup do CLI (`hermes_cli/main.py`) quanto no startup do gateway (`gateway/run.py`). Compõem naturalmente com plugin hooks Python — ambos fluem pelo mesmo dispatcher.
 
 ### Comparação rápida {#comparison-at-a-glance}
 
-| Dimensão | Hooks de shell | [Hooks de plugin](#plugin-hooks) | [Hooks de gateway](#gateway-event-hooks) |
+| Dimension | Shell hooks | [Plugin hooks](#plugin-hooks) | [Gateway hooks](#gateway-event-hooks) |
 |-----------|-------------|-------------------------------|---------------------------------------|
-| Declarado em | bloco `hooks:` em `~/.hermes/config.yaml` | `register()` em um plugin `plugin.yaml` | diretório `HOOK.yaml` + `handler.py` |
-| Fica em | `~/.hermes/agent-hooks/` (por convenção) | `~/.hermes/plugins/<name>/` | `~/.hermes/hooks/<name>/` |
-| Linguagem | Qualquer (Bash, Python, binário Go, …) | Somente Python | Somente Python |
-| Executa em | CLI + Gateway | CLI + Gateway | Somente gateway |
-| Eventos | `VALID_HOOKS` (incl. `subagent_stop`) | `VALID_HOOKS` | Ciclo de vida do gateway (`gateway:startup`, `agent:*`, `command:*`) |
-| Pode bloquear uma chamada de tool | Sim (`pre_tool_call`) | Sim (`pre_tool_call`) | Não |
-| Pode injetar contexto no LLM | Sim (`pre_llm_call`) | Sim (`pre_llm_call`) | Não |
-| Consentimento | Prompt no primeiro uso por par `(event, command)` | Implícito (confiança no plugin Python) | Implícito (confiança no diretório) |
-| Isolamento entre processos | Sim (subprocesso) | Não (no mesmo processo) | Não (no mesmo processo) |
+| Declared in | `hooks:` block in `~/.hermes/config.yaml` | `register()` in a `plugin.yaml` plugin | `HOOK.yaml` + `handler.py` directory |
+| Lives under | `~/.hermes/agent-hooks/` (by convention) | `~/.hermes/plugins/<name>/` | `~/.hermes/hooks/<name>/` |
+| Language | Any (Bash, Python, Go binary, …) | Python only | Python only |
+| Runs in | CLI + Gateway | CLI + Gateway | Gateway only |
+| Events | `VALID_HOOKS` (incl. `subagent_stop`) | `VALID_HOOKS` | Gateway lifecycle (`gateway:startup`, `agent:*`, `command:*`) |
+| Can block a tool call | Yes (`pre_tool_call`) | Yes (`pre_tool_call`) | No |
+| Can inject LLM context | Yes (`pre_llm_call`) | Yes (`pre_llm_call`) | No |
+| Consent | First-use prompt per `(event, command)` pair | Implicit (Python plugin trust) | Implicit (dir trust) |
+| Inter-process isolation | Yes (subprocess) | No (in-process) | No (in-process) |
 
 ### Schema de configuração {#configuration-schema}
 
@@ -1329,15 +1334,17 @@ hooks:
     - matcher: "<regex>"         # Optional; used for pre/post_tool_call only
       command: "<shell command>" # Required; runs via shlex.split, shell=False
       timeout: <seconds>         # Optional; default 60, capped at 300
+      fail_closed: <bool>        # Optional; default false. pre_tool_call only.
+                                 # `failClosed` also accepted (Cursor/Claude Code compat)
 
 hooks_auto_accept: false         # See "Consent model" below
 ```
 
-Os nomes de evento devem ser um dos [eventos de hook de plugin](#plugin-hooks); erros de digitação geram um aviso "Did you mean X?" e são ignorados. Chaves desconhecidas dentro de uma entrada única são ignoradas; a ausência de `command` é ignorada com aviso. `timeout > 300` é limitado com um aviso.
+Nomes de evento devem ser um dos [eventos de plugin hook](#plugin-hooks); typos produzem aviso "Did you mean X?" e são ignorados. Chaves desconhecidas dentro de uma entrada são ignoradas; `command` faltando é skip-with-warning. `timeout > 300` é clamped com aviso. `fail_closed: true` em evento diferente de `pre_tool_call` avisa e é ignorado (só eventos capazes de bloquear podem fail closed).
 
-### Protocolo de comunicação JSON {#json-wire-protocol}
+### Protocolo wire JSON {#json-wire-protocol}
 
-Cada vez que o evento dispara, o Hermes cria um subprocesso para cada hook correspondente (respeitando o `matcher`), envia um payload JSON via **stdin**, e lê o **stdout** de volta como JSON.
+Cada vez que o evento dispara, o Hermes spawna subprocesso para todo hook correspondente (matcher permitindo), envia payload JSON para **stdin** e lê **stdout** de volta como JSON.
 
 **stdin — payload que o script recebe:**
 
@@ -1352,7 +1359,7 @@ Cada vez que o evento dispara, o Hermes cria um subprocesso para cada hook corre
 }
 ```
 
-`tool_name` e `tool_input` são `null` para eventos que não são de tool (`pre_llm_call`, `subagent_stop`, ciclo de vida de sessão). O dict `extra` carrega todos os kwargs específicos do evento (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Valores não serializáveis são convertidos para string em vez de omitidos.
+`tool_name` e `tool_input` são `null` para eventos não-ferramenta (`pre_llm_call`, `subagent_stop`, ciclo de vida de sessão). O dict `extra` carrega todos os kwargs específicos do evento (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Valores não serializáveis são stringificados em vez de omitidos.
 
 **stdout — resposta opcional:**
 
@@ -1371,11 +1378,55 @@ Cada vez que o evento dispara, o Hermes cria um subprocesso para cada hook corre
 // Silent no-op — any empty / non-matching output is fine:
 ```
 
-JSON malformado, códigos de saída diferentes de zero e timeouts registram um aviso em log, mas nunca abortam o loop do agente.
+JSON malformado, exit codes não-zero e timeouts logam aviso mas nunca abortam o loop do agente.
+
+### Exit code 2 = block (compatível Claude Code / Cursor) {#exit-code-2--block-claude-code--cursor-compatible}
+
+Um hook `pre_tool_call` que sai com code **2** bloqueia a chamada de ferramenta mesmo quando stdout não carrega block JSON. A mensagem de block é resolvida em ordem de prioridade:
+
+1. stdout block JSON (`reason` / `message`), when present;
+2. the first 400 characters of stderr;
+3. a generic `"Blocked by shell hook."` default.
+
+Então o hook bloqueante mais simples possível é:
+
+```bash
+#!/usr/bin/env bash
+echo "policy violation: rm -rf is not permitted" >&2
+exit 2
+```
+
+Para eventos cujo block directive não é honrado (tudo exceto `pre_tool_call`), exit 2 é tratado como qualquer outro exit não-zero: aviso é logado e stdout ainda é parseado.
+
+### Fail-open vs fail-closed {#fail-open-vs-fail-closed}
+
+Por padrão shell hooks **fail open**: erro de spawn, timeout ou stdout não parseável loga aviso e a ação prossegue. Esse é o padrão certo para hooks de observabilidade — mas errado para gates de segurança. Um secret-scanner que crashou não deve permitir silenciosamente a chamada de ferramenta que deveria vetar.
+
+Defina `fail_closed: true` (ou `failClosed: true`, grafia Cursor/Claude Code) em entrada `pre_tool_call` para inverter isso:
+
+```yaml
+hooks:
+  pre_tool_call:
+    - matcher: "terminal|write_file|patch"
+      command: "~/.hermes/agent-hooks/secret-scan.sh"
+      timeout: 10
+      fail_closed: true
+```
+
+Com `fail_closed: true`, cada um destes agora **bloqueia** a chamada de ferramenta com `hook <command> failed closed: <reason>`:
+
+| Falha | Fail-open (padrão) | `fail_closed: true` |
+|---------|--------------------|--------------------|
+| Comando não encontrado / não executável | aviso, prossegue | **block** |
+| Timeout | aviso, prossegue | **block** |
+| stdout não-JSON (ex.: stack trace) | aviso, prossegue | **block** |
+| Exit limpo, JSON no-op válido (`{}`) | prossegue | prossegue |
+
+`fail_closed` só se aplica a eventos capazes de bloquear (`pre_tool_call` hoje); defini-lo em qualquer outro evento loga aviso no parse de config e é ignorado. `hermes hooks test` reflete essas semânticas — a linha `parsed` mostra exatamente a forma de block que o dispatcher receberia.
 
 ### Exemplos práticos {#worked-examples}
 
-#### 1. Formatar automaticamente arquivos Python depois de cada escrita {#1-auto-format-python-files-after-every-write}
+#### 1. Auto-formatar arquivos Python após cada write {#1-auto-format-python-files-after-every-write}
 
 ```yaml
 # ~/.hermes/config.yaml
@@ -1394,7 +1445,7 @@ path=$(echo "$payload" | jq -r '.tool_input.path // empty')
 printf '{}\n'
 ```
 
-A visão do arquivo no contexto do agente **não** é relida automaticamente — a reformatação só afeta o arquivo em disco. Chamadas subsequentes de `read_file` capturam a versão formatada.
+A visão in-context do agente do arquivo **não** é relida automaticamente — o reformat só afeta o arquivo em disco. Chamadas subsequentes `read_file` pegam a versão formatada.
 
 #### 2. Bloquear comandos `terminal` destrutivos {#2-block-destructive-terminal-commands}
 
@@ -1418,7 +1469,7 @@ else
 fi
 ```
 
-#### 3. Injetar `git status` em cada turno (equivalente ao `UserPromptSubmit` do Claude-Code) {#3-inject-git-status-into-every-turn-claude-code-userpromptsubmit-equivalent}
+#### 3. Injetar `git status` em todo turno (equivalente Claude-Code `UserPromptSubmit`) {#3-inject-git-status-into-every-turn-claude-code-userpromptsubmit-equivalent}
 
 ```yaml
 hooks:
@@ -1438,9 +1489,9 @@ else
 fi
 ```
 
-O evento `UserPromptSubmit` do Claude Code intencionalmente não é um evento separado no Hermes — `pre_llm_call` dispara no mesmo lugar e já suporta injeção de contexto. Use-o aqui.
+O evento `UserPromptSubmit` do Claude Code intencionalmente não é evento Hermes separado — `pre_llm_call` dispara no mesmo lugar e já suporta injeção de contexto. Use aqui.
 
-#### 4. Registrar em log cada conclusão de subagente {#4-log-every-subagent-completion}
+#### 4. Logar toda conclusão de subagente {#4-log-every-subagent-completion}
 
 ```yaml
 hooks:
@@ -1458,21 +1509,21 @@ printf '{}\n'
 
 ### Modelo de consentimento {#consent-model}
 
-Cada par único `(event, command)` solicita aprovação do usuário na primeira vez que o Hermes o vê, e então persiste a decisão em `~/.hermes/shell-hooks-allowlist.json`. Execuções subsequentes (CLI ou gateway) pulam o prompt.
+Cada par único `(event, command)` pede aprovação do usuário na primeira vez que o Hermes o vê, depois persiste a decisão em `~/.hermes/shell-hooks-allowlist.json`. Execuções subsequentes (CLI ou gateway) pulam o prompt.
 
-Três válvulas de escape contornam o prompt interativo — qualquer uma delas é suficiente:
+Três escape hatches contornam o prompt interativo — qualquer um basta:
 
-1. flag `--accept-hooks` na CLI (ex.: `hermes --accept-hooks chat`)
-2. variável de ambiente `HERMES_ACCEPT_HOOKS=1`
-3. `hooks_auto_accept: true` em `~/.hermes/config.yaml`
+1. `--accept-hooks` flag on the CLI (e.g. `hermes --accept-hooks chat`)
+2. `HERMES_ACCEPT_HOOKS=1` environment variable
+3. `hooks_auto_accept: true` in `~/.hermes/config.yaml`
 
-Execuções sem TTY (gateway, cron, CI) precisam de uma dessas três opções — caso contrário, qualquer hook recém-adicionado permanece silenciosamente não registrado e registra um aviso em log.
+Runs non-TTY (gateway, cron, CI) precisam de um destes três — senão qualquer hook recém-adicionado fica silenciosamente não registrado e loga aviso.
 
-**Edições no script são confiadas silenciosamente.** A allowlist usa como chave a string exata do comando, não o hash do script, então editar o script em disco não invalida o consentimento. `hermes hooks doctor` sinaliza divergência de mtime para que você possa identificar edições e decidir se deve reaprovar.
+**Edições de script são silenciosamente confiadas.** A allowlist keya na string exata de command, não no hash do script, então editar o script em disco não invalida consentimento. `hermes hooks doctor` sinaliza drift de mtime para você ver edições e decidir se re-aprova.
 
 #### Allowlist manual {#manual-allowlisting}
 
-A allowlist manual é útil para deployments sem TTY ou de conta de serviço, onde um operador não pode responder o prompt de primeiro uso interativamente. O arquivo de allowlist é `~/.hermes/shell-hooks-allowlist.json`, e o formato esperado é um array `approvals`. Cada aprovação registra o `event` do hook e a string exata do `command`:
+Allowlist manual é útil para deployments non-TTY ou service-account onde operador não pode responder o prompt de first-use interativamente. O arquivo allowlist é `~/.hermes/shell-hooks-allowlist.json`, e o formato esperado é array `approvals`. Cada approval registra o `event` do hook e a string exata de `command`:
 
 ```json
 {
@@ -1485,44 +1536,44 @@ A allowlist manual é útil para deployments sem TTY ou de conta de serviço, on
 }
 ```
 
-A string do comando deve corresponder exatamente ao comando de hook configurado. Um objeto indexado por caminho com um campo `sha256` não é o formato esperado e não vai aprovar o hook. Verifique entradas manuais com `hermes hooks list`.
+A string de command deve corresponder exatamente ao command do hook configurado. Objeto keyed por path com campo `sha256` não é o formato esperado e não aprovará o hook. Verifique entradas manuais com `hermes hooks list`.
 
 ### A CLI `hermes hooks` {#the-hermes-hooks-cli}
 
 | Comando | O que faz |
 |---------|--------------|
-| `hermes hooks list` | Exibe os hooks configurados com matcher, timeout e status de consentimento |
-| `hermes hooks test <event> [--for-tool X] [--payload-file F]` | Dispara cada hook correspondente contra um payload sintético e imprime a resposta interpretada |
-| `hermes hooks revoke <command>` | Remove toda entrada da allowlist que corresponda a `<command>` (tem efeito no próximo reinício) |
-| `hermes hooks doctor` | Para cada hook configurado: verifica o bit de execução, status na allowlist, divergência de mtime, validade da saída JSON e tempo aproximado de execução |
+| `hermes hooks list` | Dump configured hooks with matcher, timeout, and consent status |
+| `hermes hooks test <event> [--for-tool X] [--payload-file F]` | Fire every matching hook against a synthetic payload and print the parsed response |
+| `hermes hooks revoke <command>` | Remove every allowlist entry matching `<command>` (takes effect on next restart) |
+| `hermes hooks doctor` | For every configured hook: check exec bit, allowlist status, mtime drift, JSON output validity, and rough execution time |
 
 ### Segurança {#security}
 
-Hooks de shell rodam com **suas credenciais completas de usuário** — o mesmo limite de confiança de uma entrada de cron ou um alias de shell. Trate o bloco `hooks:` em `config.yaml` como configuração privilegiada:
+Shell hooks rodam com **suas credenciais completas de usuário** — mesmo trust boundary de entrada cron ou alias shell. Trate o bloco `hooks:` em `config.yaml` como configuração privilegiada:
 
-- Só referencie scripts que você escreveu ou revisou completamente.
-- Mantenha os scripts dentro de `~/.hermes/agent-hooks/` para que o caminho seja fácil de auditar.
-- Rode `hermes hooks doctor` novamente depois de puxar uma config compartilhada para identificar hooks recém-adicionados antes que sejam registrados.
-- Se o seu config.yaml é versionado entre uma equipe, revise PRs que alteram a seção `hooks:` da mesma forma que revisaria uma configuração de CI.
+- Referencie só scripts que você escreveu ou revisou por completo.
+- Mantenha scripts dentro de `~/.hermes/agent-hooks/` para o caminho ser fácil de auditar.
+- Re-execute `hermes hooks doctor` após pull de config compartilhada para ver hooks recém-adicionados antes de registrarem.
+- Se seu config.yaml é version-controlled em equipe, revise PRs que mudam a seção `hooks:` da mesma forma que revisaria config CI.
 
 ### Ordem e precedência {#ordering-and-precedence}
 
-Tanto hooks de plugin Python quanto hooks de shell fluem pelo mesmo dispatcher `invoke_hook()`. Plugins Python são registrados primeiro (`discover_and_load()`), hooks de shell em segundo (`register_from_config()`), então decisões de bloqueio `pre_tool_call` em Python têm precedência em casos de empate. O primeiro bloqueio válido vence — o agregador retorna assim que qualquer callback produz `{"action": "block", "message": str}` com uma mensagem não vazia.
+Tanto plugin hooks Python quanto shell hooks fluem pelo mesmo dispatcher `invoke_hook()`. Plugins Python são registrados primeiro (`discover_and_load()`), shell hooks segundo (`register_from_config()`), então decisões de block `pre_tool_call` Python têm precedência em empates. O primeiro block válido vence — o agregador retorna assim que qualquer callback produz `{"action": "block", "message": str}` com mensagem não vazia.
 
 ## Webhooks de Saída {#outbound-webhooks}
 
-Webhooks de saída são o espelho do lado push da [plataforma de webhooks de entrada](/user-guide/messaging/webhooks): webhooks de entrada acordam o Hermes quando o mundo muda; webhooks de saída avisam o mundo quando o Hermes faz algo. Configure uma lista de endpoints HTTP e os eventos de ciclo de vida com os quais eles se importam, e o Hermes faz um POST de um payload JSON assinado para cada endpoint sempre que um evento correspondente dispara — sem necessidade de polling do lado receptor.
+Outbound webhooks são o espelho push-side da [plataforma webhook inbound](/user-guide/messaging/webhooks): webhooks inbound acordam o Hermes quando o mundo muda; outbound webhooks avisam o mundo quando o Hermes faz algo. Configure lista de endpoints HTTP e eventos de ciclo de vida que interessam, e o Hermes POSTa payload JSON assinado a cada endpoint sempre que evento correspondente dispara — sem polling no lado receptor.
 
 Usos típicos:
 
-- Notificar um sistema de CI ou dashboard quando um turno do agente termina (`on_session_end`)
+- Notificar sistema CI ou dashboard quando turno de agente termina (`on_session_end`)
 - Rastrear conclusões de subagente em uma frota (`subagent_stop`)
-- Alimentar monitoramento externo com atividade de tool (`post_tool_call` com um `matcher`)
-- Acordar *outra* instância do Hermes: apontar a URL para o webhook de entrada dessa instância
+- Alimentar atividade de ferramentas em monitoramento externo (`post_tool_call` com `matcher`)
+- Acordar *outra* instância Hermes: aponte URL ao webhook inbound daquela instância
 
 ### Configuração {#configuration}
 
-Adicione uma lista `hooks.outbound:` ao `~/.hermes/config.yaml`:
+Adicione uma lista `hooks.outbound:` em `~/.hermes/config.yaml`:
 
 ```yaml
 hooks:
@@ -1539,13 +1590,13 @@ hooks:
       matcher: "terminal|delegate_task"     # regex, tool-scoped events only
 ```
 
-Qualquer evento do conjunto de hooks de plugin é válido (`pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `on_session_start`, `on_session_end`, `subagent_start`, `subagent_stop`, ...). Entradas malformadas geram aviso e são puladas — um webhook quebrado nunca derruba o agente. Mudanças têm efeito na próxima sessão de CLI / reinício do gateway.
+Qualquer evento do conjunto plugin-hook é válido (`pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `on_session_start`, `on_session_end`, `subagent_start`, `subagent_stop`, ...). Entradas malformadas avisam e são ignoradas — webhook quebrado nunca derruba o agente. Mudanças entram em vigor na próxima sessão CLI / restart do gateway.
 
-Segredos: prefira `secret_env` (o nome de uma variável de ambiente, tipicamente definida em `~/.hermes/.env`) em vez de um literal `secret:` embutido, para que o arquivo de config fique livre de credenciais. Entradas sem segredo são entregues sem assinatura (sinalizadas como `UNSIGNED` por `hermes hooks list`).
+Secrets: prefira `secret_env` (nome de variável de ambiente, tipicamente em `~/.hermes/.env`) a literal inline `secret:`, para o arquivo de config ficar livre de credenciais. Entradas sem secret são entregues unsigned (flagged como `UNSIGNED` por `hermes hooks list`).
 
-### Formato de comunicação {#wire-format}
+### Formato wire {#wire-format}
 
-Cada disparo faz um POST de um corpo JSON com o mesmo formato de nível superior que o stdin dos hooks de shell, mais metadados de entrega:
+Cada disparo POSTa corpo JSON com a mesma forma top-level do stdin de shell hooks, mais metadata de entrega:
 
 ```json
 {
@@ -1560,16 +1611,16 @@ Cada disparo faz um POST de um corpo JSON com o mesmo formato de nível superior
 }
 ```
 
-Cabeçalhos:
+Headers:
 
-| Cabeçalho | Valor |
+| Header | Valor |
 |--------|-------|
 | `Content-Type` | `application/json` |
-| `X-Hermes-Event` | O nome do evento de hook |
-| `X-Hermes-Delivery` | ID único por entrega — mesmo valor de `delivery_id` no corpo |
-| `X-Hermes-Signature-256` | `sha256=<hex>` — HMAC-SHA256 do corpo bruto, no estilo GitHub; presente apenas quando um segredo está configurado |
+| `X-Hermes-Event` | The hook event name |
+| `X-Hermes-Delivery` | Unique id per delivery — same value as `delivery_id` in the body |
+| `X-Hermes-Signature-256` | `sha256=<hex>` — HMAC-SHA256 of the raw body, GitHub-style; only present when a secret is configured |
 
-Verifique a assinatura exatamente como faria com um webhook do GitHub:
+Verifique a assinatura exatamente como faria com webhook GitHub:
 
 ```python
 import hashlib, hmac
@@ -1579,18 +1630,18 @@ def verify(body: bytes, header: str, secret: str) -> bool:
     return hmac.compare_digest(expected, header)
 ```
 
-Como `delivery_id` e `timestamp` ficam **dentro do corpo assinado**, um receptor verificado também ganha proteção contra replay de graça:
+Como `delivery_id` e `timestamp` vivem **dentro do corpo assinado**, um receptor verificado também ganha proteção contra replay de graça:
 
-- **Dedupe** em `delivery_id` (ou o header `X-Hermes-Delivery` correspondente) — lembre-se dos ids vistos recentemente e pule duplicatas. O Hermes tenta novamente entregas com falha uma vez, então o mesmo id pode legitimamente chegar duas vezes.
-- **Rejeite eventos obsoletos** verificando `timestamp` contra seu relógio com uma janela de tolerância (5 minutos é o padrão comum). Um atacante repetindo uma requisição capturada não consegue forjar um timestamp recente sem o segredo.
+- **Dedupe** em `delivery_id` (ou header correspondente `X-Hermes-Delivery`) — lembre ids vistos recentemente e pule duplicatas. Hermes retenta entregas falhas uma vez, então o mesmo id pode chegar legitimamente duas vezes.
+- **Rejeite eventos stale** checando `timestamp` contra seu relógio com janela de tolerância (5 minutos é o padrão comum). Atacante replaying request capturado não pode forjar timestamp fresco sem o secret.
 
 ### Semântica de entrega {#delivery-semantics}
 
-- **Fire-and-forget, fora do caminho crítico.** Eventos são serializados e enfileirados instantaneamente; uma única thread em segundo plano realiza os POSTs HTTP. Um endpoint lento ou morto nunca consegue travar uma chamada de tool ou um turno do agente.
-- **Apenas notificação.** Ao contrário dos hooks de shell, webhooks de saída não conseguem bloquear chamadas de tool nem injetar contexto — o corpo da resposta é ignorado. Eles observam, nunca direcionam.
-- **Tentativas limitadas.** Erros de conexão e respostas 5xx são tentados novamente uma vez com backoff; respostas 4xx não são tentadas novamente (o receptor disse que a própria requisição está errada). Falhas são registradas em log e descartadas — a entrega é best-effort, não garantida.
-- **Redirecionamentos nunca são seguidos.** Uma resposta 3xx é tratada como uma má configuração e registrada em log — seguir um POST redirecionado descartaria silenciosamente o payload assinado. Aponte a `url` para o endpoint final.
-- **Fila limitada.** Se a fila acumular (endpoint morto, tempestade de eventos), novos eventos são descartados com um aviso em vez de consumir memória ilimitada.
-- **Sem prompt de consentimento.** Alvos de saída não executam código na sua máquina — eles recebem dados em uma URL que você configurou. `HERMES_SAFE_MODE=1` ainda pula o registro, assim como plugins e hooks de shell. Note que os payloads incluem entradas de tool e metadados de evento, então só aponte os alvos para endpoints em que você confia, e prefira `https://`.
+- **Fire-and-forget, fora do hot path.** Eventos são serializados e enfileirados instantaneamente; uma única thread em background executa os HTTP POSTs. Endpoint lento ou morto nunca pode travar chamada de ferramenta ou turno de agente.
+- **Notify-only.** Diferente de shell hooks, outbound webhooks não podem bloquear chamadas de ferramentas ou injetar contexto — o corpo de resposta é ignorado. Observam, nunca dirigem.
+- **Retries limitados.** Erros de conexão e respostas 5xx são retentados uma vez com backoff; respostas 4xx não são retentadas (o receptor disse que a requisição em si está errada). Falhas são logadas e descartadas — entrega é best-effort, não garantida.
+- **Redirects nunca são seguidos.** Resposta 3xx é tratada como misconfiguration e logada — seguir POST redirecionado descartaria silenciosamente o payload assinado. Aponte `url` ao endpoint final.
+- **Fila limitada.** Se a fila enche (endpoint morto, event storm), novos eventos são descartados com aviso em vez de consumir memória ilimitada.
+- **Sem prompt de consentimento.** Targets outbound não executam código na sua máquina — recebem dados em URL que você configurou. `HERMES_SAFE_MODE=1` ainda pula registro, igual plugins e shell hooks. Note que payloads incluem inputs de ferramentas e metadata de evento, então aponte targets só para endpoints em que confia, e prefira `https://`.
 
-`hermes hooks list` mostra os alvos de saída configurados junto com os hooks de shell, incluindo se cada alvo está assinado.
+`hermes hooks list` mostra targets outbound configurados junto com shell hooks, incluindo se cada target está assinado.
