@@ -1469,6 +1469,8 @@ def init_agent(
         KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
     )
 
+    agent._next_move_routing_enabled = True
+
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
         requirements = _ra().check_toolset_requirements()

@@ -191,6 +191,19 @@ SESSION_SEARCH_GUIDANCE = (
     "asking them to repeat themselves."
 )
 
+NEXT_MOVE_GUIDANCE = (
+    "When you propose a next move, keep the normal answer in prose. Only when "
+    "the proposal is an explicit multi-step plan that is complex, durable, "
+    "asynchronous, side-effecting, or must survive a restart, append exactly one "
+    "machine-readable marker in this form: `<!-- hermes-next-move: {JSON} -->`. "
+    "The JSON must contain `proposal: true`, a non-empty `title`, and a `steps` "
+    "array; it may include boolean `durable`, `asynchronous`, `side_effecting`, "
+    "`restart_surviving`, `user_confirmed`, and an `assignee`. Do not emit the "
+    "marker for a one-step suggestion or ordinary chat. The gateway uses this "
+    "explicit evidence to place only qualifying plans on Kanban; never infer a "
+    "plan from keywords."
+)
+
 SKILLS_GUIDANCE = (
     "After completing a complex task (5+ tool calls), fixing a tricky error, "
     "or discovering a non-trivial workflow, save the approach as a "

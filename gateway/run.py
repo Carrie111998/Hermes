@@ -5482,6 +5482,42 @@ class TurnRunner:
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
 
+        # Inspect the model's explicit next-move evidence after the normal turn.
+        # This keeps chat and delegate_task lanes unchanged: only a structured,
+        # qualifying marker can create a durable Kanban task.
+        if (
+            isinstance(final_response, str)
+            and final_response
+            and not result.get("failed")
+            and not result.get("partial")
+            and not result.get("interrupted")
+            and not os.environ.get("HERMES_KANBAN_TASK")
+        ):
+            try:
+                from gateway.next_move import route_next_move
+                from tools.kanban_tools import _handle_create
+
+                def _create_next_move(**kwargs):
+                    payload = json.loads(_handle_create(kwargs))
+                    if payload.get("error"):
+                        raise RuntimeError(payload["error"])
+                    return str(payload["task_id"])
+
+                routed = route_next_move(
+                    final_response,
+                    session_id=ctx.session_id,
+                    create_fn=_create_next_move,
+                    assignee=os.environ.get("HERMES_PROFILE") or "default",
+                )
+                final_response = routed["text"]
+                result["final_response"] = final_response
+                if routed.get("created"):
+                    result["next_move_task_id"] = routed["task_id"]
+            except Exception:
+                # A routing failure must never turn a successful chat turn into
+                # an error or hide the model's answer.
+                logger.warning("next-move Kanban routing failed", exc_info=True)
+
         # Extract actual token counts from the agent instance used for this run
         _last_prompt_toks = 0
         _input_toks = 0
