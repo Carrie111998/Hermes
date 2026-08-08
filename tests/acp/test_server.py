@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -178,6 +179,24 @@ class TestAuthenticate:
 class TestSessionOps:
 
     @pytest.mark.asyncio
+    async def test_cancel_autonomous_turn_does_not_salvage_internal_notification(
+        self, agent, monkeypatch
+    ):
+        state = agent.session_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.active_turn_origin = "autonomous"
+        state.current_prompt_text = "Internal background completion"
+        state.interrupted_prompt_text = "Earlier user request"
+        interrupt = MagicMock()
+        monkeypatch.setattr("acp_adapter.server.request_hard_interrupt", interrupt)
+
+        await agent.cancel(state.session_id)
+
+        assert state.cancel_event.is_set()
+        assert state.interrupted_prompt_text == "Earlier user request"
+        interrupt.assert_called_once_with(state.agent)
+
+    @pytest.mark.asyncio
     async def test_dispatches_only_background_notifications_owned_by_connected_sessions(
         self, agent, monkeypatch
     ):
@@ -187,14 +206,23 @@ class TestSessionOps:
         conn = MagicMock()
         conn.session_update = AsyncMock()
         agent._conn = conn
-        agent._connected_session_ids.add("acp-owned")
+        state = agent.session_manager.create_session(cwd="/tmp")
+        state.agent.run_conversation.return_value = {
+            "final_response": "Parent report.",
+            "messages": [
+                {"role": "user", "content": "Background process completed."},
+                {"role": "assistant", "content": "Parent report."},
+            ],
+        }
+        state.interrupted_prompt_text = "Cancelled user request"
+        agent._connected_session_ids.add(state.session_id)
         monkeypatch.setattr("acp_adapter.server.process_registry", registry)
 
         registry.completion_queue.put(
             {
                 "type": "completion",
                 "session_id": "proc_owned",
-                "session_key": "acp-owned",
+                "session_key": state.session_id,
                 "command": "printf done",
                 "exit_code": 0,
                 "output": "done",
@@ -215,11 +243,14 @@ class TestSessionOps:
         delivered = await agent._dispatch_background_notifications_once()
 
         assert delivered == 1
-        conn.session_update.assert_awaited_once()
-        assert conn.session_update.await_args.kwargs["session_id"] == "acp-owned"
-        update = conn.session_update.await_args.kwargs["update"]
-        assert update.session_update == "agent_message_chunk"
-        assert update.field_meta == {
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in conn.session_update.await_args_list
+        ]
+        notification = next(
+            update for update in updates if update.session_update == "user_message_chunk"
+        )
+        assert notification.field_meta == {
             "hermes": {
                 "backgroundNotification": True,
                 "process": {
@@ -230,8 +261,108 @@ class TestSessionOps:
                 },
             }
         }
-        assert "proc_owned completed normally" in update.content.text
+        assert "proc_owned completed normally" in notification.content.text
+        assert any(
+            update.session_update == "agent_message_chunk"
+            and update.content.text == "Parent report."
+            for update in updates
+        )
+        state.agent.run_conversation.assert_called_once()
+        assert "proc_owned completed normally" in state.agent.run_conversation.call_args.kwargs[
+            "user_message"
+        ]
+        assert "Cancelled user request" not in state.agent.run_conversation.call_args.kwargs[
+            "user_message"
+        ]
+        assert state.interrupted_prompt_text == "Cancelled user request"
         assert registry.completion_queue.get_nowait()["session_id"] == "proc_foreign"
+
+    @pytest.mark.asyncio
+    async def test_busy_session_keeps_background_notification_pending(
+        self, agent, monkeypatch
+    ):
+        from tools.process_registry import ProcessRegistry
+
+        registry = ProcessRegistry()
+        conn = MagicMock()
+        conn.session_update = AsyncMock()
+        agent._conn = conn
+        state = agent.session_manager.create_session(cwd="/tmp")
+        state.is_running = True
+        state.active_turn_origin = "user"
+        agent._connected_session_ids.add(state.session_id)
+        monkeypatch.setattr("acp_adapter.server.process_registry", registry)
+        registry.completion_queue.put(
+            {
+                "type": "completion",
+                "session_id": "proc_busy",
+                "session_key": state.session_id,
+                "command": "printf done",
+                "exit_code": 0,
+                "output": "done",
+            }
+        )
+
+        delivered = await agent._dispatch_background_notifications_once()
+
+        assert delivered == 0
+        assert registry.completion_queue.get_nowait()["session_id"] == "proc_busy"
+        state.agent.run_conversation.assert_not_called()
+        conn.session_update.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_async_delegation_turn_completes_its_durable_claim(
+        self, agent, monkeypatch
+    ):
+        from tools.process_registry import ProcessRegistry
+
+        registry = ProcessRegistry()
+        conn = MagicMock()
+        conn.session_update = AsyncMock()
+        agent._conn = conn
+        state = agent.session_manager.create_session(cwd="/tmp")
+        state.agent.run_conversation.return_value = {
+            "final_response": "Consolidated parent report.",
+            "messages": [],
+        }
+        agent._connected_session_ids.add(state.session_id)
+        monkeypatch.setattr("acp_adapter.server.process_registry", registry)
+
+        claim = MagicMock(return_value="claim-1")
+        complete = MagicMock()
+        release = MagicMock()
+        monkeypatch.setattr("tools.async_delegation.claim_event_delivery", claim)
+        monkeypatch.setattr("tools.async_delegation.complete_event_delivery", complete)
+        monkeypatch.setattr("tools.async_delegation.release_event_delivery", release)
+
+        event = {
+            "type": "async_delegation",
+            "delegation_id": "deleg_test",
+            "session_key": state.session_id,
+            "status": "completed",
+            "is_batch": True,
+            "goals": ["inspect the regression"],
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "Child found the missing ACP queue drain.",
+                }
+            ],
+        }
+        registry.completion_queue.put(event)
+
+        delivered = await agent._dispatch_background_notifications_once()
+
+        assert delivered == 1
+        claimed_event, consumer = claim.call_args.args
+        assert claimed_event == event
+        assert consumer.startswith("acp:")
+        complete.assert_called_once_with(event, "claim-1")
+        release.assert_not_called()
+        prompt_text = state.agent.run_conversation.call_args.kwargs["user_message"]
+        assert "Child found the missing ACP queue drain." in prompt_text
+        assert "deleg_test" in prompt_text
 
     @pytest.mark.asyncio
     async def test_background_notification_loop_stops_after_transport_failure(
@@ -243,14 +374,15 @@ class TestSessionOps:
         conn = MagicMock()
         conn.session_update = AsyncMock(side_effect=ConnectionError("disconnected"))
         agent._conn = conn
-        agent._connected_session_ids.add("acp-owned")
+        state = agent.session_manager.create_session(cwd="/tmp")
+        agent._connected_session_ids.add(state.session_id)
         monkeypatch.setattr("acp_adapter.server.process_registry", registry)
 
         registry.completion_queue.put(
             {
                 "type": "completion",
                 "session_id": "proc_owned",
-                "session_key": "acp-owned",
+                "session_key": state.session_id,
                 "command": "printf done",
                 "exit_code": 0,
                 "output": "done",
@@ -282,7 +414,8 @@ class TestSessionOps:
         old_conn.session_update = AsyncMock(side_effect=blocked_session_update)
         new_conn.session_update = AsyncMock()
         agent._conn = old_conn
-        agent._connected_session_ids.add("acp-owned")
+        state = agent.session_manager.create_session(cwd="/tmp")
+        agent._connected_session_ids.add(state.session_id)
         monkeypatch.setattr("acp_adapter.server.process_registry", registry)
 
         for process_id in ("proc_first", "proc_second"):
@@ -290,7 +423,7 @@ class TestSessionOps:
                 {
                     "type": "completion",
                     "session_id": process_id,
-                    "session_key": "acp-owned",
+                    "session_key": state.session_id,
                     "command": "printf done",
                     "exit_code": 0,
                     "output": "done",
@@ -311,6 +444,131 @@ class TestSessionOps:
                 registry.completion_queue.get_nowait()["session_id"],
             ]
             assert queued_ids == ["proc_first", "proc_second"]
+            assert registry.completion_queue.empty()
+        finally:
+            if new_task is not None:
+                new_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await new_task
+
+    @pytest.mark.asyncio
+    async def test_connection_replacement_does_not_replay_started_autonomous_turn(
+        self, agent, monkeypatch
+    ):
+        from tools.process_registry import ProcessRegistry
+
+        registry = ProcessRegistry()
+        old_conn = MagicMock()
+        new_conn = MagicMock()
+        old_conn.session_update = AsyncMock()
+        new_conn.session_update = AsyncMock()
+        agent._conn = old_conn
+        state = agent.session_manager.create_session(cwd="/tmp")
+        agent._connected_session_ids.add(state.session_id)
+        monkeypatch.setattr("acp_adapter.server.process_registry", registry)
+
+        run_started = threading.Event()
+        allow_finish = threading.Event()
+
+        def run_parent(**_kwargs):
+            run_started.set()
+            assert allow_finish.wait(timeout=1)
+            return {
+                "final_response": "Parent finished once.",
+                "messages": [
+                    {"role": "user", "content": "Background process completed."},
+                    {"role": "assistant", "content": "Parent finished once."},
+                ],
+            }
+
+        state.agent.run_conversation.side_effect = run_parent
+        for process_id in ("proc_started", "proc_waiting"):
+            registry.completion_queue.put(
+                {
+                    "type": "completion",
+                    "session_id": process_id,
+                    "session_key": state.session_id,
+                    "command": "printf done",
+                    "exit_code": 0,
+                    "output": "done",
+                }
+            )
+
+        old_task = asyncio.create_task(agent._background_notification_loop(old_conn))
+        agent._background_notification_task = old_task
+        assert await asyncio.to_thread(run_started.wait, 1)
+
+        agent.on_connect(new_conn)
+        new_task = agent._background_notification_task
+        allow_finish.set()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await old_task
+            state.agent.run_conversation.assert_called_once()
+            assert registry.completion_queue.get_nowait()["session_id"] == "proc_waiting"
+            assert registry.completion_queue.empty()
+        finally:
+            if new_task is not None:
+                new_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await new_task
+
+    @pytest.mark.asyncio
+    async def test_connection_replacement_after_model_completion_does_not_replay(
+        self, agent, monkeypatch
+    ):
+        from tools.process_registry import ProcessRegistry
+
+        registry = ProcessRegistry()
+        old_conn = MagicMock()
+        new_conn = MagicMock()
+        result_delivery_started = asyncio.Event()
+        allow_result_delivery = asyncio.Event()
+
+        async def block_final_result(*args, **kwargs):
+            update = kwargs.get("update") or args[1]
+            if update.session_update == "agent_message_chunk":
+                result_delivery_started.set()
+                await allow_result_delivery.wait()
+
+        old_conn.session_update = AsyncMock(side_effect=block_final_result)
+        new_conn.session_update = AsyncMock()
+        agent._conn = old_conn
+        state = agent.session_manager.create_session(cwd="/tmp")
+        state.agent.run_conversation.return_value = {
+            "final_response": "Parent result is durable.",
+            "messages": [
+                {"role": "user", "content": "Background process completed."},
+                {"role": "assistant", "content": "Parent result is durable."},
+            ],
+        }
+        agent._connected_session_ids.add(state.session_id)
+        monkeypatch.setattr("acp_adapter.server.process_registry", registry)
+
+        for process_id in ("proc_completed", "proc_waiting"):
+            registry.completion_queue.put(
+                {
+                    "type": "completion",
+                    "session_id": process_id,
+                    "session_key": state.session_id,
+                    "command": "printf done",
+                    "exit_code": 0,
+                    "output": "done",
+                }
+            )
+
+        old_task = asyncio.create_task(agent._background_notification_loop(old_conn))
+        agent._background_notification_task = old_task
+        await asyncio.wait_for(result_delivery_started.wait(), timeout=1)
+
+        agent.on_connect(new_conn)
+        new_task = agent._background_notification_task
+        allow_result_delivery.set()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await old_task
+            state.agent.run_conversation.assert_called_once()
+            assert registry.completion_queue.get_nowait()["session_id"] == "proc_waiting"
             assert registry.completion_queue.empty()
         finally:
             if new_task is not None:
@@ -586,6 +844,29 @@ class TestPrompt:
         )
 
         assert captured.get("child") == resp.session_id
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_queues_behind_autonomous_turn_without_redirecting(
+        self, agent, mock_manager
+    ):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.is_running = True
+        state.active_turn_origin = "autonomous"
+        state.agent._supports_active_turn_redirect = True
+        state.agent.redirect = MagicMock(return_value=True)
+        conn = MagicMock(spec=acp.Client)
+        conn.session_update = AsyncMock()
+        agent._conn = conn
+
+        result = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="new user request")],
+            session_id=resp.session_id,
+        )
+
+        assert result.stop_reason == "end_turn"
+        assert state.queued_prompts == ["new user request"]
+        state.agent.redirect.assert_not_called()
 
     def test_title_update_does_not_create_coroutine_after_loop_closes(self, agent):
         class ClosedLoop:

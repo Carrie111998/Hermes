@@ -170,6 +170,7 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    active_turn_origin: str = ""
 
 
 class SessionManager:
@@ -229,6 +230,11 @@ class SessionManager:
             return state
         # Attempt to restore from database.
         return self._restore(session_id)
+
+    def get_in_memory(self, session_id: str) -> Optional[SessionState]:
+        """Return an attached in-process session without restoring from disk."""
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
