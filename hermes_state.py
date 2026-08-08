@@ -6755,6 +6755,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
 
+    def _append_messages_batch_in_transaction(
+        self,
+        conn,
+        *,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        compression_lock_holder: Optional[str] = None,
+    ) -> int:
+        """Append one transcript batch using the caller's write transaction."""
+        self._check_transcript_write_guards(
+            conn, session_id, compression_lock_holder
+        )
+        inserted, tool_calls_total = self._insert_message_rows(
+            conn, session_id, messages
+        )
+        if tool_calls_total > 0:
+            conn.execute(
+                """UPDATE sessions SET message_count = message_count + ?,
+                   tool_call_count = tool_call_count + ? WHERE id = ?""",
+                (inserted, tool_calls_total, session_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                (inserted, session_id),
+            )
+        return inserted
+
     def append_messages_batch(
         self,
         session_id: str,
@@ -6803,27 +6831,75 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted_total
 
         def _do(conn):
-            self._check_transcript_write_guards(
-                conn, session_id, compression_lock_holder
+            return self._append_messages_batch_in_transaction(
+                conn,
+                session_id=session_id,
+                messages=messages,
+                compression_lock_holder=compression_lock_holder,
             )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
-            )
-            # One aggregated counter update for the whole batch.
-            if tool_calls_total > 0:
-                conn.execute(
-                    """UPDATE sessions SET message_count = message_count + ?,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
-                    (inserted, session_id),
-                )
-            return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
+    def append_messages_batch_to_live_compression_child(
+        self,
+        parent_session_id: str,
+        messages: List[Dict[str, Any]],
+        compression_lock_holder: Optional[str] = None,
+    ) -> str:
+        """Atomically resolve one live compression child and append a batch.
+
+        The unique-child check and transcript insert share one ``BEGIN
+        IMMEDIATE`` transaction. A concurrent compression publisher therefore
+        cannot create another child between selection and commit. Missing or
+        ambiguous continuations fail closed with the same exception as a direct
+        write to the compression-ended parent.
+
+        Returns the child session id after the transcript batch commits.
+        """
+        if not messages:
+            raise ValueError("messages must not be empty")
+
+        def _do(conn):
+            parent = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is None
+                or parent["end_reason"] != "compression"
+            ):
+                raise CompressionSessionClosedError(parent_session_id)
+
+            rows = conn.execute(
+                """
+                SELECT s.id
+                FROM sessions s
+                WHERE s.parent_session_id = ?
+                  AND s.ended_at IS NULL
+                  AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL
+                  AND COALESCE(s.source, '') != 'tool'
+                ORDER BY s.started_at ASC
+                LIMIT 2
+                """,
+                (parent_session_id,),
+            ).fetchall()
+            if len(rows) != 1:
+                raise CompressionSessionClosedError(parent_session_id)
+
+            child_session_id = str(rows[0]["id"])
+            self._append_messages_batch_in_transaction(
+                conn,
+                session_id=child_session_id,
+                messages=messages,
+                compression_lock_holder=compression_lock_holder,
+            )
+            return child_session_id
+
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )

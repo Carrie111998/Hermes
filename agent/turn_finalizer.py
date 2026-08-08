@@ -676,10 +676,19 @@ def finalize_turn(
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
     # (and desktop can toast disk-full) instead of a quiet complete frame.
-    if failed and str(_turn_exit_reason) == "session_persistence_failed":
-        result["error"] = final_response or (
-            "session storage could not be written — free disk space and try again"
-        )
+    if failed and str(_turn_exit_reason) in (
+        "session_persistence_failed",
+        "compression_session_closed",
+    ):
+        if str(_turn_exit_reason) == "compression_session_closed":
+            result["error"] = final_response or (
+                "the previous session was compressed, but its live continuation "
+                "could not be selected safely — send your message again"
+            )
+        else:
+            result["error"] = final_response or (
+                "session storage could not be written — free disk space and try again"
+            )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

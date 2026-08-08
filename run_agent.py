@@ -2280,13 +2280,79 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
+                _compression_lock_holder = getattr(
+                    self, "_active_compression_lock_holder", None
                 )
+                try:
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=_batch_rows,
+                        compression_lock_holder=_compression_lock_holder,
+                    )
+                except Exception as _append_exc:
+                    from hermes_state import CompressionSessionClosedError
+
+                    if not isinstance(_append_exc, CompressionSessionClosedError):
+                        raise
+                    _parent_session_id = self.session_id
+                    _atomic_reroute = getattr(
+                        type(self._session_db),
+                        "append_messages_batch_to_live_compression_child",
+                        None,
+                    )
+                    if not callable(_atomic_reroute):
+                        self._persistence_failure_reason = (
+                            "compression_session_closed"
+                        )
+                        raise
+                    # Resolve and append under one BEGIN IMMEDIATE transaction,
+                    # then mutate the live binding only after commit. A second
+                    # publisher cannot create an ambiguous child between the
+                    # uniqueness check and transcript insert.
+                    try:
+                        _child_session_id = str(
+                            _atomic_reroute(
+                                self._session_db,
+                                parent_session_id=_parent_session_id,
+                                messages=_batch_rows,
+                                compression_lock_holder=_compression_lock_holder,
+                            )
+                        )
+                    except CompressionSessionClosedError:
+                        self._persistence_failure_reason = (
+                            "compression_session_closed"
+                        )
+                        raise
+                    self.session_id = _child_session_id
+                    self._session_db_created = True
+                    self._flushed_db_message_session_id = _child_session_id
+                    self._persistence_failure_reason = None
+                    try:
+                        from gateway.session_context import set_current_session_id
+
+                        set_current_session_id(_child_session_id)
+                    except Exception as _context_exc:
+                        os.environ["HERMES_SESSION_ID"] = _child_session_id
+                        logger.warning(
+                            "Failed to update gateway session context after "
+                            "compression-child adoption: %s",
+                            _context_exc,
+                        )
+                    try:
+                        from hermes_logging import set_session_context
+
+                        set_session_context(_child_session_id)
+                    except Exception as _logging_exc:
+                        logger.warning(
+                            "Failed to update logging session context after "
+                            "compression-child adoption: %s",
+                            _logging_exc,
+                        )
+                    logger.info(
+                        "Session DB flush adopted compression continuation: %s -> %s",
+                        _parent_session_id,
+                        _child_session_id,
+                    )
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -3674,6 +3740,14 @@ class AIAgent:
                 "written (the transcript would have been lost on restart). "
                 "This is often a full disk — free some space (or fix state.db "
                 "permissions), then send your message again."
+            )
+        if reason == "compression_session_closed":
+            return (
+                prefix
+                + "the turn was stopped because the previous session was "
+                "compressed and its live compression continuation could not "
+                "be selected safely. Send your message again to continue on "
+                "the current session."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
