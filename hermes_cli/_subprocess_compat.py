@@ -351,14 +351,15 @@ def noninteractive_git_env(
 
 
 def _kill_process_tree(proc: "subprocess.Popen") -> None:
-    """Best-effort terminate *proc* and, on Windows, its descendants.
+    """Best-effort terminate *proc* and its descendants on both platforms.
 
-    ``proc.kill()`` alone only terminates the PATH-resolved launcher; a
-    suspended descendant (``git.exe``, MSYS ``true``/``cat``, ...) can survive
-    holding duplicates of the captured pipe handles, which keeps the pipes from
-    reaching EOF and leaks two reader threads + the process per fired timeout.
-    ``taskkill /T /F`` takes the whole tree down so the bounded drain that
-    follows can actually reach EOF.
+    ``proc.kill()`` alone only terminates the direct child. On Windows a
+    suspended descendant can survive holding duplicates of the captured pipe
+    handles, so ``taskkill /T /F`` takes down the whole tree. On POSIX the probe
+    is spawned in its own process group (``process_group=0`` in
+    :func:`bounded_captured_run`), so the group is signalled only when the child
+    actually leads it (``pgid == pid``). The ownership check prevents a fallback
+    spawn that shares our group from taking down unrelated processes.
 
     On Windows the tree kill must run *before* ``proc.kill()``: once the
     launcher exits, Windows can no longer reliably discover its descendants, so
@@ -383,6 +384,17 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
                 check=False,
                 creationflags=windows_hide_flags(),
             )
+        except Exception:
+            pass
+    else:
+        # Group-kill first: verify the child actually leads its own process
+        # group before signalling it, so we never blast a shared group.
+        try:
+            import signal as _signal
+
+            pgid = os.getpgid(proc.pid)
+            if pgid == proc.pid:
+                os.killpg(pgid, _signal.SIGKILL)  # windows-footgun: ok — inside `if not IS_WINDOWS` gate
         except Exception:
             pass
     try:
@@ -421,9 +433,10 @@ def bounded_captured_run(
     reader threads are daemonic and cost nothing).
 
     Spawn contract: PIPE/PIPE/DEVNULL, ``text`` with UTF-8 ``errors="replace"``,
-    and hidden-window ``creationflags`` on Windows only. ``stdin`` is always
-    ``DEVNULL`` so ACP/TUI JSON-RPC hosts that keep stdin open cannot stall the
-    probe.
+    and hidden-window ``creationflags`` on Windows only. On POSIX the probe is
+    placed in its own process group so timeout cleanup can kill descendants.
+    ``stdin`` is always ``DEVNULL`` so ACP/TUI JSON-RPC hosts that keep stdin
+    open cannot stall the probe.
 
     On timeout / communicate failure returns ``CompletedProcess`` with
     ``returncode=-1`` and empty stdout (does not raise). ``stderr`` carries a
@@ -432,7 +445,11 @@ def bounded_captured_run(
     Spawn failures (``FileNotFoundError``, ...) propagate so callers can
     distinguish "not installed" from "timed out".
     """
-    _popen_kwargs: dict = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    _popen_kwargs: dict = (
+        {"creationflags": windows_hide_flags()}
+        if IS_WINDOWS
+        else {"process_group": 0}
+    )
     if env is not None:
         _popen_kwargs["env"] = dict(env)
     proc = subprocess.Popen(
