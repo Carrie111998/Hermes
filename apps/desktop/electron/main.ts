@@ -2617,6 +2617,13 @@ let isQuittingForHandoff = false
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
 
+// Set in `before-quit` so the close handler can tell a real quit (any path:
+// File → Quit, tray Exit, hand-off, a second-instance quit) from a plain
+// "click the X" hide. Deriving it from the other latches is wrong — a plain
+// app.quit() with no active work leaves them all false, which would make the
+// close handler hide the window instead of quitting.
+let isQuitting = false
+
 // Close-to-tray (Windows only): clicking X hides the main window to the system
 // tray instead of quitting, so the agent keeps running. `trayMinimizeEnabled`
 // is the user preference (persisted, renderer-driven). `trayController` owns
@@ -9372,7 +9379,7 @@ function createWindow() {
         event,
         isEnabled: trayMinimizeEnabled,
         isMainWindow: true,
-        isQuitting: quitPromptOpen || quitConfirmedWithActiveWork || isQuittingForHandoff,
+        isQuitting,
         isQuittingForHandoff,
         isWindows: IS_WINDOWS
       })
@@ -10713,10 +10720,12 @@ function applyTrayMinimize(enabled: boolean) {
   if (enabled && IS_WINDOWS) {
     trayController.build({
       iconPath: getAppIconPath(),
-      onQuit: () => {
-        quitConfirmedWithActiveWork = true
-        app.quit()
-      },
+      // A plain app.quit(): `before-quit` sets the `isQuitting` latch and
+      // runs the same active-work guard as every other quit, so the
+      // "Keep Running / Quit Anyway" prompt still appears with a turn in
+      // flight. Do NOT pre-set quitConfirmedWithActiveWork here — that would
+      // suppress the confirmation.
+      onQuit: () => app.quit(),
       onRestore: () => ensureMainWindow(mainWindow, {
         createWindow,
         focusWindow,
@@ -12044,6 +12053,13 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
 }
 
 app.on('before-quit', event => {
+  // Signal a genuine quit to the close handler (runs before the tray is
+  // destroyed below), so every quit path — File → Quit, tray Exit, hand-off —
+  // closes the window instead of hiding it. The close handler reads this latch
+  // (set here) rather than the active-work latches, which are false on a plain
+  // quit and would otherwise be mistaken for a plain "click the X" hide.
+  isQuitting = true
+
   // Runs ahead of every teardown below, so "Keep Running" leaves the app
   // exactly as it was.
   if (heldQuitForActiveWork(event)) {

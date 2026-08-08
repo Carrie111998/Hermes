@@ -114,6 +114,48 @@ describe('shouldMinimizeToTray', () => {
       })
     ).toBe(true)
   })
+
+  it('REGRESSION: a plain quit must close even when every active-work latch is false', () => {
+    // Bug caught in review (PR #81342): the close handler used to derive its
+    // "is quitting" signal from `quitPromptOpen || quitConfirmedWithActiveWork
+    // || isQuittingForHandoff`. A plain File → Quit with no active work leaves
+    // all of those false, so a tray-minimized window was hidden instead of
+    // quit — and because before-quit had already destroyed the tray icon, the
+    // app became a hidden window with no way to bring it back. The fix reads a
+    // dedicated `isQuitting` latch set in before-quit.
+    //
+    // This asserts the decision is driven by `isQuitting` alone, NOT by the
+    // absence of active work: with all latches false but isQuitting=true, the
+    // window must close (no hide).
+    const event = { preventDefault: vi.fn() }
+
+    expect(
+      shouldMinimizeToTray({
+        event,
+        isEnabled: true,
+        isMainWindow: true,
+        isQuitting: true, // the only thing that should distinguish a quit
+        isQuittingForHandoff: false,
+        isWindows: true
+      })
+    ).toBe(false)
+    expect(event.preventDefault).not.toHaveBeenCalled()
+
+    // And when isQuitting is false, a plain click-the-X (no active work) hides —
+    // the two cases must not be conflated.
+    const hideEvent = { preventDefault: vi.fn() }
+    expect(
+      shouldMinimizeToTray({
+        event: hideEvent,
+        isEnabled: true,
+        isMainWindow: true,
+        isQuitting: false,
+        isQuittingForHandoff: false,
+        isWindows: true
+      })
+    ).toBe(true)
+    expect(hideEvent.preventDefault).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('createTrayController', () => {
