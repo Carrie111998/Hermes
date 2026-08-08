@@ -423,26 +423,13 @@ def main():
     # Turn-isolation children inherit this profile-scope marker.
     os.environ["HERMES_PROFILE_SCOPED_UI"] = "1"
 
-    # Preserve CLI security precedence: plugin policy directives run before
-    # shell-hook directives.
     try:
-        from hermes_cli.plugins import discover_plugins
+        from agent.shell_hooks import register_profile_scoped_child_hooks
 
-        discover_plugins()
-    except Exception:
-        logger.debug("Plugin discovery failed at TUI gateway startup", exc_info=True)
-
-    # The TUI gateway runs agent turns in this child process. Shell hooks
-    # registered by the parent CLI live in its process-local plugin registry,
-    # so load the current profile's approved hooks again before announcing
-    # readiness.
-    try:
-        from agent.shell_hooks import register_from_current_config
-
-        register_from_current_config(accept_hooks=False)
+        register_profile_scoped_child_hooks(runtime_name="TUI gateway")
     except Exception:
         logger.debug(
-            "shell-hook registration failed at TUI gateway startup",
+            "profile-scoped hook setup failed at TUI gateway startup",
             exc_info=True,
         )
 

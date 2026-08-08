@@ -831,29 +831,17 @@ def _default_workers() -> int:
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
 
-    # Turn-isolated sessions run entirely in this child process, so a
-    # profile-scoped parent marks the runtime before spawning it. A generic
-    # browser dashboard can serve multiple profiles through one compute host
-    # and must not register its launch profile's hooks globally.
-    if os.environ.get("HERMES_PROFILE_SCOPED_UI") == "1":
-        # Preserve CLI security precedence: plugin policy directives run before
-        # shell-hook directives.
-        try:
-            from hermes_cli.plugins import discover_plugins
+    # Turn-isolated sessions run entirely in this child process. The shared
+    # helper's profile marker prevents launch-profile hooks from leaking into a
+    # generic multi-profile browser Dashboard.
+    try:
+        from agent.shell_hooks import register_profile_scoped_child_hooks
 
-            discover_plugins()
-        except Exception:
-            logger.debug("Plugin discovery failed at compute-host startup", exc_info=True)
-
-        try:
-            from agent.shell_hooks import register_from_current_config
-
-            register_from_current_config(accept_hooks=False)
-        except Exception:
-            logger.debug(
-                "shell-hook registration failed at compute-host startup",
-                exc_info=True,
-            )
+        register_profile_scoped_child_hooks(runtime_name="compute host")
+    except Exception:
+        logger.debug(
+            "profile-scoped hook setup failed at compute-host startup", exc_info=True
+        )
 
     stdin = stdin or sys.stdin
     host = ComputeHost(stdout=stdout or sys.stdout)
