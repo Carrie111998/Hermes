@@ -118,6 +118,7 @@ def _bare_agent() -> AIAgent:
     agent._turn_file_mutation_fingerprint_bytes = 0
     agent._turn_file_mutation_fingerprint_budget_exhausted = False
     agent._turn_file_mutation_fingerprint_lock = threading.Lock()
+    agent._turn_file_mutation_state_lock = threading.Lock()
     return agent
 
 
@@ -140,6 +141,42 @@ class TestRecordFileMutationResult:
         assert "/tmp/a.md" in state
         assert state["/tmp/a.md"]["tool"] == "patch"
         assert "Could not find old_string" in state["/tmp/a.md"]["error_preview"]
+
+    def test_disabled_verifier_skips_failure_fingerprinting(self, monkeypatch):
+        agent = _bare_agent()
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: False)
+        monkeypatch.setattr(
+            agent,
+            "_snapshot_file_mutation_target",
+            lambda *_args, **_kwargs: pytest.fail("disabled verifier fingerprinted a target"),
+        )
+
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.md", "old_string": "x", "new_string": "y"},
+            json.dumps({"error": "not found"}),
+            is_error=True,
+        )
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_disabled_verifier_skips_final_fingerprint(self, monkeypatch):
+        agent = _bare_agent()
+        agent._turn_failed_file_mutations["/tmp/a.md"] = {
+            "tool": "patch",
+            "error_preview": "not found",
+            "resolved_path": "/tmp/a.md",
+            "fingerprint": ("file", 1, "baseline"),
+            "task_id": "default",
+        }
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: False)
+        monkeypatch.setattr(
+            agent,
+            "_snapshot_file_mutation_target",
+            lambda *_args, **_kwargs: pytest.fail("disabled verifier re-fingerprinted a target"),
+        )
+
+        assert agent._unresolved_file_mutation_failures() == {}
 
     def test_success_removes_prior_failure(self):
         agent = _bare_agent()

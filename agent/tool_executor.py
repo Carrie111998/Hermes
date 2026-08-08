@@ -999,6 +999,26 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         dispatched = False
         start_advanced = False
 
+        def _record_file_mutation(result: Any, is_error: bool, is_blocked: bool) -> None:
+            """Record at worker completion before a sibling can hide recovery order."""
+            if is_blocked:
+                return
+            try:
+                state_lock = getattr(agent, "_turn_file_mutation_state_lock", None)
+                if state_lock is None:
+                    state_lock = threading.Lock()
+                    agent._turn_file_mutation_state_lock = state_lock
+                with state_lock:
+                    agent._record_file_mutation_result(
+                        function_name,
+                        function_args,
+                        result,
+                        is_error,
+                        task_id=effective_task_id,
+                    )
+            except Exception as _ver_err:
+                logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
         def _advance_start(callback=None) -> None:
             nonlocal start_advanced
             if start_advanced:
@@ -1077,6 +1097,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
+                _record_file_mutation(result, True, False)
                 results[index] = (
                     function_name,
                     function_args,
@@ -1107,6 +1128,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            _record_file_mutation(result, is_error, blocked)
             results[index] = (
                 function_name,
                 function_args,
@@ -1439,18 +1461,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-
-            # Track file-mutation outcome for the turn-end verifier.
-            # `blocked` calls never actually ran — don't let a guardrail
-            # block count as either a failure or a success.
-            if not blocked:
-                try:
-                    agent._record_file_mutation_result(
-                        function_name, function_args, function_result, is_error,
-                        task_id=effective_task_id,
-                    )
-                except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)

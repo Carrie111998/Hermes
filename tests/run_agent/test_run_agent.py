@@ -2128,6 +2128,63 @@ class TestConcurrentToolExecution:
         assert post_calls[0]["status"] == "ok"
         assert post_calls[0]["result"] == '{"intercepted":true}'
 
+    def test_concurrent_failed_mutation_snapshots_before_sibling_recovery(
+        self,
+        agent,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A sibling terminal recovery must occur after the failed-call baseline."""
+        target = tmp_path / "recovered.txt"
+        target.write_text("before\n", encoding="utf-8")
+        baseline_captured = threading.Event()
+        agent._turn_failed_file_mutations = {}
+        agent._turn_file_mutation_paths = set()
+        agent._turn_file_mutation_fingerprint_bytes = 0
+        agent._turn_file_mutation_fingerprint_budget_exhausted = False
+        agent._turn_file_mutation_fingerprint_lock = threading.Lock()
+        agent._turn_file_mutation_state_lock = threading.Lock()
+        monkeypatch.setattr(agent, "_file_mutation_verifier_enabled", lambda: True)
+        original_snapshot = agent._snapshot_file_mutation_target
+
+        def snapshot(*args, **kwargs):
+            result = original_snapshot(*args, **kwargs)
+            baseline_captured.set()
+            return result
+
+        monkeypatch.setattr(agent, "_snapshot_file_mutation_target", snapshot)
+
+        def invoke(name, _args, _task_id, _tool_call_id, **_kwargs):
+            if name == "patch":
+                return json.dumps({"error": "Could not find old_string"})
+            assert name == "terminal"
+            assert baseline_captured.wait(timeout=2)
+            target.write_text("after\n", encoding="utf-8")
+            return json.dumps({"success": True})
+
+        monkeypatch.setattr(agent, "_invoke_tool", invoke)
+        patch_call = _mock_tool_call(
+            name="patch",
+            arguments=json.dumps({
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            }),
+            call_id="patch-1",
+        )
+        terminal_call = _mock_tool_call(
+            name="terminal",
+            arguments=json.dumps({"command": "recover target"}),
+            call_id="terminal-1",
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[patch_call, terminal_call])
+
+        agent._execute_tool_calls_concurrent(message, [], "task-1")
+
+        assert target.read_text(encoding="utf-8") == "after\n"
+        assert agent._unresolved_file_mutation_failures() == {}
+
     def test_agent_runtime_post_hook_ownership_predicate_covers_agent_tools(self, agent):
         """Sequential and concurrent agent-level paths share post-hook ownership."""
         from agent.agent_runtime_helpers import agent_runtime_owns_post_tool_hook
