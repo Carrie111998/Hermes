@@ -1,0 +1,10 @@
+from __future__ import annotations
+from .models import Incident
+
+STATES = ("open", "acknowledged", "resolved", "reopened")
+_ALLOWED = {"open": {"acknowledged", "resolved"}, "acknowledged": {"resolved", "reopened"}, "resolved": {"reopened"}, "reopened": {"acknowledged", "resolved"}}
+
+def transition(incident: Incident, state: str) -> Incident:
+    if state not in STATES or state not in _ALLOWED.get(incident.state, set()): raise ValueError("invalid incident transition")
+    incident.state = state
+    return incident
