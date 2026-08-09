@@ -9,7 +9,8 @@ Two values must be absolute for the entry to work:
 
   - ``Exec`` — the launcher runs without shell ``PATH`` customizations, so
     a bare ``hermes desktop`` fails when hermes lives in ``~/.local/bin``
-    or a venv. Resolve the real binary and write its full path.
+    or a venv. Write a full path, and one that does not itself go looking
+    for an interpreter on the session's ``PATH``.
   - ``Icon`` — an unqualified icon name needs an indexed icon theme. The
     spec allows an absolute path instead, so point at the app icon in the
     checkout. Do not copy the icon: ``Exec`` already depends on that tree.
@@ -74,6 +75,58 @@ def _is_inside_checkout(path: Optional[str], project_root: Optional[Path]) -> bo
     return True
 
 
+def _is_env_python_wrapper(path: str) -> bool:
+    """True when ``path`` picks its interpreter off ``PATH`` at exec time.
+
+    A ``#!/usr/bin/env python3`` shebang defers the interpreter choice to
+    whatever ``PATH`` holds when the script runs. The desktop session's
+    ``PATH`` is not the shell's, so such a wrapper can land on a system
+    interpreter with no Hermes venv on ``sys.path`` — the same stranded
+    entry ``_is_inside_checkout`` guards against, reached by shebang
+    instead of by location. A hand-written ``~/bin/hermes``, or a console
+    script from a non-venv editable install, fails that way while sitting
+    outside the checkout. An installed console script instead names its
+    own interpreter absolutely and carries no such dependency.
+
+    Require the shebang's program *basename* to be exactly ``env``, so a
+    hardcoded interpreter under a directory named ``envs`` does not match,
+    and require the command it runs to be a ``python*`` binary.
+    """
+    try:
+        with open(path, "rb") as handle:
+            shebang = handle.readline(256)
+    except OSError:
+        return False
+    if not shebang.startswith(b"#!"):
+        return False
+    tokens = shebang[2:].split()
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0].decode("utf-8", "replace")) != "env":
+        return False
+    args = tokens[1:]
+    if args[:1] == [b"-S"]:
+        args = args[1:]
+    if not args:
+        return False
+    return os.path.basename(args[0].decode("utf-8", "replace")).startswith("python")
+
+
+def _is_durable_entry_point(path: Optional[str], project_root: Optional[Path]) -> bool:
+    """True when ``path`` is worth persisting into ``Exec=``.
+
+    Durable means it still starts Hermes months later from a cold menu
+    click, under the desktop session's own environment. Two ways to fail
+    that: living inside the checkout, and resolving ``python`` through
+    ``PATH``.
+    """
+    if not path:
+        return False
+    if _is_inside_checkout(path, project_root):
+        return False
+    return not _is_env_python_wrapper(path)
+
+
 def resolve_exec_command(project_root: Optional[Path] = None) -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
@@ -89,20 +142,32 @@ def resolve_exec_command(project_root: Optional[Path] = None) -> str:
     ``Exec`` breaks every later menu launch and never heals. It also makes
     the rendered contents alternate between the wrapper and the script,
     which defeats the unchanged-contents check below and rewrites the
-    entry on every other launch (#80439). Discard a checkout-internal
-    entry point and fall through to PATH, then to the interpreter.
+    entry on every other launch (#80439). Discard a candidate that is not
+    durable and fall through to PATH, then to the interpreter.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
     bin_path = resolve_hermes_bin()
-    if _is_inside_checkout(bin_path, project_root):
+    if bin_path and not _is_durable_entry_point(bin_path, project_root):
+        # ``resolve_hermes_bin()`` already consulted PATH last, so only
+        # retry it when the candidate it returned came from argv[0].
         bin_path = shutil.which("hermes")
-        if _is_inside_checkout(bin_path, project_root):
+        if not _is_durable_entry_point(bin_path, project_root):
             bin_path = None
     if bin_path:
         argv = [str(Path(bin_path).resolve()), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        # Absolute, but NOT symlink-resolved. A venv's ``bin/python`` is a
+        # symlink to the base interpreter, and CPython decides it is inside
+        # a venv by looking for ``pyvenv.cfg`` beside the path it was
+        # *invoked* through. Dereferencing that symlink lands on the base
+        # interpreter — for a uv-created venv, under
+        # ``~/.local/share/uv/python/``, outside the venv entirely — so the
+        # venv's ``site-packages`` drops off ``sys.path`` and the persisted
+        # command cannot import ``hermes_cli`` at all. Every other site
+        # that spawns this same module keeps the invocation path:
+        # ``relaunch.py``, ``uninstall.py``, ``kanban_db.py``.
+        argv = [os.path.abspath(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
