@@ -250,6 +250,31 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($gatewayState.get()).toBe('open')
   })
 
+  it('adopts the stored primary profile before requesting its connection', async () => {
+    const desktop = fakeDesktop()
+    const calls: string[] = []
+    const getProfile = desktop.profile.get
+    const getConnection = desktop.getConnection
+
+    desktop.profile.get = vi.fn(async () => {
+      calls.push('profile')
+
+      return getProfile()
+    })
+    desktop.getConnection = vi.fn(async (...args) => {
+      calls.push('connection')
+
+      return getConnection(...args)
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(calls.indexOf('profile')).toBeGreaterThanOrEqual(0)
+    expect(calls.indexOf('connection')).toBeGreaterThan(calls.indexOf('profile'))
+  })
+
   it('a remote that drops post-boot keeps looping with NO boot.error (the dead-end CONNECTING combo)', async () => {
     render(<Harness />)
     await flushAsync()

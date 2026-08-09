@@ -6,6 +6,16 @@ const tokenConn = { authMode: 'token' as const, wsUrl: 'ws://host/api/ws?token=a
 
 describe('resolveGatewayWsUrl', () => {
   describe('oauth mode', () => {
+    it('forwards the selected profile scope when refreshing a shared backend', async () => {
+      const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?ticket=fresh&profile=ultra')
+      const conn = { ...oauthConn, profile: 'ultra' }
+
+      await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, conn)).resolves.toBe(
+        'ws://host/api/ws?ticket=fresh&profile=ultra'
+      )
+      expect(getGatewayWsUrl).toHaveBeenCalledWith('ultra')
+    })
+
     it('uses the freshly minted URL', async () => {
       const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?ticket=fresh')
       await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, oauthConn)).resolves.toBe('ws://host/api/ws?ticket=fresh')

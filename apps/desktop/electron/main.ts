@@ -6538,11 +6538,17 @@ async function freshGatewayWsUrl(profile) {
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
 
-    return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
+    return buildGatewayWsUrlWithTicket(
+      connection.baseUrl,
+      ticket,
+      connection.sharedBackend ? connection.profile : undefined
+    )
   }
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
-  return connection.wsUrl
+  return connection.sharedBackend
+    ? buildGatewayWsUrl(connection.baseUrl, connection.token, connection.profile)
+    : connection.wsUrl
 }
 
 // --- Hermes Cloud discovery + silent per-agent sign-in (cloud-auto-discovery
@@ -8084,10 +8090,25 @@ function primaryProfileKey() {
   return readActiveDesktopProfile() || 'default'
 }
 
+// Named local profiles live under HERMES_HOME/profiles; the default profile
+// uses HERMES_HOME itself. Keep this check in the main process so a remote
+// primary does not accidentally claim a local profile as another remote scope.
+function localProfileExists(profile) {
+  const key = connectionScopeKey(profile)
+
+  if (!key || key === 'default') {
+    return true
+  }
+
+  return directoryExists(path.join(HERMES_HOME, 'profiles', key))
+}
+
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
 function profileRouteOptions(profile) {
   return {
     globalRemote: globalRemoteActive(),
+    localProfile: localProfileExists(profile),
+    primaryBackendRemote: primaryBackendIsRemote(),
     primaryProfile: primaryProfileKey(),
     profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
   }
@@ -8105,7 +8126,9 @@ async function ensureBackend(profile) {
 
     // A shared backend still owes the caller its profile scope, so renderer-side
     // WebSocket, filesystem, and cache routing target the selected profile.
-    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
+    return route.descriptorProfile
+      ? { ...connection, profile: route.descriptorProfile, sharedBackend: true }
+      : connection
   }
 
   const existing = backendPool.get(key)
@@ -10262,7 +10285,8 @@ ipcMain.handle('hermes:bootstrap:repair', async () => {
   const repairDecision = decideBootstrapRepair({
     attempt: bootstrapRepairAttempt,
     maxSoftAttempts: MAX_BOOTSTRAP_REPAIR_SOFT_ATTEMPTS,
-    primaryBackendAlive
+    primaryBackendAlive,
+    primaryBackendRemote: primaryBackendIsRemote()
   })
 
   rememberLog(

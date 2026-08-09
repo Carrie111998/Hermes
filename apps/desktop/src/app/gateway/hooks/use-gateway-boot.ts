@@ -503,6 +503,8 @@ export function useGatewayBoot({
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
         // Everything else keeps dialing the primary.
+        await adoptPrimaryProfile()
+
         const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
 
         if (cancelled) {

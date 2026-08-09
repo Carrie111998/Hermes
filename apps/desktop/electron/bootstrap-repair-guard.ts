@@ -75,6 +75,11 @@ export type RepairDecisionInput = {
    * stall is exactly the case the soft-restart path is for.
    */
   primaryBackendAlive: boolean
+  /**
+   * Whether the primary backend is remote. Remote backends have no local child
+   * process for this guard to inspect and must never trigger a local reinstall.
+   */
+  primaryBackendRemote?: boolean
 }
 
 /**
@@ -97,7 +102,18 @@ export type RepairDecisionInput = {
 export function decideBootstrapRepair(input: RepairDecisionInput): RepairDecision {
   const maxSoftAttempts = input.maxSoftAttempts ?? 3
   const attempt = Math.max(1, Math.floor(input.attempt))
+  const remote = Boolean(input.primaryBackendRemote)
   const alive = Boolean(input.primaryBackendAlive)
+
+  if (remote) {
+    return {
+      hardReinstall: false,
+      attempt,
+      reason:
+        `repair attempt ${attempt}: primary backend is a remote backend; ` +
+        `restarting the connection without a local reinstall`
+    }
+  }
 
   if (attempt > maxSoftAttempts) {
     return {

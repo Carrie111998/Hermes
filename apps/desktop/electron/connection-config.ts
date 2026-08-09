@@ -85,20 +85,24 @@ function normalizeRemoteBaseUrl(rawUrl) {
   return parsed.toString().replace(/\/+$/, '')
 }
 
-function buildGatewayWsUrl(baseUrl, token) {
+function buildGatewayWsUrl(baseUrl, token, profile?: string) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
+  const profileKey = connectionScopeKey(profile)
+  const profileQuery = profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}`
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?token=${encodeURIComponent(token)}${profileQuery}`
 }
 
-function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
+function buildGatewayWsUrlWithTicket(baseUrl, ticket, profile?: string) {
   const parsed = new URL(baseUrl)
   const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
   const prefix = parsed.pathname.replace(/\/+$/, '')
+  const profileKey = connectionScopeKey(profile)
+  const profileQuery = profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''
 
-  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}${profileQuery}`
 }
 
 /** True only when a gateway explicitly rejected the current OAuth session. */
@@ -375,6 +379,8 @@ function profileRemoteOverride(config, profile) {
 
 export interface ProfileRouteOptions {
   globalRemote?: boolean
+  localProfile?: boolean
+  primaryBackendRemote?: boolean
   primaryProfile?: null | string
   profileRemoteOverride?: boolean
 }
@@ -401,7 +407,12 @@ export interface ProfileBackendRoute {
  *     host, which is already scoped to it.
  *  3. A profile inheriting the app-global remote shares the primary backend —
  *     one host serves every profile — so it is scoped per request instead.
- *  4. Any other local profile gets its own pooled backend, spawned with
+ *  4. A known local profile keeps using a local pooled backend, even when the
+ *     primary profile is remote. This is what allows local and remote profiles
+ *     to coexist in one desktop session.
+ *  5. A profile exposed by the primary remote backend shares it, scoped per
+ *     request instead.
+ *  6. Any other local profile gets its own pooled backend, spawned with
  *     `--profile`, so its `HERMES_HOME` scopes it.
  *
  * Routing used to be spread across three overlapping predicates that each
@@ -421,6 +432,14 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
   }
 
   if (opts.globalRemote) {
+    return { backend: 'primary', descriptorProfile: scopedProfile, scopePath: true }
+  }
+
+  if (opts.localProfile) {
+    return { backend: 'pool', descriptorProfile: null, scopePath: false }
+  }
+
+  if (opts.primaryBackendRemote) {
     return { backend: 'primary', descriptorProfile: scopedProfile, scopePath: true }
   }
 

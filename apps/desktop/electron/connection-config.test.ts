@@ -247,6 +247,34 @@ const ROUTES = [
     expected: { backend: 'primary', descriptorProfile: 'coder', scopePath: true }
   },
   {
+    name: 'a profile exposed by the primary remote backend shares it, scoped per request',
+    profile: 'ultra',
+    opts: { primaryProfile: 'remote', primaryBackendRemote: true, profileRemoteOverride: false },
+    expected: { backend: 'primary', descriptorProfile: 'ultra', scopePath: true }
+  },
+  {
+    name: 'a known local profile stays local while the primary profile is remote',
+    profile: 'dev',
+    opts: {
+      primaryProfile: 'remote',
+      primaryBackendRemote: true,
+      localProfile: true,
+      profileRemoteOverride: false
+    },
+    expected: { backend: 'pool', descriptorProfile: null, scopePath: false }
+  },
+  {
+    name: 'global remote mode still wins over a local profile',
+    profile: 'dev',
+    opts: {
+      primaryProfile: 'remote',
+      globalRemote: true,
+      localProfile: true,
+      profileRemoteOverride: false
+    },
+    expected: { backend: 'primary', descriptorProfile: 'dev', scopePath: true }
+  },
+  {
     name: 'a profile with its own remote override gets a pooled descriptor for that host',
     profile: 'coder',
     opts: { primaryProfile: 'default', globalRemote: true, profileRemoteOverride: true },
@@ -287,6 +315,17 @@ test('pathWithGlobalRemoteProfile appends profile in global remote mode', () => 
       profileRemoteOverride: false
     }),
     '/api/model/info?profile=iris'
+  )
+})
+
+test('pathWithGlobalRemoteProfile scopes profiles exposed by a primary remote backend', () => {
+  assert.equal(
+    pathWithGlobalRemoteProfile('/api/model/info', 'ultra', {
+      primaryBackendRemote: true,
+      primaryProfile: 'remote',
+      profileRemoteOverride: false
+    }),
+    '/api/model/info?profile=ultra'
   )
 })
 
@@ -412,6 +451,15 @@ test('buildGatewayWsUrl url-encodes the token', () => {
   assert.equal(buildGatewayWsUrl('https://host', 'a/b c+d'), 'wss://host/api/ws?token=a%2Fb%20c%2Bd')
 })
 
+test('buildGatewayWsUrl scopes a shared backend to the selected profile', () => {
+  const buildScopedWsUrl = buildGatewayWsUrl as unknown as (baseUrl: string, token: string, profile?: string) => string
+
+  assert.equal(
+    buildScopedWsUrl('https://host', 'token', 'ultra'),
+    'wss://host/api/ws?token=token&profile=ultra'
+  )
+})
+
 // --- buildGatewayWsUrlWithTicket (oauth) ---
 
 test('buildGatewayWsUrlWithTicket uses ?ticket= not ?token=', () => {
@@ -422,6 +470,19 @@ test('buildGatewayWsUrlWithTicket uses ?ticket= not ?token=', () => {
 
 test('buildGatewayWsUrlWithTicket url-encodes the ticket', () => {
   assert.equal(buildGatewayWsUrlWithTicket('https://host', 'a+b/c'), 'wss://host/api/ws?ticket=a%2Bb%2Fc')
+})
+
+test('buildGatewayWsUrlWithTicket scopes a shared backend to the selected profile', () => {
+  const buildScopedWsUrl = buildGatewayWsUrlWithTicket as unknown as (
+    baseUrl: string,
+    ticket: string,
+    profile?: string
+  ) => string
+
+  assert.equal(
+    buildScopedWsUrl('https://host', 'ticket', 'ultra'),
+    'wss://host/api/ws?ticket=ticket&profile=ultra'
+  )
 })
 
 // --- authModeFromStatus ---

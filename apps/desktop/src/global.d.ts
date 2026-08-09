@@ -512,6 +512,9 @@ export interface HermesConnection {
   // Set for pool (non-primary) backends so the renderer knows which profile a
   // connection belongs to.
   profile?: string
+  // Set when a non-primary profile shares the window's remote backend rather
+  // than owning a separate local/pool socket.
+  sharedBackend?: boolean
   windowButtonPosition: { x: number; y: number } | null
 }
 

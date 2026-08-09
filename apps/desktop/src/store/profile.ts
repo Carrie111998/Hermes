@@ -170,10 +170,16 @@ export function requestFreshSession(): void {
 // immediately (no real change → no invalidation), so single-profile users just
 // get "default" (→ the primary backend) with no extra fetches.
 let _lastRoutedProfile: string | null = null
+let _profileRouteInitialized = false
 
 $activeGatewayProfile.subscribe(value => {
   const key = normalizeProfileKey(value)
-  setApiRequestProfile(key)
+  // The store starts at "default" as a renderer-side placeholder, but the
+  // Electron main process may have launched the primary backend under another
+  // stored profile. Do not route early REST calls to an explicit default pool
+  // until boot has adopted the main process's actual primary profile.
+  setApiRequestProfile(_profileRouteInitialized ? key : null)
+  _profileRouteInitialized = true
 
   if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
     // Profile-scoped settings + the unified session list are now stale.

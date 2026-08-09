@@ -107,3 +107,14 @@ test('alive=false on a high attempt number still escalates (defense in depth)', 
 
   assert.equal(decision.hardReinstall, true)
 })
+
+test('remote primary never escalates to a local reinstall', () => {
+  const decision = decideBootstrapRepair({
+    attempt: 4,
+    primaryBackendAlive: false,
+    primaryBackendRemote: true
+  })
+
+  assert.equal(decision.hardReinstall, false)
+  assert.match(decision.reason, /remote backend/)
+})
