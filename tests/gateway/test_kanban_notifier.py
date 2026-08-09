@@ -516,3 +516,102 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_ignores_comments_by_default(tmp_path, monkeypatch):
+    """A `commented` event produces no notification when notify_on_comment is unset (#82080).
+
+    ``kanban.notify_on_comment`` defaults to off, so posting a comment on a
+    subscribed task must be byte-identical to today: no message sent, and the
+    comment never claimed off the subscription's cursor.
+    """
+    db_path = tmp_path / "comment-default-off.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a note", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="orchestrator", body="checking in on progress")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+
+
+def test_notifier_delivers_comment_when_enabled(tmp_path, monkeypatch):
+    """With `kanban.notify_on_comment: true`, a comment from another party notifies (#82080)."""
+    db_path = tmp_path / "comment-enabled.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"notify_on_comment": True}},
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a note", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="worker", body="blocked on missing credentials")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "orchestrator"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "worker" in text
+    assert "blocked on missing credentials" in text
+    # Wake self-post must NOT fire for a comment — informative, not terminal.
+    assert adapter.handled == []
+
+
+def test_notifier_skips_authors_own_comment(tmp_path, monkeypatch):
+    """The subscriber's own comment must not echo back to them (#82080).
+
+    Mirrors the self-skip in ``inject_new_comments_from_env`` — posting a
+    note authored by the same profile that owns the subscription produces no
+    notification, only a comment from someone else does.
+    """
+    db_path = tmp_path / "comment-self-skip.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"notify_on_comment": True}},
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a note", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="orchestrator", body="my own follow-up note")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "orchestrator"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    # Cursor still advances past the self-authored comment (claimed, not re-delivered).
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["commented"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []

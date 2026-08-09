@@ -853,6 +853,8 @@ bot> ✓ t_9fc1a3 completed by transcriber
 
 Subscriptions auto-remove themselves once the task reaches `done` or `archived`. If you script a create with `--json` (machine output) the auto-subscribe is skipped — the assumption is that scripted callers want to manage subscriptions explicitly via `/kanban notify-subscribe`.
 
+Set `kanban.notify_on_comment: true` in `config.yaml` to also get pinged whenever `/kanban comment` (or the `kanban_comment` tool) adds a note to a subscribed task — author and a truncated preview of the body. Off by default to avoid noise on chatty threads; a comment never wakes the creator's agent the way `completed`/`blocked`/etc. do, and you never get pinged about your own comment.
+
 ### Output truncation in messaging
 
 Gateway platforms have practical message-length caps. If `/kanban list`, `/kanban show`, or `/kanban tail` produce more than ~3800 characters of output, the response is truncated with a `… (truncated; use \`hermes kanban …\` in your terminal for full output)` footer. The CLI surface has no such cap.

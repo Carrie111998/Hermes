@@ -57,6 +57,23 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _kanban_comment_notify_enabled(load_config: Callable[[], Any]) -> bool:
+    """Return whether ``kanban.notify_on_comment`` is on (default: off, #82080).
+
+    Read fresh on every notifier tick — same live-toggle reasoning as
+    :func:`_resolve_auto_decompose_settings` — so flipping the flag takes
+    effect on the next tick, no gateway restart required. Fails safe: any
+    config-read error keeps comment notifications OFF, preserving the
+    byte-identical default behavior the acceptance criteria require.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return False
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    return bool(kcfg.get("notify_on_comment", False))
+
+
 def _kanban_dispatch_allowed() -> bool:
     """Return False while the global emergency stop (`hermes pause`) is engaged.
 
@@ -168,6 +185,10 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            _load_config = None
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -211,6 +232,15 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    # Only claim "commented" events when the config gate is
+                    # on. `claim_unseen_events_for_sub` filters by kind at
+                    # the SQL level (`kind IN (...)`), so leaving it out of
+                    # the tuple means those rows are never selected at
+                    # all — default behavior stays byte-identical to before
+                    # this kind existed.
+                    claim_kinds = TERMINAL_KINDS
+                    if _load_config and _kanban_comment_notify_enabled(_load_config):
+                        claim_kinds = TERMINAL_KINDS + ("commented",)
                     include_unowned = self._owns_kanban_dispatcher_lock()
                     notifier_profiles = {notifier_profile}
                     notifier_profiles.update(
@@ -341,7 +371,7 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=claim_kinds,
                                     )
                                     if not events:
                                         continue
@@ -497,6 +527,23 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "commented":
+                            # Only ever claimed when kanban.notify_on_comment
+                            # is on (see claim_kinds above). Skip pinging a
+                            # subscriber about their OWN comment — mirrors the
+                            # self-skip in inject_new_comments_from_env().
+                            comment_author = ""
+                            comment_body = ""
+                            if ev.payload:
+                                comment_author = str(ev.payload.get("author") or "").strip()
+                                comment_body = str(ev.payload.get("body") or "").strip()
+                            if comment_author and comment_author == (sub_profile or notifier_profile):
+                                continue
+                            preview = f": {comment_body[:160]}" if comment_body else ""
+                            msg = (
+                                f"💬 {board_tag}Kanban {sub['task_id']} comment"
+                                f" by {comment_author or 'operator'}{preview}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
