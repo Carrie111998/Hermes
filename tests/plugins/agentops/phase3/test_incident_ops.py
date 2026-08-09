@@ -4,7 +4,7 @@ from plugins.agentops.incident.dashboard import ReadOnlyDashboard
 from plugins.agentops.incident.state_machine import transition
 
 def sig(t, target="hermes:profile:default:gateway", severity="warning", payload=None):
-    return IncidentSignal(target, "processes", "process.snapshot", t, payload or {"command_fingerprint":"sha256:"+"a"*64,"state":"failed"}, severity)
+    return IncidentSignal(f"{target}:{int(t.timestamp())}:{severity}", target, "processes", "process.snapshot", t, payload or {"command_fingerprint":"sha256:"+"a"*64,"state":"failed"}, severity)
 
 def test_stable_cross_target_correlation_and_window_split():
     now=datetime.now(timezone.utc); service=IncidentOpsService(window_seconds=60)
