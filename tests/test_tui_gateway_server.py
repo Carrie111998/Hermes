@@ -14784,6 +14784,44 @@ def test_session_not_evictable_violating_each_exemption(monkeypatch):
     assert server._session_is_evictable("s", _idle_evictable_session(now), now) is False
 
 
+def test_standalone_stdio_session_not_evictable_even_when_idle(monkeypatch):
+    """A standalone ``hermes --tui`` session pinned to the real stdio
+    transport is exempt from the idle reaper: there the transport IS a
+    per-session liveness signal, unlike a shared WebSocket."""
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    now = time.time()
+    on_stdio = _idle_evictable_session(now) | {"transport": server._stdio_transport}
+    assert server._session_is_evictable("s", on_stdio, now) is False
+
+
+def test_reap_idle_sessions_skips_standalone_stdio_sessions(monkeypatch):
+    """Standalone ``hermes --tui`` sessions on the real stdio transport must
+    not be reaped by the idle TTL, even when idle past the timeout, while
+    WebSocket-backed idle sessions alongside them still are."""
+    closed = []
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(
+        server, "_close_session_by_id",
+        lambda sid, *, end_reason, predicate=None: closed.append((sid, end_reason)),
+    )
+    now = time.time()
+    live_transport = type("T", (), {"_closed": False})()
+    server._sessions.clear()
+    # Idle standalone stdio TUI — must NOT be reaped.
+    server._sessions["stdio_tui"] = _idle_evictable_session(now) | {
+        "transport": server._stdio_transport,
+    }
+    # Idle WebSocket-backed session alongside — must still be reaped.
+    server._sessions["ws_idle"] = _idle_evictable_session(now) | {
+        "transport": live_transport,
+    }
+    try:
+        server._reap_idle_sessions()
+        assert closed == [("ws_idle", "idle_timeout")]
+    finally:
+        server._sessions.clear()
+
+
 def test_reap_idle_sessions_evicts_live_transport_idle_sessions(monkeypatch):
     """#81837: idle sessions behind a live transport must still be reaped.
 

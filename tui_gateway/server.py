@@ -1150,14 +1150,20 @@ def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     # so their forever-unset agent_ready must not make them immortal.
     if ready is not None and not ready.is_set() and not session.get("lazy"):
         return False
-    # Drop the ``_transport_is_dead()`` gate: a shared WebSocket is a
-    # gateway-level liveness signal, not a per-session one, and ``last_active``
-    # is the correct per-session activity metric the TTL already checks.
-    # Without this, idle sessions behind a long-lived client (desktop app)
-    # are immortal and never reach ``_finalize_session`` — so the
+    # Keep the standalone `hermes --tui` exempt: its session is pinned to the
+    # real ``_stdio_transport``, and a healthy stdio transport is a per-session
+    # liveness signal — evicting it would kill a live TUI session. A shared
+    # WebSocket is a gateway-level liveness signal instead (desktop apps hold
+    # one open all day), so those sessions must NOT block eviction, and
+    # ``last_active`` is the correct per-session activity metric the TTL
+    # checks. Without the WS eviction, idle sessions behind a long-lived
+    # client are immortal and never reach ``_finalize_session`` — so the
     # ``on_session_end`` plugin hook / ``commit_memory_session`` never fire
     # for memory providers (#81837). Reopening re-resumes from SQLite, so
     # eviction is safe.
+    transport = session.get("transport")
+    if transport is _stdio_transport and not _transport_is_dead(transport):
+        return False
     last_active = float(session.get("last_active") or 0.0)
     created_at = float(session.get("created_at") or 0.0)
     return (now - last_active) > _SESSION_TTL_S and (now - created_at) > _SESSION_TTL_S
