@@ -305,7 +305,7 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         assert result.receipts[0]["status"] == "delivered"
         assert result.receipts[0]["transport"] == "standalone"
 
@@ -370,7 +370,7 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         relay.send_for_platform.assert_awaited_once()
         args = relay.send_for_platform.await_args.args
         assert args[:3] == (Platform.SLACK, "D123", "scheduled result")
@@ -441,7 +441,7 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         assert result.receipts[0]["status"] == "delivered"
         assert result.receipts[0]["transport"] == "live"
 
@@ -508,7 +508,7 @@ class TestDeliverResultErrorReturns:
                 provider_contacts=contacts,
             )
 
-        assert result.state is DeliveryState.AMBIGUOUS
+        assert result.state.value == DeliveryState.AMBIGUOUS.value
         assert result.receipts == ({
             "requested_target": target,
             "actual_target": target,
@@ -543,7 +543,7 @@ class TestDeliverResultErrorReturns:
                 provider_contacts=contacts,
             )
 
-        assert result.state is DeliveryState.FAILED
+        assert result.state.value == DeliveryState.FAILED.value
         assert result.receipts == ({
             "requested_target": target,
             "actual_target": target,
@@ -580,7 +580,7 @@ class TestDeliverResultErrorReturns:
 
         assert send.await_count == 1
         assert contacts == {}
-        assert result.state is DeliveryState.FAILED
+        assert result.state.value == DeliveryState.FAILED.value
         assert result.receipts[0]["status"] == "failed"
         assert result.receipts[0]["transport"] == "none"
 
@@ -613,7 +613,7 @@ class TestDeliverResultErrorReturns:
 
         assert send.await_count == 1
         assert contacts == {json.dumps(target, sort_keys=True): "standalone"}
-        assert result.state is DeliveryState.AMBIGUOUS
+        assert result.state.value == DeliveryState.AMBIGUOUS.value
         assert result.receipts[0]["status"] == "ambiguous"
         assert result.receipts[0]["transport"] == "standalone"
 
@@ -652,7 +652,7 @@ class TestDeliverResultErrorReturns:
             )
 
         assert contacts == {}
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         assert result.receipts[0]["transport"] == "standalone"
         standalone.assert_awaited_once()
 
@@ -902,6 +902,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._cron_preflight_enabled", return_value=False), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1072,6 +1073,7 @@ class TestRunJobSessionPersistence:
                 return {"final_response": "ok"}
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._cron_preflight_enabled", return_value=False), \
              patch("hermes_state.SessionDB", return_value=fake_db), \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
@@ -1956,7 +1958,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         # 1. cancel() was attempted (returned False = in flight).
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
         # 2. Dispatch happened but confirmation did not: never fabricate delivered.
-        assert result.state is DeliveryState.AMBIGUOUS
+        assert result.state.value == DeliveryState.AMBIGUOUS.value
         assert "confirmation timed out" in result
         # 3. The standalone fallback must NOT run — that is the #38922 fix:
         #    an in-flight confirmation timeout is ambiguous, not a resend.
@@ -1969,7 +1971,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         outcome = _deliver_result(job, "saved only")
 
         assert isinstance(outcome, DeliveryOutcome)
-        assert outcome.state is DeliveryState.SUPPRESSED
+        assert outcome.state.value == DeliveryState.SUPPRESSED.value
         assert outcome.error is None
 
     def test_live_adapter_timeout_before_dispatch_falls_back_to_standalone(self):
@@ -2028,7 +2030,7 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert cancel_calls == [True], "future.cancel() should be attempted"
         # The standalone path MUST run — the message was never sent.
         standalone_send.assert_awaited_once()
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
 
     def test_live_adapter_real_exception_falls_back_to_standalone(self):
         """A non-timeout send Exception (real failure, not a slow confirmation)
@@ -2078,7 +2080,7 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         # A real exception must NOT be assume-delivered: standalone runs.
         standalone_send.assert_awaited_once()
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
 
     def test_live_adapter_forum_topic_in_private_chat_routes_via_message_thread_id(self):
         """#52060: a cron target to a PRIVATE Telegram chat with a numeric topic
@@ -2135,7 +2137,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         adapter.send.assert_called_once()
         sent_chat_id, sent_text = adapter.send.call_args[0][0], adapter.send.call_args[0][1]
         sent_metadata = adapter.send.call_args[1]["metadata"]
@@ -2197,7 +2199,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         adapter.send.assert_called_once()
         sent_metadata = adapter.send.call_args[1]["metadata"]
         assert not sent_metadata.get("direct_messages_topic_id")
@@ -2259,7 +2261,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         adapter.send.assert_called_once()
         sent_metadata = adapter.send.call_args[1]["metadata"]
         assert not sent_metadata.get("direct_messages_topic_id")
@@ -2320,7 +2322,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         adapter.send.assert_called_once()
         sent_metadata = adapter.send.call_args[1]["metadata"]
         assert not sent_metadata.get("direct_messages_topic_id")
@@ -2379,7 +2381,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         adapter.send.assert_called_once()
         sent_metadata = adapter.send.call_args[1]["metadata"]
         # Genuine channel DM topic routes via direct_messages_topic_id, no bare
@@ -2578,7 +2580,7 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         assert result.receipts[0]["requested_target"]["thread_id"] == "17"
         assert result.receipts[0]["actual_target"]["thread_id"] is None
         # Forum target routes via message_thread_id (mode 1), not DM-topic.
@@ -2644,7 +2646,7 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         """send() returning None must trigger the standalone fallback, not a
         silent "delivered" log."""
         result, standalone_send = self._run(None)
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         standalone_send.assert_awaited_once()
 
     def test_result_missing_success_attr_falls_through(self):
@@ -2655,14 +2657,14 @@ class TestDeliverResultLiveAdapterUnconfirmed:
             pass
 
         result, standalone_send = self._run(_NoSuccess())
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         standalone_send.assert_awaited_once()
 
     def test_confirmed_success_does_not_fall_through(self):
         """A genuine SendResult(success=True) is confirmed — the standalone
         path must NOT run (no duplicate)."""
         result, standalone_send = self._run(MagicMock(success=True, raw_response=None))
-        assert result.state is DeliveryState.DELIVERED
+        assert result.state.value == DeliveryState.DELIVERED.value
         standalone_send.assert_not_awaited()
 
 class TestDeliverOriginUnresolvableIsLocal:
@@ -2684,13 +2686,13 @@ class TestDeliverOriginUnresolvableIsLocal:
 
     def test_origin_with_no_home_channels_returns_none(self, monkeypatch):
         job = {"id": "cli-job", "deliver": "origin", "origin": "cli-session-provenance"}
-        assert self._deliver(job, monkeypatch).state is DeliveryState.SUPPRESSED
+        assert self._deliver(job, monkeypatch).state.value == DeliveryState.SUPPRESSED.value
 
     def test_omitted_deliver_autodetect_returns_none(self, monkeypatch):
         # deliver key present but None (auto-detect) previously errored with
         # "no delivery target resolved for deliver=None".
         job = {"id": "cli-job", "deliver": None, "origin": "cli-session-provenance"}
-        assert self._deliver(job, monkeypatch).state is DeliveryState.SUPPRESSED
+        assert self._deliver(job, monkeypatch).state.value == DeliveryState.SUPPRESSED.value
 
     def test_explicit_platform_with_no_channel_still_errors(self, monkeypatch):
         # A concrete platform target that cannot resolve is still a real error

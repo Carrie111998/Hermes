@@ -109,7 +109,7 @@ def test_unknown_job_200_gone(monkeypatch):
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "ghost", "fire_at": "2026-08-01T09:10:00Z"})
+                           json={"job_id": "ghost", "fire_at": "2026-08-01T09:10:00+00:00"})
         assert resp.status_code == 200
         assert resp.json().get("status") == "gone"
     finally:
@@ -136,7 +136,7 @@ def test_valid_token_accepts_and_fires(monkeypatch):
     try:
         resp = client.post("/api/cron/fire",
                            headers={"Authorization": "Bearer good"},
-                           json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00Z"})
+                           json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00+00:00"})
         assert resp.status_code == 202
         assert resp.json()["job_id"] == "j1"
     finally:
@@ -167,7 +167,7 @@ def test_signed_claims_must_match_exact_job_and_nominal_fire(monkeypatch, claims
         resp = client.post(
             "/api/cron/fire",
             headers={"Authorization": "Bearer good"},
-            json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00Z"},
+            json={"job_id": "j1", "fire_at": "2026-08-01T09:10:00+00:00"},
         )
         assert resp.status_code == 401
     finally:
