@@ -1,6 +1,11 @@
 """Focused seam tests for the Discord command-payload extraction."""
 
+import ast
+import hashlib
 import inspect
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -225,21 +230,6 @@ def test_shims_keep_signatures_static_descriptor_and_module_ownership(adapter):
     assert "discord" not in command_sync.__dict__
 
 
-def test_instance_monkeypatches_route_through_safe_sync(adapter):
-    adapter._client = _sync_client(
-        {"name": "deploy", "type": 1, "marker": "desired"},
-        [_ExistingCommand(payload={"name": "deploy", "type": 1})],
-    )
-    adapter._existing_command_to_payload = MagicMock(
-        return_value={"name": "deploy", "marker": "existing"}
-    )
-    adapter._canonicalize_app_command_payload = MagicMock(
-        side_effect=lambda payload: {"marker": payload["marker"]}
-    )
-    adapter._patchable_app_command_payload = MagicMock(
-        side_effect=lambda payload: {"name": payload["name"]}
-    )
-
 @pytest.mark.asyncio
 async def test_instance_monkeypatches_route_through_safe_sync_async(adapter):
     adapter._client = _sync_client(
@@ -380,3 +370,159 @@ def test_package_registration_and_adapter_entry_point_remain_unchanged():
 
     assert register is adapter_module.register
     assert adapter_module.__name__ == "plugins.platforms.discord.adapter"
+
+
+_EXTRACTED_HELPER_NAMES = (
+    "_canonicalize_app_command_payload",
+    "_normalize_permissions",
+    "_existing_command_to_payload",
+    "_canonicalize_app_command_option",
+    "_patchable_app_command_payload",
+)
+
+
+def _class_method(tree, class_name, method_name):
+    classes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    ]
+    assert len(classes) == 1, f"expected one {class_name} class"
+    methods = [
+        node
+        for node in classes[0].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == method_name
+    ]
+    assert len(methods) == 1, f"expected one {method_name} method"
+    return methods[0]
+
+
+def _normalize_helper_ast(node):
+    """Compare implementation AST while ignoring only extraction bookkeeping."""
+    staticmethod_marker = ast.Name(
+        id="__staticmethod_owner__", ctx=ast.Load()
+    )
+    for descendant in ast.walk(node):
+        for attribute in ("lineno", "col_offset", "end_lineno", "end_col_offset"):
+            if hasattr(descendant, attribute):
+                setattr(descendant, attribute, None)
+        if isinstance(descendant, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            normalized_decorators = []
+            for decorator in descendant.decorator_list:
+                if isinstance(decorator, ast.Name) and decorator.id == "staticmethod":
+                    # The decorator belongs to the source class in each tree;
+                    # preserve its presence, but not that class's nesting.
+                    normalized_decorators.append(staticmethod_marker)
+                else:
+                    normalized_decorators.append(decorator)
+            descendant.decorator_list = normalized_decorators
+    return ast.dump(node, annotate_fields=True, include_attributes=True)
+
+
+def _adapter_shim_calls(tree):
+    calls = {}
+    for name in _EXTRACTED_HELPER_NAMES:
+        method = _class_method(tree, "DiscordAdapter", name)
+        returns = [node.value for node in method.body if isinstance(node, ast.Return)]
+        assert len(returns) == 1, f"{name} must have one forwarding return"
+        call = returns[0]
+        assert isinstance(call, ast.Call), f"{name} must forward by call"
+        assert isinstance(call.func, ast.Attribute)
+        assert isinstance(call.func.value, ast.Name)
+        assert call.func.value.id == "_CommandSyncHelpers"
+        assert call.func.attr == name
+        if name == "_normalize_permissions":
+            assert call.args and isinstance(call.args[0], ast.Name)
+            assert call.args[0].id == "value"
+        else:
+            assert call.args and isinstance(call.args[0], ast.Name)
+            assert call.args[0].id == "self", f"{name} must preserve dynamic self dispatch"
+        calls[name] = call
+    return calls
+
+
+def test_pinned_adapter_window_matches_golden_sha_for_all_extracted_helpers():
+    source_pin = "70c6cf8e7efde9bdbce013a493b577170f9b3d75"
+    source_path = "plugins/platforms/discord/adapter.py"
+    source = subprocess.check_output(["git", "show", f"{source_pin}:{source_path}"])
+    window = b"".join(source.splitlines(keepends=True)[2769:2859])
+
+    assert len(window) == 4230
+    assert hashlib.sha256(window).hexdigest() == (
+        "a916fc247b2ce306568c72dd4799633e9669fe928dc7961e9d3a0f4aa028bd3e"
+    )
+    for helper_name in _EXTRACTED_HELPER_NAMES:
+        assert f"def {helper_name}".encode() in window
+
+    historical_tree = ast.parse(source.decode("utf-8"))
+    current_source = Path(command_sync.__file__).read_text(encoding="utf-8")
+    current_tree = ast.parse(current_source)
+    for helper_name in _EXTRACTED_HELPER_NAMES:
+        historical = _class_method(historical_tree, "DiscordAdapter", helper_name)
+        current = _class_method(current_tree, "_CommandSyncHelpers", helper_name)
+        assert _normalize_helper_ast(
+            historical
+        ) == _normalize_helper_ast(current), (
+            f"{helper_name} implementation diverged from pinned adapter golden"
+        )
+
+    adapter_tree = ast.parse(
+        Path(adapter_module.__file__).read_text(encoding="utf-8")
+    )
+    _adapter_shim_calls(adapter_tree)
+    for name in _EXTRACTED_HELPER_NAMES:
+        expected = (
+            ["value"]
+            if name == "_normalize_permissions"
+            else ["self", "command"]
+            if name == "_existing_command_to_payload"
+            else ["self", "payload"]
+        )
+        assert list(inspect.signature(getattr(DiscordAdapter, name)).parameters) == expected
+    assert isinstance(inspect.getattr_static(DiscordAdapter, "_normalize_permissions"), staticmethod)
+
+
+def test_fresh_import_boundary_works_without_discord_available():
+    probe = r'''
+import importlib.abc
+import sys
+
+
+class DiscordBlocker(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "discord" or fullname.startswith("discord."):
+            raise ImportError("discord intentionally blocked")
+
+
+sys.meta_path.insert(0, DiscordBlocker())
+for module_name in list(sys.modules):
+    if module_name == "discord" or module_name.startswith("discord."):
+        del sys.modules[module_name]
+
+from plugins.platforms.discord import adapter, command_sync
+
+assert command_sync.__spec__ is not None
+assert "discord" not in command_sync.__dict__
+assert not any(
+    name == "discord" or name.startswith("discord.") for name in sys.modules
+)
+assert adapter._CommandSyncHelpers is command_sync._CommandSyncHelpers
+assert all(
+    hasattr(adapter.DiscordAdapter, name)
+    for name in (
+        "_canonicalize_app_command_payload",
+        "_normalize_permissions",
+        "_existing_command_to_payload",
+        "_canonicalize_app_command_option",
+        "_patchable_app_command_payload",
+    )
+)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
