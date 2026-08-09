@@ -1,6 +1,8 @@
 import { useStore } from '@nanostores/react'
 import { type ReactNode, useEffect, useState } from 'react'
+import { useNavigate } from 'react-router'
 
+import { NEW_CHAT_ROUTE } from '@/app/routes'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -12,6 +14,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { FolderOpen, Monitor, Package, RefreshCw } from '@/lib/icons'
 import { normalize } from '@/lib/text'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import {
   $agentPluginBusy,
   $agentPlugins,
@@ -174,6 +177,7 @@ function AgentPluginRowView({ row }: { row: AgentPluginRow }) {
 function AgentPluginsSection() {
   const { t } = useI18n()
   const p = t.settings.plugins
+  const navigate = useNavigate()
   const { requestGateway } = useGatewayRequest()
   const gatewayState = useStore($gatewayState)
   const connection = useStore($connection)
@@ -181,6 +185,7 @@ function AgentPluginsSection() {
   const status = useStore($agentPluginsStatus)
   const error = useStore($agentPluginsError)
   const [query, setQuery] = useState('')
+  const [installId, setInstallId] = useState('')
 
   useEffect(() => {
     if (gatewayState !== 'open') {
@@ -226,6 +231,35 @@ function AgentPluginsSection() {
           </Button>
         </div>
       )}
+
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row">
+        <input
+          className="min-w-0 flex-1 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[length:var(--conversation-caption-font-size)] outline-none placeholder:text-(--ui-text-tertiary) focus:border-(--ui-stroke-secondary)"
+          onChange={event => setInstallId(event.target.value)}
+          placeholder={p.installModal.repoPlaceholder}
+          spellCheck={false}
+          value={installId}
+        />
+        <Button
+          disabled={!installId.trim()}
+          onClick={() => {
+            const repo = installId.trim()
+
+            if (!repo) {
+              return
+            }
+
+            navigate(NEW_CHAT_ROUTE)
+            openPluginInstallRequest({ repo })
+            setInstallId('')
+          }}
+          size="sm"
+          type="button"
+          variant="secondary"
+        >
+          {p.installModal.installFromGit}
+        </Button>
+      </div>
 
       <input
         className="mb-2 w-full rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-quinary) px-3 py-1.5 text-[length:var(--conversation-caption-font-size)] outline-none placeholder:text-(--ui-text-tertiary) focus:border-(--ui-stroke-secondary)"
