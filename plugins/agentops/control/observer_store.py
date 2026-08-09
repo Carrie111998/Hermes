@@ -172,11 +172,13 @@ def _scan_database_secrets(connection: sqlite3.Connection) -> None:
                     raise ObserverStoreError("legacy database contains secret material")
 
 
-def _preflight_existing_database(path: Path) -> int:
+def _preflight_existing_database(path: Path, identity: tuple[tuple[int, int], ...] | None = None) -> int:
     """Read schema/integrity before any writable SQLite connection or WAL change."""
     try:
+        _verify_database_path(path, identity[0] if identity else None)
         connection = _readonly_connection(path)
         try:
+            _verify_database_path(path, identity[0] if identity else None)
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchone()
             if integrity is None or str(integrity[0]).lower() != "ok":
                 raise ObserverStoreError("observer database integrity invalid")
@@ -185,6 +187,8 @@ def _preflight_existing_database(path: Path) -> int:
                 raise ObserverStoreError("unmanaged observer database")
             versions = [int(row[0]) for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
             version = versions[-1] if versions else 0
+            if identity and _database_identity(path) != identity:
+                raise ObserverStoreError("observer database identity changed")
             if version == 1 and versions == [1] and tables == _LEGACY_TABLES:
                 _validate_schema_shape(connection, version)
                 _scan_database_secrets(connection)
@@ -220,6 +224,19 @@ def _create_empty_database(path: Path) -> None:
         os.close(parent_descriptor)
 
 
+def _database_identity(path: Path) -> tuple[tuple[int, int], ...]:
+    identities = []
+    for candidate in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+        if candidate.exists() or candidate.is_symlink():
+            meta = candidate.lstat()
+            if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1 or meta.st_uid != os.getuid() or _mode(candidate) != 0o600:
+                raise ObserverStoreError("observer database identity unsafe")
+            identities.append((meta.st_dev, meta.st_ino))
+        else:
+            identities.append((-1, -1))
+    return tuple(identities)
+
+
 def _verify_database_path(path: Path, identity: tuple[int, int] | None = None) -> None:
     meta = path.lstat()
     if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or _mode(path) != 0o600 or meta.st_nlink != 1:
@@ -241,21 +258,20 @@ class ObserverStore:
         self.path = observer_database_path(config)
         self._lock = threading.RLock()
         existed = self.path.exists()
-        prior_version = _preflight_existing_database(self.path) if existed else 0
-        identity = None
-        if existed:
-            meta = self.path.lstat()
-            identity = (meta.st_dev, meta.st_ino)
-            _verify_database_path(self.path, identity)
+        identity = _database_identity(self.path) if existed else None
+        prior_version = _preflight_existing_database(self.path, identity) if existed else 0
         if not existed:
             _create_empty_database(self.path)
         try:
             if existed:
-                _verify_database_path(self.path, identity)
+                if _database_identity(self.path) != identity:
+                    raise ObserverStoreError("observer database identity changed")
             self._connection = sqlite3.connect(self.path, check_same_thread=False)
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=5000")
             self._migrate(prior_version)
+            if existed and _database_identity(self.path) != identity:
+                raise ObserverStoreError("observer database identity changed")
             self._connection.execute("PRAGMA journal_mode=WAL")
             os.chmod(self.path, 0o600)
             if _mode(self.path) != 0o600:

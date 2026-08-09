@@ -69,8 +69,14 @@ def collect_all(
                 batches.append(failed_batch(target, name, "collector_timeout_worker_budget", source_id=source_id, worker_detached=True))
                 continue
             _worker_slots += 1
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
         slot_released = False
+        try:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
+        except Exception:
+            with _detached_lock:
+                _worker_slots = max(0, _worker_slots - 1)
+            batches.append(failed_batch(target, name, "collector_executor_unavailable", source_id=source_id))
+            continue
         try:
             future = executor.submit(collector.collect, target, cursor)
         except Exception:

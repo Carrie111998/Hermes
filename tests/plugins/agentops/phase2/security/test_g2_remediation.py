@@ -471,3 +471,9 @@ def test_bootstrap_coverage_reports_process_observer_unmanaged():
     from plugins.agentops.control.registry import bootstrap_gateway_registry
     coverage = bootstrap_gateway_registry().coverage_report()
     assert "processes" in coverage.unmanaged_collectors
+
+
+def test_factory_rejects_cron_budget_expansion():
+    from plugins.agentops.control.observer_models import CronExecution, CronObservation
+    with pytest.raises(ManifestValidationError):
+        build_collector("cron", target_kind=TargetKind.CRON, source_path=Path("/tmp/status.json"), observation=CronObservation(CronExecution("j", datetime.now(timezone.utc), 0, True), ()), max_assertions=99)
