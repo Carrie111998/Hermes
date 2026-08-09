@@ -6,7 +6,8 @@ import {
   bundledRuntimeImportCheck,
   detectRemoteDisplay,
   isWindowsBinaryPathInWsl,
-  isWslEnvironment
+  isWslEnvironment,
+  remoteDisplayGpuSwitches
 } from './bootstrap-platform'
 
 test('isWslEnvironment detects WSL2 env vars on linux', () => {
@@ -67,6 +68,28 @@ test('detectRemoteDisplay flags forwarded X11 displays but not local ones', () =
 
 test('detectRemoteDisplay flags RDP sessions', () => {
   assert.match(String(detectRemoteDisplay({ env: { SESSIONNAME: 'RDP-Tcp#7' }, platform: 'win32' })), /^rdp/)
+})
+
+test('remoteDisplayGpuSwitches adds only non-sandbox hardening for Windows RDP', () => {
+  const reason = detectRemoteDisplay({ env: { SESSIONNAME: 'RDP-Tcp#7' }, platform: 'win32' })
+  const switches = remoteDisplayGpuSwitches(reason)
+
+  assert.deepEqual(switches, ['disable-gpu', 'disable-gpu-compositing', 'in-process-gpu'])
+  assert.equal(switches.some(switchName => switchName.includes('sandbox')), false)
+})
+
+test('remoteDisplayGpuSwitches keeps SSH and X11 on the existing fallback', () => {
+  const sshReason = detectRemoteDisplay({
+    env: { SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22' },
+    platform: 'linux'
+  })
+  const x11Reason = detectRemoteDisplay({
+    env: { DISPLAY: 'localhost:10.0' },
+    platform: 'linux'
+  })
+
+  assert.deepEqual(remoteDisplayGpuSwitches(sshReason), ['disable-gpu-compositing'])
+  assert.deepEqual(remoteDisplayGpuSwitches(x11Reason), ['disable-gpu-compositing'])
 })
 
 test('detectRemoteDisplay honors the HERMES_DESKTOP_DISABLE_GPU override both ways', () => {
