@@ -12,13 +12,12 @@ class IncidentCorrelator:
         self.max_history = max_history
         self._incidents: dict[str, Incident] = {}
         self._history: list[Incident] = []
-        self._seen: set[str] = set()
+        self._seen: dict[str, Incident] = {}
 
     def ingest(self, signal: IncidentSignal) -> Incident:
         if signal.signal_id in self._seen:
             fp = incident_fingerprint(signal.signal_type, signal.payload, collector=signal.collector)
-            return self._incidents.get(fp) or self._history[-1]
-        self._seen.add(signal.signal_id)
+            return self._seen[signal.signal_id]
         fp = incident_fingerprint(signal.signal_type, signal.payload, collector=signal.collector)
         incident = self._incidents.get(fp)
         if incident is None:
@@ -36,7 +35,13 @@ class IncidentCorrelator:
         incident.last_seen = max(incident.last_seen, signal.observed_at)
         incident.targets.add(signal.target_id); incident.signal_count += 1
         incident.evidence.append(signal)
+        self._seen[signal.signal_id] = incident
+        if len(incident.evidence) > self.max_history: incident.evidence.pop(0)
         return incident
 
     def incidents(self) -> tuple[Incident, ...]: return tuple(self._incidents.values())
     def history(self) -> tuple[Incident, ...]: return tuple(self._history)
+    def suppress(self, fingerprint: str) -> None:
+        if fingerprint in self._incidents: self._incidents[fingerprint].state = "resolved"; self._incidents[fingerprint].history.append("suppressed")
+    def merge(self, target: Incident, source: Incident) -> Incident:
+        target.targets.update(source.targets); target.signal_count += source.signal_count; target.evidence.extend(source.evidence); target.history.append("merged"); return target
