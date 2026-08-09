@@ -5,6 +5,7 @@
   "version": "0.17.1",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
+  "homepage": "https://github.com/kotasiddharth/hermes-agent",
   "type": "module",
   "main": "dist/electron-main.mjs",
   "engines": {
