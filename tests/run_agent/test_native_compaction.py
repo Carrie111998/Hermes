@@ -171,6 +171,11 @@ class TestRejectionMatcher:
             "invalid value for compact_threshold"
         )
 
+    def test_non_400_status_never_matches_explicit_rejection_text(self):
+        assert not is_native_compaction_rejection(
+            "Unknown parameter: context_management", status_code=500
+        )
+
     def test_generic_errors_do_not_match(self):
         # Generic failures must take the normal retry path — a transient
         # 500 or timeout must never permanently disable native compaction.
@@ -182,6 +187,17 @@ class TestRejectionMatcher:
             None,
         ):
             assert not is_native_compaction_rejection(err)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "Error code: 500 - failed while processing context_management",
+            "Request timed out while sending compact_threshold",
+            "Connection reset while serializing context_management",
+        ],
+    )
+    def test_transient_errors_that_name_fields_do_not_match(self, error):
+        assert not is_native_compaction_rejection(error)
 
 
 class TestWirePlumbing:
@@ -352,6 +368,33 @@ class TestAgentInitConfig:
         )
         assert agent.codex_responses_native_compaction is False
         assert agent.codex_responses_compact_threshold == 200_000
+
+    @pytest.mark.parametrize(
+        ("configured", "expected"),
+        [("false", False), ("off", False), ("true", True), ("yes", True)],
+    )
+    def test_native_opt_in_uses_config_boolean_semantics(
+        self, monkeypatch, configured, expected
+    ):
+        from hermes_cli import config as config_mod
+        from run_agent import AIAgent
+
+        config = {"compression": {"codex_responses_native": configured}}
+        monkeypatch.setattr(config_mod, "load_config", lambda: config)
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: config)
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            api_mode="codex_responses",
+            model="gpt-5.6",
+            provider="openai-api",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+        assert agent.codex_responses_native_compaction is expected
 
     def test_kwargs_have_no_context_management_by_default(self):
         from run_agent import AIAgent

@@ -144,16 +144,38 @@ def native_compaction_context_management(
     return [{"type": "compaction", "compact_threshold": threshold}]
 
 
-def is_native_compaction_rejection(error: Any) -> bool:
-    """True when a provider error names the context_management field.
+def is_native_compaction_rejection(
+    error: Any,
+    *,
+    status_code: Optional[int] = None,
+) -> bool:
+    """True when a provider explicitly rejects the context_management field.
 
     Used by the conversation loop's one-shot recovery: strip the field,
     disable native compaction for the rest of the session, retry. Matching
     is deliberately narrow — generic 4xx/5xx/timeouts must NOT permanently
     downgrade native compaction, they take the normal retry path.
     """
+    if status_code is not None and status_code != 400:
+        return False
     text = str(error or "").lower()
-    return "context_management" in text or "compact_threshold" in text
+    if "context_management" not in text and "compact_threshold" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unknown parameter",
+            "unknown field",
+            "unrecognized parameter",
+            "unrecognized field",
+            "unsupported parameter",
+            "unsupported field",
+            "not supported",
+            "invalid parameter",
+            "invalid value",
+            "extra inputs are not permitted",
+        )
+    )
 
 
 def merge_interim_reasoning_items(

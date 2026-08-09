@@ -4494,7 +4494,9 @@ def run_conversation(
                     and bool(getattr(agent, "codex_responses_native_compaction", False))
                 ):
                     from agent.native_compaction import is_native_compaction_rejection
-                    if is_native_compaction_rejection(api_error):
+                    if is_native_compaction_rejection(
+                        api_error, status_code=status_code
+                    ):
                         _retry.native_compaction_reject_retry_attempted = True
                         agent.codex_responses_native_compaction = False
                         agent._vprint(
