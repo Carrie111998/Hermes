@@ -193,6 +193,18 @@ def _(rid, params: dict) -> dict:
                     "an ordinary prompt.submit must not drop session history "
                     "(update your Hermes client if a rewind was intended)",
                 )
+            # Desktop/TUI ordinals count the full displayed lineage. After
+            # compression, session["history"] holds only the tip segment while
+            # display_history_prefix holds the immutable ancestor display rows
+            # still shown in the transcript (#82462 / #69107). Translate to a
+            # tip-relative ordinal instead of loading ancestors into the tip
+            # (which would duplicate compressed history on later resumes).
+            prefix_user_count = sum(
+                1
+                for message in session.get("display_history_prefix", [])
+                if message.get("role") == "user" and not message.get("display_kind")
+            )
+            segment_ordinal = ordinal - prefix_user_count
             user_indices = [
                 i for i, m in enumerate(history)
                 if m.get("role") == "user" and not m.get("display_kind")
@@ -202,9 +214,21 @@ def _(rid, params: dict) -> dict:
             # indexing below (user_indices[-1] -> the LAST user turn), silently
             # truncating history to everything before it and persisting that loss
             # via replace_messages — an unrecoverable overwrite of the session DB.
-            if ordinal < 0 or ordinal >= len(user_indices):
-                return _err(rid, 4018, "target user message is no longer in session history")
-            truncated = history[: user_indices[ordinal]]
+            # Ancestor-only targets (segment_ordinal < 0) are not editable from
+            # this continuation segment — same stale-target path as tip OOR.
+            if segment_ordinal < 0 or segment_ordinal >= len(user_indices):
+                return _err(
+                    rid,
+                    4018,
+                    "target user message is no longer in session history",
+                    data={
+                        "user_turn_count": len(user_indices),
+                        "ordinal": ordinal,
+                        "segment_ordinal": segment_ordinal,
+                        "prefix_user_count": prefix_user_count,
+                    },
+                )
+            truncated = history[: user_indices[segment_ordinal]]
             # Second gate, on top of confirm_truncate: ordinal 0 resolves to
             # history[:0] == [] and replace_messages() DELETEs every durable
             # row. A confirmed rewind that happens to erase the whole

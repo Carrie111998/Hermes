@@ -2481,6 +2481,7 @@ export interface Translations {
     stopFailed: string
     regenerateFailed: string
     editFailed: string
+    editTurnUnavailable: string
     resumeFailed: string
     resumeStrandedTitle: string
     resumeStrandedBody: string

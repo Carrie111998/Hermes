@@ -1,4 +1,5 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
@@ -923,19 +924,49 @@ export function usePromptActions({
       const isStaleTargetError = (err: unknown) =>
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
 
+      const isCompressedAwayError = (err: unknown) => {
+        if (!(err instanceof JsonRpcGatewayError) || err.code !== 4018) {
+          return false
+        }
+
+        const data = err.data
+        if (!data || typeof data !== 'object') {
+          return false
+        }
+
+        const segmentOrdinal = (data as { segment_ordinal?: unknown }).segment_ordinal
+        return typeof segmentOrdinal === 'number' && segmentOrdinal < 0
+      }
+
       try {
         await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
       } catch (err) {
-        let surfaced = err
+        let surfaced: unknown = err
+        let unavailable = isCompressedAwayError(err)
 
-        if (!plan.isFailedTurn && isStaleTargetError(err)) {
+        // Stale tip ordinal after compression/resume drift: reload server
+        // history, recompute the ordinal against the refreshed transcript, and
+        // retry the real edit once. Do NOT plain-resubmit without an ordinal —
+        // that drops rewind semantics and still fails on long Grok sessions
+        // (#82462).
+        if (!plan.isFailedTurn && !unavailable && isStaleTargetError(err)) {
           try {
-            // Already interrupted on the first attempt — submit as a plain resend.
-            await submitRewindPrompt(sessionId, plan.text, undefined, false)
+            const storedId = selectedStoredSessionIdRef.current
+            if (storedId) {
+              await resumeStoredSession(storedId)
+            }
 
-            return
+            const refreshed = $messages.get()
+            const retryPlan = planEdit(refreshed, edited)
+            if (retryPlan && retryPlan.truncateOrdinal !== undefined) {
+              await submitRewindPrompt(sessionId, retryPlan.text, retryPlan.truncateOrdinal, false)
+              return
+            }
+
+            unavailable = true
           } catch (retryErr) {
             surfaced = retryErr
+            unavailable = isCompressedAwayError(retryErr) || isStaleTargetError(retryErr)
           }
         }
 
@@ -946,10 +977,19 @@ export function usePromptActions({
         setBusy(false)
         setAwaitingResponse(false)
         updateSessionState(sessionId, state => ({ ...state, busy: false, awaitingResponse: false, messages }))
-        notifyError(surfaced, copy.editFailed)
+        notifyError(surfaced, unavailable ? copy.editTurnUnavailable : copy.editFailed)
       }
     },
-    [activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [
+      activeSessionIdRef,
+      busyRef,
+      copy.editFailed,
+      copy.editTurnUnavailable,
+      resumeStoredSession,
+      selectedStoredSessionIdRef,
+      submitRewindPrompt,
+      updateSessionState
+    ]
   )
 
   const handleThreadMessagesChange = useCallback(
