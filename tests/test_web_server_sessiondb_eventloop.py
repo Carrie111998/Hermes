@@ -152,7 +152,8 @@ def test_get_session_stats_sessiondb_work_runs_off_event_loop(monkeypatch):
         def close(self):
             db_threads.append(threading.get_ident())
 
-    def _open(profile=None):
+    def _open(profile=None, *, read_only):
+        assert read_only is True
         db_threads.append(threading.get_ident())
         return _DB()
 
@@ -197,7 +198,8 @@ def test_get_session_stats_swallows_list_sessions_rich_error_off_event_loop(monk
             db_threads.append(threading.get_ident())
             closed.append(True)
 
-    def _open(profile=None):
+    def _open(profile=None, *, read_only):
+        assert read_only is True
         db_threads.append(threading.get_ident())
         return _DB()
 

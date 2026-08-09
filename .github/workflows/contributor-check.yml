@@ -25,4 +25,32 @@ jobs:
         run: git fetch --no-tags https://github.com/NousResearch/hermes-agent.git main:refs/remotes/upstream/main
 
       - name: Check contributor attribution
-        run: python scripts/check_contributor_attribution.py --base origin/main --head HEAD --upstream upstream/main
+        id: check-emails
+        run: |
+          set +e
+          python scripts/check_contributor_attribution.py \
+            --base origin/main --head HEAD --upstream upstream/main \
+            2>&1 | tee contributor-check.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            review_status='[]'
+          else
+            detail=$(<contributor-check.log)
+            review_status=$(jq -cn \
+              --arg detail "$detail" \
+              '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not attributed to a known author.","detail":$detail,"how_to_fix":"Add the missing contributor mapping and push the fix."}]}]')
+          fi
+          echo "review_status=$review_status" >> "$GITHUB_OUTPUT"
+          echo "review_status=$review_status" > review-status.json
+          exit "$status"
+
+      - name: Upload review status artifact
+        if: always() && steps.check-emails.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-status-contributor-check
+          path: review-status.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore

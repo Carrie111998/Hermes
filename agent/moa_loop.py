@@ -367,7 +367,7 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     if entry is not None:
         stamped_at, cached = entry
         if now - stamped_at < _RUNTIME_CACHE_TTL_SECONDS:
-            return cached
+            return dict(cached)
     out: dict[str, Any] = {"provider": provider, "model": model}
     if provider in CLI_EMULATED_ROUTES:
         from hermes_cli.config import is_provider_enabled, load_config
@@ -404,8 +404,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
         # provider/model kwargs for a full TTL.
         return out
     with _runtime_cache_lock:
-        _runtime_cache[cache_key] = (now, out)
-    return out
+        _runtime_cache[cache_key] = (now, dict(out))
+    return dict(out)
 
 
 def _merge_slot_extra_body(

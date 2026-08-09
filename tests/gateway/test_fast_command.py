@@ -22,6 +22,12 @@ class _CapturingAgent:
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
         self.tools = []
+        self._session_db = kwargs.get("session_db")
+        self._session_db_created = bool(self._session_db)
+        self.session_id = kwargs.get("session_id")
+        self.platform = kwargs.get("platform")
+        self.model = kwargs.get("model")
+        self.provider = kwargs.get("provider")
 
     def run_conversation(
         self,
@@ -31,6 +37,11 @@ class _CapturingAgent:
         persist_user_message=None,
         persist_user_timestamp=None,
     ):
+        from agent.turn_context import _maybe_title_session_at_turn_start
+
+        _maybe_title_session_at_turn_start(
+            self, [{"role": "user", "content": user_message}]
+        )
         type(self).last_run = {
             "user_message": user_message,
             "conversation_history": conversation_history,
@@ -307,7 +318,7 @@ async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, 
     mock_title.assert_called_once()
     callback = mock_title.call_args.kwargs["title_callback"]
     with patch.object(runner, "_schedule_discord_semantic_thread_rename") as mock_schedule:
-        callback("Semantic Session Title")
+        callback("Semantic Session Title", "llm")
     mock_schedule.assert_called_once()
     assert mock_schedule.call_args.args[1] == "session-1"
     assert mock_schedule.call_args.args[2] == "Semantic Session Title"
