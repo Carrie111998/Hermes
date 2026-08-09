@@ -227,8 +227,8 @@ def _build_provider_env_blocklist() -> frozenset:
     blocked: set[str] = set()
 
     try:
-        from hermes_cli.auth import PROVIDER_REGISTRY
-        for pconfig in PROVIDER_REGISTRY.values():
+        from hermes_cli.auth import get_known_provider_configs
+        for pconfig in get_known_provider_configs().values():
             blocked.update(pconfig.api_key_env_vars)
             if pconfig.auth_type == "aws_sdk":
                 blocked.update(_AWS_SDK_CREDENTIAL_ENV_VARS)

@@ -39,7 +39,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from types import MappingProxyType
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+)
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -571,7 +582,9 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
 }
-_STATIC_PROVIDER_REGISTRY = dict(PROVIDER_REGISTRY)
+_STATIC_PROVIDER_REGISTRY: Mapping[str, ProviderConfig] = MappingProxyType(
+    dict(PROVIDER_REGISTRY)
+)
 # The public registry resolves the immutable provider catalog for the caller's
 # current HERMES_HOME ContextVar.  No profile-specific endpoint is published
 # into process-global routing state.
@@ -751,6 +764,18 @@ def get_known_provider_config(provider_id: str) -> ProviderConfig | None:
     if static is not None:
         return static
     return None
+
+
+def get_known_provider_configs() -> Mapping[str, ProviderConfig]:
+    """Return a read-only snapshot of built-in and currently active metadata.
+
+    Built-in entries remain visible to security consumers when their bundled
+    plugin is disabled. Third-party entries are included only while present
+    in the current active registry.
+    """
+    known = dict(_STATIC_PROVIDER_REGISTRY)
+    known.update(PROVIDER_REGISTRY.items())
+    return MappingProxyType(known)
 
 
 def get_nous_service_config() -> ProviderConfig:

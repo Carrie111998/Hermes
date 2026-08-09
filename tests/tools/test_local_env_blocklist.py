@@ -392,6 +392,24 @@ class TestBlocklistCoverage:
                     f"(provider={pconfig.id}) missing from blocklist"
                 )
 
+    def test_disabled_bundled_provider_stays_blocked_after_restart(self, monkeypatch):
+        """Static bundled keys survive an empty/rebuilt active registry."""
+        from hermes_cli import auth
+        from tools.environments.local import _build_provider_env_blocklist
+
+        active = auth.ProviderConfig(
+            id="active-plugin",
+            name="Active plugin",
+            auth_type="api_key",
+            api_key_env_vars=("ACTIVE_PLUGIN_API_KEY",),
+        )
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
+
+        blocklist = _build_provider_env_blocklist()
+
+        assert {"GMI_API_KEY", "GMI_BASE_URL"}.issubset(blocklist)
+        assert "ACTIVE_PLUGIN_API_KEY" in blocklist
+
     def test_bedrock_bearer_token_is_in_blocklist(self):
         """auth_type='aws_sdk' providers contribute their Hermes-managed
         inference token (the Bedrock bearer) to the blocklist, keyed off

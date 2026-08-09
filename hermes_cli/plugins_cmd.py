@@ -875,6 +875,15 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     return None
 
 
+def _plugin_candidate_identities(key: str) -> set[str]:
+    """Return every config identity used by candidates for a canonical key."""
+    identities = {key, key.split("/")[-1]}
+    for entry in _discover_plugin_candidates():
+        if entry[5] == key:
+            identities.update((entry[0], entry[5]))
+    return identities
+
+
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
     """Write ``plugins.entries.<plugin_id>.<key> = value`` into config.yaml."""
     from hermes_cli.config import load_config, save_config
@@ -927,25 +936,14 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         source=source,
         kind=kind,
     ) == "enabled"
+    identities = _plugin_candidate_identities(key)
+    identities.update((name, manifest_name))
 
-    if not already_enabled:
+    if not already_enabled or bool(disabled & identities):
         enabled.add(key)
-        disabled.discard(key)
-        # Drop every alias of this plugin from the disabled list so an
-        # explicit disable under a different form can't keep it off. The
-        # loader's disable check matches on BOTH the canonical key
-        # (``web/firecrawl``) AND the manifest name (``web-firecrawl``);
-        # a stale entry under either form makes "explicit disable wins"
-        # (plugins.py) silently veto this enable. Discard the key, its
-        # bare leaf, and the manifest name. (#40190 follow-up.)
-        bare = key.split("/")[-1]
-        if bare != key:
-            disabled.discard(bare)
-        for entry in _discover_all_plugins():
-            # entry = (name, version, description, source, dir_path, key, kind)
-            if entry[5] == key:
-                disabled.discard(entry[0])
-                break
+        # An explicit disable on any candidate blocks the whole canonical
+        # group, so enabling must clear every bundled/user/project identity.
+        disabled.difference_update(identities)
         _save_enabled_set(enabled)
         _save_disabled_set(disabled)
         console.print(
@@ -2216,7 +2214,8 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     aliases = {name, manifest_name, key, key.split("/")[-1]}
 
     if enabled:
-        if status == "enabled":
+        aliases.update(_plugin_candidate_identities(key))
+        if status == "enabled" and not bool(dis & aliases):
             return {"ok": True, "name": name, "key": key, "unchanged": True}
         en.difference_update(aliases)
         en.add(key)

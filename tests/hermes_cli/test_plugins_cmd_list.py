@@ -158,6 +158,51 @@ def test_dashboard_toggle_response_keeps_input_name_and_adds_key(monkeypatch):
     assert result["key"] == "image_gen/xai"
 
 
+def test_dashboard_enable_clears_every_same_key_candidate_deny(monkeypatch):
+    candidates = [
+        ("bundled-shared", "1", "", "bundled", None, "shared", "backend"),
+        ("user-shared", "2", "", "user", None, "shared", "backend"),
+    ]
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_resolve_plugin_key_and_source",
+        lambda _name: ("shared", "user", "user-shared", "backend"),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+    monkeypatch.setattr(
+        plugins_cmd, "_get_disabled_set", lambda: {"bundled-shared"}
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_toggle_plugin_toolset", lambda *args, **kwargs: None
+    )
+
+    result = plugins_cmd.dashboard_set_agent_plugin_enabled("shared", enabled=True)
+
+    assert result["unchanged"] is False
+    assert saved == {"enabled": {"shared"}, "disabled": set()}
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[1]
+    ]
+
+
 def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path):
     bundled_dir = tmp_path / "bundled"
     user_dir = tmp_path / "user"

@@ -152,6 +152,53 @@ class TestEnableDisableNested:
         saved = mock_save_en.call_args[0][0]
         assert "disk-cleanup" in saved
 
+    def test_enable_clears_legacy_denies_for_every_same_key_candidate(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("bundled-shared", "1", "", "bundled", None, "shared", "backend"),
+            ("user-shared", "2", "", "user", None, "shared", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("shared", "user", "user-shared", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+        monkeypatch.setattr(
+            plugins_cmd, "_get_disabled_set", lambda: {"bundled-shared"}
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+        monkeypatch.setattr(plugins_cmd, "_set_plugin_entry_flag", lambda *args: None)
+
+        plugins_cmd.cmd_enable("shared", allow_tool_override=False)
+
+        assert saved == {"enabled": {"shared"}, "disabled": set()}
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+            candidates[1]
+        ]
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable — built-in tool override consent (issue #29249)
