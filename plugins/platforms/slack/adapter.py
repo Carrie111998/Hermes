@@ -1662,6 +1662,22 @@ class SlackAdapter(BasePlatformAdapter):
             }
         return specs
 
+    def profile_persona_for_name(self, profile_name: str) -> Optional[Dict[str, Any]]:
+        """Return the configured, validated Slack persona for a profile.
+
+        Outbound delegation transcripts use this public resolver instead of
+        trusting caller-supplied username/icon metadata.  That keeps visual
+        attribution limited to real multiplex profiles in the operator's
+        allowlist.
+        """
+        wanted = str(profile_name or "").strip().lower()
+        if not wanted:
+            return None
+        for spec in self._profile_invocation_specs().values():
+            if str(spec.get("profile") or "").lower() == wanted:
+                return dict(spec)
+        return None
+
     def _profile_route_store_path(self) -> _Path:
         captured = getattr(self, "_profile_route_store", None)
         if captured is not None:
@@ -2751,6 +2767,17 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             team_id = self._metadata_team_id(metadata)
             persona = _profile_persona.get()
+            metadata_persona = (
+                metadata.get(_PROFILE_PERSONA_METADATA_KEY)
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(metadata_persona, dict):
+                resolved_persona = self.profile_persona_for_name(
+                    metadata_persona.get("profile")
+                )
+                if resolved_persona is not None:
+                    persona = resolved_persona
             # Check for a pending slash-command context.  When the user ran a
             # native slash command (e.g. /q, /stop, /model), the initial ack
             # already showed an ephemeral "Running /cmd…" message.  If we have

@@ -133,6 +133,31 @@ async def test_profile_slash_is_public_customized_and_stamps_source(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_outbound_delegation_metadata_uses_validated_profile_persona(tmp_path):
+    adapter, client = _adapter(tmp_path / "routes.json")
+    with (
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        await adapter.send(
+            "C1",
+            "specialist answer",
+            metadata={
+                "slack_team_id": "T1",
+                "_slack_profile_persona": {
+                    "profile": "nami",
+                    "display_name": "forged",
+                    "icon_emoji": ":forged:",
+                },
+            },
+        )
+
+    kwargs = client.chat_postMessage.await_args.kwargs
+    assert kwargs["username"] == "Nami"
+    assert kwargs["icon_emoji"] == ":hermes_nami:"
+
+
+@pytest.mark.asyncio
 async def test_legacy_hermes_slash_routes_profile_without_extra_command_slot(tmp_path):
     adapter, client = _adapter(tmp_path / "routes.json")
     captured = []
