@@ -9,6 +9,8 @@ import sys
 import subprocess
 import shutil
 import importlib.util
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from hermes_cli.config import (
@@ -676,6 +678,31 @@ def _build_apikey_providers_list() -> list:
     except Exception:
         pass
     return _static
+
+
+def _validate_github_token(token: str) -> str:
+    """Return ``valid``, ``invalid``, or ``unavailable`` for a GitHub token.
+
+    A non-empty environment variable is not evidence that the credential is
+    accepted. Network and rate-limit failures are kept distinct from a 401 so
+    doctor never labels an unverified token as authenticated.
+    """
+    request = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": _HERMES_USER_AGENT,
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return "valid" if response.status == 200 else "unavailable"
+    except urllib.error.HTTPError as exc:
+        return "invalid" if exc.code == 401 else "unavailable"
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return "unavailable"
 
 
 def managed_scope_check() -> None:
@@ -2589,7 +2616,22 @@ def run_doctor(args):
 
     github_token = get_env_value("GITHUB_TOKEN") or get_env_value("GH_TOKEN")
     if github_token:
-        check_ok("GitHub token configured (authenticated API access)")
+        github_token_status = _validate_github_token(github_token)
+        if github_token_status == "valid":
+            check_ok("GitHub token configured (authenticated API access)", "(validated)")
+        elif github_token_status == "invalid":
+            _fail_and_issue(
+                "GitHub token rejected",
+                "(GitHub API returned 401 Unauthorized)",
+                "Replace the invalid GITHUB_TOKEN/GH_TOKEN in "
+                f"{_DHH}/.env, then run `hermes doctor` again",
+                issues,
+            )
+        else:
+            check_warn(
+                "GitHub token could not be validated",
+                "(GitHub API unavailable or token access was denied)",
+            )
     elif _gh_authenticated():
         check_ok("GitHub authenticated via gh CLI", "(full API access — no GITHUB_TOKEN needed)")
     else:
