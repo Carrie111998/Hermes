@@ -161,10 +161,54 @@ def _is_official_ssh_remote(url: str | None) -> bool:
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
-def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
+def _classify_git_stderr(stderr: str | None) -> Optional[str]:
+    """Map git stderr to a stable machine-readable error code."""
+    text = (stderr or "").lower()
+    if not text:
+        return None
+    if "dubious ownership" in text or "safe.directory" in text:
+        return "git-ownership"
+    if (
+        "permission denied" in text
+        or "read-only file system" in text
+        or "operation not permitted" in text
+    ):
+        return "git-permission"
+    if (
+        "could not resolve host" in text
+        or "unable to access" in text
+        or "network is unreachable" in text
+        or "connection refused" in text
+        or "timed out" in text
+        or "temporary failure in name resolution" in text
+    ):
+        return "offline"
+    return None
+
+
+def _git_cmd_prefix(cwd: Path, *, relax_ownership: bool) -> list[str]:
+    """Build a ``git`` argv prefix.
+
+    When ``relax_ownership`` is True, add a *process-local*
+    ``-c safe.directory=<abs>`` so read-only probes work on root-owned
+    checkouts (e.g. ``/opt/hermes-agent``). Never writes global git config.
+    """
+    cmd = ["git"]
+    if relax_ownership:
+        cmd.extend(["-c", f"safe.directory={cwd.resolve()}"])
+    return cmd
+
+
+def _git_run(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 5,
+    relax_ownership: bool = False,
+) -> Optional[subprocess.CompletedProcess]:
     try:
-        result = subprocess.run(
-            ["git", *args],
+        return subprocess.run(
+            [*_git_cmd_prefix(cwd, relax_ownership=relax_ownership), *args],
             capture_output=True,
             text=True,
             # git output is UTF-8; on Windows text=True defaults to the ANSI
@@ -177,7 +221,19 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
         )
     except Exception:
         return None
-    if result.returncode != 0:
+
+
+def _git_stdout(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 5,
+    relax_ownership: bool = False,
+) -> Optional[str]:
+    result = _git_run(
+        args, cwd=cwd, timeout=timeout, relax_ownership=relax_ownership
+    )
+    if result is None or result.returncode != 0:
         return None
     return (result.stdout or "").strip()
 
@@ -204,15 +260,59 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
+def repo_install_writable(repo_dir: Path) -> bool:
+    """True when this process can write the install root and its ``.git``."""
+    try:
+        if not os.access(repo_dir, os.W_OK):
+            return False
+        git_dir = repo_dir / ".git"
+        if git_dir.exists() and not os.access(git_dir, os.W_OK):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _check_via_local_git(repo_dir: Path) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Count commits behind origin/main in a local checkout.
+
+    Returns ``(behind, error_code, current_revision)``.
+
+    Uses process-local ``safe.directory`` for **read-only** git ops so
+    root-owned installs still report availability. Fetch (which writes
+    ``.git``) is attempted normally; if it cannot write, falls back to
+    ``HEAD`` + ``ls-remote`` (``UPDATE_AVAILABLE_NO_COUNT`` when SHAs differ).
+    Never sets global ``safe.directory``.
+    """
+    # Ownership-safe read of HEAD — needed both for the compare and for
+    # surfacing current_revision when the check otherwise fails.
+    head = _git_run(
+        ["rev-parse", "HEAD"], cwd=repo_dir, relax_ownership=True
+    )
+    head_rev = (head.stdout or "").strip() if head and head.returncode == 0 else None
+    head_err = _classify_git_stderr(head.stderr if head else None)
+
+    if not head_rev:
+        # Retry without relax in case the first failure was unrelated; still
+        # classify ownership from whichever attempt produced stderr.
+        return None, head_err or "check-failed", None
+
+    origin = _git_run(
+        ["remote", "get-url", "origin"], cwd=repo_dir, relax_ownership=True
+    )
+    origin_url = (
+        (origin.stdout or "").strip()
+        if origin and origin.returncode == 0
+        else None
+    )
+
     if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
+        checked = _check_via_rev(head_rev)
+        if checked is None:
+            return None, "offline", head_rev
         if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+            return 1, None, head_rev
+        return checked, None, head_rev
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -222,9 +322,15 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     # --depth 1 to preserve the boundary and compare tip SHAs instead of
     # counting. Full clones (developers, Docker dev images) keep the exact
     # count path unchanged. Mirrors the desktop fix in apps/desktop/electron/main.cjs.
-    shallow = _git_stdout(["rev-parse", "--is-shallow-repository"], cwd=repo_dir)
+    shallow = _git_stdout(
+        ["rev-parse", "--is-shallow-repository"],
+        cwd=repo_dir,
+        relax_ownership=True,
+    )
     is_shallow = shallow == "true"
 
+    fetch_ok = False
+    fetch_error: Optional[str] = None
     try:
         # Scope the fetch to the one branch the behind-count compares against.
         # An unscoped ``git fetch origin`` transfers every remote head (~1,400
@@ -234,43 +340,186 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        #
+        # Fetch writes into ``.git`` — do NOT pass safe.directory here as a
+        # way to paper over root-owned installs; if the tree isn't writable
+        # the fetch fails and we fall back to ls-remote below.
+        fetch_args = ["fetch", "origin", "main"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
-        subprocess.run(
-            fetch_args,
-            capture_output=True, timeout=10,
-            cwd=str(repo_dir),
+        # Fetch writes into ``.git`` — never pass process-local safe.directory
+        # here. Ownership / permission failures fall through to the read-only
+        # ls-remote compare below.
+        fetch_result = _git_run(
+            fetch_args, cwd=repo_dir, timeout=10, relax_ownership=False
         )
+        if fetch_result is not None and fetch_result.returncode == 0:
+            fetch_ok = True
+        elif fetch_result is not None:
+            fetch_error = _classify_git_stderr(fetch_result.stderr) or "check-failed"
     except Exception:
-        pass  # Offline or timeout — use stale refs, that's fine
+        fetch_error = "check-failed"
+
+    if not fetch_ok:
+        # Read-only / non-writable .git / offline fetch — compare tip SHAs
+        # via ls-remote against the official HTTPS remote. No local writes.
+        checked = _check_via_rev(head_rev)
+        if checked is not None:
+            return checked, None, head_rev
+        return None, fetch_error or "offline", head_rev
 
     if is_shallow:
         # No history to count across the shallow boundary. `origin/main` may not
         # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
         # updated by the fetch above) and fall back to origin/main.
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
-            _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            _git_stdout(
+                ["rev-parse", "FETCH_HEAD"], cwd=repo_dir, relax_ownership=True
+            )
+            or _git_stdout(
+                ["rev-parse", "origin/main"], cwd=repo_dir, relax_ownership=True
+            )
         )
-        if not head_rev or not target_rev:
-            return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if not target_rev:
+            checked = _check_via_rev(head_rev)
+            if checked is not None:
+                return checked, None, head_rev
+            return None, "check-failed", head_rev
+        behind = 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        return behind, None, head_rev
+
+    count = _git_run(
+        ["rev-list", "--count", "HEAD..origin/main"],
+        cwd=repo_dir,
+        relax_ownership=True,
+    )
+    if count is not None and count.returncode == 0:
+        try:
+            return int((count.stdout or "").strip()), None, head_rev
+        except ValueError:
+            pass
+
+    # Count failed (missing origin/main ref, etc.) — last-resort SHA compare.
+    checked = _check_via_rev(head_rev)
+    if checked is not None:
+        return checked, None, head_rev
+    return None, _classify_git_stderr(count.stderr if count else None) or "check-failed", head_rev
+
+
+def check_for_updates_details() -> Dict[str, Optional[object]]:
+    """Rich update check for API consumers.
+
+    Returns a dict with:
+      - behind: int | None (null only on true failure / N/A)
+      - error_code: str | None (set when behind is null due to a failed check)
+      - current_revision: str | None
+      - message: str | None
+      - repo_writable: bool | None (git installs only)
+    """
+    hermes_home = get_hermes_home()
+    cache_file = hermes_home / ".update_check"
+    embedded_rev = os.environ.get("HERMES_REVISION") or None
 
     try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=5,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            return int(result.stdout.strip())
+        from hermes_cli.config import detect_install_method, get_project_root
+        if detect_install_method(get_project_root()) == "docker":
+            return {
+                "behind": None,
+                "error_code": None,
+                "current_revision": None,
+                "message": None,
+                "repo_writable": None,
+            }
     except Exception:
         pass
-    return None
+
+    now = time.time()
+    try:
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if (
+                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
+                and cached.get("rev") == embedded_rev
+                and cached.get("ver") == VERSION
+            ):
+                return {
+                    "behind": cached.get("behind"),
+                    "error_code": cached.get("error_code"),
+                    "current_revision": cached.get("current_revision"),
+                    "message": cached.get("message"),
+                    "repo_writable": cached.get("repo_writable"),
+                }
+    except Exception:
+        pass
+
+    behind: Optional[int] = None
+    error_code: Optional[str] = None
+    current_revision: Optional[str] = embedded_rev
+    message: Optional[str] = None
+    repo_writable: Optional[bool] = None
+
+    if embedded_rev:
+        behind = _check_via_rev(embedded_rev)
+        if behind is None:
+            error_code = "offline"
+            message = "Couldn't reach the update source — try again later."
+    else:
+        repo_dir = Path(__file__).parent.parent.resolve()
+        if not (repo_dir / ".git").exists():
+            repo_dir = hermes_home / "hermes-agent"
+        if not (repo_dir / ".git").exists():
+            behind = None
+            # No checkout — not a failed check; caller (docker/unknown) decides.
+            error_code = None
+        else:
+            repo_writable = repo_install_writable(repo_dir)
+            behind, error_code, current_revision = _check_via_local_git(repo_dir)
+            if behind is None and error_code:
+                if error_code == "git-ownership":
+                    message = (
+                        "Git refused this checkout due to ownership mismatch. "
+                        "Updates can't be applied from this process; reinstall "
+                        "or fix directory ownership, then retry."
+                    )
+                elif error_code == "git-permission":
+                    message = (
+                        "The Hermes install directory isn't writable by this "
+                        "process, so the update check couldn't refresh refs. "
+                        "Update from an account that owns the install, or "
+                        "reinstall into a user-writable location."
+                    )
+                elif error_code == "offline":
+                    message = "Couldn't reach the update source — try again later."
+                else:
+                    message = "Couldn't check for updates — try again later."
+
+    try:
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "error_code": error_code,
+                    "current_revision": current_revision,
+                    "message": message,
+                    "repo_writable": repo_writable,
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return {
+        "behind": behind,
+        "error_code": error_code,
+        "current_revision": current_revision,
+        "message": message,
+        "repo_writable": repo_writable,
+    }
 
 
 def check_for_updates() -> Optional[int]:
@@ -284,65 +533,7 @@ def check_for_updates() -> Optional[int]:
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
     the check failed or doesn't apply. Cached for 6 hours.
     """
-    hermes_home = get_hermes_home()
-    cache_file = hermes_home / ".update_check"
-    embedded_rev = os.environ.get("HERMES_REVISION") or None
-
-    # Docker images have no working tree to count commits against — the
-    # published image excludes `.git` (see .dockerignore) and sets no
-    # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
-    # banner (build_welcome_banner) and the Ink badge (branding.tsx, guarded
-    # on `typeof === 'number' && > 0`) show nothing. The dashboard's REST
-    # `/api/hermes/update/check` endpoint short-circuits docker the same way
-    # (web_server.py); mirror that here so the banner/TUI surfaces agree.
-    try:
-        from hermes_cli.config import detect_install_method, get_project_root
-        if detect_install_method(get_project_root()) == "docker":
-            return None
-    except Exception:
-        pass
-
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
-    now = time.time()
-    try:
-        if cache_file.exists():
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if (
-                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
-                and cached.get("ver") == VERSION
-            ):
-                return cached.get("behind")
-    except Exception:
-        pass
-
-    if embedded_rev:
-        behind = _check_via_rev(embedded_rev)
-    else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
-        else:
-            behind = _check_via_local_git(repo_dir)
-
-    try:
-        cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-    return behind
+    return check_for_updates_details().get("behind")  # type: ignore[return-value]
 
 
 def _resolve_repo_dir() -> Optional[Path]:
