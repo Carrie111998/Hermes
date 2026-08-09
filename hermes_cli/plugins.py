@@ -33,6 +33,7 @@ so plugin-defined tools appear alongside the built-in tools.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import importlib.metadata
@@ -315,6 +316,8 @@ class PluginManifest:
     requires_env: List[Union[str, Dict[str, Any]]] = field(default_factory=list)
     provides_tools: List[str] = field(default_factory=list)
     provides_hooks: List[str] = field(default_factory=list)
+    # Optional declaration used by the pre-dotenv source-only discovery phase.
+    provides_secret_sources: List[str] = field(default_factory=list)
     source: str = ""        # "user", "project", or "entrypoint"
     path: Optional[str] = None
     # Plugin kind — see plugins.py module docstring for semantics.
@@ -359,6 +362,27 @@ class LoadedPlugin:
     # imported) loader. The module loads on first real use via the
     # platform_registry; see PluginManager._register_deferred_platform.
     deferred: bool = False
+
+
+class _SecretSourceBootstrapContext:
+    """Restricted plugin context used before normal plugin discovery."""
+
+    def __init__(self, manifest: PluginManifest):
+        self.manifest = manifest
+
+    def register_secret_source(self, source) -> None:
+        from agent.secret_sources.base import SecretSource
+        from agent.secret_sources.registry import register_source
+
+        if isinstance(source, SecretSource):
+            register_source(source)
+
+    def __getattr__(self, name: str):
+        # All non-secret capabilities wait for the ordinary discovery phase,
+        # which imports the plugin again with the complete PluginContext.
+        if name.startswith("register_"):
+            return lambda *args, **kwargs: None
+        raise AttributeError(name)
 
 
 # ---------------------------------------------------------------------------
@@ -1314,6 +1338,9 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        # Restricted pre-dotenv imports are tracked independently: they must
+        # never make ordinary plugin discovery look complete.
+        self._secret_source_bootstrap_paths: Set[str] = set()
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1539,6 +1566,133 @@ class PluginManager:
 
         return manifests
 
+    def discover_configured_secret_sources(
+        self,
+        home_path: Path,
+        configured_source_names: Set[str],
+    ) -> None:
+        """Import only enabled source plugins from one explicit Hermes home.
+
+        This restricted first phase scans only ``<home_path>/plugins`` and
+        reads ``plugins.enabled`` from that same home's config. It does not scan
+        bundled, project, or pip plugins and does not set ``_discovered``.
+        Normal discovery later imports plugins with the complete context.
+        """
+        if not configured_source_names or _env_enabled("HERMES_SAFE_MODE"):
+            return
+
+        home_path = Path(home_path)
+        try:
+            raw_config = fast_safe_load(
+                (home_path / "config.yaml").read_text(encoding="utf-8")
+            ) or {}
+        except Exception:
+            return
+        if not isinstance(raw_config, dict):
+            return
+        plugins_config = raw_config.get("plugins")
+        if not isinstance(plugins_config, dict):
+            return
+        enabled_value = plugins_config.get("enabled")
+        if not isinstance(enabled_value, list):
+            return
+        enabled = {value for value in enabled_value if isinstance(value, str)}
+        disabled_value = plugins_config.get("disabled", [])
+        disabled = (
+            {value for value in disabled_value if isinstance(value, str)}
+            if isinstance(disabled_value, list)
+            else set()
+        )
+        if not enabled:
+            return
+
+        from agent.secret_sources.registry import get_source
+
+        manifests = self._scan_directory(
+            home_path / "plugins",
+            source="user",
+            redact_errors=True,
+        )
+        winners: Dict[str, PluginManifest] = {}
+        for manifest in manifests:
+            winners[manifest.key or manifest.name] = manifest
+
+        for manifest in winners.values():
+            remaining_sources = {
+                name for name in configured_source_names if get_source(name) is None
+            }
+            if not remaining_sources:
+                break
+            lookup_key = manifest.key or manifest.name
+            if lookup_key in disabled or manifest.name in disabled:
+                continue
+            if lookup_key not in enabled and manifest.name not in enabled:
+                continue
+            if manifest.portable or not manifest.path:
+                continue
+
+            declared = set(manifest.provides_secret_sources)
+            if declared:
+                if declared.isdisjoint(remaining_sources):
+                    continue
+            elif not self._module_registers_secret_source(manifest):
+                # Legacy source plugins may predate manifest declarations.
+                # Inspect syntax rather than importing unrelated code as a probe.
+                continue
+
+            resolved_path = str(Path(manifest.path).resolve())
+            if resolved_path in self._secret_source_bootstrap_paths:
+                continue
+            self._load_secret_source_bootstrap_plugin(
+                manifest,
+                remaining_sources,
+            )
+
+    @staticmethod
+    def _module_registers_secret_source(manifest: PluginManifest) -> bool:
+        """Return whether the plugin entry module calls the source hook."""
+        try:
+            source = (Path(manifest.path) / "__init__.py").read_text(
+                encoding="utf-8"
+            )
+            tree = ast.parse(source)
+        except Exception:
+            return False
+        return any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register_secret_source"
+            for node in ast.walk(tree)
+        )
+
+    def _load_secret_source_bootstrap_plugin(
+        self,
+        manifest: PluginManifest,
+        configured_source_names: Set[str],
+    ) -> None:
+        """Run one source plugin with the restricted bootstrap context."""
+        from agent.secret_sources.registry import get_source
+
+        try:
+            module = self._load_directory_module(manifest)
+            register_fn = getattr(module, "register", None)
+            if register_fn is None:
+                return
+            register_fn(_SecretSourceBootstrapContext(manifest))
+        except Exception:
+            # Never interpolate third-party exception text: secret-manager SDKs
+            # may include rejected credential values in their errors.
+            logger.warning(
+                "Enabled secret-source plugin '%s' failed during bootstrap",
+                manifest.name,
+            )
+            return
+
+        if any(get_source(name) is not None for name in configured_source_names):
+            self._secret_source_bootstrap_paths.add(
+                str(Path(manifest.path).resolve())
+            )
+
     def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
         """Probe enabled portable MCP packages without loading plugins.
 
@@ -1604,6 +1758,7 @@ class PluginManager:
         path: Path,
         source: str,
         skip_names: Optional[Set[str]] = None,
+        redact_errors: bool = False,
     ) -> List[PluginManifest]:
         """Read ``plugin.yaml`` manifests from subdirectories of *path*.
 
@@ -1621,7 +1776,12 @@ class PluginManager:
         pass it now that categories are first-class).
         """
         return self._scan_directory_level(
-            path, source, skip_names=skip_names, prefix="", depth=0
+            path,
+            source,
+            skip_names=skip_names,
+            prefix="",
+            depth=0,
+            redact_errors=redact_errors,
         )
 
     def _scan_directory_level(
@@ -1632,6 +1792,7 @@ class PluginManager:
         skip_names: Optional[Set[str]],
         prefix: str,
         depth: int,
+        redact_errors: bool,
     ) -> List[PluginManifest]:
         """Recursive implementation of :meth:`_scan_directory`.
 
@@ -1654,7 +1815,11 @@ class PluginManager:
 
             if manifest_file.exists():
                 manifest = self._parse_manifest(
-                    manifest_file, child, source, prefix
+                    manifest_file,
+                    child,
+                    source,
+                    prefix,
+                    redact_errors=redact_errors,
                 )
                 if manifest is not None:
                     manifests.append(manifest)
@@ -1666,12 +1831,13 @@ class PluginManager:
                     from hermes_cli.agent_plugins import read_agent_plugin_manifest
 
                     data, diagnostics = read_agent_plugin_manifest(child)
-                    for diagnostic in diagnostics:
-                        logger.warning(
-                            "Agent Plugin '%s': %s",
-                            child,
-                            diagnostic.message,
-                        )
+                    if not redact_errors:
+                        for diagnostic in diagnostics:
+                            logger.warning(
+                                "Agent Plugin '%s': %s",
+                                child,
+                                diagnostic.message,
+                            )
                     key = f"{prefix}/{child.name}" if prefix else data["name"]
                     manifests.append(
                         PluginManifest(
@@ -1687,7 +1853,12 @@ class PluginManager:
                         )
                     )
                 except Exception as exc:
-                    logger.warning("Failed to parse %s: %s", portable_file, exc)
+                    if redact_errors:
+                        logger.warning(
+                            "Failed to parse plugin manifest during secret bootstrap"
+                        )
+                    else:
+                        logger.warning("Failed to parse %s: %s", portable_file, exc)
                 continue
 
             # No manifest at this level. If we're still within the depth
@@ -1705,6 +1876,7 @@ class PluginManager:
                     skip_names=None,
                     prefix=sub_prefix,
                     depth=depth + 1,
+                    redact_errors=redact_errors,
                 )
             )
 
@@ -1716,6 +1888,8 @@ class PluginManager:
         plugin_dir: Path,
         source: str,
         prefix: str,
+        *,
+        redact_errors: bool = False,
     ) -> Optional[PluginManifest]:
         """Parse a single ``plugin.yaml`` into a :class:`PluginManifest`.
 
@@ -1790,15 +1964,30 @@ class PluginManager:
                 requires_env=data.get("requires_env", []),
                 provides_tools=data.get("provides_tools", []),
                 provides_hooks=data.get("provides_hooks", []),
+                provides_secret_sources=[
+                    value
+                    for value in data.get("provides_secret_sources", [])
+                    if isinstance(value, str)
+                ]
+                if isinstance(data.get("provides_secret_sources", []), list)
+                else [],
                 source=source,
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
             )
         except Exception as exc:
-            logger.warning(
-                "Failed to parse %s: %s", manifest_file, exc, exc_info=_PLUGINS_DEBUG,
-            )
+            if redact_errors:
+                logger.warning(
+                    "Failed to parse plugin manifest during secret bootstrap"
+                )
+            else:
+                logger.warning(
+                    "Failed to parse %s: %s",
+                    manifest_file,
+                    exc,
+                    exc_info=_PLUGINS_DEBUG,
+                )
             return None
 
     # -----------------------------------------------------------------------
@@ -2274,6 +2463,17 @@ def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
     not mutate the process-wide plugin registry or import native plugin code.
     """
     return PluginManager().has_enabled_portable_mcp(raw_config)
+
+
+def discover_configured_secret_source_plugins(
+    home_path: Path,
+    configured_source_names: Set[str],
+) -> None:
+    """Run restricted pre-dotenv discovery for one explicit home."""
+    get_plugin_manager().discover_configured_secret_sources(
+        home_path,
+        configured_source_names,
+    )
 
 
 def discover_plugins(force: bool = False) -> None:

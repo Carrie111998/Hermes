@@ -17,15 +17,25 @@ def _write_secret_source_plugin(
     fetch_body: str,
     source_name: str = "startup_test_source",
     plugin_name: str = "startup-test-plugin",
+    declares_source: bool = True,
+    register_body: str | None = None,
 ) -> None:
     plugin_dir = home / "plugins" / plugin_name
     plugin_dir.mkdir(parents=True)
+    declaration = (
+        f"provides_secret_sources:\n  - {source_name}\n" if declares_source else ""
+    )
     (plugin_dir / "plugin.yaml").write_text(
         f"name: {plugin_name}\n"
         "kind: standalone\n"
         "version: 1.0.0\n"
-        "description: External secret-source startup test\n",
+        "description: External secret-source startup test\n"
+        f"{declaration}",
         encoding="utf-8",
+    )
+    register = register_body or (
+        "def register(ctx):\n"
+        "    ctx.register_secret_source(StartupTestSource())\n"
     )
     (plugin_dir / "__init__.py").write_text(
         "from agent.secret_sources.base import FetchResult, SecretSource\n"
@@ -38,8 +48,26 @@ def _write_secret_source_plugin(
         "    def fetch(self, cfg, home_path):\n"
         f"{fetch_body}\n"
         "\n"
+        f"{register}",
+        encoding="utf-8",
+    )
+
+
+def _write_unrelated_plugin(home: Path, marker: Path) -> None:
+    plugin_dir = home / "plugins" / "unrelated-plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: unrelated-plugin\n"
+        "kind: standalone\n"
+        "version: 1.0.0\n"
+        "description: Must not import during secret bootstrap\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n"
         "def register(ctx):\n"
-        "    ctx.register_secret_source(StartupTestSource())\n",
+        "    return None\n",
         encoding="utf-8",
     )
 
@@ -49,15 +77,20 @@ def _write_config(
     *,
     source_name: str = "startup_test_source",
     plugin_name: str = "startup-test-plugin",
+    include_sources: bool = True,
+    include_unrelated: bool = False,
 ) -> None:
+    enabled = [plugin_name]
+    if include_unrelated:
+        enabled.append("unrelated-plugin")
+    sources = f"  sources:\n    - {source_name}\n" if include_sources else ""
     (home / "config.yaml").write_text(
         "plugins:\n"
         "  enabled:\n"
-        f"    - {plugin_name}\n"
-        "secrets:\n"
-        "  sources:\n"
-        f"    - {source_name}\n"
-        f"  {source_name}:\n"
+        + "".join(f"    - {name}\n" for name in enabled)
+        + "secrets:\n"
+        + sources
+        + f"  {source_name}:\n"
         "    enabled: true\n"
         "    env:\n"
         "      STARTUP_TEST_API_KEY: test-ref\n",
@@ -65,13 +98,19 @@ def _write_config(
     )
 
 
-def _run_python(home: Path, code: str) -> subprocess.CompletedProcess[str]:
-    bundled = home / "empty-bundled-plugins"
-    bundled.mkdir(exist_ok=True)
+def _run_python(
+    cwd: Path,
+    code: str,
+    *,
+    process_home: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process_home = process_home or cwd
+    bundled = process_home / "empty-bundled-plugins"
+    bundled.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(
         {
-            "HERMES_HOME": str(home),
+            "HERMES_HOME": str(process_home),
             "HERMES_BUNDLED_PLUGINS": str(bundled),
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": os.pathsep.join(
@@ -83,7 +122,7 @@ def _run_python(home: Path, code: str) -> subprocess.CompletedProcess[str]:
     env.pop("STARTUP_TEST_API_KEY", None)
     return subprocess.run(
         [sys.executable, "-c", code],
-        cwd=home,
+        cwd=cwd,
         env=env,
         text=True,
         capture_output=True,
@@ -92,8 +131,10 @@ def _run_python(home: Path, code: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_first_dotenv_load_discovers_plugin_before_validation_and_apply(tmp_path):
+def test_first_load_imports_only_enabled_secret_source_plugins(tmp_path):
     secret_value = "startup-value-that-must-not-be-logged"
+    fetch_marker = tmp_path / "fetch-count"
+    unrelated_marker = tmp_path / "unrelated-imported"
     _write_secret_source_plugin(
         tmp_path,
         fetch_body=(
@@ -103,62 +144,157 @@ def test_first_dotenv_load_discovers_plugin_before_validation_and_apply(tmp_path
             f"        return FetchResult(secrets={{'STARTUP_TEST_API_KEY': {secret_value!r}}})"
         ),
     )
+    _write_unrelated_plugin(tmp_path, unrelated_marker)
+    _write_config(tmp_path, include_unrelated=True)
+
+    result = _run_python(
+        tmp_path,
+        "from pathlib import Path\n"
+        "import os\n"
+        "from hermes_cli.env_loader import get_secret_source, load_hermes_dotenv\n"
+        "from hermes_cli.plugins import get_plugin_manager\n"
+        "home = Path(os.environ['HERMES_HOME'])\n"
+        "load_hermes_dotenv(hermes_home=home)\n"
+        "load_hermes_dotenv(hermes_home=home)\n"
+        f"assert os.environ['STARTUP_TEST_API_KEY'] == {secret_value!r}\n"
+        "assert get_secret_source('STARTUP_TEST_API_KEY') == 'startup_test_source'\n"
+        "assert not get_plugin_manager()._discovered\n"
+        "print('targeted-bootstrap-ok')\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "targeted-bootstrap-ok"
+    assert fetch_marker.read_text() == "fetch\n"
+    assert not unrelated_marker.exists()
+    assert "unknown source" not in (result.stdout + result.stderr).lower()
+    assert secret_value not in result.stdout
+    assert secret_value not in result.stderr
+
+
+def test_explicit_non_process_home_is_honored(tmp_path):
+    process_home = tmp_path / "process-home"
+    target_home = tmp_path / "target-home"
+    process_home.mkdir()
+    target_home.mkdir()
+    _write_secret_source_plugin(
+        target_home,
+        fetch_body=(
+            "        (home_path / 'target-fetch').write_text(str(home_path))\n"
+            "        return FetchResult(secrets={'STARTUP_TEST_API_KEY': 'target-value'})"
+        ),
+    )
+    _write_config(target_home)
+
+    result = _run_python(
+        target_home,
+        "from pathlib import Path\n"
+        "import os\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        f"target = Path({str(target_home)!r})\n"
+        "load_hermes_dotenv(hermes_home=target)\n"
+        "assert os.environ['STARTUP_TEST_API_KEY'] == 'target-value'\n"
+        "assert (target / 'target-fetch').read_text() == str(target)\n"
+        "print('explicit-home-ok')\n",
+        process_home=process_home,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "explicit-home-ok"
+    assert not (process_home / "target-fetch").exists()
+
+
+def test_omitted_sources_list_uses_enabled_source_section(tmp_path):
+    _write_secret_source_plugin(
+        tmp_path,
+        declares_source=False,
+        fetch_body=(
+            "        return FetchResult(secrets={'STARTUP_TEST_API_KEY': 'legacy-value'})"
+        ),
+    )
+    _write_config(tmp_path, include_sources=False)
+
+    result = _run_python(
+        tmp_path,
+        "from pathlib import Path\n"
+        "import os\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        "home = Path(os.environ['HERMES_HOME'])\n"
+        "load_hermes_dotenv(hermes_home=home)\n"
+        "assert os.environ['STARTUP_TEST_API_KEY'] == 'legacy-value'\n"
+        "print('omitted-list-ok')\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "omitted-list-ok"
+
+
+def test_bootstrap_failure_is_fail_open_and_redacted(tmp_path):
+    sentinel = "bootstrap-exception-secret-that-must-not-be-logged"
+    _write_secret_source_plugin(
+        tmp_path,
+        fetch_body="        return FetchResult(secrets={})",
+        register_body=(
+            "def register(ctx):\n"
+            f"    raise RuntimeError({sentinel!r})\n"
+        ),
+    )
     _write_config(tmp_path)
 
     result = _run_python(
         tmp_path,
         "from pathlib import Path\n"
         "import os\n"
-        "from hermes_cli.env_loader import (\n"
-        "    get_secret_source, load_hermes_dotenv,\n"
-        ")\n"
-        "home = Path(os.environ['HERMES_HOME'])\n"
-        "load_hermes_dotenv(hermes_home=home)\n"
-        "load_hermes_dotenv(hermes_home=home)\n"
-        f"assert os.environ['STARTUP_TEST_API_KEY'] == {secret_value!r}\n"
-        "assert get_secret_source('STARTUP_TEST_API_KEY') == 'startup_test_source'\n"
-        "assert (home / 'fetch-count').read_text() == 'fetch\\n'\n"
-        "print('registered-before-apply')\n",
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        "load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']))\n"
+        "assert 'STARTUP_TEST_API_KEY' not in os.environ\n"
+        "print('bootstrap-survived')\n",
     )
 
-    assert result.returncode == 0, result.stderr
-    assert "registered-before-apply" in result.stdout
-    assert "unknown source" not in (result.stdout + result.stderr).lower()
-    assert secret_value not in result.stdout
-    assert secret_value not in result.stderr
+    assert result.returncode == 0
+    assert result.stdout.strip() == "bootstrap-survived"
+    assert sentinel not in result.stdout
+    assert sentinel not in result.stderr
 
 
-def test_plugin_discovery_failure_is_fail_open_and_does_not_log_value(
-    monkeypatch, caplog, capsys
-):
-    from agent.secret_sources import registry
-    from hermes_cli import env_loader, plugins
-
-    secret_value = "discovery-exception-secret-that-must-not-be-logged"
-    monkeypatch.setattr(registry, "get_source", lambda _name: None)
-
-    def _fail_discovery():
-        raise RuntimeError(secret_value)
-
-    monkeypatch.setattr(plugins, "discover_plugins", _fail_discovery)
-
-    env_loader._discover_configured_secret_source_plugins(
-        {"sources": ["startup_test_source"]}
-    )
-
-    captured = capsys.readouterr()
-    assert secret_value not in caplog.text
-    assert secret_value not in captured.out
-    assert secret_value not in captured.err
-
-
-def test_benign_secret_config_read_does_not_discover_or_fetch_plugin(tmp_path):
+def test_fetch_failure_is_fail_open_and_redacted(tmp_path):
+    sentinel = "fetch-exception-secret-that-must-not-be-logged"
     _write_secret_source_plugin(
         tmp_path,
-        fetch_body=(
-            "        (home_path / 'fetch-count').write_text('fetched')\n"
-            "        return FetchResult(secrets={'STARTUP_TEST_API_KEY': 'unused-value'})"
-        ),
+        fetch_body=f"        raise RuntimeError({sentinel!r})",
+    )
+    _write_config(tmp_path)
+
+    result = _run_python(
+        tmp_path,
+        "from pathlib import Path\n"
+        "import os\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        "load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']))\n"
+        "assert 'STARTUP_TEST_API_KEY' not in os.environ\n"
+        "print('fetch-survived')\n",
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "fetch-survived"
+    assert sentinel not in result.stdout
+    assert sentinel not in result.stderr
+
+
+def test_benign_secret_config_read_does_not_import_or_fetch_plugin(tmp_path):
+    import_marker = tmp_path / "plugin-imported"
+    plugin_dir = tmp_path / "plugins" / "startup-test-plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: startup-test-plugin\n"
+        "kind: standalone\n"
+        "provides_secret_sources:\n"
+        "  - startup_test_source\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(import_marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
     )
     _write_config(tmp_path)
 
@@ -172,35 +308,9 @@ def test_benign_secret_config_read_does_not_discover_or_fetch_plugin(tmp_path):
         "cfg = _load_secrets_config(home)\n"
         "assert cfg['sources'] == ['startup_test_source']\n"
         "assert get_source('startup_test_source') is None\n"
-        "assert not (home / 'fetch-count').exists()\n"
-        "assert 'STARTUP_TEST_API_KEY' not in os.environ\n"
         "print('config-read-only')\n",
     )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "config-read-only"
-    assert "unused-value" not in result.stderr
-
-
-def test_plugin_fetch_failure_is_fail_open_and_does_not_log_secret_value(tmp_path):
-    secret_value = "failure-value-that-must-not-be-logged"
-    _write_secret_source_plugin(
-        tmp_path,
-        fetch_body=f"        raise RuntimeError({secret_value!r})",
-    )
-    _write_config(tmp_path)
-
-    result = _run_python(
-        tmp_path,
-        "from pathlib import Path\n"
-        "import os\n"
-        "from hermes_cli.env_loader import load_hermes_dotenv\n"
-        "load_hermes_dotenv(hermes_home=Path(os.environ['HERMES_HOME']))\n"
-        "assert 'STARTUP_TEST_API_KEY' not in os.environ\n"
-        "print('startup-survived')\n",
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "startup-survived" in result.stdout
-    assert secret_value not in result.stdout
-    assert secret_value not in result.stderr
+    assert not import_marker.exists()
