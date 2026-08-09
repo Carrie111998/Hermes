@@ -17,6 +17,7 @@ import { test } from 'vitest'
 import {
   AT_COOKIE_VARIANTS,
   backendPoolTouchKeys,
+  touchBackendPoolEntries,
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
@@ -38,6 +39,7 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveRemoteBackendRail,
   resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
@@ -348,6 +350,22 @@ test('backendPoolTouchKeys refreshes both explicit root rails while preserving o
   assert.deepEqual(backendPoolTouchKeys(''), [])
 })
 
+test('touchBackendPoolEntries refreshes all pooled variants for an explicit root target', () => {
+  const pool = new Map([
+    ['default', { lastActiveAt: 1 }],
+    ['local:default', { lastActiveAt: 2 }],
+    ['remote:default', { lastActiveAt: 3 }],
+    ['writer', { lastActiveAt: 4 }]
+  ])
+
+  touchBackendPoolEntries(pool, 'default', 99)
+
+  assert.equal(pool.get('default')?.lastActiveAt, 99)
+  assert.equal(pool.get('local:default')?.lastActiveAt, 99)
+  assert.equal(pool.get('remote:default')?.lastActiveAt, 99)
+  assert.equal(pool.get('writer')?.lastActiveAt, 4)
+})
+
 test('resolveSavedGlobalRemoteRail uses a saved inactive SSH global backend for remote-only routing', () => {
   assert.deepEqual(
     resolveSavedGlobalRemoteRail({
@@ -362,6 +380,39 @@ test('resolveSavedGlobalRemoteRail uses a saved inactive SSH global backend for 
         token: { encrypted: 'redacted-token' }
       }
     }),
+    {
+      kind: 'ssh',
+      remoteKind: 'ssh',
+      ssh: {
+        mode: 'ssh',
+        host: 'devbox.internal',
+        user: 'operator',
+        port: 2222,
+        keyPath: '/redacted/key',
+        remoteProfile: 'default'
+      },
+      tokenRef: { encrypted: 'redacted-token' }
+    }
+  )
+})
+
+test('resolveRemoteBackendRail uses a saved inactive SSH global backend for remote-only routing', () => {
+  assert.deepEqual(
+    resolveRemoteBackendRail(
+      {
+        mode: 'local',
+        remote: {
+          mode: 'ssh',
+          host: 'devbox.internal',
+          user: 'operator',
+          port: 2222,
+          keyPath: '/redacted/key',
+          remoteProfile: 'default',
+          token: { encrypted: 'redacted-token' }
+        }
+      },
+      { remoteOnly: true }
+    ),
     {
       kind: 'ssh',
       remoteKind: 'ssh',

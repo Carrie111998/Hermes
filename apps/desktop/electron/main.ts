@@ -73,9 +73,11 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveRemoteBackendRail,
   resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   savedProfileSsh,
+  touchBackendPoolEntries,
   tokenPreview
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
@@ -7633,33 +7635,30 @@ function persistSshConnectionToken(profile, source, token) {
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
 async function resolveRemoteBackend(profile, options: any = {}) {
-  if (Reflect.get(options, 'localOnly') === true) {
+  const config = readDesktopConnectionConfig()
+  const explicitRail = resolveRemoteBackendRail(config, options)
+
+  if (explicitRail?.kind === 'local') {
     return null
   }
 
-  const config = readDesktopConnectionConfig()
+  if (explicitRail?.kind === 'ssh') {
+    const reuseToken = decryptDesktopSecret(explicitRail.tokenRef)
 
-  if (Reflect.get(options, 'remoteOnly') === true) {
-    const savedGlobal = resolveSavedGlobalRemoteRail(config)
+    return bootstrapSshConnection(null, explicitRail.ssh, reuseToken, 'settings')
+  }
 
-    if (savedGlobal?.kind === 'ssh') {
-      const reuseToken = decryptDesktopSecret(savedGlobal.tokenRef)
+  if (explicitRail?.kind === 'remote') {
+    const token = explicitRail.authMode === 'oauth' ? null : decryptDesktopSecret(explicitRail.tokenRef)
 
-      return bootstrapSshConnection(null, savedGlobal.ssh, reuseToken, 'settings')
-    }
-
-    if (savedGlobal?.kind === 'remote') {
-      const token = savedGlobal.authMode === 'oauth' ? null : decryptDesktopSecret(savedGlobal.tokenRef)
-
-      return buildRemoteConnection(
-        savedGlobal.url,
-        savedGlobal.authMode,
-        token,
-        'settings',
-        undefined,
-        savedGlobal.remoteKind
-      )
-    }
+    return buildRemoteConnection(
+      explicitRail.url,
+      explicitRail.authMode,
+      token,
+      'settings',
+      undefined,
+      explicitRail.remoteKind
+    )
   }
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
@@ -8215,13 +8214,7 @@ async function ensureBackend(profile, options = {}) {
 // renderer calls this when it opens a profile's chat WS and periodically while
 // streaming, since the main process can't see the direct renderer↔backend WS.
 function touchPoolBackend(profile) {
-  for (const key of backendPoolTouchKeys(profile)) {
-    const entry = backendPool.get(key)
-
-    if (entry) {
-      entry.lastActiveAt = Date.now()
-    }
-  }
+  touchBackendPoolEntries(backendPool, profile, Date.now())
 }
 
 // Evict least-recently-used pool backends until at most `keep` remain — but only

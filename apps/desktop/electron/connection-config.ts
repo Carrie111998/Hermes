@@ -400,6 +400,13 @@ export interface ProfileBackendRoute {
   scopePath: boolean
 }
 
+export type SavedGlobalRemoteRail =
+  | { kind: 'remote'; authMode: 'oauth' | 'token'; remoteKind: 'cloud' | 'url'; tokenRef: any; url: string }
+  | { kind: 'ssh'; remoteKind: 'ssh'; ssh: any; tokenRef: any }
+  | null
+
+export type RemoteBackendRail = SavedGlobalRemoteRail | { kind: 'local' }
+
 function backendPoolTouchKeys(profile) {
   const key = connectionScopeKey(profile)
 
@@ -410,7 +417,17 @@ function backendPoolTouchKeys(profile) {
   return [key, `local:${key}`, `remote:${key}`]
 }
 
-function resolveSavedGlobalRemoteRail(config) {
+function touchBackendPoolEntries(backendPool, profile, touchedAt = Date.now()) {
+  for (const key of backendPoolTouchKeys(profile)) {
+    const entry = backendPool.get(key)
+
+    if (entry) {
+      entry.lastActiveAt = touchedAt
+    }
+  }
+}
+
+function resolveSavedGlobalRemoteRail(config): SavedGlobalRemoteRail {
   const ssh = normalizeSshConfig(config?.remote)
 
   if (ssh) {
@@ -430,6 +447,18 @@ function resolveSavedGlobalRemoteRail(config) {
     tokenRef: config?.remote?.token,
     url
   }
+}
+
+function resolveRemoteBackendRail(config, options: any = {}): RemoteBackendRail | null {
+  if (Reflect.get(options, 'localOnly') === true) {
+    return { kind: 'local' }
+  }
+
+  if (Reflect.get(options, 'remoteOnly') === true) {
+    return resolveSavedGlobalRemoteRail(config)
+  }
+
+  return null
 }
 
 /**
@@ -648,9 +677,11 @@ export {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveRemoteBackendRail,
   resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
+  touchBackendPoolEntries,
   tokenPreview
 }
