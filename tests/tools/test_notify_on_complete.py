@@ -130,6 +130,38 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_arming_after_ultrafast_exit_enqueues_exactly_once(self, registry):
+        session = _make_session(notify_on_complete=False, output="done")
+        session.exited = True
+        session.exit_code = 0
+        registry._finished[session.id] = session
+
+        registry.arm_completion_notification(session)
+        registry.arm_completion_notification(session)
+
+        assert registry.completion_queue.qsize() == 1
+        completion = registry.completion_queue.get_nowait()
+        assert completion["session_id"] == session.id
+        assert completion["exit_code"] == 0
+
+    def test_ultrafast_local_processes_never_lose_completion(self, registry, tmp_path):
+        with patch.object(registry, "_write_checkpoint"):
+            sessions = []
+            for _ in range(50):
+                session = registry.spawn_local("true", cwd=str(tmp_path))
+                registry.arm_completion_notification(session)
+                sessions.append(session)
+
+            assert all(session._completion_event.wait(5) for session in sessions)
+
+        completions = []
+        while not registry.completion_queue.empty():
+            completions.append(registry.completion_queue.get_nowait())
+        assert len(completions) == len(sessions)
+        assert {event["session_id"] for event in completions} == {
+            session.id for session in sessions
+        }
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -195,6 +227,10 @@ class TestCodeExecutionBlocked:
     def test_notify_on_complete_blocked_in_sandbox(self):
         from tools.code_execution_tool import _TERMINAL_BLOCKED_PARAMS
         assert "notify_on_complete" in _TERMINAL_BLOCKED_PARAMS
+
+    def test_ci_wait_timeout_blocked_in_sandbox(self):
+        from tools.code_execution_tool import _TERMINAL_BLOCKED_PARAMS
+        assert "ci_wait_timeout" in _TERMINAL_BLOCKED_PARAMS
 
 
 # =========================================================================
@@ -301,17 +337,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     dummy_env = SimpleNamespace(env={})
 
     def fake_spawn_local(**kwargs):
-        return SimpleNamespace(
+        return ProcessSession(
             id="proc_silent_test",
+            command=kwargs["command"],
             pid=4242,
-            notify_on_complete=False,
-            watcher_platform="",
-            watcher_chat_id="",
-            watcher_user_id="",
-            watcher_user_name="",
-            watcher_thread_id="",
-            watcher_message_id="",
-            watcher_interval=0,
         )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
@@ -435,3 +464,436 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bounded CI wait promotion
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_schema_exposes_bounded_ci_wait():
+    from tools.terminal_tool import TERMINAL_SCHEMA
+
+    prop = TERMINAL_SCHEMA["parameters"]["properties"]["ci_wait_timeout"]
+    assert prop["type"] == "integer"
+    assert prop["minimum"] == 30
+    assert prop["maximum"] == 3600
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr checks --watch",
+        "gh pr checks 123 | cat",
+        "gh pr checks 123 && echo unsafe",
+        "gh issue checks 123",
+    ],
+)
+def test_ci_wait_rejects_unrecognized_command_shapes(command):
+    from tools.terminal_tool import _parse_gh_pr_checks
+
+    assert _parse_gh_pr_checks(command) is None
+
+
+def test_ci_wait_builds_checks_and_sha_drift_guard():
+    from tools.terminal_tool import _build_bounded_ci_wait_command, _parse_gh_pr_checks
+
+    parsed = _parse_gh_pr_checks("gh pr checks 123 --required --repo owner/repo")
+    assert parsed is not None
+
+    wrapper = _build_bounded_ci_wait_command(parsed, timeout=300)
+
+    assert "gh pr checks 123 --required --repo owner/repo" in wrapper
+    assert "gh pr view 123 --repo owner/repo --json headRefOid" in wrapper
+    assert "CI_WAIT_SUCCESS" in wrapper
+    assert "CI_WAIT_FAILURE" in wrapper
+    assert "CI_WAIT_TIMEOUT" in wrapper
+    assert "CI_WAIT_SHA_DRIFT" in wrapper
+
+
+def test_pending_ci_check_promotes_to_notifying_background_wait(monkeypatch, tmp_path):
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+    from types import SimpleNamespace
+
+    spawned = {}
+
+    class PendingEnv:
+        env = {}
+        cwd = str(tmp_path)
+
+        def execute(self, command, **kwargs):
+            if command.startswith("gh pr view"):
+                return {"returncode": 0, "output": f"{1:040d}"}
+            assert command == "gh pr checks 123 --required"
+            return {"returncode": 8, "output": "build\tpending"}
+
+    def fake_spawn_local(**kwargs):
+        spawned.update(kwargs)
+        return ProcessSession(
+            id="proc_ci_wait",
+            command=kwargs["command"],
+            pid=4242,
+        )
+
+    monkeypatch.setitem(tt._active_environments, "default", PendingEnv())
+    monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="gh pr checks 123 --required",
+                ci_wait_timeout=300,
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["exit_code"] == 8
+    assert result["ci_wait_status"] == "pending"
+    assert result["ci_wait_session_id"] == "proc_ci_wait"
+    assert result["notify_on_complete"] is True
+    assert "CI_WAIT_SHA_DRIFT" in spawned["command"]
+    assert f"ci_wait_expected_sha={1:040d}" in spawned["command"]
+
+
+@pytest.mark.parametrize(
+    ("kill_status", "expected_wait_status"),
+    [
+        ("error", "cleanup_failed"),
+        ("not_found", "cleanup_failed"),
+        ("killed", "not_started"),
+        ("already_exited", "not_started"),
+    ],
+)
+def test_pending_ci_reports_verified_waiter_cleanup(
+    monkeypatch, tmp_path, kill_status, expected_wait_status
+):
+    """Claim cleanup only for registry statuses that prove the waiter stopped."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    class PendingEnv:
+        env = {}
+        cwd = str(tmp_path)
+
+        def execute(self, command, **kwargs):
+            if command.startswith("gh pr view"):
+                return {"returncode": 0, "output": f"{1:040d}"}
+            assert command == "gh pr checks 123"
+            return {"returncode": 8, "output": "build\tpending"}
+
+    def fake_spawn_local(**kwargs):
+        return ProcessSession(
+            id="proc_cleanup_failed",
+            command=kwargs["command"],
+            pid=4242,
+        )
+
+    monkeypatch.setitem(tt._active_environments, "default", PendingEnv())
+    monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
+    monkeypatch.setattr(
+        process_registry_module.process_registry,
+        "kill_process",
+        lambda _session_id: {"status": kill_status, "error": "synthetic refusal"},
+    )
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: False)
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="gh pr checks 123",
+                ci_wait_timeout=300,
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["status"] == "error"
+    assert result["ci_wait_status"] == expected_wait_status
+    if expected_wait_status == "cleanup_failed":
+        assert result["ci_wait_session_id"] == "proc_cleanup_failed"
+        assert "could not be verified" in result["error"]
+        assert "no CI waiter was left running" not in result["error"]
+    else:
+        assert "ci_wait_session_id" not in result
+        assert "no CI waiter was left running" in result["error"]
+
+
+def test_promoted_ci_wait_enqueues_completion_wakeup(monkeypatch, tmp_path):
+    """Prove the promoted waiter reaches the existing async completion rail."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    gh = fake_bin / "gh"
+    gh.write_text(
+        """#!/bin/bash
+if [ "$1 $2" = "pr view" ]; then
+  printf '%040d\n' 1
+  exit 0
+fi
+printf 'build\tpass\n'
+exit 0
+"""
+    )
+    gh.chmod(0o755)
+    fake_shell = fake_bin / "shell"
+    fake_shell.write_text('#!/bin/bash\nexec /bin/bash -c "$2"\n')
+    fake_shell.chmod(0o755)
+
+    class PendingEnv:
+        cwd = str(tmp_path)
+        env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+        def execute(self, command, **kwargs):
+            if command.startswith("gh pr view"):
+                return {"returncode": 0, "output": f"{1:040d}"}
+            assert command == "gh pr checks 123"
+            return {"returncode": 8, "output": "build\tpending"}
+
+    fresh_registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", fresh_registry)
+    monkeypatch.setattr(process_registry_module, "_find_shell", lambda: str(fake_shell))
+    monkeypatch.setitem(tt._active_environments, "default", PendingEnv())
+    monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="gh pr checks 123",
+                ci_wait_timeout=300,
+                task_id="ci-wakeup-test",
+            )
+        )
+        process_id = result["ci_wait_session_id"]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            session = fresh_registry.get(process_id)
+            if (
+                session is not None
+                and session.exited
+                and not fresh_registry.completion_queue.empty()
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("promoted CI waiter did not exit")
+
+        notifications = fresh_registry.drain_notifications(
+            skip_poll_observed=False,
+        )
+    finally:
+        fresh_registry.kill_all()
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert len(notifications) == 1
+    event, synthetic_message = notifications[0]
+    assert event["session_id"] == process_id
+    assert event["exit_code"] == 0
+    assert "CI_WAIT_SUCCESS" in synthetic_message
+
+
+def test_ci_wait_option_fails_closed_for_non_gh_command(monkeypatch, tmp_path):
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+
+    result = json.loads(
+        tt.terminal_tool(command="pytest -q", ci_wait_timeout=300)
+    )
+
+    assert "requires an exact `gh pr checks" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_rc", "marker", "expected_checks", "expected_views"),
+    [
+        ("success", 0, "CI_WAIT_SUCCESS", 2, 4),
+        ("success-drift", 75, "CI_WAIT_SHA_DRIFT", 2, 4),
+        ("failure", 1, "CI_WAIT_FAILURE", 1, 2),
+        ("failure-drift", 75, "CI_WAIT_SHA_DRIFT", 1, 2),
+        ("timeout", 124, "CI_WAIT_TIMEOUT", 1, 2),
+        ("drift", 75, "CI_WAIT_SHA_DRIFT", 0, 1),
+        ("post-pending-drift", 75, "CI_WAIT_SHA_DRIFT", 1, 2),
+        ("in-loop-drift", 75, "CI_WAIT_SHA_DRIFT", 1, 3),
+        ("lookup-pre", 70, "CI_WAIT_SHA_LOOKUP_FAILURE", 0, 1),
+        ("lookup-post", 70, "CI_WAIT_SHA_LOOKUP_FAILURE", 1, 2),
+    ],
+)
+def test_bounded_ci_wait_wrapper_resolves_explicitly(
+    tmp_path, mode, expected_rc, marker, expected_checks, expected_views
+):
+    """Exercise the generated poller as a real shell process.
+
+    Fake date/sleep binaries make backoff deterministic and instantaneous;
+    the wrapper itself, its gh exit-code handling, and every terminal state are
+    real rather than mocked.
+    """
+    import subprocess
+
+    from tools.terminal_tool import _build_bounded_ci_wait_command, _parse_gh_pr_checks
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    gh = fake_bin / "gh"
+    gh.write_text(
+        """#!/bin/bash
+mode=$CI_WAIT_TEST_MODE
+if [ "$1 $2" = "pr view" ]; then
+  count=$(cat "$CI_WAIT_TEST_DIR/view_count" 2>/dev/null || printf 0)
+  printf '%s' $((count + 1)) > "$CI_WAIT_TEST_DIR/view_count"
+  [ "$mode" = lookup-pre ] && [ "$count" -ge 0 ] && exit 1
+  [ "$mode" = lookup-post ] && [ "$count" -ge 1 ] && exit 1
+  if { [ "$mode" = drift ] && [ "$count" -ge 0 ]; } ||
+     { [ "$mode" = post-pending-drift ] && [ "$count" -ge 1 ]; } ||
+     { [ "$mode" = in-loop-drift ] && [ "$count" -ge 2 ]; } ||
+     { [ "$mode" = success-drift ] && [ "$count" -ge 3 ]; } ||
+     { [ "$mode" = failure-drift ] && [ "$count" -ge 1 ]; }; then
+    printf '%040d\n' 2
+  else
+    printf '%040d\n' 1
+  fi
+  exit 0
+fi
+count=$(cat "$CI_WAIT_TEST_DIR/check_count" 2>/dev/null || printf 0)
+printf '%s' $((count + 1)) > "$CI_WAIT_TEST_DIR/check_count"
+case "$mode" in
+  success|success-drift) [ "$count" -eq 0 ] && exit 8; printf 'build\tpass\n'; exit 0 ;;
+  failure|failure-drift) printf 'build\tfail\n'; exit 1 ;;
+  timeout) exit 8 ;;
+esac
+exit 8
+"""
+    )
+    gh.chmod(0o755)
+
+    fake_date = fake_bin / "date"
+    fake_date.write_text(
+        """#!/bin/bash
+count=$(cat "$CI_WAIT_TEST_DIR/date_count" 2>/dev/null || printf 0)
+printf '%s' $((count + 1)) > "$CI_WAIT_TEST_DIR/date_count"
+if [ "$CI_WAIT_TEST_MODE" = timeout ] && [ "$count" -ge 1 ]; then
+  printf '101\n'
+else
+  printf '100\n'
+fi
+"""
+    )
+    fake_date.chmod(0o755)
+    fake_sleep = fake_bin / "sleep"
+    fake_sleep.write_text("#!/bin/bash\nexit 0\n")
+    fake_sleep.chmod(0o755)
+
+    parsed = _parse_gh_pr_checks("gh pr checks 123")
+    assert parsed is not None
+    wrapper = _build_bounded_ci_wait_command(
+        parsed, timeout=1, expected_sha=f"{1:040d}"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "CI_WAIT_TEST_MODE": mode,
+            "CI_WAIT_TEST_DIR": str(tmp_path),
+        }
+    )
+
+    completed = subprocess.run(
+        ["/bin/bash", "-c", wrapper],
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == expected_rc, completed.stdout + completed.stderr
+    assert marker in completed.stdout
+    check_count = tmp_path / "check_count"
+    actual_checks = int(check_count.read_text()) if check_count.exists() else 0
+    assert actual_checks == expected_checks
+    assert int((tmp_path / "view_count").read_text()) == expected_views
+
+
+@pytest.mark.parametrize("checks_rc", [0, 1, 8])
+def test_foreground_ci_result_fails_closed_when_head_changes(
+    monkeypatch, tmp_path, checks_rc
+):
+    """Success and failure are both invalid when the PR head moved mid-check."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+
+    class DriftingEnv:
+        env = {}
+        cwd = str(tmp_path)
+        view_calls = 0
+        checks_calls = 0
+
+        def execute(self, command, **kwargs):
+            if command.startswith("gh pr view"):
+                self.view_calls += 1
+                return {
+                    "returncode": 0,
+                    "output": f"{self.view_calls:040d}",
+                }
+            assert command == "gh pr checks 123"
+            self.checks_calls += 1
+            return {"returncode": checks_rc, "output": "checks result"}
+
+    env = DriftingEnv()
+    monkeypatch.setitem(tt._active_environments, "default", env)
+    try:
+        result = json.loads(
+            tt.terminal_tool(command="gh pr checks 123", ci_wait_timeout=300)
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["exit_code"] == 75
+    assert "CI_WAIT_SHA_DRIFT" in result["output"]
+    assert env.view_calls == 2
+    assert env.checks_calls == 1
+
+
+@pytest.mark.parametrize(("failure_at", "expected_checks"), [(1, 0), (2, 1)])
+def test_foreground_ci_fails_closed_on_sha_lookup_error(
+    monkeypatch, tmp_path, failure_at, expected_checks
+):
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+
+    class LookupFailureEnv:
+        env = {}
+        cwd = str(tmp_path)
+        view_calls = 0
+        checks_calls = 0
+
+        def execute(self, command, **kwargs):
+            if command.startswith("gh pr view"):
+                self.view_calls += 1
+                if self.view_calls == failure_at:
+                    return {"returncode": 1, "output": "lookup failed"}
+                return {"returncode": 0, "output": f"{1:040d}"}
+            assert command == "gh pr checks 123"
+            self.checks_calls += 1
+            return {"returncode": 0, "output": "build\tpass"}
+
+    env = LookupFailureEnv()
+    monkeypatch.setitem(tt._active_environments, "default", env)
+    try:
+        result = json.loads(
+            tt.terminal_tool(command="gh pr checks 123", ci_wait_timeout=300)
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert set(result) == {"error"}
+    if failure_at == 1:
+        assert "Unable to bind the CI wait" in result["error"]
+        assert "no checks command or waiter was started" in result["error"]
+    else:
+        assert "Unable to revalidate the PR head" in result["error"]
+    assert env.view_calls == failure_at
+    assert env.checks_calls == expected_checks
