@@ -10,6 +10,7 @@ Usage:
 """
 
 import contextlib
+from contextvars import ContextVar
 from contextlib import asynccontextmanager, contextmanager
 
 import asyncio
@@ -333,6 +334,9 @@ def _resolve_session_token() -> str:
 
 _SESSION_TOKEN = _resolve_session_token()
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_DASHBOARD_AUTH_REQUEST: ContextVar[Optional[Request]] = ContextVar(
+    "hermes_dashboard_auth_request", default=None
+)
 _SSH_OWNER_NONCE: Optional[str] = None
 
 
@@ -413,6 +417,24 @@ def _has_valid_session_token(request: Request) -> bool:
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
     return hmac.compare_digest(auth.encode(), expected.encode())
+
+
+def verified_dashboard_owner(request: Request) -> Optional[tuple[str, str]]:
+    """Return owner provenance only for a request authenticated by this app."""
+    if request.app is not app:
+        return None
+    if getattr(request.app.state, "auth_required", False):
+        if _DASHBOARD_AUTH_REQUEST.get() is not request:
+            return None
+        session = getattr(request.state, "session", None)
+        identity = str(getattr(session, "user_id", "") or "").strip()
+        provider = str(getattr(session, "provider", "") or "").strip()
+        if not identity or not provider:
+            return None
+        return identity, f"dashboard_session:{provider}"
+    if _has_valid_session_token(request):
+        return f"local:{os.getuid()}", "dashboard_session_token"
+    return None
 
 
 # Routes that may also authenticate via a ``?token=`` query param, for download
@@ -644,7 +666,17 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 @app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
-    return await gated_auth_middleware(request, call_next)
+
+    async def authenticated_call_next(authenticated_request: Request):
+        if getattr(authenticated_request.state, "session", None) is None:
+            return await call_next(authenticated_request)
+        marker = _DASHBOARD_AUTH_REQUEST.set(authenticated_request)
+        try:
+            return await call_next(authenticated_request)
+        finally:
+            _DASHBOARD_AUTH_REQUEST.reset(marker)
+
+    return await gated_auth_middleware(request, authenticated_call_next)
 
 
 @app.middleware("http")

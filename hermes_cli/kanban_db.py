@@ -192,21 +192,11 @@ def normalize_not_before(value: Optional[str]) -> Optional[str]:
 
 
 _NOT_BEFORE_OVERRIDE_SEAL = object()
-_VERIFIED_OWNER_SEAL = object()
 
 
-@dataclass(frozen=True)
-class VerifiedKanbanOwner:
-    """Identity minted by a trusted dashboard/CLI authentication seam."""
-
-    identity: str
-    authenticated_by: str
-    _seal: object = field(repr=False, compare=False)
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class OwnerNotBeforeOverride:
-    """Single-task capability issued by the owner control plane."""
+    """Single-task capability issued by the authenticated dashboard."""
 
     task_id: str
     owner_identity: str
@@ -233,37 +223,48 @@ def authenticated_human_not_before_override(**_kwargs) -> OwnerNotBeforeOverride
     )
 
 
-def _verified_kanban_owner(
-    identity: str,
-    authenticated_by: str,
-) -> VerifiedKanbanOwner:
-    """Create an owner identity only for an already-verified control seam."""
-    identity = str(identity or "").strip()
-    authenticated_by = str(authenticated_by or "").strip()
-    if not identity or not authenticated_by:
-        raise ValueError("verified Kanban owner requires identity and provenance")
-    return VerifiedKanbanOwner(
-        identity=identity,
-        authenticated_by=authenticated_by,
-        _seal=_VERIFIED_OWNER_SEAL,
-    )
+def _new_owner_not_before_override(
+    task_id: str,
+    owner_identity: str,
+    reason: str,
+    token: str,
+) -> OwnerNotBeforeOverride:
+    """Build a capability only after dashboard authentication has passed."""
+    override = object.__new__(OwnerNotBeforeOverride)
+    object.__setattr__(override, "task_id", task_id)
+    object.__setattr__(override, "owner_identity", owner_identity)
+    object.__setattr__(override, "reason", reason)
+    object.__setattr__(override, "token", token)
+    object.__setattr__(override, "_seal", _NOT_BEFORE_OVERRIDE_SEAL)
+    return override
 
 
 def mint_owner_not_before_override(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    owner: VerifiedKanbanOwner,
+    request: object,
     reason: str,
 ) -> OwnerNotBeforeOverride:
-    """Mint a task-bound, one-use override in the owner control plane."""
-    if not (
-        isinstance(owner, VerifiedKanbanOwner)
-        and owner._seal is _VERIFIED_OWNER_SEAL
-        and owner.identity.strip()
-        and owner.authenticated_by.strip()
-    ):
-        raise ValueError("owner authentication is required for not-before override")
+    """Mint a task-bound override from the canonical dashboard auth seam.
+
+    ``web_server.verified_dashboard_owner`` only vouches for requests that
+    reached the production dashboard app through its loopback token or gated
+    session authentication. Caller-supplied identity/provenance is not accepted.
+    """
+    try:
+        from hermes_cli import web_server
+
+        verified = web_server.verified_dashboard_owner(request)
+    except Exception as exc:
+        raise PermissionError(
+            "owner-authenticated dashboard request required for not-before override"
+        ) from exc
+    if not verified:
+        raise PermissionError(
+            "owner-authenticated dashboard request required for not-before override"
+        )
+    owner_identity, authenticated_by = verified
     reason = str(reason or "").strip()
     if not reason:
         raise ValueError("not-before override reason is required")
@@ -285,19 +286,13 @@ def mint_owner_not_before_override(
             (
                 token_hash,
                 task_id,
-                owner.identity,
-                owner.authenticated_by,
+                owner_identity,
+                authenticated_by,
                 reason,
                 int(time.time()),
             ),
         )
-    return OwnerNotBeforeOverride(
-        task_id=task_id,
-        owner_identity=owner.identity,
-        reason=reason,
-        token=token,
-        _seal=_NOT_BEFORE_OVERRIDE_SEAL,
-    )
+    return _new_owner_not_before_override(task_id, owner_identity, reason, token)
 
 
 class NotBeforeViolation(RuntimeError):
@@ -429,47 +424,7 @@ def _not_before_blocks(
     not_before = str(row["not_before"])
     if not not_before_pending(not_before, now=now):
         return None
-    authorized_override = _authorized_not_before_override(conn, task_id, override)
-    if authorized_override is not None:
-        assert isinstance(override, OwnerNotBeforeOverride)
-        _append_event(
-            conn,
-            task_id,
-            "not_before_overridden",
-            {
-                "operation": operation,
-                "not_before": not_before,
-                "owner_identity": override.owner_identity,
-                "reason": override.reason,
-                "authenticated_by": authorized_override["authenticated_by"],
-            },
-            run_id=_current_run_id(conn, task_id),
-        )
-        consumed = conn.execute(
-            "UPDATE kanban_not_before_overrides SET used_at = ? "
-            "WHERE token_hash = ? AND task_id = ? AND used_at IS NULL",
-            (
-                int(time.time()),
-                hashlib.sha256(override.token.encode("utf-8")).hexdigest(),
-                task_id,
-            ),
-        )
-        if consumed.rowcount != 1:
-            _append_not_before_block_once(
-                conn,
-                task_id,
-                operation=operation,
-                not_before=not_before,
-            )
-            return not_before
-        # The capability is a deliberate release, so clear the gate in the
-        # same transaction that audits and consumes it. Subsequent guards in
-        # the same lifecycle operation observe the released task.
-        conn.execute(
-            "UPDATE tasks SET not_before = NULL "
-            "WHERE id = ? AND not_before = ?",
-            (task_id, not_before),
-        )
+    if _authorized_not_before_override(conn, task_id, override) is not None:
         return None
     _append_not_before_block_once(
         conn,
@@ -478,6 +433,26 @@ def _not_before_blocks(
         not_before=not_before,
     )
     return not_before
+
+
+def _pending_not_before_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    override: Optional[OwnerNotBeforeOverride],
+    *,
+    now: Optional[float] = None,
+) -> Optional[str]:
+    row = conn.execute(
+        "SELECT not_before FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or not row["not_before"]:
+        return None
+    deadline = str(row["not_before"])
+    if not not_before_pending(deadline, now=now):
+        return None
+    if _authorized_not_before_override(conn, task_id, override) is None:
+        return None
+    return deadline
 
 
 def enforce_not_before(
@@ -506,6 +481,58 @@ def enforce_not_before(
     if deadline and raise_on_block:
         raise NotBeforeViolation(task_id, operation, deadline)
     return deadline is None
+
+
+def _consume_not_before_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    operation: str,
+    override: Optional[OwnerNotBeforeOverride],
+    expected_not_before: Optional[str],
+) -> bool:
+    """Consume, audit, and clear an override after a successful transition."""
+    if expected_not_before is None:
+        return True
+    if not _valid_not_before_override(override):
+        raise RuntimeError("not-before override became invalid during transition")
+    authorized = _authorized_not_before_override(conn, task_id, override)
+    if authorized is None:
+        raise RuntimeError("not-before override was no longer authorized")
+    assert isinstance(override, OwnerNotBeforeOverride)
+    token_hash = hashlib.sha256(override.token.encode("utf-8")).hexdigest()
+    consumed = conn.execute(
+        "UPDATE kanban_not_before_overrides SET used_at = ? "
+        "WHERE token_hash = ? AND task_id = ? AND owner_identity = ? "
+        "AND reason = ? AND used_at IS NULL",
+        (
+            int(time.time()), token_hash, task_id,
+            override.owner_identity, override.reason,
+        ),
+    )
+    if consumed.rowcount != 1:
+        raise RuntimeError("not-before override could not be consumed")
+    cleared = conn.execute(
+        "UPDATE tasks SET not_before = NULL "
+        "WHERE id = ? AND not_before = ?",
+        (task_id, expected_not_before),
+    )
+    if cleared.rowcount != 1:
+        raise RuntimeError("not-before gate changed during transition")
+    _append_event(
+        conn,
+        task_id,
+        "not_before_overridden",
+        {
+            "operation": operation,
+            "not_before": expected_not_before,
+            "owner_identity": override.owner_identity,
+            "reason": override.reason,
+            "authenticated_by": authorized["authenticated_by"],
+        },
+        run_id=_current_run_id(conn, task_id),
+    )
+    return True
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -4827,6 +4854,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        override_gate = _pending_not_before_override(
+            conn, task_id, not_before_override, now=now
+        )
         if _not_before_blocks(
             conn,
             task_id,
@@ -4835,15 +4865,6 @@ def claim_task(
             now=now,
         ):
             return None
-        if _valid_not_before_override(not_before_override):
-            # A successful human-authorized claim must also let that worker's
-            # tool-execution backstop run. Clear only on the same claimable row;
-            # a stale override against another status changes nothing.
-            conn.execute(
-                "UPDATE tasks SET not_before = NULL "
-                "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
-                (task_id,),
-            )
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4903,6 +4924,11 @@ def claim_task(
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
+            return None
+        if not _consume_not_before_override(
+            conn, task_id, operation="claim", override=not_before_override,
+            expected_not_before=override_gate,
+        ):
             return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
@@ -4974,6 +5000,9 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        override_gate = _pending_not_before_override(
+            conn, task_id, not_before_override, now=now
+        )
         if _not_before_blocks(
             conn,
             task_id,
@@ -4982,12 +5011,6 @@ def claim_review_task(
             now=now,
         ):
             return None
-        if _valid_not_before_override(not_before_override):
-            conn.execute(
-                "UPDATE tasks SET not_before = NULL "
-                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
-                (task_id,),
-            )
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5002,6 +5025,11 @@ def claim_review_task(
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
+            return None
+        if not _consume_not_before_override(
+            conn, task_id, operation="claim_review", override=not_before_override,
+            expected_not_before=override_gate,
+        ):
             return None
         trow = conn.execute(
             "SELECT assignee, max_runtime_seconds, current_step_key "
@@ -5539,6 +5567,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        override_gate = _pending_not_before_override(
+            conn, task_id, not_before_override, now=now
+        )
         # Re-check inside the same write transaction as the terminal CAS. A
         # second connection may install a gate after the initial preflight;
         # that gate must win over completion and leave the task/run untouched.
@@ -5586,6 +5617,11 @@ def complete_task(
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
+            return False
+        if not _consume_not_before_override(
+            conn, task_id, operation="complete", override=not_before_override,
+            expected_not_before=override_gate,
+        ):
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
@@ -6536,32 +6572,43 @@ def promote_task(
                 )
         return True, None
 
-    if not enforce_not_before(
-        conn,
-        task_id,
-        operation="manual_promotion",
-        override=not_before_override,
-    ):
-        gate = conn.execute(
-            "SELECT not_before FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        return False, (
-            f"not-before deadline has not elapsed: {gate['not_before']}"
-            if gate else "not-before deadline has not elapsed"
-        )
-
     with write_txn(conn):
+        # Re-read and guard inside the same write transaction as the status
+        # CAS. SQLite's RESERVED lock prevents a concurrent gate insertion
+        # from landing between these operations.
+        current = conn.execute(
+            "SELECT status, not_before FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if current is None:
+            return False, f"task {task_id} not found"
+        if current["status"] not in ("todo", "scheduled", "blocked"):
+            return False, (
+                f"task {task_id} is {current['status']!r}; promote only applies to "
+                f"'todo', 'scheduled', or 'blocked'"
+            )
+        override_gate = _pending_not_before_override(
+            conn, task_id, not_before_override, now=int(time.time())
+        )
+        deadline = _not_before_blocks(
+            conn,
+            task_id,
+            operation="manual_promotion",
+            override=not_before_override,
+        )
+        if deadline:
+            return False, f"not-before deadline has not elapsed: {deadline}"
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready', not_before = ? "
-            "WHERE id = ? AND status IN ('todo', 'scheduled', 'blocked')",
-            (
-                None if _valid_not_before_override(not_before_override)
-                else row["not_before"] if "not_before" in row.keys() else None,
-                task_id,
-            ),
+            "UPDATE tasks SET status = 'ready' "
+            "WHERE id = ? AND status = ?",
+            (task_id, current["status"]),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        if not _consume_not_before_override(
+            conn, task_id, operation="manual_promotion",
+            override=not_before_override, expected_not_before=override_gate,
+        ):
+            return False, f"task {task_id} override could not be consumed"
         _append_event(
             conn,
             task_id,
@@ -6589,6 +6636,9 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
+        override_gate = _pending_not_before_override(
+            conn, task_id, not_before_override, now=now
+        )
         if _not_before_blocks(
             conn,
             task_id,
@@ -6597,12 +6647,6 @@ def unblock_task(
             now=now,
         ):
             return False
-        if _valid_not_before_override(not_before_override):
-            conn.execute(
-                "UPDATE tasks SET not_before = NULL "
-                "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-                (task_id,),
-            )
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6649,6 +6693,11 @@ def unblock_task(
             (new_status, task_id),
         )
         if cur.rowcount != 1:
+            return False
+        if not _consume_not_before_override(
+            conn, task_id, operation="unblock", override=not_before_override,
+            expected_not_before=override_gate,
+        ):
             return False
         _append_event(
             conn, task_id, "unblocked",

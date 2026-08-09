@@ -38,7 +38,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sqlite3
 import time
 from dataclasses import asdict
@@ -117,36 +116,6 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
-def _verified_owner_from_request(request: Request) -> kanban_db.VerifiedKanbanOwner:
-    """Resolve owner identity only from the dashboard's verified auth seam."""
-    session = getattr(request.state, "session", None)
-    if session is not None:
-        identity = str(getattr(session, "user_id", "") or "").strip()
-        provider = str(getattr(session, "provider", "") or "").strip()
-        if identity and provider:
-            return kanban_db._verified_kanban_owner(
-                identity,
-                f"dashboard_session:{provider}",
-            )
-
-    # Loopback dashboard auth has no external user session, but the canonical
-    # dashboard session token is still required by the real web server. Bind
-    # that local authenticated control plane to the OS owner instead of a
-    # request-supplied identity. Bare plugin test apps intentionally fail closed.
-    try:
-        from hermes_cli import web_server
-
-        if web_server._has_valid_session_token(request):
-            return kanban_db._verified_kanban_owner(
-                f"local:{os.getuid()}",
-                "dashboard_session_token",
-            )
-    except Exception:
-        pass
-    raise HTTPException(
-        status_code=403,
-        detail="owner-authenticated control plane required for not-before override",
-    )
 
 
 def _conn(board: Optional[str] = None):
@@ -917,14 +886,15 @@ def update_task(
                     status_code=400,
                     detail="not-before override only releases ready or done transitions",
                 )
-            owner = _verified_owner_from_request(request)
             try:
                 not_before_override = kanban_db.mint_owner_not_before_override(
                     conn,
                     task_id,
-                    owner=owner,
+                    request=request,
                     reason=payload.not_before_override_reason,
                 )
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1143,6 +1113,11 @@ def _set_status_direct(
         if prev is None:
             return False
 
+        override_gate = None
+        if new_status in {"ready", "running"}:
+            override_gate = kanban_db._pending_not_before_override(
+                conn, task_id, not_before_override
+            )
         if new_status in {"ready", "running"} and kanban_db._not_before_blocks(
             conn,
             task_id,
@@ -1181,6 +1156,11 @@ def _set_status_direct(
             (new_status, new_status, new_status, new_status, task_id),
         )
         if cur.rowcount != 1:
+            return False
+        if not kanban_db._consume_not_before_override(
+            conn, task_id, operation=f"dashboard_status:{new_status}",
+            override=not_before_override, expected_not_before=override_gate,
+        ):
             return False
         run_id = None
         if was_running and new_status != "running" and prev["current_run_id"]:

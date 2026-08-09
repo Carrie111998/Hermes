@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -11,6 +13,32 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _loopback_request():
+    from hermes_cli import web_server
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "path": "/api/plugins/kanban/tasks",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"127.0.0.1"),
+                (
+                    web_server._SESSION_HEADER_NAME.lower().encode(),
+                    web_server._SESSION_TOKEN.encode(),
+                ),
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 9119),
+            "scheme": "http",
+            "root_path": "",
+            "app": web_server.app,
+        }
+    )
 
 
 FUTURE = "2030-01-01T00:00:00Z"
@@ -565,14 +593,10 @@ def test_manual_promotion_requires_sealed_human_override_and_audits_it(
         assert "not-before" in reason
         assert kb.get_task(conn, task_id).status == "scheduled"
 
-        owner = kb._verified_kanban_owner(
-            "alex",
-            "local_tty_os_user",
-        )
         override = kb.mint_owner_not_before_override(
             conn,
             task_id,
-            owner=owner,
+            request=_loopback_request(),
             reason="approved emergency release",
         )
         ok, reason = kb.promote_task(
@@ -591,9 +615,9 @@ def test_manual_promotion_requires_sealed_human_override_and_audits_it(
         assert event.payload == {
             "operation": "manual_promotion",
             "not_before": FUTURE,
-            "owner_identity": "alex",
+            "owner_identity": f"local:{os.getuid()}",
             "reason": "approved emergency release",
-            "authenticated_by": "local_tty_os_user",
+            "authenticated_by": "dashboard_session_token",
         }
 
 
@@ -630,8 +654,64 @@ def test_legacy_and_forged_not_before_overrides_fail_closed(kanban_home):
         assert kb.get_task(conn, task_id).not_before == FUTURE
 
 
+def test_owner_capability_construction_is_not_a_public_issuer():
+    with pytest.raises(TypeError):
+        kb.OwnerNotBeforeOverride(
+            task_id="t_deadbeef",
+            owner_identity="alex",
+            reason="self asserted",
+            token="forged",
+            _seal=object(),
+        )
+    assert not hasattr(kb, "VerifiedKanbanOwner")
+
+
+def test_gated_dashboard_auth_can_issue_owner(kanban_home, monkeypatch):
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import middleware as auth_middleware
+    from hermes_cli.dashboard_auth.base import Session
+    from starlette.responses import Response
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="gated owner", not_before=FUTURE)
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(
+        auth_middleware,
+        "_verify_bearer",
+        lambda request, *, access_token: Session(
+            user_id="alex", email="alex@example.com", display_name="Alex",
+            org_id="org", provider="test-owner-auth", expires_at=2_000_000_000,
+            access_token=access_token, refresh_token="refresh",
+        ),
+    )
+    request = _loopback_request()
+    request.scope["headers"] = [
+        (b"host", b"127.0.0.1"),
+        (b"authorization", b"Bearer gated-token"),
+    ]
+    issued = []
+
+    async def endpoint(authenticated_request):
+        with kb.connect() as conn:
+            issued.append(kb.mint_owner_not_before_override(
+                conn, task_id, request=authenticated_request, reason="approved"
+            ))
+        return Response(status_code=200)
+
+
+    response = asyncio.run(web_server._dashboard_auth_gate(request, endpoint))
+    assert response.status_code == 200
+    assert len(issued) == 1
+    with kb.connect() as conn:
+        ok, reason = kb.promote_task(
+            conn, task_id, actor="alex", force=True, not_before_override=issued[0]
+        )
+        assert (ok, reason) == (True, None)
+        assert kb.get_task(conn, task_id).not_before is None
 def test_synthetic_completed_evidence_is_blocked_before_release(
     kanban_home, monkeypatch
+
+
 ):
     monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000.0)
 
@@ -700,3 +780,56 @@ def test_tool_execution_backstop_blocks_before_relay_or_provider_mutation(
     with kb.connect(db_path=db_path) as conn:
         event = _events(conn, task_id, "not_before_blocked")[-1]
         assert event.payload["operation"] == "side_effect_execution:terminal"
+
+def test_override_is_reusable_when_completion_cas_fails(kanban_home, monkeypatch):
+    """A failed terminal CAS must not burn a valid owner release."""
+    monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000.0)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="rollback completion", assignee="worker",
+            not_before=FUTURE,
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,)
+        )
+        override = kb.mint_owner_not_before_override(
+            conn, task_id, request=_loopback_request(), reason="approved"
+        )
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            expected_run_id=999,
+            not_before_override=override,
+        ) is False
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.not_before == FUTURE
+        used = conn.execute(
+            "SELECT used_at FROM kanban_not_before_overrides WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert used["used_at"] is None
+        assert _events(conn, task_id, "not_before_overridden") == []
+
+        assert kb.complete_task(
+            conn, task_id, not_before_override=override
+        ) is True
+
+
+def test_unblock_override_is_consumed_after_success(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unblock release", not_before=FUTURE)
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+        override = kb.mint_owner_not_before_override(
+            conn, task_id, request=_loopback_request(), reason="approved"
+        )
+        assert kb.unblock_task(conn, task_id, not_before_override=override) is True
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready" and task.not_before is None
+        used = conn.execute(
+            "SELECT used_at FROM kanban_not_before_overrides WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert used["used_at"] is not None
