@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,45 @@ from gateway.restart import (
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
 )
+
+
+class TestLaunchdExitTimeout:
+    @pytest.mark.parametrize(
+        ("drain_timeout", "expected_exit_timeout"),
+        [
+            (DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT, 30),
+            (0, 30),
+            (12.25, 43),
+            (900, 930),
+        ],
+        ids=["default", "zero", "fractional", "configured-900"],
+    )
+    def test_exit_timeout_tracks_drain_timeout_with_headroom(
+        self, monkeypatch, drain_timeout, expected_exit_timeout
+    ):
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: drain_timeout
+        )
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == expected_exit_timeout
+
+    def test_drain_timeout_change_marks_hardcoded_exit_timeout_as_drift(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 900)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(
+            gateway_cli.generate_launchd_plist().replace(
+                "<key>ExitTimeOut</key>\n    <integer>930</integer>",
+                "<key>ExitTimeOut</key>\n    <integer>25</integer>",
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        assert gateway_cli.launchd_plist_is_current() is False
 
 
 class TestUserSystemdPrivateSocketPreflight:
@@ -1995,4 +2035,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
-
