@@ -1297,6 +1297,93 @@ class TestToolUseEnforcementGuidance:
         assert isinstance(TOOL_USE_ENFORCEMENT_MODELS, tuple)
 
 
+class TestSkillRetrieverCompactPointer:
+    """Tests for the compact pointer when skill-retriever is active.
+
+    When skill-retriever is enabled, ``build_skills_system_prompt`` should
+    return a brief pointer instead of the full <available_skills> index,
+    because the plugin injects per-turn recommendations via pre_llm_call.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def test_compact_pointer_when_skill_retriever_active(self, monkeypatch, tmp_path):
+        """When skill-retriever is enabled, a compact pointer is returned."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # Create at least one skill to prove the full index is NOT built
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        # Enable skill-retriever via config patch (patch the real import target)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "plugins": {"enabled": ["skill-retriever"]},
+                "skills": {"max_index_entries": 500},
+            },
+        )
+        # Clear cache to force rebuild
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+        result = build_skills_system_prompt()
+        # Should NOT contain the full index markers
+        assert "<available_skills>" not in result
+        assert "available_skills" not in result
+        # Should contain the compact pointer
+        assert "skill_retrieve" in result
+        assert "skills_list" in result
+        assert "skill_view" in result
+        assert "~/.hermes/skills" in result
+
+    def test_full_index_when_skill_retriever_inactive(self, monkeypatch, tmp_path):
+        """Without skill-retriever, the full index is returned."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skills_dir.mkdir(parents=True)
+        (skills_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        # Ensure skill-retriever is NOT in plugins.enabled
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"plugins": {"enabled": []}, "skills": {"max_index_entries": 500}},
+        )
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+        result = build_skills_system_prompt()
+        # Full index with <available_skills> tag
+        assert "<available_skills>" in result
+        assert "python-debug" in result
+
+    def test_skill_retriever_active_helper(self, monkeypatch):
+        """_skill_retriever_active reads plugins.enabled from config."""
+        import agent.prompt_builder as pb
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"plugins": {"enabled": ["skill-retriever", "other"]}},
+        )
+        assert pb._skill_retriever_active() is True
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"plugins": {"enabled": ["other-plugin"]}},
+        )
+        assert pb._skill_retriever_active() is False
+
+
 class TestOpenAIModelExecutionGuidance:
     """Tests for GPT/Codex-specific execution discipline guidance."""
 

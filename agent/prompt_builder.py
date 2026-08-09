@@ -1115,6 +1115,23 @@ def _skill_should_show(
     return True
 
 
+def _skill_retriever_active() -> bool:
+    """Return True when the skill-retriever plugin is enabled.
+
+    When active, the full ``<available_skills>`` index is replaced by a
+    compact pointer because skill-retriever injects per-turn
+    recommendations into the user message via its ``pre_llm_call`` hook.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        _cfg = load_config()
+        _plugins = _cfg.get("plugins", {}) if isinstance(_cfg, dict) else {}
+        return "skill-retriever" in _plugins.get("enabled", [])
+    except Exception:
+        return False
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1139,7 +1156,43 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    When the ``skill-retriever`` plugin is enabled, this function returns a
+    **compact pointer** instead of the full index.  The plugin's
+    ``pre_llm_call`` hook injects per-turn, query-aware recommendations into
+    the user message, so the static index is redundant.  The pointer directs
+    the agent to ``skill_retrieve()``, ``skills_list()``, and ``skill_view()``
+    for skill discovery.
     """
+    # ── Skill-retriever shortcut ──────────────────────────────────────
+    # When skill-retriever is active, skip the full index build and return
+    # a compact pointer.  The plugin injects per-turn recommendations.
+    if _skill_retriever_active():
+        _ext_dirs: list[str] = []
+        try:
+            from hermes_cli.config import load_config
+
+            _cfg = load_config()
+            _skills_cfg = _cfg.get("skills", {}) if isinstance(_cfg, dict) else {}
+            _ext_dirs = _skills_cfg.get("external_dirs", []) or []
+        except Exception:
+            pass
+
+        _paths = ["~/.hermes/skills/"]
+        if _ext_dirs:
+            _paths.extend(_ext_dirs)
+        _paths_str = ", ".join(_paths)
+
+        return (
+            "## Skills\n"
+            f"Skills are available at `{_paths_str}`. "
+            "Use `skill_retrieve(\"<query>\")` to find relevant skills for your task — "
+            "it searches all installed skills semantically and returns the best matches. "
+            "Use `skills_list()` to browse all skills by category. "
+            "Use `skill_view(name)` to load a specific skill. "
+            "Only proceed without loading a skill if genuinely none are relevant to the task."
+        )
+
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
