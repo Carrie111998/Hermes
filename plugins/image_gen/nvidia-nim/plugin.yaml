@@ -1,0 +1,7 @@
+name: nvidia-nim
+version: 1.0.0
+description: "NVIDIA NIM image generation backend (FLUX, Qwen-Image, SD 3.5) via integrate.api.nvidia.com"
+author: NousResearch
+kind: backend
+requires_env:
+  - NVIDIA_API_KEY
