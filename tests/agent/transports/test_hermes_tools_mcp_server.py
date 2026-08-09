@@ -107,6 +107,104 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
+    def test_build_server_uses_mcp_scoped_tool_loading(self, monkeypatch):
+        """MCP startup must not assemble Hermes' full tool catalog."""
+        import sys
+        import types
+
+        import agent.transports.hermes_tools_mcp_server as m
+
+        calls = []
+
+        def fake_load_mcp_tool_definitions():
+            calls.append(True)
+            return [{
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }]
+
+        monkeypatch.setattr(m, "_load_mcp_tool_definitions", fake_load_mcp_tool_definitions)
+
+        class FakeFastMCP:
+            def __init__(self, *args, **kwargs):
+                self.tools = []
+
+            def add_tool(self, handler, *, name, description):
+                self.tools.append((name, description))
+
+        fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fake_fastmcp.FastMCP = FakeFastMCP
+        fake_server = types.ModuleType("mcp.server")
+        fake_server.fastmcp = fake_fastmcp
+        fake_mcp = types.ModuleType("mcp")
+        fake_mcp.server = fake_server
+        monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
+        monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+
+        server = m._build_server()
+
+        assert calls == [True]
+        assert server.tools == [("web_search", "Search the web.")]
+
+    def test_build_server_defers_model_tools_until_first_call(self, monkeypatch):
+        """MCP build must avoid model_tools and load it only for dispatch."""
+        import sys
+        import types
+
+        import agent.transports.hermes_tools_mcp_server as m
+
+        monkeypatch.setattr(
+            m,
+            "_load_mcp_tool_definitions",
+            lambda: [{
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+            raising=False,
+        )
+
+        fake_model_tools = types.ModuleType("model_tools")
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        class FakeFastMCP:
+            def __init__(self, *args, **kwargs):
+                self.tools = []
+                self.handlers = {}
+
+            def add_tool(self, handler, *, name, description):
+                self.tools.append((name, description))
+                self.handlers[name] = handler
+
+        fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+        fake_fastmcp.FastMCP = FakeFastMCP
+        fake_server = types.ModuleType("mcp.server")
+        fake_server.fastmcp = fake_fastmcp
+        fake_mcp = types.ModuleType("mcp")
+        fake_mcp.server = fake_server
+        monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
+        monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
+        monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+
+        server = m._build_server()
+        assert server.tools == [("web_search", "Search the web.")]
+        assert not hasattr(fake_model_tools, "handle_function_call")
+
+        fake_model_tools.handle_function_call = (
+            lambda tool_name, args: f"called:{tool_name}:{args}"
+        )
+        assert server.handlers["web_search"](query="hello") == (
+            "called:web_search:{'query': 'hello'}"
+        )
+
 
 
 
