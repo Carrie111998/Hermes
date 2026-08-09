@@ -1052,6 +1052,8 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+        assert isinstance(kwargs["agent_ref"], list)
+        assert len(kwargs["agent_ref"]) == 1
 
 
     @pytest.mark.asyncio
