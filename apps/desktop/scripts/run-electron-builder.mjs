@@ -30,10 +30,18 @@ function distBinary(dist) {
 }
 
 function electronBuilderCli() {
-  const pkgJson = require.resolve("electron-builder/package.json")
-  const bin = require(pkgJson).bin
+  // 27 no longer exports ./package.json; resolve the entry module and walk
+  // up to the package root instead.
+  const entry = require.resolve("electron-builder")
+  let dir = path.dirname(entry)
+  while (!fs.existsSync(path.join(dir, "package.json"))) {
+    const parent = path.dirname(dir)
+    if (parent === dir) throw new Error("electron-builder package root not found")
+    dir = parent
+  }
+  const bin = require(path.join(dir, "package.json")).bin
   const rel = typeof bin === "string" ? bin : bin["electron-builder"]
-  return path.join(path.dirname(pkgJson), rel)
+  return path.join(dir, rel)
 }
 
 const dist = electronDistDir()
@@ -60,21 +68,22 @@ if (!args.includes("--publish") && !args.some((a) => a.startsWith("-p"))) {
 // commas, and no quoting survives the cmd.exe hops between the outer build
 // script, npm's lifecycle spawn, and this script. This spawn is the first
 // one with no shell in between, so values pass through verbatim.
-// (azureSignOptions is the 26.x schema; the old win.sign.type=azure shape
-// fails validation.)
+// (win.sign.type=azure is the 27.x schema; 26.x called it azureSignOptions.
+// 27 signs through signtool /dlib from the winCodeSign 1.3.0 toolset — no
+// PowerShell TrustedSigning module, which froze the arm64 CI runner.)
 if (
   args.includes("--win") &&
   process.env.AZURE_SIGN_ENDPOINT &&
   process.env.AZURE_CLIENT_ID &&
-  !args.some((a) => a.includes("azureSignOptions"))
+  !args.some((a) => a.includes("win.sign"))
 ) {
   console.log(`[run-electron-builder] Windows signing: Azure Trusted Signing at ${process.env.AZURE_SIGN_ENDPOINT}`)
   args.push(
-    "-c.win.signAndEditExecutable=true",
-    `-c.win.azureSignOptions.endpoint=${process.env.AZURE_SIGN_ENDPOINT}`,
-    `-c.win.azureSignOptions.codeSigningAccountName=${process.env.AZURE_SIGN_ACCOUNT}`,
-    `-c.win.azureSignOptions.certificateProfileName=${process.env.AZURE_SIGN_PROFILE}`,
-    `-c.win.azureSignOptions.publisherName=${process.env.AZURE_SIGN_PUBLISHER}`
+    "-c.win.sign.type=azure",
+    `-c.win.sign.endpoint=${process.env.AZURE_SIGN_ENDPOINT}`,
+    `-c.win.sign.codeSigningAccountName=${process.env.AZURE_SIGN_ACCOUNT}`,
+    `-c.win.sign.certificateProfileName=${process.env.AZURE_SIGN_PROFILE}`,
+    `-c.win.sign.publisherName=${process.env.AZURE_SIGN_PUBLISHER}`
   )
 }
 
