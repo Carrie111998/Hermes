@@ -72,6 +72,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # MoA consultation (gated via check_fn on the default MoA preset)
+    "consult_moa",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -298,6 +300,12 @@ TOOLSETS = {
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    "moa": {
+        "description": "Consult configured Mixture-of-Agents advisors while the acting model retains control",
+        "tools": ["consult_moa"],
         "includes": []
     },
 
