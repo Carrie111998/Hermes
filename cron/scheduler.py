@@ -122,6 +122,15 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    # Script execution happens outside the LLM/provider path.  Check its
+    # explicit error contract before generic timeout matching so a script-only
+    # watchdog timeout never claims a provider fallback was attempted.
+    if lower.startswith("script timed out"):
+        return (
+            f"⚠️ Cron '{job_name}' failed: script timed out. "
+            "No model was invoked. Full details saved in cron output."
+        )
+
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
