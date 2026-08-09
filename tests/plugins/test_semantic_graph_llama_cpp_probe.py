@@ -10,6 +10,8 @@ from scripts.semantic_graph_llama_embedding_probe import (
     ProbeConfig,
     ProbeResult,
     check_batch_stability,
+    determine_verdict,
+    required_check_names,
     check_finite_norm,
     check_repeat_stability,
     check_semantic_ordering,
@@ -17,6 +19,20 @@ from scripts.semantic_graph_llama_embedding_probe import (
     cosine,
     make_report,
 )
+
+
+BASE_CHECKS = {
+    "health": True,
+    "v1_models": True,
+    "v1_embeddings": True,
+    "one_vector_per_input": True,
+    "all_finite": True,
+    "all_nonzero": True,
+    "unit_norm": True,
+    "repeat_stability": True,
+    "batch_stability": True,
+    "semantic_ordering": True,
+}
 
 
 def _response(vectors: list[list[float]], indices: list[int] | None = None) -> dict[str, object]:
@@ -147,26 +163,63 @@ def test_report_verdict_requires_all_compatibility_checks() -> None:
         actual_dimensions=2048,
     )
     assert result.verdict == "fail_model_compatibility"
-    required = (
-        "health",
-        "v1_models",
-        "v1_embeddings",
-        "one_vector_per_input",
-        "all_finite",
-        "unit_norm",
-        "repeat_stability",
-        "batch_stability",
-        "semantic_ordering",
-        "japanese_cross_lingual",
-        "soak",
-    )
     passing = make_report(
         config,
-        checks={name: True for name in required},
+        checks={**BASE_CHECKS, "soak": None},
         metrics={},
         actual_dimensions=2048,
     )
     assert passing.verdict == "pass_text_only"
+
+
+def test_zero_soak_requests_does_not_fail_otherwise_passing_probe() -> None:
+    assert determine_verdict({**BASE_CHECKS, "soak": None}, soak_requests=0) == "pass_text_only"
+
+
+def test_zero_soak_requests_records_not_run() -> None:
+    result = make_report(
+        ProbeConfig(soak_requests=0),
+        checks={**BASE_CHECKS, "soak": None},
+        metrics={},
+        actual_dimensions=2048,
+    )
+    data = result.to_dict()
+    assert data["checks"]["soak"] is None
+    assert data["soak"] == {
+        "requested": False,
+        "request_count": 0,
+        "passed": None,
+    }
+
+
+def test_observations_are_not_required_verdict_checks() -> None:
+    result = make_report(
+        ProbeConfig(soak_requests=0),
+        checks={**BASE_CHECKS, "soak": None},
+        metrics={},
+        actual_dimensions=2048,
+        observations={
+            "japanese_cross_lingual": {"passed": False},
+            "instruction_profile_comparison": {"passed": False},
+        },
+    )
+    data = result.to_dict()
+    assert result.verdict == "pass_text_only"
+    assert data["observations"]["japanese_cross_lingual"]["passed"] is False
+
+
+def test_requested_successful_soak_is_required_and_passes() -> None:
+    assert "soak" in required_check_names(soak_requests=500)
+    assert determine_verdict({**BASE_CHECKS, "soak": True}, soak_requests=500) == "pass_text_only"
+
+
+def test_requested_failed_soak_fails_probe() -> None:
+    assert determine_verdict({**BASE_CHECKS, "soak": False}, soak_requests=500) == "fail_model_compatibility"
+
+
+def test_negative_soak_requests_are_rejected() -> None:
+    with pytest.raises(ValueError, match="soak_requests must be non-negative"):
+        required_check_names(soak_requests=-1)
 
 
 def test_probe_result_json_has_no_raw_vectors() -> None:

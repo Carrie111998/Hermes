@@ -315,16 +315,18 @@ Control and candidate profiles:
 
 Probe contract:
 - Loopback HTTP only when explicitly invoked; stdlib `urllib.request` is used and no production HTTP client is introduced.
-- Checks `/health`, `/v1/models`, `/props` best-effort, `/v1/embeddings`, flat-vector shape, count/index coverage, exact dimension, finite/nonzero/unit norm, repeat stability, batch sizes `1,2,4,8,16,32`, semantic ordering, and optional soak requests.
+- Checks `/health`, `/v1/models`, `/props` best-effort, `/v1/embeddings`, flat-vector shape, count/index coverage, exact dimension, finite/nonzero/unit norm, repeat stability, batch sizes `1,2,4,8,16,32`, and English semantic ordering.
+- Japanese/cross-lingual retrieval and instruction-profile comparison are recorded under `observations`; they are not required verdict gates at this stage.
+- Soak is opt-in: `soak_requests=0` records `checks.soak=null`, `soak.requested=false`, and `soak.passed=null` without affecting the verdict. When `soak_requests>0`, the soak check is required and reports completed requests and failures.
 - Token matrices, nulls, NaN/Inf, zero vectors, dimension drift, missing/duplicate indices, and semantic-ordering failures are rejected.
 - Summary JSON contains no raw vectors, raw response, server logs, credentials, or absolute GGUF path. A SHA-256 is computed only when an explicit local `--gguf-path` is supplied.
 - Live pytest execution requires `HERMES_RUN_LLAMA_EMBEDDING_LIVE=1` plus `HERMES_TEST_LLAMA_EMBEDDING_URL`, `HERMES_TEST_LLAMA_EMBEDDING_MODEL`, `HERMES_TEST_LLAMA_EMBEDDING_REPO`, and `HERMES_TEST_LLAMA_EMBEDDING_DIMENSIONS`. Soak additionally requires `HERMES_LLAMA_EMBEDDING_SOAK=1` and at least 500 requests; normal CI never performs network calls.
 - `pass_text_only` is not a multimodal compatibility claim. Vision/image/video/mixed-input support remains untested.
 
 Verification evidence:
-- RED: the initial focused command failed with `file or directory not found` because the probe unit test had not yet been created (exit 4); a later canonical-runner pass also caught and fixed a stale removed `statistics` compatibility reference.
-- Focused probe tests: 17 passed, 2 explicitly skipped, exit 0.
-- The verdict gate requires English ordering, Japanese-to-English ordering, and an executed soak check; an unexecuted soak is not treated as a pass.
+- RED: the initial focused command failed with `file or directory not found` because the probe unit test had not yet been created (exit 4); the fix regression tests then failed at collection because `determine_verdict` and `required_check_names` were absent.
+- Fix regression tests: 23 passed, 2 explicitly skipped, exit 0.
+- The fix makes soak opt-in, preserves a three-value not-run/passed/failed representation, and keeps Japanese/profile results observational.
 - Ruff: PASS.
 - Python compile check: PASS.
 - `git diff --check`: PASS.
@@ -342,3 +344,35 @@ Live-validation status:
 Residual risk:
 - `/v1/embeddings` behavior, Qwen3-VL text preprocessing/chat-template equivalence, `--pooling last`, actual dimension, Q8_0 quality, resource usage, and long-run stability remain unverified.
 - Production adapter creation remains correctly blocked on control/candidate live evidence.
+
+## Commit 7 follow-up — opt-in soak verdict fix
+
+The independent follow-up keeps Commit 7 unchanged and fixes the probe judgment contract without touching production Semantic Graph code.
+
+Changed files:
+- `scripts/semantic_graph_llama_embedding_probe.py`
+- `tests/plugins/test_semantic_graph_llama_cpp_probe.py`
+- this implementation log
+
+Implementation:
+- `BASE_REQUIRED_CHECKS` contains only base compatibility checks.
+- `required_check_names(soak_requests=...)` adds `soak` only when requests are explicitly requested and rejects negative counts.
+- `determine_verdict()` uses identity checks (`is True`) so `None` remains an explicit not-run state.
+- `soak_requests=0` does not issue soak requests, records `checks.soak=null`, and emits `soak.requested=false`, `request_count=0`, `passed=null`.
+- Requested soak records `passed`, `completed_requests`, and `failures`; a failed requested soak fails the verdict.
+- Japanese/cross-lingual and instruction-profile measurements are emitted under `observations` and do not gate the text-only verdict.
+
+Fresh verification:
+- Canonical Windows runner: 4 existing target files, 58 tests passed, 0 failed; the requested `test_semantic_graph_hybrid_retrieval.py` file does not exist in this checkout and therefore could not be run.
+- Probe/live focused result: 23 passed, 2 skipped.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- No live server or network call was used; control/candidate validation remains pending.
+
+Residual risk:
+- The probe still requires live control and candidate GGUF validation before any production embedding backend or Associative Adapter work.
+- The soak-duration option only qualifies an explicitly requested soak; duration alone does not trigger soak execution.
+
+Next action:
+- Create the independent fix commit, then obtain pinned control/candidate GGUFs and run the explicit live probes.

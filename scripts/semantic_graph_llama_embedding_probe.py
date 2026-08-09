@@ -33,15 +33,50 @@ class ProbeConfig:
         return self.base_url.rstrip("/")
 
 
+BASE_REQUIRED_CHECKS = (
+    "health",
+    "v1_models",
+    "v1_embeddings",
+    "one_vector_per_input",
+    "all_finite",
+    "all_nonzero",
+    "unit_norm",
+    "repeat_stability",
+    "batch_stability",
+    "semantic_ordering",
+)
+
+
+def required_check_names(*, soak_requests: int) -> tuple[str, ...]:
+    if soak_requests < 0:
+        raise ValueError("soak_requests must be non-negative")
+    if soak_requests > 0:
+        return BASE_REQUIRED_CHECKS + ("soak",)
+    return BASE_REQUIRED_CHECKS
+
+
+def determine_verdict(
+    checks: Mapping[str, bool | None], *, soak_requests: int
+) -> str:
+    required = required_check_names(soak_requests=soak_requests)
+    return (
+        "pass_text_only"
+        if all(checks.get(name) is True for name in required)
+        else "fail_model_compatibility"
+    )
+
+
 @dataclass
 class ProbeResult:
     schema_version: int = 1
     server: dict[str, Any] = field(default_factory=dict)
     model: dict[str, Any] = field(default_factory=dict)
-    checks: dict[str, bool] = field(default_factory=dict)
+    checks: dict[str, bool | None] = field(default_factory=dict)
     metrics: dict[str, float] = field(default_factory=dict)
     verdict: str = "fail_model_compatibility"
     errors: list[str] = field(default_factory=list)
+    observations: dict[str, Any] = field(default_factory=dict)
+    soak: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +85,8 @@ class ProbeResult:
             "model": self.model,
             "checks": self.checks,
             "metrics": self.metrics,
+            "observations": self.observations,
+            "soak": self.soak,
             "verdict": self.verdict,
             **({"errors": self.errors} if self.errors else {}),
         }
@@ -217,11 +254,13 @@ def _percentile(values: Sequence[float], percentile: float) -> float:
 def make_report(
     config: ProbeConfig,
     *,
-    checks: Mapping[str, bool],
+    checks: Mapping[str, bool | None],
     metrics: Mapping[str, float],
     actual_dimensions: int | None,
     errors: Sequence[str] = (),
     server: Mapping[str, Any] | None = None,
+    observations: Mapping[str, Any] | None = None,
+    soak: Mapping[str, Any] | None = None,
 ) -> ProbeResult:
     model = {
         "repo": config.repo,
@@ -239,15 +278,31 @@ def make_report(
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
             model["gguf_sha256"] = digest.hexdigest()
-    required = ("health", "v1_models", "v1_embeddings", "one_vector_per_input", "all_finite", "unit_norm", "repeat_stability", "batch_stability", "semantic_ordering", "japanese_cross_lingual", "soak")
-    verdict = "pass_text_only" if all(checks.get(name, False) for name in required) else "fail_model_compatibility"
-    return ProbeResult(server={"base_url": config.normalized_base_url, **dict(server or {})}, model=model, checks=dict(checks), metrics=dict(metrics), verdict=verdict, errors=list(errors))
+    verdict = determine_verdict(checks, soak_requests=config.soak_requests)
+    soak_status = {
+        "requested": config.soak_requests > 0,
+        "request_count": config.soak_requests,
+        "passed": None,
+        **dict(soak or {}),
+    }
+    return ProbeResult(
+        server={"base_url": config.normalized_base_url, **dict(server or {})},
+        model=model,
+        checks=dict(checks),
+        metrics=dict(metrics),
+        verdict=verdict,
+        errors=list(errors),
+        observations=dict(observations or {}),
+        soak=soak_status,
+    )
 
 
 def run_probe_sync(config: ProbeConfig) -> ProbeResult:
-    checks: dict[str, bool] = {}
+    checks: dict[str, bool | None] = {"soak": None}
     metrics: dict[str, float] = {}
     errors: list[str] = []
+    observations: dict[str, Any] = {}
+    soak_result: dict[str, Any] = {}
     try:
         health_status, health_payload = _request_json(config.base_url, "/health", timeout=config.timeout_seconds)
         checks["health"] = health_status == 200 and isinstance(health_payload, Mapping)
@@ -272,7 +327,15 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
         checks["one_vector_per_input"] = ok
         if not ok:
             errors.append(message)
-            return make_report(config, checks=checks, metrics=metrics, actual_dimensions=None, errors=errors)
+            return make_report(
+                config,
+                checks=checks,
+                metrics=metrics,
+                actual_dimensions=None,
+                errors=errors,
+                observations=observations,
+                soak=soak_result,
+            )
         actual_dimensions = len(vectors[0])
         finite_ok, message, norm_metrics = check_finite_norm(vectors)
         checks["all_finite"] = finite_ok
@@ -329,36 +392,44 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
         if batch_message:
             errors.append(batch_message)
 
-        soak_check = True
-        soak_started = time.perf_counter()
-        for _ in range(max(0, config.soak_requests)):
-            soak_status, soak_payload = _request_json(
-                config.base_url,
-                "/v1/embeddings",
-                method="POST",
-                payload=build_payload(config.model, [inputs[0]]),
-                timeout=config.timeout_seconds,
+        checks["soak"] = None
+        if config.soak_requests > 0:
+            soak_check = True
+            completed_requests = 0
+            soak_started = time.perf_counter()
+            for _ in range(config.soak_requests):
+                soak_status, soak_payload = _request_json(
+                    config.base_url,
+                    "/v1/embeddings",
+                    method="POST",
+                    payload=build_payload(config.model, [inputs[0]]),
+                    timeout=config.timeout_seconds,
+                )
+                soak_ok, soak_message, soak_vectors = check_shape(
+                    soak_payload, 1, actual_dimensions
+                )
+                if soak_status != 200 or not soak_ok:
+                    soak_check = False
+                    errors.append(soak_message or "soak embedding request failed")
+                    break
+                finite_ok, finite_message, _ = check_finite_norm(soak_vectors)
+                if not finite_ok:
+                    soak_check = False
+                    errors.append(finite_message or "soak vector validation failed")
+                    break
+                completed_requests += 1
+            if config.soak_duration_seconds > 0:
+                soak_check = soak_check and (
+                    time.perf_counter() - soak_started >= config.soak_duration_seconds
+                )
+            checks["soak"] = soak_check
+            soak_result.update(
+                {
+                    "passed": soak_check,
+                    "completed_requests": completed_requests,
+                    "failures": config.soak_requests - completed_requests,
+                }
             )
-            soak_ok, soak_message, soak_vectors = check_shape(
-                soak_payload, 1, actual_dimensions
-            )
-            if soak_status != 200 or not soak_ok:
-                soak_check = False
-                errors.append(soak_message or "soak embedding request failed")
-                break
-            finite_ok, finite_message, _ = check_finite_norm(soak_vectors)
-            if not finite_ok:
-                soak_check = False
-                errors.append(finite_message or "soak vector validation failed")
-                break
-        if config.soak_requests > 0 or config.soak_duration_seconds > 0:
-            checks["soak"] = soak_check and (
-                config.soak_duration_seconds <= 0
-                or time.perf_counter() - soak_started >= config.soak_duration_seconds
-            )
-        else:
-            checks["soak"] = False
-            errors.append("soak was not executed")
         def ordering_for(query_text: str, *, profile: str) -> tuple[bool, str, dict[str, float]]:
             query_status, query_payload = _request_json(
                 config.base_url,
@@ -390,18 +461,23 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
         ordering_ok, ordering_message, ordering_metrics = ordering_for(
             "What frontend language does the user prefer?", profile="raw"
         )
-        metrics.update(ordering_metrics)
         checks["semantic_ordering"] = ordering_ok
+        observations["semantic_ordering"] = {
+            "passed": ordering_ok,
+            **ordering_metrics,
+        }
         if ordering_message:
-            errors.append(ordering_message)
+            observations["semantic_ordering"]["error"] = ordering_message
 
         japanese_ok, japanese_message, japanese_metrics = ordering_for(
             "フロントエンドでは何の言語を優先する？", profile="raw"
         )
-        checks["japanese_cross_lingual"] = japanese_ok
-        metrics.update({f"japanese_{key}": value for key, value in japanese_metrics.items()})
+        observations["japanese_cross_lingual"] = {
+            "passed": japanese_ok,
+            **japanese_metrics,
+        }
         if japanese_message:
-            errors.append(f"japanese: {japanese_message}")
+            observations["japanese_cross_lingual"]["error"] = japanese_message
 
         instruction_query = (
             "Instruct: Retrieve stable, provenance-backed memories relevant to the user's current query.\n"
@@ -410,16 +486,36 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
         profile_ok, profile_message, profile_metrics = ordering_for(
             instruction_query, profile="qwen3_text"
         )
-        checks["instruction_profile_comparison"] = True
-        metrics.update({f"qwen3_text_{key}": value for key, value in profile_metrics.items()})
-        metrics["profile_margin_delta"] = profile_metrics.get("semantic_margin", 0.0) - japanese_metrics.get("semantic_margin", 0.0)
+        observations["instruction_profile_comparison"] = {
+            "passed": profile_ok,
+            "raw_margin": japanese_metrics.get("semantic_margin", 0.0),
+            "instruction_margin": profile_metrics.get("semantic_margin", 0.0),
+            "margin_delta": profile_metrics.get("semantic_margin", 0.0)
+            - japanese_metrics.get("semantic_margin", 0.0),
+        }
         if profile_message:
-            errors.append(f"qwen3_text profile: {profile_message}")
+            observations["instruction_profile_comparison"]["error"] = profile_message
 
-        return make_report(config, checks=checks, metrics=metrics, actual_dimensions=actual_dimensions, errors=errors)
+        return make_report(
+            config,
+            checks=checks,
+            metrics=metrics,
+            actual_dimensions=actual_dimensions,
+            errors=errors,
+            observations=observations,
+            soak=soak_result,
+        )
     except (ProbeTransportError, ValueError, TypeError) as exc:
         errors.append(str(exc))
-        return make_report(config, checks=checks, metrics=metrics, actual_dimensions=None, errors=errors)
+        return make_report(
+            config,
+            checks=checks,
+            metrics=metrics,
+            actual_dimensions=None,
+            errors=errors,
+            observations=observations,
+            soak=soak_result,
+        )
 
 
 def run_probe(config: ProbeConfig) -> ProbeResult:
@@ -458,4 +554,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-__all__ = ["ProbeConfig", "ProbeResult", "build_payload", "check_shape", "check_finite_norm", "check_repeat_stability", "check_batch_stability", "check_semantic_ordering", "cosine", "make_report", "run_probe", "run_probe_sync"]
+__all__ = [
+    "BASE_REQUIRED_CHECKS",
+    "ProbeConfig",
+    "ProbeResult",
+    "build_payload",
+    "check_shape",
+    "check_finite_norm",
+    "check_repeat_stability",
+    "check_batch_stability",
+    "check_semantic_ordering",
+    "cosine",
+    "determine_verdict",
+    "make_report",
+    "required_check_names",
+    "run_probe",
+    "run_probe_sync",
+]
