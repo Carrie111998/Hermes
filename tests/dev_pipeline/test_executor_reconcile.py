@@ -79,7 +79,7 @@ def _seed_running_task(conn, metadata: dict) -> tuple[str, int]:
         (
             task_id,
             int(time.time()),
-            json.dumps({"dev_pipeline": metadata}),
+            json.dumps({"dev_pipeline": {**metadata, "run_kind": metadata.get("run_kind", ex.RUN_KIND_ATTEMPT)}}),
             int(time.time()) + 900,
         ),
     )
@@ -224,11 +224,19 @@ def test_reconcile_retry_spawns_attempt(kanban_home_fixture):
 
 def test_reconcile_block_marks_task_blocked(kanban_home_fixture):
     conn = kanban_home_fixture
-    task_id, _run_id = _seed_running_task(conn, {"phase": "RUNNING"})
+    task_id, _run_id = _seed_running_task(
+        conn,
+        {"phase": "RUNNING", "run_kind": "attempt", "unit_started": True},
+    )
     conn.execute(
-        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
-        "VALUES (?, 'crashed', ?, ?, 'crashed')",
-        (task_id, int(time.time()), int(time.time())),
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'crashed', ?, ?, 'crashed', ?)",
+        (
+            task_id,
+            int(time.time()),
+            int(time.time()),
+            json.dumps({"dev_pipeline": {"run_kind": "attempt", "unit_started": True}}),
+        ),
     )
     conn.commit()
 
@@ -317,3 +325,66 @@ def test_fresh_executor_tick_adopts_running_task_after_restart(kanban_home_fixtu
                     ex.PHASE_PREPARING,
                     ex.PHASE_RUNNING,
                 }
+
+
+def test_reconcile_planning_resumes_planning_not_spawn(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, run_id = _seed_running_task(conn, {"phase": "PLANNING"})
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    with patch.object(ex, "run_planning", return_value=({"task_summary": "x"}, None, [])) as mock_plan:
+        with patch.object(ex, "clone_repo", return_value=(True, "")):
+            with patch.object(ex, "build_repo_summary", return_value="summary"):
+                with patch.object(executor, "_spawn_attempt") as mock_spawn:
+                    ex.reconcile_board(
+                        conn,
+                        executor.cfg,
+                        executor=executor,
+                        is_active_fn=lambda _u: (False, "inactive"),
+                    )
+                    mock_spawn.assert_not_called()
+                    mock_plan.assert_called_once()
+    assert task_id in executor._active
+
+
+def test_reconcile_preparing_reruns_prepare_not_spawn(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, _run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "PREPARING",
+            "repo": "/tmp/r",
+            "branch": "main",
+            "contract": {"task_summary": "x"},
+        },
+    )
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    with patch.object(ex, "start_new_run") as mock_new_run:
+        with patch.object(ex, "clone_repo", return_value=(True, "/tmp/r")):
+            with patch.object(ex, "ensure_dev_branch", return_value=("hermes-dev/t", "abc")):
+                with patch.object(ex, "install_pinned_agents", return_value="pinned"):
+                    with patch.object(ex, "systemd_run_attempt", return_value=(True, 1, 100)):
+                        ex.reconcile_board(
+                            conn,
+                            executor.cfg,
+                            executor=executor,
+                            is_active_fn=lambda _u: (False, "inactive"),
+                        )
+                        mock_new_run.assert_not_called()

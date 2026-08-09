@@ -41,7 +41,7 @@ def _setup_pipeline_task(conn, tmp_path, *, phase: str = ex.PHASE_REVIEWING) -> 
         summary="attempt done",
         metadata={"dev_pipeline": {"candidate_commit": "bbb"}},
     )
-    pipeline_run = ex.start_new_run(
+    pipeline_run = ex.start_pipeline_run(
         conn,
         task_id,
         metadata=ex.merge_pipeline_state(
@@ -192,4 +192,54 @@ def test_spawn_refuses_when_other_task_unit_active(kanban_home, tmp_path):
                 conn, task_id, run2, meta, ex.pipeline_state(meta)
             )
             mock_run.assert_not_called()
+    meta_after = ex.load_run_metadata(conn, run2)
+    assert ex.pipeline_state(meta_after).get("spawn_pending") is True
+    assert ex.pipeline_state(meta_after).get("unit_started") is False
+    conn.close()
+
+
+def test_refused_spawn_tick_does_not_classify_completed(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body='{"task":"x"}',
+        workspace_kind="scratch",
+        board="dev",
+    )
+    kb.claim_task(conn, task_id, claimer="dev-executor")
+    run_id = kb.latest_run(conn, task_id).id
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs = tmp_path / "logs"
+    meta = ex.merge_pipeline_state(
+        {},
+        {
+            "phase": ex.PHASE_RUNNING,
+            "spawn_pending": True,
+            "unit_started": False,
+            "unit_name": ex.unit_name(task_id, run_id),
+            "repo_path": str(repo),
+            "logs_root": str(logs),
+            "run_kind": ex.RUN_KIND_ATTEMPT,
+        },
+    )
+    ex.save_run_metadata(conn, run_id, meta)
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_RUNNING)
+
+    with patch.object(executor, "_is_active", return_value=(False, "inactive")):
+        with patch.object(executor, "_finish_attempt") as mock_finish:
+            executor._phase_running(conn, task_id, run_id, meta, ex.pipeline_state(meta))
+            mock_finish.assert_not_called()
     conn.close()

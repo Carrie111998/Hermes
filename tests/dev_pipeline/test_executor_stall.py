@@ -66,6 +66,9 @@ def test_running_phase_stall_stops_unit_and_classifies(kanban_home, tmp_path):
     meta = ex.merge_pipeline_state(
         {},
         {
+            "phase": ex.PHASE_RUNNING,
+            "unit_started": True,
+            "run_kind": ex.RUN_KIND_ATTEMPT,
             "unit_name": f"hermes-dev-{task_id}-{run.id}",
             "jsonl_path": str(jsonl),
             "repo_path": str(tmp_path / "repo"),

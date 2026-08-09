@@ -56,6 +56,13 @@ POST_RUNNING_PHASES = frozenset(
     {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}
 )
 
+EXECUTOR_LOCAL_PRE_RUNNING = frozenset(
+    {PHASE_PLANNING, PHASE_ROUTING, PHASE_PREPARING}
+)
+
+RUN_KIND_ATTEMPT = "attempt"
+RUN_KIND_PIPELINE = "pipeline"
+
 CLAIM_TTL_SECONDS = 15 * 60
 HEARTBEAT_INTERVAL_SECONDS = 60
 STALL_NO_OUTPUT_SECONDS = 10 * 60
@@ -366,11 +373,31 @@ def block_dev_task(
 
 
 def count_attempt_runs(conn: Any, task_id: str) -> int:
+    """Count only Cursor attempt runs; pipeline/post-RUNNING runs are excluded."""
     rows = conn.execute(
-        "SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ?",
+        "SELECT metadata FROM task_runs WHERE task_id = ?",
         (task_id,),
-    ).fetchone()
-    return int(rows["c"]) if rows else 0
+    ).fetchall()
+    count = 0
+    for row in rows:
+        raw = row["metadata"]
+        if not raw:
+            continue
+        try:
+            meta = json.loads(raw)
+        except json.JSONDecodeError:
+            meta = {}
+        st = pipeline_state(meta)
+        kind = st.get("run_kind")
+        if kind == RUN_KIND_PIPELINE:
+            continue
+        if kind == RUN_KIND_ATTEMPT:
+            count += 1
+            continue
+        # Legacy rows: spawned units count as attempts.
+        if st.get("unit_started") or st.get("unit_name"):
+            count += 1
+    return count
 
 
 def start_new_run(
@@ -378,8 +405,11 @@ def start_new_run(
     task_id: str,
     *,
     metadata: Optional[dict] = None,
+    run_kind: str = RUN_KIND_ATTEMPT,
 ) -> int:
-    """Insert a new attempt run while the task stays ``running``."""
+    """Insert a new run while the task stays ``running``."""
+    base_meta = dict(metadata) if metadata else {}
+    base_meta = merge_pipeline_state(base_meta, {"run_kind": run_kind})
     now = int(time.time())
     lock = conn.execute(
         "SELECT claim_lock, claim_expires FROM tasks WHERE id = ?",
@@ -406,7 +436,7 @@ def start_new_run(
                 claim_lock,
                 claim_expires,
                 now,
-                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                json.dumps(base_meta, ensure_ascii=False),
             ),
         )
         run_id = int(cur.lastrowid or 0)
@@ -417,11 +447,21 @@ def start_new_run(
         kb._append_event(
             conn,
             task_id,
-            "dev_attempt_started",
-            {"run_id": run_id},
+            "dev_attempt_started" if run_kind == RUN_KIND_ATTEMPT else "dev_pipeline_run_started",
+            {"run_id": run_id, "run_kind": run_kind},
             run_id=run_id,
         )
     return run_id
+
+
+def start_pipeline_run(
+    conn: Any,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+) -> int:
+    """Open a post-RUNNING pipeline run (verify/review/publish)."""
+    return start_new_run(conn, task_id, metadata=metadata, run_kind=RUN_KIND_PIPELINE)
 
 
 def end_attempt_run(
@@ -1098,18 +1138,18 @@ def reconcile_task_state(
         )
     if unit_active and not pid_match:
         return ReconcileDecision(action="unit_gone", reason="pid_mismatch")
+    if phase in EXECUTOR_LOCAL_PRE_RUNNING:
+        return ReconcileDecision(action="resume", phase=str(phase))
     if phase in {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}:
         return ReconcileDecision(action="resume", phase=str(phase))
     if phase == PHASE_RUNNING and candidate_commit:
         return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
-    if phase in {PHASE_RUNNING, PHASE_PREPARING} and not candidate_commit:
+    if phase == PHASE_RUNNING and not candidate_commit:
         if attempts_used < max_attempts:
             return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
         return ReconcileDecision(action="block", reason="executor_restarted")
     if candidate_commit:
         return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
-    if attempts_used < max_attempts:
-        return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
     return ReconcileDecision(action="block", reason="executor_restarted")
 
 
@@ -1349,6 +1389,18 @@ class DevExecutor:
             run = kb.latest_run(conn, task.id)
             if not run:
                 continue
+            initial_meta = merge_pipeline_state(
+                {},
+                {
+                    "phase": PHASE_PLANNING,
+                    "run_kind": RUN_KIND_ATTEMPT,
+                    "phase_entered": True,
+                },
+            )
+            save_run_metadata(conn, run.id, initial_meta)
+            record_dev_phase(
+                conn, task.id, run.id, PHASE_PLANNING, {"entered": True}
+            )
             self._active[task.id] = ActiveTask(
                 task_id=task.id,
                 run_id=run.id,
@@ -1421,7 +1473,12 @@ class DevExecutor:
         phase: str,
     ) -> dict:
         """Persist phase to run metadata before any long I/O in the handler."""
-        meta = merge_pipeline_state(meta, {"phase": phase})
+        st = pipeline_state(meta)
+        if st.get("phase") == phase and st.get("phase_entered"):
+            if task_id in self._active:
+                self._active[task_id].phase = phase
+            return meta
+        meta = merge_pipeline_state(meta, {"phase": phase, "phase_entered": True})
         save_run_metadata(conn, run_id, meta)
         record_dev_phase(conn, task_id, run_id, phase, {"entered": True})
         if task_id in self._active:
@@ -1577,6 +1634,12 @@ class DevExecutor:
                 task_id,
                 active_unit,
             )
+            stop_task_units(conn, task_id, self._stop, self._is_active)
+            meta = merge_pipeline_state(
+                meta,
+                {"spawn_pending": True, "unit_started": False, "run_kind": RUN_KIND_ATTEMPT},
+            )
+            save_run_metadata(conn, run_id, meta)
             return
         if self._is_active(unit)[0]:
             return
@@ -1605,6 +1668,9 @@ class DevExecutor:
                 "repo_path": str(repo_dir),
                 "logs_root": str(logs_root),
                 "phase": PHASE_RUNNING,
+                "run_kind": RUN_KIND_ATTEMPT,
+                "spawn_pending": True,
+                "unit_started": False,
             },
         )
         save_run_metadata(conn, run_id, meta)
@@ -1624,6 +1690,8 @@ class DevExecutor:
             {
                 "unit_pid": pid,
                 "host_start_time": start_time,
+                "spawn_pending": False,
+                "unit_started": True,
             },
         )
         save_run_metadata(conn, run_id, meta)
@@ -1645,8 +1713,16 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
-        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_RUNNING)
         st = pipeline_state(meta)
+        if st.get("phase") != PHASE_RUNNING:
+            meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_RUNNING)
+            st = pipeline_state(meta)
+
+        if not st.get("unit_started"):
+            if st.get("spawn_pending"):
+                self._spawn_attempt(conn, task_id, run_id, meta, st)
+            return
+
         unit = str(st.get("unit_name") or unit_name(task_id, run_id))
         jsonl_path = Path(str(st.get("jsonl_path") or ""))
         active, _ = self._is_active(unit)
@@ -1693,7 +1769,10 @@ class DevExecutor:
         if active:
             return
 
-        exit_code = 0
+        if not st.get("unit_started"):
+            return
+
+        exit_code: Optional[int] = None
         try:
             code_str = systemctl_show(unit, "ExecMainStatus")
             if code_str and code_str.isdigit():
@@ -1770,7 +1849,7 @@ class DevExecutor:
                 )
                 self._active.pop(task_id, None)
             return
-        pipeline_run = start_new_run(conn, task_id, metadata=meta)
+        pipeline_run = start_pipeline_run(conn, task_id, metadata=meta)
         if task_id in self._active:
             self._active[task_id].run_id = pipeline_run
         fresh_meta = load_run_metadata(conn, pipeline_run)
