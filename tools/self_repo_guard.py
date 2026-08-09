@@ -123,6 +123,17 @@ _WRAPPER_OPTIONS_WITH_ARG = {
 }
 _SIMPLE_WRAPPERS = frozenset({"builtin", "exec", "nohup", "setsid", "time"})
 _MAX_RECURSION = 4
+# Native Windows path: drive letter + separator. Used to avoid treating `\` as a
+# shell escape when the operand is clearly a filesystem path for Git.
+_WINDOWS_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+# After approval.py's escape stripping, `D:\work\repo` becomes `D:workrepo` —
+# drive letter, colon, then a non-separator. Treat as untrusted (fail closed).
+_MANGLED_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[^\\/]")
+# Git-Bash / MSYS drive form: `/d/work/...` → `D:/work/...` (explicit Git
+# path operands only; always recognized so tests can pin behavior on POSIX).
+# Require a slash (or EOS) immediately after the single drive letter so
+# ordinary Unix paths like `/tmp/foo` and `/dev/null` never match.
+_GIT_BASH_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?\Z")
 
 
 @dataclass
@@ -166,6 +177,110 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _unquote_raw_preserve(raw: str) -> str:
+    """Strip a single layer of matching quotes without interpreting escapes."""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+        return raw[1:-1]
+    return raw
+
+
+def _raw_looks_like_windows_path(raw: str) -> bool:
+    """True when *raw* (possibly quoted) is a native Windows drive path."""
+    inner = _unquote_raw_preserve(raw)
+    if _WINDOWS_DRIVE_PATH_RE.match(inner):
+        return True
+    return bool(re.match(r"^[A-Za-z]:", inner) and "\\" in inner)
+
+
+def _strip_quotes_preserve_windows_path(raw_word: str) -> str:
+    """Strip shell quotes but keep `\\` as path separators in Windows paths."""
+    return _unquote_raw_preserve(raw_word)
+
+
+def _path_aware_shell_word(raw_word: str) -> str:
+    """Deobfuscate a shell word, preserving native Windows path separators.
+
+    approval.py's escape strip treats `\\` as a shell escape, which mangles
+    quoted paths like ``"D:\\work\\hermes-agent"`` into ``D:workhermes-agent``.
+    For explicit filesystem operands we keep those separators instead.
+    """
+    assign = _ASSIGNMENT_RE.fullmatch(raw_word)
+    if assign:
+        name, _, value_raw = raw_word.partition("=")
+        if _raw_looks_like_windows_path(value_raw):
+            return f"{name}={_strip_quotes_preserve_windows_path(value_raw)}"
+        return _deobfuscate_shell_word_for_detection(raw_word)
+
+    if raw_word.startswith("--work-tree="):
+        value = raw_word[len("--work-tree=") :]
+        if _raw_looks_like_windows_path(value):
+            return "--work-tree=" + _strip_quotes_preserve_windows_path(value)
+        return _deobfuscate_shell_word_for_detection(raw_word)
+
+    if (
+        raw_word.startswith("-C")
+        and len(raw_word) > 2
+        and not raw_word.startswith("--")
+    ):
+        value = raw_word[2:]
+        if _raw_looks_like_windows_path(value):
+            return "-C" + _strip_quotes_preserve_windows_path(value)
+        return _deobfuscate_shell_word_for_detection(raw_word)
+
+    if _raw_looks_like_windows_path(raw_word):
+        return _strip_quotes_preserve_windows_path(raw_word)
+    return _deobfuscate_shell_word_for_detection(raw_word)
+
+
+def _windows_git_bash_to_drive(path: str) -> str | None:
+    """Translate Git-Bash ``/d/work/...`` to ``D:/work/...``, else None."""
+    match = _GIT_BASH_DRIVE_RE.fullmatch(path)
+    if not match:
+        return None
+    drive = match.group(1).upper()
+    rest = match.group(2)
+    if rest is None:
+        return f"{drive}:/"
+    return f"{drive}:/{rest}"
+
+
+def _is_mangled_windows_drive(path: str) -> bool:
+    """True when a drive path lost its separators (escape-strip artifact)."""
+    return bool(_MANGLED_WINDOWS_DRIVE_RE.match(path))
+
+
+def _normalize_git_path_operand(path: str) -> str:
+    """Normalize an explicit Git path operand for resolve/compare.
+
+    Preserves native Windows separators; maps Git-Bash drive form to
+    ``D:/...``. Does not require running on Windows.
+    """
+    git_bash = _windows_git_bash_to_drive(path)
+    if git_bash is not None:
+        return git_bash
+    return path
+
+
+def _explicit_git_path(path: str, base: Path) -> Path:
+    """Resolve an explicit Git ``-C`` / work-tree path operand."""
+    return _resolve_git_target(_normalize_git_path_operand(path), base)
+
+
+def _resolve_git_target(path_str: str, base: Path) -> Path:
+    """Resolve a Git path operand with Windows-aware absolute detection.
+
+    Drive-letter paths (``D:/...``, ``D:\\...``) are absolute for comparison
+    even when pathlib on POSIX would treat them as relative.
+    """
+    normalized = _normalize_git_path_operand(path_str)
+    expanded = os.path.expanduser(normalized)
+    if _WINDOWS_DRIVE_PATH_RE.match(expanded):
+        # Keep a stable absolute form without joining *base* (POSIX Path would
+        # otherwise treat ``D:/x`` as relative and prepend cwd/base).
+        return Path(expanded.replace("\\", "/"))
+    return _resolve(expanded, base)
+
+
 def _executable_name(value: str) -> str:
     return Path(value.replace("\\", "/")).name.removesuffix(".exe").lower()
 
@@ -179,7 +294,7 @@ def _shell_words_at(command: str, start: int) -> list[str]:
             break
         if words and "\n" in command[cursor:word_start]:
             break
-        words.append(_deobfuscate_shell_word_for_detection(raw_word))
+        words.append(_path_aware_shell_word(raw_word))
         cursor = word_end
     return words
 
@@ -457,11 +572,30 @@ def _git_target_and_subcommand(
     args: list[str],
     current_dir: Path,
     env: dict[str, str],
+    root: Path | None = None,
 ) -> tuple[Path, str | None, list[str], dict[str, str]]:
     target = current_dir
     work_tree: str | None = None
     aliases: dict[str, str] = {}
     index = 0
+    dash_c_count = 0
+    # Conservative multi -C rule: if any intermediate -C lands inside the
+    # source root, treat the effective target as the source root so mutating
+    # subcommands block — even when a later -C leaves the tree. Ambiguous /
+    # mangled Windows operands also fail closed (target := root) rather than
+    # falling back to ambient cwd.
+    any_dash_c_within_root = False
+    untrusted_path_operand = False
+
+    def _apply_explicit_path(path_str: str, base: Path) -> Path:
+        nonlocal any_dash_c_within_root, untrusted_path_operand
+        if _is_mangled_windows_drive(path_str):
+            untrusted_path_operand = True
+            return root if root is not None else base
+        resolved = _explicit_git_path(path_str, base)
+        if root is not None and _is_within(resolved, root):
+            any_dash_c_within_root = True
+        return resolved
 
     while index < len(args):
         arg = args[index]
@@ -469,11 +603,13 @@ def _git_target_and_subcommand(
             index += 1
             break
         if arg == "-C" and index + 1 < len(args):
-            target = _resolve(args[index + 1], target)
+            dash_c_count += 1
+            target = _apply_explicit_path(args[index + 1], target)
             index += 2
             continue
         if arg.startswith("-C") and len(arg) > 2:
-            target = _resolve(arg[2:], target)
+            dash_c_count += 1
+            target = _apply_explicit_path(arg[2:], target)
             index += 1
             continue
         if arg in {"--work-tree", "--git-dir", "--namespace", "--exec-path"}:
@@ -504,7 +640,14 @@ def _git_target_and_subcommand(
 
     explicit_work_tree = work_tree or env.get("GIT_WORK_TREE")
     if explicit_work_tree:
-        target = _resolve(explicit_work_tree, target)
+        target = _apply_explicit_path(explicit_work_tree, target)
+
+    if root is not None and (
+        untrusted_path_operand
+        or (dash_c_count > 1 and any_dash_c_within_root)
+    ):
+        target = root
+
     subcommand = args[index].lower() if index < len(args) else None
     return target, subcommand, args[index + 1 :], aliases
 
@@ -559,7 +702,7 @@ def _inspect_git_worktree(args: list[str], cwd: Path, root: Path) -> str | None:
     target_index = _next_positional(args, action_index + 1)
     if target_index >= len(args):
         return None
-    if _resolve(args[target_index], cwd) == root:
+    if _explicit_git_path(args[target_index], cwd) == root:
         return f"git worktree {action}"
     return None
 
@@ -588,7 +731,7 @@ def _inspect_git(
     depth: int,
 ) -> str | None:
     target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
-        args, current_dir, env
+        args, current_dir, env, root=root
     )
     if subcommand is None:
         return None

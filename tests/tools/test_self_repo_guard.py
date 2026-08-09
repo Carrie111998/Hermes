@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 from tools.self_repo_guard import (
+    _explicit_git_path,
+    _is_mangled_windows_drive,
+    _normalize_git_path_operand,
+    _path_aware_shell_word,
+    _strip_quotes_preserve_windows_path,
+    _windows_git_bash_to_drive,
     detect_self_repo_git_mutation,
     get_running_source_root,
 )
@@ -354,3 +360,102 @@ class TestUnparseableCommands:
     def test_subshell_syntax_does_not_crash(self, repo):
         hit, _ = _detect("VAL=$(git rev-parse HEAD) git checkout main", repo, repo)
         assert hit is True
+
+
+class TestExplicitGitTargetPaths:
+    """Windows / Git-Bash explicit ``-C`` operands must not fail open."""
+
+    def test_preserves_windows_backslash_in_dash_c_operand(self):
+        raw = r'"D:\work\hermes-agent"'
+        preserved = _strip_quotes_preserve_windows_path(raw)
+        assert preserved == r"D:\work\hermes-agent"
+        assert "\\" in preserved
+        assert _path_aware_shell_word(raw) == r"D:\work\hermes-agent"
+        normalized = _normalize_git_path_operand(r"D:\work\hermes-agent")
+        assert normalized == r"D:\work\hermes-agent"
+        path = _explicit_git_path(r"D:\work\hermes-agent", Path("/tmp"))
+        assert "D:" in str(path).replace("\\", "/") or str(path).startswith("D:")
+        text = str(path).replace("\\", "/")
+        assert "work" in text and "hermes-agent" in text
+
+    def test_git_bash_drive_path_normalizes(self):
+        assert _windows_git_bash_to_drive("/d/work/hermes-agent") == "D:/work/hermes-agent"
+        assert _windows_git_bash_to_drive("/D/work/x") == "D:/work/x"
+        assert _windows_git_bash_to_drive("/c") == "C:/"
+        assert _normalize_git_path_operand("/d/work/hermes-agent") == "D:/work/hermes-agent"
+        path = _explicit_git_path("/d/work/hermes-agent", Path("/var/tmp"))
+        text = str(path).replace("\\", "/")
+        assert "D:" in text
+        assert "work/hermes-agent" in text
+        # Use non-escape string forms: "/tmp/..." embeds a TAB via \t in
+        # ordinary Python literals and would accidentally pass a looser regex.
+        assert _windows_git_bash_to_drive("/" + "tmp/foo") is None
+        assert _windows_git_bash_to_drive("/" + "dev/null") is None
+        assert _windows_git_bash_to_drive("/" + "Users/hermes") is None
+        assert _windows_git_bash_to_drive("/" + "etc/passwd") is None
+
+    def test_dash_c_windows_path_blocks_mutation_when_normalized_target_is_repo(
+        self, repo, tmp_path, monkeypatch
+    ):
+        import tools.self_repo_guard as mod
+
+        win_path = r"D:\work\hermes-agent"
+
+        def fake_explicit(path_str, base):
+            if path_str.replace("\\", "/") in {
+                win_path.replace("\\", "/"),
+                "D:/work/hermes-agent",
+            } or path_str == win_path:
+                return repo
+            return mod._resolve_git_target(
+                mod._normalize_git_path_operand(path_str), base
+            )
+
+        monkeypatch.setattr(mod, "_explicit_git_path", fake_explicit)
+        # Double-quoted native Windows path — path-aware word keep separators,
+        # then our stub maps the operand onto the real temp repo.
+        command = f'git -C "{win_path}" checkout main'
+        hit, _ = _detect(command, tmp_path, repo)
+        assert hit is True
+
+    def test_multiple_dash_c_fail_closed_when_first_is_repo(self, repo, tmp_path):
+        # Intermediate -C lands in the source root even though a later -C
+        # leaves it — conservative rule blocks the mutating subcommand.
+        hit, _ = _detect(
+            f"git -C {repo} -C {tmp_path} checkout main",
+            tmp_path,
+            repo,
+        )
+        assert hit is True
+
+    def test_multiple_dash_c_all_outside_still_allowed(self, repo, tmp_path):
+        outside_a = tmp_path / "outside-a"
+        outside_b = tmp_path / "outside-b"
+        outside_a.mkdir()
+        outside_b.mkdir()
+        hit, _ = _detect(
+            f"git -C {outside_a} -C {outside_b} checkout main",
+            tmp_path,
+            repo,
+        )
+        assert hit is False
+
+    def test_mangled_drive_path_operand_fail_closed(self, repo, tmp_path):
+        assert _is_mangled_windows_drive("D:workhermes")
+        assert not _is_mangled_windows_drive(r"D:\work\hermes")
+        assert not _is_mangled_windows_drive("D:/work/hermes")
+        # Escape-stripped drive form must fail closed for mutations regardless
+        # of ambient cwd (do not fall open to outside-the-repo ambient path).
+        hit, _ = _detect("git -C D:workhermes checkout main", tmp_path, repo)
+        assert hit is True
+
+    def test_path_aware_word_recovers_quoted_windows_path(self):
+        # Simulates the raw token _read_shell_word returns for a double-quoted
+        # Windows path; approval deobfuscation would mangle it.
+        from tools.approval import _deobfuscate_shell_word_for_detection
+
+        raw = r'"D:\work\hermes-agent"'
+        mangled = _deobfuscate_shell_word_for_detection(raw)
+        assert mangled == "D:workhermes-agent" or "\\" not in mangled
+        assert _path_aware_shell_word(raw) == r"D:\work\hermes-agent"
+        assert not _is_mangled_windows_drive(_path_aware_shell_word(raw))
