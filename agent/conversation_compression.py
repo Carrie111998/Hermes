@@ -271,6 +271,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_compression_telemetry",
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
+    "_proactive_prune_rearm_tokens",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -1309,6 +1310,27 @@ def recover_rotated_compression_session(
                 return recovered
             holder = holder_getter(session_id) if callable(holder_getter) else None
             if not holder or attempt == 20:
+                if not holder:
+                    orphan_reopener = getattr(
+                        type(session_db),
+                        "reopen_orphaned_compression_session",
+                        None,
+                    )
+                    if callable(orphan_reopener):
+                        try:
+                            if orphan_reopener(session_db, session_id):
+                                logger.warning(
+                                    "compression recovery: reopened orphaned "
+                                    "session=%s with no continuation",
+                                    session_id,
+                                )
+                        except Exception as exc:
+                            logger.warning(
+                                "orphaned compression session reopen failed "
+                                "for %s: %s",
+                                session_id,
+                                exc,
+                            )
                 return None
             time.sleep(0.05)
         return None
@@ -3192,7 +3214,17 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    from agent.context_compressor import (
+                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
+                    )
+
+                    agent._session_db.archive_and_compact(
+                        agent.session_id,
+                        compressed,
+                        model_config_patch={
+                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                        },
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3293,13 +3325,58 @@ def compress_context(
                         migrate_goal_to_session(old_session_id, agent.session_id, reason="compression")
                     except Exception as _goal_err:
                         logger.debug("Could not migrate goal on compression: %s", _goal_err)
-                    # Auto-number the title for the continuation session
+                    # Same boundary hazard for /heartbeat state — carry it too.
+                    try:
+                        from hermes_cli.heartbeat import migrate_heartbeat_to_session
+                        migrate_heartbeat_to_session(old_session_id, agent.session_id)
+                    except Exception as _hb_err:
+                        logger.debug("Could not migrate heartbeat on compression: %s", _hb_err)
+                    # Carry the title across the compression boundary unchanged.
+                    #
+                    # This used to renumber ("Fix X" → "Fix X #2") on every
+                    # rotation, which is why a long conversation ended up as
+                    # "Smallville Map Architecture Plan #10" — ten forks of ONE
+                    # session, each looking like a separate piece of work in the
+                    # sidebar. Compression is an internal implementation detail;
+                    # the user's conversation did not change topic, so its name
+                    # must not change either. Uniqueness still holds because
+                    # _set_session_title transfers the title off a hidden
+                    # compression ancestor rather than raising on the conflict.
                     if old_title:
+                        # Read provenance BEFORE the write: transferring the
+                        # title off a hidden compression ancestor clears the
+                        # ancestor's row, so reading afterwards always returns
+                        # None and the child would be stamped "user" — freezing
+                        # an auto-title that should still be upgradeable.
+                        _src = None
                         try:
-                            new_title = agent._session_db.get_next_title_in_lineage(old_title)
-                            agent._session_db.set_session_title(agent.session_id, new_title)
+                            _src = agent._session_db.get_session_title_source(
+                                old_session_id
+                            )
+                        except Exception as _src_err:
+                            logger.debug(
+                                "Could not read title provenance: %s", _src_err
+                            )
+                        try:
+                            agent._session_db.set_session_title(
+                                agent.session_id, old_title
+                            )
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
+                        else:
+                            # set_session_title() records "user"; restore the
+                            # original authority so an inherited auto-title
+                            # stays upgradeable and a manual one stays pinned.
+                            if _src is not None:
+                                try:
+                                    agent._session_db.set_session_title_source(
+                                        agent.session_id, _src
+                                    )
+                                except Exception as _src_err:
+                                    logger.debug(
+                                        "Could not propagate title provenance: %s",
+                                        _src_err,
+                                    )
 
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
@@ -3329,6 +3406,24 @@ def compress_context(
                     messages[:] = copy.deepcopy(messages_before_compression)
                     compressed = messages
                     _compression_made_progress = False
+                    # Restore ONLY the prune runway, not the full attempt
+                    # snapshot: _restore_compressor_attempt_state is reserved
+                    # for pre-commit cancels (fence deny / explicit cancel),
+                    # while this branch is post-attempt — the other snapshot
+                    # fields (telemetry, aborted flags) must keep the failed
+                    # attempt's values. The runway is a property of transcript
+                    # state, and the transcript was just rolled back to its
+                    # pre-compression copy, so the runway rolls back with it.
+                    # (compress() zeroed it in-memory on summary success; the
+                    # durable copy was never cleared — that clear only rides
+                    # the atomic archive_and_compact / child-row publication
+                    # that just failed.)
+                    if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
+                        agent.context_compressor._proactive_prune_rearm_tokens = (
+                            _compressor_attempt_snapshot[
+                                "_proactive_prune_rearm_tokens"
+                            ]
+                        )
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place
