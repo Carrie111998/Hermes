@@ -9,12 +9,22 @@ One user entrypoint: `delegate_development(repo, task)`. Hermes plans via the co
 
 ## Non-goals (hard exclusions for this slice)
 
-- No GLM/Claude Code endurance lane (adapter not qualified yet).
+- No GLM/Claude Code endurance lane (adapter not qualified yet — and it does not ship until it meets the observability bar below).
 - No ambiguous-task probe lane, no Cursor→GLM escalation, no runtime lane switching.
 - No learned routing, semantic progress scoring, or LLM-judged test greenness.
 - No concurrent writers, multi-host scheduling, auto-merge, or deployment.
 - No new external job database: Kanban (`hermes_cli/kanban_db.py`) is the single durable ledger.
 - No modifications to the gateway service, the Kanban dispatcher, or `tools/cursor_agent_tool.py` behavior (read-only reuse of its helpers is fine).
+
+## Lane-agnostic observability requirement (applies to every worker lane, Cursor now, GLM later)
+
+A lane may not ship unless the user can see what it is doing while it runs, without asking a model to summarize. Minimum bar:
+
+1. **Structured event stream per attempt.** Cursor: its `--output-format stream-json` JSONL. GLM/Claude Code (slice 2): its headless stream-json equivalent — qualification MUST prove the stream is parseable; if it is not, the lane waits.
+2. **Condensed progress events on the Kanban card.** The executor tails the attempt stream and writes coarse `task_events` rows (file edited, command run + exit code, checkpoint created, no-output warnings). Queryable via `hermes kanban show <id>` and by the agent mid-run.
+3. **Checkpoint commits as timeline.** Every meaningful step becomes a commit whose message names the milestone; the job branch's `git log` is the progress feed.
+4. **Phase-change thread updates.** The existing kanban notifier posts phase transitions (planned → running → verifying → reviewing → done/blocked) to the origin thread as ordinary messages; only the terminal message replies/mentions. Quiet between phases, but state is always queryable.
+5. **Stall detection from the same stream.** No stream growth for N minutes = stalled → terminate, checkpoint, classify. Observability doubles as the dead-man switch.
 
 ## Existing pieces to reuse (verified in tree)
 
@@ -84,7 +94,7 @@ Phases:
   `agent -p --trust --force --model kimi-k3-high --output-format stream-json "<attempt prompt>"`
   streaming JSONL to `<board logs root>/<task_id>/attempt-<run_id>.jsonl`.
 - Attempt prompt: task text, plan contract JSON, rules: delegate implementation to `implementer`, then review to `reviewer`, fix blocking findings via implementer, commit with conventional message, do not push, do not create PRs, report structured final summary. (Mirror the proven prompt shape from the cursor-bridge skill.)
-- Monitor: every tick, `systemctl is-active <unit>` + heartbeat the claim + record output mtime. Stall definition: unit active but no JSONL output growth for 10 min → terminate unit (`systemctl stop`), classify `stalled`.
+- Monitor: every tick, `systemctl is-active <unit>` + heartbeat the claim + record output mtime. Also tail the JSONL stream and write coarse progress `task_events` (per the observability requirement: files edited, commands run + exit codes, checkpoints, no-output warnings). Stall definition: unit active but no JSONL output growth for 10 min → terminate unit (`systemctl stop`), classify `stalled`.
 - On unit exit: collect exit code, final JSONL events, `git log` in workspace, candidate commit SHA. Classify: `completed` | `timeout` | `stalled` | `crashed` | `no_changes`.
 
 **VERIFYING (mechanical — no model judgment of greenness)**
