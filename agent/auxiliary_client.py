@@ -9616,6 +9616,14 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    # Auxiliary callers do not pass through the main runtime's provider-copy
+    # sanitizer. Build the same disposable exact-secret-masked view here so
+    # title/one-shot/plugin/direct calls cannot bypass the provider boundary.
+    # The helper preserves caller history and replay/signed/sealed fields, and
+    # deliberately respects the operator's explicit redaction opt-out.
+    from agent.redact import redact_provider_message_values
+
+    provider_messages = redact_provider_message_values(messages)
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -9656,7 +9664,7 @@ def call_llm(
                 base_url=base_url,
                 api_key=api_key,
                 main_runtime=main_runtime,
-                messages=messages,
+                messages=provider_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 tools=tools,
@@ -10562,6 +10570,17 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    import asyncio
+
+    from agent.redact import redact_provider_message_values
+
+    # Exact-secret collection, JSON parsing, pattern compilation, and deep-copy
+    # traversal are synchronous CPU/filesystem work. Keep them off the event
+    # loop; asyncio.to_thread propagates the active ContextVar profile scope.
+    provider_messages = await asyncio.to_thread(
+        redact_provider_message_values,
+        messages,
+    )
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10573,7 +10592,7 @@ async def async_call_llm(
             base_url=base_url,
             api_key=api_key,
             main_runtime=main_runtime,
-            messages=messages,
+            messages=provider_messages,
             temperature=temperature,
             max_tokens=max_tokens,
             tools=tools,
