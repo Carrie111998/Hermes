@@ -7188,6 +7188,29 @@ def heartbeat_worker(
     return True
 
 
+def _send_worker_signal(
+    kill_fn, pid: int, sig: int, pg_capable: bool
+) -> bool:
+    """Send ``sig`` to the worker's process group, then fall back to pid.
+
+    Returns True if either send completed without raising. On POSIX we
+    try the negative pid first so the wrapper's child also receives the
+    signal; on Windows (no ``os.killpg``) we skip straight to the single
+    pid send.
+    """
+    if pg_capable:
+        try:
+            kill_fn(-pid, sig)
+            return True
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        kill_fn(pid, sig)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -7240,24 +7263,21 @@ def enforce_max_runtime(
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
+        # Prefer signalling the whole process group so a wrapper's
+        # SIGKILL also reaches its child; fall back to the single pid.
+        pg_capable = hasattr(os, "killpg")
         if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
+            _send_worker_signal(kill, pid, signal.SIGTERM, pg_capable)
             # Short polling wait — no time.sleep on the write txn.
             for _ in range(10):
                 if not _pid_alive(pid):
                     break
                 time.sleep(0.5)
             if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
+                # signal.SIGKILL doesn't exist on Windows.
+                _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                if _send_worker_signal(kill, pid, _sigkill, pg_capable):
                     killed = True
-                except (ProcessLookupError, OSError):
-                    pass
 
         with write_txn(conn):
             cur = conn.execute(
@@ -8849,11 +8869,22 @@ def _rotate_worker_log(
             src = _rotated_log_path(log_path, generation)
             if not src.exists():
                 continue
+            dst = _rotated_log_path(log_path, generation + 1)
             try:
-                src.rename(_rotated_log_path(log_path, generation + 1))
+                src.rename(dst)
+            except OSError:
+                continue
+            # Re-harden mode in case the file was created before 0600 was default.
+            try:
+                dst.chmod(0o600)
             except OSError:
                 pass
-        log_path.rename(_rotated_log_path(log_path, 1))
+        first = _rotated_log_path(log_path, 1)
+        log_path.rename(first)
+        try:
+            first.chmod(0o600)
+        except OSError:
+            pass
     except OSError:
         pass
 
