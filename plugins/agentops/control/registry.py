@@ -61,8 +61,9 @@ class FleetRegistry:
     def coverage_report(self) -> FleetCoverage:
         registered = len(self._targets)
         snapshotted = len(self._snapshots)
-        coverage = 0 if registered == 0 else (snapshotted * 100) // registered
-        disabled = ("processes",) if any(target.spec.labels.get("process_observation") == "disabled" for target in self._targets.values()) else ()
+        disabled_count = sum(1 for target in self._targets.values() if target.spec.labels.get("process_observation") == "disabled")
+        coverage = 0 if registered == 0 else (max(0, snapshotted - disabled_count) * 100) // registered
+        disabled = ("processes",) if disabled_count else ()
         return FleetCoverage(registered, snapshotted, coverage, disabled)
 
 

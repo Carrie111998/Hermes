@@ -153,6 +153,8 @@ def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: R
         if name == "min_interval_seconds" and name in runtime and float(runtime[name]) < spec.rate_limit_seconds:
             raise ManifestValidationError("runtime collector rate below pack")
         runtime.setdefault(name, value)
+    if collector_id == "cron" and "max_assertions" in runtime and int(runtime["max_assertions"]) > spec.max_items:
+        raise ManifestValidationError("runtime assertion budget exceeds pack")
     runtime.pop("target_kind", None)
     if collector_id == "cron":
         runtime["review_pack"] = active

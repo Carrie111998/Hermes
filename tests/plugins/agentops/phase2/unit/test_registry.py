@@ -33,7 +33,8 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
         )
 
     coverage = registry.coverage_report()
-    assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (5, 5, 100)
+    assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (5, 5, 0)
+    assert "processes" in coverage.unmanaged_collectors
 
 
 def test_registry_refuses_duplicate_targets_and_unknown_snapshots():
