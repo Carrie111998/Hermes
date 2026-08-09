@@ -742,7 +742,7 @@ def get_provider_implementation_config(provider_id: str) -> ProviderConfig:
 
 
 def get_known_provider_config(provider_id: str) -> ProviderConfig | None:
-    """Return cleanup/security metadata independently of live routability."""
+    """Return active or built-in metadata independently of live routability."""
     normalized = (provider_id or "").strip().lower()
     live = PROVIDER_REGISTRY.get(normalized)
     if live is not None:
@@ -750,30 +750,7 @@ def get_known_provider_config(provider_id: str) -> ProviderConfig | None:
     static = _STATIC_PROVIDER_REGISTRY.get(normalized)
     if static is not None:
         return static
-    try:
-        from providers import get_observed_provider_profiles
-
-        for profile in get_observed_provider_profiles():
-            if normalized == profile.name or normalized in profile.aliases:
-                return _provider_config_from_profile(profile)
-    except Exception:
-        pass
     return None
-
-
-def get_all_known_provider_configs() -> tuple[ProviderConfig, ...]:
-    """Return a monotonic union for secret-name filtering, not routing."""
-    configs = list(_STATIC_PROVIDER_REGISTRY.values())
-    try:
-        from providers import get_observed_provider_profiles
-
-        for profile in get_observed_provider_profiles():
-            config = _provider_config_from_profile(profile)
-            if config is not None:
-                configs.append(config)
-    except Exception:
-        pass
-    return tuple(configs)
 
 
 def get_nous_service_config() -> ProviderConfig:

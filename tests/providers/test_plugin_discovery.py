@@ -431,40 +431,6 @@ def test_inactive_external_manifest_cannot_suppress_static_provider(
     )
 
 
-def test_observed_provider_secret_names_remain_blocked_after_disable(
-    tmp_path,
-    monkeypatch,
-):
-    home = tmp_path / "home"
-    home.mkdir()
-    _write_user_provider(
-        home,
-        "secret-provider",
-        base_url="https://secret.example/v1",
-        env_vars=("SECRET_PROVIDER_API_KEY", "SECRET_PROVIDER_BASE_URL"),
-    )
-    _write_activation(
-        home,
-        enabled=("model-providers/secret-provider",),
-    )
-    monkeypatch.setenv("HERMES_HOME", str(home))
-
-    import providers
-    from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
-
-    providers.invalidate_provider_discovery()
-    assert "SECRET_PROVIDER_API_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
-    assert "SECRET_PROVIDER_BASE_URL" in _HERMES_PROVIDER_ENV_BLOCKLIST
-
-    _write_activation(
-        home,
-        disabled=("model-providers/secret-provider",),
-    )
-    providers.invalidate_provider_discovery()
-    assert "SECRET_PROVIDER_API_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
-    assert "SECRET_PROVIDER_BASE_URL" in _HERMES_PROVIDER_ENV_BLOCKLIST
-
-
 def test_disabling_provider_refreshes_all_derived_surfaces(
     tmp_path,
     monkeypatch,
@@ -508,11 +474,7 @@ def test_disabling_provider_refreshes_all_derived_surfaces(
         for entry in models.CANONICAL_PROVIDERS
     )
     assert "refresh-provider" not in models._KNOWN_PROVIDER_NAMES
-    # Observed secret names remain in the process-wide metadata/blocklist even
-    # after this profile disables the plugin.  Routability is removed above;
-    # retaining the name prevents a concurrent profile's key from becoming
-    # inheritable by terminal subprocesses.
-    assert "REFRESH_PROVIDER_API_KEY" in config.OPTIONAL_ENV_VARS
+    assert "REFRESH_PROVIDER_API_KEY" not in config.OPTIONAL_ENV_VARS
 
 
 def test_failed_provider_import_rolls_back_registry_aliases_and_modules(

@@ -1240,8 +1240,13 @@ def _discover_plugin_candidates() -> list:
     return candidates
 
 
-def _select_active_plugin_entries(entries: list, activation: PluginActivationState) -> list:
-    """Select the highest-priority active candidate for each canonical key."""
+def _select_plugin_entries(
+    entries: list,
+    activation: PluginActivationState,
+    *,
+    active_only: bool = False,
+) -> list:
+    """Select the canonical winner for each key using runtime semantics."""
     from hermes_cli.plugins import resolve_plugin_candidate_winner
 
     grouped: dict[str, list] = {}
@@ -1259,9 +1264,30 @@ def _select_active_plugin_entries(entries: list, activation: PluginActivationSta
                 kind=entry[6],
             ),
         )
-        if selection is not None and selection[1] == "enabled":
+        if selection is not None and (
+            not active_only or selection[1] == "enabled"
+        ):
             winners.append(selection[0])
     return winners
+
+
+def _select_active_plugin_entries(
+    entries: list,
+    activation: PluginActivationState,
+) -> list:
+    """Select only executable canonical winners."""
+    return _select_plugin_entries(entries, activation, active_only=True)
+
+
+def _discover_plugin_display_entries(
+    activation: PluginActivationState | None = None,
+) -> list:
+    """Return one runtime-consistent introspection row per canonical key."""
+    if activation is None:
+        from hermes_cli.config import load_plugin_activation_state
+
+        activation = load_plugin_activation_state()
+    return _select_plugin_entries(_discover_plugin_candidates(), activation)
 
 
 def _discover_all_plugins() -> list:
@@ -1364,7 +1390,7 @@ def cmd_list(args: Any | None = None) -> None:
     from rich.table import Table
 
     console = Console()
-    entries = _discover_all_plugins()
+    entries = _discover_plugin_display_entries()
     if not entries:
         console.print("[dim]No plugins installed.[/dim]")
         console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")

@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 from hermes_cli import plugins_cmd
+from hermes_cli.plugin_activation import PluginActivationState
 
 
 def _args(**kwargs):
@@ -39,7 +40,11 @@ def test_cmd_list_plain_compact_output(monkeypatch, capsys):
         ("disk-cleanup", "2.0.0", "Bundled", "bundled", None, "disk-cleanup", "backend"),
         ("web-search-plus", "2.2.0", "Search", "git", None, "web-search-plus", "standalone"),
     ]
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_entries",
+        lambda: entries,
+    )
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"web-search-plus"})
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
 
@@ -56,7 +61,11 @@ def test_cmd_list_json_preserves_name_and_adds_canonical_key(monkeypatch, capsys
     entries = [
         ("xai", "1.0.0", "Images", "bundled", None, "image_gen/xai", "backend"),
     ]
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_entries",
+        lambda: entries,
+    )
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
 
@@ -72,7 +81,11 @@ def test_cmd_list_plain_disambiguates_duplicate_manifest_names(monkeypatch, caps
         ("xai", "1.0.0", "Images", "bundled", None, "image_gen/xai", "backend"),
         ("xai", "1.0.0", "Video", "bundled", None, "video_gen/xai", "backend"),
     ]
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: entries)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_entries",
+        lambda: entries,
+    )
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
 
@@ -81,6 +94,50 @@ def test_cmd_list_plain_disambiguates_duplicate_manifest_names(monkeypatch, caps
     out = capsys.readouterr().out
     assert "xai [image_gen/xai]" in out
     assert "xai [video_gen/xai]" in out
+
+
+def test_cmd_list_uses_active_bundled_winner_over_inactive_user_copy(
+    monkeypatch,
+    capsys,
+):
+    candidates = [
+        (
+            "bundled-shared",
+            "1.0.0",
+            "Bundled",
+            "bundled",
+            None,
+            "shared",
+            "backend",
+        ),
+        (
+            "user-shared",
+            "2.0.0",
+            "User",
+            "user",
+            None,
+            "shared",
+            "backend",
+        ),
+    ]
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_plugin_activation_state",
+        lambda: PluginActivationState(),
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
+
+    plugins_cmd.cmd_list(_args(json=True))
+
+    payload = json.loads(capsys.readouterr().out)
+    assert [(row["name"], row["source"]) for row in payload] == [
+        ("bundled-shared", "bundled")
+    ]
 
 
 def test_dashboard_toggle_response_keeps_input_name_and_adds_key(monkeypatch):

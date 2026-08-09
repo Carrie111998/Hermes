@@ -32,6 +32,11 @@ def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugi
     )
     monkeypatch.setattr(
         web_server,
+        "_discover_dashboard_plugin_entries",
+        discover_all_plugins or (lambda: list(_PLUGIN_ROW)),
+    )
+    monkeypatch.setattr(
+        web_server,
         "_load_dashboard_plugin_activation_state",
         lambda: PluginActivationState(
             enabled=frozenset({"category/demo"})
@@ -41,11 +46,6 @@ def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugi
     monkeypatch.setattr(web_server, "get_hermes_home", lambda: Path("/tmp/hermes-home"))
     monkeypatch.setattr(web_server, "load_config", lambda: {"dashboard": {"hidden_plugins": []}})
 
-    monkeypatch.setattr(
-        plugins_cmd,
-        "_discover_all_plugins",
-        discover_all_plugins or (lambda: list(_PLUGIN_ROW)),
-    )
     monkeypatch.setattr(plugins_cmd, "_get_current_context_engine", lambda: "compressor")
     monkeypatch.setattr(plugins_cmd, "_get_current_memory_provider", lambda: "")
     monkeypatch.setattr(plugins_cmd, "_discover_context_engines", lambda: [])

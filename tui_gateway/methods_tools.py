@@ -1811,7 +1811,7 @@ def _(rid, params: dict) -> dict:
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
-            _discover_all_plugins,
+            _discover_plugin_display_entries,
             _get_disabled_set,
             _get_enabled_set,
             _is_portable_plugin_dir,
@@ -1823,7 +1823,7 @@ def _(rid, params: dict) -> dict:
             disabled = _get_disabled_set()
             out = []
             for name, version, desc, source, _dir, key, kind in sorted(
-                _discover_all_plugins()
+                _discover_plugin_display_entries()
             ):
                 out.append(
                     {

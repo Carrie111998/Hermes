@@ -17,7 +17,11 @@ def _call(params):
 
 
 def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: list(_ENTRIES))
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_entries",
+        lambda: list(_ENTRIES),
+    )
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
 
@@ -28,7 +32,11 @@ def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
 
 
 def test_plugins_manage_toggle_targets_key_and_returns_matching_row(monkeypatch):
-    monkeypatch.setattr(plugins_cmd, "_discover_all_plugins", lambda: list(_ENTRIES))
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_entries",
+        lambda: list(_ENTRIES),
+    )
     monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"video_gen/xai"})
     monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
     calls = []

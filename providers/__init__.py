@@ -100,9 +100,6 @@ _SNAPSHOT_CACHE: dict[tuple[object, ...], ProviderCatalogSnapshot] = {}
 _LAST_SNAPSHOT_FINGERPRINT: tuple[object, ...] | None = None
 _NOTIFIED_SNAPSHOT_FINGERPRINTS: set[tuple[object, ...]] = set()
 _MODULE_REGISTRATIONS: dict[str, tuple[ProviderProfile, ...]] = {}
-_MODULE_PATHS: dict[str, str] = {}
-_OBSERVED_PROFILES: dict[tuple[str, str, str], ProviderProfile] = {}
-_OBSERVED_PROVIDER_ENV_VARS: set[str] = set()
 _OBSERVED_PROVIDER_IDS_BY_SCOPE: dict[tuple[str, str], set[str]] = {}
 _RUNTIME_REGISTRY: dict[str, ProviderProfile] = {}
 _RUNTIME_ALIASES: dict[str, str] = {}
@@ -112,16 +109,6 @@ _RUNTIME_REGISTRATION_GENERATION = 0
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
 )
-
-
-def _record_observed_profile_locked(
-    source: str,
-    path: str,
-    profile: ProviderProfile,
-) -> None:
-    """Record monotonic non-executable security metadata under discovery lock."""
-    _OBSERVED_PROFILES[(source, path, profile.name)] = profile
-    _OBSERVED_PROVIDER_ENV_VARS.update(profile.env_vars)
 
 
 def register_provider(profile: ProviderProfile) -> None:
@@ -147,7 +134,6 @@ def register_provider(profile: ProviderProfile) -> None:
         _REGISTRY[profile.name] = profile
         for alias in profile.aliases:
             _ALIASES[alias] = profile.name
-        _record_observed_profile_locked("runtime", "", profile)
         _PROVIDER_LIST_CACHE = None
 
 
@@ -290,7 +276,6 @@ def invalidate_provider_discovery() -> None:
                     sys.modules.pop(module_name, None)
         _IMPORTED_PROVIDER_MODULES.clear()
         _MODULE_REGISTRATIONS.clear()
-        _MODULE_PATHS.clear()
         _discovered = False
         _ACTIVATION_STATE = None
         _DISCOVERY_FINGERPRINT = None
@@ -320,14 +305,6 @@ def is_provider_plugin_active(provider_id: str) -> bool:
     return provider_id in snapshot.active_plugin_provider_ids
 
 
-def is_bundled_provider_id(provider_id: str) -> bool:
-    """Return whether the trusted bundled catalog owns *provider_id*."""
-    snapshot = _ensure_providers_discovered()
-    if snapshot is None:
-        return False
-    return provider_id in snapshot.bundled_provider_ids
-
-
 def get_known_provider_ids() -> frozenset[str]:
     """Return non-executable identities suitable for cleanup validation."""
     snapshot = _ensure_providers_discovered()
@@ -335,32 +312,6 @@ def get_known_provider_ids() -> frozenset[str]:
         with _DISCOVERY_LOCK:
             return frozenset(_REGISTRY)
     return snapshot.known_provider_ids
-
-
-def get_observed_provider_profiles() -> tuple[ProviderProfile, ...]:
-    """Return a process-lifetime union used only for secret-name hardening."""
-    with _DISCOVERY_LOCK:
-        return tuple(_OBSERVED_PROFILES.values())
-
-
-def get_observed_provider_env_vars() -> frozenset[str]:
-    """Return provider env names observed before catalog publication.
-
-    Provider refresh hooks run after a newly built catalog is placed in the
-    snapshot cache.  A concurrent subprocess launch must not depend on those
-    callbacks having completed: otherwise a newly discovered provider key can
-    briefly escape the child-env scrubber.  ``_OBSERVED_PROFILES`` is updated
-    synchronously while discovery still holds ``_DISCOVERY_LOCK``, so this
-    monotonic view is the security publication barrier for spawn-time checks.
-    """
-    with _DISCOVERY_LOCK:
-        return frozenset(_OBSERVED_PROVIDER_ENV_VARS)
-
-
-def is_observed_provider_env_var(name: str) -> bool:
-    """Check the provider-owned spawn-security index without hook latency."""
-    with _DISCOVERY_LOCK:
-        return name in _OBSERVED_PROVIDER_ENV_VARS
 
 
 def _current_activation_state() -> PluginActivationState:
@@ -568,7 +519,6 @@ def _record_plugin_profiles(
     for profile in profiles:
         register_provider(profile)
         build_state.origins[profile.name] = origin
-        _record_observed_profile_locked(source, origin[1], profile)
 
 
 def _import_plugin_dir(plugin_dir: Path, source: str) -> tuple[ProviderProfile, ...]:
@@ -618,9 +568,7 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> tuple[ProviderProfile, 
         origin = (source, _path_identity(plugin_dir))
         for profile in profiles:
             build_state.origins[profile.name] = origin
-            _record_observed_profile_locked(source, origin[1], profile)
         _MODULE_REGISTRATIONS[module_name] = profiles
-        _MODULE_PATHS[module_name] = origin[1]
         _IMPORTED_PROVIDER_MODULES.add(module_name)
         return profiles
     except Exception as exc:
@@ -634,7 +582,6 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> tuple[ProviderProfile, 
         build_state.origins.clear()
         build_state.origins.update(origins_snapshot)
         _MODULE_REGISTRATIONS.pop(module_name, None)
-        _MODULE_PATHS.pop(module_name, None)
         for imported_name in tuple(sys.modules):
             if imported_name == module_name or imported_name.startswith(
                 f"{module_name}."
@@ -786,13 +733,9 @@ def _discover_providers(
                                 Path(getattr(module, "__file__", None) or modname)
                             ),
                         )
-                        _MODULE_PATHS[module_name] = origin[1]
                         for profile in profiles:
                             register_provider(profile)
                             build_state.origins[profile.name] = origin
-                            _record_observed_profile_locked(
-                                "legacy", origin[1], profile
-                            )
                             active_provider_ids.add(profile.name)
                             active_provider_ids.update(profile.aliases)
                             managed_provider_ids.add(profile.name)
@@ -808,7 +751,6 @@ def _discover_providers(
                         build_state.origins.clear()
                         build_state.origins.update(origins_snapshot)
                         _MODULE_REGISTRATIONS.pop(module_name, None)
-                        _MODULE_PATHS.pop(module_name, None)
                         for imported_name in tuple(sys.modules):
                             if imported_name == module_name or imported_name.startswith(
                                 f"{module_name}."

@@ -16810,6 +16810,22 @@ def _discover_dashboard_runtime_entries() -> list:
         reset_hermes_home_override(token)
 
 
+def _discover_dashboard_plugin_entries() -> list:
+    """Discover display winners in the dashboard process-home scope."""
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from hermes_cli.config import load_plugin_activation_state
+    from hermes_cli.plugins_cmd import _discover_plugin_display_entries
+
+    token = set_hermes_home_override(get_process_hermes_home())
+    try:
+        return _discover_plugin_display_entries(load_plugin_activation_state())
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _load_dashboard_plugin_activation_state():
     """Load activation config in the same process-home scope as discovery."""
     from hermes_constants import (
@@ -17394,7 +17410,6 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
 
     started_at = time.monotonic()
     from hermes_cli.plugins_cmd import (
-        _discover_all_plugins,
         _get_current_context_engine,
         _get_current_memory_provider,
         _discover_context_engines,
@@ -17407,7 +17422,7 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         for plugin in dashboard_list
         if (root := _dashboard_plugin_root(plugin)) is not None
     }
-    runtime_entries = _discover_all_plugins()
+    runtime_entries = _discover_dashboard_plugin_entries()
     try:
         active_runtime_entries = _discover_dashboard_runtime_entries()
         activation = _load_dashboard_plugin_activation_state()
