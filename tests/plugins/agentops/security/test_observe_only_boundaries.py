@@ -8,16 +8,19 @@ from plugins.agentops.control.events import EventSpool, EventValidationError
 from plugins.agentops.control.store import open_store
 
 
-def test_synthetic_secret_never_enters_spool_or_database(tmp_path, make_event):
+def test_synthetic_secret_never_enters_spool_or_database(make_event, write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
     secret = "sk-test-canary-secret"
-    spool = EventSpool(tmp_path / "spool")
-    store = open_store(tmp_path / "state.db")
+    config = load_agentops_config(write_config())
+    spool = EventSpool(config.spool_dir)
+    store = open_store(config)
 
     with pytest.raises(EventValidationError):
         event = make_event(payload={"cookie": secret})
         spool.write(event)
 
-    assert secret.encode() not in (tmp_path / "state.db").read_bytes()
+    assert secret.encode() not in config.sqlite_path.read_bytes()
     assert not spool.pending_paths()
 
 

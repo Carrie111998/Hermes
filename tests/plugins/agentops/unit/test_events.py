@@ -23,9 +23,12 @@ def test_secret_payload_is_rejected_before_spooling_or_storage(tmp_path, make_ev
     assert not spool.pending_paths()
 
 
-def test_spool_replay_is_idempotent_and_deletes_committed_file(tmp_path, make_event):
-    spool = EventSpool(tmp_path / "spool")
-    store = open_store(tmp_path / "state.db")
+def test_spool_replay_is_idempotent_and_deletes_committed_file(make_event, write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
+    config = load_agentops_config(write_config())
+    spool = EventSpool(config.spool_dir)
+    store = open_store(config)
     event = make_event()
     spool.write(event)
 
@@ -39,9 +42,12 @@ def test_spool_replay_is_idempotent_and_deletes_committed_file(tmp_path, make_ev
     assert not spool.pending_paths()
 
 
-def test_unknown_schema_is_quarantined_without_entering_store(tmp_path):
-    spool = EventSpool(tmp_path / "spool")
-    store = open_store(tmp_path / "state.db")
+def test_unknown_schema_is_quarantined_without_entering_store(write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
+    config = load_agentops_config(write_config())
+    spool = EventSpool(config.spool_dir)
+    store = open_store(config)
     spool.root.mkdir(parents=True)
     (spool.root / "unknown.json").write_text(
         json.dumps({"schema_version": 99, "event_id": "evt-unknown"}),
@@ -55,9 +61,12 @@ def test_unknown_schema_is_quarantined_without_entering_store(tmp_path):
     assert (spool.quarantine_dir / "unknown.json").exists()
 
 
-def test_secret_in_corrupt_spool_is_replaced_by_redacted_quarantine_metadata(tmp_path):
-    spool = EventSpool(tmp_path / "spool")
-    store = open_store(tmp_path / "state.db")
+def test_secret_in_corrupt_spool_is_replaced_by_redacted_quarantine_metadata(write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
+    config = load_agentops_config(write_config())
+    spool = EventSpool(config.spool_dir)
+    store = open_store(config)
     spool.root.mkdir(parents=True)
     (spool.root / "unsafe.json").write_text(
         '{"token":"sk-test-canary-secret","schema_version":999}',

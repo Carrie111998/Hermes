@@ -1,33 +1,43 @@
-"""SQLite WAL persistence limited to Phase 1 AgentOps control-plane state."""
+"""SQLite persistence with preflight validation and fail-closed recovery."""
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import sqlite3
+import stat
+import tempfile
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from plugins.agentops.control.audit import audit_entry_hash, validate_audit_event
+from plugins.agentops.control.config import AgentOpsConfig, path_is_within_state
 from plugins.agentops.control.events import canonical_json
 from plugins.agentops.control.models import AppendResult, AuditEvent, EventEnvelope, StoreInspection
 
 
 SCHEMA_VERSION = 1
+_REQUIRED_TABLES = {"schema_migrations", "events", "audit_events", "metadata"}
 
 
 class StoreMigrationError(RuntimeError):
-    """A migration failure that must keep the daemon in safe observe-only mode."""
+    """A database cannot safely be opened by this Phase 1 store."""
 
 
 class StoreIntegrityError(RuntimeError):
-    """Raised when the same event identity is reused for different content."""
+    """Stored data violates an append-only invariant."""
+
+
+class StoreRestoreError(StoreMigrationError):
+    """A restore was rejected or was rolled back to its original database."""
 
 
 class AgentOpsStore:
-    def __init__(self, path: Path, connection: sqlite3.Connection):
-        self.path = Path(path)
+    def __init__(self, config: AgentOpsConfig, connection: sqlite3.Connection):
+        self.config = config
+        self.path = config.sqlite_path
         self._connection = connection
         self._lock = threading.RLock()
 
@@ -44,7 +54,9 @@ class AgentOpsStore:
 
     def schema_version(self) -> int:
         with self._lock:
-            row = self._connection.execute("SELECT version FROM schema_migrations LIMIT 1").fetchone()
+            row = self._connection.execute(
+                "SELECT version FROM schema_migrations WHERE singleton = 1"
+            ).fetchone()
         if row is None:
             raise StoreMigrationError("schema version unavailable")
         return int(row[0])
@@ -85,15 +97,30 @@ class AgentOpsStore:
 
     def _append_audit_locked(self, cursor: sqlite3.Cursor, event: AuditEvent) -> int:
         validate_audit_event(event)
-        row = cursor.execute("SELECT sequence, entry_hash FROM audit_events ORDER BY sequence DESC LIMIT 1").fetchone()
-        previous_hash = str(row[1]) if row else None
-        next_sequence = int(row[0]) + 1 if row else 1
+        if not _verify_chain_read_only(self._connection):
+            raise StoreIntegrityError("audit chain invalid")
+        head_sequence, head_hash = _read_audit_head(cursor)
+        row = cursor.execute("SELECT COUNT(*), MAX(sequence), MAX(entry_hash) FROM audit_events").fetchone()
+        count = int(row[0])
+        if count != head_sequence:
+            raise StoreIntegrityError("audit metadata mismatch")
+        if count == 0:
+            if head_hash:
+                raise StoreIntegrityError("audit metadata mismatch")
+            previous_hash: str | None = None
+        else:
+            tail = cursor.execute("SELECT sequence, entry_hash FROM audit_events ORDER BY sequence DESC LIMIT 1").fetchone()
+            if tail is None or int(tail[0]) != head_sequence or str(tail[1]) != head_hash:
+                raise StoreIntegrityError("audit metadata mismatch")
+            previous_hash = head_hash
+        next_sequence = head_sequence + 1
         payload = event.to_dict(previous_hash=previous_hash)
         entry_hash = audit_entry_hash(sequence=next_sequence, payload=payload)
         cursor.execute(
             "INSERT INTO audit_events(sequence, event_json, previous_hash, entry_hash) VALUES (?, ?, ?, ?)",
             (next_sequence, canonical_json(payload), previous_hash, entry_hash),
         )
+        _write_audit_head(cursor, next_sequence, entry_hash)
         return next_sequence
 
     def append_audit(self, event: AuditEvent) -> int:
@@ -101,22 +128,8 @@ class AgentOpsStore:
             return self._append_audit_locked(cursor, event)
 
     def verify_audit_chain(self) -> bool:
-        try:
-            with self._lock:
-                rows = self._connection.execute(
-                    "SELECT sequence, event_json, previous_hash, entry_hash FROM audit_events ORDER BY sequence"
-                ).fetchall()
-            previous_hash: str | None = None
-            for sequence, event_json, recorded_previous, entry_hash in rows:
-                if recorded_previous != previous_hash:
-                    return False
-                payload = json.loads(event_json)
-                if audit_entry_hash(sequence=int(sequence), payload=payload) != entry_hash:
-                    return False
-                previous_hash = str(entry_hash)
-            return True
-        except (sqlite3.Error, ValueError, TypeError):
-            return False
+        with self._lock:
+            return _verify_chain_read_only(self._connection)
 
     def event_count(self) -> int:
         with self._lock:
@@ -126,27 +139,83 @@ class AgentOpsStore:
         with self._lock:
             return int(self._connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0])
 
-    def backup_to(self, destination: Path) -> Path:
+    def backup_to(self, destination: Path | None = None) -> Path:
+        if destination is None:
+            destination = self.config.backup_dir / f"backup-{uuid.uuid4().hex}.db"
         destination = Path(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not path_is_within_state(self.config, destination) or not _is_within(destination, self.config.backup_dir):
+            raise StoreMigrationError("backup destination rejected")
+        if destination.exists() or destination.is_symlink():
+            raise StoreMigrationError("backup destination rejected")
+        self.config.backup_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+        status = self.config.backup_dir.lstat()
+        if (
+            status.st_uid != os.getuid()
+            or not stat.S_ISDIR(status.st_mode)
+            or stat.S_ISLNK(status.st_mode)
+            or stat.S_IMODE(status.st_mode) != 0o700
+        ):
+            raise StoreMigrationError("backup directory rejected")
         with self._lock, sqlite3.connect(destination) as backup_connection:
             self._connection.backup(backup_connection)
+        _fsync_file(destination)
+        _fsync_directory(destination.parent)
         return destination
 
+    def _open_existing_writable(self) -> sqlite3.Connection:
+        _preflight_database(self.path)
+        return _connect_write(self.path)
+
     def restore_from(self, source: Path) -> None:
+        """Validate a controlled backup before atomically replacing the live store.
+
+        A pre-restore snapshot is kept even when the replacement must be rolled
+        back, so an operator can investigate the failed candidate safely.
+        """
         source = Path(source)
-        if not source.is_file():
-            raise StoreMigrationError("backup unavailable")
-        temporary = self.path.with_suffix(self.path.suffix + ".restore")
-        with sqlite3.connect(source) as source_connection, sqlite3.connect(temporary) as restore_connection:
-            source_connection.backup(restore_connection)
-        with self._lock:
-            self._connection.close()
-            for suffix in ("-wal", "-shm"):
-                (Path(str(self.path) + suffix)).unlink(missing_ok=True)
-            os.replace(temporary, self.path)
-            self._connection = _connect(self.path)
-            _validate_existing_schema(self._connection, self.path)
+        if (
+            not source.exists()
+            or source.is_symlink()
+            or not source.is_file()
+            or not _is_within(source.resolve(strict=False), self.config.backup_dir)
+        ):
+            raise StoreRestoreError("backup unavailable")
+        try:
+            validation_copy = _copy_read_only_backup(source, self.config.backup_dir, "validate")
+        except (OSError, sqlite3.Error, StoreMigrationError) as exc:
+            raise StoreRestoreError("backup rejected") from exc
+        try:
+            _preflight_database(validation_copy)
+        except (StoreMigrationError, StoreIntegrityError):
+            validation_copy.unlink(missing_ok=True)
+            raise StoreRestoreError("backup rejected")
+
+        snapshot = self.backup_to(self.config.backup_dir / f"pre-restore-{uuid.uuid4().hex}.db")
+        replacement = self.config.backup_dir / f"replace-{uuid.uuid4().hex}.db"
+        try:
+            _copy_database(validation_copy, replacement)
+            _preflight_database(replacement)
+            with self._lock:
+                self._connection.close()
+                _remove_sidecars(self.path)
+                os.replace(replacement, self.path)
+                _fsync_directory(self.path.parent)
+                try:
+                    self._connection = self._open_existing_writable()
+                except Exception as exc:
+                    rollback = self.config.backup_dir / f"rollback-{uuid.uuid4().hex}.db"
+                    _copy_database(snapshot, rollback)
+                    os.replace(rollback, self.path)
+                    _fsync_directory(self.path.parent)
+                    self._connection = self._open_existing_writable()
+                    raise StoreRestoreError("restore rolled back") from exc
+        except StoreRestoreError:
+            raise
+        except (OSError, sqlite3.Error, StoreMigrationError) as exc:
+            raise StoreRestoreError("restore failed") from exc
+        finally:
+            validation_copy.unlink(missing_ok=True)
+            replacement.unlink(missing_ok=True)
 
 
 class _Transaction:
@@ -173,11 +242,15 @@ class _Transaction:
             self.lock.release()
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def _connect_read_only(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+
+
+def _connect_write(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
-    connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA journal_mode=WAL")
     return connection
 
 
@@ -185,93 +258,202 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def _create_schema_v1(connection: sqlite3.Connection) -> None:
-    with connection:
-        connection.execute("CREATE TABLE schema_migrations(version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations(version) VALUES (1)")
-        connection.execute(
-            "CREATE TABLE events(event_id TEXT PRIMARY KEY, event_hash TEXT NOT NULL, event_json TEXT NOT NULL, occurred_at TEXT NOT NULL, created_at TEXT NOT NULL)"
-        )
-        connection.execute(
-            "CREATE TABLE audit_events(sequence INTEGER PRIMARY KEY, event_json TEXT NOT NULL, previous_hash TEXT, entry_hash TEXT NOT NULL)"
-        )
-        connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+def _migration_v1(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE schema_migrations(singleton INTEGER PRIMARY KEY CHECK(singleton = 1), version INTEGER NOT NULL)"
+    )
+    connection.execute("INSERT INTO schema_migrations(singleton, version) VALUES (1, 1)")
+    connection.execute(
+        "CREATE TABLE events(event_id TEXT PRIMARY KEY, event_hash TEXT NOT NULL, event_json TEXT NOT NULL, occurred_at TEXT NOT NULL, created_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE audit_events(sequence INTEGER PRIMARY KEY, event_json TEXT NOT NULL, previous_hash TEXT, entry_hash TEXT NOT NULL)"
+    )
+    connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.executemany(
+        "INSERT INTO metadata(key, value) VALUES (?, ?)",
+        (("audit_head_sequence", "0"), ("audit_head_hash", "")),
+    )
 
 
-def _validate_existing_schema(connection: sqlite3.Connection, path: Path) -> None:
-    tables = _table_names(connection)
-    if not tables:
-        _create_schema_v1(connection)
-        return
-    if "schema_migrations" not in tables:
-        raise StoreMigrationError("unrecognized existing database")
-    row = connection.execute("SELECT version FROM schema_migrations LIMIT 1").fetchone()
-    if row is None or int(row[0]) != SCHEMA_VERSION:
+_MIGRATIONS: dict[int, object] = {1: _migration_v1}
+
+
+def _run_migrations(connection: sqlite3.Connection, current_version: int) -> None:
+    if current_version < 0 or current_version > SCHEMA_VERSION:
         raise StoreMigrationError("unsupported schema version")
-    required = {"events", "audit_events", "metadata"}
-    if not required.issubset(tables):
-        raise StoreMigrationError("incomplete schema")
+    for target in range(current_version + 1, SCHEMA_VERSION + 1):
+        migration = _MIGRATIONS.get(target)
+        if migration is None:
+            raise StoreMigrationError("migration missing")
+        migration(connection)
+    if current_version != SCHEMA_VERSION:
+        row = connection.execute("SELECT version FROM schema_migrations WHERE singleton = 1").fetchone()
+        if row is None or int(row[0]) != SCHEMA_VERSION:
+            raise StoreMigrationError("migration version mismatch")
 
 
-def open_store(path: Path) -> AgentOpsStore:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _validate_schema(connection: sqlite3.Connection) -> int:
+    if _table_names(connection) != _REQUIRED_TABLES:
+        raise StoreMigrationError("unrecognized existing database")
+    columns = connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
+    names = {str(row[1]) for row in columns}
+    if names != {"singleton", "version"}:
+        raise StoreMigrationError("unsupported migration schema")
+    rows = connection.execute("SELECT singleton, version FROM schema_migrations").fetchall()
+    if len(rows) != 1 or int(rows[0][0]) != 1:
+        raise StoreMigrationError("migration singleton invalid")
+    version = int(rows[0][1])
+    if version != SCHEMA_VERSION:
+        raise StoreMigrationError("unsupported schema version")
+    metadata = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+    if set(metadata) != {"audit_head_sequence", "audit_head_hash"}:
+        raise StoreMigrationError("audit metadata unavailable")
+    return version
+
+
+def _preflight_database(path: Path) -> int:
     try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = _connect(path)
-        _validate_existing_schema(connection, path)
-    except StoreMigrationError:
-        if connection is not None:
-            connection.close()
-        raise
+        with _connect_read_only(path) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).lower() != "ok":
+                raise StoreMigrationError("sqlite integrity check failed")
+            version = _validate_schema(connection)
+            if not _verify_chain_read_only(connection):
+                raise StoreIntegrityError("audit chain invalid")
+            return version
     except (sqlite3.Error, OSError) as exc:
-        if connection is not None:
-            connection.close()
-        raise StoreMigrationError("store migration failed") from exc
-    assert connection is not None
-    return AgentOpsStore(path, connection)
+        raise StoreMigrationError("store preflight failed") from exc
+
+
+def open_store(config: AgentOpsConfig) -> AgentOpsStore:
+    """Open only an AgentOps-owned database; existing data is preflighted first."""
+    if not config.state_dir_safe or not path_is_within_state(config, config.sqlite_path):
+        raise StoreMigrationError("store path rejected")
+    path = config.sqlite_path
+    if path.exists():
+        try:
+            _preflight_database(path)
+        except (StoreMigrationError, StoreIntegrityError):
+            raise
+    else:
+        try:
+            with sqlite3.connect(path) as bootstrap:
+                _run_migrations(bootstrap, 0)
+        except (sqlite3.Error, OSError, StoreMigrationError) as exc:
+            raise StoreMigrationError("store bootstrap failed") from exc
+    try:
+        connection = _connect_write(path)
+        _preflight_database(path)
+        return AgentOpsStore(config, connection)
+    except (sqlite3.Error, OSError, StoreMigrationError, StoreIntegrityError) as exc:
+        try:
+            connection.close()  # type: ignore[name-defined]
+        except (UnboundLocalError, sqlite3.Error):
+            pass
+        raise StoreMigrationError("store open failed") from exc
 
 
 def inspect_store(path: Path) -> StoreInspection:
-    """Inspect an existing Store through SQLite read-only mode without creating it."""
+    """Inspect through SQLite read-only mode and never initialize WAL."""
     path = Path(path)
     if not path.exists():
-        return StoreInspection(exists=False, schema_version=None, audit_chain_valid=None, event_count=None)
+        return StoreInspection(False, None, None, None, None, "store_missing")
     try:
-        uri = f"file:{path.as_posix()}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
-        try:
-            version_row = connection.execute("SELECT version FROM schema_migrations LIMIT 1").fetchone()
-            event_count = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-            chain_valid = _verify_chain_read_only(connection)
-        finally:
-            connection.close()
-        return StoreInspection(
-            exists=True,
-            schema_version=int(version_row[0]) if version_row else None,
-            audit_chain_valid=chain_valid,
-            event_count=event_count,
-        )
-    except sqlite3.Error:
-        return StoreInspection(exists=True, schema_version=None, audit_chain_valid=False, event_count=None)
+        with _connect_read_only(path) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            integrity_ok = integrity is not None and str(integrity[0]).lower() == "ok"
+            version = _validate_schema(connection) if integrity_ok else None
+            events = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]) if version else None
+            chain = _verify_chain_read_only(connection) if version else False
+        return StoreInspection(True, version, chain, events, integrity_ok, None if chain else "audit_chain_invalid")
+    except (sqlite3.Error, OSError, StoreMigrationError, StoreIntegrityError):
+        return StoreInspection(True, None, False, None, False, "store_invalid")
+
+
+def _read_audit_head(cursor: sqlite3.Cursor) -> tuple[int, str]:
+    rows = dict(cursor.execute("SELECT key, value FROM metadata WHERE key IN ('audit_head_sequence', 'audit_head_hash')"))
+    try:
+        return int(rows["audit_head_sequence"]), str(rows["audit_head_hash"])
+    except (KeyError, ValueError) as exc:
+        raise StoreIntegrityError("audit metadata unavailable") from exc
+
+
+def _write_audit_head(cursor: sqlite3.Cursor, sequence: int, entry_hash: str) -> None:
+    cursor.execute("UPDATE metadata SET value = ? WHERE key = 'audit_head_sequence'", (str(sequence),))
+    cursor.execute("UPDATE metadata SET value = ? WHERE key = 'audit_head_hash'", (entry_hash,))
+    if cursor.rowcount != 1:
+        raise StoreIntegrityError("audit metadata unavailable")
 
 
 def _verify_chain_read_only(connection: sqlite3.Connection) -> bool:
     try:
-        previous_hash: str | None = None
-        for sequence, event_json, recorded_previous, entry_hash in connection.execute(
+        rows = connection.execute(
             "SELECT sequence, event_json, previous_hash, entry_hash FROM audit_events ORDER BY sequence"
-        ):
-            if recorded_previous != previous_hash:
+        ).fetchall()
+        expected_sequence = 1
+        previous_hash: str | None = None
+        for sequence, event_json, recorded_previous, entry_hash in rows:
+            if int(sequence) != expected_sequence or recorded_previous != previous_hash:
                 return False
             payload = json.loads(event_json)
             if audit_entry_hash(sequence=int(sequence), payload=payload) != entry_hash:
                 return False
             previous_hash = str(entry_hash)
-        return True
-    except (sqlite3.Error, ValueError, TypeError):
+            expected_sequence += 1
+        metadata = dict(connection.execute("SELECT key, value FROM metadata").fetchall())
+        if set(metadata) != {"audit_head_sequence", "audit_head_hash"}:
+            return False
+        return int(metadata["audit_head_sequence"]) == len(rows) and str(metadata["audit_head_hash"]) == (previous_hash or "")
+    except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
         return False
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _fsync_file(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _copy_database(source: Path, destination: Path) -> None:
+    with _connect_read_only(source) as source_connection, sqlite3.connect(destination) as destination_connection:
+        source_connection.backup(destination_connection)
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
+
+
+def _copy_read_only_backup(source: Path, directory: Path, prefix: str) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(prefix=f".{prefix}-", suffix=".db", dir=directory)
+    os.close(descriptor)
+    destination = Path(raw_path)
+    try:
+        _copy_database(source, destination)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def _remove_sidecars(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        if candidate.exists() and not candidate.is_symlink():
+            candidate.unlink()

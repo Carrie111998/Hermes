@@ -22,5 +22,8 @@ def test_health_serializes_only_observe_only_authority():
         "audit_chain_valid": None,
         "event_count": 0,
         "spool_depth": 0,
+        "spool_bytes": 0,
+        "spool_quarantine_bytes": 0,
+        "spool_healthy": True,
         "global_write_enabled": False,
     }

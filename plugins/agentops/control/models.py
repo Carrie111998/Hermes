@@ -149,6 +149,19 @@ class AuditEvent:
         before_hash: str | None = None,
         after_hash: str | None = None,
     ) -> "AuditEvent":
+        from plugins.agentops.control.audit import validate_audit_fields
+
+        validate_audit_fields(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            object_type=object_type,
+            object_id=object_id,
+            timestamp=timestamp,
+            metadata=metadata,
+            before_hash=before_hash,
+            after_hash=after_hash,
+        )
         return cls(
             actor_type=actor_type,
             actor_id=actor_id,
@@ -188,6 +201,7 @@ class SpoolReplayResult:
     appended: int = 0
     duplicates: int = 0
     quarantined: int = 0
+    dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -199,6 +213,9 @@ class ControlPlaneHealth:
     audit_chain_valid: bool | None
     event_count: int
     spool_depth: int
+    spool_bytes: int = 0
+    spool_quarantine_bytes: int = 0
+    spool_healthy: bool = True
     global_write_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,6 +227,9 @@ class ControlPlaneHealth:
             "audit_chain_valid": self.audit_chain_valid,
             "event_count": self.event_count,
             "spool_depth": self.spool_depth,
+            "spool_bytes": self.spool_bytes,
+            "spool_quarantine_bytes": self.spool_quarantine_bytes,
+            "spool_healthy": self.spool_healthy,
             "global_write_enabled": self.global_write_enabled,
         }
 
@@ -220,3 +240,5 @@ class StoreInspection:
     schema_version: int | None
     audit_chain_valid: bool | None
     event_count: int | None
+    integrity_ok: bool | None = None
+    error: str | None = None
