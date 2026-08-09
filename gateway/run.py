@@ -22676,6 +22676,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
+        preclaimed_durable_id: Optional[str] = None,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -22686,11 +22687,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         guarantee is claimed.
         """
         identity = self._completion_delivery_identity(evt)
-        durable_claim_id = ""
+        durable_claim_id = preclaimed_durable_id or ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
+            if durable_delegation_id and preclaimed_durable_id is None:
                 try:
                     from tools.async_delegation import claim_completion_delivery
 
@@ -22721,19 +22722,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "delegation records).",
                         durable_delegation_id or "<legacy>", parent_session_id,
                     )
+                    drop_confirmed = not durable_claim_id
                     if durable_claim_id:
                         try:
                             from tools.async_delegation import drop_completion_delivery
 
-                            drop_completion_delivery(
+                            drop_confirmed = drop_completion_delivery(
                                 durable_delegation_id, durable_claim_id,
                             )
+                            if not drop_confirmed:
+                                from tools.async_delegation import get_durable_delegation
+
+                                # Legacy events predate the ledger. A false drop
+                                # for an absent row is already terminal; a row
+                                # that still exists must remain retryable.
+                                drop_confirmed = (
+                                    get_durable_delegation(durable_delegation_id)
+                                    is None
+                                )
                         except Exception:
                             logger.debug(
                                 "Could not drop durable completion claim",
                                 exc_info=True,
                             )
-                    return None
+                    if drop_confirmed:
+                        return None
+                    if durable_claim_id:
+                        try:
+                            from tools.async_delegation import release_completion_delivery
+
+                            release_completion_delivery(
+                                durable_delegation_id, durable_claim_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not release failed terminal-drop claim",
+                                exc_info=True,
+                            )
+                    return False
                 if verdict == "retry":
                     if durable_claim_id:
                         try:
@@ -22761,6 +22787,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
+                if injection_result is None and durable_claim_id:
+                    try:
+                        from tools.async_delegation import drop_completion_delivery
+
+                        drop_confirmed = drop_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                        if not drop_confirmed:
+                            from tools.async_delegation import get_durable_delegation
+
+                            drop_confirmed = (
+                                get_durable_delegation(durable_delegation_id)
+                                is None
+                            )
+                        if drop_confirmed:
+                            # The claim is terminally disposed; do not release it
+                            # in finally and imply a transient retry.
+                            durable_claim_id = ""
+                        else:
+                            injection_result = False
+                    except Exception:
+                        logger.debug(
+                            "Could not terminally drop unroutable async completion",
+                            exc_info=True,
+                        )
+                        injection_result = False
                 return injection_result
             accepted = True
 
@@ -22814,8 +22866,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         expects. Best-effort: a CLI-origin event (empty session_key) is left
         as-is and simply won't route on the gateway.
         """
+        owner_keys = {str(evt.get("session_key") or "")}
+        owner_keys.discard("")
+        parent_ids = {str(evt.get("parent_session_id") or "")}
+        parent_ids.discard("")
+        lineage_known = True
+        try:
+            session_db = getattr(self, "_session_db", None)
+            sync_db = getattr(session_db, "_db", session_db)
+            if parent_ids and sync_db is not None:
+                for session_id in tuple(parent_ids):
+                    lineage = sync_db.get_compression_lineage(session_id)
+                    if not lineage:
+                        lineage_known = False
+                        continue
+                    parent_ids.update(str(item) for item in lineage if str(item))
+            elif parent_ids:
+                lineage_known = False
+        except Exception:
+            lineage_known = False
+        evt["_owner_session_lineage_known"] = lineage_known
+        evt["_owner_session_keys"] = sorted(owner_keys)
+        evt["_owner_parent_session_ids"] = sorted(parent_ids)
+
         if evt.get("platform"):
-            return  # already enriched
+            return  # routing already enriched
         parsed = _parse_session_key(evt.get("session_key", "") or "")
         if not parsed:
             return
@@ -22860,15 +22935,79 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
+                    from tools.async_delegation import (
+                        claim_event_delivery,
+                        release_event_delivery,
+                    )
+                    try:
+                        self._enrich_async_delegation_routing(evt)
+                    except Exception as exc:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Async delegation routing error: %s", exc)
+                        continue
+                    # Gateway delivery must be positively routable before it
+                    # competes for the durable claim. TUI/CLI identities share
+                    # this process-wide queue but are owned by their respective
+                    # consumers and must remain pending for them.
+                    try:
+                        route_platform = Platform(str(evt.get("platform") or ""))
+                    except Exception:
+                        route_platform = None
+                    raw_session_id = str(evt.get("origin_session_id") or "").strip()
+                    if not raw_session_id:
+                        raw_session_key = str(evt.get("session_key") or "").strip()
+                        if raw_session_key and _parse_session_key(raw_session_key) is None:
+                            raw_session_id = raw_session_key
+                    raw_api_adapter = self.adapters.get(Platform.API_SERVER)
+                    if raw_api_adapter is not None:
+                        from gateway.wake import adapter_supports_push
+                        raw_api_route = bool(
+                            raw_session_id and not adapter_supports_push(raw_api_adapter)
+                        )
+                    else:
+                        raw_api_route = False
+                    if (
+                        evt.get("origin_ui_session_id")
+                        or (
+                            not raw_api_route
+                            and (
+                                not evt.get("platform")
+                                or not evt.get("chat_id")
+                                or evt.get("chat_type") not in {"dm", "group", "channel", "thread"}
+                                or route_platform not in self.adapters
+                            )
+                        )
+                    ):
+                        _pr.completion_queue.put(evt)
                         continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
+                        durable_claim = claim_event_delivery(evt, "gateway-watcher")
+                    except Exception as exc:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Async delegation claim error: %s", exc)
+                        continue
+                    if durable_claim is None:
+                        continue
+                    try:
+                        synth_text = _format_gateway_process_notification(evt)
+                        if not synth_text:
+                            release_event_delivery(evt, durable_claim)
+                            _pr.completion_queue.put(evt)
+                            continue
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, evt,
+                            preclaimed_durable_id=durable_claim,
+                        )
                         if delivered is False:
                             _pr.completion_queue.put(evt)
                     except Exception as e:
+                        try:
+                            release_event_delivery(evt, durable_claim)
+                        except Exception:
+                            logger.debug(
+                                "Could not release async delegation formatter claim",
+                                exc_info=True,
+                            )
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
@@ -22917,6 +23056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         last_output_len = 0
+        formatter_failures = 0
         while True:
             await asyncio.sleep(interval)
 
@@ -22971,7 +23111,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                     }
-                    synth_text = format_process_notification(completion_evt)
+                    try:
+                        synth_text = format_process_notification(completion_evt)
+                    except Exception as exc:
+                        formatter_failures += 1
+                        logger.error(
+                            "Process completion formatting failed for %s "
+                            "(attempt %d/3): %s",
+                            session_id,
+                            formatter_failures,
+                            exc,
+                        )
+                        if formatter_failures >= 3:
+                            logger.error(
+                                "Giving up process completion formatting for %s",
+                                session_id,
+                            )
+                            break
+                        continue
                     if not synth_text:
                         break
                     delivered = await self._deliver_completion_notification(

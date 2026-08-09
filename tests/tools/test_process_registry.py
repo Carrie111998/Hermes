@@ -1054,6 +1054,125 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
+def test_get_matching_notification_preserves_unmatched_order(registry):
+    first = {"type": "async_delegation", "session_key": "other"}
+    second = {"type": "async_delegation", "session_key": "mine"}
+    third = {"type": "completion", "session_key": "other"}
+    for event in (first, second, third):
+        registry.completion_queue.put(event)
+
+    snapshot = registry.snapshot_notifications(timeout=0)
+    assert registry.get_matching_notification(snapshot, (second,)) is second
+    assert registry.completion_queue.get_nowait() is first
+    assert registry.completion_queue.get_nowait() is third
+    assert registry.completion_queue.empty()
+
+
+def test_snapshot_allows_ownership_evaluation_outside_queue_lock(registry):
+    event = {"type": "async_delegation", "session_key": "mine"}
+    registry.completion_queue.put(event)
+    snapshot = registry.snapshot_notifications(timeout=0)
+    lock_states = []
+
+    accepted = []
+    for candidate in snapshot[0]:
+        lock_states.append(registry.completion_queue.mutex.locked())
+        if candidate is event:
+            accepted.append(candidate)
+
+    assert registry.get_matching_notification(snapshot, accepted) is event
+    assert lock_states == [False]
+
+
+def test_get_matching_notification_completes_removed_queue_task(registry):
+    import threading
+
+    first = {"type": "async_delegation", "session_key": "other"}
+    second = {"type": "async_delegation", "session_key": "mine"}
+    registry.completion_queue.put(first)
+    registry.completion_queue.put(second)
+
+    snapshot = registry.snapshot_notifications(timeout=0)
+    assert registry.get_matching_notification(snapshot, (second,)) is second
+    assert registry.completion_queue.unfinished_tasks == 1
+
+    assert registry.completion_queue.get_nowait() is first
+    joined = threading.Event()
+    waiter = threading.Thread(
+        target=lambda: (registry.completion_queue.join(), joined.set()), daemon=True
+    )
+    waiter.start()
+    waiter.join(timeout=0.5)
+    assert joined.is_set()
+
+
+def test_notification_queue_raw_requeue_balances_tasks_and_advances_generation(registry):
+    event = {"type": "async_delegation", "session_key": "mine"}
+    queue = registry.completion_queue
+    start_generation = queue.mutation_generation
+    queue.put(event)
+    after_put = queue.mutation_generation
+    assert queue.unfinished_tasks == 1
+
+    assert queue.get_nowait() is event
+    after_get = queue.mutation_generation
+    assert queue.unfinished_tasks == 0
+    queue.put(event)
+
+    assert start_generation < after_put < after_get < queue.mutation_generation
+    assert queue.unfinished_tasks == 1
+    assert queue.qsize() == 1
+
+
+def test_snapshot_notifications_honors_empty_queue_deadline(registry):
+    import queue
+    import time
+
+    started = time.monotonic()
+    with pytest.raises(queue.Empty):
+        registry.snapshot_notifications(timeout=0.005)
+    assert time.monotonic() - started < 0.03
+
+
+def test_get_matching_notification_rejects_same_object_requeue_aba(registry):
+    import queue
+
+    event = {"type": "async_delegation", "session_key": "mine"}
+    registry.completion_queue.put(event)
+    snapshot = registry.snapshot_notifications(timeout=0)
+    assert registry.completion_queue.get_nowait() is event
+    registry.completion_queue.put(event)
+
+    with pytest.raises(queue.Empty):
+        registry.get_matching_notification(snapshot, (event,))
+    assert registry.completion_queue.get_nowait() is event
+
+
+def test_get_matching_notification_timeout_leaves_queue_untouched(registry):
+    import queue
+
+    event = {"type": "async_delegation", "session_key": "other"}
+    registry.completion_queue.put(event)
+    snapshot = registry.snapshot_notifications(timeout=0)
+
+    with pytest.raises(queue.Empty):
+        registry.get_matching_notification(snapshot, ())
+    assert registry.completion_queue.get_nowait() is event
+
+
+def test_drain_notifications_requeues_when_formatter_raises(monkeypatch, registry):
+    event = {"type": "completion", "session_id": "proc-format-error"}
+    registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("format failed")),
+    )
+
+    assert registry.drain_notifications() == []
+    assert registry.completion_queue.get_nowait() is event
+    assert registry.completion_queue.empty()
+
+
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
     event = {
         "type": "completion",

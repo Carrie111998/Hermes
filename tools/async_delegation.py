@@ -240,17 +240,19 @@ def _prune_durable_records() -> None:
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
         )
-        terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+        delivered_count = conn.execute(
+            """SELECT COUNT(*) FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')
+                 AND delivery_state='delivered'"""
         ).fetchone()[0]
-        excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
+        excess = max(0, delivered_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                       AND delivery_state='delivered'
+                     ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (excess,),
             )
@@ -261,12 +263,15 @@ def _prune_durable_records() -> None:
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
             conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
+                """UPDATE async_delegations SET delivery_state='dropped',
+                          delivery_claim=NULL, delivery_claimed_at=NULL,
+                          event_json=NULL, result_json=NULL, updated_at=?
+                   WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
-                (overflow,),
+                (now, overflow),
             )
 
 
@@ -315,7 +320,12 @@ def recover_abandoned_delegations() -> int:
                     live = get_process_start_time(int(pid)) == int(started)
             if live:
                 continue
-            task = json.loads(task_json or "{}")
+            try:
+                task = json.loads(task_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                task = {}
+            if not isinstance(task, dict):
+                task = {}
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -360,12 +370,40 @@ def restore_undelivered_completions(target_queue) -> int:
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
-            evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
+        restored = 0
+        for delegation_id, payload in rows:
+            try:
+                evt = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                logger.error(
+                    "Skipping malformed durable completion event for %s",
+                    delegation_id,
+                )
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=? WHERE delegation_id=?
+                         AND delivery_state='pending'""",
+                    (time.time(), delegation_id),
+                )
+                continue
+            if not isinstance(evt, dict):
+                logger.error(
+                    "Skipping non-object durable completion event for %s",
+                    delegation_id,
+                )
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=? WHERE delegation_id=?
+                         AND delivery_state='pending'""",
+                    (time.time(), delegation_id),
+                )
+                continue
+            evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -374,7 +412,9 @@ def mark_completion_delivered(delegation_id: str) -> bool:
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
-               WHERE delegation_id=? AND delivery_state!='delivered'""",
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim IS NULL
+                 AND state IN ('completed','success','error','failed','timeout','cancelled','interrupted','stalled')""",
             (now, now, delegation_id),
         )
         return cur.rowcount == 1
@@ -504,10 +544,21 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
     if row is None:
         return None
+    result = None
+    result_parse_error = False
+    if row[4]:
+        try:
+            parsed = json.loads(row[4])
+            if isinstance(parsed, dict):
+                result = parsed
+            else:
+                result_parse_error = True
+        except (TypeError, json.JSONDecodeError):
+            result_parse_error = True
     return {
         "delegation_id": delegation_id, "origin_session": row[0], "state": row[1],
         "dispatched_at": row[2], "completed_at": row[3],
-        "result": json.loads(row[4]) if row[4] else None,
+        "result": result, "result_parse_error": result_parse_error,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
     }
@@ -586,16 +637,143 @@ def active_task_count() -> int:
 
 
 def _matches_session_selectors(
-    record: Dict[str, Any],
+    record: dict,
     *,
     session_key: str = "",
+    session_keys: Optional[set[str]] = None,
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    parent_session_ids: Optional[set[str]] = None,
 ) -> bool:
+    lineage_keys = set(session_keys or ())
+    if session_key:
+        lineage_keys.add(session_key)
+    parent_ids = set(parent_session_ids or ())
+    if parent_session_id:
+        parent_ids.add(parent_session_id)
     return (
         (origin_ui_session_id and str(record.get("origin_ui_session_id") or "") == origin_ui_session_id)
-        or (session_key and str(record.get("session_key") or "") == session_key)
-        or (parent_session_id and str(record.get("parent_session_id") or "") == parent_session_id)
+        or (lineage_keys and str(record.get("session_key") or "") in lineage_keys)
+        or (parent_ids and str(record.get("parent_session_id") or "") in parent_ids)
+    )
+
+
+def owner_work_counts(
+    *,
+    session_key: str = "",
+    session_keys: Optional[set[str]] = None,
+    origin_ui_session_id: str = "",
+    parent_session_id: str = "",
+    parent_session_ids: Optional[set[str]] = None,
+    exclude_delegation_id: str = "",
+) -> tuple[int, int, int, int, int, int, bool]:
+    """Return live and pending-delivery work owned by one session.
+
+    ``exclude_delegation_id`` lets a completion formatter ignore the record
+    currently being delivered.
+
+    The tuple is ``(active units, active tasks, pending units, pending tasks,
+    unavailable units, unavailable tasks, delivery state known)``.
+    """
+    lineage_keys = {str(key) for key in (session_keys or set()) if str(key)}
+    if session_key:
+        lineage_keys.add(session_key)
+    parent_lineage_ids = {
+        str(value) for value in (parent_session_ids or set()) if str(value)
+    }
+    if parent_session_id:
+        parent_lineage_ids.add(parent_session_id)
+    if not lineage_keys and not origin_ui_session_id and not parent_lineage_ids:
+        return 0, 0, 0, 0, 0, 0, True
+    excluded = {exclude_delegation_id} if exclude_delegation_id else set()
+    active_units = 0
+    active_tasks = 0
+    active_ids: set[str] = set()
+    active_task_counts: dict[str, int] = {}
+    with _records_lock:
+        for delegation_id, record in _records.items():
+            if delegation_id in excluded:
+                continue
+            if record.get("status") not in {"running", "stalling", "finalizing"}:
+                continue
+            if not _matches_session_selectors(
+                record,
+                session_key=session_key,
+                session_keys=lineage_keys,
+                origin_ui_session_id=origin_ui_session_id,
+                parent_session_id=parent_session_id,
+                parent_session_ids=parent_lineage_ids,
+            ):
+                continue
+            active_ids.add(delegation_id)
+            active_units += 1
+            goals = record.get("goals") if record.get("is_batch") else None
+            record_task_count = (
+                len(goals) if isinstance(goals, (list, tuple)) and goals else 1
+            )
+            active_task_counts[delegation_id] = record_task_count
+            active_tasks += record_task_count
+
+    pending_units = 0
+    pending_tasks = 0
+    unavailable_units = 0
+    unavailable_tasks = 0
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            rows = conn.execute(
+                """SELECT delegation_id, origin_session, origin_ui_session_id,
+                          parent_session_id, state, delivery_state, task_json
+                   FROM async_delegations"""
+            ).fetchall()
+    except Exception:
+        logger.debug("Could not count durable delegation delivery state", exc_info=True)
+        return active_units, active_tasks, 0, 0, 0, 0, False
+
+    for row in rows:
+        (delegation_id, row_session_key, row_origin_ui, row_parent_id,
+         state, delivery_state, task_json) = row
+        if delegation_id in excluded:
+            continue
+        if not (
+            (lineage_keys and str(row_session_key or "") in lineage_keys)
+            or (origin_ui_session_id and str(row_origin_ui or "") == origin_ui_session_id)
+            or (parent_lineage_ids and str(row_parent_id or "") in parent_lineage_ids)
+        ):
+            continue
+        try:
+            task = json.loads(task_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            task = {}
+        if not isinstance(task, dict):
+            task = {}
+        goals = task.get("goals") if task.get("is_batch") else None
+        task_count = len(goals) if isinstance(goals, list) and goals else 1
+        if state in {"running", "finalizing"}:
+            if delegation_id not in active_ids:
+                active_units += 1
+                active_tasks += task_count
+            continue
+        if delegation_id in active_ids:
+            active_ids.remove(delegation_id)
+            active_units -= 1
+            active_tasks -= active_task_counts.pop(delegation_id, 0)
+        if state == "unknown":
+            unavailable_units += 1
+            unavailable_tasks += task_count
+        elif delivery_state == "pending":
+            pending_units += 1
+            pending_tasks += task_count
+        elif delivery_state == "dropped":
+            unavailable_units += 1
+            unavailable_tasks += task_count
+    return (
+        active_units,
+        active_tasks,
+        pending_units,
+        pending_tasks,
+        unavailable_units,
+        unavailable_tasks,
+        True,
     )
 
 

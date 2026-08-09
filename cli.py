@@ -10836,10 +10836,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session identity when draining so another window cannot claim and mark
         delivered a completion that belongs to this one.
         """
-        from tools.process_registry import process_registry
+        from tools.process_registry import (
+            format_process_notification,
+            process_registry,
+        )
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            release_event_delivery,
         )
 
         session_key = getattr(self, "session_id", "") or ""
@@ -10847,11 +10851,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
+            try:
+                claim = claim_event_delivery(event, consumer)
+            except Exception:
+                process_registry.completion_queue.put(event)
+                continue
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            accepted = False
+            try:
+                if event.get("type") == "async_delegation":
+                    owner_keys = {
+                        str(event.get("session_key") or ""),
+                        str(session_key),
+                    }
+                    lineage_known = False
+                    try:
+                        session_db = getattr(self, "_session_db", None)
+                        if session_db is not None:
+                            lineage = session_db.get_compression_lineage(session_key)
+                            if lineage:
+                                owner_keys.update(
+                                    str(key) for key in lineage if str(key)
+                                )
+                                lineage_known = True
+                    except Exception:
+                        lineage_known = False
+                    event["_owner_session_lineage_known"] = lineage_known
+                    event["_owner_session_keys"] = sorted(owner_keys - {""})
+                    refreshed = format_process_notification(event)
+                    if refreshed:
+                        synthetic_message = refreshed
+                self._pending_input.put(synthetic_message)
+                accepted = True
+                complete_event_delivery(event, claim)
+            except Exception:
+                # Before Queue.put(), release and requeue for retry. After the
+                # turn has been accepted, doing either would inject a duplicate;
+                # keep the durable claim until expiry for restart-time recovery.
+                if not accepted:
+                    try:
+                        release_event_delivery(event, claim)
+                    except Exception:
+                        pass
+                    process_registry.completion_queue.put(event)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

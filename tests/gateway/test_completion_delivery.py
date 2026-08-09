@@ -112,7 +112,7 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     adapter.handle_message.assert_awaited_once()
 
 
-def test_unroutable_async_event_is_not_requeued_forever(
+def test_unroutable_async_event_is_preserved_for_its_non_gateway_owner(
     monkeypatch, isolated_registry,
 ):
     isolated = queue.Queue()
@@ -128,6 +128,7 @@ def test_unroutable_async_event_is_not_requeued_forever(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_not_awaited()
+    assert isolated.get_nowait() is event
     assert isolated.empty()
 
 

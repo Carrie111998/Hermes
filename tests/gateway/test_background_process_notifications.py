@@ -158,6 +158,499 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
 
 
 @pytest.mark.asyncio
+async def test_process_watcher_retries_after_formatter_error(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    terminal = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo done",
+    )
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([terminal, terminal], consumed=False),
+    )
+    calls = {"count": 0}
+
+    def flaky_formatter(_event):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("format failed")
+        return "formatted completion"
+
+    monkeypatch.setattr(pr_module, "format_process_notification", flaky_formatter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._deliver_completion_notification = AsyncMock(return_value=True)
+    watcher = _watcher_dict()
+    watcher["notify_on_complete"] = True
+
+    await runner._run_process_watcher(watcher)
+
+    assert calls["count"] == 2
+    runner._deliver_completion_notification.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_process_watcher_gives_up_after_persistent_formatter_errors(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr_module
+
+    terminal = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo done",
+    )
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([terminal, terminal, terminal], consumed=False),
+    )
+    calls = {"count": 0}
+
+    def broken_formatter(_event):
+        calls["count"] += 1
+        raise RuntimeError("persistent format failure")
+
+    monkeypatch.setattr(pr_module, "format_process_notification", broken_formatter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._deliver_completion_notification = AsyncMock(return_value=True)
+    watcher = _watcher_dict()
+    watcher["notify_on_complete"] = True
+
+    await runner._run_process_watcher(watcher)
+
+    assert calls["count"] == 3
+    runner._deliver_completion_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_requeues_formatter_error(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+    from tools.process_registry import process_registry
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-format-error",
+        "session_key": "session-a",
+    }
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        gateway_run,
+        "_format_gateway_process_notification",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("format failed")),
+    )
+    sleep_calls = {"count": 0}
+
+    async def _stop_after_iteration(*_a, **_kw):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop_after_iteration)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_terminally_drops_no_route(monkeypatch, tmp_path):
+    import time
+
+    import gateway.run as gateway_run
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    delegation_id = "deleg-no-route"
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "agent:main:telegram:dm:123",
+        "status": "completed",
+    }
+    ad._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": "agent:main:telegram:dm:123",
+            "dispatched_at": time.time(),
+            "goal": "unroutable",
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        gateway_run, "_format_gateway_process_notification", lambda _event: "formatted"
+    )
+    runner._inject_watch_notification = AsyncMock(return_value=None)
+    sleep_calls = {"count": 0}
+
+    async def _stop_after_iteration(*_a, **_kw):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop_after_iteration)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+
+        durable = ad.get_durable_delegation(delegation_id)
+        assert durable is not None
+        assert durable["delivery_state"] == "dropped"
+        assert process_registry.completion_queue.empty()
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_persistent_formatter_failure_converges_to_dropped(
+    monkeypatch, tmp_path
+):
+    import time
+
+    import gateway.run as gateway_run
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    delegation_id = "deleg-persistent-format-error"
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "agent:main:telegram:dm:123",
+        "status": "completed",
+    }
+    ad._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": "agent:main:telegram:dm:123",
+            "dispatched_at": time.time(),
+            "goal": "formatter convergence",
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        gateway_run,
+        "_format_gateway_process_notification",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("persistent format failure")),
+    )
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    sleep_calls = {"count": 0}
+
+    async def _stop_after_attempt_budget(*_a, **_kw):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= ad._MAX_DELIVERY_ATTEMPTS + 3:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop_after_attempt_budget)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+
+        durable = ad.get_durable_delegation(delegation_id)
+        assert durable is not None
+        assert durable["delivery_state"] == "dropped"
+        assert durable["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+        assert process_registry.completion_queue.empty()
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_leaves_tui_owned_event_unclaimed(
+    monkeypatch, tmp_path
+):
+    import time
+
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-tui-owner",
+        "session_key": "20260101_120000_abc123",
+        "origin_ui_session_id": "tui-window-1",
+        "status": "completed",
+    }
+    ad._persist_dispatch(
+        {
+            "delegation_id": event["delegation_id"],
+            "session_key": event["session_key"],
+            "origin_ui_session_id": event["origin_ui_session_id"],
+            "dispatched_at": time.time(),
+            "goal": "tui-owned",
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    process_registry.completion_queue.put(event)
+    runner._inject_watch_notification = AsyncMock(return_value=None)
+    sleeps = {"count": 0}
+
+    async def _stop(*_args, **_kwargs):
+        sleeps["count"] += 1
+        if sleeps["count"] >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+        durable = ad.get_durable_delegation(event["delegation_id"])
+        assert durable is not None
+        assert durable["delivery_state"] == "pending"
+        runner._inject_watch_notification.assert_not_awaited()
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_leaves_unknown_platform_unclaimed(
+    monkeypatch, tmp_path
+):
+    import time
+
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._running = True
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-bad-platform",
+        "session_key": "agent:main:not-a-real-platform:dm:123",
+        "status": "completed",
+    }
+    ad._persist_dispatch({
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "dispatched_at": time.time(),
+        "goal": "bad route",
+    })
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    process_registry.completion_queue.put(event)
+    runner._inject_watch_notification = AsyncMock(return_value=None)
+    sleeps = {"count": 0}
+
+    async def _stop(*_args, **_kwargs):
+        sleeps["count"] += 1
+        if sleeps["count"] >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+        durable = ad.get_durable_delegation(event["delegation_id"])
+        assert durable is not None
+        assert durable["delivery_state"] == "pending"
+        runner._inject_watch_notification.assert_not_awaited()
+        assert process_registry.completion_queue.get_nowait() is event
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+@pytest.mark.asyncio
+async def test_async_delegation_watcher_delivers_raw_api_server_session(
+    monkeypatch, tmp_path
+):
+    import time
+
+    import tools.async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+        supports_async_delivery=False
+    )
+    runner._running = True
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-raw-api",
+        "session_key": "raw-sid-7",
+        "origin_session_id": "raw-sid-7",
+        "status": "completed",
+    }
+    ad._persist_dispatch({
+        "delegation_id": event["delegation_id"],
+        "session_key": event["session_key"],
+        "origin_session_id": event["origin_session_id"],
+        "dispatched_at": time.time(),
+        "goal": "raw api route",
+    })
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    process_registry.completion_queue.put(event)
+    runner._deliver_completion_notification = AsyncMock(return_value=True)
+    sleeps = {"count": 0}
+
+    async def _stop(*_args, **_kwargs):
+        sleeps["count"] += 1
+        if sleeps["count"] >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", _stop)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+        runner._deliver_completion_notification.assert_awaited_once()
+    finally:
+        runner._running = False
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
+def test_gateway_enrichment_counts_active_compression_lineage_sibling(
+    monkeypatch, tmp_path
+):
+    import gateway.run as gateway_run
+    import tools.async_delegation as ad
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    class _DB:
+        def get_compression_lineage(self, session_id):
+            assert session_id == "parent-old"
+            return ["parent-old", "parent-new"]
+
+    runner._session_db = SimpleNamespace(_db=_DB())
+    with ad._records_lock:
+        ad._records["active-sibling"] = {
+            "delegation_id": "active-sibling",
+            "status": "running",
+            "session_key": "agent:main:telegram:dm:123",
+            "parent_session_id": "parent-new",
+        }
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "agent:main:telegram:dm:123",
+        "parent_session_id": "parent-old",
+        "status": "completed",
+    }
+
+    runner._enrich_async_delegation_routing(event)
+    text = gateway_run._format_gateway_process_notification(event)
+
+    assert event["_owner_parent_session_ids"] == ["parent-new", "parent-old"]
+    assert event["_owner_session_lineage_known"] is True
+    assert event["remaining_active_delegations"] == 1
+    assert event["remaining_active_subagents"] == 1
+    assert event["all_owned_results_available"] is False
+    assert "Do not present a final synthesis yet" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_mode", ["false", "raise"])
+async def test_terminal_preflight_drop_failure_is_retryable(
+    monkeypatch, tmp_path, drop_mode
+):
+    import tools.async_delegation as ad
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._classify_completion_target = AsyncMock(return_value="terminal")
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    released = []
+    monkeypatch.setattr(ad, "claim_completion_delivery", lambda *_args: True)
+
+    def fail_drop(*_args):
+        if drop_mode == "raise":
+            raise RuntimeError("drop failed")
+        return False
+
+    monkeypatch.setattr(ad, "drop_completion_delivery", fail_drop)
+    monkeypatch.setattr(
+        ad, "get_durable_delegation", lambda _delegation_id: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_completion_delivery",
+        lambda delegation_id, claim_id: released.append((delegation_id, claim_id)) or True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-preflight-drop-failure",
+        "parent_session_id": "gone-parent",
+    }
+
+    result = await runner._deliver_completion_notification("formatted", event)
+
+    assert result is False
+    runner._inject_watch_notification.assert_not_awaited()
+    assert len(released) == 1
+    assert released[0][0] == event["delegation_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_mode", ["false", "raise"])
+async def test_no_route_drop_failure_is_retryable(monkeypatch, tmp_path, drop_mode):
+    import tools.async_delegation as ad
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._inject_watch_notification = AsyncMock(return_value=None)
+    released = []
+
+    def fail_drop(*_args):
+        if drop_mode == "raise":
+            raise RuntimeError("drop failed")
+        return False
+
+    monkeypatch.setattr(ad, "drop_completion_delivery", fail_drop)
+    monkeypatch.setattr(
+        ad, "get_durable_delegation", lambda _delegation_id: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_completion_delivery",
+        lambda delegation_id, claim_id: released.append((delegation_id, claim_id)) or True,
+    )
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-no-route-drop-failure",
+    }
+
+    result = await runner._deliver_completion_notification(
+        "formatted", event, preclaimed_durable_id="claim-token"
+    )
+
+    assert result is False
+    assert released == [(event["delegation_id"], "claim-token")]
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

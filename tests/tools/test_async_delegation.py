@@ -65,6 +65,28 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def _persist_pending_completion(delegation_id, session_key="session-a"):
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": session_key,
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "status": "running",
+        "dispatched_at": time.time(),
+    }
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": session_key,
+        "status": "completed",
+        "summary": f"{delegation_id} result",
+        "completed_at": time.time(),
+    }
+    ad._persist_dispatch(record)
+    ad._persist_completion(event, {"summary": event["summary"]})
+    return event
+
+
 def test_active_for_session_counts_every_live_delegation_state():
     with ad._records_lock:
         ad._records.update(
@@ -95,6 +117,340 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("desktop-sid") == 3
     assert ad.active_for_session("other-sid") == 1
     assert ad.active_for_session("") == 0
+
+
+def test_owner_work_counts_excludes_current_and_expands_batches(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "current": {
+                    "delegation_id": "current",
+                    "status": "finalizing",
+                    "session_key": "session-a",
+                },
+                "batch": {
+                    "delegation_id": "batch",
+                    "status": "running",
+                    "session_key": "session-a",
+                    "is_batch": True,
+                    "goals": ["one", "two", "three"],
+                },
+                "stalling": {
+                    "delegation_id": "stalling",
+                    "status": "stalling",
+                    "parent_session_id": "parent-a",
+                },
+                "completed": {
+                    "delegation_id": "completed",
+                    "status": "completed",
+                    "session_key": "session-a",
+                },
+                "other": {
+                    "delegation_id": "other",
+                    "status": "running",
+                    "session_key": "session-b",
+                },
+            }
+        )
+
+    _persist_pending_completion("pending")
+
+    assert ad.owner_work_counts(
+        session_key="session-a",
+        parent_session_id="parent-a",
+        exclude_delegation_id="current",
+    ) == (2, 4, 1, 1, 0, 0, True)
+    assert ad.owner_work_counts() == (0, 0, 0, 0, 0, 0, True)
+
+
+def test_owner_work_counts_matches_all_compression_lineage_keys(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    with ad._records_lock:
+        ad._records["before-compression"] = {
+            "delegation_id": "before-compression",
+            "status": "running",
+            "session_key": "session-old",
+        }
+        ad._records["after-compression"] = {
+            "delegation_id": "after-compression",
+            "status": "running",
+            "session_key": "session-new",
+        }
+
+    assert ad.owner_work_counts(
+        session_keys={"session-old", "session-new"},
+    ) == (2, 2, 0, 0, 0, 0, True)
+
+
+def test_owner_work_counts_terminal_durable_row_supersedes_in_memory_finalizing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    delegation_id = "same-finalizing"
+    with ad._records_lock:
+        ad._records[delegation_id] = {
+            "delegation_id": delegation_id,
+            "status": "finalizing",
+            "session_key": "session-a",
+        }
+    _persist_pending_completion(delegation_id, session_key="session-a")
+
+    assert ad.owner_work_counts(session_key="session-a") == (
+        0, 0, 1, 1, 0, 0, True
+    )
+
+
+def test_dropped_owned_result_blocks_complete_synthesis(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    dropped = _persist_pending_completion("dropped", session_key="session-a")
+    claim = ad.claim_event_delivery(dropped, "test")
+    assert claim
+    assert ad.drop_completion_delivery("dropped", claim)
+    current = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-a",
+        "status": "completed",
+        "summary": "current result",
+    }
+
+    text = format_process_notification(current)
+
+    assert text is not None
+    assert current["unavailable_completion_delegations"] == 1
+    assert current["unavailable_completion_subagents"] == 1
+    assert current["all_owned_subagents_terminal"] is True
+    assert current["all_owned_results_available"] is False
+    assert "1 result(s) are unavailable" in text
+    assert "Do not claim a complete final synthesis" in text
+
+
+def test_legacy_ack_cannot_convert_dropped_result_to_delivered(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion("legacy-ack-dropped", session_key="session-a")
+    claim = ad.claim_event_delivery(event, "test")
+    assert claim
+    assert ad.drop_completion_delivery("legacy-ack-dropped", claim)
+
+    assert ad.mark_completion_delivered("legacy-ack-dropped") is False
+    durable = ad.get_durable_delegation("legacy-ack-dropped")
+    assert durable is not None
+    assert durable["delivery_state"] == "dropped"
+
+
+def test_legacy_ack_cannot_deliver_unknown_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion("legacy-ack-unknown", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            (event["delegation_id"],),
+        )
+
+    assert ad.mark_completion_delivered(event["delegation_id"]) is False
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["state"] == "unknown"
+    assert durable["delivery_state"] == "pending"
+
+
+def test_legacy_ack_cannot_overwrite_active_modern_claim(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion("legacy-vs-modern", session_key="session-a")
+    claim = ad.claim_event_delivery(event, "modern-consumer")
+    assert claim
+
+    assert ad.mark_completion_delivered(event["delegation_id"]) is False
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "pending"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT delivery_claim FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()
+    assert row == (claim,)
+
+
+def test_legacy_ack_delivers_success_terminal_result(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion("legacy-ack-success", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='success' WHERE delegation_id=?",
+            (event["delegation_id"],),
+        )
+
+    assert ad.mark_completion_delivered(event["delegation_id"]) is True
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
+
+
+@pytest.mark.parametrize("task_json", ["{", "[]", "null"])
+def test_recover_abandoned_delegation_tolerates_malformed_task_json(
+    monkeypatch, tmp_path, task_json
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    ad._persist_dispatch(
+        {
+            "delegation_id": "abandoned",
+            "session_key": "session-a",
+            "status": "running",
+            "dispatched_at": time.time(),
+        }
+    )
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET task_json=? WHERE delegation_id=?",
+            (task_json, "abandoned"),
+        )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    assert ad.recover_abandoned_delegations() == 1
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    event = restored.get_nowait()
+    assert event["status"] == "unknown"
+    assert event["goal"] == ""
+
+
+def test_unknown_completion_never_authorizes_complete_synthesis(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "unknown",
+        "session_key": "session-a",
+        "status": "unknown",
+        "error": "owner exited",
+    }
+
+    text = format_process_notification(event)
+
+    assert event["all_owned_subagents_terminal"] is True
+    assert event["all_owned_results_available"] is False
+    assert "outcome is unknown" in text
+    assert "Do not claim a complete final synthesis" in text
+
+
+def test_unknown_sibling_rejects_legacy_ack_and_blocks_complete_synthesis(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _persist_pending_completion("unknown-sibling", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            ("unknown-sibling",),
+        )
+    assert ad.mark_completion_delivered("unknown-sibling") is False
+    current = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-a",
+        "status": "completed",
+        "summary": "current result",
+    }
+
+    text = format_process_notification(current)
+
+    assert current["unavailable_completion_delegations"] == 1
+    assert current["all_owned_results_available"] is False
+    assert "1 result(s) are unavailable" in text
+    assert "Do not claim a complete final synthesis" in text
+
+
+@pytest.mark.parametrize("bad_event_json", ["{", "[]", "null"])
+def test_restore_skips_malformed_event_and_restores_later_valid_row(
+    monkeypatch, tmp_path, bad_event_json
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _persist_pending_completion("bad", session_key="session-a")
+    valid = _persist_pending_completion("valid", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (bad_event_json, "bad"),
+        )
+    restored = queue.Queue()
+
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["delegation_id"] == valid["delegation_id"]
+    assert restored.empty()
+    durable_bad = ad.get_durable_delegation("bad")
+    assert durable_bad is not None
+    assert durable_bad["delivery_state"] == "dropped"
+
+
+def test_get_durable_delegation_tolerates_malformed_result_json(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _persist_pending_completion("malformed-result", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET result_json=? WHERE delegation_id=?",
+            ("{", "malformed-result"),
+        )
+
+    durable = ad.get_durable_delegation("malformed-result")
+
+    assert durable is not None
+    assert durable["result"] is None
+    assert durable["result_parse_error"] is True
+
+
+def test_pending_unknown_counts_as_unavailable_not_pending(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _persist_pending_completion("unknown-pending", session_key="session-a")
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            ("unknown-pending",),
+        )
+
+    assert ad.owner_work_counts(session_key="session-a") == (
+        0, 0, 0, 0, 1, 1, True
+    )
+
+
+def test_lineage_resolution_failure_forces_unknown_work_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-new",
+        "status": "completed",
+        "summary": "result",
+        "_owner_session_lineage_known": False,
+    }
+
+    text = format_process_notification(event)
+
+    assert event["owned_work_state_known"] is False
+    assert event["all_owned_results_available"] is False
+    assert "Could not verify" in text
+
+
+def test_reinjection_fails_closed_when_delivery_ledger_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        ad,
+        "_transaction",
+        lambda: (_ for _ in ()).throw(RuntimeError("ledger unavailable")),
+    )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-a",
+        "status": "completed",
+        "summary": "result",
+    }
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert evt["owned_work_state_known"] is False
+    assert evt["all_owned_subagents_terminal"] is False
+    assert evt["all_owned_results_available"] is False
+    assert "Could not verify whether other completion results await delivery" in text
+    assert "Do not present a final synthesis yet" in text
 
 
 def test_dispatch_returns_immediately_without_blocking():
@@ -200,6 +556,182 @@ def test_rich_reinjection_block_is_self_contained():
         "API calls: 7",
     ]:
         assert needle in text, f"missing {needle!r}"
+
+
+def test_reinjection_reports_other_owned_background_work(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    with ad._records_lock:
+        ad._records.update(
+            {
+                "current": {
+                    "delegation_id": "current",
+                    "status": "finalizing",
+                    "session_key": "session-a",
+                },
+                "remaining": {
+                    "delegation_id": "remaining",
+                    "status": "running",
+                    "session_key": "session-a",
+                    "is_batch": True,
+                    "goals": ["one", "two"],
+                },
+            }
+        )
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-a",
+        "status": "completed",
+        "summary": "first result",
+    }
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert evt["remaining_active_delegations"] == 1
+    assert evt["remaining_active_subagents"] == 2
+    assert evt["pending_completion_delegations"] == 0
+    assert evt["pending_completion_subagents"] == 0
+    assert evt["all_owned_subagents_terminal"] is False
+    assert evt["all_owned_results_available"] is False
+    assert "2 subagent task(s) across 1 delegation(s) are still running" in text
+    assert "Do not present a final synthesis yet" in text
+
+
+def test_reinjection_reports_last_owned_background_completion(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    with ad._records_lock:
+        ad._records["current"] = {
+            "delegation_id": "current",
+            "status": "finalizing",
+            "session_key": "session-a",
+        }
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "current",
+        "session_key": "session-a",
+        "status": "completed",
+        "summary": "last result",
+    }
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert evt["remaining_active_delegations"] == 0
+    assert evt["remaining_active_subagents"] == 0
+    assert evt["pending_completion_delegations"] == 0
+    assert evt["pending_completion_subagents"] == 0
+    assert evt["all_owned_subagents_terminal"] is True
+    assert evt["all_owned_results_available"] is True
+    assert "running or awaiting result delivery" in text
+    assert "after any required parent-side verification" in text
+
+
+def test_two_terminal_results_do_not_allow_synthesis_before_second_delivery(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+
+    events = [
+        _persist_pending_completion(delegation_id)
+        for delegation_id in ("first", "second")
+    ]
+
+    first_text = format_process_notification(events[0])
+    assert first_text is not None
+    assert events[0]["remaining_active_subagents"] == 0
+    assert events[0]["pending_completion_subagents"] == 1
+    assert events[0]["all_owned_subagents_terminal"] is True
+    assert events[0]["all_owned_results_available"] is False
+    assert "1 completed result(s) still await delivery" in first_text
+    assert "Do not present a final synthesis yet" in first_text
+
+    assert ad.mark_completion_delivered("first")
+    second_text = format_process_notification(events[1])
+    assert second_text is not None
+    assert events[1]["pending_completion_subagents"] == 0
+    assert events[1]["all_owned_results_available"] is True
+    assert "running or awaiting result delivery" in second_text
+
+
+def test_pruning_preserves_pending_rows_and_tombstones_overflow(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _persist_pending_completion("old-pending", session_key="session-a")
+    _persist_pending_completion("new-pending", session_key="session-a")
+    monkeypatch.setattr(ad, "_MAX_RETAINED_COMPLETED", 0)
+    monkeypatch.setattr(ad, "_MAX_DURABLE_PENDING", 1)
+
+    ad._prune_durable_records()
+
+    old = ad.get_durable_delegation("old-pending")
+    new = ad.get_durable_delegation("new-pending")
+    assert old is not None
+    assert new is not None
+    assert {old["delivery_state"], new["delivery_state"]} == {
+        "dropped", "pending"
+    }
+    assert ad.owner_work_counts(session_key="session-a") == (
+        0, 0, 1, 1, 1, 1, True
+    )
+
+
+def test_drain_persistent_async_formatter_failure_converges_to_dropped(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion(
+        "persistent-drain-format-error", session_key="session-a"
+    )
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification",
+        lambda _event: (_ for _ in ()).throw(RuntimeError("persistent failure")),
+    )
+
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS + 1):
+        assert process_registry.drain_notifications(session_key="session-a") == []
+
+    durable = ad.get_durable_delegation("persistent-drain-format-error")
+    assert durable is not None
+    assert durable["delivery_state"] == "dropped"
+    assert durable["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert process_registry.completion_queue.empty()
+
+
+def test_drain_empty_async_formatter_converges_to_dropped(monkeypatch, tmp_path):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = _persist_pending_completion(
+        "persistent-drain-empty-format", session_key="session-a"
+    )
+    process_registry.completion_queue.put(event)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification", lambda _event: ""
+    )
+
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS + 1):
+        assert process_registry.drain_notifications(session_key="session-a") == []
+
+    durable = ad.get_durable_delegation("persistent-drain-empty-format")
+    assert durable is not None
+    assert durable["delivery_state"] == "dropped"
+    assert durable["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert process_registry.completion_queue.empty()
+
+
+def test_cli_style_drain_marks_only_last_completion_ready_for_synthesis(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    for delegation_id in ("first", "second"):
+        process_registry.completion_queue.put(
+            _persist_pending_completion(delegation_id)
+        )
+
+    drained = process_registry.drain_notifications(session_key="session-a")
+
+    assert len(drained) == 2
+    assert "Do not present a final synthesis yet" in drained[0][1]
+    assert "Do not present a final synthesis yet" in drained[1][1]
 
 
 def test_dispatch_rejected_at_capacity():

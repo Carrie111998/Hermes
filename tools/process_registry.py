@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import queue
 import shlex
 import signal
 import subprocess
@@ -46,13 +47,38 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+
+class _NotificationQueue(queue.Queue):
+    """Queue whose tasks complete when notifications are removed.
+
+    Notification consumers either consume immediately or requeue explicitly;
+    none has a post-processing ``task_done`` phase. Track every structural
+    mutation with a monotonic generation for fail-closed snapshot validation.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.mutation_generation = 0
+
+    def _put(self, item):
+        super()._put(item)
+        self.mutation_generation += 1
+
+    def _get(self):
+        item = super()._get()
+        self.mutation_generation += 1
+        self.unfinished_tasks -= 1
+        if self.unfinished_tasks == 0:
+            self.all_tasks_done.notify_all()
+        return item
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -446,8 +472,7 @@ class ProcessRegistry:
         # Completion notifications (notify_on_complete) and watch pattern matches
         # both land here, distinguished by "type" field.  CLI process_loop and
         # gateway drain this after each agent turn to auto-trigger new turns.
-        import queue as _queue_mod
-        self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        self.completion_queue: _NotificationQueue = _NotificationQueue()
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
@@ -489,6 +514,66 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    def snapshot_notifications(self, timeout: float = 0.5) -> tuple[tuple[dict, ...], int]:
+        """Return an immutable snapshot token after waiting for queue availability.
+
+        The token includes Queue task generation state. Callers may perform
+        arbitrary ownership/lineage checks outside the Queue mutex, then pass
+        the snapshot to ``get_matching_notification`` for atomic validation.
+        """
+        import queue as _queue_mod
+
+        q = self.completion_queue
+        with q.not_empty:
+            if not q.queue:
+                if timeout <= 0 or not q.not_empty.wait_for(
+                    lambda: bool(q.queue), timeout=max(0.0, timeout)
+                ):
+                    raise _queue_mod.Empty
+            return tuple(q.queue), q.mutation_generation
+
+    def get_matching_notification(
+        self,
+        snapshot: tuple[tuple[dict, ...], int],
+        accepted_events,
+    ) -> dict:
+        """Atomically dequeue the first accepted event from a valid snapshot.
+
+        Ownership is evaluated by the caller outside the Queue lock. The
+        queue identity sequence and task-generation count must still match the
+        snapshot; any get/put/requeue race fails closed and the caller retries.
+        The removed queue task is completed here because callers consume or
+        explicitly requeue the returned event and never call ``task_done()``.
+        """
+        import queue as _queue_mod
+
+        snapshot_events, snapshot_generation = snapshot
+        accepted_ids = {id(event) for event in accepted_events}
+        if not accepted_ids:
+            raise _queue_mod.Empty
+
+        q = self.completion_queue
+        with q.not_empty:
+            if (
+                q.mutation_generation != snapshot_generation
+                or len(q.queue) != len(snapshot_events)
+                or any(
+                    current is not previous
+                    for current, previous in zip(q.queue, snapshot_events)
+                )
+            ):
+                raise _queue_mod.Empty
+            for index, event in enumerate(q.queue):
+                if id(event) in accepted_ids:
+                    del q.queue[index]
+                    q.mutation_generation += 1
+                    q.unfinished_tasks -= 1
+                    if q.unfinished_tasks == 0:
+                        q.all_tasks_done.notify_all()
+                    q.not_full.notify()
+                    return event
+        raise _queue_mod.Empty
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1717,9 +1802,53 @@ class ProcessRegistry:
             ):
                 continue
 
-            text = format_process_notification(evt)
+            try:
+                text = format_process_notification(evt)
+            except Exception:
+                logger.exception("Could not format process notification; requeueing")
+                if is_async_delegation:
+                    try:
+                        from tools.async_delegation import (
+                            claim_event_delivery,
+                            release_event_delivery,
+                        )
+                        format_claim = claim_event_delivery(
+                            evt, "process-registry-formatter"
+                        )
+                    except Exception:
+                        format_claim = ""
+                    if format_claim is None:
+                        continue
+                    if format_claim:
+                        try:
+                            release_event_delivery(evt, format_claim)
+                        except Exception:
+                            pass
+                requeue.append(evt)
+                continue
             if text:
                 results.append((evt, text))
+            elif is_async_delegation:
+                # Empty output is also an unformattable durable payload. Count
+                # it against the same bounded attempt budget as exceptions.
+                try:
+                    from tools.async_delegation import (
+                        claim_event_delivery,
+                        release_event_delivery,
+                    )
+                    format_claim = claim_event_delivery(
+                        evt, "process-registry-empty-formatter"
+                    )
+                except Exception:
+                    format_claim = ""
+                if format_claim is None:
+                    continue
+                if format_claim:
+                    try:
+                        release_event_delivery(evt, format_claim)
+                    except Exception:
+                        pass
+                requeue.append(evt)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -2626,6 +2755,106 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+def _async_delegation_runtime_state_lines(evt: dict) -> list[str]:
+    """Annotate a completion with live and not-yet-delivered sibling work."""
+    session_key = str(evt.get("session_key") or "")
+    owner_session_keys = {
+        str(key) for key in (evt.get("_owner_session_keys") or []) if str(key)
+    }
+    origin_ui_session_id = str(evt.get("origin_ui_session_id") or "")
+    parent_session_id = str(evt.get("parent_session_id") or "")
+    owner_parent_session_ids = {
+        str(value)
+        for value in (evt.get("_owner_parent_session_ids") or [])
+        if str(value)
+    }
+    if not session_key and not owner_session_keys and not origin_ui_session_id and not parent_session_id:
+        return []
+
+    from tools.async_delegation import owner_work_counts
+
+    (
+        active_units,
+        active_tasks,
+        pending_units,
+        pending_tasks,
+        unavailable_units,
+        unavailable_tasks,
+        state_known,
+    ) = owner_work_counts(
+        session_key=session_key,
+        session_keys=owner_session_keys,
+        origin_ui_session_id=origin_ui_session_id,
+        parent_session_id=parent_session_id,
+        parent_session_ids=owner_parent_session_ids,
+        exclude_delegation_id=str(evt.get("delegation_id") or ""),
+    )
+    lineage_known = evt.get("_owner_session_lineage_known", True) is not False
+    outcome_known = str(evt.get("status") or "completed") != "unknown"
+    state_known = state_known and lineage_known
+    evt["remaining_active_delegations"] = active_units
+    evt["remaining_active_subagents"] = active_tasks
+    evt["pending_completion_delegations"] = pending_units
+    evt["pending_completion_subagents"] = pending_tasks
+    evt["unavailable_completion_delegations"] = unavailable_units
+    evt["unavailable_completion_subagents"] = unavailable_tasks
+    evt["owned_work_state_known"] = state_known
+    evt["all_owned_subagents_terminal"] = state_known and active_units == 0
+    evt["all_owned_results_available"] = (
+        state_known
+        and outcome_known
+        and active_units == 0
+        and pending_units == 0
+        and unavailable_units == 0
+    )
+
+    if not state_known:
+        return [
+            "",
+            "--- BACKGROUND WORK STATE ---",
+            "Could not verify whether other completion results await delivery. "
+            "Do not present a final synthesis yet unless the user explicitly "
+            "asks for a partial result.",
+        ]
+    if active_units or pending_units:
+        return [
+            "",
+            "--- BACKGROUND WORK STATE ---",
+            f"{active_tasks} subagent task(s) across {active_units} delegation(s) "
+            f"are still running; {pending_tasks} completed result(s) still await "
+            f"delivery across {pending_units} delegation(s). Do not present a "
+            "final synthesis yet; "
+            "wait for the remaining completion event(s), unless the user "
+            "explicitly asks for a partial result.",
+        ]
+    if unavailable_units:
+        return [
+            "",
+            "--- BACKGROUND WORK STATE ---",
+            f"{unavailable_tasks} result(s) are unavailable across "
+            f"{unavailable_units} delegation(s) because they were dropped or "
+            "their outcome is unknown. Do not claim a complete final "
+            "synthesis from the delivered results; inspect the delegation "
+            "records or rerun the missing work.",
+        ]
+    if not outcome_known:
+        return [
+            "",
+            "--- BACKGROUND WORK STATE ---",
+            "This delegation's outcome is unknown because its owner exited "
+            "before recording a terminal result. Do not claim a complete final "
+            "synthesis from the delivered results; inspect the delegation "
+            "records or rerun the missing work.",
+        ]
+    return [
+        "",
+        "--- BACKGROUND WORK STATE ---",
+        "No other background delegations owned by this session are still "
+        "running or awaiting result delivery. This result may now be included "
+        "in a final synthesis after any required parent-side verification.",
+    ]
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2682,6 +2911,7 @@ def _format_async_delegation(evt: dict) -> str:
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
+            lines.extend(_async_delegation_runtime_state_lines(evt))
             return "\n".join(lines)
         for r in sorted(results, key=lambda x: x.get("task_index", 0)):
             idx = r.get("task_index", 0)
@@ -2719,6 +2949,7 @@ def _format_async_delegation(evt: dict) -> str:
                 lines.append(
                     f"Full live transcript (complete tool/assistant trace): {r_live}"
                 )
+        lines.extend(_async_delegation_runtime_state_lines(evt))
         return "\n".join(lines)
 
     age = ""
@@ -2762,6 +2993,7 @@ def _format_async_delegation(evt: dict) -> str:
         if summary:
             lines.append("Partial output:")
             lines.append(summary)
+    lines.extend(_async_delegation_runtime_state_lines(evt))
     return "\n".join(lines)
 
 

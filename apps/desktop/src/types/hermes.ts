@@ -530,6 +530,15 @@ export type TimelineDisplayMetadata =
       completed_count?: number
       failed_count?: number
       duration_seconds?: number
+      remaining_active_delegations?: number
+      remaining_active_subagents?: number
+      pending_completion_delegations?: number
+      pending_completion_subagents?: number
+      unavailable_completion_delegations?: number
+      unavailable_completion_subagents?: number
+      owned_work_state_known?: boolean
+      all_owned_subagents_terminal?: boolean
+      all_owned_results_available?: boolean
     }
   | { reactions: MessageReaction[] }
 
