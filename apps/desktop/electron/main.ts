@@ -134,6 +134,7 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import { makeHudWindowFocusable } from './hud-focusable'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -9224,6 +9225,7 @@ function spawnHudWindow(sessionId) {
 
   win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
   win.setHiddenInMissionControl?.(true)
+  makeHudWindowFocusable(win)
 
   try {
     win.setVisibleOnAllWorkspaces(
