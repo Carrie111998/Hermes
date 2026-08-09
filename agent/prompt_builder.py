@@ -2339,7 +2339,7 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
     if (
-        not _is_denied_project_context_path(cursor_rules_dir, base_path=cwd_path)
+        not _is_denied_project_context_root(cursor_rules_dir, base_path=cwd_path)
         and cursor_rules_dir.exists()
         and cursor_rules_dir.is_dir()
     ):

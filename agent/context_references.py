@@ -266,14 +266,21 @@ async def _expand_reference(
     return f"{ref.raw}: unsupported reference type", None
 
 
+def _lexical_reference_path(cwd: Path, target: str) -> Path:
+    """Anchor a reference spelling without dereferencing filesystem aliases."""
+    path = Path(os.path.expanduser(target))
+    return path if path.is_absolute() else cwd / path
+
+
 def _expand_file_reference(
     ref: ContextReference,
     cwd: Path,
     *,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    lexical_path = _lexical_reference_path(cwd, ref.target)
+    _ensure_reference_path_allowed(lexical_path, base_path=cwd)
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
-    _ensure_reference_path_allowed(path, base_path=cwd)
     if not path.exists():
         return f"{ref.raw}: file not found", None
     if not path.is_file():
@@ -306,8 +313,9 @@ def _expand_folder_reference(
     *,
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
+    lexical_path = _lexical_reference_path(cwd, ref.target)
+    _ensure_reference_path_allowed(lexical_path, base_path=cwd, search_root=True)
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
-    _ensure_reference_path_allowed(path, base_path=cwd, search_root=True)
     if not path.exists():
         return f"{ref.raw}: folder not found", None
     if not path.is_dir():

@@ -135,6 +135,20 @@ class TestPermissionsDenyPathMatching:
         assert match is not None
         assert match.pattern == "/workspace/*/secret/**"
 
+    def test_lexical_match_returns_before_realpath(self):
+        with patch(
+            "agent.deny_policy.os.path.realpath",
+            side_effect=AssertionError("realpath ran before lexical deny"),
+        ) as mock_realpath:
+            match = deny_policy.match_permissions_deny_path(
+                "/workspace/secret/file.txt",
+                patterns=["/workspace/secret/**"],
+            )
+
+        assert match is not None
+        assert match.pattern == "/workspace/secret/**"
+        mock_realpath.assert_not_called()
+
     def test_rule_alias_matches_canonical_target(self):
         def fake_realpath(value):
             normalized = str(value).replace("\\", "/").rstrip("/")
@@ -294,6 +308,32 @@ class TestPermissionsDenyFileTools:
 
         assert error is not None
         assert "matches the user-defined deny rule 'secret/**'" in error
+
+    def test_search_tool_denies_before_resolution_or_file_probe(self, monkeypatch, tmp_path):
+        denied = tmp_path / "private"
+        _install_permissions_config(monkeypatch, paths=[str(denied / "**")])
+
+        with (
+            patch(
+                "tools.file_tools._resolve_path_for_task",
+                side_effect=AssertionError("search path resolved before lexical deny"),
+            ) as mock_resolve,
+            patch(
+                "tools.file_tools.os.path.isfile",
+                side_effect=AssertionError("search root probed before lexical deny"),
+            ) as mock_isfile,
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.search_tool(
+                "needle",
+                path=str(denied),
+                task_id="deny-search-before-probe",
+            ))
+
+        assert "permissions.deny.paths" in result["error"]
+        mock_resolve.assert_not_called()
+        mock_isfile.assert_not_called()
+        mock_get.assert_not_called()
 
     def test_read_file_denied_before_file_ops(self, monkeypatch, tmp_path):
         secret = tmp_path / "secret.txt"
@@ -760,6 +800,60 @@ class TestPermissionsDenyFileTools:
         assert "permissions.deny.paths" in result["error"]
         assert "could not be evaluated" in result["error"]
         mock_get.assert_not_called()
+
+    def test_malformed_top_level_user_policy_raises(self, monkeypatch, tmp_path):
+        home = tmp_path / "hermes-home"
+        home.mkdir()
+        (home / "config.yaml").write_text("- not\n- a mapping\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with pytest.raises(deny_policy.DenyPolicyError):
+            deny_policy.permissions_deny_paths()
+
+    def test_malformed_managed_policy_raises(self, monkeypatch, tmp_path):
+        home = tmp_path / "hermes-home"
+        managed = tmp_path / "managed"
+        home.mkdir()
+        managed.mkdir()
+        (home / "config.yaml").write_text("permissions: {}\n", encoding="utf-8")
+        (managed / "config.yaml").write_text("- not\n- a mapping\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+        with pytest.raises(deny_policy.DenyPolicyError):
+            deny_policy.permissions_deny_paths()
+
+    def test_managed_policy_overlay_and_env_expansion_are_effective(
+        self, monkeypatch, tmp_path
+    ):
+        home = tmp_path / "hermes-home"
+        managed = tmp_path / "managed"
+        protected = tmp_path / "protected"
+        home.mkdir()
+        managed.mkdir()
+        (home / "config.yaml").write_text(
+            "permissions:\n  deny:\n    paths:\n      - user-only/**\n",
+            encoding="utf-8",
+        )
+        (managed / "config.yaml").write_text(
+            "permissions:\n  deny:\n    paths:\n      - ${POLICY_ROOT}/**\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        monkeypatch.setenv("POLICY_ROOT", str(protected))
+
+        assert deny_policy.permissions_deny_paths() == [str(protected) + "/**"]
+
+    def test_policy_read_does_not_seed_missing_hermes_home(self, monkeypatch, tmp_path):
+        home = tmp_path / "missing-hermes-home"
+        managed = tmp_path / "empty-managed"
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+        assert deny_policy.permissions_deny_paths() == []
+        assert not home.exists()
 
     def test_effective_home_resolution_failure_blocks_before_file_ops(self, monkeypatch, tmp_path):
         candidate = tmp_path / "candidate.txt"

@@ -648,29 +648,24 @@ def _permissions_deny_patterns_for_task(
     return variants
 
 
+def _restore_configured_deny_match(match, pattern_variants):
+    """Map an internal anchored match back to the configured source rule."""
+    if match is None:
+        return None
+    from agent.deny_policy import DenyMatch
+
+    source_pattern = next(
+        source_pattern
+        for variant, source_pattern in pattern_variants
+        if variant == match.pattern
+    )
+    return DenyMatch(pattern=source_pattern, source=match.source)
+
+
 def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error when ``filepath`` matches ``permissions.deny.paths``."""
     text = str(filepath)
     expanded = _expand_tilde(text)
-    # Do not call _resolve_path_for_task for obvious absolute paths: tests often
-    # patch _get_file_ops, and resolution may consult terminal cwd state.  Policy
-    # matching only needs task-cwd anchoring for relative paths.
-    is_absolute = (
-        os.path.isabs(expanded)
-        or posixpath.isabs(expanded)
-        or bool(re.match(r"^[A-Za-z]:[\\/]", expanded))
-        or expanded.startswith("\\\\")
-    )
-    candidates = [expanded]
-    if is_absolute:
-        resolved = None
-    else:
-        try:
-            resolved = str(_resolve_path_for_task(expanded, task_id))
-        except (OSError, ValueError, RuntimeError, TypeError):
-            resolved = None
-    if resolved and resolved not in candidates:
-        candidates.append(resolved)
     try:
         from agent.deny_policy import (
             match_permissions_deny_path,
@@ -678,9 +673,36 @@ def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str
             permissions_deny_paths,
         )
 
+        configured_patterns = permissions_deny_paths()
+        # Raw spellings are authoritative and must deny before task resolution
+        # or host canonicalization can inspect filesystem topology.
+        match = match_permissions_deny_path(
+            expanded,
+            patterns=configured_patterns,
+            canonicalize=False,
+        )
+        if match is not None:
+            return path_deny_error(filepath, match)
+
+        is_absolute = (
+            os.path.isabs(expanded)
+            or posixpath.isabs(expanded)
+            or bool(re.match(r"^[A-Za-z]:[\\/]", expanded))
+            or expanded.startswith("\\\\")
+        )
+        candidates = [expanded]
+        if is_absolute:
+            resolved = None
+        else:
+            try:
+                resolved = str(_resolve_path_for_task(expanded, task_id))
+            except (OSError, ValueError, RuntimeError, TypeError):
+                resolved = None
+        if resolved and resolved not in candidates:
+            candidates.append(resolved)
+
         pattern_variants = _permissions_deny_patterns_for_task(
-            permissions_deny_paths(),
-            task_id,
+            configured_patterns, task_id
         )
         patterns = [variant for variant, _source in pattern_variants]
         local_backend = _terminal_env_type_for_task(task_id) == "local"
@@ -692,14 +714,7 @@ def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str
                 canonicalize=local_backend,
             )
             if match is not None:
-                from agent.deny_policy import DenyMatch
-
-                source_pattern = next(
-                    source_pattern
-                    for variant, source_pattern in pattern_variants
-                    if variant == match.pattern
-                )
-                match = DenyMatch(pattern=source_pattern, source=match.source)
+                match = _restore_configured_deny_match(match, pattern_variants)
                 break
     except Exception:
         logger.warning("permissions.deny.paths check failed closed for %s", filepath, exc_info=True)
@@ -715,23 +730,36 @@ def _check_permissions_deny_search_root(filepath: str, task_id: str = "default")
     """Block a search root that is denied or may contain denied descendants."""
     text = str(filepath)
     expanded = _expand_tilde(text)
-    candidates = [expanded]
-    try:
-        resolved = str(_resolve_path_for_task(expanded, task_id))
-    except (OSError, ValueError, RuntimeError, TypeError):
-        resolved = None
-    if resolved and resolved not in candidates:
-        candidates.append(resolved)
     try:
         from agent.deny_policy import (
+            match_permissions_deny_path,
             match_permissions_deny_search_root,
             path_deny_error,
             permissions_deny_paths,
         )
 
+        configured_patterns = permissions_deny_paths()
+        # Establish the direct lexical verdict before task resolution or the
+        # root-is-file metadata probe. Descendant-overlap analysis follows once
+        # an allowed spelling has an authoritative task identity.
+        match = match_permissions_deny_path(
+            expanded,
+            patterns=configured_patterns,
+            canonicalize=False,
+        )
+        if match is not None:
+            return path_deny_error(filepath, match)
+
+        candidates = [expanded]
+        try:
+            resolved = str(_resolve_path_for_task(expanded, task_id))
+        except (OSError, ValueError, RuntimeError, TypeError):
+            resolved = None
+        if resolved and resolved not in candidates:
+            candidates.append(resolved)
+
         pattern_variants = _permissions_deny_patterns_for_task(
-            permissions_deny_paths(),
-            task_id,
+            configured_patterns, task_id
         )
         patterns = [variant for variant, _source in pattern_variants]
         local_backend = _terminal_env_type_for_task(task_id) == "local"
@@ -757,14 +785,7 @@ def _check_permissions_deny_search_root(filepath: str, task_id: str = "default")
                 canonicalize=local_backend,
             )
             if match is not None:
-                from agent.deny_policy import DenyMatch
-
-                source_pattern = next(
-                    source_pattern
-                    for variant, source_pattern in pattern_variants
-                    if variant == match.pattern
-                )
-                match = DenyMatch(pattern=source_pattern, source=match.source)
+                match = _restore_configured_deny_match(match, pattern_variants)
                 break
     except Exception:
         logger.warning(
@@ -2623,14 +2644,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 already_searched=count,
             )
 
-        try:
-            resolved_path = _resolve_path_for_task(path, task_id)
-        except (OSError, ValueError, RuntimeError):
-            resolved_path = None
         for policy_path in _search_root_policy_candidates(path):
             policy_error = _check_permissions_deny_search_root(policy_path, task_id)
             if policy_error:
                 return json.dumps({"error": policy_error}, ensure_ascii=False)
+        try:
+            resolved_path = _resolve_path_for_task(path, task_id)
+        except (OSError, ValueError, RuntimeError):
+            resolved_path = None
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)

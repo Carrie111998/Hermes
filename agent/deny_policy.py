@@ -29,10 +29,15 @@ class DenyPolicyError(ValueError):
 
 
 def load_user_config() -> dict[str, Any]:
-    """Load explicit user policy without config migrations or write side effects."""
-    from hermes_cli.config import read_user_config_raw
+    """Load effective deny policy without mutations or fail-open fallback."""
+    from hermes_cli.config import load_security_policy_config_readonly
 
-    loaded = read_user_config_raw()
+    try:
+        loaded = load_security_policy_config_readonly()
+    except DenyPolicyError:
+        raise
+    except Exception as exc:
+        raise DenyPolicyError(f"Hermes security policy could not be loaded: {exc}") from exc
     if not isinstance(loaded, dict):
         raise DenyPolicyError("Hermes config must be a mapping")
     return loaded
@@ -331,8 +336,9 @@ def match_permissions_deny_path(
 ) -> DenyMatch | None:
     """Return the matching path deny rule for *path*, or ``None``.
 
-    Matching uses case-insensitive fnmatch globs against a realpath-normalized,
-    slash-separated candidate. Empty patterns are ignored.
+    Matching evaluates slash-normalized lexical spellings first. When
+    ``canonicalize`` is enabled, filesystem-canonical aliases are evaluated only
+    after the lexical phase allows the candidate. Empty patterns are ignored.
     """
     if patterns is None:
         patterns = permissions_deny_paths()
@@ -340,13 +346,24 @@ def match_permissions_deny_path(
     pattern_variants = _patterns_with_local_base(globs, base_path)
     if not pattern_variants:
         return None
-    candidates = _normalize_path_variants(path, canonicalize=canonicalize)
-    for match_pattern, source_pattern in pattern_variants:
-        if any(
-            _path_matches_pattern(candidate, match_pattern, canonicalize=canonicalize)
-            for candidate in candidates
-        ):
-            return DenyMatch(pattern=source_pattern, source=source)
+    # Lexical policy is the first security boundary. Only touch filesystem
+    # topology (realpath) after every lexical spelling has been allowed.
+    phases = (False, True) if canonicalize else (False,)
+    for phase_canonicalize in phases:
+        candidates = _normalize_path_variants(
+            path,
+            canonicalize=phase_canonicalize,
+        )
+        for match_pattern, source_pattern in pattern_variants:
+            if any(
+                _path_matches_pattern(
+                    candidate,
+                    match_pattern,
+                    canonicalize=phase_canonicalize,
+                )
+                for candidate in candidates
+            ):
+                return DenyMatch(pattern=source_pattern, source=source)
     return None
 
 
@@ -372,33 +389,42 @@ def match_permissions_deny_search_root(
     if not pattern_variants:
         return None
 
-    candidates = tuple(
-        candidate.rstrip("/")
-        for candidate in _normalize_path_variants(path, canonicalize=canonicalize)
-    )
-    for match_pattern, source_pattern in pattern_variants:
-        if any(
-            _path_matches_pattern(candidate, match_pattern, canonicalize=canonicalize)
-            for candidate in candidates
-        ):
-            return DenyMatch(pattern=source_pattern, source=source)
-        if root_is_file:
-            continue
-        for prefix, segment_boundary in _search_overlap_prefixes(
-            match_pattern,
-            canonicalize=canonicalize,
-        ):
+    phases = (False, True) if canonicalize else (False,)
+    for phase_canonicalize in phases:
+        candidates = tuple(
+            candidate.rstrip("/")
+            for candidate in _normalize_path_variants(
+                path,
+                canonicalize=phase_canonicalize,
+            )
+        )
+        for match_pattern, source_pattern in pattern_variants:
             if any(
-                prefix == candidate
-                or prefix.startswith(candidate + "/")
-                or (
-                    candidate.startswith(prefix + "/")
-                    if segment_boundary
-                    else candidate.startswith(prefix)
+                _path_matches_pattern(
+                    candidate,
+                    match_pattern,
+                    canonicalize=phase_canonicalize,
                 )
                 for candidate in candidates
             ):
                 return DenyMatch(pattern=source_pattern, source=source)
+            if root_is_file:
+                continue
+            for prefix, segment_boundary in _search_overlap_prefixes(
+                match_pattern,
+                canonicalize=phase_canonicalize,
+            ):
+                if any(
+                    prefix == candidate
+                    or prefix.startswith(candidate + "/")
+                    or (
+                        candidate.startswith(prefix + "/")
+                        if segment_boundary
+                        else candidate.startswith(prefix)
+                    )
+                    for candidate in candidates
+                ):
+                    return DenyMatch(pattern=source_pattern, source=source)
     return None
 
 

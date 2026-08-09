@@ -177,6 +177,41 @@ async def test_permissions_deny_relative_rule_blocks_file_reference(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reference", "patterns"),
+    [
+        ("@file:secret.txt", ["secret.txt"]),
+        ("@folder:private", ["private/**"]),
+    ],
+)
+async def test_permissions_deny_blocks_reference_before_path_resolution(
+    tmp_path: Path,
+    reference: str,
+    patterns: list[str],
+):
+    from agent.context_references import preprocess_context_references_async
+
+    with (
+        patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=patterns,
+        ),
+        patch(
+            "agent.context_references._resolve_path",
+            side_effect=AssertionError("reference resolved before lexical deny"),
+        ) as mock_resolve,
+    ):
+        result = await preprocess_context_references_async(
+            f"inspect {reference}",
+            cwd=tmp_path,
+            context_length=100_000,
+        )
+
+    mock_resolve.assert_not_called()
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 async def test_permissions_deny_blocks_git_reference_before_subprocess(tmp_path: Path):
     from agent.context_references import preprocess_context_references_async
 

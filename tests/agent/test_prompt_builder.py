@@ -515,6 +515,38 @@ class TestBuildContextFilesPrompt:
         assert "Allowed relative-rule sibling" in result
         assert "RELATIVE DENIED CONTEXT" not in result
 
+    def test_denied_cursor_rules_descendant_blocks_directory_enumeration(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        rules_dir = tmp_path / ".cursor" / "rules"
+        rules_dir.mkdir(parents=True)
+        denied = rules_dir / "secret.mdc"
+        denied.write_text("DENIED CURSOR RULE")
+        original_glob = Path.glob
+
+        def guarded_glob(path_obj, pattern):
+            if path_obj == rules_dir:
+                raise AssertionError("cursor rules enumerated before deny-root check")
+            return original_glob(path_obj, pattern)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(denied)],
+            ),
+            patch.object(
+                Path,
+                "glob",
+                autospec=True,
+                side_effect=guarded_glob,
+            ) as mock_glob,
+        ):
+            result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert result == ""
+        mock_glob.assert_not_called()
+
     def test_denied_hermes_md_is_not_probed_before_allowed_agents_md(self, tmp_path):
         """Exact deny checks precede implicit .hermes.md file metadata access."""
         from pathlib import Path
