@@ -53,6 +53,25 @@ Equivalent agent tools: `airi_sync`, `airi_start`, `airi_restart`, `airi_status`
 
 CDP seeding needs `websocket-client` in the Hermes venv (`uv pip install websocket-client`).
 
+## AITuber OnAir companion speech bridge
+
+The AITuber OnAir companion bridge is distributed separately, so Hermes core
+does not vendor its Node runtime or voice engine. After installing that local
+plugin, point AIRI at its loopback-only OpenAI-compatible speech endpoint:
+
+```bash
+hermes airi sync \
+  --tts-base-url http://127.0.0.1:5177/v1/ \
+  --tts-model aituber-onair-voice \
+  --tts-voice 8
+```
+
+The same three options are accepted by `hermes airi start`, `restart`, and
+`configure`. They seed AIRI's `openai-compatible-audio-speech` provider; no
+speech credential is written by this plugin. The companion bridge remains
+responsible for starting its TTS engine and forwarding the same WAV bytes to
+the AITuber OnAir VRM surface.
+
 Secrets in `~/.hermes/.env` only:
 
 ```text

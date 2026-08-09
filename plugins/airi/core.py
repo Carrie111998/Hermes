@@ -1423,6 +1423,16 @@ def vrchat_autonomy(values: dict[str, Any] | None = None, **_: Any) -> str:
     )
 
 
+AIRI_TTS_BRIDGE_PROPERTIES = {
+    "tts_base_url": {
+        "type": "string",
+        "description": "Loopback OpenAI-compatible speech base URL, for example http://127.0.0.1:5177/v1/.",
+    },
+    "tts_model": {"type": "string", "description": "Speech model id exposed by the local bridge."},
+    "tts_voice": {"type": "string", "description": "Voice id forwarded to the local bridge."},
+}
+
+
 AIRI_SCHEMAS = {
     "airi_status": {
         "name": "airi_status",
@@ -1438,6 +1448,7 @@ AIRI_SCHEMAS = {
                 "repo_root": {"type": "string"},
                 "hermes_base_url": {"type": "string"},
                 "hermes_model": {"type": "string"},
+                **AIRI_TTS_BRIDGE_PROPERTIES,
             },
         },
     },
@@ -1450,6 +1461,7 @@ AIRI_SCHEMAS = {
                 "repo_root": {"type": "string"},
                 "hermes_base_url": {"type": "string"},
                 "hermes_model": {"type": "string"},
+                **AIRI_TTS_BRIDGE_PROPERTIES,
             },
         },
     },
@@ -1463,6 +1475,7 @@ AIRI_SCHEMAS = {
                 "hermes_base_url": {"type": "string"},
                 "hermes_model": {"type": "string"},
                 "cdp_port": {"type": "integer"},
+                **AIRI_TTS_BRIDGE_PROPERTIES,
             },
         },
     },
@@ -1481,6 +1494,7 @@ AIRI_SCHEMAS = {
                 "hermes_base_url": {"type": "string"},
                 "hermes_model": {"type": "string"},
                 "cdp_port": {"type": "integer"},
+                **AIRI_TTS_BRIDGE_PROPERTIES,
             },
         },
     },

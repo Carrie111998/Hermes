@@ -1,5 +1,5 @@
 name: airi
-version: 0.3.0
+version: 0.3.1
 description: "AIRI Electron VRM/TTS process worker under Hermes — concurrent with Hermes Desktop; api_server is the shared AI core."
 author: zapabob
 kind: standalone
@@ -17,6 +17,15 @@ config:
   hermes_model:
     type: string
     default: "hermes-agent"
+  tts_base_url:
+    type: string
+    default: ""
+  tts_model:
+    type: string
+    default: ""
+  tts_voice:
+    type: string
+    default: ""
   cdp_port:
     type: integer
     default: 9455

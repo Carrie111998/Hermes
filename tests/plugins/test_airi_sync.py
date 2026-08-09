@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 
-from plugins.airi import core
+from plugins.airi import cli, core
 
 
 def test_base_url_keeps_trailing_slash():
@@ -116,6 +117,45 @@ def test_tts_payload_maps_irodori(monkeypatch):
     assert payload["config"]["baseUrl"].endswith("/v1/")
     assert payload["config"]["model"] == "irodori-tts"
     assert payload["config"]["voice"] == "hakua"
+
+
+def test_tts_payload_accepts_local_aituber_companion_bridge():
+    payload = core.tts_payload(
+        {
+            "tts_base_url": "http://127.0.0.1:5177/v1",
+            "tts_model": "aituber-onair-voice",
+            "tts_voice": "8",
+        }
+    )
+    assert payload["ok"] is True
+    assert payload["source"] == "plugin_override"
+    assert payload["airi_provider"] == "openai-compatible-audio-speech"
+    assert payload["config"]["baseUrl"] == "http://127.0.0.1:5177/v1/"
+    assert payload["config"]["model"] == "aituber-onair-voice"
+    assert payload["config"]["voice"] == "8"
+    assert payload["config"]["apiKey"] == "local"
+
+
+def test_cli_forwards_local_tts_bridge_values():
+    parser = argparse.ArgumentParser()
+    cli.register_cli(parser)
+    args = parser.parse_args(
+        [
+            "sync",
+            "--tts-base-url",
+            "http://127.0.0.1:5177/v1/",
+            "--tts-model",
+            "aituber-onair-voice",
+            "--tts-voice",
+            "8",
+        ]
+    )
+    values = cli._values_from_args(args)
+    assert values == {
+        "tts_base_url": "http://127.0.0.1:5177/v1/",
+        "tts_model": "aituber-onair-voice",
+        "tts_voice": "8",
+    }
 
 
 def test_readback_matches_requires_consciousness_and_key():
