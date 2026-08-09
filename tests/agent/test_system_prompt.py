@@ -116,6 +116,37 @@ class TestCodingContextBlock:
         assert "coding agent" not in _stable_prompt(agent)
 
 
+def test_rendered_prompt_contains_no_delivery_shaped_steer_block():
+    """The steer note documents its markers; the rendered prompt must never
+    contain them assembled into a delivery-shaped OPEN…CLOSE block, which is
+    byte-indistinguishable from a real mid-turn steer (#81828)."""
+    import re
+
+    from agent.prompt_builder import STEER_MARKER_OPEN
+
+    # _emit_status absorbs truncation warnings left queued by earlier tests;
+    # without it, draining them into a SimpleNamespace agent raises.
+    agent = _make_agent(
+        valid_tool_names=["read_file"],
+        skip_context_files=True,
+        _emit_status=lambda *args, **kwargs: None,
+    )
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        prompt = build_system_prompt(agent)
+
+    assert STEER_MARKER_OPEN in prompt
+    delivery_shaped = re.compile(
+        r"\[OUT-OF-BAND USER MESSAGE\b.*?\[/OUT-OF-BAND USER MESSAGE\]",
+        re.DOTALL,
+    )
+    assert not delivery_shaped.search(prompt)
+
+
 def test_build_system_prompt_records_stable_prefix():
     agent = _make_agent()
     with (
