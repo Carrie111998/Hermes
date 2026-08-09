@@ -34,6 +34,27 @@ if sys.platform == "win32":
 else:
     import fcntl
 
+# Top-level flags that take a value. Used by ``_hermes_subcommand`` so that
+# in ``-m hermes_cli.main --model gpt5 serve``, ``gpt5`` is correctly
+# skipped as a flag value rather than misclassified as the subcommand.
+# Mirrors ``hermes_cli.main._TOP_LEVEL_VALUE_FLAGS`` (the canonical list,
+# kept in sync with ``hermes_cli/_parser.py``); ``--profile``/``-p`` is
+# handled inline because it is stripped from argv by ``_apply_profile_override``
+# before argparse runs and never appears on the parser.
+_TOP_LEVEL_VALUE_FLAGS = frozenset(
+    {
+        "-z", "--oneshot",
+        "-m", "--model",
+        "--provider",
+        "-t", "--toolsets",
+        "-r", "--resume",
+        "-s", "--skills",
+        "--usage-file",
+        "--in",
+        "-c", "--continue",
+    }
+)
+
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
 _LOCKS_DIRNAME = "gateway-locks"
@@ -445,11 +466,14 @@ def _hermes_subcommand(command: str | None) -> str | None:
     """Return the ``hermes_cli.main`` subcommand *command* dispatches, or None.
 
     Shares the gateway matcher's tokenization (quote-aware shlex, case and
-    slash normalization, profile-selector stripping) so the pausable-process
+    slash normalization, value-flag stripping) so the pausable-process
     classification can never drift from the ``gateway run`` matcher on the
-    same argv. The dispatched subcommand is the first non-flag token after
-    the entrypoint — exactly how ``hermes_cli.main`` dispatches. A nested
-    token (``hermes_cli.main mcp serve``, a chat prompt mentioning serve) is
+    same argv. The dispatched subcommand is the first non-flag,
+    non-flag-value token after the entrypoint — exactly how
+    ``hermes_cli.main`` dispatches (``--model gpt5 serve`` dispatches
+    ``serve``; the flag values are skipped via the same top-level value-flag
+    set ``_first_positional_argv`` uses). A nested token
+    (``hermes_cli.main mcp serve``, a chat prompt mentioning serve) is
     NOT the backend and returns None. Returns None for empty/unparsable
     command lines and for invocations with no ``hermes_cli.main`` entrypoint
     (no ``hermes_cli.main`` / ``hermes_cli/main.py`` marker and no
@@ -492,8 +516,17 @@ def _hermes_subcommand(command: str | None) -> str | None:
             continue
         filtered.append(token)
 
+    # The dispatched subcommand is the first non-flag token after the
+    # entrypoint, with top-level VALUE-flag values skipped the same way
+    # ``hermes_cli.main._first_positional_argv`` does: ``--model gpt5 serve``
+    # dispatches ``serve``, so the flag VALUE (``gpt5``) must not be read as
+    # the subcommand. The value-skip only applies once the entrypoint has
+    # been seen — Python's own ``-m`` module flag (and its module argument,
+    # the entry itself) sits BEFORE the entry and must pass through intact.
     entry_seen = False
-    for token in filtered:
+    i = 0
+    while i < len(filtered):
+        token = filtered[i]
         if not entry_seen:
             if (
                 token == "hermes_cli.main"
@@ -502,8 +535,17 @@ def _hermes_subcommand(command: str | None) -> str | None:
                 or token.rsplit("/", 1)[-1] in ("hermes", "hermes.exe")
             ):
                 entry_seen = True
+            i += 1
             continue
         if token.startswith("-"):
+            # ``--flag=value`` carries its value inline — single token.
+            if "=" in token:
+                i += 1
+                continue
+            if token in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(filtered):
+                i += 2
+                continue
+            i += 1
             continue
         if token in ("serve", "dashboard"):
             return token

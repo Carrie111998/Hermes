@@ -34,7 +34,7 @@ import sys
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -3031,6 +3031,99 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     return found
 
 
+def _parse_desktop_child_pids(raw: str | None) -> set[int]:
+    """Parse the Desktop's ``HERMES_DESKTOP_CHILD_PID`` env value.
+
+    The Desktop hands the update process the PIDs of every backend it
+    manages (comma-separated; a lone int parses for back-compat) so the
+    reaper can skip them — the same value ``_kill_stale_dashboard_processes``
+    reads from its own environment. Tolerant of junk, exactly like that
+    reader. Returns an empty set when unset or unparsable.
+    """
+    if not raw:
+        return set()
+    parsed: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.add(int(part))
+        except (ValueError, TypeError):
+            pass
+    return parsed
+
+
+def _is_desktop_managed_backend(proc: Any, argv: str) -> bool:
+    """Return True when *proc* is a ``serve``/``dashboard`` backend the
+    Desktop app spawned and supervises.
+
+    The Desktop marks every backend it spawns (primary + pool profiles) with
+    ``HERMES_DESKTOP=1`` in the child environment (apps/desktop/electron/
+    main.ts), the same marker that routes the backend into its cron ticker.
+    Killing a desktop-managed backend is futile — the app respawns it within
+    seconds — so the pausable classification must refuse on it, exactly as
+    ``_orphaned_desktop_backend_pids`` refuses on any live-parent backend.
+
+    Three signals, first hit wins:
+
+    - ``HERMES_DESKTOP=1`` in the holder's own environment — authoritative,
+      works even when the parent hop is a ``cmd.exe`` launcher, and cannot
+      be confused with a manually-started backend.
+    - the holder's PID in OUR ``HERMES_DESKTOP_CHILD_PID`` — the Desktop
+      passes the PIDs of every backend it manages to the update process it
+      spawns (the same list ``_kill_stale_dashboard_processes`` reads and
+      skips); a holder on that list is desktop-managed by the Desktop's own
+      admission.
+    - parent fallback for unreadable holder env: a live parent whose
+      executable is the packaged Electron app
+      (``.../release/<plat>-unpacked/Hermes[.exe]``).
+
+    psutil errors never raise — an undecidable holder simply does not count
+    as desktop-managed and the pausable classification stands.
+    """
+    try:
+        env = proc.environ() or {}
+        marker = env.get("HERMES_DESKTOP")
+        if isinstance(marker, bytes):
+            marker = marker.decode("utf-8", "replace")
+        if str(marker) == "1":
+            return True
+    except Exception:
+        pass  # fall through to the parent check
+
+    try:
+        if int(proc.pid) in _parse_desktop_child_pids(
+            os.environ.get("HERMES_DESKTOP_CHILD_PID")
+        ):
+            return True
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+    try:
+        parent = proc.parent()
+    except Exception:
+        return False
+    if parent is None or not parent.is_running():
+        return False
+    low = argv.lower()
+    if not (
+        "hermes_cli.main" in low
+        and (
+            " serve" in low
+            or " dashboard" in low
+            or low.endswith(" serve")
+            or low.endswith(" dashboard")
+        )
+    ):
+        return False
+    try:
+        parent_low = (parent.exe() or "").lower()
+    except Exception:
+        return False
+    return parent_low.endswith(("hermes.exe", "hermes")) and "-unpacked" in parent_low
+
+
 def _leftover_pausable_gateway_pids(
     matches: list[tuple[int, str, str]],
 ) -> list[int] | None:
@@ -3056,8 +3149,19 @@ def _leftover_pausable_gateway_pids(
     cmdline prefix, so the live argv is re-read where psutil allows; an
     unreadable argv falls back to the captured prefix.
 
-    Returns ``None`` when any holder is not pausable — an operator REPL or a
-    stray script has no stop machinery downstream, and the guard must keep
+    Desktop-MANAGED ``serve``/``dashboard`` backends are excluded from the
+    pausable class: the Desktop app marks its spawned backends with
+    ``HERMES_DESKTOP=1`` in their environment, and killing one is futile
+    (the app supervises and respawns it within seconds — see
+    ``_orphaned_desktop_backend_pids`` below for that contract, and
+    ``_kill_stale_dashboard_processes`` for the identical
+    ``HERMES_DESKTOP_CHILD_PID`` skip). A desktop-owned holder therefore
+    keeps the hard refusal; only backends the updater genuinely reaps later
+    (manually-started ones) are nominated for a stop-and-recheck here.
+
+    Returns ``None`` when any holder is not pausable — an operator REPL, a
+    stray script, or a desktop-managed backend has no stop machinery
+    downstream (or would just be respawned), and the guard must keep
     refusing exactly as before.
     """
     from hermes_cli._scan_venv_blockers import _is_pausable_hermes_process
@@ -3070,12 +3174,20 @@ def _leftover_pausable_gateway_pids(
     pids: list[int] = []
     for pid, _name, cmdline in matches:
         argv = cmdline
+        proc = None
         if psutil is not None:
             try:
-                argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
+                proc = psutil.Process(int(pid))
+                argv = " ".join(proc.cmdline()) or cmdline
             except Exception:
                 pass
         if not _is_pausable_hermes_process(argv):
+            return None
+        if proc is not None and _is_desktop_managed_backend(proc, argv):
+            # The Desktop app is still open and would respawn this backend
+            # within seconds; stopping it here is futile. Keep the hard
+            # refusal (the same contract _orphaned_desktop_backend_pids
+            # documents) — the user closes the app, which kills the backend.
             return None
         pids.append(int(pid))
     return pids

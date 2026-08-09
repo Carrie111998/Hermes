@@ -103,6 +103,24 @@ PAUSABLE_ACCEPT = [
     "python -m hermes_cli.main --profile dashboard dashboard",
     # case variations survive
     "PYTHON.EXE -m HERMES_CLI.MAIN SERVE --HOST 127.0.0.1",
+    # other top-level VALUE flags before the subcommand (the #81869 triage
+    # gap: `--model gpt5 serve` read `gpt5` as the subcommand and the backend
+    # stayed a blocker — the flag's VALUE must be skipped like --profile's)
+    "python -m hermes_cli.main --model gpt5 serve",
+    "python -m hermes_cli.main -m gpt5 serve --host 127.0.0.1",
+    "python -m hermes_cli.main --provider openai --model gpt5 serve",
+    "python -m hermes_cli.main --model=gpt5 serve",
+    "python -m hermes_cli.main -t web,research serve",
+    "python -m hermes_cli.main -r latest serve",
+    "python -m hermes_cli.main -s web-search serve",
+    "python -m hermes_cli.main -z 'answer this' --in ./dir serve",
+    "python -m hermes_cli.main --usage-file ./usage.json serve",
+    "python -m hermes_cli.main --in ./project serve",
+    "python -m hermes_cli.main --provider openai dashboard",
+    # a VALUE that literally reads "serve" must not be taken as the
+    # subcommand (same rule as a profile named "serve")
+    "python -m hermes_cli.main --model serve dashboard",
+    "python -m hermes_cli.main --in serve dashboard",
 ]
 
 PAUSABLE_REJECT = [
@@ -112,6 +130,10 @@ PAUSABLE_REJECT = [
     "python -m hermes_cli.main gateway install",
     "python -m hermes_cli.main chat",
     "python -m hermes_cli.main config",
+    # a value-flag VALUE is not the subcommand; the dispatched subcommand
+    # decides (`--model serve chat` dispatches chat, not serve)
+    "python -m hermes_cli.main --model serve chat",
+    "python -m hermes_cli.main -z serve chat",
     # nested tokens are NOT the dispatched subcommand
     "python -m hermes_cli.main mcp serve",
     "python -m hermes_cli.main webhook serve",

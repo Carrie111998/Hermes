@@ -430,7 +430,10 @@ def test_pause_kill_set_covers_venv_guard_abort_set(
 # spawn paths never register in discovery at all. Those holders are exactly
 # what the pause machinery exists to stop — the guard nominates them for a
 # stop-and-recheck instead of dead-ending, and refuses the moment any
-# non-gateway holder is present.
+# non-gateway holder is present. Desktop-MANAGED serve/dashboard backends
+# are also refused (#81869 triage): the app respawns them within seconds, so
+# nominating them for terminate_pid(force=True) kills the desktop's own
+# backend mid-update.
 # ---------------------------------------------------------------------------
 
 
@@ -444,7 +447,13 @@ GATEWAY_ARGV = [
 
 
 def _fake_psutil_cmdlines(argv_by_pid):
-    """psutil stand-in serving live argv per pid; unknown pids raise."""
+    """psutil stand-in serving live argv per pid; unknown pids raise.
+
+    ``environ``/``parent`` are exposed as a missing-attribute stand-in
+    (desktop-managed detection catches AttributeError), so a plain argv fake
+    behaves exactly like an unreadable-env process: the pausable
+    classification is decided by argv alone.
+    """
 
     class FakeProc:
         def __init__(self, pid):
@@ -454,6 +463,16 @@ def _fake_psutil_cmdlines(argv_by_pid):
 
         def cmdline(self):
             return self._argv
+
+        def environ(self):
+            raise AttributeError("not modelled")
+
+        def parent(self):
+            raise AttributeError("not modelled")
+
+        @property
+        def pid(self):
+            raise AttributeError("not modelled")
 
     return types.SimpleNamespace(Process=FakeProc)
 
@@ -534,6 +553,186 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Desktop-managed backend exclusion (#81869 triage)
+#
+# The Desktop app marks every backend it spawns with HERMES_DESKTOP=1 in the
+# child env and supervises it (respawns within seconds). The pausable
+# classification must therefore NOT nominate a desktop-owned `serve` holder
+# for terminate_pid(force=True) — the update would kill the desktop's own
+# backend mid-flight — while a manually-started secondary-profile backend
+# (the #81774 case) keeps its nomination.
+# ---------------------------------------------------------------------------
+
+SERVE_ARGV = [
+    r"C:\x\venv\Scripts\python.exe",
+    "-m",
+    "hermes_cli.main",
+    "serve",
+    "--host",
+    "127.0.0.1",
+]
+
+
+def _fake_psutil_desktop(argv_by_pid, env_by_pid=None):
+    """psutil stand-in with live argv AND a per-pid environ dict.
+
+    ``env_by_pid`` maps pid -> dict (or ``None``/absent → empty env).
+    ``parent`` is not modelled, so the env signal alone decides.
+    """
+
+    env_by_pid = env_by_pid or {}
+
+    class FakeProc:
+        def __init__(self, pid):
+            if pid not in argv_by_pid:
+                raise ValueError(f"no such pid {pid}")
+            self.pid = pid
+            self._argv = argv_by_pid[pid]
+            self._env = env_by_pid.get(pid, {})
+
+        def cmdline(self):
+            return self._argv
+
+        def environ(self):
+            return self._env
+
+        def parent(self):
+            raise AttributeError("not modelled")
+
+    return types.SimpleNamespace(Process=FakeProc)
+
+
+def test_desktop_managed_serve_keeps_the_hard_refusal(monkeypatch):
+    """A `serve` backend the Desktop spawned (HERMES_DESKTOP=1) is NOT
+    pausable: the app supervises and respawns it, so killing it here is
+    futile and the guard must refuse exactly as before (#81869 triage)."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_psutil_desktop(
+            {400: SERVE_ARGV},
+            env_by_pid={400: {"HERMES_DESKTOP": "1"}},
+        ),
+    )
+    matches = [(400, "python.exe", "...")]
+
+    assert cli_main._leftover_pausable_gateway_pids(matches) is None
+
+
+def test_manual_secondary_profile_serve_still_nominated(monkeypatch):
+    """A manually-started secondary-profile `serve` backend has no
+    HERMES_DESKTOP marker, so the pausable nomination (#81774) is kept."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_psutil_desktop(
+            {
+                400: [
+                    r"C:\x\venv\Scripts\python.exe",
+                    "-m",
+                    "hermes_cli.main",
+                    "--profile",
+                    "secondary",
+                    "serve",
+                ]
+            },
+            env_by_pid={400: {}},  # no HERMES_DESKTOP marker
+        ),
+    )
+    matches = [(400, "python.exe", "...")]
+
+    assert cli_main._leftover_pausable_gateway_pids(matches) == [400]
+
+
+def test_desktop_child_pid_env_excludes_listed_holder(monkeypatch):
+    """When the Desktop hands us HERMES_DESKTOP_CHILD_PID (the same list
+    _kill_stale_dashboard_processes reads and skips), a holder on it is
+    desktop-managed by the Desktop's own admission — hard refusal."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_psutil_desktop(
+            {400: SERVE_ARGV, 401: SERVE_ARGV},
+            env_by_pid={400: {}, 401: {}},
+        ),
+    )
+    monkeypatch.setenv("HERMES_DESKTOP_CHILD_PID", "400,999")
+
+    assert cli_main._leftover_pausable_gateway_pids(
+        [(400, "python.exe", "..."), (401, "python.exe", "...")]
+    ) is None
+
+
+def test_desktop_env_unreadable_but_hermes_exe_parent_refuses(monkeypatch):
+    """Even when the holder env can't be read, a live Hermes.exe parent
+    (the packaged app under release/*-unpacked) marks it desktop-managed."""
+    import types as _types
+
+    class ParentProc:
+        def is_running(self):
+            return True
+
+        def exe(self):
+            return r"C:\x\apps\desktop\release\win-unpacked\Hermes.exe"
+
+    class FakeProc:
+        pid = 400
+
+        def cmdline(self):
+            return SERVE_ARGV
+
+        def environ(self):
+            raise OSError("Access is denied")
+
+        def parent(self):
+            return ParentProc()
+
+    fake = _types.SimpleNamespace(
+        Process=lambda pid: FakeProc() if pid == 400 else (_ for _ in ()).throw(ValueError())
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+
+    assert cli_main._leftover_pausable_gateway_pids(
+        [(400, "python.exe", "...")]
+    ) is None
+
+
+def test_manual_serve_under_plain_parent_still_nominated(monkeypatch):
+    """A serve backend whose live parent is a plain shell is manual: the
+    updater reaps it later (_kill_stale_dashboard_processes), so it keeps
+    its stop-and-recheck nomination."""
+    import types as _types
+
+    class ParentProc:
+        def is_running(self):
+            return True
+
+        def exe(self):
+            return r"C:\Windows\System32\cmd.exe"
+
+    class FakeProc:
+        pid = 400
+
+        def cmdline(self):
+            return SERVE_ARGV
+
+        def environ(self):
+            raise OSError("Access is denied")
+
+        def parent(self):
+            return ParentProc()
+
+    fake = _types.SimpleNamespace(
+        Process=lambda pid: FakeProc() if pid == 400 else (_ for _ in ()).throw(ValueError())
+    )
+    monkeypatch.setitem(sys.modules, "psutil", fake)
+
+    assert cli_main._leftover_pausable_gateway_pids(
+        [(400, "python.exe", "...")]
+    ) == [400]
 
 
 
