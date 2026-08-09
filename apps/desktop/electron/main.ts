@@ -52,7 +52,6 @@ import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
-  backendPoolTouchKeys,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
@@ -73,13 +72,11 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
-  resolveRemoteBackendRail,
-  resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   savedProfileSsh,
-  touchBackendPoolEntries,
   tokenPreview
 } from './connection-config'
+import { resolveExplicitBackendRail, touchPooledBackendEntries } from './backend-routing-entrypoints'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -7636,7 +7633,7 @@ function persistSshConnectionToken(profile, source, token) {
 // the connection test (which pass no profile) are unchanged.
 async function resolveRemoteBackend(profile, options: any = {}) {
   const config = readDesktopConnectionConfig()
-  const explicitRail = resolveRemoteBackendRail(config, options)
+  const explicitRail = resolveExplicitBackendRail(config, options)
 
   if (explicitRail?.kind === 'local') {
     return null
@@ -8214,7 +8211,7 @@ async function ensureBackend(profile, options = {}) {
 // renderer calls this when it opens a profile's chat WS and periodically while
 // streaming, since the main process can't see the direct renderer↔backend WS.
 function touchPoolBackend(profile) {
-  touchBackendPoolEntries(backendPool, profile, Date.now())
+  touchPooledBackendEntries(backendPool, profile, Date.now())
 }
 
 // Evict least-recently-used pool backends until at most `keep` remain — but only
