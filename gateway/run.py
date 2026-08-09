@@ -17058,7 +17058,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # to outer dispatch, or this early exit leaks task-local identity.
                 self._clear_session_env(_session_env_tokens)
                 raise
-            if _lease_token is not None:
+            # A fail-open/legacy registry may return a degraded token after
+            # timing out. It does not own the registry lock and must never
+            # overwrite the held turn's token in shared session state.
+            if _lease_token is not None and not getattr(
+                _lease_token, "degraded", False
+            ):
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
