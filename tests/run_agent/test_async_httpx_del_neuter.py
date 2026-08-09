@@ -48,6 +48,23 @@ class _FailingAsyncCloseClient(_AsyncCloseSentinelClient):
         raise RuntimeError("transport close failed")
 
 
+class _CoordinatedAsyncCloseClient(_AsyncCloseSentinelClient):
+    def __init__(self, started, all_started, expected):
+        super().__init__()
+        self._started = started
+        self._all_started = all_started
+        self._expected = expected
+
+    async def close(self):
+        with self._started["lock"]:
+            self._started["count"] += 1
+            if self._started["count"] == self._expected:
+                self._all_started.set()
+        while not self._all_started.is_set():
+            await asyncio.sleep(0.005)
+        await super().close()
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: neuter_async_httpx_del
 # ---------------------------------------------------------------------------
@@ -343,6 +360,141 @@ class TestClientCacheBoundedGrowth:
                 aux._client_cache_owner_threads.pop(key, None)
                 if hasattr(aux, "_retired_async_clients"):
                     aux._retired_async_clients.clear()
+
+    def test_same_loop_eviction_schedules_physical_close(self):
+        """A sync eviction on the owner loop must not defer close to shutdown."""
+        import agent.auxiliary_client as aux
+
+        client = _AsyncCloseSentinelClient()
+        key = aux._client_cache_key(
+            "test_same_loop_evict", async_mode=True, model="m1"
+        )
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            with aux._client_cache_lock:
+                aux._client_cache[key] = (client, "m1", loop)
+            aux._evict_cached_clients("test_same_loop_evict")
+            for _ in range(20):
+                with aux._client_cache_lock:
+                    ownership_released = (
+                        id(client) not in aux._retired_async_clients
+                    )
+                if client.transport_closed.is_set() and ownership_released:
+                    break
+                await asyncio.sleep(0)
+
+            assert client.transport_closed.is_set()
+            with aux._client_cache_lock:
+                assert key not in aux._client_cache
+                assert id(client) not in aux._retired_async_clients
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+                aux._retired_async_clients.pop(id(client), None)
+                aux._retired_async_close_tasks.pop(id(client), None)
+
+    def test_loop_drain_keeps_owner_when_client_has_no_close_api(self):
+        """Unsupported wrappers cannot be reported closed and discarded."""
+        import agent.auxiliary_client as aux
+
+        client = SimpleNamespace()
+        key = aux._client_cache_key(
+            "test_missing_close", async_mode=True, model="m1"
+        )
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            with aux._client_cache_lock:
+                aux._client_cache[key] = (client, "m1", loop)
+
+            await aux.close_cached_async_clients_for_loop(loop)
+
+            with aux._client_cache_lock:
+                assert aux._client_cache[key][0] is client
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            with aux._client_cache_lock:
+                aux._client_cache.pop(key, None)
+
+    def test_async_compatibility_wrappers_close_real_clients(self):
+        """Async shims expose close so loop drains reach their real transports."""
+        import agent.auxiliary_client as aux
+
+        class RealClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        def sync_wrapper(real_client):
+            return SimpleNamespace(
+                chat=SimpleNamespace(completions=MagicMock()),
+                api_key="key",
+                base_url="https://example.invalid",
+                _real_client=real_client,
+            )
+
+        async def scenario():
+            codex_real = RealClient()
+            anthropic_real = RealClient()
+            codex = aux.AsyncCodexAuxiliaryClient(sync_wrapper(codex_real))
+            anthropic = aux.AsyncAnthropicAuxiliaryClient(
+                sync_wrapper(anthropic_real)
+            )
+
+            assert await aux._await_cached_client_close(codex) is True
+            assert await aux._await_cached_client_close(anthropic) is True
+            assert codex_real.closed
+            assert anthropic_real.closed
+
+        asyncio.run(scenario())
+
+    def test_shutdown_closes_owner_loops_concurrently(self):
+        """One slow generation must not consume one timeout after another."""
+        import agent.auxiliary_client as aux
+
+        expected = 3
+        started = {"count": 0, "lock": threading.Lock()}
+        all_started = threading.Event()
+        loops = [asyncio.new_event_loop() for _ in range(expected)]
+        clients = [
+            _CoordinatedAsyncCloseClient(started, all_started, expected)
+            for _ in range(expected)
+        ]
+        keys = [
+            aux._client_cache_key(
+                f"test_parallel_shutdown_{index}", async_mode=True, model="m1"
+            )
+            for index in range(expected)
+        ]
+
+        with aux._client_cache_lock:
+            for key, client, loop in zip(keys, clients, loops):
+                aux._client_cache[key] = (client, "m1", loop)
+
+        try:
+            with patch.object(aux, "_ASYNC_CLIENT_CLOSE_TIMEOUT", 0.2):
+                aux.shutdown_cached_clients()
+
+            assert all_started.is_set()
+            assert all(client.transport_closed.is_set() for client in clients)
+            with aux._client_cache_lock:
+                assert all(key not in aux._client_cache for key in keys)
+        finally:
+            with aux._client_cache_lock:
+                for key in keys:
+                    aux._client_cache.pop(key, None)
+                aux._retired_async_clients.clear()
+            for loop in loops:
+                if not loop.is_closed():
+                    loop.close()
 
     def test_repeated_worker_loop_turns_keep_fd_count_bounded(self):
         """Each disposable loop closes its real HTTP keep-alive transport."""

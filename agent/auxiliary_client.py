@@ -1819,6 +1819,9 @@ class AsyncCodexAuxiliaryClient:
         # gateway restarts.
         self._real_client = sync_wrapper._real_client
 
+    async def close(self):
+        await asyncio.to_thread(self._real_client.close)
+
 
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
@@ -2036,6 +2039,11 @@ class AsyncAnthropicAuxiliaryClient:
         # eviction on a poisoned underlying client also drops this entry.
         self._real_client = sync_wrapper._real_client
 
+    async def close(self):
+        close_fn = getattr(self._real_client, "close", None)
+        if callable(close_fn):
+            await asyncio.to_thread(close_fn)
+
 
 class _BedrockCompletionsAdapter:
     """Translates ``chat.completions.create(**kwargs)`` into Bedrock Converse."""
@@ -2125,6 +2133,10 @@ class AsyncBedrockAuxiliaryClient:
         self.chat = _AsyncBedrockChatShim(async_adapter)
         self.api_key = sync_wrapper.api_key
         self.base_url = sync_wrapper.base_url
+        self._sync_wrapper = sync_wrapper
+
+    async def close(self):
+        await asyncio.to_thread(self._sync_wrapper.close)
 
 
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
@@ -7170,6 +7182,7 @@ _client_cache: Dict[tuple, tuple] = {}
 _client_cache_lock = threading.Lock()
 _client_cache_owner_threads: Dict[tuple, threading.Thread] = {}
 _retired_async_clients: Dict[int, tuple] = {}
+_retired_async_close_tasks: Dict[int, asyncio.Task] = {}
 _CLIENT_CACHE_MAX_SIZE = 64  # safety belt — evict oldest when exceeded
 _ASYNC_CLIENT_CLOSE_TIMEOUT = 5.0
 
@@ -7333,16 +7346,23 @@ def neuter_async_httpx_del() -> None:
         pass  # Graceful degradation if the SDK changes its internals
 
 
-async def _await_cached_client_close(client: Any) -> None:
-    """Invoke a client's supported close API and await it when necessary."""
+async def _await_cached_client_close(client: Any) -> bool:
+    """Invoke a client's supported close API and report physical close support."""
     close_fn = getattr(client, "close", None)
     if not callable(close_fn):
         close_fn = getattr(client, "aclose", None)
     if not callable(close_fn):
-        return
+        return False
     result = close_fn()
     if inspect.isawaitable(result):
         await result
+    return True
+
+
+async def _await_close_result(result: Any) -> bool:
+    """Await a close result already produced by a synchronous close method."""
+    await result
+    return True
 
 
 def _close_cached_client(client: Any, bound_loop: Any = None) -> bool:
@@ -7353,7 +7373,7 @@ def _close_cached_client(client: Any, bound_loop: Any = None) -> bool:
     if not callable(close_fn):
         close_fn = getattr(client, "aclose", None)
     if not callable(close_fn):
-        return True
+        return bound_loop is None
     if not inspect.iscoroutinefunction(close_fn):
         try:
             result = close_fn()
@@ -7361,7 +7381,7 @@ def _close_cached_client(client: Any, bound_loop: Any = None) -> bool:
             return False
         if not inspect.isawaitable(result):
             return True
-        close_coro = result
+        close_coro = _await_close_result(result)
     else:
         close_coro = _await_cached_client_close(client)
 
@@ -7383,14 +7403,14 @@ def _close_cached_client(client: Any, bound_loop: Any = None) -> bool:
     try:
         if bound_loop.is_running():
             future = asyncio.run_coroutine_threadsafe(bounded_close, bound_loop)
-            future.result(timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT + 0.1)
-        elif running_loop is None:
-            bound_loop.run_until_complete(bounded_close)
-        else:
-            bounded_close.close()
-            close_coro.close()
-            return False
-        return True
+            return bool(
+                future.result(timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT + 0.1)
+            )
+        if running_loop is None:
+            return bool(bound_loop.run_until_complete(bounded_close))
+        bounded_close.close()
+        close_coro.close()
+        return False
     except Exception:
         if future is not None:
             future.cancel()
@@ -7406,6 +7426,45 @@ def _retire_async_client(client: Any, bound_loop: Any) -> None:
         _retired_async_clients[id(client)] = (client, bound_loop)
 
 
+async def _close_retired_async_client_on_owner_loop(
+    client: Any,
+    bound_loop: Any,
+) -> bool:
+    """Close one retired generation without blocking its running owner loop."""
+    client_id = id(client)
+    try:
+        closed = await asyncio.wait_for(
+            _await_cached_client_close(client),
+            timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        closed = False
+    except Exception:
+        closed = False
+
+    with _client_cache_lock:
+        task = _retired_async_close_tasks.get(client_id)
+        if task is asyncio.current_task():
+            del _retired_async_close_tasks[client_id]
+        current = _retired_async_clients.get(client_id)
+        if closed and current is not None and current[0] is client:
+            del _retired_async_clients[client_id]
+    return closed
+
+
+def _schedule_retired_async_client_close(client: Any, bound_loop: Any) -> None:
+    """Schedule a same-loop close once while retaining the client strongly."""
+    client_id = id(client)
+    with _client_cache_lock:
+        existing = _retired_async_close_tasks.get(client_id)
+        if existing is not None and not existing.done():
+            return
+        task = bound_loop.create_task(
+            _close_retired_async_client_on_owner_loop(client, bound_loop)
+        )
+        _retired_async_close_tasks[client_id] = task
+
+
 def _retire_or_close_client(client: Any, bound_loop: Any) -> bool:
     """Close a removed entry or retain it for an owner-loop retry."""
     if bound_loop is None:
@@ -7414,6 +7473,13 @@ def _retire_or_close_client(client: Any, bound_loop: Any) -> bool:
         _retire_async_client(client, None)
         return False
     _retire_async_client(client, bound_loop)
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is bound_loop and not bound_loop.is_closed():
+        _schedule_retired_async_client_close(client, bound_loop)
+        return False
     return _close_retired_async_client(client, bound_loop)
 
 
@@ -7443,22 +7509,43 @@ async def close_cached_async_clients_for_loop(bound_loop: Any = None) -> None:
                 if loop is owner_loop
             }
         )
+        pending_tasks = {
+            client_id: task
+            for client_id, task in _retired_async_close_tasks.items()
+            if client_id in candidates and not task.done()
+        }
 
-    results = await asyncio.gather(
+    direct_candidates = {
+        client_id: client
+        for client_id, client in candidates.items()
+        if client_id not in pending_tasks
+    }
+    direct_results = await asyncio.gather(
         *(
             asyncio.wait_for(
                 _await_cached_client_close(client),
                 timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT,
             )
-            for client in candidates.values()
+            for client in direct_candidates.values()
         ),
+        return_exceptions=True,
+    )
+    pending_results = await asyncio.gather(
+        *pending_tasks.values(),
         return_exceptions=True,
     )
     closed_ids = {
         client_id
-        for (client_id, _client), result in zip(candidates.items(), results)
-        if not isinstance(result, BaseException)
+        for (client_id, _client), result in zip(
+            direct_candidates.items(), direct_results
+        )
+        if result is True
     }
+    closed_ids.update(
+        client_id
+        for client_id, result in zip(pending_tasks, pending_results)
+        if result is True
+    )
 
     if not closed_ids:
         return
@@ -7472,18 +7559,74 @@ async def close_cached_async_clients_for_loop(bound_loop: Any = None) -> None:
                 del _retired_async_clients[client_id]
 
 
-def shutdown_cached_clients() -> None:
-    """Close all cached clients (sync and async) to prevent event-loop errors.
+def _drain_cached_async_client_loop(bound_loop: Any) -> None:
+    """Run one owner loop's concurrent drain from a shutdown worker."""
+    if bound_loop.is_closed():
+        return
+    close_coro = close_cached_async_clients_for_loop(bound_loop)
+    future = None
+    try:
+        if bound_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(close_coro, bound_loop)
+            future.result(timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT + 0.1)
+        else:
+            bound_loop.run_until_complete(close_coro)
+    except Exception:
+        if future is not None:
+            future.cancel()
+        else:
+            close_coro.close()
 
-    Call this during CLI shutdown, *before* the event loop is closed, to
-    avoid ``AsyncHttpxClientWrapper.__del__`` raising on a dead loop.
-    """
+
+def shutdown_cached_clients() -> None:
+    """Close all cached clients without serializing per-generation timeouts."""
     with _client_cache_lock:
         active = list(_client_cache.items())
         retired = list(_retired_async_clients.values())
+
+    owner_loops = {
+        entry[2]
+        for _key, entry in active
+        if entry[2] is not None and not entry[2].is_closed()
+    }
+    owner_loops.update(
+        loop
+        for _client, loop in retired
+        if loop is not None and not loop.is_closed()
+    )
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop in owner_loops:
+        owner_loops.remove(running_loop)
+        running_loop.create_task(
+            close_cached_async_clients_for_loop(running_loop)
+        )
+
+    if owner_loops:
+        import concurrent.futures
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(len(owner_loops), 32),
+            thread_name_prefix="aux-client-close",
+        )
+        futures = [
+            executor.submit(_drain_cached_async_client_loop, loop)
+            for loop in owner_loops
+        ]
+        concurrent.futures.wait(
+            futures,
+            timeout=_ASYNC_CLIENT_CLOSE_TIMEOUT + 0.2,
+        )
+        executor.shutdown(wait=False, cancel_futures=True)
+
     for key, entry in active:
         client, _default, bound_loop = entry
-        if client is None or not _close_cached_client(client, bound_loop):
+        if bound_loop is not None:
+            continue
+        if client is None or not _close_cached_client(client):
             continue
         with _client_cache_lock:
             current = _client_cache.get(key)
@@ -7491,7 +7634,8 @@ def shutdown_cached_clients() -> None:
                 del _client_cache[key]
                 _client_cache_owner_threads.pop(key, None)
     for client, bound_loop in retired:
-        _close_retired_async_client(client, bound_loop)
+        if bound_loop is None:
+            _close_retired_async_client(client, None)
 
 
 def cleanup_stale_async_clients() -> None:
