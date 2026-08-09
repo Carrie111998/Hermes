@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -228,6 +229,36 @@ def _connect(board: Optional[str] = None):
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+
+_RECOVERABLE_ENGINEERING_MARKERS = (
+    "test failed",
+    "tests failed",
+    "pytest failed",
+    "lint failed",
+    "type check failed",
+    "typecheck failed",
+    "merge conflict",
+    "merge conflicts",
+    "ci failed",
+    "ci failure",
+    "missing package",
+    "package not found",
+    "network timeout",
+    "transient network",
+    "tool lookup",
+    "skill lookup",
+)
+
+
+def _looks_recoverable_engineering_obstacle(reason: str) -> bool:
+    """Identify common internal failures that should enter recovery, not block.
+
+    This deliberately uses a small, conservative marker list: legacy callers
+    may still omit ``kind`` for arbitrary human-facing reasons, while workers
+    get a clear tool error for the recurring engineering-failure escape hatch.
+    """
+    normalized = re.sub(r"\s+", " ", str(reason).strip().lower())
+    return any(marker in normalized for marker in _RECOVERABLE_ENGINEERING_MARKERS)
 
 
 def _goal_judge_available() -> bool:
@@ -827,6 +858,19 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    # A typed boundary prevents the most common passive-block escape hatch:
+    # stopping on an engineering failure that the worker is expected to
+    # diagnose and recover from. Keep untyped blocks accepted for legacy
+    # callers, but make the failure actionable so the worker retries with an
+    # explicit genuine-gate kind rather than parking a solvable task.
+    if kind in {None, "transient"} and _looks_recoverable_engineering_obstacle(reason):
+        return tool_error(
+            "kanban_block rejected: this looks like a recoverable engineering "
+            "obstacle. Diagnose it, consult skills/docs, retry with a bounded "
+            "alternate path, or create an assigned remediation child. Use "
+            "kind='dependency', 'needs_input', or 'capability' only for a "
+            "genuine gate, with evidence in the reason."
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

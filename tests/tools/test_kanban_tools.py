@@ -228,6 +228,44 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_rejects_recoverable_engineering_obstacle(worker_env):
+    """Ordinary engineering failures must enter recovery, not park the task."""
+    from tools import kanban_tools as kt
+
+    for reason in (
+        "pytest failed",
+        "CI failure",
+        "merge conflict",
+        "missing package",
+        "tool lookup failed",
+    ):
+        for kind in (None, "transient"):
+            out = kt._handle_block({"reason": reason, "kind": kind})
+            d = json.loads(out)
+            assert "error" in d
+            assert "recoverable engineering obstacle" in d["error"]
+
+
+def test_block_preserves_genuine_capability_gate(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": (
+            "required production permission is unavailable after checking "
+            "documented sources"
+        ),
+        "kind": "capability",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     """Set up an isolated HERMES_HOME with one claimed goal_mode task,
     matching the pattern used by the kanban_complete judge gate tests."""
