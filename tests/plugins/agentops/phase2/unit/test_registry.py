@@ -3,8 +3,9 @@ from datetime import datetime, timezone
 import pytest
 
 from plugins.agentops.control.models import AuthorityMode
-from plugins.agentops.control.observer_models import TargetSnapshot
+from plugins.agentops.control.observer_models import TargetSnapshot, CollectionBatch, CollectorHealth, RawSignal
 from plugins.agentops.control.registry import TargetRegistrationError, bootstrap_gateway_registry
+from plugins.agentops.control.redaction import redact_signal
 
 
 def test_bootstrap_registry_has_the_five_phase_zero_profiles_in_observe_only_mode():
@@ -38,7 +39,8 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
         registry.record_target_snapshot(
             TargetSnapshot(target_id=target.target_id, observed_at=observed_at, facts={"present": True})
         )
-    registry.record_process_result("hermes:profile:default:gateway", True)
+    process_signal = redact_signal(RawSignal("hermes:profile:default:gateway", "processes", "process.snapshot", observed_at, {"pid": 1}))
+    registry.record_process_result(CollectionBatch("hermes:profile:default:gateway", "processes", observed_at, (process_signal,), CollectorHealth(True), source_id="sha256:" + "1" * 64))
 
     coverage = registry.coverage_report()
     assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (1, 1, 100)

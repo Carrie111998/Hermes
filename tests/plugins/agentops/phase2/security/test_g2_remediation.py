@@ -513,7 +513,7 @@ def test_coverage_requires_process_health_evidence():
     from plugins.agentops.control.observer_models import TargetSnapshot
     registry = bootstrap_gateway_registry(); target = registry.get_target("hermes:profile:default:gateway")
     registry.record_target_snapshot(TargetSnapshot(target.target_id, datetime.now(timezone.utc), {"ok": True}))
-    registry.record_process_result(target.target_id, False)
+    registry.record_process_result(CollectionBatch(target.target_id, "processes", datetime.now(timezone.utc), (), CollectorHealth(False, "process_binding_no_match"), source_id="sha256:" + "e" * 64))
     assert registry.coverage_report().coverage_percent == 0
 
 
