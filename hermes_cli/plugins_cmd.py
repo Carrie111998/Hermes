@@ -897,6 +897,24 @@ def _plugin_runtime_identity_changes(
     return identities, preserved_entries
 
 
+def _plugin_disable_identities_to_clear(key: str) -> set[str]:
+    """Return target identities that do not also activate another key."""
+    candidates = _discover_plugin_candidates()
+    target_identities = {key}
+    for entry in candidates:
+        if entry[5] == key:
+            target_identities.update((entry[0], entry[5]))
+
+    shared_identities = {
+        identity
+        for entry in candidates
+        if entry[5] != key
+        for identity in (entry[0], entry[5])
+        if identity in target_identities
+    }
+    return target_identities - shared_identities
+
+
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
     """Write ``plugins.entries.<plugin_id>.<key> = value`` into config.yaml."""
     from hermes_cli.config import load_config, save_config
@@ -1042,15 +1060,9 @@ def cmd_disable(name: str) -> None:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
 
-    identities, preserved_enables = _plugin_runtime_identity_changes(
-        key,
-        enabled,
-    )
-    _, preserved_denies = _plugin_runtime_identity_changes(key, disabled)
+    identities = _plugin_disable_identities_to_clear(key)
     enabled.difference_update(identities)
-    enabled.update(preserved_enables)
     disabled.difference_update(identities)
-    disabled.update(preserved_denies)
     disabled.add(key)
     _save_enabled_set(enabled)
     _save_disabled_set(disabled)
@@ -1745,12 +1757,6 @@ def _persist_composite_plugin_selection(
 
     for i in sorted(chosen - initial_selected):
         key = plugin_keys[i]
-        enabled_ids, preserved_allows = _plugin_runtime_identity_changes(
-            key,
-            new_enabled,
-        )
-        new_enabled.difference_update(enabled_ids)
-        new_enabled.update(preserved_allows)
         new_enabled.add(key)
 
         disabled_ids, preserved_denies = _plugin_runtime_identity_changes(
@@ -1762,12 +1768,9 @@ def _persist_composite_plugin_selection(
 
     for i in sorted(initial_selected - chosen):
         key = plugin_keys[i]
-        enabled_ids, preserved_allows = _plugin_runtime_identity_changes(
-            key,
-            new_enabled,
-        )
+        enabled_ids = _plugin_disable_identities_to_clear(key)
         new_enabled.difference_update(enabled_ids)
-        new_enabled.update(preserved_allows)
+        new_disabled.difference_update(enabled_ids)
         new_disabled.add(key)
 
     changed = new_enabled != previous_enabled or new_disabled != disabled
@@ -2254,12 +2257,9 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     if status == "disabled":
         return {"ok": True, "name": name, "key": key, "unchanged": True}
 
-    identities, preserved_enables = _plugin_runtime_identity_changes(key, en)
-    _, preserved_denies = _plugin_runtime_identity_changes(key, dis)
+    identities = _plugin_disable_identities_to_clear(key)
     en.difference_update(identities)
-    en.update(preserved_enables)
     dis.difference_update(identities)
-    dis.update(preserved_denies)
     dis.add(key)
     _save_enabled_set(en)
     _save_disabled_set(dis)

@@ -2,6 +2,8 @@ import argparse
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import plugins_cmd
 from hermes_cli.plugin_activation import PluginActivationState
 
@@ -19,6 +21,19 @@ _PORTABLE_SHADOW_CANDIDATES = [
         "project",
         None,
         "shared",
+        "standalone",
+    ),
+]
+_SHARED_ALLOW_SOURCE_CANDIDATES = [
+    ("shared", "1.0", "Target", "user", None, "target", "standalone"),
+    ("shared", "1.0", "Sibling", "user", None, "sibling", "standalone"),
+    (
+        "project-shadow",
+        "2.0",
+        "Project",
+        "project",
+        None,
+        "sibling",
         "standalone",
     ),
 ]
@@ -315,6 +330,115 @@ def test_composite_confirm_preserves_user_alias_and_active_winner(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("surface", ["cli", "dashboard", "delta"])
+def test_disable_shared_allow_preserves_sibling_source_winner(
+    monkeypatch,
+    surface,
+):
+    candidates = _SHARED_ALLOW_SOURCE_CANDIDATES
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"shared"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", set)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+
+    if surface == "cli":
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("target", "user", "shared", "standalone"),
+        )
+        plugins_cmd.cmd_disable("target")
+    elif surface == "dashboard":
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("target", "user", "shared", "standalone"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_toggle_plugin_toolset",
+            lambda *args, **kwargs: None,
+        )
+        result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+            "target",
+            enabled=False,
+        )
+        assert result["unchanged"] is False
+    else:
+        changed = plugins_cmd._persist_composite_plugin_selection(
+            ["target"],
+            {0},
+            set(),
+            set(),
+        )
+        assert changed is True
+
+    assert saved == {"enabled": {"shared"}, "disabled": {"target"}}
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[1]
+    ]
+
+
+def test_composite_enable_keeps_shared_allow_and_sibling_source_winner(monkeypatch):
+    candidates = _SHARED_ALLOW_SOURCE_CANDIDATES
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"shared"})
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+
+    changed = plugins_cmd._persist_composite_plugin_selection(
+        ["target"],
+        set(),
+        {0},
+        {"target"},
+    )
+
+    assert changed is True
+    assert saved == {
+        "enabled": {"shared", "target"},
+        "disabled": set(),
+    }
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[0],
+        candidates[1],
+    ]
+
+
 def test_dashboard_toggle_response_keeps_input_name_and_adds_key(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
@@ -464,7 +588,7 @@ def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch
 
     assert result["unchanged"] is False
     assert saved == {
-        "enabled": {"video_gen/xai"},
+        "enabled": {"xai"},
         "disabled": {"image_gen/xai"},
     }
     activation = PluginActivationState(
@@ -476,7 +600,7 @@ def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch
     ]
 
 
-def test_dashboard_disable_user_override_preserves_sibling_key_deny(monkeypatch):
+def test_dashboard_disable_user_override_preserves_shared_deny(monkeypatch):
     candidates = [
         ("shared", "1", "Target", "bundled", None, "target/key", "backend"),
         ("shared", "1", "Sibling", "bundled", None, "sibling/key", "backend"),
@@ -515,7 +639,7 @@ def test_dashboard_disable_user_override_preserves_sibling_key_deny(monkeypatch)
     assert result["unchanged"] is False
     assert saved == {
         "enabled": set(),
-        "disabled": {"target/key", "sibling/key"},
+        "disabled": {"shared", "target/key"},
     }
     activation = PluginActivationState(
         enabled=frozenset(saved["enabled"]),

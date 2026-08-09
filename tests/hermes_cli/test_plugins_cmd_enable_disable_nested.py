@@ -282,7 +282,7 @@ class TestEnableDisableNested:
         plugins_cmd.cmd_disable("image_gen/xai")
 
         assert saved == {
-            "enabled": {"video_gen/xai"},
+            "enabled": {"xai"},
             "disabled": {"image_gen/xai"},
         }
         activation = PluginActivationState(
@@ -293,7 +293,7 @@ class TestEnableDisableNested:
             candidates[1]
         ]
 
-    def test_disable_user_override_preserves_sibling_canonical_deny(
+    def test_disable_user_override_preserves_shared_deny(
         self,
         monkeypatch,
     ):
@@ -331,7 +331,7 @@ class TestEnableDisableNested:
 
         assert saved == {
             "enabled": set(),
-            "disabled": {"target/key", "sibling/key"},
+            "disabled": {"shared", "target/key"},
         }
         activation = PluginActivationState(
             enabled=frozenset(saved["enabled"]),
