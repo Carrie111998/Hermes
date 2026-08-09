@@ -16,8 +16,9 @@ import signal
 import threading
 import time
 import traceback
+from typing import Optional
 
-from tui_gateway._stdin_recovery import handle_spurious_eof
+from tui_gateway._stdin_recovery import MAX_RECOVERIES_PER_MINUTE, handle_spurious_eof
 
 from tui_gateway import server
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
@@ -418,6 +419,36 @@ def ensure_mcp_discovery_started() -> None:
         )
 
 
+def _read_stdin_line(
+    recovery_times: list,
+    log_fn: object,
+) -> Optional[str]:
+    """Read one stdin line, recovering from Windows EINVAL (Errno 22).
+
+    On Windows, ``sys.stdin.readline()`` can raise ``OSError: [Errno 22]
+    Invalid argument`` when the console/pipe state is disturbed — previously
+    this crashed the gateway child, surfacing "gateway exited — recovering
+    your session" in the TUI. Retry with a rate limit (shared with
+    ``handle_spurious_eof``): a permanently broken stdin still exits
+    cleanly instead of spinning forever.
+
+    Returns the line read, or ``None`` when the recovery budget is exceeded
+    (caller should treat it as fatal).
+    """
+    while True:
+        try:
+            return sys.stdin.readline()
+        except OSError as e:
+            now = time.time()
+            recovery_times.append(now)
+            recovery_times[:] = [t for t in recovery_times if t > now - 60]
+            if len(recovery_times) > MAX_RECOVERIES_PER_MINUTE:
+                log_fn(f"stdin read keeps failing ({e!r}); giving up")  # type: ignore[operator]
+                return None
+            log_fn(f"stdin read OSError ({e!r}); retrying")  # type: ignore[operator]
+            time.sleep(0.5)
+
+
 def main():
     _install_sidecar_publisher()
 
@@ -458,7 +489,11 @@ def main():
         logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
     while True:
-        raw = sys.stdin.readline()
+        raw = _read_stdin_line(_recovery_times, _log_exit)
+        if raw is None:
+            # Repeated OSError failures exceeded the recovery budget — a
+            # permanently broken stdin must not spin forever.
+            break
         if not raw:
             # Stdin fell through — check if spurious (O_NONBLOCK flip by a
             # child on the shared open file description) or genuine EOF.
