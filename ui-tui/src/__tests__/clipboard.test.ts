@@ -1,6 +1,38 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { isUsableClipboardText, readClipboardText, writeClipboardText } from '../lib/clipboard.js'
+import { isUsableClipboardText, readClipboardImage, readClipboardText, writeClipboardText } from '../lib/clipboard.js'
+
+describe('readClipboardImage', () => {
+  it('extracts a PNG from the native Windows clipboard via PowerShell', async () => {
+    const contentBase64 = Buffer.from('png bytes').toString('base64')
+    const run = vi.fn().mockResolvedValue({ stdout: `${contentBase64}\r\n` })
+
+    await expect(readClipboardImage('win32', run)).resolves.toEqual({ contentBase64, filename: 'clipboard.png' })
+    expect(run).toHaveBeenCalledWith(
+      'powershell',
+      expect.arrayContaining(['-NoProfile', '-NonInteractive', '-Command']),
+      expect.objectContaining({ encoding: 'utf8', windowsHide: true })
+    )
+    expect(run.mock.calls[0]![1].at(-1)).toContain('[System.Windows.Forms.Clipboard]::GetImage()')
+  })
+
+  it('uses the Windows clipboard first from WSL', async () => {
+    const contentBase64 = Buffer.from('png bytes').toString('base64')
+    const run = vi.fn().mockResolvedValue({ stdout: contentBase64 })
+
+    await expect(readClipboardImage('linux', run, { WSL_INTEROP: '/tmp/socket' })).resolves.toEqual({
+      contentBase64,
+      filename: 'clipboard.png'
+    })
+    expect(run).toHaveBeenCalledWith('powershell.exe', expect.any(Array), expect.objectContaining({ encoding: 'utf8' }))
+  })
+
+  it('returns null when no local clipboard backend yields image bytes', async () => {
+    const run = vi.fn().mockRejectedValue(new Error('no image'))
+
+    await expect(readClipboardImage('win32', run)).resolves.toBeNull()
+  })
+})
 
 describe('readClipboardText', () => {
   it('reads text from pbpaste on macOS', async () => {
