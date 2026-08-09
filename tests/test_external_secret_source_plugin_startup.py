@@ -53,6 +53,52 @@ def _write_secret_source_plugin(
     )
 
 
+def _write_package_secret_source_plugin(home: Path, import_marker: Path) -> None:
+    plugin_dir = home / "plugins" / "startup-package-plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: startup-package-plugin\n"
+        "kind: standalone\n"
+        "version: 1.0.0\n"
+        "description: Package secret-source startup test\n"
+        "provides_secret_sources:\n"
+        "  - startup_package_source\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from .registration import register\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "source.py").write_text(
+        "from agent.secret_sources.base import FetchResult, SecretSource\n"
+        "class PackageSource(SecretSource):\n"
+        "    name = 'startup_package_source'\n"
+        "    label = 'Package startup source'\n"
+        "    shape = 'mapped'\n"
+        "    def fetch(self, cfg, home_path):\n"
+        "        return FetchResult(secrets={'STARTUP_TEST_API_KEY': 'package-value'})\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "registration.py").write_text(
+        "from pathlib import Path\n"
+        "from .source import PackageSource\n"
+        f"_marker = Path({str(import_marker)!r})\n"
+        "_prior = _marker.read_text() if _marker.exists() else ''\n"
+        "_marker.write_text(_prior + 'import\\n')\n"
+        "_registered = False\n"
+        "def _command(_args):\n"
+        "    return 'package-command-ok'\n"
+        "def register(ctx):\n"
+        "    global _registered\n"
+        "    if _registered:\n"
+        "        return\n"
+        "    _registered = True\n"
+        "    ctx.register_secret_source(PackageSource())\n"
+        "    ctx.register_command('startup-package-command', _command, description='package command')\n",
+        encoding="utf-8",
+    )
+
+
 def _write_unrelated_plugin(home: Path, marker: Path) -> None:
     plugin_dir = home / "plugins" / "unrelated-plugin"
     plugin_dir.mkdir(parents=True)
@@ -169,6 +215,41 @@ def test_first_load_imports_only_enabled_secret_source_plugins(tmp_path):
     assert "unknown source" not in (result.stdout + result.stderr).lower()
     assert secret_value not in result.stdout
     assert secret_value not in result.stderr
+
+
+def test_package_plugin_registers_non_secret_capabilities_after_bootstrap(tmp_path):
+    import_marker = tmp_path / "package-import-count"
+    _write_package_secret_source_plugin(tmp_path, import_marker)
+    _write_config(
+        tmp_path,
+        source_name="startup_package_source",
+        plugin_name="startup-package-plugin",
+    )
+
+    result = _run_python(
+        tmp_path,
+        "from pathlib import Path\n"
+        "import os, sys\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        "from hermes_cli.plugins import get_plugin_commands, get_plugin_manager\n"
+        "home = Path(os.environ['HERMES_HOME'])\n"
+        "load_hermes_dotenv(hermes_home=home)\n"
+        "manager = get_plugin_manager()\n"
+        "assert not manager._discovered\n"
+        "assert not any('__secret_bootstrap_' in name for name in sys.modules)\n"
+        "commands = get_plugin_commands()\n"
+        "assert commands['startup-package-command']['handler']('') == 'package-command-ok'\n"
+        "loaded = manager._plugins['startup-package-plugin']\n"
+        "assert loaded.enabled and loaded.error is None\n"
+        "assert 'startup-package-command' in loaded.commands_registered\n"
+        "assert not any('__secret_bootstrap_' in name for name in sys.modules)\n"
+        "print('package-full-discovery-ok')\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "package-full-discovery-ok"
+    assert import_marker.read_text() == "import\nimport\n"
+    assert "already registered" not in result.stderr
 
 
 def test_explicit_non_process_home_is_honored(tmp_path):

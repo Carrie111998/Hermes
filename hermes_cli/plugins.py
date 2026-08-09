@@ -367,14 +367,18 @@ class LoadedPlugin:
 class _SecretSourceBootstrapContext:
     """Restricted plugin context used before normal plugin discovery."""
 
-    def __init__(self, manifest: PluginManifest):
+    def __init__(self, manifest: PluginManifest, allowed_source_names: Set[str]):
         self.manifest = manifest
+        self._allowed_source_names = frozenset(allowed_source_names)
 
     def register_secret_source(self, source) -> None:
         from agent.secret_sources.base import SecretSource
         from agent.secret_sources.registry import register_source
 
-        if isinstance(source, SecretSource):
+        if (
+            isinstance(source, SecretSource)
+            and source.name in self._allowed_source_names
+        ):
             register_source(source)
 
     def __getattr__(self, name: str):
@@ -896,13 +900,26 @@ class PluginContext:
         See the base-module docstring for the full contract.
         """
         from agent.secret_sources.base import SecretSource
-        from agent.secret_sources.registry import register_source
+        from agent.secret_sources.registry import get_source, register_source
 
         if not isinstance(source, SecretSource):
             logger.warning(
                 "Plugin '%s' tried to register a secret source that does "
                 "not inherit from SecretSource. Ignoring.",
                 self.manifest.name,
+            )
+            return
+        plugin_path = (
+            str(Path(self.manifest.path).resolve()) if self.manifest.path else ""
+        )
+        bootstrap_sources = self._manager._secret_source_bootstrap_paths.get(
+            plugin_path, set()
+        )
+        if source.name in bootstrap_sources and get_source(source.name) is not None:
+            logger.debug(
+                "Plugin '%s' retained bootstrap secret source: %s",
+                self.manifest.name,
+                source.name,
             )
             return
         if register_source(source):
@@ -1340,7 +1357,7 @@ class PluginManager:
         self._discovered: bool = False
         # Restricted pre-dotenv imports are tracked independently: they must
         # never make ordinary plugin discovery look complete.
-        self._secret_source_bootstrap_paths: Set[str] = set()
+        self._secret_source_bootstrap_paths: Dict[str, Set[str]] = {}
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1673,12 +1690,30 @@ class PluginManager:
         """Run one source plugin with the restricted bootstrap context."""
         from agent.secret_sources.registry import get_source
 
+        plugin_path = str(Path(manifest.path).resolve())
+        key = manifest.key or manifest.name
+        slug = key.replace("/", "__").replace("-", "_")
+        token = hashlib.sha256(
+            f"{plugin_path}:{id(self)}".encode()
+        ).hexdigest()[:16]
+        module_name = f"{_NS_PARENT}.{slug}__secret_bootstrap_{token}"
+        canonical_prefix = f"{_NS_PARENT}.{slug}"
+        canonical_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == canonical_prefix or name.startswith(canonical_prefix + ".")
+        }
+        before = {
+            name for name in configured_source_names if get_source(name) is not None
+        }
         try:
-            module = self._load_directory_module(manifest)
+            module = self._load_directory_module_as(manifest, module_name)
             register_fn = getattr(module, "register", None)
             if register_fn is None:
                 return
-            register_fn(_SecretSourceBootstrapContext(manifest))
+            register_fn(
+                _SecretSourceBootstrapContext(manifest, configured_source_names)
+            )
         except Exception:
             # Never interpolate third-party exception text: secret-manager SDKs
             # may include rejected credential values in their errors.
@@ -1686,11 +1721,30 @@ class PluginManager:
                 "Enabled secret-source plugin '%s' failed during bootstrap",
                 manifest.name,
             )
-            return
+        finally:
+            # Bootstrap must not populate the canonical plugin package cache.
+            # Package plugins often re-export register() from a submodule; if
+            # that submodule survives, ordinary discovery can silently skip
+            # its non-secret capabilities. Restore the exact pre-bootstrap
+            # canonical cache and discard the temporary package tree.
+            for name in list(sys.modules):
+                if name == module_name or name.startswith(module_name + "."):
+                    sys.modules.pop(name, None)
+                elif (
+                    name == canonical_prefix
+                    or name.startswith(canonical_prefix + ".")
+                ) and name not in canonical_modules:
+                    sys.modules.pop(name, None)
+            sys.modules.update(canonical_modules)
 
-        if any(get_source(name) is not None for name in configured_source_names):
-            self._secret_source_bootstrap_paths.add(
-                str(Path(manifest.path).resolve())
+        registered = {
+            name
+            for name in configured_source_names
+            if name not in before and get_source(name) is not None
+        }
+        if registered:
+            self._secret_source_bootstrap_paths.setdefault(plugin_path, set()).update(
+                registered
             )
 
     def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
@@ -2232,21 +2286,28 @@ class PluginManager:
         ``hermes_plugins.image_gen__openai`` without colliding with any
         future ``tts/openai``.
         """
+        key = manifest.key or manifest.name
+        slug = key.replace("/", "__").replace("-", "_")
+        module_name = f"{_NS_PARENT}.{slug}"
+        return self._load_directory_module_as(manifest, module_name)
+
+    def _load_directory_module_as(
+        self,
+        manifest: PluginManifest,
+        module_name: str,
+    ) -> types.ModuleType:
+        """Import one directory plugin under an explicit package name."""
         plugin_dir = Path(manifest.path)  # type: ignore[arg-type]
         init_file = plugin_dir / "__init__.py"
         if not init_file.exists():
             raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
 
-        # Ensure the namespace parent package exists
         if _NS_PARENT not in sys.modules:
             ns_pkg = types.ModuleType(_NS_PARENT)
             ns_pkg.__path__ = []  # type: ignore[attr-defined]
             ns_pkg.__package__ = _NS_PARENT
             sys.modules[_NS_PARENT] = ns_pkg
 
-        key = manifest.key or manifest.name
-        slug = key.replace("/", "__").replace("-", "_")
-        module_name = f"{_NS_PARENT}.{slug}"
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
