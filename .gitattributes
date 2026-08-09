@@ -8,3 +8,21 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Enforce LF for source files. Without this, Windows checkouts silently
+# produce CRLF, which breaks Linux CI lint (whole-file diff noise on .py
+# and .ts) and byte-sensitive parsers. Text files are normalized to LF on
+# checkout regardless of the platform's core.autocrlf setting.
+*.py     text eol=lf
+*.ts     text eol=lf
+*.tsx    text eol=lf
+*.js     text eol=lf
+*.mjs    text eol=lf
+*.cjs    text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.toml   text eol=lf
+*.css    text eol=lf
+*.html   text eol=lf
