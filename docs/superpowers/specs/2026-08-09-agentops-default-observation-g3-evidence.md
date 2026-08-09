@@ -2,8 +2,11 @@
 
 **Status:** implementation/evidence contract only; seven-day production observation is pending.
 
-**Final offline PR head:** `fbdc57bdd` (clean worktree; AgentOps 144 passed,
-plugins 683 passed, compileall/static read-only scan/diff check passed).
+**Sol-reviewed AgentOps implementation head:** `fbdc57bdd`. The current PR head
+is its docs-only descendant `6a9a5a574`; the AgentOps implementation tree is
+identical. Local `tests/plugins/agentops` passed 144 tests and local
+`tests/plugins` passed 683 tests; compileall, static read-only scan, and diff
+check also passed.
 
 ## Scope and trust boundary
 
