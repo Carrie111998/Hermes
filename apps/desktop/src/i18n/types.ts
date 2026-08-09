@@ -1326,6 +1326,9 @@ export interface Translations {
     allProfiles: string
     showAllProfiles: string
     switchToProfile: (name: string) => string
+    backendLocal: string
+    backendRemote: string
+    backendRemoteUnavailable: string
     manageProfiles: string
     actions: string
     color: string

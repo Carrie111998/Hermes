@@ -1409,6 +1409,9 @@ export const ja = defineLocale({
     allProfiles: 'すべてのプロファイル',
     showAllProfiles: 'すべてのプロファイルを表示',
     switchToProfile: name => `${name} に切り替え`,
+    backendLocal: 'Mac バックエンド',
+    backendRemote: 'リモート バックエンド',
+    backendRemoteUnavailable: '先に Gateway 設定でリモート バックエンドを設定してください。',
     manageProfiles: 'プロファイルを管理…',
     actions: 'アクション',
 

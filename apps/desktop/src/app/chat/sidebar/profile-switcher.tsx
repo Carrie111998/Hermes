@@ -34,6 +34,7 @@ import { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@
 import { getProfileSoul, updateProfileSoul } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { Globe, Monitor } from '@/lib/icons'
 import { PROFILE_SWATCHES, profileColorSoft, resolveProfileColor } from '@/lib/profile-color'
 import {
   REORDER_DRAG_TRANSITION_CSS,
@@ -52,8 +53,11 @@ import {
   $profiles,
   $profileScope,
   ALL_PROFILES,
+  type BackendTarget,
   normalizeProfileKey,
+  prewarmBackend,
   refreshActiveProfile,
+  selectBackend,
   selectProfile,
   setProfileColor,
   setProfileOrder,
@@ -121,6 +125,7 @@ export function ProfileRail() {
   const [pendingRename, setPendingRename] = useState<null | ProfileInfo>(null)
   const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
   const [pendingSoul, setPendingSoul] = useState<null | string>(null)
+  const [hasSavedRemote, setHasSavedRemote] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
 
   // Too many profiles for the square strip → collapse to the select. Declared
@@ -226,6 +231,29 @@ export function ProfileRail() {
     setCreateOpen(true)
   }, [createRequest])
 
+  useEffect(() => {
+    let cancelled = false
+
+    window.hermesDesktop
+      ?.getConnectionConfig?.()
+      .then(config => {
+        if (!cancelled) {
+          setHasSavedRemote(Boolean(config.remoteUrl.trim()))
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setHasSavedRemote(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const remoteAvailable = connection?.mode === 'remote' || hasSavedRemote
+
   return (
     <div aria-label="Profiles" className="flex items-center gap-0.5" data-slot="profile-rail" role="tablist">
       {/* One button toggles default ↔ all: home face when scoped to a profile,
@@ -254,6 +282,16 @@ export function ProfileRail() {
           onSelect={() => selectProfile(defaultProfile.name)}
         />
       )}
+
+      <BackendPill active={connection?.mode !== 'remote'} icon={Monitor} label={p.backendLocal} target="local" />
+      <BackendPill
+        active={connection?.mode === 'remote'}
+        disabled={!remoteAvailable}
+        disabledLabel={p.backendRemoteUnavailable}
+        icon={Globe}
+        label={p.backendRemote}
+        target="remote"
+      />
 
       {condensed ? (
         // Condensed path: one compact dropdown instead of N squares. No drag
@@ -542,6 +580,43 @@ function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
       >
         <Codicon name={glyph} size="0.875rem" />
       </Button>
+    </Tip>
+  )
+}
+
+interface BackendPillProps {
+  active: boolean
+  disabled?: boolean
+  disabledLabel?: string
+  icon: typeof Monitor
+  label: string
+  target: BackendTarget
+}
+
+function BackendPill({ active, disabled = false, disabledLabel, icon: Icon, label, target }: BackendPillProps) {
+  const tipLabel = disabled ? disabledLabel || label : label
+
+  return (
+    <Tip delayDuration={0} label={tipLabel}>
+      <span className="inline-flex shrink-0">
+        <Button
+          aria-label={label}
+          aria-pressed={active}
+          className={cn(
+            'gap-1.5 bg-transparent px-2 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground',
+            active && 'bg-(--ui-control-active-background) text-foreground'
+          )}
+          disabled={disabled}
+          onClick={() => selectBackend(target)}
+          onPointerEnter={() => !disabled && !active && prewarmBackend(target)}
+          size="xs"
+          type="button"
+          variant="ghost"
+        >
+          <Icon className="size-3.5" />
+          <span>{label}</span>
+        </Button>
+      </span>
     </Tip>
   )
 }
