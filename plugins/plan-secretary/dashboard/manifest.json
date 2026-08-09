@@ -1,0 +1,12 @@
+{
+  "name": "plan-secretary",
+  "label": "Plan Secretary",
+  "description": "Real pending-commitment counts for the Plan Secretary hook plugin.",
+  "version": "0.3.0",
+  "api": "plugin_api.py",
+  "entry": "dist/index.js",
+  "tab": {
+    "path": "/plan-secretary",
+    "position": "end"
+  }
+}

@@ -50,6 +50,7 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_promise_gate_synthetic",
 )
 
 
@@ -412,14 +413,6 @@ def finalize_turn(
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
-    # The gateway owns a separate in-memory history snapshot. Keep it current
-    # even when finalization reports a cleanup error: a later prompt must not be
-    # sent with the pre-turn snapshot while the durable DB already has this turn.
-    try:
-        agent._session_messages = messages
-    except Exception:
-        pass
-
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log
@@ -529,8 +522,7 @@ def finalize_turn(
                     or _is_partial_stream_recovery
                 ):
                     _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason,
-                        getattr(agent, "_last_persistence_error_cause", None),
+                        _turn_exit_reason
                     )
                     if _explanation:
                         if _is_empty_terminal:
@@ -548,7 +540,6 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
-    _pre_transform_response = None
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -566,7 +557,6 @@ def finalize_turn(
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
-                    _pre_transform_response = final_response
                     final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
@@ -651,7 +641,6 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
-        "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
@@ -679,20 +668,11 @@ def finalize_turn(
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
     # final_response; also stamp `error` so gateway surfaces status="error"
-    # (and desktop can toast the cause) instead of a quiet complete frame.
+    # (and desktop can toast disk-full) instead of a quiet complete frame.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
         result["error"] = final_response or (
-            "session storage could not be written — check the state database "
-            "health (`hermes doctor`), then send your message again"
+            "session storage could not be written — free disk space and try again"
         )
-        # Machine-readable cause for the gateway/desktop: exactly
-        # 'session_persistence_failed:<locked|disk|unknown>'. Never clobber a
-        # failure_reason another path already stamped on this result.
-        if "failure_reason" not in result:
-            _cause = getattr(agent, "_last_persistence_error_cause", None)
-            result["failure_reason"] = (
-                "session_persistence_failed:" + (_cause or "unknown")
-            )
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -734,15 +714,7 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    # Suppressed when skip_background_review=True (e.g. cron) — review forks
-    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
-    # human-in-the-loop benefit from the review.
-    if (
-        final_response
-        and not interrupted
-        and not getattr(agent, "skip_background_review", False)
-        and (_should_review_memory or _should_review_skills)
-    ):
+    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

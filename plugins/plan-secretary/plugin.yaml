@@ -1,6 +1,12 @@
 name: plan-secretary
-version: 0.1.0
-description: "Turn assistant future-commitments (\"I will do X\") into human-confirmed, session-scoped task plans with due-time reminders. Capture -> confirm -> remind -> resolve, all scoped to the originating session."
+version: 0.3.0
+description: "Plan Secretary — capture assistant future-commitments (\"我接下来会…\") and inject pending-confirm / due reminders into the agent's next turn. promise_gate keeps the same turn going for immediate execute/register/cancel; a desktop pane shows real pending counts."
 author: "Victor-lys"
+provides_hooks:
+  - promise_gate
+  - post_llm_call
+  - pre_llm_call
 hooks:
-  - post_tool_call
+  - promise_gate
+  - post_llm_call
+  - pre_llm_call
