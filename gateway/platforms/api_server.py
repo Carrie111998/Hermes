@@ -4230,7 +4230,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_reasoning(text):
                 """Queue reasoning content as a tagged tuple for the SSE writer."""
-                _stream_q.put(("__reasoning__", text))
+                _stream_q.put_threadsafe(("__reasoning__", text))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -5379,7 +5379,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             def _on_reasoning(text):
                 """Queue reasoning content as a tagged tuple for the SSE writer."""
-                _stream_q.put(("__reasoning__", text))
+                _stream_q.put_threadsafe(("__reasoning__", text))
 
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
