@@ -3148,6 +3148,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        # Secondary adapters must be authorized against their own immutable
+        # startup configuration, not the default profile held in self.config.
+        # The map is populated alongside _profile_adapters and is consulted by
+        # every source-profile-aware slash authorization decision.
+        self._profile_gateway_configs: Dict[str, GatewayConfig] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -9578,6 +9583,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
                 self._profile_adapters.clear()
+            if hasattr(self, "_profile_gateway_configs"):
+                self._profile_gateway_configs.clear()
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
@@ -9872,6 +9879,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"or configure them only on the default profile."
             )
 
+        # Keep the parsed config with the secondary adapters. Authorization
+        # occurs after adapter construction and must not fall back to the
+        # multiplexer default profile's policy for a stamped source.
+        self._profile_gateway_configs[profile_name] = profile_cfg
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
         for platform, platform_config in profile_cfg.platforms.items():
@@ -10974,6 +10985,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
+            # DDP lifecycle decisions are independent of the running agent and
+            # must remain reachable while it is busy. Their handlers enforce a
+            # separate explicit-admin, fail-closed gate before touching the
+            # ledger; they never unblock tools or grant execution authority.
+            if _cmd_def_inner and _cmd_def_inner.name in {
+                "ddp-approve", "ddp-decline",
+                "ddp-approve-confirm", "ddp-decline-confirm",
+            }:
+                if _cmd_def_inner.name == "ddp-approve":
+                    return await self._handle_ddp_approve_command(event)
+                if _cmd_def_inner.name == "ddp-decline":
+                    return await self._handle_ddp_decline_command(event)
+                if _cmd_def_inner.name == "ddp-approve-confirm":
+                    return await self._handle_ddp_approve_confirm_command(event)
+                return await self._handle_ddp_decline_confirm_command(event)
+
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
@@ -11501,6 +11528,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "ddp-approve":
+            return await self._handle_ddp_approve_command(event)
+
+        if canonical == "ddp-decline":
+            return await self._handle_ddp_decline_command(event)
+
+        if canonical == "ddp-approve-confirm":
+            return await self._handle_ddp_approve_confirm_command(event)
+
+        if canonical == "ddp-decline-confirm":
+            return await self._handle_ddp_decline_confirm_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
@@ -14249,6 +14288,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    def _gateway_config_for_source(self, source: SessionSource) -> Optional[GatewayConfig]:
+        """Return the config that owns a source's slash authority.
+
+        A source stamped by a secondary multiplex adapter must never inherit
+        default-profile command permissions. Missing secondary config fails
+        closed by returning None; unstamped sources retain normal default
+        profile behavior.
+        """
+        config = getattr(self, "config", None)
+        if not getattr(config, "multiplex_profiles", False):
+            return config
+        profile = (getattr(source, "profile", None) or "").strip()
+        if not profile:
+            return config
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            active_profile = get_active_profile_name() or "default"
+        except Exception:
+            active_profile = "default"
+        if profile == active_profile:
+            return config
+        return getattr(self, "_profile_gateway_configs", {}).get(profile)
+
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
     ) -> Optional[str]:
@@ -14266,7 +14329,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        config = self._gateway_config_for_source(source)
+        if config is None:
+            logger.warning(
+                "Slash command /%s denied for stamped source with no profile config: %s",
+                canonical_cmd,
+                getattr(source, "profile", None),
+            )
+            return "⛔ Slash commands are unavailable for this profile until its policy loads."
+        policy = _policy_for_source(config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(

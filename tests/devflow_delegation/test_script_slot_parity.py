@@ -37,6 +37,28 @@ def test_wrapper_pair_byte_identical():
         "(nightly_gate._dual_path_drift cannot see a half-deleted pair)")
 
 
+def test_triage_wrapper_pair_byte_identical():
+    root = _HERMES / "scripts" / "devflow_triage_tick.py"
+    profile = _HERMES / "profiles" / "main" / "scripts" / "devflow_triage_tick.py"
+    verdict = _parity_verdict(root, profile)
+    assert verdict == "ok", (
+        "scripts/devflow_triage_tick.py and profiles/main/scripts/"
+        "devflow_triage_tick.py must BOTH exist and stay byte-identical "
+        "(nightly_gate._dual_path_drift cannot see a half-deleted pair)"
+    )
+
+
+def test_executor_wrapper_pair_byte_identical():
+    root = _HERMES / "scripts" / "devflow_executor_tick.py"
+    profile = _HERMES / "profiles" / "main" / "scripts" / "devflow_executor_tick.py"
+    verdict = _parity_verdict(root, profile)
+    assert verdict == "ok", (
+        "scripts/devflow_executor_tick.py and profiles/main/scripts/"
+        "devflow_executor_tick.py must BOTH exist and stay byte-identical "
+        "(nightly_gate._dual_path_drift cannot see a half-deleted pair)"
+    )
+
+
 def test_parity_verdict_semantics(tmp_path):
     """The skip/fail seam itself, exercised on disposable paths. A
     HALF-DELETED pair (exactly one twin present) must classify as a violation,

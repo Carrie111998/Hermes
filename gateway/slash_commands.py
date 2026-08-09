@@ -371,7 +371,10 @@ class GatewaySlashCommandsMixin:
         from gateway.slash_access import policy_for_source as _policy_for_source
 
         source = event.source
-        policy = _policy_for_source(self.config, source)
+        config = self._gateway_config_for_source(source)
+        if config is None:
+            return "**You** — slash access policy unavailable for this profile"
+        policy = _policy_for_source(config, source)
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
@@ -803,7 +806,11 @@ class GatewaySlashCommandsMixin:
         """
         try:
             from gateway.slash_access import policy_for_source
-            policy = policy_for_source(self.config, source)
+
+            config = self._gateway_config_for_source(source)
+            if config is None:
+                return False
+            policy = policy_for_source(config, source)
             uid = getattr(source, "user_id", None)
             return bool(policy.enabled and uid and policy.is_admin(uid))
         except Exception:
@@ -4634,6 +4641,203 @@ class GatewaySlashCommandsMixin:
         lines.append("")
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
+
+    # DDP decisions are intentionally separate from /approve and /deny, which
+    # resolve pending dangerous tool commands.  The gateway command path is
+    # deliberately fail-closed: an operator must configure an explicit admin
+    # list for the source scope before a lifecycle decision can even be staged.
+    _DDP_CONFIRM_TTL_SECONDS = 300.0
+
+    def _ddp_actor_for_source(self, source: SessionSource) -> Optional[str]:
+        """Return an authenticated, explicitly-admin actor identity or None."""
+        try:
+            from gateway.slash_access import policy_for_source
+
+            config = self._gateway_config_for_source(source)
+            if config is None:
+                return None
+            policy = policy_for_source(config, source)
+            user_id = str(getattr(source, "user_id", "") or "").strip()
+            platform = getattr(source, "platform", None)
+            platform_name = getattr(platform, "value", str(platform or "")).strip()
+            if not (policy.enabled and user_id and policy.is_admin(user_id) and platform_name):
+                return None
+            return f"{platform_name}:{user_id}"
+        except Exception:
+            return None
+
+    def _ddp_confirmation_store(self) -> dict[str, dict[str, Any]]:
+        """Return per-run in-memory pending confirmations keyed by token.
+
+        The pending half is intentionally short-lived and actor-bound.  The
+        executed half is durable in the DDP ledger's human_decisions table.
+        """
+        pending = getattr(self, "_ddp_pending_confirmations", None)
+        if pending is None:
+            pending = {}
+            self._ddp_pending_confirmations = pending
+        return pending
+
+    @staticmethod
+    def _ddp_confirmation_token(request_id: str, decision: str, actor: str, nonce: str) -> str:
+        material = f"{request_id}:{decision}:{actor}:{nonce}".encode("utf-8")
+        return hashlib.sha256(material).hexdigest()[:12]
+
+    def _ddp_ledger_and_bus(self):
+        ledger = getattr(self, "_ddp_ledger", None)
+        bus = getattr(self, "_ddp_bus", None)
+        if ledger is None:
+            from devflow_delegation.emitter import DelegationEmitter
+
+            emitter = DelegationEmitter()
+            ledger, bus = emitter.ledger, emitter.bus
+        return ledger, bus
+
+    async def _handle_ddp_decision_command(self, event: MessageEvent, decision: str) -> str:
+        """Stage one bounded, evidence-backed DDP lifecycle decision."""
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DDP human approval is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+
+        args = event.get_command_args().strip().split(maxsplit=1)
+        canonical = "ddp-approve" if decision == "approve" else "ddp-decline"
+        if not args:
+            return f"Usage: /{canonical} <request-id> <evidence>"
+        if len(args) < 2 or not args[1].strip():
+            return "Decision evidence is required; include a short operator-visible reason."
+        request_id, evidence_ref = args[0].strip(), args[1].strip()[:500]
+        if not request_id:
+            return f"Usage: /{canonical} <request-id> <evidence>"
+
+        try:
+            ledger, _bus = self._ddp_ledger_and_bus()
+            row = ledger.get_request(request_id)
+            if row is None:
+                return f"Unknown DDP request: {request_id}"
+            if row.get("state") != "TRIAGED":
+                return (
+                    f"DDP request {request_id} is {row.get('state')}, not TRIAGED; "
+                    "no approval decision can be applied."
+                )
+            existing = ledger.human_decision_for(request_id, actor)
+        except Exception as exc:
+            logger.warning("DDP decision ledger unavailable: %s", exc)
+            return "❌ DDP ledger is unavailable; no decision was recorded."
+        if existing is not None:
+            return f"DDP request {request_id} was already decided by this admin."
+
+        nonce = f"{time.time_ns()}:{id(event)}"
+        token = self._ddp_confirmation_token(request_id, decision, actor, nonce)
+        self._ddp_confirmation_store()[token] = {
+            "request_id": request_id,
+            "decision": decision,
+            "actor": actor,
+            "evidence_ref": evidence_ref,
+            "created_at": time.monotonic(),
+        }
+        target_state = "PLANNED" if decision == "approve" else "DECLINED"
+        return (
+            f"DDP {decision} staged for `{request_id}`: `{row.get('title', '')}`\n"
+            f"Target lifecycle state: `{target_state}`\n"
+            f"Evidence: {evidence_ref}\n\n"
+            f"To execute this one-time decision, reply `/{canonical}-confirm {token}`"
+        )
+
+    async def _handle_ddp_confirm_command(self, event: MessageEvent, decision: str) -> str:
+        """Durably execute an actor-bound, staged DDP decision once."""
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DDP human approval is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+        token = event.get_command_args().strip().split(maxsplit=1)[0] if event.get_command_args().strip() else ""
+        if not token:
+            canonical = "ddp-approve" if decision == "approve" else "ddp-decline"
+            return f"Usage: /{canonical}-confirm <confirmation-token>"
+
+        pending = self._ddp_confirmation_store().get(token)
+        if pending is None:
+            return "This DDP confirmation token is unknown, expired, or already used."
+        if pending["decision"] != decision:
+            return "This confirmation token is for a different DDP decision."
+        if pending["actor"] != actor:
+            return "Only the same admin who staged this DDP decision may confirm it."
+        if time.monotonic() - pending["created_at"] > self._DDP_CONFIRM_TTL_SECONDS:
+            self._ddp_confirmation_store().pop(token, None)
+            return "This DDP confirmation token has expired; stage the decision again."
+
+        request_id = pending["request_id"]
+        target_state = "PLANNED" if decision == "approve" else "DECLINED"
+        try:
+            from devflow_delegation.lifecycle import IllegalTransitionError, emit_transition_event, transition
+
+            ledger, bus = self._ddp_ledger_and_bus()
+            with ledger.transaction():
+                inserted = ledger.record_human_decision(
+                    request_id,
+                    actor,
+                    decision,
+                    pending["evidence_ref"],
+                    token,
+                )
+                if not inserted:
+                    self._ddp_confirmation_store().pop(token, None)
+                    return f"DDP request {request_id} was already decided; no transition was added."
+                transition(
+                    ledger,
+                    None,
+                    request_id,
+                    target_state,
+                    actor=actor,
+                    evidence_ref=pending["evidence_ref"],
+                )
+        except IllegalTransitionError as exc:
+            return f"DDP decision was not applied: {exc}"
+        except Exception as exc:
+            logger.exception("DDP %s confirmation failed for %s", decision, request_id)
+            return f"❌ DDP decision was not applied: {exc}"
+
+        # Consume the in-memory token only after the durable transaction has
+        # committed. Concurrent/repeated deliveries are still stopped by the
+        # ledger's UNIQUE constraints; a transient pre-commit failure stays
+        # retryable until the token expires.
+        self._ddp_confirmation_store().pop(token, None)
+        try:
+            emit_transition_event(
+                bus,
+                request_id=request_id,
+                from_state="TRIAGED",
+                to_state=target_state,
+                actor=actor,
+            )
+        except Exception:
+            # The durable lifecycle decision succeeded before this best-effort
+            # telemetry attempt. A failed EventBus must neither roll it back
+            # nor make the one-time confirmation retryable.
+            logger.exception("DDP %s telemetry failed for %s", decision, request_id)
+            verb = "approved" if decision == "approve" else "declined"
+            return (
+                f"✅ DDP request {request_id} {verb}; lifecycle state is now {target_state}. "
+                "Telemetry delivery failed after the durable decision."
+            )
+        verb = "approved" if decision == "approve" else "declined"
+        return f"✅ DDP request {request_id} {verb}; lifecycle state is now {target_state}."
+
+    async def _handle_ddp_approve_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_decision_command(event, "approve")
+
+    async def _handle_ddp_decline_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_decision_command(event, "decline")
+
+    async def _handle_ddp_approve_confirm_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_confirm_command(event, "approve")
+
+    async def _handle_ddp_decline_confirm_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_confirm_command(event, "decline")
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).

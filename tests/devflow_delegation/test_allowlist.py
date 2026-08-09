@@ -74,6 +74,25 @@ def test_non_int_timeout_fails_closed(tmp_path):
         load_allowlist(p)
 
 
+def test_validation_argv_vectors_are_preserved(allowlist_file):
+    raw = json.loads(allowlist_file.read_text(encoding="utf-8"))
+    raw["targets"]["hermes"]["test_commands"] = [["python", "-c", "print('ok')"]]
+    allowlist_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    target = resolve_target(load_allowlist(allowlist_file), "hermes")
+
+    assert target.test_commands == (("python", "-c", "print('ok')"),)
+
+
+def test_enabled_executor_requires_all_synthetic_safety_gates(allowlist_file):
+    raw = json.loads(allowlist_file.read_text(encoding="utf-8"))
+    raw["targets"]["hermes"]["executor_enabled"] = True
+    allowlist_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(AllowlistError):
+        load_allowlist(allowlist_file)
+
+
 def test_path_allowed_enforces_allow_and_deny(allowlist_file):
     t = resolve_target(load_allowlist(allowlist_file), "hermes")
     assert path_allowed(t, "agent-src/events/bus.py") is True
@@ -81,6 +100,10 @@ def test_path_allowed_enforces_allow_and_deny(allowlist_file):
     # denied even though it matches profiles/**
     assert path_allowed(t, "profiles/main/cron/jobs.json") is False
     assert path_allowed(t, "profiles/main/.env") is False
+    # Python fnmatch does not let **/ consume zero directories, so the allowlist
+    # matcher must cover both root and nested secrets/env paths.
+    assert path_allowed(t, ".env") is False
     assert path_allowed(t, "agent-src/secrets/token.json") is False
+    assert path_allowed(t, "secrets/token.json") is False
     # outside every allowed glob
     assert path_allowed(t, "bridges/hermes_to_devflow.py") is False

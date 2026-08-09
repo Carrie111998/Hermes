@@ -70,6 +70,18 @@ def test_api_cron_endpoint_present(client):
     assert isinstance(r.json(), list)
 
 
+def test_api_devflow_endpoint_present(client):
+    r = client.get("/api/devflow")
+    assert r.status_code == 200
+    assert {"ledger_total", "active_leases", "read_errors"} <= set(r.json())
+
+
+def test_api_devflow_accepts_bounded_detail_query(client):
+    r = client.get("/api/devflow", params={"state": "TRIAGED", "limit": 1})
+    assert r.status_code == 200
+    assert r.json()["request_page"]["limit"] == 1
+
+
 from pathlib import Path
 import artifact_surface
 

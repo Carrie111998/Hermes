@@ -298,6 +298,338 @@ def read_financier(*, workspace_dir: Optional[Path] = None) -> dict:
     return {"snapshot": snapshot, "latest_digest": digest}
 
 
+def _iso_now(now: Optional[str]) -> str:
+    if now is not None:
+        return now
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_allowlist_live_gateway_imports(path: Path, errors: list[str]) -> dict[str, bool]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(f"allowlist: {type(exc).__name__}: {exc}")
+        return {}
+    targets = data.get("targets", {}) if isinstance(data, dict) else {}
+    if not isinstance(targets, dict):
+        return {}
+    return {
+        str(name): bool(config.get("live_gateway_imports", False))
+        for name, config in targets.items()
+        if isinstance(config, dict)
+    }
+
+
+def _parse_autonomy_gate(ref: object) -> Optional[dict]:
+    if not isinstance(ref, str):
+        return None
+    parts = ref.split(":", 4)
+    if len(parts) != 5:
+        return None
+    mode, action, tier, reason, _digest = parts
+    return {"mode": mode, "action": action, "tier": tier, "reason": reason}
+
+
+_DDP_SIDE_STATES = frozenset({
+    "DUPLICATE", "SUPPRESSED", "DECLINED", "FAILED", "CANCELLED",
+    "REVERT_REQUESTED", "REVERTED",
+})
+_DDP_MAX_PAGE_SIZE = 100
+
+
+def _safe_request_summary(row: sqlite3.Row, *, lease: Optional[dict], latest_artifact: Optional[dict]) -> dict:
+    """Return presentation-safe request fields from a ledger row.
+
+    The API returns data, not HTML; nevertheless it deliberately excludes raw
+    envelope/evidence strings so Canvas cannot accidentally turn persisted
+    untrusted content into executable markup.
+    """
+    try:
+        envelope = json.loads(row["envelope_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        envelope = {}
+    if not isinstance(envelope, dict):
+        envelope = {}
+    criteria = envelope.get("acceptance_criteria")
+    return {
+        "request_id": row["request_id"],
+        "state": row["state"],
+        "source_agent": row["source_agent"],
+        "source_kind": row["source_kind"],
+        "target_repo": row["target_repo"],
+        "target_subsystem": row["target_subsystem"],
+        "kind": row["kind"],
+        "severity": row["severity"],
+        "terminal_reason": row["terminal_reason"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "title": str(envelope.get("title") or "(unreadable envelope)"),
+        "acceptance_criteria": [str(item) for item in criteria] if isinstance(criteria, list) else [],
+        "lease": lease,
+        "latest_artifact": latest_artifact,
+    }
+
+
+def _safe_evidence_summary(raw: object) -> object:
+    """Parse structured evidence while retaining only a small safe shape."""
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, json.JSONDecodeError):
+        return {"status": "unreadable"}
+    if not isinstance(parsed, dict):
+        return {"status": "unreadable"}
+    out: dict[str, object] = {}
+    for key in ("reason", "kind", "summary", "source", "ref"):
+        if key not in parsed:
+            continue
+        value = parsed[key]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+    return out or {"status": "recorded"}
+
+
+def _parse_page_args(
+    *, state: Optional[str], source: Optional[str], cursor: Optional[str], limit: int, errors: list[str],
+) -> tuple[Optional[str], Optional[str], Optional[str], int]:
+    clean_state = state.strip().upper() if isinstance(state, str) else None
+    if clean_state and (not clean_state.replace("_", "").isalpha() or len(clean_state) > 40):
+        errors.append("query: invalid state filter")
+        clean_state = None
+    clean_source = source.strip() if isinstance(source, str) else None
+    if clean_source and len(clean_source) > 200:
+        errors.append("query: source filter is too long")
+        clean_source = None
+    clean_cursor = cursor.strip() if isinstance(cursor, str) else None
+    if clean_cursor and (len(clean_cursor) > 200 or not clean_cursor.startswith("dwr_")):
+        errors.append("query: invalid cursor")
+        clean_cursor = None
+    try:
+        clean_limit = int(limit)
+    except (TypeError, ValueError):
+        clean_limit = _DDP_MAX_PAGE_SIZE
+        errors.append("query: invalid limit")
+    if clean_limit < 1:
+        clean_limit = 1
+        errors.append("query: limit must be positive")
+    if clean_limit > _DDP_MAX_PAGE_SIZE:
+        clean_limit = _DDP_MAX_PAGE_SIZE
+        errors.append(f"query: limit capped at {_DDP_MAX_PAGE_SIZE}")
+    return clean_state, clean_source, clean_cursor, clean_limit
+
+
+def read_devflow(
+    *,
+    ledger_path: Optional[Path] = None,
+    allowlist_path: Optional[Path] = None,
+    sentinel_path: Optional[Path] = None,
+    now: Optional[str] = None,
+    state: Optional[str] = None,
+    source: Optional[str] = None,
+    request_id: Optional[str] = None,
+    cursor: Optional[str] = None,
+    limit: int = 40,
+) -> dict:
+    """Return a read-only, schema-tolerant DevFlow ledger summary for Canvas.
+
+    This intentionally opens SQLite in URI read-only mode rather than using
+    ``DelegationLedger``: constructing that class can initialize/migrate schema.
+    Missing files and Stage-1 tables produce empty data plus diagnostics, never
+    writes or exceptions.
+    """
+    root = _root()
+    devflow_dir = root / "devflow"
+    db = Path(ledger_path) if ledger_path is not None else devflow_dir / "delegation_ledger.db"
+    allowlist = (Path(allowlist_path) if allowlist_path is not None
+                 else devflow_dir / "allowlist.json")
+    sentinel = (Path(sentinel_path) if sentinel_path is not None
+                else devflow_dir / ".autonomy_enabled")
+    generated_at = _iso_now(now)
+    errors: list[str] = []
+    result = {
+        "generated_at": generated_at,
+        "ledger_total": 0,
+        "by_state": {},
+        "by_source": {},
+        "active_leases": [],
+        "expired_leases": [],
+        "awaiting_approval_count": 0,
+        "autonomy_decisions_recent": [],
+        "live_gateway_imports": _read_allowlist_live_gateway_imports(allowlist, errors),
+        "autonomy_sentinel_note": (
+            "enabled" if sentinel.is_file() else
+            "invalid (not a file)" if sentinel.exists() else
+            "no (shadow-first)"
+        ),
+        "side_state_counts": {},
+        "requests": [],
+        "approval_queue": [],
+        "request_page": {"limit": 0, "next_cursor": None, "has_more": False},
+        "request_detail": None,
+        "ledger_freshness": {
+            "latest_request_updated_at": None,
+            "latest_transition_at": None,
+            "last_successful_read_at": None,
+        },
+        "read_errors": errors,
+    }
+    clean_state, clean_source, clean_cursor, clean_limit = _parse_page_args(
+        state=state, source=source, cursor=cursor, limit=limit, errors=errors,
+    )
+    result["request_page"]["limit"] = clean_limit
+    if request_id is not None and (not isinstance(request_id, str) or not request_id.startswith("dwr_")
+                                   or len(request_id) > 200):
+        errors.append("query: invalid request_id")
+        return result
+    if not db.exists():
+        return result
+
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        state_rows = conn.execute(
+            "SELECT state, COUNT(*) AS count FROM requests GROUP BY state"
+        ).fetchall()
+        source_rows = conn.execute(
+            "SELECT source_agent, COUNT(*) AS count FROM requests GROUP BY source_agent"
+        ).fetchall()
+        result["by_state"] = {str(row["state"]): int(row["count"]) for row in state_rows}
+        result["by_source"] = {
+            str(row["source_agent"]): int(row["count"]) for row in source_rows
+        }
+        result["ledger_total"] = sum(result["by_state"].values())
+        result["awaiting_approval_count"] = result["by_state"].get("TRIAGED", 0)
+        result["side_state_counts"] = {
+            key: value for key, value in result["by_state"].items() if key in _DDP_SIDE_STATES
+        }
+    except sqlite3.Error as exc:
+        errors.append(f"requests: {type(exc).__name__}: {exc}")
+        return result
+
+    assert conn is not None
+    lease_by_request: dict[str, dict] = {}
+    try:
+        lease_rows = conn.execute("SELECT * FROM leases ORDER BY expires_at").fetchall()
+        for row in lease_rows:
+            lease = dict(row)
+            lease_by_request[str(lease.get("request_id") or "")] = lease
+            key = "expired_leases" if str(lease.get("expires_at") or "") < generated_at else "active_leases"
+            result[key].append(lease)
+    except sqlite3.Error as exc:
+        errors.append(f"leases: {type(exc).__name__}: {exc}")
+
+    latest_artifact_by_request: dict[str, dict] = {}
+    try:
+        artifact_rows = conn.execute(
+            "SELECT request_id, kind, ref, created_at FROM artifacts ORDER BY id DESC"
+        ).fetchall()
+        for row in artifact_rows:
+            artifact = {"kind": row["kind"], "ref": row["ref"], "created_at": row["created_at"]}
+            latest_artifact_by_request.setdefault(row["request_id"], artifact)
+            if row["kind"] != "autonomy_gate":
+                continue
+            decision = _parse_autonomy_gate(row["ref"])
+            if decision is not None and len(result["autonomy_decisions_recent"]) < 20:
+                result["autonomy_decisions_recent"].append({
+                    "request_id": row["request_id"], **decision, "created_at": row["created_at"],
+                })
+    except sqlite3.Error as exc:
+        errors.append(f"artifacts: {type(exc).__name__}: {exc}")
+
+    try:
+        latest_request = conn.execute("SELECT MAX(updated_at) FROM requests").fetchone()[0]
+        result["ledger_freshness"]["latest_request_updated_at"] = latest_request
+    except sqlite3.Error as exc:
+        errors.append(f"freshness: {type(exc).__name__}: {exc}")
+
+    try:
+        transition_latest = conn.execute("SELECT MAX(created_at) FROM transitions").fetchone()[0]
+        result["ledger_freshness"]["latest_transition_at"] = transition_latest
+    except sqlite3.Error as exc:
+        errors.append(f"transitions: {type(exc).__name__}: {exc}")
+
+    try:
+        where: list[str] = []
+        params: list[object] = []
+        if clean_state:
+            where.append("state = ?")
+            params.append(clean_state)
+        if clean_source:
+            where.append("source_agent = ?")
+            params.append(clean_source)
+        if clean_cursor:
+            where.append("request_id < ?")
+            params.append(clean_cursor)
+        if request_id:
+            where.append("request_id = ?")
+            params.append(request_id)
+        predicate = f" WHERE {' AND '.join(where)}" if where else ""
+        rows = conn.execute(
+            "SELECT request_id, state, source_agent, source_kind, target_repo, target_subsystem, kind, "
+            "severity, terminal_reason, created_at, updated_at, envelope_json FROM requests"
+            + predicate + " ORDER BY request_id DESC LIMIT ?",
+            (*params, clean_limit + 1),
+        ).fetchall()
+        has_more = len(rows) > clean_limit
+        rows = rows[:clean_limit]
+        result["requests"] = [
+            _safe_request_summary(
+                row,
+                lease=lease_by_request.get(row["request_id"]),
+                latest_artifact=latest_artifact_by_request.get(row["request_id"]),
+            )
+            for row in rows
+        ]
+        result["request_page"] = {
+            "limit": clean_limit,
+            "next_cursor": rows[-1]["request_id"] if rows else None,
+            "has_more": has_more,
+        }
+        result["approval_queue"] = [item for item in result["requests"] if item["state"] == "TRIAGED"]
+    except sqlite3.Error as exc:
+        errors.append(f"request_detail: {type(exc).__name__}: {exc}")
+
+    if request_id and result["requests"]:
+        detail = dict(result["requests"][0])
+        try:
+            transitions = conn.execute(
+                "SELECT from_state, to_state, actor, policy_version, evidence_ref, created_at "
+                "FROM transitions WHERE request_id=? ORDER BY id", (request_id,),
+            ).fetchall()
+            detail["transitions"] = [dict(row) for row in transitions]
+        except sqlite3.Error as exc:
+            errors.append(f"transitions: {type(exc).__name__}: {exc}")
+            detail["transitions"] = []
+        try:
+            evidence = conn.execute(
+                "SELECT evidence_json, created_at FROM evidence_log WHERE request_id=? ORDER BY id", (request_id,),
+            ).fetchall()
+            detail["evidence"] = [
+                {"created_at": row["created_at"], "summary": _safe_evidence_summary(row["evidence_json"])}
+                for row in evidence
+            ]
+        except sqlite3.Error as exc:
+            errors.append(f"evidence_log: {type(exc).__name__}: {exc}")
+            detail["evidence"] = []
+        try:
+            decisions = conn.execute(
+                "SELECT actor, decision, evidence_ref, created_at "
+                "FROM human_decisions WHERE request_id=? ORDER BY id",
+                (request_id,),
+            ).fetchall()
+            detail["human_decisions"] = [dict(row) for row in decisions]
+        except sqlite3.Error as exc:
+            errors.append(f"human_decisions: {type(exc).__name__}: {exc}")
+            detail["human_decisions"] = []
+        result["request_detail"] = detail
+
+    result["ledger_freshness"]["last_successful_read_at"] = generated_at
+    conn.close()
+    return result
+
+
 router = APIRouter(prefix="/api")
 
 
@@ -324,3 +656,20 @@ async def api_financier() -> JSONResponse:
 @router.get("/boot")
 async def api_boot(limit: int = 20) -> JSONResponse:
     return JSONResponse(read_boot(limit=limit))
+
+
+@router.get("/devflow")
+async def api_devflow(
+    state: str = "",
+    source: str = "",
+    request_id: str = "",
+    cursor: str = "",
+    limit: int = 40,
+) -> JSONResponse:
+    return JSONResponse(read_devflow(
+        state=state or None,
+        source=source or None,
+        request_id=request_id or None,
+        cursor=cursor or None,
+        limit=limit,
+    ))

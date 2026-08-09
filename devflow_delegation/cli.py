@@ -4,9 +4,16 @@ package in-process, and for operator/script-slot ticks.
     <request-json> | python -m devflow_delegation.cli delegate [--dry-run]
     python -m devflow_delegation.cli status
     python -m devflow_delegation.cli reconcile
+    python -m devflow_delegation.cli triage [--limit N]
+    python -m devflow_delegation.cli executor --synthetic-only
+    python -m devflow_delegation.cli gate --request-id RID --action {merge,deploy} \
+        --changed-path PATH [--changed-path PATH ...] --changed-lines N \
+        (--reversible | --not-reversible)
+    python -m devflow_delegation.cli adopt-history [--dry-run] [--actor NAME]
     python -m devflow_delegation.cli transition --request-id RID --to STATE --actor NAME
 
-Exit codes: 0 completed (any policy outcome), 2 bad input, 1 unexpected error.
+The executor command requires ``--synthetic-only`` and remains a no-op unless
+operator-owned allowlist configuration enables a synthetic fixture target.
 """
 from __future__ import annotations
 
@@ -56,9 +63,105 @@ def _cmd_reconcile(args) -> int:
     return 0
 
 
+def _cmd_triage(args) -> int:
+    from devflow_delegation.triage import run_triage
+
+    em = DelegationEmitter()
+    counts = run_triage(em.ledger, em.bus, actor=args.actor, limit=args.limit)
+    print(f"considered={counts['considered']} triaged={counts['triaged']} "
+          f"errors={counts['errors']}")
+    return 0 if counts["errors"] == 0 else 1
+
+
+def _cmd_executor(args) -> int:
+    # There is deliberately no real PR client construction in this command.
+    # Production PR creation is unavailable via CLI/script slot until a separate
+    # operator decision supplies a dedicated trusted runner and configuration.
+    if not args.synthetic_only:
+        print("ERROR: --synthetic-only is required; no live executor CLI exists", file=sys.stderr)
+        return 2
+    from devflow_delegation.executor import run_executor_tick
+
+    em = DelegationEmitter()
+    counts = run_executor_tick(em.ledger, em.allowlist, em.bus, actor=args.actor, pr_client=None)
+    print(f"processed={counts['processed']} errors={counts['errors']} skipped={counts['skipped']} "
+          "mode=synthetic-only-no-pr-client")
+    return 0 if counts["errors"] == 0 else 1
+
+
+def _cmd_gate(args) -> int:
+    """Record a deterministic Stage-3 gate decision without acting on it."""
+    if not args.request_id:
+        print("ERROR: --request-id is required", file=sys.stderr)
+        return 2
+    if args.action not in {"merge", "deploy"}:
+        print("ERROR: --action must be merge or deploy", file=sys.stderr)
+        return 2
+    if not args.changed_path:
+        print("ERROR: --changed-path is required", file=sys.stderr)
+        return 2
+    if args.changed_lines is None:
+        print("ERROR: --changed-lines is required", file=sys.stderr)
+        return 2
+    if args.reversible is None:
+        print("ERROR: one of --reversible or --not-reversible is required", file=sys.stderr)
+        return 2
+
+    from events.paths import autonomy_sentinel_path
+
+    from devflow_delegation.allowlist import resolve_target
+    from devflow_delegation.gate import GateRequest, evaluate_gate, record_shadow_decision
+    from devflow_delegation.risk import RiskInput
+
+    em = DelegationEmitter()
+    row = em.ledger.get_request(args.request_id)
+    if row is None:
+        print(f"ERROR: unknown request: {args.request_id}", file=sys.stderr)
+        return 2
+    target = resolve_target(em.allowlist, row["target_repo"])
+    if target is None:
+        print(f"ERROR: target unresolved: {row['target_repo']}", file=sys.stderr)
+        return 2
+
+    decision = evaluate_gate(
+        target,
+        GateRequest(
+            request_id=row["request_id"],
+            action=args.action,
+            risk_input=RiskInput(
+                changed_paths=tuple(args.changed_path),
+                changed_lines=args.changed_lines,
+                reversible=args.reversible,
+                severity=row["severity"],
+                source_kind=row["source_kind"],
+            ),
+        ),
+        sentinel_path=autonomy_sentinel_path(),
+    )
+    artifact = record_shadow_decision(em.ledger, decision)
+    print(
+        f"request_id={decision.request_id} action={decision.action} mode={decision.mode} "
+        f"eligible={decision.eligible} authorized={decision.authorized} "
+        f"risk={decision.risk.tier}/{decision.risk.score} reason={decision.reason} "
+        f"artifact={artifact['ref']}"
+    )
+    return 0
+
+
 def _cmd_transition(args) -> int:
     em = DelegationEmitter()
     try:
+        row = em.ledger.get_request(args.request_id)
+        if (
+            row is not None
+            and row["state"] == "TRIAGED"
+            and args.to in {"PLANNED", "DECLINED"}
+        ):
+            command = "/ddp-approve" if args.to == "PLANNED" else "/ddp-decline"
+            raise IllegalTransitionError(
+                f"TRIAGED -> {args.to} is a human decision; use authenticated "
+                f"{command} with its confirmation command instead"
+            )
         new_state = transition(
             em.ledger, em.bus, args.request_id, args.to,
             actor=args.actor, evidence_ref=args.evidence_ref)
@@ -67,6 +170,32 @@ def _cmd_transition(args) -> int:
         return 2
     print(f"request_id={args.request_id} state={new_state}")
     return 0
+
+
+def _cmd_adopt_history(args) -> int:
+    from devflow_delegation.adopt_history import (
+        adopt, dry_run, gather_approved_keys, gather_fix_requests,
+    )
+
+    approved_keys = gather_approved_keys()
+    fixes = gather_fix_requests()
+    matched, unmatched, _ = dry_run(approved_keys, fixes)
+    print(f"approved_keys={len(approved_keys)} fixes={len(fixes)} "
+          f"matched={matched} unmatched={unmatched}")
+    if args.dry_run:
+        print("[dry-run] No writes performed.")
+        return 0
+    if matched == 0:
+        print("Nothing to adopt (0 matched).")
+        return 0
+    ledger = DelegationEmitter().ledger
+    try:
+        result = adopt(approved_keys, fixes, ledger, actor=args.actor)
+    finally:
+        ledger.close()
+    print(f"adopted={result['adopted']} triaged={result['triaged']} "
+          f"skipped={result['skipped_already_triaged']} errors={result['errors']}")
+    return 0 if result["errors"] == 0 else 1
 
 
 def main(argv=None) -> int:
@@ -84,12 +213,43 @@ def main(argv=None) -> int:
     p_reconcile = sub.add_parser("reconcile", help="idempotent ledger<->mailbox reconciliation")
     p_reconcile.set_defaults(func=_cmd_reconcile)
 
+    p_triage = sub.add_parser("triage", help="advance REQUESTED work to the TRIAGED approval gate")
+    p_triage.add_argument("--limit", type=int, default=50,
+                          help="maximum REQUESTED rows to process (default: 50)")
+    p_triage.add_argument("--actor", default="ddp.triage")
+    p_triage.set_defaults(func=_cmd_triage)
+
+    p_executor = sub.add_parser("executor", help="report synthetic Stage-2 eligibility without PR authority")
+    p_executor.add_argument("--synthetic-only", action="store_true",
+                            help="required safety gate; never constructs a real PR client")
+    p_executor.add_argument("--actor", default="ddp.executor.cli")
+    p_executor.set_defaults(func=_cmd_executor)
+
+    p_gate = sub.add_parser("gate", help="record a shadow-only merge/deploy gate decision")
+    p_gate.add_argument("--request-id", required=True)
+    p_gate.add_argument("--action", choices=("merge", "deploy"), required=True)
+    p_gate.add_argument("--changed-path", action="append", default=[],
+                        help="observed changed path; repeat for each path")
+    p_gate.add_argument("--changed-lines", type=int, default=None,
+                        help="observed total added plus removed lines")
+    reversibility = p_gate.add_mutually_exclusive_group()
+    reversibility.add_argument("--reversible", action="store_const", const=True, dest="reversible")
+    reversibility.add_argument("--not-reversible", action="store_const", const=False, dest="reversible")
+    p_gate.set_defaults(func=_cmd_gate, reversible=None)
+
     p_transition = sub.add_parser("transition", help="apply a legal lifecycle transition")
     p_transition.add_argument("--request-id", required=True)
     p_transition.add_argument("--to", required=True)
     p_transition.add_argument("--actor", required=True)
     p_transition.add_argument("--evidence-ref", default=None)
     p_transition.set_defaults(func=_cmd_transition)
+
+    p_adopt = sub.add_parser("adopt-history",
+                              help="adopt historically-approved v2 fix-requests into the v3 ledger at TRIAGED")
+    p_adopt.add_argument("--dry-run", action="store_true",
+                          help="report what would happen without writing")
+    p_adopt.add_argument("--actor", default="ddp.historical-adoption")
+    p_adopt.set_defaults(func=_cmd_adopt_history)
 
     args = parser.parse_args(argv)
     try:

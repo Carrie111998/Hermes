@@ -99,6 +99,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[session|always]"),
     CommandDef("deny", "Deny a pending dangerous command (optionally with a reason)", "Session",
                gateway_only=True, args_hint="[all] [reason]"),
+    CommandDef("ddp-approve", "Stage a human approval for one TRIAGED DevFlow request", "Session",
+               gateway_only=True, aliases=("ddp_approve",), args_hint="<request-id> <evidence>"),
+    CommandDef("ddp-decline", "Stage a human decline for one TRIAGED DevFlow request", "Session",
+               gateway_only=True, aliases=("ddp_decline",), args_hint="<request-id> <evidence>"),
+    CommandDef("ddp-approve-confirm", "Confirm one staged DevFlow approval", "Session",
+               gateway_only=True, aliases=("ddp_approve_confirm",), args_hint="<confirmation-token>"),
+    CommandDef("ddp-decline-confirm", "Confirm one staged DevFlow decline", "Session",
+               gateway_only=True, aliases=("ddp_decline_confirm",), args_hint="<confirmation-token>"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
@@ -1164,7 +1172,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug"})
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug",
+    # DDP human decision commands carry explicit confirmation tokens and
+    # remain reachable as `/hermes ddp-…` on Slack. Keeping the four new
+    # commands off the 50-slot native manifest preserves parity for existing
+    # Telegram-visible operational commands.
+    "ddp-approve", "ddp-decline", "ddp-approve-confirm", "ddp-decline-confirm",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1182,10 +1197,10 @@ def _sanitize_slack_name(raw: str) -> str:
 def slack_native_slashes() -> list[tuple[str, str, str]]:
     """Return (slash_name, description, usage_hint) triples for Slack.
 
-    Every gateway-available command in ``COMMAND_REGISTRY`` is surfaced as
-    a standalone Slack slash command (e.g. ``/btw``, ``/stop``, ``/model``),
-    matching Discord's and Telegram's model where every command is a
-    first-class slash and not a ``/hermes <verb>`` subcommand.
+    Gateway commands are surfaced as standalone Slack slashes where the
+    manifest budget permits (e.g. ``/btw``, ``/stop``, ``/model``), matching
+    Discord's and Telegram's first-class command model. Commands explicitly
+    reserved for ``/hermes <verb>`` remain reachable through that catch-all.
 
     Both canonical names and aliases are included so users can type any
     documented form (e.g. ``/background``, ``/bg``, and ``/btw`` all work).

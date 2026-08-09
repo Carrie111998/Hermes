@@ -6,15 +6,20 @@ PRAGMAs (SR-446 / ADR-0018) — do NOT lower wal_autocheckpoint below 1000.
 
 The ledger is the lifecycle/dedup authority; mailbox envelopes are durable
 evidence; EventBus is trigger/telemetry only.
+
+Stage 2 adds worktree leases, executor artifacts, and a transaction() context
+manager so state/history transitions commit atomically.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from devflow_delegation.contract import WorkRequest, parse_request
 
@@ -42,7 +47,8 @@ CREATE TABLE IF NOT EXISTS requests (
     kind TEXT NOT NULL,
     severity TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    lease_attempt_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_fingerprint ON requests(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_requests_state ON requests(state);
@@ -69,8 +75,45 @@ CREATE TABLE IF NOT EXISTS leases (
     holder TEXT NOT NULL,
     acquired_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    heartbeat_at TEXT
+    heartbeat_at TEXT,
+    worktree_path TEXT,
+    branch TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES requests(request_id),
+    kind TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, kind, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_request ON artifacts(request_id);
+"""
+
+# SQLite CREATE TABLE IF NOT EXISTS does not add columns on an existing Stage-1
+# ledger. Each ALTER is independently idempotent: duplicate-column errors mean
+# another process already applied it.
+_LEASE_MIGRATIONS = (
+    "ALTER TABLE leases ADD COLUMN worktree_path TEXT",
+    "ALTER TABLE leases ADD COLUMN branch TEXT",
+    "ALTER TABLE leases ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1",
+)
+_REQUEST_MIGRATIONS = (
+    "ALTER TABLE requests ADD COLUMN lease_attempt_count INTEGER NOT NULL DEFAULT 0",
+)
+_HUMAN_DECISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS human_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL REFERENCES requests(request_id),
+    actor TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    evidence_ref TEXT NOT NULL,
+    confirmation_token TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, actor)
+);
+CREATE INDEX IF NOT EXISTS idx_human_decisions_request ON human_decisions(request_id);
 """
 
 _TERMINAL_SQL = ",".join("?" for _ in TERMINAL_STATES)
@@ -104,14 +147,62 @@ class DelegationLedger:
     def _init_schema(self) -> None:
         conn = self._conn()
         conn.executescript(_SCHEMA)
+        conn.executescript(_HUMAN_DECISIONS_SCHEMA)
+        for statement in (*_LEASE_MIGRATIONS, *_REQUEST_MIGRATIONS):
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         conn.commit()
 
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """Yield the calling thread's connection in one atomic transaction.
+
+        Helpers retain their Stage-1 immediate-commit behavior outside this
+        context. Nested transaction contexts use savepoints.
+        """
+        conn = self._conn()
+        depth = getattr(self._local, "transaction_depth", 0)
+        if depth:
+            savepoint = f"ddp_tx_{depth}"
+            conn.execute(f"SAVEPOINT {savepoint}")
+            self._local.transaction_depth = depth + 1
+            try:
+                yield conn
+            except Exception:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            else:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            finally:
+                self._local.transaction_depth = depth
+            return
+
+        conn.execute("BEGIN IMMEDIATE")
+        self._local.transaction_depth = 1
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            self._local.transaction_depth = 0
+
+    def _outer_commit(self, conn: sqlite3.Connection) -> None:
+        if not getattr(self._local, "transaction_depth", 0):
+            conn.commit()
+
+    def _outer_rollback(self, conn: sqlite3.Connection) -> None:
+        if not getattr(self._local, "transaction_depth", 0):
+            conn.rollback()
+
     def close(self) -> None:
-        """Release the calling thread's connection so the db file can be
-        deleted or handed to a fresh reader. WAL keeps an exclusive OS handle
-        on the file while open, which blocks unlink on Windows (WinError 32);
-        the reconcile hand-off (a new emitter re-opening the same path) needs
-        this. Idempotent — a later query lazily reconnects via _conn()."""
+        """Release this thread's SQLite handle; safe to call repeatedly."""
         conn = getattr(self._local, "conn", None)
         if conn is not None:
             conn.close()
@@ -135,17 +226,14 @@ class DelegationLedger:
                     req.target_subsystem, req.kind, req.severity, req.created_at, now,
                 ),
             )
-            conn.commit()
+            self._outer_commit(conn)
         except Exception:
-            conn.rollback()
+            self._outer_rollback(conn)
             raise
 
     def adopt_envelope(self, env: Dict[str, Any]) -> None:
-        """Reconciler path: adopt an envelope dict (v3) already carrying its
-        request_id, without minting a new identity."""
+        """Adopt a v3 envelope while preserving its request identity/time."""
         req = parse_request(env)
-        # parse_request re-mints identity/timestamp; pin the envelope's own so an
-        # aged envelope (crash recovery) keeps its original creation time and id.
         if req.request_id != env.get("request_id"):
             req.request_id = env["request_id"]
         if env.get("created_at"):
@@ -154,20 +242,28 @@ class DelegationLedger:
 
     def append_evidence(self, request_id: str, evidence: Dict[str, Any]) -> None:
         conn = self._conn()
-        conn.execute(
-            "INSERT INTO evidence_log (request_id, evidence_json, created_at) VALUES (?,?,?)",
-            (request_id, json.dumps(evidence, ensure_ascii=False), _now_iso()),
-        )
-        conn.execute("UPDATE requests SET updated_at=? WHERE request_id=?", (_now_iso(), request_id))
-        conn.commit()
+        try:
+            conn.execute(
+                "INSERT INTO evidence_log (request_id, evidence_json, created_at) VALUES (?,?,?)",
+                (request_id, json.dumps(evidence, ensure_ascii=False), _now_iso()),
+            )
+            conn.execute("UPDATE requests SET updated_at=? WHERE request_id=?", (_now_iso(), request_id))
+            self._outer_commit(conn)
+        except Exception:
+            self._outer_rollback(conn)
+            raise
 
     def set_state(self, request_id: str, state: str, terminal_reason: Optional[str] = None) -> None:
         conn = self._conn()
-        conn.execute(
-            "UPDATE requests SET state=?, terminal_reason=?, updated_at=? WHERE request_id=?",
-            (state, terminal_reason, _now_iso(), request_id),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                "UPDATE requests SET state=?, terminal_reason=?, updated_at=? WHERE request_id=?",
+                (state, terminal_reason, _now_iso(), request_id),
+            )
+            self._outer_commit(conn)
+        except Exception:
+            self._outer_rollback(conn)
+            raise
 
     def record_transition(
         self,
@@ -179,13 +275,47 @@ class DelegationLedger:
         evidence_ref: Optional[str] = None,
     ) -> None:
         conn = self._conn()
-        conn.execute(
-            """INSERT INTO transitions
-               (request_id, from_state, to_state, actor, policy_version, evidence_ref, created_at)
-               VALUES (?,?,?,?,?,?,?)""",
-            (request_id, from_state, to_state, actor, policy_version, evidence_ref, _now_iso()),
-        )
-        conn.commit()
+        try:
+            conn.execute(
+                """INSERT INTO transitions
+                   (request_id, from_state, to_state, actor, policy_version, evidence_ref, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (request_id, from_state, to_state, actor, policy_version, evidence_ref, _now_iso()),
+            )
+            self._outer_commit(conn)
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+
+    def record_human_decision(
+        self,
+        request_id: str,
+        actor: str,
+        decision: str,
+        evidence_ref: str,
+        confirmation_token: str,
+    ) -> bool:
+        """Persist a one-time human decision. Returns False on replay."""
+        conn = self._conn()
+        try:
+            inserted = conn.execute(
+                """INSERT OR IGNORE INTO human_decisions
+                   (request_id, actor, decision, evidence_ref, confirmation_token, created_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (request_id, actor, decision, evidence_ref, confirmation_token, _now_iso()),
+            )
+            self._outer_commit(conn)
+            return inserted.rowcount == 1
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+
+    def human_decision_for(self, request_id: str, actor: str) -> Optional[Dict[str, Any]]:
+        row = self._conn().execute(
+            "SELECT * FROM human_decisions WHERE request_id=? AND actor=?",
+            (request_id, actor),
+        ).fetchone()
+        return self._row_to_dict(row)
 
     # ------------------------------------------------------------------- read
     @staticmethod
@@ -221,9 +351,6 @@ class DelegationLedger:
         return self._row_to_dict(row)
 
     def oldest_requested(self) -> Optional[Dict[str, Any]]:
-        """The most-aged still-open (REQUESTED) row, or None. Ascending by
-        created_at — distinct from list_requests(), which is DESC (newest
-        first). The status CLI uses this to surface the oldest stuck request."""
         row = self._conn().execute(
             "SELECT * FROM requests WHERE state='REQUESTED' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
@@ -280,3 +407,140 @@ class DelegationLedger:
             "SELECT source_agent, COUNT(*) AS n FROM requests GROUP BY source_agent")}
         total = conn.execute("SELECT COUNT(*) AS n FROM requests").fetchone()["n"]
         return {"by_state": by_state, "by_source": by_source, "total": int(total)}
+
+    # --------------------------------------------------------------- lease mgmt
+    def acquire_lease(
+        self,
+        request_id: str,
+        holder: str,
+        *,
+        lease_id: Optional[str] = None,
+        expires_in_seconds: int = 600,
+        worktree_path: Optional[str] = None,
+        branch: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Insert exactly one active lease and increment its durable attempt."""
+        if expires_in_seconds <= 0:
+            raise ValueError("expires_in_seconds must be positive")
+        lid = lease_id or f"lse_{uuid.uuid4().hex[:16]}"
+        now = _now_iso()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).isoformat()
+        conn = self._conn()
+        with self.transaction():
+            updated = conn.execute(
+                "UPDATE requests SET lease_attempt_count=lease_attempt_count+1 WHERE request_id=?",
+                (request_id,),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"unknown request: {request_id}")
+            attempt = conn.execute(
+                "SELECT lease_attempt_count FROM requests WHERE request_id=?", (request_id,)
+            ).fetchone()[0]
+            conn.execute(
+                """INSERT INTO leases
+                   (request_id, lease_id, holder, acquired_at, expires_at,
+                    heartbeat_at, worktree_path, branch, attempt_count)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (request_id, lid, holder, now, expires, now, worktree_path, branch, attempt),
+            )
+        row = conn.execute("SELECT * FROM leases WHERE request_id=?", (request_id,)).fetchone()
+        return dict(row)
+
+    def set_lease_worktree(
+        self,
+        request_id: str,
+        lease_id: str,
+        worktree_path: str,
+        branch: str,
+    ) -> bool:
+        """Attach the derived worktree identity to the current lease only."""
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                "UPDATE leases SET worktree_path=?, branch=? WHERE request_id=? AND lease_id=?",
+                (worktree_path, branch, request_id, lease_id),
+            )
+            self._outer_commit(conn)
+            return cur.rowcount > 0
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+
+    def renew_heartbeat(
+        self,
+        request_id: str,
+        lease_id: str,
+        *,
+        expires_in_seconds: int = 600,
+    ) -> bool:
+        """Renew both heartbeat and expiry. Returns False for a stale lease."""
+        if expires_in_seconds <= 0:
+            raise ValueError("expires_in_seconds must be positive")
+        now = _now_iso()
+        expires = (datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds)).isoformat()
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                "UPDATE leases SET heartbeat_at=?, expires_at=? WHERE request_id=? AND lease_id=?",
+                (now, expires, request_id, lease_id),
+            )
+            self._outer_commit(conn)
+            return cur.rowcount > 0
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+
+    def release_lease(self, request_id: str, lease_id: str) -> bool:
+        conn = self._conn()
+        try:
+            cur = conn.execute(
+                "DELETE FROM leases WHERE request_id=? AND lease_id=?",
+                (request_id, lease_id),
+            )
+            self._outer_commit(conn)
+            return cur.rowcount > 0
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+
+    def expired_leases(self) -> List[Dict[str, Any]]:
+        rows = self._conn().execute(
+            "SELECT * FROM leases WHERE expires_at < ?", (_now_iso(),)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_leases(self) -> List[Dict[str, Any]]:
+        rows = self._conn().execute(
+            "SELECT * FROM leases WHERE expires_at >= ?", (_now_iso(),)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def lease_for_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn().execute(
+            "SELECT * FROM leases WHERE request_id=?", (request_id,)
+        ).fetchone()
+        return self._row_to_dict(row)
+
+    # ------------------------------------------------------------ artifact mgmt
+    def add_artifact(self, request_id: str, kind: str, ref: str) -> Dict[str, Any]:
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO artifacts (request_id, kind, ref, created_at) VALUES (?,?,?,?)",
+                (request_id, kind, ref, _now_iso()),
+            )
+            self._outer_commit(conn)
+        except Exception:
+            self._outer_rollback(conn)
+            raise
+        row = conn.execute(
+            "SELECT * FROM artifacts WHERE request_id=? AND kind=? AND ref=?",
+            (request_id, kind, ref),
+        ).fetchone()
+        return dict(row)
+
+    def artifacts_for(self, request_id: str) -> List[Dict[str, Any]]:
+        rows = self._conn().execute(
+            "SELECT * FROM artifacts WHERE request_id=? ORDER BY id", (request_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]

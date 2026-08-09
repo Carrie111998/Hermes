@@ -71,6 +71,31 @@ def test_transition_illegal_exits_2(queue_mode, capsys, monkeypatch):
     assert rc == 2
 
 
+@pytest.mark.parametrize(("to_state", "gateway_command"), (
+    ("PLANNED", "/ddp-approve"),
+    ("DECLINED", "/ddp-decline"),
+))
+def test_transition_cli_rejects_unauthenticated_human_decision_edges(
+    queue_mode, capsys, monkeypatch, to_state, gateway_command
+):
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+    from devflow_delegation.lifecycle import transition
+
+    ledger = DelegationEmitter().ledger
+    rid = ledger.list_requests()[0]["request_id"]
+    transition(ledger, None, rid, "TRIAGED", actor="fixture")
+
+    rc = cli.main(["transition", "--request-id", rid, "--to", to_state, "--actor", "test"])
+
+    assert rc == 2
+    assert gateway_command in capsys.readouterr().err
+    assert ledger.get_request(rid)["state"] == "TRIAGED"
+    assert [item["to_state"] for item in ledger.transitions_for(rid)] == ["TRIAGED"]
+    assert ledger.human_decision_for(rid, "test") is None
+
+
 def _requested_env(created_at, key, title):
     from devflow_delegation import contract
 
@@ -121,3 +146,133 @@ def test_delegate_bad_kwargs_exits_2(queue_mode, capsys, monkeypatch):
     # `except Exception` and return 1.
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps({"not_a_real_kwarg": 1})))
     assert cli.main(["delegate"]) == 2
+
+
+def test_executor_cli_requires_synthetic_only_flag(queue_mode, capsys):
+    assert cli.main(["executor"]) == 2
+    assert "--synthetic-only is required" in capsys.readouterr().err
+
+
+def test_synthetic_executor_cli_has_no_pr_authority(queue_mode, capsys):
+    # The production CLI intentionally supplies no PR client. A synthetic flag
+    # can expose status/no-op behavior but cannot create a remote PR.
+    assert cli.main(["executor", "--synthetic-only"]) == 0
+    assert "mode=synthetic-only-no-pr-client" in capsys.readouterr().out
+
+
+def test_gate_cli_records_shadow_decision_without_authority(queue_mode, allowlist_file, capsys, monkeypatch):
+    allowlist = json.loads(allowlist_file.read_text(encoding="utf-8"))
+    allowlist["targets"]["fixture"] = {
+        "repo": "fixture",
+        "checkout_path": "/fixture",
+        "allowed_globs": ["agent-src/**"],
+        "risk_ceiling": "medium",
+    }
+    allowlist_file.write_text(json.dumps(allowlist), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.stdin",
+        __import__("io").StringIO(json.dumps(make_delegate_kwargs(
+            target={"repo": "fixture", "subsystem": "autonomy-gate"},
+        ))),
+    )
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+
+    em = DelegationEmitter()
+    request_id = em.ledger.list_requests()[0]["request_id"]
+    em.ledger.close()
+
+    rc = cli.main([
+        "gate", "--request-id", request_id, "--action", "merge",
+        "--changed-path", "agent-src/devflow_delegation/gate.py",
+        "--changed-lines", "10", "--reversible",
+    ])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "mode=shadow" in out
+    assert "eligible=True" in out
+    assert "authorized=False" in out
+    assert "reason=shadow_mode" in out
+    recorded = DelegationEmitter().ledger.artifacts_for(request_id)
+    assert [item["kind"] for item in recorded] == ["autonomy_gate"]
+
+
+def test_gate_cli_rejects_unknown_request_without_creating_artifact(queue_mode, capsys):
+    rc = cli.main([
+        "gate", "--request-id", "dwr_unknown", "--action", "merge",
+        "--changed-path", "agent-src/devflow_delegation/gate.py",
+        "--changed-lines", "10", "--reversible",
+    ])
+
+    assert rc == 2
+    assert "unknown request" in capsys.readouterr().err
+
+
+def test_gate_cli_never_creates_operator_sentinel(queue_mode, hermes_root, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+
+    request_id = DelegationEmitter().ledger.list_requests()[0]["request_id"]
+    sentinel = hermes_root / "devflow" / ".autonomy_enabled"
+    assert not sentinel.exists()
+
+    rc = cli.main([
+        "gate", "--request-id", request_id, "--action", "deploy",
+        "--changed-path", "agent-src/devflow_delegation/gate.py",
+        "--changed-lines", "10", "--reversible",
+    ])
+
+    assert rc == 0
+    assert "authorized=False" in capsys.readouterr().out
+    assert not sentinel.exists()
+
+
+def test_gate_cli_requires_observed_diff_facts(queue_mode, capsys):
+    rc = cli.main(["gate", "--request-id", "dwr_unknown", "--action", "merge"])
+
+    assert rc == 2
+    assert "--changed-path" in capsys.readouterr().err
+
+
+def test_gate_cli_live_gateway_target_is_never_eligible(queue_mode, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+
+    request_id = DelegationEmitter().ledger.list_requests()[0]["request_id"]
+    rc = cli.main([
+        "gate", "--request-id", request_id, "--action", "merge",
+        "--changed-path", "agent-src/devflow_delegation/gate.py",
+        "--changed-lines", "10", "--reversible",
+    ])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "eligible=False" in out
+    assert "authorized=False" in out
+    assert "reason=live_gateway_target" in out
+
+
+def test_gate_cli_reads_but_never_acts_on_an_operator_sentinel(queue_mode, hermes_root, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+
+    request_id = DelegationEmitter().ledger.list_requests()[0]["request_id"]
+    sentinel = hermes_root / "devflow" / ".autonomy_enabled"
+    sentinel.write_text("operator-owned\n", encoding="utf-8")
+
+    rc = cli.main([
+        "gate", "--request-id", request_id, "--action", "merge",
+        "--changed-path", "agent-src/devflow_delegation/gate.py",
+        "--changed-lines", "10", "--reversible",
+    ])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "mode=enabled" in out
+    assert "authorized=False" in out
+    assert "reason=live_gateway_target" in out
+    assert sentinel.read_text(encoding="utf-8") == "operator-owned\n"

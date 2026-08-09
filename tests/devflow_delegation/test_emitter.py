@@ -138,6 +138,28 @@ def test_explicit_idempotency_key_dedups(emitter):
     assert r2.status == "duplicate" and r2.request_id == r1.request_id
 
 
+def test_explicit_idempotency_key_reopens_after_terminal_cooldown(emitter, hermes_root):
+    """Explicit producer keys need the same safe reopen behavior as auto keys."""
+    (hermes_root / "devflow").mkdir(parents=True, exist_ok=True)
+    (hermes_root / "devflow" / "policy.json").write_text(
+        json.dumps({"critic": {"mode": "queue", "cooldown_declined_hours": 0}}), encoding="utf-8")
+    em = DelegationEmitter()
+    kw = make_delegate_kwargs(idempotency_key="critic:gw-timeout:2026-08-06:v1")
+    first = em.delegate(**kw)
+    assert first.status == "queued"
+    em.ledger.set_state(first.request_id, "DECLINED", terminal_reason="fixture")
+    for envelope in em.inbox_dir.glob("*.json"):
+        envelope.unlink()
+
+    reopened = em.delegate(**kw)
+
+    assert reopened.status == "queued"
+    assert reopened.request_id != first.request_id
+    row = em.ledger.get_request(reopened.request_id)
+    assert row["idempotency_key"].startswith("critic:gw-timeout:2026-08-06:v1:")
+    assert em.ledger.summary_counts()["by_state"].get("REQUESTED") == 1
+
+
 def test_reconcile_rewrites_missing_envelope(emitter, hermes_root):
     r = emitter.delegate(mode="queue", **make_delegate_kwargs())
     inbox = hermes_root / "mailbox" / "devflow" / "inbox"
@@ -146,6 +168,51 @@ def test_reconcile_rewrites_missing_envelope(emitter, hermes_root):
     counts = emitter.reconcile()
     assert counts["rewritten"] == 1
     assert any(r.request_id in f.name for f in inbox.glob("*.json"))
+
+
+def test_reconcile_does_not_duplicate_v3_row_for_matching_legacy_v2_envelope(emitter, hermes_root):
+    """A legacy migration record is durable evidence for the same v3 request."""
+    key = "roadmap:sr-500:v1"
+    queued = emitter.delegate(
+        mode="queue",
+        **make_delegate_kwargs(
+            source={"agent": "roadmap-intake", "kind": "arch-review", "finding_id": "SR-500"},
+            idempotency_key=key,
+        ),
+    )
+    inbox = hermes_root / "mailbox" / "devflow" / "inbox"
+    next(inbox.glob("*.json")).unlink()
+    (inbox / "legacy-sr-500.json").write_text(json.dumps({
+        "type": "DEVFLOW_FIX_REQUEST",
+        "idempotency_key": key,
+        "from": "roadmap-intake",
+        "payload": {
+            "issue": "SR-500",
+            "task": "Restore bounded gateway health query",
+            "priority": "high",
+            "evidence": {"roadmap": "roadmap.md", "source_row": 42},
+        },
+    }), encoding="utf-8")
+
+    counts = emitter.reconcile()
+
+    assert counts == {"adopted": 0, "rewritten": 0}
+    assert emitter.ledger.summary_counts()["total"] == 1
+    assert emitter.ledger.find_by_idempotency_key(key)["request_id"] == queued.request_id
+
+
+def test_reconcile_skips_malformed_envelope_without_aborting(emitter, hermes_root):
+    """One malformed mailbox record cannot block a valid v3 repair pass."""
+    queued = emitter.delegate(mode="queue", **make_delegate_kwargs())
+    inbox = hermes_root / "mailbox" / "devflow" / "inbox"
+    next(inbox.glob("*.json")).unlink()
+    (inbox / "malformed-record.json").write_text("[]", encoding="utf-8")
+
+    counts = emitter.reconcile()
+
+    assert counts == {"adopted": 0, "rewritten": 1}
+    assert any(queued.request_id in path.name for path in inbox.glob("*.json"))
+    assert emitter.ledger.summary_counts()["total"] == 1
 
 
 def test_reconcile_adopts_orphan_envelope(emitter, hermes_root):

@@ -199,3 +199,103 @@ def test_find_by_idempotency_key(ledger):
     found = ledger.find_by_idempotency_key("critic:gw-timeout:v1")
     assert found["request_id"] == req.request_id
     assert ledger.find_by_idempotency_key("nonexistent:key") is None
+
+
+# Stage 2: transaction(), leases, and executor artifacts.
+def test_transaction_rolls_back_state_and_history_together(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    with pytest.raises(RuntimeError):
+        with ledger.transaction():
+            ledger.set_state(req.request_id, "PLANNED")
+            ledger.record_transition(req.request_id, "REQUESTED", "PLANNED", "test", "p1")
+            raise RuntimeError("simulated crash")
+
+    assert ledger.get_request(req.request_id)["state"] == "REQUESTED"
+    assert ledger.transitions_for(req.request_id) == []
+
+
+def test_nested_transaction_uses_savepoint(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    with ledger.transaction():
+        ledger.set_state(req.request_id, "TRIAGED")
+        with pytest.raises(RuntimeError):
+            with ledger.transaction():
+                ledger.set_state(req.request_id, "PLANNED")
+                raise RuntimeError("inner rollback")
+
+    assert ledger.get_request(req.request_id)["state"] == "TRIAGED"
+
+
+def test_lease_persists_attempt_and_worktree_identity(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    first = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-1")
+    assert first["attempt_count"] == 1
+    assert ledger.set_lease_worktree(req.request_id, "lse-1", "/tmp/worktree", "ddp-branch")
+    assert ledger.lease_for_request(req.request_id)["branch"] == "ddp-branch"
+    assert ledger.release_lease(req.request_id, "lse-1")
+
+    second = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-2")
+    assert second["attempt_count"] == 2
+
+
+def test_renew_heartbeat_renews_expiry(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+    lease = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-1", expires_in_seconds=60)
+
+    assert ledger.renew_heartbeat(req.request_id, lease["lease_id"], expires_in_seconds=600)
+    renewed = ledger.lease_for_request(req.request_id)
+    assert renewed["heartbeat_at"] >= lease["heartbeat_at"]
+    assert renewed["expires_at"] > lease["expires_at"]
+
+
+def test_artifacts_are_idempotent(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    ledger.add_artifact(req.request_id, "branch", "ddp-branch")
+    ledger.add_artifact(req.request_id, "branch", "ddp-branch")
+
+    assert ledger.artifacts_for(req.request_id) == [
+        {"id": 1, "request_id": req.request_id, "kind": "branch", "ref": "ddp-branch", "created_at": ledger.artifacts_for(req.request_id)[0]["created_at"]}
+    ]
+
+
+def test_stage2_schema_migrates_existing_ledger(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE requests (
+            request_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL,
+            fingerprint TEXT NOT NULL, envelope_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'REQUESTED', terminal_reason TEXT,
+            source_agent TEXT NOT NULL, source_kind TEXT NOT NULL,
+            target_repo TEXT NOT NULL, target_subsystem TEXT NOT NULL,
+            kind TEXT NOT NULL, severity TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE leases (
+            request_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL, holder TEXT NOT NULL,
+            acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, heartbeat_at TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    migrated = DelegationLedger(db)
+    schema = sqlite3.connect(db)
+    request_columns = {row[1] for row in schema.execute("PRAGMA table_info(requests)")}
+    lease_columns = {row[1] for row in schema.execute("PRAGMA table_info(leases)")}
+    tables = {row[0] for row in schema.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    schema.close()
+
+    assert "lease_attempt_count" in request_columns
+    assert {"worktree_path", "branch", "attempt_count"} <= lease_columns
+    assert "artifacts" in tables
+    migrated.close()

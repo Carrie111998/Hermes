@@ -11109,9 +11109,9 @@ def _open_session_db_for_profile(profile: Optional[str]):
     """
     from hermes_state import SessionDB
     if not profile:
-        return SessionDB()
+        return SessionDB(read_only=True)
     _name, home = _cron_profile_home(profile)
-    return SessionDB(db_path=Path(home) / "state.db")
+    return SessionDB(db_path=Path(home) / "state.db", read_only=True)
 
 
 @app.get("/api/sessions/{session_id}")

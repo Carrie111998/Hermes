@@ -151,3 +151,182 @@ def test_write_atomic_roundtrip(tmp_path):
     path = tmp_path / "sub" / "ai-tokens.json"
     write_atomic(path, {"generated_at": "x", "providers": []})
     assert json.loads(path.read_text(encoding="utf-8"))["generated_at"] == "x"
+
+
+def test_manual_snapshots_override_all_hermes_derived_providers(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    manual_path = tmp_path / "ai-usage-manual.json"
+    manual_path.write_text(json.dumps({
+        "schema_version": 1,
+        "providers": {
+            "gemini": {"used_pct": 65.0, "saved_at": "2026-08-08T19:30:00Z"},
+            "xai": {"used_pct": 35.0, "saved_at": "2026-08-08T19:30:00Z"},
+            "opencode-go": {"used_pct": 10.0, "saved_at": "2026-08-08T19:30:00Z"},
+        },
+    }), encoding="utf-8")
+
+    data = collect(
+        db_path=str(db),
+        prev=None,
+        fetch_usage=lambda _: FakeSnap(False, (), unavailable_reason="no token"),
+        now=datetime(2026, 8, 8, 19, 35, tzinfo=timezone.utc),
+        manual_store_path=str(manual_path),
+    )
+
+    by = {p["key"]: p for p in data["providers"]}
+    for key, expected_pct in (("gemini", 65.0), ("xai", 35.0), ("opencode-go", 10.0)):
+        row = by[key]
+        assert row["mode"] == "budget"
+        assert row["source"] == "manual"
+        assert row["state"] == "ok"
+        assert row["windows"][0]["used_pct"] == expected_pct
+
+
+def test_no_manual_record_preserves_hermes_fallback(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    manual_path = tmp_path / "ai-usage-manual.json"
+    manual_path.write_text(json.dumps({
+        "schema_version": 1,
+        "providers": {
+            "xai": {"used_pct": 10.0, "saved_at": "2026-08-08T19:30:00Z"},
+        },
+    }), encoding="utf-8")
+
+    data = collect(
+        db_path=str(db),
+        prev=None,
+        fetch_usage=lambda _: FakeSnap(False, (), unavailable_reason="no token"),
+        now=datetime(2026, 8, 8, 19, 35, tzinfo=timezone.utc),
+        manual_store_path=str(manual_path),
+    )
+
+    by = {p["key"]: p for p in data["providers"]}
+    assert by["gemini"]["mode"] == "spend"
+    assert by["gemini"]["source"] == "hermes"
+    assert by["xai"]["mode"] == "budget"
+    assert by["xai"]["source"] == "manual"
+
+
+def test_all_rows_receive_a_source_field(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+
+    def fetch(provider):
+        if provider == "anthropic":
+            return FakeSnap(True, (FakeWin("Current session", 62.0, None),))
+        if provider == "deepseek":
+            return FakeSnap(True, (), balance_usd=5.00)
+        return FakeSnap(False, (), unavailable_reason="no token")
+
+    data = collect(db_path=str(db), prev=None, fetch_usage=fetch, now=NOW)
+    by = {p["key"]: p for p in data["providers"]}
+
+    assert all("source" in row for row in data["providers"])
+    assert by["anthropic"]["source"] == "official"
+    assert by["deepseek"]["source"] == "official"
+    assert by["gemini"]["source"] == "hermes"
+    assert by["xai"]["source"] == "hermes"
+    assert by["opencode-go"]["source"] == "hermes"
+
+
+def test_stale_manual_snapshot_still_wins_over_hermes(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    manual_path = tmp_path / "ai-usage-manual.json"
+    manual_path.write_text(json.dumps({
+        "schema_version": 1,
+        "providers": {
+            "gemini": {"used_pct": 99.0, "saved_at": "2026-08-07T19:00:00Z"},
+        },
+    }), encoding="utf-8")
+
+    data = collect(
+        db_path=str(db),
+        prev=None,
+        fetch_usage=lambda _: FakeSnap(False, (), unavailable_reason="no token"),
+        now=datetime(2026, 8, 9, 19, 1, tzinfo=timezone.utc),
+        manual_store_path=str(manual_path),
+    )
+
+    gemini = {p["key"]: p for p in data["providers"]}["gemini"]
+    assert gemini["source"] == "manual"
+    assert gemini["state"] == "stale"
+    assert gemini["mode"] == "budget"
+
+
+def test_manual_snapshot_survives_missing_state_db(tmp_path):
+    manual_path = tmp_path / "ai-usage-manual.json"
+    manual_path.write_text(json.dumps({
+        "schema_version": 1,
+        "providers": {
+            "gemini": {"used_pct": 42.0, "saved_at": "2026-08-08T19:30:00Z"},
+        },
+    }), encoding="utf-8")
+
+    data = collect(
+        db_path=str(tmp_path / "missing-state.db"),
+        prev=None,
+        fetch_usage=lambda _: FakeSnap(False, (), unavailable_reason="no token"),
+        now=datetime(2026, 8, 8, 19, 35, tzinfo=timezone.utc),
+        manual_store_path=str(manual_path),
+    )
+
+    by = {p["key"]: p for p in data["providers"]}
+    assert by["gemini"]["source"] == "manual"
+    assert by["xai"]["source"] == "hermes"
+    assert by["xai"]["state"] == "error"
+
+
+def test_carried_forward_row_preserves_existing_source(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    prev = {
+        "providers": [{
+            "key": "anthropic",
+            "label": "Claude",
+            "mode": "budget",
+            "source": "manual",
+            "state": "ok",
+            "windows": [{"id": "5h", "label": "5h", "used_pct": 55.0}],
+            "detail": "last known",
+        }],
+    }
+
+    data = collect(
+        db_path=str(db),
+        prev=prev,
+        fetch_usage=lambda _: None,
+        now=NOW,
+    )
+
+    anthropic = {p["key"]: p for p in data["providers"]}["anthropic"]
+    assert anthropic["state"] == "stale"
+    assert anthropic["source"] == "manual"
+
+
+def test_carried_forward_pre_provenance_row_gets_hermes_source(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    prev = {
+        "providers": [{
+            "key": "gemini",
+            "label": "Gemini",
+            "mode": "spend",
+            "state": "ok",
+            "windows": [],
+            "detail": "last known",
+        }],
+    }
+
+    data = collect(
+        db_path=str(tmp_path / "missing-state.db"),
+        prev=prev,
+        fetch_usage=lambda _: None,
+        now=NOW,
+    )
+
+    gemini = {p["key"]: p for p in data["providers"]}["gemini"]
+    assert gemini["state"] == "stale"
+    assert gemini["source"] == "hermes"

@@ -2190,6 +2190,40 @@ class TestWebServerEndpoints:
             for r in results
         )
 
+    def test_get_session_messages_uses_read_only_db(self, monkeypatch):
+        """Transcript reads must not run unrelated Session Bridge migrations.
+
+        A damaged bridge ledger once made every imported Claude transcript fail
+        to open even though the session and message rows were intact.
+        """
+        import hermes_state
+
+        captured = {}
+
+        class _ReadOnlyMessagesDB:
+            def __init__(self, *args, **kwargs):
+                captured["read_only"] = kwargs.get("read_only")
+
+            def resolve_session_id(self, session_id):
+                return session_id
+
+            def resolve_resume_session_id(self, session_id):
+                return session_id
+
+            def get_messages(self, session_id, *, limit=None, offset=0):
+                return [{"role": "user", "content": "still readable"}]
+
+            def close(self):
+                captured["closed"] = True
+
+        monkeypatch.setattr(hermes_state, "SessionDB", _ReadOnlyMessagesDB)
+
+        resp = self.client.get("/api/sessions/claude:imported/messages")
+
+        assert resp.status_code == 200
+        assert resp.json()["messages"][0]["content"] == "still readable"
+        assert captured == {"read_only": True, "closed": True}
+
     def test_get_session_messages_follows_compression_tip(self):
         """Reading a compressed session by its old id should hydrate from the
         live continuation, matching /resume behavior."""
