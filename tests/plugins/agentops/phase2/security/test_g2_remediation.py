@@ -515,3 +515,12 @@ def test_coverage_requires_process_health_evidence():
     registry.record_target_snapshot(TargetSnapshot(target.target_id, datetime.now(timezone.utc), {"ok": True}))
     registry.record_process_result(target.target_id, False)
     assert registry.coverage_report().coverage_percent == 0
+
+
+def test_phase2_memory_sink_has_no_persistence_surface():
+    from plugins.agentops.control.observer_store import MemoryObserverStore, ObserverStoreError, open_observer_store
+    from plugins.agentops.control.config import load_agentops_config
+    sink = MemoryObserverStore()
+    now = datetime.now(timezone.utc); source = "sha256:" + "f" * 64
+    sink.commit_collection(CollectionBatch("hermes:profile:g2test:gateway", "memory", now, (), CollectorHealth(True), LogCursor(1, 1, source), source_id=source))
+    assert sink.collection_run_count() == 1 and sink.get_cursor("hermes:profile:g2test:gateway", "memory", source).offset == 1

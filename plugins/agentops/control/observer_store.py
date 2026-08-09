@@ -561,4 +561,33 @@ class ObserverStore:
 
 
 def open_observer_store(config: AgentOpsConfig) -> ObserverStore:
+    if os.environ.get("AGENTOPS_ALLOW_SQLITE_TEST_ONLY") != "1":
+        raise ObserverStoreError("Phase 2 SQLite persistence is deferred; use MemoryObserverStore")
     return ObserverStore(config)
+
+
+class MemoryObserverStore:
+    """Non-persistent Phase 2 observation sink."""
+    def __init__(self) -> None:
+        self._runs = []
+        self._signals = {}
+        self._cursors = {}
+
+    def commit_collection(self, batch: CollectionBatch) -> None:
+        if not isinstance(batch, CollectionBatch) or not batch.source_id:
+            raise ObserverStoreError("memory collection source required")
+        self._runs.append(batch)
+        for signal in batch.signals:
+            self._signals[signal.signal_id] = signal
+        if batch.next_cursor is not None:
+            key = (batch.target_id, batch.collector, batch.source_id)
+            prior = self._cursors.get(key)
+            if prior is None or batch.collected_at >= prior[0]:
+                self._cursors[key] = (batch.collected_at, batch.next_cursor)
+
+    def get_cursor(self, target_id: str, collector: str, source_id: str):
+        item = self._cursors.get((target_id, collector, source_id))
+        return None if item is None else item[1]
+
+    def collection_run_count(self): return len(self._runs)
+    def signal_count(self): return len(self._signals)
