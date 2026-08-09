@@ -41,6 +41,7 @@ not a G2 approval claim; independent Sol review remains required.
 | Final P0 closure | Existing legacy DBs are refused before writable migration; DB/sidecar identity is rechecked immediately after connect and before PRAGMA/migration/WAL. Existing/new path-swap tests remain an explicit release gate and are not claimed as G2 approval | `test_store_rejects_legacy_trigger_object_before_migration`; connect-boundary swap coverage is pending independent review |
 | Final P1 coverage status | Approved G2 scope is the default core only. Its fixed JSON deployment asset is verified with bounded owner/label/ProgramArguments checks and yields coverage 100% when snapshotted; feishu3/4/5/newbot remain explicitly out_of_scope/unmanaged and are excluded from the core denominator. No fleet-wide 100% claim is made | `test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targets`, `test_bootstrap_coverage_reports_process_observer_unmanaged` |
 | Persistence scope | Phase 2 default runtime has no SQLite writable surface. `open_observer_store` fails closed; `MemoryObserverStore` is the observation sink. fd-safe SQLite persistence is deferred, and A→B→A/legacy/new DB writes are not claimed | memory sink contract tests; persistence refusal path |
+| Public writer refusal | `ObserverStore` constructor and `open_observer_store` fail in clean subprocesses with and without legacy env; no observer DB sidecars are created | `test_public_sqlite_writer_entrypoints_fail_closed_in_subprocess` |
 | Approved G2 scope adjustment | G2 core denominator is only the default daily-production profile. feishu3/4/5/newbot remain registered but are explicitly `out_of_scope`/unmanaged and excluded from the core denominator; this does not claim fleet-wide 100% coverage | `test_bootstrap_coverage_reports_process_observer_unmanaged` plus scope assertions |
 | Default core binding | The fixed default asset supplies executable-name matching (`python3.11`) and exact ProgramArguments fingerprint; only this asset gets optional marker/service-label semantics, with exact fingerprint/owner and process-health evidence still mandatory. Other profiles remain out of scope | `test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targets`, `test_default_deployment_asset_parser_rejects_malformed_and_wrong_arguments`, `test_default_process_binding_accepts_exact_command_without_string_markers`, `test_coverage_requires_process_health_evidence` |
 | P2 deep freeze/interpreter parity | Recursive immutable mappings detach snapshot/signal data; separate Python 3.14 environment contains dependencies | `test_asset_binding_deadline_and_snapshot_deep_freeze`; Python 3.14 command below |
@@ -52,7 +53,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-122 passed in 3.65s
+123 passed in 3.50s
 ```
 
 ```bash
@@ -60,7 +61,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-122 passed in 6.43s
+123 passed in 6.43s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -72,7 +73,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.45s
+122 passed in 2.86s
 ```
 
 ```text

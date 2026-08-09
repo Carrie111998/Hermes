@@ -5,7 +5,7 @@ import pytest
 from plugins.agentops.control.models import AuthorityMode
 from plugins.agentops.control.observer_models import TargetSnapshot, CollectionBatch, CollectorHealth, RawSignal
 from plugins.agentops.control.registry import TargetRegistrationError, bootstrap_gateway_registry
-from plugins.agentops.control.redaction import redact_signal
+from plugins.agentops.control.collectors.processes import ProcessCollector
 
 
 def test_bootstrap_registry_has_the_five_phase_zero_profiles_in_observe_only_mode():
@@ -39,8 +39,15 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
         registry.record_target_snapshot(
             TargetSnapshot(target_id=target.target_id, observed_at=observed_at, facts={"present": True})
         )
-    process_signal = redact_signal(RawSignal("hermes:profile:default:gateway", "processes", "process.snapshot", observed_at, {"pid": 1}))
-    registry.record_process_result(CollectionBatch("hermes:profile:default:gateway", "processes", observed_at, (process_signal,), CollectorHealth(True), source_id="sha256:" + "1" * 64))
+    class P:
+        pid = 1
+        def name(self): return "python3.11"
+        def cmdline(self): return ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+        def uids(self):
+            class U: real = __import__("os").getuid()
+            return U()
+    process_batch = ProcessCollector(process_iter=lambda: [P()]).collect(default)
+    registry.record_process_result(process_batch)
 
     coverage = registry.coverage_report()
     assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (1, 1, 100)
