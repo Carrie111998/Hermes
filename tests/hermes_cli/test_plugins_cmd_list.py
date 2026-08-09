@@ -37,6 +37,19 @@ _SHARED_ALLOW_SOURCE_CANDIDATES = [
         "standalone",
     ),
 ]
+_XAI_DEPENDENT_SOURCE_CANDIDATES = [
+    ("xai", "1.0", "Images", "user", None, "image_gen/xai", "standalone"),
+    ("xai", "1.0", "Video", "user", None, "video_gen/xai", "standalone"),
+    (
+        "project-shadow",
+        "2.0",
+        "Project",
+        "project",
+        None,
+        "video_gen/xai",
+        "standalone",
+    ),
+]
 
 
 def _args(**kwargs):
@@ -439,6 +452,148 @@ def test_composite_enable_keeps_shared_allow_and_sibling_source_winner(monkeypat
     ]
 
 
+@pytest.mark.parametrize("surface", ["cli", "dashboard"])
+def test_sequential_disable_clears_last_shared_allow(
+    monkeypatch,
+    surface,
+):
+    candidates = _XAI_DEPENDENT_SOURCE_CANDIDATES
+    state = {"enabled": {"xai"}, "disabled": set()}
+    resolutions = {
+        "image_gen/xai": (
+            "image_gen/xai",
+            "user",
+            "xai",
+            "standalone",
+        ),
+        "video_gen/xai": (
+            "video_gen/xai",
+            "user",
+            "xai",
+            "standalone",
+        ),
+    }
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_resolve_plugin_key_and_source",
+        resolutions.__getitem__,
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_enabled_set",
+        lambda: set(state["enabled"]),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_disabled_set",
+        lambda: set(state["disabled"]),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: state.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: state.update(disabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_toggle_plugin_toolset",
+        lambda *args, **kwargs: None,
+    )
+
+    def _disable(key):
+        if surface == "cli":
+            plugins_cmd.cmd_disable(key)
+        else:
+            result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+                key,
+                enabled=False,
+            )
+            assert result["unchanged"] is False
+
+    _disable("image_gen/xai")
+    assert state == {
+        "enabled": {"xai"},
+        "disabled": {"image_gen/xai"},
+    }
+    first_activation = PluginActivationState(
+        enabled=frozenset(state["enabled"]),
+        disabled=frozenset(state["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(
+        candidates,
+        first_activation,
+    ) == [candidates[1]]
+
+    _disable("video_gen/xai")
+    assert state == {
+        "enabled": set(),
+        "disabled": {"image_gen/xai", "video_gen/xai"},
+    }
+    final_activation = PluginActivationState(
+        enabled=frozenset(state["enabled"]),
+        disabled=frozenset(state["disabled"]),
+    )
+    assert final_activation.status(
+        name="xai",
+        key="xai",
+        source="user",
+        kind="standalone",
+    ) == "not enabled"
+
+
+def test_composite_disable_two_groups_clears_last_shared_allow(monkeypatch):
+    candidates = _XAI_DEPENDENT_SOURCE_CANDIDATES
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"xai"})
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+
+    changed = plugins_cmd._persist_composite_plugin_selection(
+        ["image_gen/xai", "video_gen/xai"],
+        {0, 1},
+        set(),
+        set(),
+    )
+
+    assert changed is True
+    assert saved == {
+        "enabled": set(),
+        "disabled": {"image_gen/xai", "video_gen/xai"},
+    }
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert activation.status(
+        name="xai",
+        key="xai",
+        source="user",
+        kind="standalone",
+    ) == "not enabled"
+
+
 def test_dashboard_toggle_response_keeps_input_name_and_adds_key(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
@@ -551,7 +706,7 @@ def test_dashboard_enable_preserves_other_shared_manifest_key_deny(monkeypatch):
     ]
 
 
-def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch):
+def test_dashboard_disable_drops_redundant_bundled_allow(monkeypatch):
     candidates = [
         ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
         ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
@@ -588,7 +743,7 @@ def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch
 
     assert result["unchanged"] is False
     assert saved == {
-        "enabled": {"xai"},
+        "enabled": set(),
         "disabled": {"image_gen/xai"},
     }
     activation = PluginActivationState(

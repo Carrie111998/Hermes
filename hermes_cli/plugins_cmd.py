@@ -897,8 +897,18 @@ def _plugin_runtime_identity_changes(
     return identities, preserved_entries
 
 
-def _plugin_disable_identities_to_clear(key: str) -> set[str]:
-    """Return target identities that do not also activate another key."""
+def _plugin_disable_identity_changes(
+    key: str,
+    enabled: set[str],
+    disabled: set[str],
+) -> tuple[set[str], set[str]]:
+    """Return safe allow/deny identities to clear while disabling *key*.
+
+    A manifest-name allow can cover several canonical groups. Keep such an
+    alias only when removing it would change another group's resolved winner
+    or status after the target deny takes effect. Shared denies are never
+    rewritten here.
+    """
     candidates = _discover_plugin_candidates()
     target_identities = {key}
     for entry in candidates:
@@ -912,7 +922,35 @@ def _plugin_disable_identities_to_clear(key: str) -> set[str]:
         for identity in (entry[0], entry[5])
         if identity in target_identities
     }
-    return target_identities - shared_identities
+    exclusive_identities = target_identities - shared_identities
+    enabled_to_clear = set(exclusive_identities)
+
+    proposed_disabled = set(disabled)
+    proposed_disabled.add(key)
+
+    def _other_group_records(configured_enabled: set[str]) -> list:
+        activation = PluginActivationState(
+            enabled=frozenset(configured_enabled),
+            disabled=frozenset(proposed_disabled),
+        )
+        return [
+            (entry, status)
+            for entry, status in _select_plugin_display_records(
+                candidates,
+                activation,
+            )
+            if entry[5] != key
+        ]
+
+    working_enabled = set(enabled)
+    baseline = _other_group_records(working_enabled)
+    for identity in sorted(shared_identities & working_enabled):
+        without_identity = working_enabled - {identity}
+        if _other_group_records(without_identity) == baseline:
+            enabled_to_clear.add(identity)
+            working_enabled = without_identity
+
+    return enabled_to_clear, exclusive_identities
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
@@ -1060,9 +1098,13 @@ def cmd_disable(name: str) -> None:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
 
-    identities = _plugin_disable_identities_to_clear(key)
-    enabled.difference_update(identities)
-    disabled.difference_update(identities)
+    enabled_ids, disabled_ids = _plugin_disable_identity_changes(
+        key,
+        enabled,
+        disabled,
+    )
+    enabled.difference_update(enabled_ids)
+    disabled.difference_update(disabled_ids)
     disabled.add(key)
     _save_enabled_set(enabled)
     _save_disabled_set(disabled)
@@ -1768,9 +1810,13 @@ def _persist_composite_plugin_selection(
 
     for i in sorted(initial_selected - chosen):
         key = plugin_keys[i]
-        enabled_ids = _plugin_disable_identities_to_clear(key)
+        enabled_ids, disabled_ids = _plugin_disable_identity_changes(
+            key,
+            new_enabled,
+            new_disabled,
+        )
         new_enabled.difference_update(enabled_ids)
-        new_disabled.difference_update(enabled_ids)
+        new_disabled.difference_update(disabled_ids)
         new_disabled.add(key)
 
     changed = new_enabled != previous_enabled or new_disabled != disabled
@@ -2257,9 +2303,9 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     if status == "disabled":
         return {"ok": True, "name": name, "key": key, "unchanged": True}
 
-    identities = _plugin_disable_identities_to_clear(key)
-    en.difference_update(identities)
-    dis.difference_update(identities)
+    enabled_ids, disabled_ids = _plugin_disable_identity_changes(key, en, dis)
+    en.difference_update(enabled_ids)
+    dis.difference_update(disabled_ids)
     dis.add(key)
     _save_enabled_set(en)
     _save_disabled_set(dis)

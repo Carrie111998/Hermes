@@ -246,7 +246,7 @@ class TestEnableDisableNested:
             candidates[0]
         ]
 
-    def test_disable_shared_manifest_preserves_other_canonical_allow(
+    def test_disable_shared_manifest_drops_redundant_bundled_allow(
         self,
         monkeypatch,
     ):
@@ -282,7 +282,7 @@ class TestEnableDisableNested:
         plugins_cmd.cmd_disable("image_gen/xai")
 
         assert saved == {
-            "enabled": {"xai"},
+            "enabled": set(),
             "disabled": {"image_gen/xai"},
         }
         activation = PluginActivationState(
