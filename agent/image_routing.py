@@ -12,9 +12,16 @@ Two modes:
             it only sees a lossy text summary. This is the pre-existing
             behaviour and still the right choice for non-vision models.
 
+  attach  — do not pre-analyze at all. The cached local image path is exposed
+            as plain text so the agent can call ``vision_analyze`` itself
+            when it needs to inspect the image.  No extra LLM call is spent
+            on auto-summarization; the agent decides when (and whether) to
+            look at the image.  Useful for gateway platforms where an image
+            arrives without text and the user wants zero-cost intake.
+
 The decision is made once per message turn by :func:`decide_image_input_mode`.
 It reads ``agent.image_input_mode`` from config.yaml (``auto`` | ``native``
-| ``text``, default ``auto``) and the active model's capability metadata.
+| ``text`` | ``attach``, default ``auto``) and the active model's capability metadata.
 
 In ``auto`` mode:
   - If the active model reports ``supports_vision=True`` (via config
@@ -49,7 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 
-_VALID_MODES = frozenset({"auto", "native", "text"})
+_VALID_MODES = frozenset({"auto", "native", "text", "attach"})
 
 
 # Image extensions used by extract_image_refs(). Kept tight on purpose — we
@@ -483,6 +490,8 @@ def decide_image_input_mode(
         return "native"
     if mode_cfg == "text":
         return "text"
+    if mode_cfg == "attach":
+        return "attach"
 
     # auto: prefer native vision when the main model supports it. An
     # explicit auxiliary.vision config acts as a *fallback* for text-only

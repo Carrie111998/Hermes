@@ -262,6 +262,10 @@ DEFAULT_CONFIG = {
         #              (see run_agent._prepare_messages_for_api).
         #   "text"   — always pre-analyze with vision_analyze and prepend the
         #              description as text; the main model never sees pixels.
+        #   "attach" — do not pre-analyze; expose the cached local image path
+        #              as text so the agent can call vision_analyze itself
+        #              when it needs to inspect the image.  No extra LLM call
+        #              is spent on auto-summarization.
         # Affects gateway platforms, the TUI, and CLI /attach.  vision_analyze
         # remains available as a tool regardless of this setting — the routing
         # only controls how inbound user images are presented.

@@ -78,6 +78,22 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", None) == "native"
 
+    def test_attach_mode_returns_attach_regardless_of_vision_capability(self):
+        """attach mode short-circuits before capability lookup: no auto-summary."""
+        cfg = {"agent": {"image_input_mode": "attach"}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "attach"
+
+    def test_attach_mode_with_text_only_model(self):
+        """attach is a valid explicit choice for non-vision main models too."""
+        cfg = {"agent": {"image_input_mode": "attach"}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=False):
+            assert decide_image_input_mode("deepseek", "deepseek-v4-flash", cfg) == "attach"
+
+    def test_attach_is_valid_coerced_mode(self):
+        assert _coerce_mode("attach") == "attach"
+        assert _coerce_mode("ATTACH") == "attach"
+
 
 
 

@@ -16288,6 +16288,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Image routing: native (model supports vision). %d image(s) will be attached inline.",
                         len(image_paths),
                     )
+                elif _img_mode == "attach":
+                    # Attach-only: do NOT auto-summarize via vision_analyze.
+                    # Expose the cached image paths as text so the agent can
+                    # inspect them on demand with the vision_analyze tool.
+                    logger.info(
+                        "Image routing: attach (no auto-summary). %d image(s) exposed as paths.",
+                        len(image_paths),
+                    )
+                    _attach_parts = [
+                        f"[The user sent an image: {p}]"
+                        f"[Inspect it on demand with vision_analyze(image_url: {p})]"
+                        for p in image_paths
+                    ]
+                    message_text = (
+                        "\n\n".join(_attach_parts) + "\n\n" + message_text
+                        if message_text.strip()
+                        else "\n\n".join(_attach_parts)
+                    )
                 else:
                     logger.info(
                         "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
@@ -20076,6 +20094,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
             enriched_prompt = prompt
+            img_mode = str(
+                (user_config.get("agent") or {}).get("image_input_mode") or "auto"
+            ).strip().lower()
             if media_urls:
                 image_paths = []
                 for i, path in enumerate(media_urls):
@@ -20083,12 +20104,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if mtype.startswith("image/"):
                         image_paths.append(path)
                 if image_paths:
-                    try:
-                        enriched_prompt = await self._enrich_message_with_vision(
-                            prompt, image_paths,
+                    if img_mode == "attach":
+                        # Attach-only: no auto-summary; expose cached paths as
+                        # text so the background agent can call vision_analyze
+                        # on demand (same as the main flow).
+                        _attach_parts = [
+                            f"[The user sent an image: {p}]"
+                            f"[Inspect it on demand with vision_analyze(image_url: {p})]"
+                            for p in image_paths
+                        ]
+                        enriched_prompt = (
+                            "\n\n".join(_attach_parts) + "\n\n" + prompt
+                            if prompt.strip()
+                            else "\n\n".join(_attach_parts)
                         )
-                    except Exception as e:
-                        logger.warning("Background task vision enrichment failed: %s", e)
+                    else:
+                        try:
+                            enriched_prompt = await self._enrich_message_with_vision(
+                                prompt, image_paths,
+                            )
+                        except Exception as e:
+                            logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
                 agent = AIAgent(
