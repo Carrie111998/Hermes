@@ -241,8 +241,8 @@ def get_profiles_sessions_sidebar(
     """Batched sidebar session slices — one profile-DB open per refresh.
 
     The desktop sidebar needs three source-scoped windows per refresh: recents
-    (local chats, scoped to the active profile), cron sessions (all profiles),
-    and messaging-platform sessions (all profiles). Served as three separate
+    (local chats), cron sessions, and messaging-platform sessions, all scoped
+    to the requested profile. Served as three separate
     ``/api/profiles/sessions`` calls they reopened every profile's ``state.db``
     three times and re-counted each refresh. This opens each DB once and runs
     the three filtered queries together, returning the three windows in one
@@ -257,8 +257,8 @@ def get_profiles_sessions_sidebar(
     """
     from hermes_cli import profiles as profiles_mod
 
-    # cron + messaging are cross-profile; recents is scoped to recents_profile.
-    # Scan every profile once regardless (each DB opened a single time).
+    # All slices share recents_profile; the explicit "all" scope retains the
+    # unified cross-profile view. Each selected DB is opened a single time.
     try:
         infos = profiles_mod.list_profiles()
         targets: List[Tuple[str, Path]] = [(info.name, info.path) for info in infos]
@@ -314,6 +314,8 @@ def get_profiles_sessions_sidebar(
         )
 
     for name, home in targets:
+        if recents_scope != "all" and name != recents_scope:
+            continue
         db_path = Path(home) / "state.db"
         if not db_path.exists():
             continue
@@ -327,16 +329,15 @@ def get_profiles_sessions_sidebar(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
-            if recents_scope == "all" or name == recents_scope:
-                profile_rows = _slice(db, exclude=recents_exclude_list, cap=recents_cap)
-                # A full window means more rows remain on disk. That is all the
-                # sidebar's "load more" needs, and unlike an exact COUNT(*) per
-                # profile per refresh it costs nothing beyond the rows already
-                # read. Discount pinned back-fills — they arrive past the LIMIT
-                # and would otherwise fake a full page on a short list.
-                unpinned_count = sum(1 for s in profile_rows if not s.get("pinned"))
-                recents_truncated[name] = unpinned_count >= recents_cap
-                recents_rows.extend(_tag(profile_rows, name))
+            profile_rows = _slice(db, exclude=recents_exclude_list, cap=recents_cap)
+            # A full window means more rows remain on disk. That is all the
+            # sidebar's "load more" needs, and unlike an exact COUNT(*) per
+            # profile per refresh it costs nothing beyond the rows already
+            # read. Discount pinned back-fills — they arrive past the LIMIT
+            # and would otherwise fake a full page on a short list.
+            unpinned_count = sum(1 for s in profile_rows if not s.get("pinned"))
+            recents_truncated[name] = unpinned_count >= recents_cap
+            recents_rows.extend(_tag(profile_rows, name))
             cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
             messaging_rows.extend(
                 _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)

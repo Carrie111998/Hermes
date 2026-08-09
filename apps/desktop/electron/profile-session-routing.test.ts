@@ -2,7 +2,32 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { fetchPrimaryProfileSessions } from './profile-session-routing'
+import { fetchPrimaryProfileSessions, sidebarSessionSliceParams } from './profile-session-routing'
+
+test('sidebar slice fan-out keeps every slice on the requested profile', () => {
+  const slices = sidebarSessionSliceParams(
+    new URLSearchParams({
+      recents_profile: 'work',
+      recents_limit: '30',
+      cron_limit: '50',
+      messaging_limit: '100',
+      recents_exclude: 'cron,tool',
+      messaging_exclude: 'cron,desktop'
+    })
+  )
+
+  assert.equal(slices.recents.get('profile'), 'work')
+  assert.equal(slices.cron.get('profile'), 'work')
+  assert.equal(slices.messaging.get('profile'), 'work')
+})
+
+test('sidebar slice fan-out preserves the explicit all-profiles scope', () => {
+  const slices = sidebarSessionSliceParams(new URLSearchParams({ recents_profile: 'all' }))
+
+  assert.equal(slices.recents.get('profile'), 'all')
+  assert.equal(slices.cron.get('profile'), 'all')
+  assert.equal(slices.messaging.get('profile'), 'all')
+})
 
 test('primary session reads use the profile-aware request path', async () => {
   const calls: Array<{ profile: string | null; path: string }> = []

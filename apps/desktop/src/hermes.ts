@@ -452,8 +452,8 @@ export async function listAllProfileSessions(
   }
 }
 
-// Batched sidebar slices in one request: recents (scoped to the active profile),
-// cron, and messaging. The backend opens each profile's state.db once and runs
+// Batched sidebar slices in one request: recents, cron, and messaging, all
+// scoped to the requested profile. The backend opens each profile's state.db once and runs
 // all three filtered queries, replacing three separate listAllProfileSessions
 // calls that each reopened + re-counted every profile DB per refresh. Electron
 // splices remote profiles per slice (see interceptSessionRequestForRemote).
@@ -535,15 +535,15 @@ function isEndpointMissingError(err: unknown): boolean {
 // Compatibility fallback: reassemble the three sidebar slices from the
 // per-slice endpoint, mirroring the batched route's semantics (min_messages=1,
 // archived excluded, recency order; recents scoped to the caller's profile,
-// cron + messaging cross-profile). Rides the same Electron remote-splice
+// cron + messaging scoped to that same profile). Rides the same Electron remote-splice
 // interception as the pre-batching desktop, so remote profiles stay correct.
 async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<SidebarSessionsResponse> {
   const [recents, cron, messaging] = await Promise.all([
     listAllProfileSessions(req.recentsLimit, 1, 'exclude', 'recent', req.recentsProfile, {
       excludeSources: req.recentsExclude
     }),
-    listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', 'all', { source: 'cron' }),
-    listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', 'all', {
+    listAllProfileSessions(req.cronLimit, 1, 'exclude', 'recent', req.recentsProfile, { source: 'cron' }),
+    listAllProfileSessions(req.messagingLimit, 1, 'exclude', 'recent', req.recentsProfile, {
       excludeSources: req.messagingExclude
     })
   ])
