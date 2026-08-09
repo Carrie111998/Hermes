@@ -662,7 +662,21 @@ class GitHubSource(SkillSource):
         repo = f"{parts[0]}/{parts[1]}"
         skill_path = parts[2]
 
-        skill_md = self._fetch_file_content(repo, f"{skill_path.rstrip('/')}/SKILL.md")
+        # Resolve the tree first so every byte in the tree-backed bundle can
+        # be fetched from the same immutable snapshot as its path and mode.
+        # Contents API requests without ``ref`` follow the moving default
+        # branch and can otherwise mix revisions during a concurrent push.
+        tree = self._get_repo_tree(repo)
+        revision = ""
+        if tree is not None:
+            branch, _entries = tree
+            revision = self._tree_revisions.get(repo) or branch
+
+        skill_md = self._fetch_file_content(
+            repo,
+            f"{skill_path.rstrip('/')}/SKILL.md",
+            ref=revision or None,
+        )
         if skill_md is None:
             return None
         # Keep link validation even though GitHub bundles are now enumerated
@@ -675,7 +689,6 @@ class GitHubSource(SkillSource):
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
         file_modes: Dict[str, int] = {}
         warnings: List[str] = []
-        tree = self._get_repo_tree(repo)
         if tree is not None:
             branch, entries = tree
             prefix = f"{skill_path.rstrip('/')}/"
@@ -707,7 +720,7 @@ class GitHubSource(SkillSource):
                 if rel_path == "SKILL.md":
                     saw_skill_md = True
                     continue
-                content = self._fetch_file_bytes(repo, item_path)
+                content = self._fetch_file_bytes(repo, item_path, ref=revision)
                 if content is None:
                     logger.warning("Failed to fetch skill bundle file: %s", item_path)
                     return None
@@ -715,7 +728,6 @@ class GitHubSource(SkillSource):
             if not saw_skill_md:
                 logger.warning("Git tree did not contain the resolved skill file: %sSKILL.md", prefix)
                 return None
-            revision = self._tree_revisions.get(repo) or branch
         else:
             downloaded = self._download_bundle_via_contents(repo, skill_path)
             if downloaded is None or "SKILL.md" not in downloaded:
@@ -1153,9 +1165,11 @@ class GitHubSource(SkillSource):
 
         return None
 
-    def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
+    def _fetch_file_content(
+        self, repo: str, path: str, *, ref: Optional[str] = None
+    ) -> Optional[str]:
         """Fetch a single text file from GitHub."""
-        content = self._fetch_file_bytes(repo, path)
+        content = self._fetch_file_bytes(repo, path, ref=ref)
         if content is None:
             return None
         try:
@@ -1163,11 +1177,14 @@ class GitHubSource(SkillSource):
         except UnicodeDecodeError:
             return None
 
-    def _fetch_file_bytes(self, repo: str, path: str) -> Optional[bytes]:
+    def _fetch_file_bytes(
+        self, repo: str, path: str, *, ref: Optional[str] = None
+    ) -> Optional[bytes]:
         """Fetch exact file bytes from GitHub without text decoding."""
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         resp = self._github_get(
             url,
+            params={"ref": ref} if ref else None,
             headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
         )
         if resp is not None and resp.status_code == 200:

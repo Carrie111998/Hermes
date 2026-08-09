@@ -106,7 +106,11 @@ def test_url_source_rejects_traversal_reference(monkeypatch):
 
 def test_github_source_rejects_symlink_in_referenced_directory(monkeypatch):
     source = GitHubSource(GitHubAuth())
-    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path: SKILL_MD if path.endswith("SKILL.md") else "x")
+    monkeypatch.setattr(
+        source,
+        "_fetch_file_content",
+        lambda _repo, path, **_kwargs: SKILL_MD if path.endswith("SKILL.md") else "x",
+    )
     source._tree_cache["owner/repo"] = (
         "main",
         [

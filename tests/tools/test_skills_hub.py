@@ -307,7 +307,11 @@ class TestGitHubBundleFetch:
                  {"path": "skills/demo/assets/logo.png", "type": "blob", "mode": "100644"},
                  {"path": "skills/other/SKILL.md", "type": "blob", "mode": "100644"},
              ])), \
-             patch.object(source, "_fetch_file_bytes", side_effect=lambda _repo, path: path.encode()):
+             patch.object(
+                 source,
+                 "_fetch_file_bytes",
+                 side_effect=lambda _repo, path, **_kwargs: path.encode(),
+             ):
             bundle = source.fetch("owner/repo/skills/demo")
 
         assert bundle is not None
@@ -320,6 +324,33 @@ class TestGitHubBundleFetch:
         }
         assert bundle.metadata["source_revision"] == "abc123"
         assert bundle.metadata["bundle_warnings"] == []
+
+    def test_fetch_pins_every_tree_backed_file_to_one_revision(self):
+        source = self._source()
+        source._tree_revisions["owner/repo"] = "abc123"
+        skill_md = "---\nname: demo\n---\n"
+
+        with patch.object(
+            source, "_fetch_file_content", return_value=skill_md
+        ) as fetch_text, patch.object(
+            source,
+            "_get_repo_tree",
+            return_value=("main", [
+                {"path": "demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "demo/scripts/run", "type": "blob", "mode": "100755"},
+            ]),
+        ), patch.object(
+            source, "_fetch_file_bytes", return_value=b"#!/bin/sh\n"
+        ) as fetch_bytes:
+            bundle = source.fetch("owner/repo/demo")
+
+        assert bundle is not None
+        fetch_text.assert_called_once_with(
+            "owner/repo", "demo/SKILL.md", ref="abc123"
+        )
+        fetch_bytes.assert_called_once_with(
+            "owner/repo", "demo/scripts/run", ref="abc123"
+        )
 
     def test_fetch_fails_instead_of_returning_partial_tree_bundle(self):
         source = self._source()
@@ -380,7 +411,7 @@ class TestGitHubBundleFetch:
              patch.object(
                  source,
                  "_fetch_file_bytes",
-                 side_effect=lambda _repo, path: path.encode(),
+                 side_effect=lambda _repo, path, **_kwargs: path.encode(),
              ):
             files = source._download_bundle_via_contents("owner/repo", "demo")
 
