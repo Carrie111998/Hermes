@@ -2561,7 +2561,17 @@ _VERTEX_PROVIDER_ALIASES = frozenset(
 
 
 def _runtime_resolve_memo_signature() -> tuple:
-    """(config sig, profile auth sig, global auth sig) — mtime+size of each.
+    """(hermes_home, config sig, profile auth sig, global auth sig).
+
+    ``hermes_home`` is part of the key because a multiplex gateway resolves
+    multiple profiles' agents in the same OS process (the desktop tui_gateway
+    switches profiles per request via ``set_hermes_home_override``). Without
+    it, two profiles whose config.yaml/auth.json happen to share the same
+    (mtime_ns, size) — e.g. ``hermes profile create --clone-all`` copies the
+    tree with mtime-preserving ``shutil.copy2`` — would resolve to the same
+    memo slot and one profile would receive the other's cached api_key /
+    base_url for up to the TTL. Same profile-boundary fix as #78185 applies
+    to agent/moa_loop.py's sibling cache.
 
     A missing file contributes None so an auth.json that appears later
     (first `hermes auth add`) invalidates the memo.
@@ -2587,6 +2597,7 @@ def _runtime_resolve_memo_signature() -> tuple:
     except Exception:
         auth_path = global_path = None
     return (
+        str(get_hermes_home()),
         _sig(cfg_path) if cfg_path is not None else None,
         _sig(auth_path) if auth_path is not None else None,
         _sig(global_path) if global_path is not None else None,
