@@ -68,7 +68,12 @@ def _is_ancestor_or_same(a: Path, b: Path) -> bool:
         return False
 
 
-def _is_denied_context_path(path: Path, *, base_path: Path) -> bool:
+def _is_denied_context_path(
+    path: Path,
+    *,
+    base_path: Path,
+    canonicalize: bool = True,
+) -> bool:
     """Return whether progressive context discovery must not inspect *path*.
 
     Context hints are an implicit file-read path, so they inherit the same
@@ -86,7 +91,7 @@ def _is_denied_context_path(path: Path, *, base_path: Path) -> bool:
             str(path),
             patterns=patterns,
             base_path=base_path,
-            canonicalize=True,
+            canonicalize=canonicalize,
         ) is not None
     except Exception:
         logger.warning(
@@ -204,26 +209,52 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
-            if _is_denied_context_path(p, base_path=self.working_dir):
-                return
             p = p.absolute()
+
+            # Preflight the complete lexical ancestor chain before realpath,
+            # exists/is_file/is_dir, or hint-file probes. A fixed-width rule can
+            # deny an ancestor without matching a deeper descendant.
+            if self._has_denied_lexical_ancestor(p):
+                return
             if _is_denied_context_path(p, base_path=self.working_dir):
                 return
             # Use parent if it's a file path (has extension or doesn't exist as dir)
             if p.suffix or (p.exists() and p.is_file()):
                 p = p.parent
             # Walk up ancestors — stop at already-loaded or root
+            pending: Set[Path] = set()
             for _ in range(_MAX_ANCESTOR_WALK):
                 if p in self._loaded_dirs:
                     break
+                if _is_denied_context_path(p, base_path=self.working_dir):
+                    return
                 if self._is_valid_subdir(p):
-                    candidates.add(p)
+                    pending.add(p)
                 parent = p.parent
                 if parent == p:
                     break  # filesystem root
                 p = parent
+            candidates.update(pending)
         except (OSError, ValueError, RuntimeError):
             pass
+
+    def _has_denied_lexical_ancestor(self, path: Path) -> bool:
+        """Check the progressive walk chain without filesystem canonicalization."""
+        current = path
+        for _ in range(_MAX_ANCESTOR_WALK + 1):
+            if _is_denied_context_path(
+                current,
+                base_path=self.working_dir,
+                canonicalize=False,
+            ):
+                return True
+            if current == self.working_dir:
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        return False
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
         """Extract path-like tokens from a shell command string."""
@@ -252,10 +283,9 @@ class SubdirectoryHintTracker:
         (e.g. ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md), which causes
         cross-agent context contamination and instruction mixup.
         """
-        try:
-            if not path.is_dir():
-                return False
-        except OSError:
+        if self._has_denied_lexical_ancestor(path):
+            return False
+        if _is_denied_context_path(path, base_path=self.working_dir):
             return False
         if path in self._loaded_dirs:
             return False
@@ -269,6 +299,11 @@ class SubdirectoryHintTracker:
         except (OSError, ValueError):
             if not _is_ancestor_or_same(self.working_dir, path):
                 return False
+        try:
+            if not path.is_dir():
+                return False
+        except OSError:
+            return False
         if self._is_excluded(path):
             return False
         return True

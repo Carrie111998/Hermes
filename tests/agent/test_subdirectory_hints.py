@@ -181,6 +181,53 @@ class TestSubdirectoryHintTracker:
         ):
             SubdirectoryHintTracker(working_dir=str(lexical_workdir))
 
+    def test_progressive_discovery_preflights_denied_ancestor_before_metadata(
+        self,
+        tmp_path,
+    ):
+        denied_ancestor = tmp_path / "private1"
+        nested = denied_ancestor / "src"
+        nested.mkdir(parents=True)
+        hint = nested / "AGENTS.md"
+        hint.write_text("DENIED ANCESTOR CONTEXT")
+        target = nested / "file.py"
+        target.write_text("data")
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        original_is_dir = Path.is_dir
+        original_read_text = Path.read_text
+
+        def guarded_is_dir(path_obj):
+            if denied_ancestor == path_obj or denied_ancestor in path_obj.parents:
+                raise AssertionError("denied ancestor subtree was probed")
+            return original_is_dir(path_obj)
+
+        def guarded_read_text(path_obj, *args, **kwargs):
+            if denied_ancestor == path_obj or denied_ancestor in path_obj.parents:
+                raise AssertionError("denied ancestor context was read")
+            return original_read_text(path_obj, *args, **kwargs)
+
+        from agent import deny_policy
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+            patch.object(Path, "is_dir", guarded_is_dir),
+            patch.object(Path, "read_text", guarded_read_text),
+        ):
+            result = tracker.check_tool_call(
+                "read_file",
+                {"path": str(target)},
+            )
+
+        assert result is None
+        mock_realpath.assert_not_called()
+
     def test_workdir_arg(self, project):
         """The workdir argument from terminal tool is checked."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))

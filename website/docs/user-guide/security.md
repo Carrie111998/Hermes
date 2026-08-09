@@ -147,7 +147,7 @@ Details:
 - Deny policy loading, validation, and matching errors fail closed. Malformed deny configuration blocks the affected operation until the configuration is fixed.
 - Matching runs over the same normalized/deobfuscated command variants the dangerous-pattern detector uses, so simple quoting tricks (`git pu""sh --force`) don't slip past a command rule.
 - **YAML quoting:** always quote patterns. A bare leading `*` is a YAML alias and fails to parse; `{`, `!`, and `: ` have their own YAML meanings. Single quotes are safest for shell-ish content.
-- Command deny rules apply to host-reaching backends (local, SSH, host-mounted Docker). Isolated container backends skip the command guard stack entirely, as they always have — nothing they run can touch the host.
+- Command deny rules apply to every backend, including isolated Docker, Singularity, Modal, Daytona, and Vercel Sandbox sessions. Isolation still skips the ordinary dangerous-command prompt stack for non-denied commands, but it never overrides an explicit user deny rule.
 - A denied command or path returns a BLOCKED error to the agent telling it not to retry or rephrase. Nothing runs.
 
 Like the rest of the config, changes take effect immediately (the config cache is mtime-keyed) — no session restart needed.
@@ -207,7 +207,7 @@ The following patterns trigger approval prompts (defined in `tools/approval.py`)
 | `podman --remote`/`-r`/`--url`/`--connection`/`--identity`, `CONTAINER_HOST=` | Podman remote daemon redirect |
 
 :::info
-**Container bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, or `vercel_sandbox` backends, dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
+**Container bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, or `vercel_sandbox` backends, ordinary dangerous-command heuristics and approval prompts are **skipped** because the container itself is the security boundary. Explicit user-defined command deny rules still run first and block matching commands in every backend.
 :::
 
 ### Approval Flow (CLI)
