@@ -287,6 +287,9 @@ class SessionSearchMixin:
         if high_water_raw is None:
             return False
         high_water = int(high_water_raw)
+        if high_water <= 0:
+            self._fts_rebuild_finish()
+            return False
         include_trigram = self._trigram_available
         chunk = self._FTS_REBUILD_CHUNK_ROWS
 
@@ -367,6 +370,9 @@ class SessionSearchMixin:
         if high_water_raw is None:
             return False
         high_water = int(high_water_raw)
+        if high_water <= 0:
+            self._fts_cjk_rebuild_finish()
+            return False
         chunk = self._FTS_REBUILD_CHUNK_ROWS
 
         def _do(conn):

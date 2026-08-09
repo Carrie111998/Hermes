@@ -2686,6 +2686,46 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
+    def test_optimize_empty_legacy_db_clears_zero_row_rebuild(self, tmp_path):
+        """A zero-row legacy migration must settle instead of staying pending."""
+        db_path = tmp_path / "v22-empty.db"
+        self._build_v22_db(db_path)
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM sessions")
+
+        db = SessionDB(db_path=db_path)
+        try:
+            assert db.fts_optimize_available() is True
+
+            result = db.optimize_fts_storage(vacuum=False)
+
+            assert result["ok"] is True
+            assert db.get_meta("fts_rebuild_high_water") is None
+            assert db.get_meta("fts_rebuild_progress") is None
+            assert db.get_meta("fts_storage_version") == str(
+                hermes_state.FTS_STORAGE_VERSION
+            )
+            assert db.fts_optimize_available() is False
+        finally:
+            db.close()
+
+    def test_zero_row_cjk_rebuild_claim_is_cleared(self, tmp_path):
+        """The sibling CJK worker must also finish an empty rebuild claim."""
+        db = SessionDB(db_path=tmp_path / "empty-cjk.db")
+        try:
+            if not db._fts_cjk_loaded:
+                pytest.skip("CJK tokenizer is unavailable")
+            db.set_meta("fts_cjk_rebuild_high_water", "0")
+            db.set_meta("fts_cjk_rebuild_progress", "0")
+
+            assert db.fts_cjk_rebuild_step() is False
+
+            assert db.get_meta("fts_cjk_rebuild_high_water") is None
+            assert db.get_meta("fts_cjk_rebuild_progress") is None
+        finally:
+            db.close()
+
 
 
 
