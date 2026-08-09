@@ -688,10 +688,36 @@ class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
 
+    def test_node_refresh_installs_root_and_required_workspaces_atomically(
+        self, tmp_path, monkeypatch
+    ):
+        """A second ``npm ci`` must not erase packages installed by the first."""
+        from hermes_cli import main as hm
 
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package-lock.json").write_text("{}")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(hm, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+        monkeypatch.setattr(hm, "_npm_lockfile_changed", lambda _root: True)
+        monkeypatch.setattr(hm, "_record_npm_lockfile_hash", lambda _root: None)
+        calls = []
 
+        def fake_install(*args, **kwargs):
+            # Retain only the assertion target. Capturing the full ``env``
+            # would make a failing assertion dump unrelated process secrets.
+            calls.append(kwargs["extra_args"])
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
 
+        monkeypatch.setattr(hm, "_run_npm_install_deterministic", fake_install)
 
+        assert hm._update_node_dependencies() == []
+        assert len(calls) == 1
+        extra_args = calls[0]
+        assert "--include-workspace-root" in extra_args
+        assert extra_args.count("--workspace") == 2
+        assert "ui-tui" in extra_args
+        assert "web" in extra_args
+        assert "--workspaces=false" not in extra_args
 
     def test_node_failure_returns_failed_labels_and_warns(
         self, tmp_path, monkeypatch, capsys
@@ -708,7 +734,7 @@ class TestNodeRuntimeNpmResolution:
         )
 
         failed = hm._update_node_dependencies()
-        assert failed == ["repo root"]
+        assert failed == ["repo root + ui-tui, web workspaces"]
         out = capsys.readouterr().out
         assert "mixed state" in out
 

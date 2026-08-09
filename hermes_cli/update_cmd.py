@@ -2092,11 +2092,13 @@ def _update_node_dependencies() -> list[str]:
         logger.info("npm lockfile unchanged, skipping npm install")
         return []
 
-    # With a single workspace lockfile the root install would cover ALL
-    # workspaces — but apps/desktop pulls in Electron as a devDependency,
-    # and its postinstall downloads a ~200MB binary.  Most users don't
-    # need desktop during `hermes update`, so we install root-only first
-    # then add just the workspaces the CLI/TUI/web build actually requires.
+    # With a single workspace lockfile an unscoped root install would cover
+    # ALL workspaces — but apps/desktop pulls in Electron as a devDependency,
+    # and its postinstall downloads a ~200MB binary. Most users don't need
+    # desktop during `hermes update`, so select the root plus only ui-tui/web.
+    # This MUST be one npm invocation: ``npm ci`` removes ``node_modules`` at
+    # startup, so a second workspace-only invocation erases root packages
+    # installed by the first and leaves a deceptively successful mixed tree.
     # Desktop deps are installed on demand by the desktop launcher
     # (see _desktop_build_needed).
     print("→ Updating Node.js dependencies...")
@@ -2114,47 +2116,40 @@ def _update_node_dependencies() -> list[str]:
 
     nixos_env = with_hermes_node_path(_m()._nixos_build_env())
 
-    # Step 1: root install (no workspace recursion).
+    # Install the root and required workspaces atomically. npm's
+    # --include-workspace-root keeps root dependencies in the resulting tree,
+    # while explicit --workspace flags avoid the desktop/Electron workspace.
     # NOTE: capture_output=False here is deliberate (#18840) — optional
     # postinstall scripts (e.g. @askjo/camofox-browser's browser-binary fetch)
     # print download progress, and capturing it makes a long download look
     # hung. The chatty npm-deprecation noise during `hermes update` comes from
     # the *desktop* build, not this step; that one is captured to update.log.
-    root_args = [*extra_args, "--workspaces=false"]
-    root_result = _m()._run_npm_install_deterministic(
+    install_args = [
+        *extra_args,
+        "--include-workspace-root",
+        "--workspace", "ui-tui",
+        "--workspace", "web",
+    ]
+    install_result = _m()._run_npm_install_deterministic(
         npm,
         _m().PROJECT_ROOT,
-        extra_args=tuple(root_args),
+        extra_args=tuple(install_args),
         capture_output=False,
         env=nixos_env,
     )
-    if root_result.returncode != 0:
-        print("  ⚠ npm install failed in repo root")
-        stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        return _partial_update_failure("repo root")
-
-    # Step 2: install only the workspaces update needs (ui-tui, web).
-    # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
-    ws_result = _m()._run_npm_install_deterministic(
-        npm,
-        _m().PROJECT_ROOT,
-        extra_args=tuple(ws_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if ws_result.returncode == 0:
+    if install_result.returncode == 0:
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
         return []
 
-    print("  ⚠ npm workspace install failed")
-    stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
+    print("  ⚠ npm install failed for repo root + ui-tui, web workspaces")
+    stderr = (
+        (install_result.stderr or "").strip()
+        if install_result.stderr else ""
+    )
     if stderr:
         print(f"    {stderr.splitlines()[-1]}")
-    return _partial_update_failure("ui-tui, web workspaces")
+    return _partial_update_failure("repo root + ui-tui, web workspaces")
 
 def _log_only_write(text: str) -> None:
     """Write ``text`` to ``~/.hermes/logs/update.log`` only, never the terminal.
