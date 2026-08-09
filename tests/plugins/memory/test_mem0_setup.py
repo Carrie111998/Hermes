@@ -126,6 +126,20 @@ class TestBuildOSSConfig:
         _, env_writes = build_oss_config(flags)
         assert env_writes == {"OPENAI_API_KEY": "sk-oai"}
 
+    def test_ollama_embedder_optional_key_is_written(self):
+        """A bearer-guarded (fronted) Ollama embedder takes an OPTIONAL key via
+        OLLAMA_API_KEY — the ollama client attaches it as an Authorization
+        bearer. --oss-embedder-key used to be silently discarded for ollama."""
+        flags = parse_flags([
+            "--mode", "oss",
+            "--oss-llm", "ollama",
+            "--oss-embedder", "ollama", "--oss-embedder-key", "fronted-bearer",
+            "--oss-embedder-url", "https://embed.example",
+        ])
+        oss, env_writes = build_oss_config(flags)
+        assert env_writes == {"OLLAMA_API_KEY": "fronted-bearer"}
+        assert oss["embedder"]["config"]["ollama_base_url"] == "https://embed.example"
+
     def test_different_embedder_needs_separate_key(self):
         flags = parse_flags([
             "--mode", "oss",

@@ -180,7 +180,10 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
     env_writes: dict[str, str] = {}
     if llm_def.get("needs_key") and flags.get("oss_llm_key"):
         env_writes[llm_def["env_var"]] = flags["oss_llm_key"]
-    if embedder_def.get("needs_key") and flags.get("oss_embedder_key"):
+    # Gate on env_var, not needs_key: providers with an OPTIONAL key (ollama
+    # behind an authenticated front) declare env_var without needs_key, and
+    # --oss-embedder-key used to be silently discarded for them.
+    if embedder_def.get("env_var") and flags.get("oss_embedder_key"):
         env_writes[embedder_def["env_var"]] = flags["oss_embedder_key"]
     elif embedder_def.get("needs_key") and embedder_id == llm_id and flags.get("oss_llm_key"):
         env_writes[embedder_def["env_var"]] = flags["oss_llm_key"]
@@ -461,7 +464,7 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
         print(f"    Vector: {vector_id}")
         if env_writes:
             print(f"    Env vars: {', '.join(env_writes.keys())}")
-        _run_connectivity_checks(oss_config)
+        _run_connectivity_checks(oss_config, env_writes)
         print("  [dry-run] No files written.\n")
         return
 
@@ -475,7 +478,7 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
     config["memory"]["provider"] = "mem0"
     save_config(config)
 
-    _run_connectivity_checks(oss_config)
+    _run_connectivity_checks(oss_config, env_writes)
     print("\n  ✓ Mem0 configured (OSS mode)")
     print(f"    LLM:      {oss_config['llm']['provider']} ({oss_config['llm']['config'].get('model', '')})")
     print(f"    Embedder: {oss_config['embedder']['provider']} ({oss_config['embedder']['config'].get('model', '')})")
@@ -828,7 +831,7 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
     config["memory"]["provider"] = "mem0"
     save_config(config)
 
-    _run_connectivity_checks(oss_config)
+    _run_connectivity_checks(oss_config, env_writes)
     print("\n  ✓ Mem0 configured (OSS mode)")
     print(f"    LLM:      {oss_config['llm']['provider']} ({oss_config['llm']['config'].get('model', '')})")
     print(f"    Embedder: {oss_config['embedder']['provider']} ({oss_config['embedder']['config'].get('model', '')})")
@@ -874,10 +877,17 @@ def _check_qdrant_path(path: str) -> tuple[bool, str]:
         return False, f"Cannot write to {parent}: {e}"
 
 
-def _check_ollama(url: str) -> tuple[bool, str]:
-    """Check Ollama is reachable via /api/tags."""
+def _check_ollama(url: str, api_key: str = "") -> tuple[bool, str]:
+    """Check Ollama is reachable via /api/tags.
+
+    A bearer-guarded front answers 401 without the key, which used to read as
+    "not reachable" — a false negative for an endpoint that works fine once
+    the real client sends its Authorization header.
+    """
     try:
         req = urllib.request.Request(f"{url.rstrip('/')}/api/tags", method="GET")
+        if api_key:
+            req.add_header("Authorization", f"Bearer {api_key}")
         urllib.request.urlopen(req, timeout=3)
         return True, "Ollama reachable"
     except Exception as e:
@@ -894,8 +904,13 @@ def _check_pgvector(host: str, port: int) -> tuple[bool, str]:
         return False, f"PGVector not reachable at {host}:{port}: {e}"
 
 
-def _run_connectivity_checks(oss_config: dict) -> None:
-    """Run connectivity checks and print warnings."""
+def _run_connectivity_checks(oss_config: dict, env_writes: dict[str, str] | None = None) -> None:
+    """Run connectivity checks and print warnings.
+
+    env_writes carries keys the setup is ABOUT to write to .env — they are not
+    in this process's environment yet, and the probe of a bearer-guarded
+    endpoint would 401 without them.
+    """
     vs = oss_config.get("vector_store", {})
     if vs.get("provider") == "qdrant":
         path = vs.get("config", {}).get("path")
@@ -916,12 +931,23 @@ def _run_connectivity_checks(oss_config: dict) -> None:
         if not ok:
             print(f"  Warning: {msg}")
 
+    ollama_key = (env_writes or {}).get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY", "")
     llm = oss_config.get("llm", {})
     if llm.get("provider") == "ollama":
         url = llm.get("config", {}).get("ollama_base_url", "http://localhost:11434")
-        ok, msg = _check_ollama(url)
+        ok, msg = _check_ollama(url, ollama_key)
         if not ok:
             print(f"  Warning: {msg}")
+
+    # The embedder's endpoint is its own URL (often a different host or an
+    # authenticated front) — checking only the LLM's left it unprobed.
+    embedder = oss_config.get("embedder", {})
+    if embedder.get("provider") == "ollama":
+        emb_url = embedder.get("config", {}).get("ollama_base_url", "http://localhost:11434")
+        if emb_url != llm.get("config", {}).get("ollama_base_url"):
+            ok, msg = _check_ollama(emb_url, ollama_key)
+            if not ok:
+                print(f"  Warning: embedder: {msg}")
 
 
 def _check_min_dep_version() -> None:
