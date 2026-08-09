@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import tempfile
-import os
+import plugins.agentops.control.observer_store as _observer_store
 
-os.environ.setdefault("AGENTOPS_ALLOW_SQLITE_TEST_ONLY", "1")
+_observer_store.open_observer_store = _observer_store._SQLiteObserverStore
 
 import pytest
 

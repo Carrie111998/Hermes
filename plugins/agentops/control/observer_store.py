@@ -252,7 +252,7 @@ def _verify_database_path(path: Path, identity: tuple[int, int] | None = None) -
                 raise ObserverStoreError("observer database sidecar unsafe")
 
 
-class ObserverStore:
+class _SQLiteObserverStore:
     """Transactional store for its fixed own database and redacted evidence."""
 
     def __init__(self, config: AgentOpsConfig) -> None:
@@ -560,10 +560,13 @@ class ObserverStore:
             return int(self._connection.execute("SELECT COUNT(*) FROM target_snapshots").fetchone()[0])
 
 
-def open_observer_store(config: AgentOpsConfig) -> ObserverStore:
-    if os.environ.get("AGENTOPS_ALLOW_SQLITE_TEST_ONLY") != "1":
+class ObserverStore:
+    def __init__(self, config: AgentOpsConfig) -> None:
         raise ObserverStoreError("Phase 2 SQLite persistence is deferred; use MemoryObserverStore")
-    return ObserverStore(config)
+
+
+def open_observer_store(config: AgentOpsConfig) -> ObserverStore:
+    raise ObserverStoreError("Phase 2 SQLite persistence is deferred; use MemoryObserverStore")
 
 
 class MemoryObserverStore:

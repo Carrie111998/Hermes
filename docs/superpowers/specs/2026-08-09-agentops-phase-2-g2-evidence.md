@@ -52,7 +52,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-122 passed in 3.32s
+122 passed in 3.65s
 ```
 
 ```bash
@@ -60,7 +60,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-122 passed in 6.29s
+122 passed in 6.43s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -72,7 +72,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.83s
+122 passed in 2.45s
 ```
 
 ```text

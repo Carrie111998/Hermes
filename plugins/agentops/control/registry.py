@@ -31,7 +31,7 @@ class FleetRegistry:
     def __init__(self, targets: Iterable[TargetSpec] = ()) -> None:
         self._targets: dict[str, Target] = {}
         self._snapshots: dict[str, TargetSnapshot] = {}
-        self._process_health: dict[str, bool] = {}
+        self._process_health: dict[str, tuple[datetime, str, bool]] = {}
         for spec in targets:
             self.register_target(spec)
 
@@ -52,9 +52,13 @@ class FleetRegistry:
             raise TargetRegistrationError("target snapshot is older than current snapshot")
         self._snapshots[snapshot.target_id] = snapshot
 
-    def record_process_result(self, target_id: str, healthy: bool) -> None:
+    def record_process_result(self, batch) -> None:
+        from plugins.agentops.control.observer_models import CollectionBatch
+        if not isinstance(batch, CollectionBatch) or batch.collector != "processes" or not batch.source_id:
+            raise TargetRegistrationError("process result must be a processes CollectionBatch")
+        target_id, healthy = batch.target_id, batch.health.healthy
         self.get_target(target_id)
-        self._process_health[target_id] = bool(healthy)
+        self._process_health[target_id] = (batch.collected_at, batch.source_id, bool(healthy and batch.signals))
 
     def get_target(self, target_id: str) -> Target:
         try:
@@ -74,7 +78,12 @@ class FleetRegistry:
         snapshotted = len(self._snapshots)
         out_scope = tuple(sorted(target.target_id for target in self._targets.values() if target.spec.labels.get("g2_scope") == "out_of_scope"))
         core_targets = [target for target in self._targets.values() if target.spec.labels.get("g2_scope", "core") == "core"]
-        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots and self._process_health.get(target.target_id, False))
+        core_snapshots = 0
+        for target in core_targets:
+            snapshot = self._snapshots.get(target.target_id)
+            process = self._process_health.get(target.target_id)
+            if snapshot is not None and process is not None and process[2] and process[0] >= snapshot.observed_at:
+                core_snapshots += 1
         disabled_count = sum(1 for target in core_targets if target.spec.labels.get("process_observation") == "disabled")
         coverage = 0 if not core_targets else (max(0, core_snapshots - disabled_count) * 100) // len(core_targets)
         disabled = ("processes",) if disabled_count else ()
