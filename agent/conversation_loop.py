@@ -23,6 +23,7 @@ import random
 import re
 import ssl
 import time
+from dataclasses import replace as dataclass_replace
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -535,6 +536,86 @@ def _print_billing_or_entitlement_guidance(
     for line in message.splitlines():
         agent._vprint(f"{agent.log_prefix}   💡 {line}", force=True)
     return True
+
+
+# Shown instead of the generic content-policy trailer when the account itself
+# has contradicted the "out of extra usage" claim. The point of the wording is
+# to stop the user from buying quota they already have (#82154: the billing
+# link in Anthropic's message cost the reporter three debugging sessions).
+_ANTHROPIC_OAUTH_CONTENT_FILTER_HINT = (
+    "Your subscription is NOT exhausted — Hermes checked the Anthropic OAuth usage "
+    "endpoint and it still reports available capacity. Anthropic's subscription "
+    "classifier rejects certain request *content* using its billing message, so this "
+    "is a content rejection wearing a billing error. Do not buy extra usage for it.\n"
+    "The classifier keys off system-prompt text, so the trigger is usually injected "
+    "guidance rather than your own message. Bisect the system blocks in the request "
+    "dump written above, or retry on an `sk-ant-api…` API key — API keys do not go "
+    "through this classifier."
+)
+
+
+def _reclassify_verified_anthropic_content_filter(agent, classified):
+    """Re-label an Anthropic billing 400 that the account itself contradicts.
+
+    Anthropic's subscription (OAuth) endpoint answers a content rejection with
+    the *billing* sentence "You're out of extra usage. Add more at
+    claude.ai/settings/usage and keep going." — the identical body a genuinely
+    depleted account gets, on the identical HTTP 400. Message matching alone
+    therefore cannot tell the two apart, and the classifier commits to
+    ``billing``: the user is told to buy quota, and — worse for diagnosis — the
+    credential is marked exhausted for the pool's cooldown, so every later
+    attempt replays the stored error without issuing a request and a real fix
+    looks like it did nothing (#82154).
+
+    The account settles it. One authenticated GET against the OAuth usage
+    endpoint reports the very quota the message claims is gone, so when it
+    shows remaining capacity the 400 provably was not about billing. Only then
+    is the verdict rewritten to ``content_policy_blocked`` — which already has
+    end-to-end handling (fallback attempt, dedicated abort message) and, being
+    request-scoped, does NOT rotate or quarantine the credential.
+
+    Deliberately one-directional: an unknown or exhausted answer leaves the
+    billing classification exactly as it was. This can only clear a false
+    billing verdict, never manufacture one — so a real spend wall keeps every
+    bit of today's behaviour.
+
+    Rewording whichever prompt string currently upsets the classifier is a
+    separate, per-occurrence fix (see #65365, #25255, #20865). This is the
+    layer that keeps the *next* trigger from being misdiagnosed at all.
+    """
+    if (
+        classified.reason != FailoverReason.billing
+        or classified.status_code != 400
+        or (getattr(agent, "provider", "") or "").strip().lower() != "anthropic"
+    ):
+        return classified
+
+    try:
+        from agent.account_usage import anthropic_subscription_capacity_exhausted
+
+        exhausted = anthropic_subscription_capacity_exhausted()
+    except Exception:
+        logger.debug("Anthropic capacity fact-check unavailable", exc_info=True)
+        return classified
+
+    # None (unknown) and True (really exhausted) both keep the billing verdict.
+    if exhausted is not False:
+        return classified
+
+    logger.warning(
+        "Anthropic HTTP 400 carried a billing message but the OAuth usage endpoint "
+        "reports remaining capacity — reclassifying as content_policy_blocked and "
+        "leaving the credential healthy (#82154)."
+    )
+    return dataclass_replace(
+        classified,
+        reason=FailoverReason.content_policy_blocked,
+        should_rotate_credential=False,
+        error_context={
+            **(classified.error_context or {}),
+            "anthropic_oauth_content_filter": True,
+        },
+    )
 
 
 def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
@@ -4154,6 +4235,11 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                # classify_api_error() is pure by contract; the Anthropic
+                # billing-400 verdict is the one case that needs an external
+                # fact to be trustworthy, so the check lives here — before the
+                # credential pool acts on the reason below.
+                classified = _reclassify_verified_anthropic_content_filter(agent, classified)
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -5645,11 +5731,20 @@ def run_conversation(
                     else:
                         agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
+                        # A verified Anthropic billing-shaped rejection needs the
+                        # opposite of the generic trailer: the provider message
+                        # says "buy quota", and the whole point is that the user
+                        # must not act on it.
+                        _policy_hint = (
+                            _ANTHROPIC_OAUTH_CONTENT_FILTER_HINT
+                            if (classified.error_context or {}).get("anthropic_oauth_content_filter")
+                            else _CONTENT_POLICY_RECOVERY_HINT
+                        )
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
                             f"Provider message: {_nonretryable_summary}\n\n"
-                            f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                            f"{_policy_hint}"
                         )
                         return _content_policy_blocked_result(
                             messages,

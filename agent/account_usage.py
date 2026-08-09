@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -748,6 +749,33 @@ def redeem_codex_reset_credit(
     )
 
 
+_ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# The utilization windows Anthropic reports on the OAuth usage endpoint, each
+# paired with the label it renders under.
+_ANTHROPIC_USAGE_WINDOWS = (
+    ("five_hour", "Current session"),
+    ("seven_day", "Current week"),
+    ("seven_day_opus", "Opus week"),
+    ("seven_day_sonnet", "Sonnet week"),
+)
+
+
+def _fetch_anthropic_usage_payload(token: str, *, timeout: float = 15.0) -> dict:
+    """GET the raw OAuth usage payload for *token* (raises on transport/HTTP error)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.0",
+    }
+    with httpx.Client(timeout=timeout) as client:
+        response = client.get(_ANTHROPIC_USAGE_URL, headers=headers)
+        response.raise_for_status()
+    return response.json() or {}
+
+
 def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
     token = (resolve_anthropic_token() or "").strip()
     if not token:
@@ -759,25 +787,9 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
             fetched_at=_utc_now(),
             unavailable_reason="Anthropic account limits are only available for OAuth-backed Claude accounts.",
         )
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-code/2.1.0",
-    }
-    with httpx.Client(timeout=15.0) as client:
-        response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
-        response.raise_for_status()
-    payload = response.json() or {}
+    payload = _fetch_anthropic_usage_payload(token)
     windows: list[AccountUsageWindow] = []
-    mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
-    )
-    for key, label in mapping:
+    for key, label in _ANTHROPIC_USAGE_WINDOWS:
         window = payload.get(key) or {}
         util = window.get("utilization")
         if util is None:
@@ -807,6 +819,101 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+# ── Subscription capacity fact-check ────────────────────────────────────
+#
+# Anthropic's OAuth billing classifier rejects some *prompt content* with an
+# HTTP 400 whose body is the billing sentence "You're out of extra usage. Add
+# more at claude.ai/settings/usage and keep going." — byte-for-byte what a
+# genuinely depleted account gets.  The message therefore cannot discriminate
+# between "the account is out of paid capacity" and "the classifier disliked
+# this request's content" (#82154: removing one sentence of a built-in system
+# prompt flipped the same credential from 400 to 200).
+#
+# The usage endpoint can discriminate: it reports the very quota the message
+# claims is gone.  One authenticated GET settles it — no model tokens, no
+# guessing at which prose upset the classifier.
+_CAPACITY_CACHE_TTL_SECONDS = 60.0
+
+# token-fingerprint → (monotonic timestamp, verdict). Bounded by the number of
+# distinct Anthropic OAuth credentials a process uses, i.e. a handful.
+_capacity_cache: dict[str, tuple[float, Optional[bool]]] = {}
+
+# Anthropic reports utilization as a 0..1 fraction (or an already-scaled
+# percentage). A window this close to its cap is spent for our purposes.
+_WINDOW_SATURATED_PERCENT = 99.5
+
+
+def _capacity_exhausted_from_usage(payload: dict) -> Optional[bool]:
+    """Decide whether an OAuth usage payload shows exhausted paid capacity.
+
+    Returns True (exhausted), False (capacity remains), or None (the payload
+    carries no usable signal). Pure — no I/O, so the decision table is
+    directly testable.
+
+    Ordering is deliberate:
+      1. Extra-usage credits still available outranks a saturated plan window,
+         because overage would be billed rather than refused — "out of extra
+         usage" cannot be literally true while credits remain.
+      2. Extra-usage credits spent is exactly what the error message claims.
+      3. Only then do plan windows decide.
+    """
+    extra = payload.get("extra_usage") or {}
+    if extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        limit = extra.get("monthly_limit")
+        if _is_finite_num(used) and _is_finite_num(limit):
+            return float(used) >= float(limit)
+
+    utilizations: list[float] = []
+    for key, _label in _ANTHROPIC_USAGE_WINDOWS:
+        window = payload.get(key) or {}
+        util = window.get("utilization")
+        if not _is_finite_num(util):
+            continue
+        utilizations.append(float(util) * 100 if float(util) <= 1 else float(util))
+
+    if not utilizations:
+        return None
+    return any(u >= _WINDOW_SATURATED_PERCENT for u in utilizations)
+
+
+def anthropic_subscription_capacity_exhausted() -> Optional[bool]:
+    """Is the active Anthropic subscription actually out of paid capacity?
+
+    Returns True when the account genuinely has nothing left to spend, False
+    when capacity remains (so a billing-shaped rejection is about the request,
+    not the account), and None when the question cannot be answered — no OAuth
+    credential, endpoint unreachable, or a payload without usage fields.
+
+    Callers MUST treat None as "keep the existing billing behaviour": this is a
+    fact-check that can only *downgrade* a false billing verdict, never invent
+    one.
+    """
+    token = (resolve_anthropic_token() or "").strip()
+    # API keys never see the subscription classifier's billing-shaped 400, so
+    # there is nothing to disambiguate for them.
+    if not token or not _is_oauth_token(token):
+        return None
+
+    fingerprint = token[-12:]
+    now = time.monotonic()
+    cached = _capacity_cache.get(fingerprint)
+    if cached is not None and (now - cached[0]) < _CAPACITY_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    try:
+        payload = _fetch_anthropic_usage_payload(token, timeout=8.0)
+    except Exception:
+        # Transient failures are NOT cached — a fix must be able to prove
+        # itself on the next attempt rather than wait out a stale verdict.
+        logger.debug("Anthropic OAuth usage probe failed", exc_info=True)
+        return None
+
+    verdict = _capacity_exhausted_from_usage(payload)
+    _capacity_cache[fingerprint] = (now, verdict)
+    return verdict
 
 
 def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[str]) -> Optional[AccountUsageSnapshot]:
