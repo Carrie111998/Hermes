@@ -1,0 +1,1894 @@
+"""Dev-pipeline executor service — durable Cursor lane (slice 1).
+
+Entry points::
+
+    python -m hermes_cli.dev_executor run
+    python -m hermes_cli.dev_executor attempt <task_id> <run_id> --lane cursor-bounded
+    python -m hermes_cli.dev_executor reconcile
+
+Pipeline state lives in ``task_runs.metadata`` under ``dev_pipeline``; phase
+transitions are recorded as ``task_events`` rows with ``kind='dev_phase'``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Mapping, MutableMapping, Optional, Sequence
+
+from hermes_cli import kanban_db as kb
+from hermes_cli.dev_pipeline import (
+    build_attempt_env,
+    get_dev_pipeline_config,
+    is_https_repo_url,
+    is_local_git_repo,
+    route_plan_contract,
+    scan_diff_for_secrets,
+    validate_plan_contract,
+)
+from tools.cursor_agent_tool import resolve_cursor_agent_binary
+from tools.moa_tool import consult_moa
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PHASE_PLANNING = "PLANNING"
+PHASE_ROUTING = "ROUTING"
+PHASE_PREPARING = "PREPARING"
+PHASE_RUNNING = "RUNNING"
+PHASE_VERIFYING = "VERIFYING"
+PHASE_REVIEWING = "REVIEWING"
+PHASE_PUBLISHING = "PUBLISHING"
+
+POST_RUNNING_PHASES = frozenset(
+    {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}
+)
+
+CLAIM_TTL_SECONDS = 15 * 60
+HEARTBEAT_INTERVAL_SECONDS = 60
+STALL_NO_OUTPUT_SECONDS = 10 * 60
+MAX_VERIFY_TIMEOUT = 1800
+MAX_DIFF_REVIEW_BYTES = 50_000
+JOB_MARKER_TEMPLATE = "<!-- hermes-dev-job:{task_id} -->"
+
+DEV_BLOCK_KINDS = frozenset(
+    {
+        "plan_invalid",
+        "planning_unavailable",
+        "missing_credentials",
+        "missing_product_input",
+        "infra_broken",
+        "acceptance_unverifiable",
+        "lane_unavailable",
+        "review_unavailable",
+        "secret_in_diff",
+        "executor_restarted",
+    }
+)
+
+_ASSETS_AGENTS_DIR = (
+    Path(__file__).resolve().parent / "dev_pipeline_assets" / "cursor-agents"
+)
+
+_VERDICT_JSON_RE = re.compile(
+    r'\{\s*"verdict"\s*:\s*"(?:pass|fail)"[^}]*\}',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# ---------------------------------------------------------------------------
+# Thin subprocess / systemctl wrappers (mockable in tests)
+# ---------------------------------------------------------------------------
+
+
+def run_subprocess(
+    args: Sequence[str],
+    *,
+    cwd: Optional[str | Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: Optional[float] = None,
+    capture_output: bool = True,
+    text: bool = True,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess; tests patch this boundary."""
+    return subprocess.run(
+        list(args),
+        cwd=str(cwd) if cwd else None,
+        env=dict(env) if env is not None else None,
+        timeout=timeout,
+        capture_output=capture_output,
+        text=text,
+        input=input_text,
+    )
+
+
+def systemctl_is_active(unit: str) -> tuple[bool, str]:
+    """Return ``(is_active, raw_status_line)``."""
+    proc = run_subprocess(["systemctl", "is-active", unit], timeout=30)
+    status = (proc.stdout or proc.stderr or "").strip()
+    return proc.returncode == 0 and status == "active", status
+
+
+def systemctl_stop(unit: str) -> bool:
+    proc = run_subprocess(["systemctl", "stop", unit], timeout=120)
+    return proc.returncode == 0
+
+
+def systemctl_show(unit: str, prop: str) -> Optional[str]:
+    proc = run_subprocess(
+        ["systemctl", "show", unit, f"-p{prop}", "--value"],
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        return None
+    value = (proc.stdout or "").strip()
+    return value or None
+
+
+def systemd_run_attempt(
+    *,
+    unit: str,
+    runtime_max_sec: int,
+    working_directory: Path,
+    env: Mapping[str, str],
+    argv: Sequence[str],
+) -> tuple[bool, Optional[int], Optional[int]]:
+    """Spawn a transient attempt unit. Returns ``(ok, pid, host_start_time)``."""
+    cmd: list[str] = [
+        "systemd-run",
+        f"--unit={unit}",
+        f"--property=RuntimeMaxSec={runtime_max_sec}",
+        "--property=MemoryMax=6G",
+        "--property=OOMScoreAdjust=500",
+        f"--working-directory={working_directory}",
+    ]
+    for key, value in env.items():
+        cmd.append(f"--setenv={key}={value}")
+    cmd.extend(argv)
+    proc = run_subprocess(cmd, timeout=120)
+    if proc.returncode != 0:
+        logger.warning("systemd-run failed for %s: %s", unit, proc.stderr)
+        return False, None, None
+    pid_str = systemctl_show(unit, "MainPID")
+    pid = int(pid_str) if pid_str and pid_str.isdigit() else None
+    start_time = get_host_start_time(pid) if pid else None
+    return True, pid, start_time
+
+
+def gh_command(args: Sequence[str], *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
+    return run_subprocess(["gh", *args], cwd=cwd, timeout=300)
+
+
+def git_command(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: float = 120,
+) -> subprocess.CompletedProcess[str]:
+    return run_subprocess(["git", *args], cwd=cwd, env=env, timeout=timeout)
+
+
+def hermes_chat_review(prompt: str, *, cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
+    return run_subprocess(
+        [
+            "hermes",
+            "chat",
+            "-Q",
+            "--provider",
+            "kimi-coding",
+            "--model",
+            "kimi-k3",
+            "--toolsets",
+            "safe",
+            "-q",
+            prompt,
+        ],
+        cwd=cwd,
+        timeout=600,
+    )
+
+
+def get_host_start_time(pid: Optional[int]) -> Optional[int]:
+    if not pid:
+        return None
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def host_pid_is_ours(pid: Optional[int], expected_start: Optional[int]) -> bool:
+    if not pid or expected_start is None:
+        return False
+    live = get_host_start_time(pid)
+    return live is not None and live == expected_start
+
+
+# ---------------------------------------------------------------------------
+# Pipeline state helpers
+# ---------------------------------------------------------------------------
+
+
+def unit_name(task_id: str, run_id: int) -> str:
+    safe_task = re.sub(r"[^a-zA-Z0-9_-]", "-", task_id)
+    return f"hermes-dev-{safe_task}-{run_id}"
+
+
+def parse_task_body(body: Optional[str]) -> dict[str, Any]:
+    if not body:
+        return {}
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def pipeline_state(metadata: Optional[dict]) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    state = metadata.get("dev_pipeline")
+    return dict(state) if isinstance(state, dict) else {}
+
+
+def merge_pipeline_state(metadata: Optional[dict], updates: Mapping[str, Any]) -> dict[str, Any]:
+    base = dict(metadata) if isinstance(metadata, dict) else {}
+    current = pipeline_state(base)
+    current.update(dict(updates))
+    base["dev_pipeline"] = current
+    return base
+
+
+def save_run_metadata(
+    conn: Any,
+    run_id: int,
+    metadata: dict[str, Any],
+) -> None:
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, ensure_ascii=False), int(run_id)),
+        )
+
+
+def load_run_metadata(conn: Any, run_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?",
+        (int(run_id),),
+    ).fetchone()
+    if not row or not row["metadata"]:
+        return {}
+    try:
+        data = json.loads(row["metadata"])
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def record_dev_phase(
+    conn: Any,
+    task_id: str,
+    run_id: Optional[int],
+    phase: str,
+    payload: Optional[dict[str, Any]] = None,
+) -> None:
+    body = {"phase": phase}
+    if payload:
+        body.update(payload)
+    with kb.write_txn(conn):
+        kb._append_event(conn, task_id, "dev_phase", body, run_id=run_id)
+
+
+def block_dev_task(
+    conn: Any,
+    task_id: str,
+    dev_block_kind: str,
+    reason: str,
+    *,
+    run_id: Optional[int] = None,
+) -> bool:
+    """Block a task and record the dev-pipeline block kind in events."""
+    ok = kb.block_task(
+        conn,
+        task_id,
+        reason=reason,
+        kind=None,
+        expected_run_id=run_id,
+    )
+    if ok:
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "dev_blocked",
+                {"block_kind": dev_block_kind, "reason": reason},
+                run_id=run_id,
+            )
+    return ok
+
+
+def count_attempt_runs(conn: Any, task_id: str) -> int:
+    rows = conn.execute(
+        "SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return int(rows["c"]) if rows else 0
+
+
+def start_new_run(
+    conn: Any,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+) -> int:
+    """Insert a new attempt run while the task stays ``running``."""
+    now = int(time.time())
+    lock = conn.execute(
+        "SELECT claim_lock, claim_expires FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    claim_lock = lock["claim_lock"] if lock else None
+    claim_expires = lock["claim_expires"] if lock else None
+    trow = conn.execute(
+        "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, profile, step_key, status,
+                claim_lock, claim_expires, started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                trow["assignee"] if trow else None,
+                trow["current_step_key"] if trow else None,
+                claim_lock,
+                claim_expires,
+                now,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            ),
+        )
+        run_id = int(cur.lastrowid or 0)
+        conn.execute(
+            "UPDATE tasks SET current_run_id = ? WHERE id = ?",
+            (run_id, task_id),
+        )
+        kb._append_event(
+            conn,
+            task_id,
+            "dev_attempt_started",
+            {"run_id": run_id},
+            run_id=run_id,
+        )
+    return run_id
+
+
+def end_attempt_run(
+    conn: Any,
+    task_id: str,
+    *,
+    outcome: str,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> Optional[int]:
+    return kb._end_run(
+        conn,
+        task_id,
+        outcome=outcome,
+        summary=summary,
+        metadata=metadata,
+        status=outcome,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planning / routing
+# ---------------------------------------------------------------------------
+
+
+def build_repo_summary(repo_path: Path) -> str:
+    """Summarize repo for the planning prompt."""
+    lines: list[str] = []
+    if repo_path.is_dir():
+        try:
+            top = sorted(
+                p.name for p in repo_path.iterdir() if not p.name.startswith(".")
+            )[:30]
+            lines.append("Top-level entries: " + ", ".join(top))
+        except OSError:
+            pass
+    hints: list[str] = []
+    for name in (
+        "pyproject.toml",
+        "setup.py",
+        "package.json",
+        "Makefile",
+        "scripts/run_tests.sh",
+        "pytest.ini",
+        "tox.ini",
+    ):
+        if (repo_path / name).exists():
+            hints.append(name)
+    if hints:
+        lines.append("Test/build hints: " + ", ".join(hints))
+    if (repo_path / "requirements.txt").exists():
+        lines.append("Python requirements.txt present")
+    return "\n".join(lines) if lines else "(no summary available)"
+
+
+def build_planning_prompt(task_text: str, repo_summary: str) -> str:
+    schema = """
+{
+  "task_summary": "string",
+  "lane_hint": "cursor|broad",
+  "estimated_minutes": 0,
+  "allowed_paths": ["relative/globs"],
+  "acceptance_commands": ["shell commands, run from repo root"],
+  "broad_flags": {
+    "migration": false, "repo_wide_change": false, "toolchain_change": false,
+    "multi_subsystem": false, "long_verification": false
+  },
+  "blocked_reasons": [],
+  "step_plan": [{"id": "s1", "description": "...", "verifiable": true}],
+  "assumptions": ["..."]
+}
+""".strip()
+    return (
+        "Produce a STRICT JSON plan contract for an automated dev-pipeline job.\n"
+        "Return ONLY valid JSON matching this schema (no markdown, no commentary):\n"
+        f"{schema}\n\n"
+        f"Task:\n{task_text}\n\n"
+        f"Repository summary:\n{repo_summary}\n"
+    )
+
+
+def extract_json_object(text: str) -> Any:
+    text = (text or "").strip()
+    if not text:
+        return None
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def synthesize_plan_from_moa(
+    moa_result: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    """Pick a valid plan contract from MoA advisor outputs."""
+    advisors = moa_result.get("advisors") or []
+    partial = bool(moa_result.get("partial"))
+    usable_plans: list[tuple[dict[str, Any], list[str]]] = []
+    advisor_statuses: list[dict[str, Any]] = []
+
+    for adv in advisors:
+        if not isinstance(adv, dict):
+            continue
+        status = adv.get("status")
+        advisor_statuses.append(
+            {
+                "label": adv.get("label"),
+                "status": status,
+            }
+        )
+        if status != "ok":
+            continue
+        raw = extract_json_object(str(adv.get("advice") or ""))
+        contract, errors = validate_plan_contract(raw)
+        if contract:
+            usable_plans.append((contract, errors))
+
+    if partial and len(usable_plans) < 2:
+        return None, ["partial council: fewer than 2 usable plans"], advisor_statuses
+
+    if not usable_plans:
+        return None, ["no advisor produced a valid plan contract"], advisor_statuses
+
+    return usable_plans[0][0], [], advisor_statuses
+
+
+def run_planning(
+    task_text: str,
+    repo_summary: str,
+    *,
+    consult_fn: Callable[..., str] = consult_moa,
+) -> tuple[Optional[dict[str, Any]], str, list[dict[str, Any]]]:
+    """Run MoA planning with one validation retry."""
+    prompt = build_planning_prompt(task_text, repo_summary)
+    last_errors: list[str] = []
+    advisor_log: list[dict[str, Any]] = []
+
+    for attempt in range(2):
+        question = prompt
+        if last_errors:
+            question += (
+                "\n\nPrevious attempt failed validation:\n"
+                + "\n".join(f"- {e}" for e in last_errors)
+            )
+        raw = consult_fn(question=question, decision_needed="Return the plan contract JSON.")
+        try:
+            moa = json.loads(raw)
+        except json.JSONDecodeError:
+            return None, "planning_unavailable", advisor_log
+
+        if not moa.get("success"):
+            return None, "planning_unavailable", advisor_log
+
+        contract, errors, statuses = synthesize_plan_from_moa(moa)
+        advisor_log = statuses
+        if contract:
+            return contract, "", advisor_log
+
+        last_errors = errors or ["invalid plan contract"]
+        if moa.get("partial") and len([s for s in statuses if s.get("status") == "ok"]) < 2:
+            return None, "planning_unavailable", advisor_log
+
+    return None, "plan_invalid", advisor_log
+
+
+def route_contract(contract: Mapping[str, Any]) -> tuple[str, str | None, str | None]:
+    return route_plan_contract(contract)
+
+
+# ---------------------------------------------------------------------------
+# Attempt classification / review parsing
+# ---------------------------------------------------------------------------
+
+
+def classify_attempt(
+    *,
+    exit_code: Optional[int],
+    classification_hint: Optional[str] = None,
+    base_commit: Optional[str],
+    candidate_commit: Optional[str],
+) -> str:
+    if classification_hint:
+        return classification_hint
+    if candidate_commit and base_commit and candidate_commit == base_commit:
+        return "no_changes"
+    if exit_code == 0 and candidate_commit and candidate_commit != base_commit:
+        return "completed"
+    if exit_code in (124, 137, 143):
+        return "timeout"
+    return "crashed"
+
+
+def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
+    """Parse strict JSON review verdict; fail-closed on garbage."""
+    if not text:
+        return None
+    match = _VERDICT_JSON_RE.search(text)
+    candidate = match.group(0) if match else text.strip()
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        obj = extract_json_object(text)
+        data = obj if isinstance(obj, dict) else None
+    if not isinstance(data, dict):
+        return None
+    verdict = str(data.get("verdict", "")).lower()
+    if verdict not in {"pass", "fail"}:
+        return None
+    blocking = data.get("blocking_findings")
+    notes = data.get("notes")
+    if not isinstance(blocking, list) or not isinstance(notes, list):
+        return None
+    return {
+        "verdict": verdict,
+        "blocking_findings": blocking,
+        "notes": notes,
+    }
+
+
+def review_gate(
+    mechanical_pass: bool,
+    kimi_verdict: Optional[dict[str, Any]],
+    grok_verdict: Optional[dict[str, Any]],
+) -> tuple[bool, bool]:
+    """Return ``(proceed_to_publish, needs_repair)``."""
+    kimi_ok = kimi_verdict and kimi_verdict.get("verdict") == "pass"
+    grok_ok = grok_verdict and grok_verdict.get("verdict") == "pass"
+    if mechanical_pass and kimi_ok and grok_ok:
+        return True, False
+    blocking = False
+    for verdict in (kimi_verdict, grok_verdict):
+        if verdict and verdict.get("verdict") == "fail":
+            findings = verdict.get("blocking_findings") or []
+            if findings:
+                blocking = True
+    if not mechanical_pass:
+        blocking = True
+    return False, blocking
+
+
+# ---------------------------------------------------------------------------
+# Workspace / git helpers
+# ---------------------------------------------------------------------------
+
+
+def workspace_paths(task_id: str, board: str) -> tuple[Path, Path]:
+    ws_root = kb.workspaces_root(board=board) / task_id
+    logs_root = kb.worker_logs_dir(board=board) / task_id
+    return ws_root, logs_root
+
+
+def clone_repo(
+    repo: str,
+    dest: Path,
+    branch: str,
+    *,
+    git_fn: Callable[..., subprocess.CompletedProcess[str]] = git_command,
+) -> tuple[bool, str]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return True, str(dest)
+    if is_https_repo_url(repo):
+        proc = git_fn(
+            ["clone", "--branch", branch, repo, str(dest)],
+            cwd=dest.parent,
+        )
+        if proc.returncode != 0 and branch != "main":
+            proc = git_fn(["clone", repo, str(dest)], cwd=dest.parent)
+            if proc.returncode == 0:
+                git_fn(["checkout", branch], cwd=dest)
+        if proc.returncode != 0:
+            return False, proc.stderr or proc.stdout or "clone failed"
+        return True, str(dest)
+    if is_local_git_repo(repo):
+        proc = git_fn(["clone", repo, str(dest)], cwd=dest.parent)
+        if proc.returncode != 0:
+            return False, proc.stderr or proc.stdout or "clone failed"
+        git_fn(["checkout", branch], cwd=dest)
+        return True, str(dest)
+    return False, f"unsupported repo: {repo}"
+
+
+def ensure_dev_branch(repo_dir: Path, task_id: str) -> str:
+    branch = f"hermes-dev/{task_id}"
+    if git_command(["checkout", branch], cwd=repo_dir).returncode != 0:
+        git_command(["checkout", "-b", branch], cwd=repo_dir)
+    return branch
+
+
+def git_head_sha(repo_dir: Path) -> Optional[str]:
+    proc = git_command(["rev-parse", "HEAD"], cwd=repo_dir)
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() or None
+
+
+def git_log_oneline(repo_dir: Path, base: Optional[str] = None) -> str:
+    args = ["log", "--oneline", "-20"]
+    if base:
+        args.append(f"{base}..HEAD")
+    proc = git_command(args, cwd=repo_dir)
+    return (proc.stdout or "").strip()
+
+
+def unified_diff(repo_dir: Path, base: str, head: str) -> str:
+    proc = git_command(["diff", f"{base}..{head}"], cwd=repo_dir, timeout=120)
+    return proc.stdout or ""
+
+
+def install_pinned_agents(repo_dir: Path) -> str:
+    """Copy pinned agents if absent; record source."""
+    dest = repo_dir / ".cursor" / "agents"
+    if dest.exists() and any(dest.glob("*.md")):
+        return "repo"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in ("implementer.md", "reviewer.md"):
+        src = _ASSETS_AGENTS_DIR / name
+        if src.is_file():
+            (dest / name).write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    return "pinned"
+
+
+def build_attempt_prompt(
+    task_text: str,
+    contract: Mapping[str, Any],
+    *,
+    repair_context: Optional[str] = None,
+) -> str:
+    rules = (
+        "Rules:\n"
+        "- Delegate implementation to the `implementer` subagent.\n"
+        "- Delegate review to the `reviewer` subagent.\n"
+        "- Fix blocking findings via implementer.\n"
+        "- Commit with conventional messages; do not push; do not create PRs.\n"
+        "- Report a structured final summary at the end.\n"
+    )
+    parts = [
+        f"Task:\n{task_text}\n",
+        f"Plan contract JSON:\n{json.dumps(dict(contract), indent=2)}\n",
+        rules,
+    ]
+    if repair_context:
+        parts.append(f"Repair context:\n{repair_context}\n")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CommandResult:
+    command: str
+    exit_code: int
+    output_path: Path
+    output_preview: str = ""
+
+
+def _shell_runner(
+    command: str,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        shell=True,
+        cwd=str(cwd),
+        env=dict(env),
+        timeout=timeout,
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_verification(
+    repo_dir: Path,
+    commands: Sequence[str],
+    evidence_dir: Path,
+    *,
+    timeout: int,
+    env: Mapping[str, str],
+    runner_fn: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+) -> list[CommandResult]:
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    runner = runner_fn or (
+        lambda cmd, **kw: _shell_runner(cmd, cwd=repo_dir, env=env, timeout=min(timeout, MAX_VERIFY_TIMEOUT))
+    )
+    results: list[CommandResult] = []
+    for idx, command in enumerate(commands):
+        out_path = evidence_dir / f"cmd-{idx}.log"
+        proc = runner(
+            command,
+            cwd=repo_dir,
+            env=env,
+            timeout=min(timeout, MAX_VERIFY_TIMEOUT),
+        )
+        combined = (proc.stdout or "") + (proc.stderr or "")
+        preview = combined[:4000]
+        out_path.write_text(combined[:100_000], encoding="utf-8")
+        results.append(
+            CommandResult(
+                command=command,
+                exit_code=proc.returncode,
+                output_path=out_path,
+                output_preview=preview,
+            )
+        )
+    return results
+
+
+def classify_verification(
+    candidate_results: Sequence[CommandResult],
+    base_results: Optional[Sequence[CommandResult]] = None,
+) -> str:
+    if all(r.exit_code == 0 for r in candidate_results):
+        return "pass"
+    if base_results is None:
+        return "regression"
+    cand_fail = {r.command for r in candidate_results if r.exit_code != 0}
+    base_fail = {r.command for r in base_results if r.exit_code != 0}
+    if cand_fail and cand_fail <= base_fail:
+        return "baseline_failure"
+    return "regression"
+
+
+def build_repair_prompt(
+    task_text: str,
+    contract: Mapping[str, Any],
+    candidate_results: Sequence[CommandResult],
+    diff_summary: str,
+) -> str:
+    failures = [
+        f"Command: {r.command}\nExit: {r.exit_code}\nOutput preview:\n{r.output_preview}"
+        for r in candidate_results
+        if r.exit_code != 0
+    ]
+    ctx = (
+        "Verification failed. Fix the regression.\n\n"
+        + "\n\n".join(failures)
+        + f"\n\nDiff summary:\n{diff_summary[:8000]}"
+    )
+    return build_attempt_prompt(task_text, contract, repair_context=ctx)
+
+
+# ---------------------------------------------------------------------------
+# Publishing
+# ---------------------------------------------------------------------------
+
+
+def find_existing_pr(head_branch: str, *, gh_fn: Callable = gh_command) -> Optional[int]:
+    proc = gh_fn(["pr", "list", "--head", head_branch, "--state", "open", "--json", "number"])
+    if proc.returncode != 0:
+        return None
+    try:
+        items = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if items and isinstance(items, list):
+        num = items[0].get("number")
+        return int(num) if num is not None else None
+    return None
+
+
+def build_pr_body(
+    *,
+    task_id: str,
+    task_text: str,
+    contract: Mapping[str, Any],
+    lane: str,
+    attempt_history: Sequence[dict],
+    verification: Mapping[str, Any],
+    reviews: Mapping[str, Any],
+    evidence_paths: Sequence[str],
+) -> str:
+    marker = JOB_MARKER_TEMPLATE.format(task_id=task_id)
+    lines = [
+        marker,
+        f"## Task\n{task_text}",
+        f"## Plan summary\n{contract.get('task_summary', '')}",
+        f"## Lane\n{lane}",
+        "## Attempt history",
+        json.dumps(list(attempt_history), indent=2),
+        "## Verification",
+        json.dumps(dict(verification), indent=2),
+        "## Reviews",
+        json.dumps(dict(reviews), indent=2),
+        "## Evidence paths",
+        "\n".join(f"- `{p}`" for p in evidence_paths),
+    ]
+    return "\n".join(lines)
+
+
+def publish_pr(
+    *,
+    task_id: str,
+    task_text: str,
+    contract: Mapping[str, Any],
+    repo_dir: Path,
+    branch: str,
+    lane: str,
+    attempt_history: Sequence[dict],
+    verification: Mapping[str, Any],
+    reviews: Mapping[str, Any],
+    evidence_paths: Sequence[str],
+    diff_text: str,
+    gh_fn: Callable = gh_command,
+    git_fn: Callable[..., subprocess.CompletedProcess[str]] = git_command,
+) -> tuple[bool, str, str]:
+    """Secret-scan, push, and open or update PR. Returns ``(ok, url_or_error, block_kind)``."""
+    findings = scan_diff_for_secrets(diff_text)
+    if findings:
+        return False, json.dumps(findings), "secret_in_diff"
+
+    push = git_fn(["push", "-u", "origin", branch], cwd=repo_dir, timeout=300)
+    if push.returncode != 0:
+        return False, push.stderr or push.stdout or "git push failed", "infra_broken"
+
+    body = build_pr_body(
+        task_id=task_id,
+        task_text=task_text,
+        contract=contract,
+        lane=lane,
+        attempt_history=attempt_history,
+        verification=verification,
+        reviews=reviews,
+        evidence_paths=evidence_paths,
+    )
+    existing = find_existing_pr(branch, gh_fn=gh_fn)
+    if existing is not None:
+        comment = gh_fn(["pr", "comment", str(existing), "--body", body])
+        if comment.returncode != 0:
+            return False, comment.stderr or "gh pr comment failed", "infra_broken"
+        view = gh_fn(["pr", "view", str(existing), "--json", "url"])
+        url = ""
+        if view.returncode == 0:
+            try:
+                url = json.loads(view.stdout or "{}").get("url", "")
+            except json.JSONDecodeError:
+                pass
+        return True, url or f"https://github.com/pull/{existing}", ""
+
+    title = str(contract.get("task_summary") or task_text)[:120]
+    create = gh_fn(
+        [
+            "pr",
+            "create",
+            "--draft",
+            "--head",
+            branch,
+            "--title",
+            title,
+            "--body",
+            body,
+        ],
+        cwd=repo_dir,
+    )
+    if create.returncode != 0:
+        return False, create.stderr or create.stdout or "gh pr create failed", "infra_broken"
+    url = (create.stdout or "").strip()
+    return True, url, ""
+
+
+# ---------------------------------------------------------------------------
+# JSONL progress tailing
+# ---------------------------------------------------------------------------
+
+
+def tail_jsonl_progress(
+    jsonl_path: Path,
+    last_size: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    if not jsonl_path.is_file():
+        return last_size, []
+    size = jsonl_path.stat().st_size
+    if size <= last_size:
+        return last_size, []
+    events: list[dict[str, Any]] = []
+    with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(last_size)
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return size, events
+
+
+def coarse_progress_from_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    progress: list[dict[str, Any]] = []
+    for ev in events:
+        etype = ev.get("type") or ev.get("event")
+        if etype in {"tool_call", "tool_result"}:
+            name = ev.get("tool") or ev.get("name") or "tool"
+            progress.append({"kind": "command", "detail": str(name)})
+        elif "edit" in json.dumps(ev).lower():
+            progress.append({"kind": "file_edited", "detail": "edit"})
+        elif etype == "checkpoint":
+            progress.append({"kind": "checkpoint", "detail": "checkpoint"})
+    if not progress and events:
+        progress.append({"kind": "stream_activity", "detail": f"{len(events)} events"})
+    return progress
+
+
+def detect_stall(
+    *,
+    unit_active: bool,
+    jsonl_path: Path,
+    last_size: int,
+    last_growth_at: float,
+    now: float,
+    stall_seconds: float = STALL_NO_OUTPUT_SECONDS,
+) -> tuple[bool, int, float]:
+    size = jsonl_path.stat().st_size if jsonl_path.is_file() else last_size
+    if size > last_size:
+        return False, size, now
+    if unit_active and (now - last_growth_at) >= stall_seconds:
+        return True, last_size, last_growth_at
+    return False, last_size, last_growth_at
+
+
+# ---------------------------------------------------------------------------
+# Reconcile
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReconcileDecision:
+    action: str
+    phase: Optional[str] = None
+    reason: Optional[str] = None
+    adopt: bool = False
+
+
+def reconcile_task_state(
+    state: Mapping[str, Any],
+    *,
+    unit_active: bool,
+    pid_match: bool,
+    candidate_commit: Optional[str],
+    attempts_used: int,
+    max_attempts: int,
+) -> ReconcileDecision:
+    phase = state.get("phase")
+    if unit_active and pid_match:
+        return ReconcileDecision(action="adopt", phase=str(phase), adopt=True)
+    if unit_active and not pid_match:
+        return ReconcileDecision(action="unit_gone", reason="pid_mismatch")
+    if candidate_commit and phase in POST_RUNNING_PHASES | {PHASE_VERIFYING}:
+        return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
+    if phase in {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}:
+        return ReconcileDecision(action="resume", phase=str(phase))
+    if phase in {PHASE_RUNNING, PHASE_PREPARING} and not candidate_commit:
+        if attempts_used < max_attempts:
+            return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
+        return ReconcileDecision(action="block", reason="executor_restarted")
+    if candidate_commit:
+        return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
+    if attempts_used < max_attempts:
+        return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
+    return ReconcileDecision(action="block", reason="executor_restarted")
+
+
+def reconcile_board(
+    conn: Any,
+    cfg: Mapping[str, Any],
+    *,
+    is_active_fn: Callable[[str], tuple[bool, str]] = systemctl_is_active,
+    pid_match_fn: Callable[[Optional[int], Optional[int]], bool] = host_pid_is_ours,
+) -> list[ReconcileDecision]:
+    board = str(cfg.get("board") or "dev")
+    decisions: list[ReconcileDecision] = []
+    tasks = kb.list_tasks(conn, status="running")
+    for task in tasks:
+        run = kb.latest_run(conn, task.id)
+        if not run:
+            continue
+        meta = load_run_metadata(conn, run.id)
+        state = pipeline_state(meta)
+        if not state:
+            continue
+        unit = state.get("unit_name") or unit_name(task.id, run.id)
+        active, _status = is_active_fn(unit)
+        pid = state.get("unit_pid")
+        start = state.get("host_start_time")
+        pid_ok = pid_match_fn(
+            int(pid) if pid is not None else None,
+            int(start) if start is not None else None,
+        )
+        attempts = count_attempt_runs(conn, task.id)
+        candidate = state.get("candidate_commit")
+        decision = reconcile_task_state(
+            state,
+            unit_active=active,
+            pid_match=pid_ok,
+            candidate_commit=candidate,
+            attempts_used=attempts,
+            max_attempts=int(cfg.get("max_attempts") or 2),
+        )
+        decisions.append(decision)
+        if decision.adopt:
+            record_dev_phase(
+                conn,
+                task.id,
+                run.id,
+                str(state.get("phase") or PHASE_RUNNING),
+                {"reconcile": "adopted"},
+            )
+    return decisions
+
+
+# ---------------------------------------------------------------------------
+# Executor service
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ActiveTask:
+    task_id: str
+    run_id: int
+    phase: str
+    last_heartbeat: float = 0.0
+    last_jsonl_size: int = 0
+    last_jsonl_growth_at: float = field(default_factory=time.time)
+
+
+class DevExecutor:
+    """Tick loop driving claimed dev-pipeline tasks."""
+
+    def __init__(
+        self,
+        cfg: Optional[Mapping[str, Any]] = None,
+        *,
+        is_active_fn: Callable[[str], tuple[bool, str]] = systemctl_is_active,
+        stop_fn: Callable[[str], bool] = systemctl_stop,
+    ) -> None:
+        self.cfg = dict(cfg or get_dev_pipeline_config())
+        self.board = str(self.cfg.get("board") or "dev")
+        self._active: dict[str, ActiveTask] = {}
+        self._is_active = is_active_fn
+        self._stop = stop_fn
+        self._last_reconcile = 0.0
+
+    def enabled(self) -> bool:
+        return bool(self.cfg.get("enabled"))
+
+    def tick(self) -> None:
+        if not self.enabled():
+            return
+        kb.create_board(self.board)
+        conn = kb.connect(board=self.board)
+        try:
+            reconcile_board(conn, self.cfg, is_active_fn=self._is_active)
+            self._drive_active(conn)
+            self._claim_ready(conn)
+        finally:
+            conn.close()
+
+    def _claim_ready(self, conn: Any) -> None:
+        if self._active:
+            return
+        rows = kb.list_tasks(conn, status="ready")
+        for task in rows:
+            body = parse_task_body(task.body)
+            if not body.get("repo"):
+                continue
+            claimed = kb.claim_task(
+                conn,
+                task.id,
+                ttl_seconds=CLAIM_TTL_SECONDS,
+                claimer="dev-executor",
+            )
+            if not claimed:
+                continue
+            run = kb.latest_run(conn, task.id)
+            if not run:
+                continue
+            self._active[task.id] = ActiveTask(
+                task_id=task.id,
+                run_id=run.id,
+                phase=PHASE_PLANNING,
+            )
+            self._advance(conn, task.id)
+            break
+
+    def _drive_active(self, conn: Any) -> None:
+        for task_id in list(self._active.keys()):
+            task = kb.get_task(conn, task_id)
+            if not task or task.status != "running":
+                if task and task.status == "blocked":
+                    self._handle_external_block(conn, task_id)
+                self._active.pop(task_id, None)
+                continue
+            self._maybe_heartbeat(conn, task_id)
+            self._advance(conn, task_id)
+
+    def _maybe_heartbeat(self, conn: Any, task_id: str) -> None:
+        active = self._active.get(task_id)
+        if not active:
+            return
+        now = time.time()
+        if now - active.last_heartbeat < HEARTBEAT_INTERVAL_SECONDS:
+            return
+        kb.heartbeat_claim(
+            conn,
+            task_id,
+            ttl_seconds=CLAIM_TTL_SECONDS,
+            claimer="dev-executor",
+        )
+        active.last_heartbeat = now
+
+    def _handle_external_block(self, conn: Any, task_id: str) -> None:
+        meta = load_run_metadata(conn, self._active.get(task_id, ActiveTask(task_id, 0, "")).run_id)
+        state = pipeline_state(meta)
+        unit = state.get("unit_name")
+        if unit:
+            self._stop(str(unit))
+        record_dev_phase(conn, task_id, None, PHASE_RUNNING, {"cancelled_by_user": True})
+
+    def _advance(self, conn: Any, task_id: str) -> None:
+        active = self._active.get(task_id)
+        if not active:
+            return
+        meta = load_run_metadata(conn, active.run_id)
+        state = pipeline_state(meta)
+        phase = state.get("phase") or active.phase
+
+        handlers = {
+            PHASE_PLANNING: self._phase_planning,
+            PHASE_ROUTING: self._phase_routing,
+            PHASE_PREPARING: self._phase_preparing,
+            PHASE_RUNNING: self._phase_running,
+            PHASE_VERIFYING: self._phase_verifying,
+            PHASE_REVIEWING: self._phase_reviewing,
+            PHASE_PUBLISHING: self._phase_publishing,
+        }
+        handler = handlers.get(str(phase))
+        if handler:
+            handler(conn, task_id, active.run_id, meta, state)
+
+    def _set_phase(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        phase: str,
+        **extra: Any,
+    ) -> None:
+        meta = merge_pipeline_state(meta, {"phase": phase, **extra})
+        save_run_metadata(conn, run_id, meta)
+        record_dev_phase(conn, task_id, run_id, phase, extra or None)
+        if task_id in self._active:
+            self._active[task_id].phase = phase
+
+    def _phase_planning(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        task = kb.get_task(conn, task_id)
+        body = parse_task_body(task.body if task else None)
+        task_text = str(body.get("task") or "")
+        repo = str(body.get("repo") or "")
+        branch = str(body.get("branch") or "main")
+        ws_root, _logs = workspace_paths(task_id, self.board)
+        repo_dir = ws_root / "repo"
+        if not repo_dir.is_dir():
+            ok, err = clone_repo(repo, repo_dir, branch)
+            if not ok:
+                block_dev_task(conn, task_id, "infra_broken", err, run_id=run_id)
+                self._active.pop(task_id, None)
+                return
+        summary = build_repo_summary(repo_dir)
+        contract, block_kind, advisors = run_planning(task_text, summary)
+        record_dev_phase(
+            conn,
+            task_id,
+            run_id,
+            PHASE_PLANNING,
+            {"advisors": advisors},
+        )
+        if not contract:
+            block_dev_task(
+                conn,
+                task_id,
+                block_kind or "plan_invalid",
+                "planning failed",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        meta = merge_pipeline_state(
+            meta,
+            {"contract": contract, "repo": repo, "branch": branch},
+        )
+        self._set_phase(conn, task_id, run_id, meta, PHASE_ROUTING)
+
+    def _phase_routing(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        contract = state.get("contract") or {}
+        decision, block_kind, reason = route_contract(contract)
+        if decision == "block":
+            block_dev_task(
+                conn,
+                task_id,
+                block_kind or "lane_unavailable",
+                reason or "blocked by plan contract",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        self._set_phase(conn, task_id, run_id, meta, PHASE_PREPARING)
+
+    def _phase_preparing(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        body = parse_task_body(kb.get_task(conn, task_id).body)
+        repo = str(state.get("repo") or body.get("repo") or "")
+        branch = str(state.get("branch") or body.get("branch") or "main")
+        ws_root, logs_root = workspace_paths(task_id, self.board)
+        ws_root.mkdir(parents=True, exist_ok=True)
+        logs_root.mkdir(parents=True, exist_ok=True)
+        repo_dir = ws_root / "repo"
+        ok, err = clone_repo(repo, repo_dir, branch)
+        if not ok:
+            block_dev_task(conn, task_id, "infra_broken", err, run_id=run_id)
+            self._active.pop(task_id, None)
+            return
+        git_command(["checkout", branch], cwd=repo_dir)
+        dev_branch = ensure_dev_branch(repo_dir, task_id)
+        agents_source = install_pinned_agents(repo_dir)
+        base_commit = git_head_sha(repo_dir) or ""
+        meta = merge_pipeline_state(
+            meta,
+            {
+                "workspace_root": str(ws_root),
+                "repo_path": str(repo_dir),
+                "logs_root": str(logs_root),
+                "dev_branch": dev_branch,
+                "base_commit": base_commit,
+                "agents_source": agents_source,
+            },
+        )
+        self._set_phase(conn, task_id, run_id, meta, PHASE_RUNNING)
+        self._spawn_attempt(conn, task_id, run_id, meta, state)
+
+    def _spawn_attempt(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+        *,
+        repair_context: Optional[str] = None,
+    ) -> None:
+        st = pipeline_state(meta)
+        repo_dir = Path(str(st.get("repo_path") or ""))
+        logs_root = Path(str(st.get("logs_root") or ""))
+        contract = st.get("contract") or {}
+        task = kb.get_task(conn, task_id)
+        body = parse_task_body(task.body if task else None)
+        task_text = str(body.get("task") or "")
+
+        unit = unit_name(task_id, run_id)
+        if self._is_active(unit)[0]:
+            return
+
+        jsonl_path = logs_root / f"attempt-{run_id}.jsonl"
+        prompt = build_attempt_prompt(task_text, contract, repair_context=repair_context)
+        runtime = int(self.cfg.get("cursor_timeout_seconds") or 1800)
+        env = build_attempt_env(os.environ, lane="cursor-bounded")
+        argv = [
+            sys.executable,
+            "-m",
+            "hermes_cli.dev_executor",
+            "attempt",
+            task_id,
+            str(run_id),
+            "--lane",
+            "cursor-bounded",
+        ]
+        ok, pid, start_time = systemd_run_attempt(
+            unit=unit,
+            runtime_max_sec=runtime,
+            working_directory=repo_dir,
+            env=env,
+            argv=argv,
+        )
+        if not ok:
+            block_dev_task(conn, task_id, "infra_broken", "failed to spawn attempt unit", run_id=run_id)
+            self._active.pop(task_id, None)
+            return
+        meta = merge_pipeline_state(
+            meta,
+            {
+                "unit_name": unit,
+                "unit_pid": pid,
+                "host_start_time": start_time,
+                "jsonl_path": str(jsonl_path),
+                "attempt_prompt": prompt,
+                "phase": PHASE_RUNNING,
+            },
+        )
+        save_run_metadata(conn, run_id, meta)
+        record_dev_phase(conn, task_id, run_id, PHASE_RUNNING, {"unit": unit, "run_id": run_id})
+        if task_id in self._active:
+            self._active[task_id].run_id = run_id
+            self._active[task_id].last_jsonl_size = 0
+            self._active[task_id].last_jsonl_growth_at = time.time()
+
+    def _phase_running(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        st = pipeline_state(meta)
+        unit = str(st.get("unit_name") or unit_name(task_id, run_id))
+        jsonl_path = Path(str(st.get("jsonl_path") or ""))
+        active, _ = self._is_active(unit)
+        active_task = self._active.get(task_id)
+        now = time.time()
+
+        if active_task and jsonl_path:
+            prev_size = active_task.last_jsonl_size
+            stalled, new_size, new_growth = detect_stall(
+                unit_active=active,
+                jsonl_path=jsonl_path,
+                last_size=prev_size,
+                last_growth_at=active_task.last_jsonl_growth_at,
+                now=now,
+            )
+            if new_size > prev_size:
+                active_task.last_jsonl_growth_at = now
+            else:
+                active_task.last_jsonl_growth_at = new_growth
+            size, events = tail_jsonl_progress(jsonl_path, prev_size)
+            for item in coarse_progress_from_events(events):
+                record_dev_phase(conn, task_id, run_id, PHASE_RUNNING, item)
+            active_task.last_jsonl_size = size
+            if stalled:
+                self._stop(unit)
+                self._finish_attempt(
+                    conn,
+                    task_id,
+                    run_id,
+                    meta,
+                    exit_code=None,
+                    classification_hint="stalled",
+                )
+                return
+
+        if active:
+            return
+
+        exit_code = 0
+        try:
+            code_str = systemctl_show(unit, "ExecMainStatus")
+            if code_str and code_str.isdigit():
+                exit_code = int(code_str)
+        except Exception:
+            pass
+        self._finish_attempt(conn, task_id, run_id, meta, exit_code=exit_code)
+
+    def _finish_attempt(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        *,
+        exit_code: Optional[int],
+        classification_hint: Optional[str] = None,
+    ) -> None:
+        st = pipeline_state(meta)
+        repo_dir = Path(str(st.get("repo_path") or ""))
+        base = st.get("base_commit")
+        candidate = git_head_sha(repo_dir)
+        classification = classify_attempt(
+            exit_code=exit_code,
+            classification_hint=classification_hint,
+            base_commit=base,
+            candidate_commit=candidate,
+        )
+        history = list(st.get("attempt_history") or [])
+        history.append(
+            {
+                "run_id": run_id,
+                "classification": classification,
+                "exit_code": exit_code,
+                "candidate_commit": candidate,
+            }
+        )
+        meta = merge_pipeline_state(
+            meta,
+            {
+                "candidate_commit": candidate,
+                "attempt_history": history,
+                "last_classification": classification,
+            },
+        )
+        end_attempt_run(
+            conn,
+            task_id,
+            outcome=classification,
+            summary=f"attempt {run_id}: {classification}",
+            metadata=meta,
+        )
+        record_dev_phase(
+            conn,
+            task_id,
+            run_id,
+            PHASE_RUNNING,
+            {"classification": classification, "exit_code": exit_code},
+        )
+        if classification not in {"completed"} or not candidate:
+            attempts = count_attempt_runs(conn, task_id)
+            if attempts < int(self.cfg.get("max_attempts") or 2):
+                new_run = start_new_run(conn, task_id, metadata=meta)
+                if task_id in self._active:
+                    self._active[task_id].run_id = new_run
+                self._spawn_attempt(conn, task_id, new_run, meta, st)
+            else:
+                kb.block_task(conn, task_id, reason=f"attempts exhausted: {classification}", kind=None)
+                self._active.pop(task_id, None)
+            return
+        run = kb.latest_run(conn, task_id)
+        current_run = run.id if run else run_id
+        if task_id in self._active:
+            self._active[task_id].run_id = current_run
+        fresh_meta = load_run_metadata(conn, current_run)
+        self._set_phase(conn, task_id, current_run, fresh_meta, PHASE_VERIFYING)
+
+    def _phase_verifying(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        st = pipeline_state(meta)
+        contract = st.get("contract") or {}
+        commands = contract.get("acceptance_commands") or []
+        repo_dir = Path(str(st.get("repo_path") or ""))
+        logs_root = Path(str(st.get("logs_root") or ""))
+        candidate = st.get("candidate_commit") or git_head_sha(repo_dir)
+        base = st.get("base_commit") or ""
+        verify_dir = repo_dir.parent / "verify"
+        verify_base_dir = repo_dir.parent / "verify-base"
+
+        if verify_dir.exists():
+            import shutil
+
+            shutil.rmtree(verify_dir, ignore_errors=True)
+        git_command(["clone", str(repo_dir), str(verify_dir)], cwd=verify_dir.parent)
+        git_command(["checkout", str(candidate)], cwd=verify_dir)
+
+        timeout = int(self.cfg.get("verify_command_timeout") or 600)
+        env = build_attempt_env(os.environ, lane="cursor-bounded")
+        cand_results = run_verification(
+            verify_dir,
+            commands,
+            logs_root / "verify-candidate",
+            timeout=timeout,
+            env=env,
+        )
+        outcome = classify_verification(cand_results)
+        verification: dict[str, Any] = {
+            "outcome": outcome,
+            "candidate": [
+                {"command": r.command, "exit_code": r.exit_code, "log": str(r.output_path)}
+                for r in cand_results
+            ],
+        }
+        if outcome == "regression":
+            if verify_base_dir.exists():
+                import shutil
+
+                shutil.rmtree(verify_base_dir, ignore_errors=True)
+            git_command(["clone", str(repo_dir), str(verify_base_dir)], cwd=verify_base_dir.parent)
+            git_command(["checkout", str(base)], cwd=verify_base_dir)
+            base_results = run_verification(
+                verify_base_dir,
+                commands,
+                logs_root / "verify-base",
+                timeout=timeout,
+                env=env,
+            )
+            outcome = classify_verification(cand_results, base_results)
+            verification["base"] = [
+                {"command": r.command, "exit_code": r.exit_code, "log": str(r.output_path)}
+                for r in base_results
+            ]
+            verification["outcome"] = outcome
+
+        meta = merge_pipeline_state(meta, {"verification": verification, "mechanical_pass": outcome == "pass"})
+        if outcome == "regression":
+            attempts = count_attempt_runs(conn, task_id)
+            if attempts < int(self.cfg.get("max_attempts") or 2) and not st.get("repair_used"):
+                diff = unified_diff(repo_dir, str(base), str(candidate))
+                body = parse_task_body(kb.get_task(conn, task_id).body)
+                repair = build_repair_prompt(
+                    str(body.get("task") or ""),
+                    contract,
+                    cand_results,
+                    diff,
+                )
+                meta = merge_pipeline_state(meta, {"repair_used": True, "repair_pending": True})
+                save_run_metadata(conn, run_id, meta)
+                new_run = start_new_run(conn, task_id, metadata=meta)
+                if task_id in self._active:
+                    self._active[task_id].run_id = new_run
+                self._spawn_attempt(conn, task_id, new_run, meta, st, repair_context=repair)
+                return
+            kb.block_task(conn, task_id, reason="verification regression", kind=None)
+            self._active.pop(task_id, None)
+            return
+        if outcome == "baseline_failure":
+            meta = merge_pipeline_state(meta, {"mechanical_pass": True})
+        save_run_metadata(conn, run_id, meta)
+        self._set_phase(conn, task_id, run_id, meta, PHASE_REVIEWING)
+
+    def _phase_reviewing(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        st = pipeline_state(meta)
+        contract = st.get("contract") or {}
+        repo_dir = Path(str(st.get("repo_path") or ""))
+        logs_root = Path(str(st.get("logs_root") or ""))
+        logs_root.mkdir(parents=True, exist_ok=True)
+        base = str(st.get("base_commit") or "")
+        candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
+        diff = unified_diff(repo_dir, base, candidate)
+        if len(diff) > MAX_DIFF_REVIEW_BYTES:
+            diff = diff[:MAX_DIFF_REVIEW_BYTES] + "\n... [truncated]\n"
+        verification = st.get("verification") or {}
+        task = kb.get_task(conn, task_id)
+        body = parse_task_body(task.body if task else None)
+        task_text = str(body.get("task") or "")
+
+        kimi_prompt = (
+            "Review the dev change. Return STRICT JSON only:\n"
+            '{"verdict":"pass|fail","blocking_findings":[],"notes":[]}\n\n'
+            f"Task:\n{task_text}\n\nPlan:\n{json.dumps(contract)}\n\n"
+            f"Diff:\n{diff}\n\nVerification:\n{json.dumps(verification)}"
+        )
+        kimi_proc = hermes_chat_review(kimi_prompt, cwd=repo_dir)
+        kimi_raw = (kimi_proc.stdout or "") + (kimi_proc.stderr or "")
+        (logs_root / "review-kimi.raw").write_text(kimi_raw[:200_000], encoding="utf-8")
+        kimi_verdict = parse_review_verdict(kimi_raw)
+
+        grok_prompt = (
+            "Delegate ONLY to the reviewer subagent. Read-only correctness/security "
+            "review of the committed diff. Return STRICT JSON:\n"
+            '{"verdict":"pass|fail","blocking_findings":[],"notes":[]}\n\n'
+            f"Diff:\n{diff}"
+        )
+        agent_bin = resolve_cursor_agent_binary()
+        grok_verdict = None
+        grok_raw = ""
+        if agent_bin:
+            grok_jsonl = logs_root / "review-grok.jsonl"
+            proc = run_subprocess(
+                [
+                    agent_bin,
+                    "-p",
+                    "--trust",
+                    "--model",
+                    "kimi-k3-high",
+                    "--output-format",
+                    "stream-json",
+                    grok_prompt,
+                ],
+                cwd=repo_dir,
+                env=build_attempt_env(os.environ, lane="cursor-bounded"),
+                timeout=int(self.cfg.get("cursor_timeout_seconds") or 1800),
+            )
+            grok_raw = (proc.stdout or "") + (proc.stderr or "")
+            grok_jsonl.write_text(grok_raw[:500_000], encoding="utf-8")
+            grok_verdict = parse_review_verdict(grok_raw)
+
+        reviews = {
+            "kimi": kimi_verdict,
+            "grok": grok_verdict,
+        }
+        (logs_root / "reviews.json").write_text(json.dumps(reviews, indent=2), encoding="utf-8")
+
+        if not kimi_verdict or not grok_verdict:
+            block_dev_task(conn, task_id, "review_unavailable", "review verdict unparseable", run_id=run_id)
+            self._active.pop(task_id, None)
+            return
+
+        mechanical_pass = bool(st.get("mechanical_pass", True))
+        proceed, needs_repair = review_gate(mechanical_pass, kimi_verdict, grok_verdict)
+        meta = merge_pipeline_state(meta, {"reviews": reviews})
+        save_run_metadata(conn, run_id, meta)
+
+        if proceed:
+            self._set_phase(conn, task_id, run_id, meta, PHASE_PUBLISHING)
+            return
+
+        if needs_repair and not st.get("repair_used"):
+            attempts = count_attempt_runs(conn, task_id)
+            if attempts < int(self.cfg.get("max_attempts") or 2):
+                findings = (kimi_verdict.get("blocking_findings") or []) + (
+                    grok_verdict.get("blocking_findings") or []
+                )
+                repair = build_attempt_prompt(
+                    task_text,
+                    contract,
+                    repair_context="Review findings:\n" + json.dumps(findings),
+                )
+                meta = merge_pipeline_state(meta, {"repair_used": True, "repair_pending": True})
+                save_run_metadata(conn, run_id, meta)
+                new_run = start_new_run(conn, task_id, metadata=meta)
+                if task_id in self._active:
+                    self._active[task_id].run_id = new_run
+                self._spawn_attempt(conn, task_id, new_run, meta, st, repair_context=repair)
+                self._set_phase(conn, task_id, new_run, meta, PHASE_RUNNING)
+                return
+
+        kb.block_task(conn, task_id, reason="review failed", kind=None)
+        self._active.pop(task_id, None)
+
+    def _phase_publishing(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        state: dict,
+    ) -> None:
+        st = pipeline_state(meta)
+        contract = st.get("contract") or {}
+        repo_dir = Path(str(st.get("repo_path") or ""))
+        logs_root = Path(str(st.get("logs_root") or ""))
+        branch = str(st.get("dev_branch") or f"hermes-dev/{task_id}")
+        base = str(st.get("base_commit") or "")
+        candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
+        diff = unified_diff(repo_dir, base, candidate)
+        task = kb.get_task(conn, task_id)
+        body = parse_task_body(task.body if task else None)
+        task_text = str(body.get("task") or "")
+
+        ok, url, block_kind = publish_pr(
+            task_id=task_id,
+            task_text=task_text,
+            contract=contract,
+            repo_dir=repo_dir,
+            branch=branch,
+            lane="cursor-bounded",
+            attempt_history=st.get("attempt_history") or [],
+            verification=st.get("verification") or {},
+            reviews=st.get("reviews") or {},
+            evidence_paths=[
+                str(logs_root / "verify-candidate"),
+                str(logs_root / "reviews.json"),
+            ],
+            diff_text=diff,
+        )
+        if not ok:
+            if block_kind == "secret_in_diff":
+                (logs_root / "secret-scan.json").write_text(url, encoding="utf-8")
+            block_dev_task(conn, task_id, block_kind or "infra_broken", url, run_id=run_id)
+            self._active.pop(task_id, None)
+            return
+        kb.complete_task(conn, task_id, result=url, summary="dev pipeline complete")
+        record_dev_phase(conn, task_id, run_id, PHASE_PUBLISHING, {"pr_url": url})
+        self._active.pop(task_id, None)
+
+    def run(self) -> None:
+        if not self.enabled():
+            logger.error("dev_pipeline.enabled is false — refusing to run")
+            sys.exit(1)
+        reconcile_once(self.cfg)
+        tick_seconds = int(self.cfg.get("tick_seconds") or 15)
+        while True:
+            try:
+                self.tick()
+            except Exception:
+                logger.exception("dev executor tick failed")
+            time.sleep(tick_seconds)
+
+
+def reconcile_once(cfg: Optional[Mapping[str, Any]] = None) -> list[ReconcileDecision]:
+    cfg = dict(cfg or get_dev_pipeline_config())
+    board = str(cfg.get("board") or "dev")
+    kb.create_board(board)
+    conn = kb.connect(board=board)
+    try:
+        return reconcile_board(conn, cfg)
+    finally:
+        conn.close()
+
+
+def run_attempt_cli(task_id: str, run_id: int, *, lane: str = "cursor-bounded") -> None:
+    """Exec Cursor agent for a single attempt (systemd unit entrypoint)."""
+    cfg = get_dev_pipeline_config()
+    board = str(cfg.get("board") or "dev")
+    conn = kb.connect(board=board)
+    try:
+        meta = load_run_metadata(conn, run_id)
+        st = pipeline_state(meta)
+        repo_dir = Path(str(st.get("repo_path") or "."))
+        logs_root = Path(
+            str(st.get("logs_root") or kb.worker_logs_dir(board=board) / task_id)
+        )
+        jsonl_path = logs_root / f"attempt-{run_id}.jsonl"
+        logs_root.mkdir(parents=True, exist_ok=True)
+        prompt = st.get("attempt_prompt") or ""
+        agent_bin = resolve_cursor_agent_binary()
+        if not agent_bin:
+            sys.exit(127)
+        env = build_attempt_env(os.environ, lane=lane)
+        cmd = [
+            agent_bin,
+            "-p",
+            "--trust",
+            "--force",
+            "--model",
+            "kimi-k3-high",
+            "--output-format",
+            "stream-json",
+            prompt,
+        ]
+        with jsonl_path.open("w", encoding="utf-8") as out_fh:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(repo_dir),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                out_fh.write(line)
+                out_fh.flush()
+            rc = proc.wait()
+        sys.exit(rc)
+    finally:
+        conn.close()
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    parser = argparse.ArgumentParser(prog="hermes_cli.dev_executor")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("run", help="Long-running executor tick loop")
+    sub.add_parser("reconcile", help="One-shot startup reconciliation")
+
+    attempt_p = sub.add_parser("attempt", help="Run one Cursor attempt")
+    attempt_p.add_argument("task_id")
+    attempt_p.add_argument("run_id", type=int)
+    attempt_p.add_argument("--lane", default="cursor-bounded")
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    logging.basicConfig(level=logging.INFO)
+
+    if args.command == "run":
+        DevExecutor().run()
+    elif args.command == "reconcile":
+        decisions = reconcile_once()
+        for d in decisions:
+            logger.info("reconcile: %s", d)
+    elif args.command == "attempt":
+        run_attempt_cli(args.task_id, args.run_id, lane=args.lane)
+    else:
+        parser.error(f"unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
