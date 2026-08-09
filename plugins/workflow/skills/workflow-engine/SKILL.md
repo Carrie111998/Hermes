@@ -164,6 +164,18 @@ The template files ship inside the plugin bundle at `<plugin install>/skills/wor
 
 Engine support note: the wiki's unbounded loop-until-done and mid-run dynamic graph extension are **not** representable in static YAML — the engine's loop is the bounded review loop, and dynamic extension lives in (paused) dynamic mode.
 
+## References
+
+Engine internals and edge-case knowledge, loaded on demand:
+
+- `references/state-file-structure.md` — `.engine-state` file layout (source of truth for loops)
+- `references/yaml-patterns.md` — pipeline YAML patterns (linear, loop, review zones)
+- `references/kanban-events.md` — kanban event reference (lifecycle + event payloads)
+- `references/session-info-persistence.md` — why session context is lost across the tool-handler → engine boundary, and the file-bridge fix
+- `references/session-env-vars-gap.md` — session env vars unavailable to the tool handler subprocess
+- `references/db-corruption-recovery.md` — SQLite corruption from concurrent supervisors and recovery
+- `references/board-name-pattern.md` — board names must not be hardcoded in shared code
+
 ## Common Pitfalls
 
 | Symptom | Cause | Fix |
