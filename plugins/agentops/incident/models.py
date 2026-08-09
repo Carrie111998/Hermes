@@ -63,3 +63,4 @@ class ReviewResult:
     def __post_init__(self):
         if self.decision not in {"observe", "escalate"} or self.risk not in {"low", "medium", "high", "critical", "unknown"} or not 0 <= self.confidence <= 1: raise ValueError("invalid review proposal")
         if self.actions and self.degraded or (self.degraded and self.model_used): raise ValueError("degraded review cannot propose actions/model")
+        if not isinstance(self.model_used, bool) or not isinstance(self.degraded, bool) or not all(isinstance(x, str) for x in self.hypotheses + self.actions + self.verification + self.rollback + self.evidence_ids): raise ValueError("invalid review schema")
