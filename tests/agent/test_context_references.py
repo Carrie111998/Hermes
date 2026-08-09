@@ -228,10 +228,11 @@ async def test_permissions_deny_blocks_git_reference_before_subprocess(tmp_path:
             raise AssertionError("denied-overlap ancestor .git was probed")
         return original_exists(path_obj)
 
+    denied_rule = str(denied / "**")
     with (
         patch(
             "agent.deny_policy.permissions_deny_paths",
-            return_value=[str(denied / "**")],
+            return_value=[denied_rule],
         ),
         patch.object(Path, "exists", guarded_exists),
         patch("agent.context_references.subprocess.run") as mock_run,
@@ -244,6 +245,30 @@ async def test_permissions_deny_blocks_git_reference_before_subprocess(tmp_path:
 
     mock_run.assert_not_called()
     assert any("permissions.deny.paths" in warning for warning in result.warnings)
+    assert all(denied_rule not in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_folder_deny_warning_does_not_disclose_descendant_rule(tmp_path: Path):
+    from agent.context_references import preprocess_context_references_async
+
+    root = tmp_path / "workspace"
+    denied = root / "private" / "vault"
+    denied.mkdir(parents=True)
+
+    denied_rule = str(denied / "**")
+    with patch(
+        "agent.deny_policy.permissions_deny_paths",
+        return_value=[denied_rule],
+    ):
+        result = await preprocess_context_references_async(
+            f"inspect @folder:{root}",
+            cwd=tmp_path,
+            context_length=100_000,
+        )
+
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+    assert all(denied_rule not in warning for warning in result.warnings)
 
 
 def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path: Path, monkeypatch):

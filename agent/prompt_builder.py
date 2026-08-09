@@ -2254,7 +2254,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     case outside a git repo — output is identical to the historical
     single-file behavior.
     """
-    cwd_resolved = cwd_path.resolve()
+    cwd_resolved = cwd_path.absolute()
     sections: List[str] = []
     seen_content: set = set()
     for directory in _agents_md_directory_chain(cwd_resolved):
@@ -2393,7 +2393,10 @@ def build_context_files_prompt(
     else:
         cwd_is_fallback = False
 
-    cwd_path = Path(cwd).resolve()
+    cwd_path = Path(cwd).expanduser()
+    if not cwd_path.is_absolute():
+        cwd_path = Path.cwd() / cwd_path
+    cwd_path = cwd_path.absolute()
     sections = []
 
     # Never let a FALLBACK-picked directory inside the Hermes install/source

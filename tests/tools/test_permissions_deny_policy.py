@@ -234,6 +234,33 @@ class TestPermissionsDenyPathMatching:
         assert disjoint is None
         assert matching is not None
 
+    @pytest.mark.parametrize(
+        ("pattern", "disjoint_root", "matching_root"),
+        [
+            ("/workspace/foo?/secret/**", "/workspace/foobar", "/workspace/fooa"),
+            ("/workspace/foo[ab]/secret/**", "/workspace/fooc", "/workspace/fooa"),
+        ],
+    )
+    def test_fixed_width_glob_search_overlap_is_precise(
+        self,
+        pattern,
+        disjoint_root,
+        matching_root,
+    ):
+        disjoint = deny_policy.match_permissions_deny_search_root(
+            disjoint_root,
+            patterns=[pattern],
+            canonicalize=False,
+        )
+        matching = deny_policy.match_permissions_deny_search_root(
+            matching_root,
+            patterns=[pattern],
+            canonicalize=False,
+        )
+
+        assert disjoint is None
+        assert matching is not None
+
 
 class TestPermissionsDenyFileTools:
     def test_vercel_sandbox_uses_remote_path_semantics(self, monkeypatch):

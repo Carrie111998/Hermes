@@ -60,6 +60,10 @@ class TestMatchUserDenyRule:
 
 class TestDenyBeatsYolo:
     @pytest.mark.parametrize(
+        "env_type",
+        ["local", "docker", "modal"],
+    )
+    @pytest.mark.parametrize(
         "deny_value",
         [
             "git push --force*",
@@ -72,14 +76,14 @@ class TestDenyBeatsYolo:
         [mod.check_dangerous_command, mod.check_all_command_guards],
     )
     def test_malformed_legacy_deny_fails_closed_in_all_guards(
-            self, monkeypatch, clean_env, deny_value, guard):
+            self, monkeypatch, clean_env, deny_value, guard, env_type):
         monkeypatch.setattr(
             mod,
             "_get_approval_config",
             lambda: {"mode": "off", "deny": deny_value},
         )
 
-        result = guard("ls -la", "local")
+        result = guard("ls -la", env_type)
 
         assert result["approved"] is False
         assert result.get("user_deny") is True
@@ -140,12 +144,22 @@ class TestDenyOrdering:
         assert result["approved"] is False
         assert result.get("user_deny") is True
 
-    def test_container_backend_skips_deny(self, deny_config, clean_env):
-        """Isolated container backends bypass the whole guard stack (existing
-        contract) — deny rules protect the host, containers can't touch it."""
+    @pytest.mark.parametrize(
+        "guard",
+        [mod.check_dangerous_command, mod.check_all_command_guards],
+    )
+    @pytest.mark.parametrize(
+        "env_type",
+        ["docker", "singularity", "modal", "daytona", "vercel_sandbox"],
+    )
+    def test_isolated_backend_does_not_skip_user_deny(
+            self, deny_config, clean_env, guard, env_type):
         deny_config(["git push --force*"])
-        result = mod.check_dangerous_command("git push --force origin main", "docker")
-        assert result["approved"] is True
+
+        result = guard("git push --force origin main", env_type)
+
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
 
     def test_benign_command_unaffected(self, deny_config, clean_env):
         deny_config(["git push --force*"])

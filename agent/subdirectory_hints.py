@@ -111,7 +111,10 @@ class SubdirectoryHintTracker:
     """
 
     def __init__(self, working_dir: Optional[str] = None):
-        self.working_dir = Path(working_dir or os.getcwd()).resolve()
+        lexical_working_dir = Path(working_dir or os.getcwd()).expanduser()
+        if not lexical_working_dir.is_absolute():
+            lexical_working_dir = Path.cwd() / lexical_working_dir
+        self.working_dir = lexical_working_dir.absolute()
         self._loaded_dirs: Set[Path] = set()
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
@@ -189,9 +192,9 @@ class SubdirectoryHintTracker:
         return list(candidates)
 
     def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
-        """Resolve a raw path and add its directory + ancestors to candidates.
+        """Anchor a raw path lexically and add its directory + ancestors.
 
-        Walks up from the resolved directory toward the filesystem root,
+        Walks up from the lexical directory toward the filesystem root,
         stopping at the first directory already in ``_loaded_dirs`` (or after
         ``_MAX_ANCESTOR_WALK`` levels).  This ensures that reading
         ``project/src/main.py`` discovers ``project/AGENTS.md`` even when
@@ -203,7 +206,7 @@ class SubdirectoryHintTracker:
                 p = self.working_dir / p
             if _is_denied_context_path(p, base_path=self.working_dir):
                 return
-            p = p.resolve()
+            p = p.absolute()
             if _is_denied_context_path(p, base_path=self.working_dir):
                 return
             # Use parent if it's a file path (has extension or doesn't exist as dir)
@@ -256,16 +259,14 @@ class SubdirectoryHintTracker:
             return False
         if path in self._loaded_dirs:
             return False
-        # Reject paths outside the working directory tree.
-        # path.resolve() may differ from working_dir.resolve() due to symlinks,
-        # but path.is_relative_to(working_dir) handles both absolute and
-        # symlinked paths correctly on Python 3.9+.
+        # Reject paths whose canonical target escapes the working directory while
+        # retaining the lexical path for deny checks and hint-file provenance.
         try:
-            if not path.is_relative_to(self.working_dir):
+            canonical_path = path.resolve()
+            canonical_root = self.working_dir.resolve()
+            if not canonical_path.is_relative_to(canonical_root):
                 return False
         except (OSError, ValueError):
-            # Older Python or path resolution error — fall back to parent
-            # check as a best-effort safeguard.
             if not _is_ancestor_or_same(self.working_dir, path):
                 return False
         if self._is_excluded(path):

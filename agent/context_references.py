@@ -438,8 +438,7 @@ def _ensure_reference_path_allowed(
             )
         if match is not None:
             raise ValueError(
-                f"path matches permissions.deny.paths rule {match.pattern!r} "
-                "and cannot be attached"
+                "path is blocked by permissions.deny.paths and cannot be attached"
             )
     except ValueError:
         raise

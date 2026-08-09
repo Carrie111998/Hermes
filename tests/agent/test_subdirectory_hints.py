@@ -161,6 +161,26 @@ class TestSubdirectoryHintTracker:
         ):
             SubdirectoryHintTracker(working_dir=str(project))
 
+    def test_digest_seed_checks_lexical_working_dir_before_resolve(self, tmp_path):
+        lexical_workdir = tmp_path / "alias-workspace"
+        lexical_workdir.mkdir()
+        (lexical_workdir / "AGENTS.md").write_text("DENIED LEXICAL HINT")
+        original_resolve = Path.resolve
+
+        def guarded_resolve(path_obj, *args, **kwargs):
+            if path_obj == lexical_workdir:
+                raise AssertionError("working dir resolved before lexical deny")
+            return original_resolve(path_obj, *args, **kwargs)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "alias-*" / "AGENTS.md")],
+            ),
+            patch.object(Path, "resolve", autospec=True, side_effect=guarded_resolve),
+        ):
+            SubdirectoryHintTracker(working_dir=str(lexical_workdir))
+
     def test_workdir_arg(self, project):
         """The workdir argument from terminal tool is checked."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))

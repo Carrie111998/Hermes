@@ -547,6 +547,32 @@ class TestBuildContextFilesPrompt:
         assert result == ""
         mock_glob.assert_not_called()
 
+    def test_startup_context_checks_lexical_cwd_before_resolve(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        lexical_cwd = tmp_path / "alias-workspace"
+        lexical_cwd.mkdir()
+        (lexical_cwd / "AGENTS.md").write_text("DENIED LEXICAL STARTUP")
+        original_resolve = Path.resolve
+
+        def guarded_resolve(path_obj, *args, **kwargs):
+            if path_obj == lexical_cwd:
+                raise AssertionError("startup cwd resolved before lexical deny")
+            return original_resolve(path_obj, *args, **kwargs)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "alias-*" / "AGENTS.md")],
+            ),
+            patch.object(Path, "resolve", autospec=True, side_effect=guarded_resolve),
+        ):
+            result = build_context_files_prompt(cwd=str(lexical_cwd), skip_soul=True)
+
+        assert result == ""
+        assert "DENIED LEXICAL STARTUP" not in result
+
     def test_denied_hermes_md_is_not_probed_before_allowed_agents_md(self, tmp_path):
         """Exact deny checks precede implicit .hermes.md file metadata access."""
         from pathlib import Path

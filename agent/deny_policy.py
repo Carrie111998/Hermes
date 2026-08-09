@@ -293,6 +293,48 @@ def _search_overlap_prefixes(
     return tuple(dict.fromkeys(prefixes))
 
 
+def _fixed_width_search_prefix_compatible(
+    candidate: str,
+    pattern: str,
+    *,
+    canonicalize: bool,
+) -> bool:
+    """Reject impossible overlap before applying the conservative prefix test.
+
+    ``?`` and character classes consume exactly one path-segment character.
+    Truncating at those metacharacters makes ``foo?`` appear to overlap
+    ``foobar``. Compare every fully constrained segment up to the first ``*``;
+    after a variable-width star, overlap remains intentionally conservative.
+    """
+
+    candidate_parts = candidate.strip("/").split("/") if candidate.strip("/") else []
+    for normalized in _normalize_pattern_variants(
+        pattern,
+        canonicalize=canonicalize,
+    ):
+        pattern_parts = normalized.strip("/").split("/") if normalized.strip("/") else []
+        compatible = True
+        for index, pattern_part in enumerate(pattern_parts):
+            if "*" in pattern_part:
+                break
+            if index >= len(candidate_parts):
+                break
+            candidate_part = candidate_parts[index]
+            if any(char in pattern_part for char in "?["):
+                if not fnmatch.fnmatchcase(candidate_part, pattern_part):
+                    compatible = False
+                    break
+            elif candidate_part != pattern_part:
+                compatible = False
+                break
+        else:
+            if len(candidate_parts) > len(pattern_parts):
+                compatible = False
+        if compatible:
+            return True
+    return False
+
+
 def _path_matches_normalized_pattern(candidate: str, pat: str) -> bool:
     """Return whether normalized *candidate* is denied by normalized *pat*."""
     if not pat:
@@ -415,12 +457,19 @@ def match_permissions_deny_search_root(
                 canonicalize=phase_canonicalize,
             ):
                 if any(
-                    prefix == candidate
-                    or prefix.startswith(candidate + "/")
-                    or (
-                        candidate.startswith(prefix + "/")
-                        if segment_boundary
-                        else candidate.startswith(prefix)
+                    _fixed_width_search_prefix_compatible(
+                        candidate,
+                        match_pattern,
+                        canonicalize=phase_canonicalize,
+                    )
+                    and (
+                        prefix == candidate
+                        or prefix.startswith(candidate + "/")
+                        or (
+                            candidate.startswith(prefix + "/")
+                            if segment_boundary
+                            else candidate.startswith(prefix)
+                        )
                     )
                     for candidate in candidates
                 ):
