@@ -7027,11 +7027,9 @@ class AIAgent:
             "assistant": "assistant",
             "tool": "tool result",
         }.get(role, "user")
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, UI, data, objects, people, layout, colors, "
-            "and any other notable visual information."
-        )
+        from tools.vision_tools import get_vision_analysis_prompt
+
+        analysis_prompt = get_vision_analysis_prompt()
 
         vision_source = str(image_url or "")
         cleanup_path: Optional[Path] = None

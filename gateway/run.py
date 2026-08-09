@@ -23819,16 +23819,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns:
             The enriched message string with vision descriptions prepended.
         """
-        from tools.vision_tools import vision_analyze_tool
+        from tools.vision_tools import vision_analyze_tool, get_vision_analysis_prompt
         from agent.memory_manager import sanitize_context
 
-        analysis_prompt = (
-            "Concisely describe this image in 2-4 sentences "
-            "(~200 Chinese characters or ~150 English words). "
-            "Cover the main subject, key visible text/data/code, and overall context. "
-            "If it is a chart, diagram, or scientific figure, include the important "
-            "labels, legend, and key values. Skip decorative details."
-        )
+        analysis_prompt = get_vision_analysis_prompt()
 
         enriched_parts = []
         for path in image_paths:

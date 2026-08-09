@@ -8481,13 +8481,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         image later with ``vision_analyze`` if needed.
         """
         import asyncio as _asyncio
-        from tools.vision_tools import vision_analyze_tool
+        from tools.vision_tools import vision_analyze_tool, get_vision_analysis_prompt
 
-        analysis_prompt = (
-            "Describe everything visible in this image in thorough detail. "
-            "Include any text, code, data, objects, people, layout, colors, "
-            "and any other notable visual information."
-        )
+        analysis_prompt = get_vision_analysis_prompt()
 
         enriched_parts = []
         for img_path in images:
