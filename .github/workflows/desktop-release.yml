@@ -20,14 +20,10 @@ jobs:
             os: windows-latest
             command: dist:win
             artifact: windows-x64
-          - name: macOS Intel
-            os: macos-13
-            command: dist:mac
-            artifact: macos-x64
-          - name: macOS Apple Silicon
+          - name: macOS Universal
             os: macos-14
-            command: dist:mac
-            artifact: macos-arm64
+            command: dist:mac:universal
+            artifact: macos-universal
           - name: Linux x64
             os: ubuntu-22.04
             command: dist:linux
