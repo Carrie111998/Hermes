@@ -111,3 +111,24 @@ def test_normal_dispatch_still_promotes_claims_and_spawns(kanban_db):
     assert row["claim_lock"]
     assert row["current_run_id"] is not None
     assert row["worker_pid"] == 321
+
+
+def test_dry_run_restores_crash_diagnostics_side_channels(kanban_db, monkeypatch):
+    """Prospective crash diagnostics must not leak into the live dispatcher."""
+    kb = kanban_db
+    live_auto_blocked = ["live-auto-blocked"]
+    live_rate_limited = ["live-rate-limited"]
+    monkeypatch.setattr(
+        kb.detect_crashed_workers, "_last_auto_blocked", live_auto_blocked,
+    )
+    monkeypatch.setattr(
+        kb.detect_crashed_workers, "_last_rate_limited", live_rate_limited,
+    )
+
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_once(conn, dry_run=True, spawn_fn=lambda *args: 123)
+
+    assert result.auto_blocked == []
+    assert result.rate_limited == []
+    assert kb.detect_crashed_workers._last_auto_blocked is live_auto_blocked
+    assert kb.detect_crashed_workers._last_rate_limited is live_rate_limited

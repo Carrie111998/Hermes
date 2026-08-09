@@ -9242,6 +9242,12 @@ def _dispatch_once_dry_run(
     """Return a dispatch plan without mutating the live database or process."""
     snapshot = sqlite3.connect(":memory:")
     snapshot.row_factory = sqlite3.Row
+    diagnostic_attrs = ("_last_auto_blocked", "_last_rate_limited")
+    missing = object()
+    live_diagnostics = {
+        name: getattr(detect_crashed_workers, name, missing)
+        for name in diagnostic_attrs
+    }
     try:
         conn.backup(snapshot)
         return _dispatch_once_locked(
@@ -9258,6 +9264,18 @@ def _dispatch_once_dry_run(
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
     finally:
+        # ``detect_crashed_workers`` communicates prospective diagnostics via
+        # function attributes.  The in-memory dispatch still runs that code,
+        # so restore the live dispatcher side channels before returning; a
+        # dry-run must not make the next real tick consume stale plan data.
+        for name, value in live_diagnostics.items():
+            if value is missing:
+                try:
+                    delattr(detect_crashed_workers, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(detect_crashed_workers, name, value)
         snapshot.close()
 
 
