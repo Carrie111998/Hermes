@@ -221,13 +221,20 @@ class TestFindAllSkills:
     def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
         no_desc = tmp_path / "no-desc"
         no_desc.mkdir()
+        # The directory name is the canonical skill identifier (#81839); no
+        # frontmatter `name:` is needed (and none is provided here), so the
+        # walker falls back to the directory name verbatim.
         (no_desc / "SKILL.md").write_text(
-            "---\nname: no-desc\n---\n\n# Heading\n\nFirst paragraph.\n"
+            "---\n---\n\n# Heading\n\nFirst paragraph.\n"
         )
         long_dir = tmp_path / "long-desc"
         long_dir.mkdir()
+        # When the frontmatter `name:` is set, it MUST match the directory
+        # name — the directory is the on-disk source of truth that disable
+        # lists, file paths, and shell completion all index by. A
+        # mismatch would silently bypass disable checks (#81839).
         (long_dir / "SKILL.md").write_text(
-            f"---\nname: long\ndescription: {'x' * (MAX_DESCRIPTION_LENGTH + 100)}\n---\n\nBody.\n"
+            f"---\nname: long-desc\ndescription: {'x' * (MAX_DESCRIPTION_LENGTH + 100)}\n---\n\nBody.\n"
         )
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -235,7 +242,7 @@ class TestFindAllSkills:
 
         # If no description in frontmatter, the first non-header line is used.
         assert skills["no-desc"]["description"] == "First paragraph."
-        assert len(skills["long"]["description"]) <= MAX_DESCRIPTION_LENGTH
+        assert len(skills["long-desc"]["description"]) <= MAX_DESCRIPTION_LENGTH
 
     def test_finds_skills_in_symlinked_category_dir(self, tmp_path):
         external_root = tmp_path / "repo"
