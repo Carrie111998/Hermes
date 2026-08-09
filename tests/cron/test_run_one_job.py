@@ -109,3 +109,85 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert ss.current_secret_scope() is None
 
 
+class TestRunOneJobRevalidatesPersistedJob:
+    """Regression for #82650: a scheduler snapshot must fail closed at
+    dispatch admission if the persisted job was deleted or paused after the
+    snapshot was taken. The stale dict must NOT reach the executor, the
+    execution-running transition, completion accounting, or delivery.
+
+    These exercise the real store (temp HERMES_HOME via the session conftest)
+    against real create/trigger/due/pause/remove operations, then drive the
+    shared ``run_one_job`` body with the pipeline primitives patched so the
+    test can observe whether the agent path was reached.
+    """
+
+    def _due_snapshot(self, job_id):
+        return next(j for j in s.get_due_jobs() if j["id"] == job_id)
+
+    def test_deleted_job_snapshot_is_skipped(self, monkeypatch):
+        """Snapshot enumerated, then the row removed → job must not execute."""
+        from cron.jobs import create_job, trigger_job, remove_job
+
+        job = create_job(
+            name="stale delete repro",
+            schedule="every 60m",
+            prompt="must not execute after authoritative state changes",
+        )
+        assert trigger_job(job["id"]) is not None
+        snapshot = self._due_snapshot(job["id"])
+        assert remove_job(job["id"]) is True
+
+        calls = _patch_pipeline(monkeypatch)
+        result = s.run_one_job(snapshot)
+
+        assert result is True
+        assert calls == [], "deleted job reached the executor/delivery path"
+
+    def test_paused_job_snapshot_is_skipped(self, monkeypatch):
+        """Snapshot enumerated, then the row paused → job must not execute."""
+        from cron.jobs import create_job, trigger_job, pause_job
+
+        job = create_job(
+            name="stale pause repro",
+            schedule="every 60m",
+            prompt="must not execute after authoritative state changes",
+        )
+        assert trigger_job(job["id"]) is not None
+        snapshot = self._due_snapshot(job["id"])
+        assert pause_job(job["id"]) is not None
+
+        calls = _patch_pipeline(monkeypatch)
+        result = s.run_one_job(snapshot)
+
+        assert result is True
+        assert calls == [], "paused job reached the executor/delivery path"
+
+    def test_valid_job_snapshot_still_executes(self, monkeypatch):
+        """A still-valid snapshot keeps the full execute→save→deliver→mark run."""
+        from cron.jobs import create_job, trigger_job
+
+        job = create_job(
+            name="valid repro",
+            schedule="every 60m",
+            prompt="must execute normally",
+        )
+        assert trigger_job(job["id"]) is not None
+        snapshot = self._due_snapshot(job["id"])
+
+        calls = _patch_pipeline(monkeypatch)
+        result = s.run_one_job(snapshot)
+
+        assert result is True
+        assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+
+    def test_handed_in_dict_missing_row_keeps_compat(self, monkeypatch):
+        """Direct/manual handed-in dicts (no store row, no snapshot marker)
+        retain the historical missing-row compatibility: they still execute."""
+        calls = _patch_pipeline(monkeypatch)
+
+        ok = s.run_one_job({"id": "handed-in-no-row", "name": "t"})
+
+        assert ok is True
+        assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
+
+
