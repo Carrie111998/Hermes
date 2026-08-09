@@ -34,6 +34,7 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
@@ -217,6 +218,13 @@ VALID_HOOKS: Set[str] = {
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+# Directory plugins share the process-global ``hermes_plugins`` import
+# namespace even though multiplex gateways keep one PluginManager per profile.
+# Serialize discovery across managers so two routed profiles cannot overwrite
+# the same package entry while one of them is still importing its submodules.
+# Re-entrant because a plugin's register() path may trigger discovery again.
+_PLUGIN_DISCOVERY_LOCK = threading.RLock()
 
 
 def _env_enabled(name: str) -> bool:
@@ -1296,6 +1304,11 @@ class PluginManager:
     # -----------------------------------------------------------------------
 
     def discover_and_load(self, force: bool = False) -> None:
+        """Serialize plugin imports across profile-scoped managers."""
+        with _PLUGIN_DISCOVERY_LOCK:
+            self._discover_and_load_serialized(force=force)
+
+    def _discover_and_load_serialized(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
 
         When ``force`` is true, clear cached discovery state first so config
@@ -1775,9 +1788,10 @@ class PluginManager:
         from tools.registry import registry as _registry
         _plugin_id = manifest.key or manifest.name
         _slug = _plugin_id.replace("/", "__").replace("-", "_")
+        _override_allowed = PluginContext(manifest, self)._tool_override_allowed("")
         _registry.register_plugin_override_policy(
             f"{_NS_PARENT}.{_slug}",
-            PluginContext(manifest, self)._tool_override_allowed(""),
+            _override_allowed,
         )
         try:
             if manifest.source in {"user", "project", "bundled"}:
@@ -1786,6 +1800,12 @@ class PluginManager:
                 module = self._load_entrypoint_module(manifest)
 
             loaded.module = module
+            module_name = getattr(module, "__name__", "")
+            if module_name.startswith(f"{_NS_PARENT}."):
+                _registry.register_plugin_override_policy(
+                    module_name,
+                    _override_allowed,
+                )
 
             # Call register()
             register_fn = getattr(module, "register", None)
@@ -1870,7 +1890,35 @@ class PluginManager:
 
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
+        multiplex_active = False
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_active = is_multiplex_active()
+        except Exception:
+            logger.debug(
+                "Could not resolve multiplex state for plugin '%s'",
+                key,
+                exc_info=True,
+            )
+        if multiplex_active:
+            scope = str(get_hermes_home())
+            scope_digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:12]
+            slug = f"scope_{scope_digest}__{slug}"
         module_name = f"{_NS_PARENT}.{slug}"
+        cached = sys.modules.get(module_name) if multiplex_active else None
+        if cached is not None:
+            cached_file = getattr(cached, "__file__", None)
+            if cached_file is not None:
+                try:
+                    if Path(cached_file).resolve() == init_file.resolve():
+                        return cached
+                except OSError:
+                    logger.debug(
+                        "Could not resolve cached plugin path for '%s'",
+                        module_name,
+                        exc_info=True,
+                    )
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,
@@ -1883,7 +1931,15 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(
+                    f"{module_name}."
+                ):
+                    sys.modules.pop(loaded_name, None)
+            raise
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:
