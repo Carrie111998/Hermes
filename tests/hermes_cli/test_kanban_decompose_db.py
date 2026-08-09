@@ -4,11 +4,13 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
@@ -30,6 +32,28 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         tenant=tenant,
         triage=True,
     )
+
+
+def _make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test User"],
+        check=True,
+    )
+    (repo / "README.md").write_text("project\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "initial"],
+        check=True,
+        capture_output=True,
+    )
+    return repo
 
 
 def test_decompose_creates_children_and_promotes_root(kanban_home):
@@ -88,5 +112,44 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_decompose_children_inherit_root_project_and_tenant(
+    kanban_home, tmp_path
+):
+    project_repo = _make_repo(tmp_path)
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Principal Remediation",
+            primary_path=str(project_repo),
+        )
 
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="rough idea",
+            tenant="principal-remediation",
+            triage=True,
+            project_id=project_id,
+            board="default",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "first child", "assignee": "terra-dev"},
+                {"title": "second child", "assignee": "default", "parents": [0]},
+            ],
+            author="decomposer",
+        )
 
+    assert child_ids is not None
+    child_tasks = []
+    with kb.connect() as conn:
+        for child_id in child_ids:
+            child = kb.get_task(conn, child_id)
+            assert child is not None
+            child_tasks.append(child)
+
+    assert {child.tenant for child in child_tasks} == {"principal-remediation"}
+    assert {child.project_id for child in child_tasks} == {project_id}
