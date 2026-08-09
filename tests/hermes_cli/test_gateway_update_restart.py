@@ -158,3 +158,21 @@ def test_systemd_deferred_restart_schedules_post_exit_recovery(monkeypatch):
         "hermes-gateway.service",
     ]
     assert launch.call_args.kwargs == {"wait_timeout": 27.0}
+
+
+def test_watcher_timeout_is_unbounded_for_deferred_ancestor(monkeypatch):
+    """#82195 review: a guessed short deadline abandons the respawn once a
+    deferred restart's real exit (gateway after-turn wait + drain, which this
+    CLI cannot reliably bound) outlives it."""
+    monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: True)
+
+    assert gateway_cli._restart_watcher_wait_timeout(654, 45.0) == float("inf")
+
+
+def test_watcher_timeout_stays_bounded_for_unrelated_gateway(monkeypatch):
+    """A non-ancestor gateway already went through a bounded synchronous
+    SIGUSR1 wait before the watcher is spawned, so the drain-budget deadline
+    remains a safe, tight bound."""
+    monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False)
+
+    assert gateway_cli._restart_watcher_wait_timeout(654, 45.0) == 75.0

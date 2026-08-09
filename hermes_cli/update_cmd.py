@@ -4898,6 +4898,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _is_pid_ancestor_of_current_process,
                 _get_service_pids,
                 _restart_gateway_for_update,
+                _restart_watcher_wait_timeout,
                 launch_detached_systemd_restart_after_exit,
                 _wait_for_gateway_exit,
             )
@@ -5167,7 +5168,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         _main_pid,
                                         _manage_cmd,
                                         svc_name,
-                                        wait_timeout=_drain_budget + 30.0,
+                                        wait_timeout=_restart_watcher_wait_timeout(
+                                            _main_pid, _drain_budget
+                                        ),
                                     )
                                 ):
                                     failed_or_stale_units.append(svc_name)
@@ -5427,7 +5430,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 restart_mode = _prepare_profile_gateway_update_restart(
                     proc.profile,
                     pid,
-                    wait_timeout=_drain_budget + 30.0,
+                    wait_timeout=_restart_watcher_wait_timeout(pid, _drain_budget),
                 )
                 if restart_mode is None:
                     continue
@@ -5479,7 +5482,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     continue
                 restart_mode = _prepare_unmapped_gateway_update_restart(
                     pid,
-                    wait_timeout=_drain_budget + 30.0,
+                    wait_timeout=_restart_watcher_wait_timeout(pid, _drain_budget),
                 )
                 if restart_mode is not None:
                     print(

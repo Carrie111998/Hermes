@@ -313,6 +313,24 @@ def _restart_gateway_for_update(pid: int, wait_timeout: float) -> str:
     return "failed"
 
 
+def _restart_watcher_wait_timeout(pid: int, drain_budget: float) -> float:
+    """Deadline for a detached restart watcher waiting on ``pid`` to exit.
+
+    A deferred restart (``pid`` is a process ancestor; SIGUSR1 already sent)
+    leaves the actual exit time to the gateway's own after-turn wait plus
+    drain, which this CLI process cannot reliably bound: the running
+    gateway may have been started with env-var timeout overrides this
+    process never sees. Giving the watcher a short, guessed deadline in
+    that case silently abandons the respawn once the real exit outlives it
+    (#82195 review). Non-ancestor gateways already went through a bounded
+    synchronous SIGUSR1 wait before this is called, so the drain-budget
+    deadline remains a safe, tight bound there.
+    """
+    if _is_pid_ancestor_of_current_process(pid):
+        return float("inf")
+    return drain_budget + 30.0
+
+
 def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
     """Wait up to ``timeout`` seconds for ``pid`` to leave the process table.
 
