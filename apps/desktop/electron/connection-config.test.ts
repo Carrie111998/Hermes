@@ -16,6 +16,7 @@ import { test } from 'vitest'
 
 import {
   AT_COOKIE_VARIANTS,
+  backendPoolTouchKeys,
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
@@ -37,6 +38,7 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
@@ -338,6 +340,42 @@ test('resolveProfileBackendRoute only tags a descriptor when the backend is shar
     assert.equal(Boolean(resolved.descriptorProfile), resolved.scopePath)
     assert.ok(!resolved.descriptorProfile || resolved.backend === 'primary')
   }
+})
+
+test('backendPoolTouchKeys refreshes both explicit root rails while preserving ordinary profile keys', () => {
+  assert.deepEqual(backendPoolTouchKeys('default'), ['default', 'local:default', 'remote:default'])
+  assert.deepEqual(backendPoolTouchKeys('  writer  '), ['writer', 'local:writer', 'remote:writer'])
+  assert.deepEqual(backendPoolTouchKeys(''), [])
+})
+
+test('resolveSavedGlobalRemoteRail uses a saved inactive SSH global backend for remote-only routing', () => {
+  assert.deepEqual(
+    resolveSavedGlobalRemoteRail({
+      mode: 'local',
+      remote: {
+        mode: 'ssh',
+        host: 'devbox.internal',
+        user: 'operator',
+        port: 2222,
+        keyPath: '/redacted/key',
+        remoteProfile: 'default',
+        token: { encrypted: 'redacted-token' }
+      }
+    }),
+    {
+      kind: 'ssh',
+      remoteKind: 'ssh',
+      ssh: {
+        mode: 'ssh',
+        host: 'devbox.internal',
+        user: 'operator',
+        port: 2222,
+        keyPath: '/redacted/key',
+        remoteProfile: 'default'
+      },
+      tokenRef: { encrypted: 'redacted-token' }
+    }
+  )
 })
 
 // --- pathWithGlobalRemoteProfile ---

@@ -400,6 +400,38 @@ export interface ProfileBackendRoute {
   scopePath: boolean
 }
 
+function backendPoolTouchKeys(profile) {
+  const key = connectionScopeKey(profile)
+
+  if (!key) {
+    return []
+  }
+
+  return [key, `local:${key}`, `remote:${key}`]
+}
+
+function resolveSavedGlobalRemoteRail(config) {
+  const ssh = normalizeSshConfig(config?.remote)
+
+  if (ssh) {
+    return { kind: 'ssh', remoteKind: 'ssh', ssh, tokenRef: config?.remote?.token }
+  }
+
+  const url = String(config?.remote?.url || '').trim()
+
+  if (!url) {
+    return null
+  }
+
+  return {
+    authMode: normAuthMode(config?.remote?.authMode),
+    kind: 'remote',
+    remoteKind: config?.mode === 'cloud' ? 'cloud' : 'url',
+    tokenRef: config?.remote?.token,
+    url
+  }
+}
+
 /**
  * The one place that answers "which backend serves profile P, and does its
  * REST path need a profile scope?". Four routes, in precedence order:
@@ -593,6 +625,7 @@ function cookiesHavePrivySession(cookies) {
 export {
   AT_COOKIE_VARIANTS,
   authModeFromStatus,
+  backendPoolTouchKeys,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
@@ -615,6 +648,7 @@ export {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,

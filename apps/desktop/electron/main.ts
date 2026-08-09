@@ -52,6 +52,7 @@ import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   authModeFromStatus,
+  backendPoolTouchKeys,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
@@ -72,6 +73,7 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSavedGlobalRemoteRail,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview
@@ -7638,17 +7640,26 @@ async function resolveRemoteBackend(profile, options: any = {}) {
   const config = readDesktopConnectionConfig()
 
   if (Reflect.get(options, 'remoteOnly') === true) {
-    const authMode = normAuthMode(config.remote?.authMode)
-    const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
+    const savedGlobal = resolveSavedGlobalRemoteRail(config)
 
-    return buildRemoteConnection(
-      config.remote?.url,
-      authMode,
-      token,
-      'settings',
-      undefined,
-      config.mode === 'cloud' ? 'cloud' : 'url'
-    )
+    if (savedGlobal?.kind === 'ssh') {
+      const reuseToken = decryptDesktopSecret(savedGlobal.tokenRef)
+
+      return bootstrapSshConnection(null, savedGlobal.ssh, reuseToken, 'settings')
+    }
+
+    if (savedGlobal?.kind === 'remote') {
+      const token = savedGlobal.authMode === 'oauth' ? null : decryptDesktopSecret(savedGlobal.tokenRef)
+
+      return buildRemoteConnection(
+        savedGlobal.url,
+        savedGlobal.authMode,
+        token,
+        'settings',
+        undefined,
+        savedGlobal.remoteKind
+      )
+    }
   }
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
@@ -8204,16 +8215,12 @@ async function ensureBackend(profile, options = {}) {
 // renderer calls this when it opens a profile's chat WS and periodically while
 // streaming, since the main process can't see the direct renderer↔backend WS.
 function touchPoolBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : null
+  for (const key of backendPoolTouchKeys(profile)) {
+    const entry = backendPool.get(key)
 
-  if (!key) {
-    return
-  }
-
-  const entry = backendPool.get(key)
-
-  if (entry) {
-    entry.lastActiveAt = Date.now()
+    if (entry) {
+      entry.lastActiveAt = Date.now()
+    }
   }
 }
 
