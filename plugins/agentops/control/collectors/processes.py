@@ -45,11 +45,12 @@ class ProcessCollector:
         self._rate_lock = threading.Lock()
 
     @staticmethod
-    def _command_fingerprint(process: Any) -> str:
-        try:
-            command = process.cmdline()
-        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
-            command = []
+    def _command_fingerprint(process: Any, command: list[str] | None = None) -> str:
+        if command is None:
+            try:
+                command = process.cmdline()
+            except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
+                command = []
         digest = hashlib.sha256("\x00".join(str(part) for part in command).encode("utf-8")).hexdigest()
         return "sha256:" + digest
 
@@ -72,6 +73,7 @@ class ProcessCollector:
         observed_at = utc_now()
         signals = []
         inspected = 0
+        name_contains = target.spec.labels.get("process_name_contains", self.name_contains).casefold()
         try:
             processes = self._process_iter()
             for process in processes:
@@ -80,10 +82,10 @@ class ProcessCollector:
                     break
                 try:
                     name = str(process.name())
-                    if self.name_contains and self.name_contains not in name.casefold():
+                    if name_contains and name_contains not in name.casefold():
                         continue
                     command = [str(part) for part in process.cmdline()]
-                    fingerprint = self._command_fingerprint(process)
+                    fingerprint = self._command_fingerprint(process, command)
                     if labels.get("process_marker_optional") != "true" and profile_marker not in command and f"--profile={profile_marker}" not in command:
                         continue
                     if service_label not in command and labels.get("process_command_label_optional") != "true":

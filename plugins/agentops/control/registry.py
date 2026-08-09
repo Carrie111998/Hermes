@@ -31,6 +31,7 @@ class FleetRegistry:
     def __init__(self, targets: Iterable[TargetSpec] = ()) -> None:
         self._targets: dict[str, Target] = {}
         self._snapshots: dict[str, TargetSnapshot] = {}
+        self._process_health: dict[str, bool] = {}
         for spec in targets:
             self.register_target(spec)
 
@@ -51,6 +52,10 @@ class FleetRegistry:
             raise TargetRegistrationError("target snapshot is older than current snapshot")
         self._snapshots[snapshot.target_id] = snapshot
 
+    def record_process_result(self, target_id: str, healthy: bool) -> None:
+        self.get_target(target_id)
+        self._process_health[target_id] = bool(healthy)
+
     def get_target(self, target_id: str) -> Target:
         try:
             return self._targets[target_id]
@@ -69,7 +74,7 @@ class FleetRegistry:
         snapshotted = len(self._snapshots)
         out_scope = tuple(sorted(target.target_id for target in self._targets.values() if target.spec.labels.get("g2_scope") == "out_of_scope"))
         core_targets = [target for target in self._targets.values() if target.spec.labels.get("g2_scope", "core") == "core"]
-        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots)
+        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots and self._process_health.get(target.target_id, True))
         disabled_count = sum(1 for target in core_targets if target.spec.labels.get("process_observation") == "disabled")
         coverage = 0 if not core_targets else (max(0, core_snapshots - disabled_count) * 100) // len(core_targets)
         disabled = ("processes",) if disabled_count else ()
@@ -124,7 +129,7 @@ def bootstrap_gateway_registry() -> FleetRegistry:
                     digest = hashlib.sha256("\x00".join(args).encode()).hexdigest()
                     labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled")
                     if profile == "default":
-                        labels.update(process_command_label_optional="true", process_marker_optional="true")
+                        labels.update(process_command_label_optional="true", process_marker_optional="true", process_name_contains="python3.11")
                 else:
                     labels["process_observation"] = "disabled"
             else:
