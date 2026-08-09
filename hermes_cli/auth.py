@@ -766,16 +766,22 @@ def get_known_provider_config(provider_id: str) -> ProviderConfig | None:
     return None
 
 
-def get_known_provider_configs() -> Mapping[str, ProviderConfig]:
-    """Return a read-only snapshot of built-in and currently active metadata.
+def get_known_provider_configs() -> tuple[ProviderConfig, ...]:
+    """Return an immutable snapshot of built-in and active configurations.
 
     Built-in entries remain visible to security consumers when their bundled
-    plugin is disabled. Third-party entries are included only while present
-    in the current active registry.
+    plugin is disabled. Active same-ID overrides are appended instead of
+    replacing built-in security metadata; identical objects and aliases are
+    de-duplicated by identity. Unknown inactive third-party metadata remains a
+    follow-up for a durable manifest inventory, not process-observed state.
     """
-    known = dict(_STATIC_PROVIDER_REGISTRY)
-    known.update(PROVIDER_REGISTRY.items())
-    return MappingProxyType(known)
+    known = list(_STATIC_PROVIDER_REGISTRY.values())
+    seen = {id(config) for config in known}
+    for config in PROVIDER_REGISTRY.values():
+        if id(config) not in seen:
+            known.append(config)
+            seen.add(id(config))
+    return tuple(known)
 
 
 def get_nous_service_config() -> ProviderConfig:

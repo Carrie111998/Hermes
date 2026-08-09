@@ -203,6 +203,82 @@ def test_dashboard_enable_clears_every_same_key_candidate_deny(monkeypatch):
     ]
 
 
+def test_dashboard_enable_preserves_other_shared_manifest_key_deny(monkeypatch):
+    candidates = [
+        ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+        ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+    ]
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_resolve_plugin_key_and_source",
+        lambda _name: ("image_gen/xai", "bundled", "xai", "backend"),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"xai"})
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_toggle_plugin_toolset", lambda *args, **kwargs: None
+    )
+
+    result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+        "image_gen/xai",
+        enabled=True,
+    )
+
+    assert result["unchanged"] is False
+    assert saved == {
+        "enabled": {"image_gen/xai"},
+        "disabled": {"video_gen/xai"},
+    }
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[0]
+    ]
+
+
+def test_enable_identities_do_not_treat_key_leaf_as_runtime_identity(monkeypatch):
+    candidates = [
+        (
+            "xai-provider",
+            "1",
+            "Models",
+            "bundled",
+            None,
+            "model-providers/xai",
+            "model-provider",
+        ),
+        ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+        ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+    ]
+    monkeypatch.setattr(
+        plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+    )
+
+    identities, preserved = plugins_cmd._plugin_enable_identity_changes(
+        "model-providers/xai",
+        {"xai"},
+    )
+
+    assert identities == {"model-providers/xai", "xai-provider"}
+    assert preserved == set()
+
+
 def test_discover_all_plugins_includes_entrypoint_plugins(monkeypatch, tmp_path):
     bundled_dir = tmp_path / "bundled"
     user_dir = tmp_path / "user"

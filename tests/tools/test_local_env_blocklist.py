@@ -392,23 +392,47 @@ class TestBlocklistCoverage:
                     f"(provider={pconfig.id}) missing from blocklist"
                 )
 
-    def test_disabled_bundled_provider_stays_blocked_after_restart(self, monkeypatch):
-        """Static bundled keys survive an empty/rebuilt active registry."""
+    def test_same_id_override_keeps_static_and_active_keys_blocked(self, monkeypatch):
+        """An active same-ID override cannot replace static security metadata."""
         from hermes_cli import auth
         from tools.environments.local import _build_provider_env_blocklist
 
         active = auth.ProviderConfig(
-            id="active-plugin",
-            name="Active plugin",
+            id="gmi",
+            name="GMI override",
             auth_type="api_key",
-            api_key_env_vars=("ACTIVE_PLUGIN_API_KEY",),
+            api_key_env_vars=("GMI_OVERRIDE_API_KEY",),
+            base_url_env_var="GMI_OVERRIDE_BASE_URL",
         )
         monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
 
         blocklist = _build_provider_env_blocklist()
 
         assert {"GMI_API_KEY", "GMI_BASE_URL"}.issubset(blocklist)
-        assert "ACTIVE_PLUGIN_API_KEY" in blocklist
+        assert {"GMI_OVERRIDE_API_KEY", "GMI_OVERRIDE_BASE_URL"}.issubset(blocklist)
+
+    def test_late_active_provider_is_filtered_by_all_local_paths(self, monkeypatch):
+        """Each real sanitizer snapshots active provider metadata per call."""
+        from hermes_cli import auth
+        from tools.environments.local import (
+            _make_run_env,
+            _sanitize_subprocess_env,
+            hermes_subprocess_env,
+        )
+
+        active = auth.ProviderConfig(
+            id="late-active",
+            name="Late active",
+            auth_type="api_key",
+            api_key_env_vars=("LATE_ACTIVE_API_KEY",),
+        )
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
+        source = {"LATE_ACTIVE_API_KEY": "secret", "PATH": os.defpath}
+
+        assert "LATE_ACTIVE_API_KEY" not in _sanitize_subprocess_env(source)
+        with patch.dict(os.environ, source, clear=True):
+            assert "LATE_ACTIVE_API_KEY" not in hermes_subprocess_env()
+            assert "LATE_ACTIVE_API_KEY" not in _make_run_env({})
 
     def test_bedrock_bearer_token_is_in_blocklist(self):
         """auth_type='aws_sdk' providers contribute their Hermes-managed

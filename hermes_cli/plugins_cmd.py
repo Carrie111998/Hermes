@@ -875,13 +875,26 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     return None
 
 
-def _plugin_candidate_identities(key: str) -> set[str]:
-    """Return every config identity used by candidates for a canonical key."""
-    identities = {key, key.split("/")[-1]}
-    for entry in _discover_plugin_candidates():
+def _plugin_enable_identity_changes(
+    key: str,
+    disabled: set[str],
+) -> tuple[set[str], set[str]]:
+    """Return target identities to clear and shared other-key denies to keep."""
+    candidates = _discover_plugin_candidates()
+    identities = {key}
+    for entry in candidates:
         if entry[5] == key:
             identities.update((entry[0], entry[5]))
-    return identities
+    cleared_denies = disabled & identities
+    # A legacy manifest-name deny can cover several canonical groups. Replace
+    # it with canonical denies for every non-target group before removing it.
+    preserved_denies = {
+        entry[5]
+        for entry in candidates
+        if entry[5] != key
+        and cleared_denies & {entry[0], entry[5]}
+    }
+    return identities, preserved_denies
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
@@ -936,14 +949,17 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         source=source,
         kind=kind,
     ) == "enabled"
-    identities = _plugin_candidate_identities(key)
-    identities.update((name, manifest_name))
+    identities, preserved_denies = _plugin_enable_identity_changes(
+        key,
+        disabled,
+    )
 
     if not already_enabled or bool(disabled & identities):
         enabled.add(key)
         # An explicit disable on any candidate blocks the whole canonical
         # group, so enabling must clear every bundled/user/project identity.
         disabled.difference_update(identities)
+        disabled.update(preserved_denies)
         _save_enabled_set(enabled)
         _save_disabled_set(disabled)
         console.print(
@@ -2211,20 +2227,22 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         source=source,
         kind=kind,
     )
-    aliases = {name, manifest_name, key, key.split("/")[-1]}
-
     if enabled:
-        aliases.update(_plugin_candidate_identities(key))
-        if status == "enabled" and not bool(dis & aliases):
+        identities, preserved_denies = _plugin_enable_identity_changes(
+            key,
+            dis,
+        )
+        if status == "enabled" and not bool(dis & identities):
             return {"ok": True, "name": name, "key": key, "unchanged": True}
-        en.difference_update(aliases)
         en.add(key)
-        dis.difference_update(aliases)
+        dis.difference_update(identities)
+        dis.update(preserved_denies)
         _save_enabled_set(en)
         _save_disabled_set(dis)
         _toggle_plugin_toolset(key, enable=True)
         return {"ok": True, "name": name, "key": key, "unchanged": False}
 
+    aliases = {name, manifest_name, key, key.split("/")[-1]}
     if status == "disabled":
         return {"ok": True, "name": name, "key": key, "unchanged": True}
 

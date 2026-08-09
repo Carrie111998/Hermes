@@ -295,6 +295,27 @@ class TestTerminalIntegration:
         assert blocked_var not in result
         assert "PATH" in result
 
+    def test_registered_key_is_reclassified_when_provider_becomes_active(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import auth
+
+        active = auth.ProviderConfig(
+            id="late-active",
+            name="Late active",
+            auth_type="api_key",
+            api_key_env_vars=("LATE_ACTIVE_API_KEY",),
+        )
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {})
+        register_env_passthrough(["LATE_ACTIVE_API_KEY"])
+        assert is_env_passthrough("LATE_ACTIVE_API_KEY")
+
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
+
+        assert not is_env_passthrough("LATE_ACTIVE_API_KEY")
+        assert "LATE_ACTIVE_API_KEY" not in get_all_passthrough()
+
     def test_passthrough_cannot_override_internal_dynamic_secret(self):
         """A skill must NOT be able to register dynamically-named Hermes
         secrets (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth) as
