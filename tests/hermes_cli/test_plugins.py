@@ -365,6 +365,7 @@ class TestPluginDiscovery:
         mgr._plugin_skills["p:skill"] = {}
         mgr._aux_tasks["task"] = {"plugin": "p"}
         mgr._slack_action_handlers.append(("aid", lambda **_: None, "p"))
+        mgr._telegram_callback_handlers.append(("p:", lambda *_: True, "p"))
         mgr._discovered = True
 
         monkeypatch.setattr(PluginManager, "_discover_and_load_inner", lambda self_inner: None)
@@ -382,6 +383,43 @@ class TestPluginDiscovery:
         assert mgr._plugin_skills == {}
         assert mgr._aux_tasks == {}
         assert mgr._slack_action_handlers == []
+        assert mgr._telegram_callback_handlers == []
+
+
+class TestTelegramCallbackHandlers:
+    def test_registers_prefix_and_regex_handlers(self):
+        import re
+
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="picker", source="user"), mgr)
+        prefix_handler = lambda *_: True
+        regex_handler = lambda *_: {"handled": True}
+
+        ctx.register_telegram_callback_handler("dp:", prefix_handler)
+        matcher = re.compile(r"^other:\d+$")
+        ctx.register_telegram_callback_handler(matcher, regex_handler)
+
+        assert mgr.get_telegram_callback_handlers() == [
+            ("dp:", prefix_handler, "picker"),
+            (matcher, regex_handler, "picker"),
+        ]
+
+    @pytest.mark.parametrize("matcher", [None, "", "unnamespaced", object()])
+    def test_rejects_invalid_matcher(self, matcher):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="picker", source="user"), mgr)
+
+        with pytest.raises(ValueError):
+            ctx.register_telegram_callback_handler(matcher, lambda *_: True)
+
+    def test_rejects_duplicate_matcher(self):
+        mgr = PluginManager()
+        first = PluginContext(PluginManifest(name="first", source="user"), mgr)
+        second = PluginContext(PluginManifest(name="second", source="user"), mgr)
+        first.register_telegram_callback_handler("dp:", lambda *_: True)
+
+        with pytest.raises(ValueError, match="conflicts with plugin 'first'"):
+            second.register_telegram_callback_handler("dp:", lambda *_: True)
 
 
 # ── TestPluginLoading ──────────────────────────────────────────────────────

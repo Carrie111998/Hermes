@@ -205,6 +205,143 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.mark.asyncio
+    async def test_plugin_callback_claims_namespaced_data(self):
+        adapter = _make_adapter()
+        callback = AsyncMock(return_value={"handled": True})
+        manager = MagicMock()
+        manager.get_telegram_callback_handlers.return_value = [
+            ("dp:", callback, "digest-picker")
+        ]
+        query = AsyncMock()
+        query.data = "dp:t:abc:2"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="12345", first_name="Tim")
+        update = MagicMock(callback_query=query)
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "12345"}, clear=False):
+            with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+                await adapter._handle_callback_query(update, context)
+
+        callback.assert_awaited_once_with(adapter, query, context)
+
+    @pytest.mark.asyncio
+    async def test_builtin_callback_takes_precedence_over_plugin_matcher(self):
+        adapter = _make_adapter()
+        adapter._approval_state[8] = "some-session"
+        callback = AsyncMock(return_value={"handled": True})
+        manager = MagicMock()
+        manager.get_telegram_callback_handlers.return_value = [
+            ("ea:", callback, "broken-plugin")
+        ]
+        query = AsyncMock()
+        query.data = "ea:once:8"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="12345", first_name="Tim")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "12345"}, clear=False):
+            with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+                with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+                    await adapter._handle_callback_query(update, MagicMock())
+
+        resolve.assert_called_once_with("some-session", "once")
+        callback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_plugin_callback_exception_does_not_break_polling(self):
+        adapter = _make_adapter()
+        callback = AsyncMock(side_effect=RuntimeError("boom"))
+        manager = MagicMock()
+        manager.get_telegram_callback_handlers.return_value = [
+            ("zz:", callback, "broken-plugin")
+        ]
+        query = AsyncMock()
+        query.data = "zz:anything"
+        query.message = MagicMock(chat_id=12345, message_thread_id=None)
+        query.message.chat.type = "private"
+        query.from_user = MagicMock(id="12345", first_name="Tim")
+        update = MagicMock(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "12345"}, clear=False):
+            with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        callback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatch_callback_text_preserves_identity_and_topic(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        query = MagicMock()
+        query.from_user.id = 777
+        query.from_user.full_name = "Tim"
+        query.message.chat.id = 12345
+        query.message.chat.type = "private"
+        query.message.chat.full_name = "Tim"
+        query.message.message_id = 42
+        query.message.message_thread_id = 99
+        query.message.is_topic_message = False
+        query.message.date = None
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "777"}, clear=False):
+            await adapter.dispatch_callback_text(query, "3,1,3")
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "3,1,3"
+        assert event.source.platform == Platform.TELEGRAM
+        assert event.source.chat_id == "12345"
+        assert event.source.user_id == "777"
+        assert event.source.thread_id is None
+        assert event.metadata["telegram_callback_dispatch"] is True
+
+    @pytest.mark.asyncio
+    async def test_dispatch_callback_text_preserves_real_dm_topic(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        query = MagicMock()
+        query.from_user.id = 777
+        query.from_user.full_name = "Tim"
+        query.message.chat.id = 12345
+        query.message.chat.type = "private"
+        query.message.chat.full_name = "Tim"
+        query.message.message_id = 42
+        query.message.message_thread_id = 99
+        query.message.is_topic_message = True
+        query.message.date = None
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "777"}, clear=False):
+            await adapter.dispatch_callback_text(query, "3,1,3")
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "dm"
+        assert event.source.thread_id == "99"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_callback_text_normalizes_forum_general_topic(self):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        query = MagicMock()
+        query.from_user.id = 777
+        query.from_user.full_name = "Tim"
+        query.message.chat.id = -10012345
+        query.message.chat.type = "supergroup"
+        query.message.chat.is_forum = True
+        query.message.chat.title = "Digest group"
+        query.message.message_id = 42
+        query.message.message_thread_id = None
+        query.message.is_topic_message = True
+        query.message.date = None
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "777"}, clear=False):
+            await adapter.dispatch_callback_text(query, "3,1,3")
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_type == "group"
+        assert event.source.thread_id == "1"
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):

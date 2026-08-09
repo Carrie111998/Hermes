@@ -6375,6 +6375,69 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+    async def dispatch_callback_text(self, query: Any, text: str) -> None:
+        """Dispatch callback-selected text as an ordinary Telegram user turn.
+
+        The synthetic event preserves the callback user's identity and the
+        picker message's chat/topic identity, then enters the same public
+        ``handle_message`` path as typed Telegram text.
+        """
+        text = str(text or "").strip()
+        query_message = getattr(query, "message", None)
+        query_user = getattr(query, "from_user", None)
+        query_chat = getattr(query_message, "chat", None)
+        if not text or query_message is None or query_user is None or query_chat is None:
+            raise ValueError("Callback query is missing text, user, message, or chat identity")
+
+        chat_id = str(getattr(query_chat, "id", getattr(query_message, "chat_id", "")))
+        user_id = str(getattr(query_user, "id", ""))
+        telegram_chat_type = str(getattr(query_chat, "type", "")).split(".")[-1].lower()
+        normalized_chat_type = "dm"
+        if telegram_chat_type in {"group", "supergroup"}:
+            normalized_chat_type = "group"
+        elif telegram_chat_type == "channel":
+            normalized_chat_type = "channel"
+        # Use the same topic normalizer as ordinary typed messages. Telegram
+        # also puts reply-anchor IDs in message_thread_id; those are not
+        # durable session threads, while forum General normalizes to thread 1.
+        thread_id = self._effective_message_thread_id(query_message)
+
+        if not self._is_callback_user_authorized(
+            user_id,
+            chat_id=chat_id,
+            chat_type=normalized_chat_type,
+            thread_id=thread_id,
+            user_name=getattr(query_user, "first_name", None),
+        ):
+            raise PermissionError("Telegram callback user is not authorized")
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=(
+                getattr(query_chat, "title", None)
+                or getattr(query_chat, "full_name", None)
+            ),
+            chat_type=normalized_chat_type,
+            user_id=user_id,
+            user_name=(
+                getattr(query_user, "full_name", None)
+                or getattr(query_user, "first_name", None)
+            ),
+            thread_id=thread_id,
+            message_id=str(getattr(query_message, "message_id", "")),
+            is_bot=False,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=query_message,
+            message_id=str(getattr(query_message, "message_id", "")),
+            timestamp=getattr(query_message, "date", None) or datetime.now(timezone.utc),
+            metadata={"telegram_callback_dispatch": True},
+        )
+        await self.handle_message(event)
+
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
 
@@ -6414,6 +6477,72 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Plugin callback handlers ---
+        # Plugins claim only their own namespaced callback data. Unclaimed or
+        # failed callbacks continue through the unchanged built-in routes.
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+
+            plugin_handlers = get_plugin_manager().get_telegram_callback_handlers()
+        except Exception as exc:
+            logger.warning("[%s] Could not load Telegram plugin callback handlers: %s", self.name, exc)
+            plugin_handlers = []
+
+        built_in_prefixes = (
+            "mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:",
+            "cp:", "gt:", "ea:", "sc:", "cl:", "update_prompt:",
+        )
+        # Built-in controls retain precedence even if a plugin registers an
+        # over-broad matcher. Plugin callbacks are an extension namespace, not
+        # an override mechanism for approvals, clarify prompts, or settings.
+        if data.startswith(built_in_prefixes):
+            plugin_handlers = []
+
+        for matcher, callback, plugin_name in plugin_handlers:
+            try:
+                matched = (
+                    data.startswith(matcher)
+                    if isinstance(matcher, str)
+                    else bool(matcher.match(data))
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Telegram callback matcher from plugin %s failed: %s",
+                    self.name,
+                    plugin_name,
+                    exc,
+                )
+                continue
+            if not matched:
+                continue
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to use this control.")
+                return
+
+            try:
+                result = callback(self, query, context)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Telegram callback handler from plugin %s failed: %s",
+                    self.name,
+                    plugin_name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            if result is True or (isinstance(result, dict) and result.get("handled") is True):
+                return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

@@ -972,6 +972,32 @@ def register(ctx):
 
 This is the public way for plugins to participate in Slack interactivity. Older plugins may patch `SlackAdapter.connect`; prefer this API instead.
 
+### Handle Telegram inline-keyboard callbacks
+
+Plugins that send Telegram inline keyboards can register a namespaced callback-data prefix or compiled regex. The adapter applies the normal Telegram user allowlist before invoking the callback, and built-in Hermes controls retain precedence.
+
+```python
+def register(ctx):
+    async def _on_picker(adapter, query, telegram_context):
+        await query.answer("Selection saved")
+        # query.data, query.from_user, query.message.chat_id
+        # ...update the plugin's deterministic state...
+        return {"handled": True}
+
+    ctx.register_telegram_callback_handler("acme:", _on_picker)
+```
+
+**Signature:** `ctx.register_telegram_callback_handler(matcher, callback) -> None`
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `matcher` | `str \| re.Pattern` | A namespaced string prefix (for example `"acme:"`) or compiled regex. Duplicate matchers are rejected. |
+| `callback` | async or sync callable | Receives `(adapter, callback_query, telegram_context)`. Return `True` or `{"handled": true}` to claim the callback. |
+
+Callbacks should call `await callback_query.answer(...)` promptly so Telegram stops its progress spinner. Exceptions are logged and fail open to other plugin handlers; they do not stop polling. Hermes's built-in approval, model-picker, clarify, settings, and update-prompt callback namespaces cannot be intercepted by plugins.
+
+To feed a deterministic picker result back through the normal gateway session, call `await adapter.dispatch_callback_text(callback_query, text)`. This constructs a regular `MessageEvent` from the callback's real user, chat, and topic identity, then dispatches it through the same agent path as typed Telegram text.
+
 :::tip
 This guide covers **general plugins** (tools, hooks, slash commands, CLI commands). The sections below sketch the authoring pattern for each specialized plugin type; each links to its full guide for field reference and examples.
 :::
