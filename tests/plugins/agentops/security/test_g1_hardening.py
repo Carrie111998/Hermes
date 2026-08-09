@@ -295,6 +295,226 @@ def test_quarantine_budget_drops_untrusted_raw_input_without_retaining_it(write_
     store.close()
 
 
+def test_orphaned_quarantine_temp_is_removed_before_replay_and_never_blocks_restart(write_config):
+    config = _config(write_config)
+    store = open_store(config)
+    spool = EventSpool(config.spool_dir)
+    secret = b"sk-test-canary-secret"
+    spool._ensure_directories()
+    orphan = spool.quarantine_dir / ".invalid.json.tmp"
+    orphan.write_bytes(secret + b"\xff")
+    source = spool.root / "invalid.json"
+    source.write_bytes(secret + b"\xff")
+
+    result = EventSpool(config.spool_dir).replay(store)
+
+    assert result.quarantined == 1
+    assert result.failed == 0
+    assert not orphan.exists()
+    assert not source.exists()
+    assert secret not in b"".join(path.read_bytes() for path in config.spool_dir.rglob("*") if path.is_file())
+    store.close()
+
+
+def test_quarantine_replace_failure_is_fatal_and_does_not_leave_raw_input(write_config, monkeypatch):
+    import plugins.agentops.control.events as events
+
+    config = _config(write_config)
+    spool = EventSpool(config.spool_dir)
+    spool._ensure_directories()
+    secret = b"sk-test-canary-secret"
+    source = spool.root / "invalid.json"
+    source.write_bytes(secret + b"\xff")
+    real_replace = os.replace
+
+    def fail_quarantine_replace(source_path, destination_path):
+        if Path(source_path).parent == spool.quarantine_dir:
+            raise OSError("synthetic replace interruption")
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(events.os, "replace", fail_quarantine_replace)
+    handle = start_daemon_thread(config.config_path)
+    try:
+        health = handle.health()
+        assert health["ready"] is False
+        assert "spool_quarantine_failed" in health["safe_start_reasons"]
+    finally:
+        handle.stop()
+    assert not source.exists()
+    assert not list(spool.quarantine_dir.glob(".*.tmp"))
+    assert secret not in b"".join(path.read_bytes() for path in config.spool_dir.rglob("*") if path.is_file())
+
+
+def test_unremovable_untrusted_spool_input_keeps_daemon_not_ready(write_config, monkeypatch):
+    import plugins.agentops.control.events as events
+
+    config = _config(write_config)
+    spool = EventSpool(config.spool_dir)
+    spool._ensure_directories()
+    source = spool.root / "invalid.json"
+    source.write_bytes(b"sk-test-canary-secret\xff")
+    real_replace = os.replace
+
+    def fail_quarantine_replace(source_path, destination_path):
+        if Path(source_path).parent == spool.quarantine_dir:
+            raise OSError("synthetic replace interruption")
+        return real_replace(source_path, destination_path)
+
+    monkeypatch.setattr(events.os, "replace", fail_quarantine_replace)
+    monkeypatch.setattr(events.EventSpool, "_remove_untrusted_source", lambda _self, _path: False)
+    handle = start_daemon_thread(config.config_path)
+    try:
+        health = handle.health()
+        assert health["ready"] is False
+        assert "spool_quarantine_failed" in health["safe_start_reasons"]
+    finally:
+        handle.stop()
+    assert source.exists()
+
+
+def _prepared_restore(write_config, make_event):
+    config = _config(write_config)
+    store = open_store(config)
+    store.append_event(make_event("evt-before"))
+    backup = store.backup_to()
+    store.append_event(make_event("evt-after"))
+    return config, store, backup
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["copy", "replace", "fsync", "first_reopen", "rollback_reopen", "rollback_replace", "rollback_fsync"],
+)
+def test_restore_faults_leave_a_usable_verified_original_store(write_config, make_event, monkeypatch, failure_point):
+    import plugins.agentops.control.store as store_module
+
+    config, store, backup = _prepared_restore(write_config, make_event)
+    if failure_point == "copy":
+        real_copy = store_module._copy_database
+
+        def fail_replacement_copy(source, destination):
+            if Path(destination).name.startswith("replace-"):
+                raise OSError("synthetic replacement copy failure")
+            return real_copy(source, destination)
+
+        monkeypatch.setattr(store_module, "_copy_database", fail_replacement_copy)
+    elif failure_point == "replace":
+        real_replace = store_module.os.replace
+
+        def fail_replacement_replace(source, destination):
+            if Path(source).name.startswith("replace-"):
+                raise OSError("synthetic replacement rename failure")
+            return real_replace(source, destination)
+
+        monkeypatch.setattr(store_module.os, "replace", fail_replacement_replace)
+    elif failure_point in {"fsync", "rollback_fsync"}:
+        real_fsync = store_module._fsync_directory
+        state_fsync_calls = 0
+
+        def fail_post_replace_fsync(path):
+            nonlocal state_fsync_calls
+            if Path(path) == config.state_dir:
+                state_fsync_calls += 1
+                if failure_point == "fsync" and state_fsync_calls == 2:
+                    raise OSError("synthetic post-replace fsync failure")
+                if failure_point == "rollback_fsync" and state_fsync_calls == 4:
+                    raise OSError("synthetic rollback fsync failure")
+            return real_fsync(path)
+
+        monkeypatch.setattr(store_module, "_fsync_directory", fail_post_replace_fsync)
+        if failure_point == "rollback_fsync":
+            original_open = store._open_existing_writable
+            calls = 0
+
+            def fail_first_open():
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise StoreMigrationError("synthetic first reopen failure")
+                return original_open()
+
+            monkeypatch.setattr(store, "_open_existing_writable", fail_first_open)
+    else:
+        original_open = store._open_existing_writable
+        calls = 0
+
+        def fail_open():
+            nonlocal calls
+            calls += 1
+            if failure_point in {"first_reopen", "rollback_replace"} and calls == 1:
+                raise StoreMigrationError("synthetic first reopen failure")
+            if failure_point == "rollback_reopen" and calls <= 2:
+                raise StoreMigrationError("synthetic rollback reopen failure")
+            return original_open()
+
+        monkeypatch.setattr(store, "_open_existing_writable", fail_open)
+        if failure_point == "rollback_replace":
+            real_replace = store_module.os.replace
+
+            def fail_rollback_replace(source, destination):
+                if Path(source).name.startswith("rollback-"):
+                    raise OSError("synthetic rollback rename failure")
+                return real_replace(source, destination)
+
+            monkeypatch.setattr(store_module.os, "replace", fail_rollback_replace)
+
+    with pytest.raises(StoreRestoreError):
+        store.restore_from(backup)
+
+    assert store.event_count() == 2
+    assert store.verify_audit_chain() is True
+    store.close()
+
+
+def test_restore_serializes_concurrent_append_across_snapshot_and_replace(write_config, make_event, monkeypatch):
+    config, store, backup = _prepared_restore(write_config, make_event)
+    entered_snapshot = threading.Event()
+    release_snapshot = threading.Event()
+    append_complete = threading.Event()
+    restore_errors: list[BaseException] = []
+    append_errors: list[BaseException] = []
+    original_snapshot = store._backup_to_locked
+
+    def blocking_snapshot(destination):
+        result = original_snapshot(destination)
+        if Path(destination).name.startswith("pre-restore-"):
+            entered_snapshot.set()
+            assert release_snapshot.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(store, "_backup_to_locked", blocking_snapshot)
+
+    def restore() -> None:
+        try:
+            store.restore_from(backup)
+        except BaseException as exc:
+            restore_errors.append(exc)
+
+    def append() -> None:
+        try:
+            store.append_event(make_event("evt-concurrent"))
+            append_complete.set()
+        except BaseException as exc:
+            append_errors.append(exc)
+
+    restore_thread = threading.Thread(target=restore)
+    restore_thread.start()
+    assert entered_snapshot.wait(timeout=5)
+    append_thread = threading.Thread(target=append)
+    append_thread.start()
+    assert append_complete.wait(timeout=0.15) is False
+    release_snapshot.set()
+    restore_thread.join(timeout=10)
+    append_thread.join(timeout=10)
+
+    assert restore_errors == []
+    assert append_errors == []
+    assert append_complete.is_set()
+    assert store.event_count() == 2
+    assert store.verify_audit_chain() is True
+    store.close()
+
+
 def test_uds_refuses_wide_state_dir_and_chmod_failure(write_config, monkeypatch):
     config = _config(write_config)
     api = ControlAPI(config.socket_path, config.state_dir, lambda: {"ready": True}, allow_stale_reclaim=True)
@@ -368,6 +588,18 @@ def test_daemon_does_not_replace_non_socket_occupant(write_config):
 
     assert run_daemon(config, threading.Event()) == 1
     assert config.socket_path.read_text(encoding="utf-8") == "occupied"
+
+
+def test_process_lock_rejects_hard_linked_lockfile(write_config):
+    from plugins.agentops.control.daemon import ProcessLockError, _ProcessLock
+
+    config = _config(write_config)
+    config.lock_path.write_text("lock", encoding="ascii")
+    linked = config.state_dir / "lock-copy"
+    os.link(config.lock_path, linked)
+
+    with pytest.raises(ProcessLockError):
+        _ProcessLock(config.lock_path).acquire()
 
 
 def test_real_cli_doctor_exits_nonzero_when_degraded(tmp_path):

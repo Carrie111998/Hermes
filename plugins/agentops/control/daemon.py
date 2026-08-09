@@ -29,10 +29,13 @@ class _ProcessLock:
     def acquire(self) -> None:
         if self.path.is_symlink() or self.path.parent.is_symlink() or self.path.exists() and not self.path.is_file():
             raise ProcessLockError("lock path rejected")
-        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            raise ProcessLockError("safe lock open unsupported")
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | no_follow, 0o600)
         try:
             status = os.fstat(descriptor)
-            if status.st_uid != os.getuid() or not stat.S_ISREG(status.st_mode):
+            if status.st_uid != os.getuid() or not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
                 raise ProcessLockError("lock ownership rejected")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             os.ftruncate(descriptor, 0)
@@ -140,6 +143,8 @@ class ObserveOnlyDaemon:
                     replay = self.spool.replay(self.store)
                     if replay.dropped:
                         self._reason("spool_quarantine_budget_exceeded")
+                    if replay.failed:
+                        self._reason("spool_quarantine_failed")
                 except Exception:
                     self._reason("spool_replay_failed")
                 if not self.store.verify_audit_chain():

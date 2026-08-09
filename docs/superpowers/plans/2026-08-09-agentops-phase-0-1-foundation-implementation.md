@@ -200,13 +200,13 @@ Expected: all tests pass.
 
 **Consumes:** Event and Audit contracts.
 
-**Produces:** `open_store(path: Path) -> AgentOpsStore`, `append_event(event) -> AppendResult`, `append_audit(event) -> int`, `get_health() -> ControlPlaneHealth`, `backup_to(path)` and `restore_from(path)`.
+**Produces:** `open_store(config: AgentOpsConfig) -> AgentOpsStore`, `append_event(event) -> AppendResult`, `append_audit(event) -> int`, `get_health() -> ControlPlaneHealth`, `backup_to(path)` and `restore_from(path)`.
 
 - [x] **Step 1: Write failing store tests**
 
 ```python
 def test_store_uses_wal_and_event_idempotency(tmp_path):
-    store = open_store(tmp_path / "state.db")
+    store = open_store(config)
     first = store.append_event(make_event())
     second = store.append_event(make_event())
     assert first.inserted is True
@@ -214,7 +214,7 @@ def test_store_uses_wal_and_event_idempotency(tmp_path):
     assert store.journal_mode() == "wal"
 
 def test_backup_restore_returns_to_a_verified_snapshot(tmp_path):
-    store = open_store(tmp_path / "state.db")
+    store = open_store(config)
     store.append_event(make_event("a"))
     backup = store.backup_to(tmp_path / "backup.db")
     store.append_event(make_event("b"))
@@ -385,7 +385,9 @@ Provide branch SHA, touched files, raw test output, static scan output, G1 matri
 | 5. Crash/singleton safety | A `flock` lock serializes independent daemon processes. A live UDS blocks a second daemon; only a held-lock daemon may reclaim a current-user stale socket after failed health probing. | `test_second_daemon_is_rejected_and_stale_socket_is_reclaimed_after_kill`, `test_daemon_does_not_replace_non_socket_occupant` |
 | 6. Audit-chain metadata | Append transaction updates sequence/hash metadata atomically and verification checks first/continuous sequence, count and head/tail agreement. | `test_audit_chain_rejects_head_middle_and_tail_deletion`, `test_audit_chain_rejects_metadata_head_mismatch` |
 | 7. UDS fail-closed | State/socket parent must be current-user non-symlink `0700`; bound socket is re-read as `0600`/current-user/socket type. Chmod failure and occupants refuse startup. | `test_uds_refuses_wide_state_dir_and_chmod_failure`, `test_uds_refuses_symlink_socket_occupant` |
-| P2 durability/budgets | Event and quarantine replacements fsync file and parent; spool health and size flow to health; `schema_migrations` is a singleton table. | Phase 1 suite listed below |
+| 8. Quarantine crash safety | Quarantine uses UUID temp names, cleans orphan temp artifacts without reading them, fsyncs cleanup, reports `failed`, and makes daemon health fatal on an unredacted/replay failure. | `test_orphaned_quarantine_temp_is_removed_before_replay_and_never_blocks_restart`, `test_quarantine_replace_failure_is_fatal_and_does_not_leave_raw_input`, `test_unremovable_untrusted_spool_input_keeps_daemon_not_ready` |
+| 9. Restore atomic recovery | Store RLock spans pre-restore snapshot through replacement, reopen and rollback. Recovery reopens original before replacement or rolls back snapshot after replacement, then verifies audit usability. | `test_restore_faults_leave_a_usable_verified_original_store`, `test_restore_serializes_concurrent_append_across_snapshot_and_replace` |
+| P2 durability/budgets | Event/quarantine replacement and orphan cleanup fsync parent; spool `failed` health is fatal; `schema_migrations` is singleton; ProcessLock uses `O_NOFOLLOW` and requires `nlink == 1`. | `test_process_lock_rejects_hard_linked_lockfile` |
 
 ### Raw verification output
 
@@ -394,8 +396,17 @@ $ /Users/molly/Desktop/Hermes/venv/bin/python -m compileall -q plugins/agentops 
 bringing up nodes...
 bringing up nodes...
 
-............................................................             [100%]
-60 passed in 3.39s
+........................................................................ [100%]
+72 passed in 3.33s
+
+$ /Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -m pytest -o addopts='' -q tests/plugins/agentops
+........................................................................ [100%]
+72 passed in 6.17s
+
+$ /Users/molly/Desktop/Hermes/venv/bin/python -m pytest -q tests/hermes_cli/test_plugins.py tests/hermes_cli/test_plugin_cli_registration.py tests/hermes_cli/test_startup_plugin_gating.py tests/hermes_cli/test_plugin_scanner_recursion.py
+........................................................................ [ 59%]
+..................................................                       [100%]
+122 passed in 2.60s
 
 $ rg -n "subprocess|os\.system|shell=True|launchctl|requests\.|httpx\.|openai|gateway" plugins/agentops --glob '*.py'
 (no matches)
@@ -412,4 +423,5 @@ $ git diff --check 34b4513f9..HEAD && git diff --check
 - This is an isolated Phase 1 implementation only. It has not installed launchd, a scheduler, Gateway hook, collector, Executor, Target write API, or any R1/R2/R3/R4 capability.
 - `backup_to` / `restore_from` exist only as controlled local AgentOps-store primitives; no CLI route exposes restore, and they cannot point outside the dedicated `backups/` and state root.
 - Crash recovery is validated with an isolated child process and temporary state only. No production `~/.hermes` data, running Gateway or LaunchAgent was accessed.
+- Python 3.11 verification used the project test venv (3.11.15); the separately installed `python3.11` had no pytest module, so it was used for `compileall` only. Python 3.14 ran the full Phase 1 suite with `-o addopts=''` because that interpreter lacks pytest-xdist while repository `addopts` requests `-n`.
 - This branch is awaiting a fresh Sol G1 review. It must not merge, push or begin Phase 2 until that review accepts the evidence.
