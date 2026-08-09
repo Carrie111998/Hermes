@@ -426,7 +426,7 @@ function resolveGetWindowsRoot() {
  */
 const GET_WINDOWS_VERSION = '9.3.0'
 
-export function stageGetWindowsInto(srcRoot, destRoot, { platform = process.platform } = {}) {
+export function stageGetWindowsInto(srcRoot, destRoot, { platform = process.platform, rebuild } = {}) {
   // The STAGED_WINDOWS_JS rewrite mirrors this exact version's export surface.
   // A version bump must fail the build here until the rewrite is re-verified —
   // otherwise it ships stale and fails soft as a generic "unavailable".
@@ -473,17 +473,34 @@ export function stageGetWindowsInto(srcRoot, destRoot, { platform = process.plat
     // the target platform; the classify gate below still catches a dir that
     // claims win32 but holds a foreign binary.
     const bindingRoot = join(srcRoot, 'lib', 'binding')
-    const bindingDirs = existsSync(bindingRoot)
-      ? readdirSync(bindingRoot).filter(
-          (dir) =>
-            dir.includes(`-${platform}-`) &&
-            existsSync(join(bindingRoot, dir, 'node-get-windows.node'))
-        )
-      : []
+    const scanBindingDirs = () =>
+      existsSync(bindingRoot)
+        ? readdirSync(bindingRoot).filter(
+            (dir) =>
+              dir.includes(`-${platform}-`) &&
+              existsSync(join(bindingRoot, dir, 'node-get-windows.node'))
+          )
+        : []
+    let bindingDirs = scanBindingDirs()
+    if (bindingDirs.length === 0 && typeof rebuild === 'function') {
+      // Self-heal the common bricked state: npm's allowScripts policy blocked
+      // get-windows' node-pre-gyp install script on a previous install, so
+      // lib/binding was never populated — and a later plain `npm install`
+      // won't re-run install scripts for a package that is already present.
+      // `npm rebuild` re-runs them now that the script is allow-listed.
+      console.log(
+        '[stage-native-deps] get-windows has no win32 binding; attempting `npm rebuild get-windows`...'
+      )
+      rebuild()
+      bindingDirs = scanBindingDirs()
+    }
     if (bindingDirs.length === 0) {
       throw new Error(
         '[stage-native-deps] get-windows has no win32 prebuilt binding under lib/binding; ' +
-          'reinstall dependencies on the Windows build host.'
+          'its install script was likely blocked by the npm allowScripts policy. ' +
+          'Recover from the hermes-agent checkout root with:\n' +
+          '  npm install-scripts approve get-windows\n' +
+          '  npm rebuild get-windows'
       )
     }
     for (const dir of bindingDirs) {
@@ -506,10 +523,30 @@ export function stageGetWindowsInto(srcRoot, destRoot, { platform = process.plat
   return destRoot
 }
 
+/**
+ * Re-run get-windows' install script (node-pre-gyp) via `npm rebuild`.
+ * Only meaningful when the packaging host IS the target Windows machine —
+ * cross-platform packs can't produce the win32 binding anyway.
+ */
+function rebuildGetWindowsViaNpm() {
+  const repoRoot = resolve(projectRoot, '..', '..')
+  // npm resolves to npm.cmd on Windows, so it needs a shell there.
+  const result = spawnSync('npm', ['rebuild', 'get-windows'], {
+    cwd: repoRoot,
+    stdio: 'inherit',
+    shell: process.platform === 'win32'
+  })
+  if (result.status !== 0) {
+    console.warn(`[stage-native-deps] npm rebuild get-windows exited with ${result.status}`)
+  }
+}
+
 export function stageGetWindows({ platform = process.platform } = {}) {
   const srcRoot = resolveGetWindowsRoot()
   const destRoot = resolve(projectRoot, 'dist/node_modules/get-windows')
-  return stageGetWindowsInto(srcRoot, destRoot, { platform })
+  const rebuild =
+    platform === 'win32' && process.platform === 'win32' ? rebuildGetWindowsViaNpm : undefined
+  return stageGetWindowsInto(srcRoot, destRoot, { platform, rebuild })
 }
 
 // Allow direct CLI invocation: node scripts/stage-native-deps.mjs [platform] [arch]
