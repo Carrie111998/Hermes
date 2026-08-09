@@ -182,39 +182,107 @@ def test_read_devflow_returns_bounded_filtered_request_detail(tmp_path):
     conn.close()
 
     result = data_api.read_devflow(
-        ledger_path=db, now="2026-08-08T10:30:00+00:00", state="TRIAGED", limit=1,
+        ledger_path=db, now="2026-08-09T00:00:00+00:00", state="BUILDING", limit=1,
     )
     detail = data_api.read_devflow(
         ledger_path=db, now="2026-08-08T10:30:00+00:00", request_id="dwr_03",
     )
 
-    assert result["request_page"] == {"limit": 1, "next_cursor": "dwr_03", "has_more": False}
-    assert result["requests"] == [{
-        "request_id": "dwr_03", "state": "TRIAGED", "source_agent": "critic",
-        "source_kind": "critic", "target_repo": "repo", "target_subsystem": "api",
-        "kind": "bug", "severity": "high", "terminal_reason": None,
-        "created_at": "2026-08-08T10:03:00+00:00", "updated_at": "2026-08-08T10:03:00+00:00",
-        "title": "Safe title", "acceptance_criteria": ["prove it"], "lease": None,
-        "latest_artifact": {"kind": "plan", "ref": "https://example.test/plan", "created_at": "2026-08-08T10:04:00+00:00"},
-    }]
-    assert result["approval_queue"] == result["requests"]
+    assert result["request_page"] == {"limit": 1, "next_cursor": "dwr_02", "has_more": False}
+    assert [item["request_id"] for item in result["requests"]] == ["dwr_02"]
+    assert result["requests"][0]["title"] == "<script>alert(1)</script>"
+    assert result["requests"][0]["acceptance_criteria"] == ["<b>raw</b>"]
+    assert result["requests"][0]["lease"]["lease_id"] == "lse_02"
+    assert result["requests"][0]["latest_artifact"] is None
+    assert [item["request_id"] for item in result["approval_queue"]] == ["dwr_03"]
+    assert result["approval_queue_page"] == {
+        "limit": 200,
+        "next_cursor": None,
+        "has_more": False,
+    }
     assert detail["request_detail"]["request_id"] == "dwr_03"
     assert detail["request_detail"]["transitions"] == [{
-        "from_state": "REQUESTED", "to_state": "TRIAGED", "actor": "ddp.triage",
+        "from_state": "REQUESTED", "to_state": "TRIAGED",
         "policy_version": "policy-v1", "evidence_ref": "mailbox:one", "created_at": "2026-08-08T10:04:00+00:00",
     }]
     assert detail["request_detail"]["evidence"] == [{"created_at": "2026-08-08T10:04:00+00:00", "summary": {"reason": "operator review"}}]
     assert detail["request_detail"]["human_decisions"] == [{
-        "actor": "telegram:admin-1", "decision": "approve",
-        "evidence_ref": "operator reviewed", "created_at": "2026-08-08T10:05:00+00:00",
+        "decision": "approve", "evidence_ref": "operator reviewed", "created_at": "2026-08-08T10:05:00+00:00",
     }]
-    assert "secret-token" not in json.dumps(detail["request_detail"])
+    rendered_detail = json.dumps(detail["request_detail"])
+    assert "ddp.triage" not in rendered_detail
+    assert "telegram:admin-1" not in rendered_detail
+    assert "secret-token" not in rendered_detail
     assert result["side_state_counts"] == {"FAILED": 1}
-    assert result["ledger_freshness"] == {
+    assert detail["ledger_freshness"] == {
         "latest_request_updated_at": "2026-08-08T10:03:00+00:00",
         "latest_transition_at": "2026-08-08T10:04:00+00:00",
         "last_successful_read_at": "2026-08-08T10:30:00+00:00",
     }
+
+
+def test_read_devflow_bounds_untrusted_summary_text(tmp_path):
+    db = tmp_path / "delegation_ledger.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE requests (request_id TEXT, state TEXT, source_agent TEXT, source_kind TEXT, "
+        "target_repo TEXT, target_subsystem TEXT, kind TEXT, severity TEXT, terminal_reason TEXT, "
+        "created_at TEXT, updated_at TEXT, envelope_json TEXT)"
+    )
+    conn.execute("CREATE TABLE leases (request_id TEXT)")
+    conn.execute("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, request_id TEXT, kind TEXT, ref TEXT, created_at TEXT)")
+    conn.execute(
+        "INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "dwr_long", "TRIAGED", "critic", "critic", "repo", "api", "bug", "high", None,
+            "2026-08-08T10:00:00+00:00", "2026-08-08T10:00:00+00:00",
+            json.dumps({"title": "t" * 161, "acceptance_criteria": ["c" * 221]}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    result = data_api.read_devflow(ledger_path=db, now="2026-08-09T00:00:00+00:00")
+
+    summary = result["approval_queue"][0]
+    assert summary["title"] == "t" * 160 + "…"
+    assert summary["acceptance_criteria"] == ["c" * 220 + "…"]
+
+
+def test_read_devflow_approval_queue_reports_display_overflow(tmp_path):
+    db = tmp_path / "delegation_ledger.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE requests (request_id TEXT, state TEXT, source_agent TEXT, source_kind TEXT, "
+        "target_repo TEXT, target_subsystem TEXT, kind TEXT, severity TEXT, terminal_reason TEXT, "
+        "created_at TEXT, updated_at TEXT, envelope_json TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE leases (request_id TEXT, lease_id TEXT, holder TEXT, acquired_at TEXT, "
+        "expires_at TEXT, heartbeat_at TEXT, worktree_path TEXT, branch TEXT)"
+    )
+    conn.execute(
+        "CREATE TABLE artifacts (id INTEGER PRIMARY KEY, request_id TEXT, kind TEXT, ref TEXT, created_at TEXT)"
+    )
+    envelope = json.dumps({"title": "Safe title", "acceptance_criteria": ["prove it"]})
+    conn.executemany(
+        "INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            (f"dwr_{index:03d}", "TRIAGED", "critic", "critic", "repo", "api", "bug", "high", None,
+             "2026-08-08T10:00:00+00:00", "2026-08-08T10:00:00+00:00", envelope)
+            for index in range(201)
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    result = data_api.read_devflow(ledger_path=db, now="2026-08-09T00:00:00+00:00")
+
+    assert result["awaiting_approval_count"] == 201
+    assert len(result["approval_queue"]) == 200
+    assert result["approval_queue_page"]["limit"] == 200
+    assert result["approval_queue_page"]["has_more"] is True
+    assert result["approval_queue_page"]["next_cursor"] == result["approval_queue"][-1]["request_id"]
 
 
 def test_read_devflow_rejects_invalid_request_query_parameters(tmp_path):
@@ -229,6 +297,24 @@ def test_read_devflow_rejects_invalid_request_query_parameters(tmp_path):
     assert any("cursor" in error for error in result["read_errors"])
 
 
+def test_read_devflow_invalid_request_id_preserves_healthy_ledger_availability(tmp_path):
+    db = tmp_path / "delegation_ledger.db"
+    _write_devflow_ledger(db)
+
+    result = data_api.read_devflow(
+        ledger_path=db,
+        request_id="invalid",
+        now="2026-08-09T00:00:00+00:00",
+    )
+
+    assert result["ledger_available"] is True
+    assert result["ledger_total"] == 2
+    assert result["ledger_freshness"]["last_successful_read_at"] == "2026-08-09T00:00:00+00:00"
+    assert result["requests"] == []
+    assert result["request_detail"] is None
+    assert any(error == "query: invalid request_id" for error in result["read_errors"])
+
+
 def test_read_devflow_empty_ledger_returns_zeros(tmp_path):
     result = data_api.read_devflow(ledger_path=tmp_path / "missing.db")
 
@@ -237,6 +323,31 @@ def test_read_devflow_empty_ledger_returns_zeros(tmp_path):
     assert result["active_leases"] == []
     assert result["expired_leases"] == []
     assert result["read_errors"] == []
+
+
+def test_read_devflow_missing_ledger_is_healthy_empty(tmp_path):
+    result = data_api.read_devflow(ledger_path=tmp_path / "missing.db", now="2026-08-09T00:00:00+00:00")
+
+    assert result["ledger_available"] is True
+    assert result["ledger_total"] == 0
+    assert result["ledger_freshness"]["last_successful_read_at"] == "2026-08-09T00:00:00+00:00"
+    assert not any(error.startswith("requests:") for error in result["read_errors"])
+
+
+def test_read_devflow_primary_requests_failure_marks_ledger_unavailable(tmp_path):
+    db = tmp_path / "delegation_ledger.db"
+    _write_devflow_ledger(db)
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE requests")
+    conn.commit()
+    conn.close()
+
+    result = data_api.read_devflow(ledger_path=db, now="2026-08-09T00:00:00+00:00")
+
+    assert result["ledger_available"] is False
+    assert result["ledger_total"] == 0
+    assert result["ledger_freshness"]["last_successful_read_at"] is None
+    assert any(error.startswith("requests: OperationalError:") for error in result["read_errors"])
 
 
 def test_read_devflow_surfaces_active_and_expired_leases(tmp_path):
@@ -267,6 +378,86 @@ def test_read_devflow_surfaces_live_gateway_policy(tmp_path):
 
     assert result["live_gateway_imports"] == {"hermes": True, "fixture": False}
     assert result["autonomy_sentinel_note"] == "no (shadow-first)"
+
+
+def test_read_devflow_auth_readiness_merges_top_level_and_nested_platform_config(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+telegram:
+  allow_admin_from: ["123"]
+platforms:
+  telegram:
+    extra:
+      group_allow_admin_from: ["456", "789"]
+  slack:
+    extra:
+      allow_admin_from: "s1,s2"
+""",
+        encoding="utf-8",
+    )
+
+    result = data_api.read_devflow(
+        ledger_path=tmp_path / "missing.db",
+        gateway_config_path=config,
+    )
+
+    assert result["ddp_auth_readiness"] == {
+        "slack": {
+            "dm_configured": True, "dm_admin_count": 2,
+            "group_configured": False, "group_admin_count": 0,
+        },
+        "telegram": {
+            "dm_configured": True, "dm_admin_count": 1,
+            "group_configured": True, "group_admin_count": 2,
+        },
+    }
+    assert "123" not in json.dumps(result["ddp_auth_readiness"])
+
+
+def test_read_devflow_redacts_malformed_gateway_config_errors(tmp_path):
+    config = tmp_path / "config.yaml"
+    configured_id = "telegram-admin-4242"
+    config.write_text(
+        f"telegram:\n  allow_admin_from: [{configured_id}\n",
+        encoding="utf-8",
+    )
+
+    result = data_api.read_devflow(
+        ledger_path=tmp_path / "missing.db",
+        gateway_config_path=config,
+    )
+    rendered = json.dumps(result)
+
+    assert result["ddp_auth_readiness"] == {}
+    assert "gateway_config: YAMLError: could not parse config" in result["read_errors"]
+    assert configured_id not in rendered
+    assert "allow_admin_from:" not in rendered
+
+
+def test_read_devflow_tick_health_uses_only_safe_cron_fields(tmp_path):
+    jobs = tmp_path / "jobs.json"
+    jobs.write_text(json.dumps({"jobs": [
+        {
+            "id": "safe", "name": "devflow-observability-refresh", "state": "scheduled",
+            "last_run_at": "2026-08-09T00:00:00+00:00", "last_status": "ok",
+            "consecutive_errors": 0, "next_run_at": "2026-08-09T01:00:00+00:00",
+            "prompt": "secret", "script": "C:/secret.py", "model": "secret-model",
+        },
+        {"id": "other", "name": "postgres-sync", "last_status": "ok"},
+    ]}), encoding="utf-8")
+
+    result = data_api.read_devflow(
+        ledger_path=tmp_path / "missing.db",
+        cron_jobs_path=jobs,
+    )
+
+    assert result["tick_health"] == [{
+        "name": "devflow-observability-refresh", "state": "scheduled",
+        "last_run_at": "2026-08-09T00:00:00+00:00", "last_status": "ok",
+        "consecutive_errors": 0, "next_run_at": "2026-08-09T01:00:00+00:00",
+    }]
+    assert "secret" not in json.dumps(result["tick_health"])
 
 
 def test_read_devflow_tolerates_stage_one_schema(tmp_path):

@@ -4498,6 +4498,9 @@ def get_sessions(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+MAX_SESSION_CATALOG_PAGE_SIZE = 500
+
+
 @app.get("/api/profiles/sessions")
 def get_profiles_sessions(
     limit: int = 20,
@@ -4531,7 +4534,8 @@ def get_profiles_sessions(
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
-    if profile and profile != "all":
+    concrete_profile = bool(profile and profile != "all")
+    if concrete_profile:
         name, home = _cron_profile_home(profile)
         targets.append((name, home))
     else:
@@ -4544,6 +4548,8 @@ def get_profiles_sessions(
         if not targets:
             targets.append(("default", profiles_mod.get_profile_dir("default")))
 
+    limit = min(max(1, limit), MAX_SESSION_CATALOG_PAGE_SIZE)
+    offset = max(0, offset)
     min_message_count = max(0, min_messages)
     archived_only = archived == "only"
     include_archived = archived == "include"
@@ -4552,9 +4558,14 @@ def get_profiles_sessions(
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-    # Over-fetch per profile so the merged+sorted window is correct for the
-    # requested page. Capped so a huge profile can't blow up the response.
-    per_profile = min(max(limit + offset, limit), 500)
+    # Concrete-profile pages can be delegated directly to SQLite. Cross-profile
+    # pages need enough rows from each profile to build the requested global
+    # window, but every individual catalog query remains bounded.
+    per_profile = limit if concrete_profile else min(
+        MAX_SESSION_CATALOG_PAGE_SIZE,
+        limit + offset,
+    )
+    per_profile_offset = offset if concrete_profile else 0
 
     merged: List[Dict[str, Any]] = []
     total = 0
@@ -4578,7 +4589,7 @@ def get_profiles_sessions(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
                 limit=per_profile,
-                offset=0,
+                offset=per_profile_offset,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -4611,9 +4622,12 @@ def get_profiles_sessions(
         finally:
             db.close()
 
-    sort_key = "last_active" if order == "recent" else "started_at"
-    merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
-    window = merged[offset:offset + limit]
+    if concrete_profile:
+        window = merged
+    else:
+        sort_key = "last_active" if order == "recent" else "started_at"
+        merged.sort(key=lambda s: s.get(sort_key) or s.get("started_at") or 0, reverse=True)
+        window = merged[offset:offset + limit]
     if not full:
         _strip_session_list_rows(window)
     return {
@@ -4670,7 +4684,7 @@ def get_profiles_sessions_sidebar(
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
-    recents_cap = min(max(recents_limit, 1), 5000)
+    recents_cap = min(max(recents_limit, 1), MAX_SESSION_CATALOG_PAGE_SIZE)
     cron_cap = min(max(cron_limit, 1), 500)
     messaging_cap = min(max(messaging_limit, 1), 500)
 

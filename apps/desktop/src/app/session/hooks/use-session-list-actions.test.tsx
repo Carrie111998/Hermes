@@ -1,7 +1,8 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import type { SessionInfo, SidebarSessionsRequest, SidebarSessionsResponse } from '@/hermes'
+import { $sessionsLimit, resetSessionsLimit, SIDEBAR_SESSIONS_INITIAL_LIMIT } from '@/store/layout'
 import {
   $cronSessions,
   $messagingSessions,
@@ -65,6 +66,7 @@ vi.mock('@/hermes', async importOriginal => ({
 beforeEach(() => {
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  $sessionsLimit.set(SIDEBAR_SESSIONS_INITIAL_LIMIT)
   setSessions([])
   setCronSessions([])
   setMessagingSessions([])
@@ -72,6 +74,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  resetSessionsLimit()
   setSessions([])
   setCronSessions([])
   setMessagingSessions([])
@@ -81,7 +84,7 @@ afterEach(() => {
 describe('refreshSessions identity + loading hygiene', () => {
   it('keeps the previous $sessions array when the refresh is content-identical', async () => {
     const rows = [row('a'), row('b')]
-    listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows, total: 2, profile_totals: { default: 2 } }))
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: rows, total: 2 }))
 
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
@@ -93,9 +96,7 @@ describe('refreshSessions identity + loading hygiene', () => {
     expect(first.map(s => s.id)).toEqual(['a', 'b'])
 
     // Second refresh returns fresh (but equal) row objects, as the API does.
-    listSidebarSessions.mockResolvedValue(
-      sidebar({ sessions: [row('a'), row('b')], total: 2, profile_totals: { default: 2 } })
-    )
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a'), row('b')], total: 2 }))
 
     await act(async () => {
       await result.current.refreshSessions()
@@ -163,14 +164,410 @@ describe('refreshSessions identity + loading hygiene', () => {
 })
 
 describe('refreshSessions batches slices into one request', () => {
+  it('hydrates a cold 501-row total in bounded 0/500 pages, then skips stable rehydration', async () => {
+    const rows = Array.from({ length: SIDEBAR_SESSIONS_INITIAL_LIMIT + 1 }, (_, index) =>
+      row(`session-${index + 1}`, { last_active: SIDEBAR_SESSIONS_INITIAL_LIMIT - index })
+    )
+
+    listSidebarSessions.mockResolvedValue(
+      sidebar({
+        sessions: rows.slice(0, SIDEBAR_SESSIONS_INITIAL_LIMIT),
+        total: rows.length,
+        profile_totals: { default: rows.length }
+      })
+    )
+    listAllProfileSessions.mockImplementation(
+      (
+        limit: number,
+        _minMessages: number,
+        _archived: string,
+        _order: string,
+        profile: string,
+        filter: { offset?: number } = {}
+      ) => {
+        const offset = filter.offset ?? 0
+
+        return Promise.resolve({
+          limit,
+          offset,
+          profile_totals: { [profile]: rows.length },
+          sessions: rows.slice(offset, offset + limit),
+          total: rows.length
+        })
+      }
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(
+      listAllProfileSessions.mock.calls.map(call => ({ limit: call[0], offset: call[5]?.offset ?? 0 }))
+    ).toEqual([
+      { limit: SIDEBAR_SESSIONS_INITIAL_LIMIT, offset: 0 },
+      { limit: SIDEBAR_SESSIONS_INITIAL_LIMIT, offset: SIDEBAR_SESSIONS_INITIAL_LIMIT }
+    ])
+    expect(new Set($sessions.get().map(session => session.id)).size).toBe(rows.length)
+    expect($sessions.get()).toHaveLength(rows.length)
+
+    listSidebarSessions.mockClear()
+    listAllProfileSessions.mockClear()
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalledTimes(1)
+    expect(listSidebarSessions).toHaveBeenCalledWith(
+      expect.objectContaining({ recentsLimit: SIDEBAR_SESSIONS_INITIAL_LIMIT })
+    )
+    expect(listAllProfileSessions).not.toHaveBeenCalled()
+  })
+
+  it('rehydrates a stable profile again after a soft gateway switch clears the session cache', async () => {
+    const rows = Array.from({ length: SIDEBAR_SESSIONS_INITIAL_LIMIT + 1 }, (_, index) =>
+      row(`session-${index + 1}`, { last_active: SIDEBAR_SESSIONS_INITIAL_LIMIT - index })
+    )
+
+    listSidebarSessions.mockResolvedValue(
+      sidebar({
+        sessions: rows.slice(0, SIDEBAR_SESSIONS_INITIAL_LIMIT),
+        total: rows.length,
+        profile_totals: { default: rows.length }
+      })
+    )
+    listAllProfileSessions.mockImplementation(
+      (
+        limit: number,
+        _minMessages: number,
+        _archived: string,
+        _order: string,
+        profile: string,
+        filter: { offset?: number } = {}
+      ) => {
+        const offset = filter.offset ?? 0
+
+        return Promise.resolve({
+          limit,
+          offset,
+          profile_totals: { [profile]: rows.length },
+          sessions: rows.slice(offset, offset + limit),
+          total: rows.length
+        })
+      }
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get()).toHaveLength(rows.length)
+
+    // Connection/mode apply wipes gateway-bound stores without remounting this
+    // hook. The new backend may expose the same profile name and total.
+    setSessions([])
+    listAllProfileSessions.mockClear()
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listAllProfileSessions.mock.calls.map(call => call[5]?.offset)).toEqual([
+      0,
+      SIDEBAR_SESSIONS_INITIAL_LIMIT
+    ])
+    expect($sessions.get()).toHaveLength(rows.length)
+    expect($sessions.get().some(session => session.id === rows.at(-1)!.id)).toBe(true)
+  })
+
+  it('rehydrates a concrete profile when its explicit total changes', async () => {
+    let rows = [row('session-1'), row('session-2')]
+
+    listSidebarSessions.mockImplementation((request: SidebarSessionsRequest) =>
+      Promise.resolve(
+        sidebar({
+          sessions: rows.slice(0, request.recentsLimit),
+          total: rows.length,
+          profile_totals: { default: rows.length }
+        })
+      )
+    )
+    listAllProfileSessions.mockImplementation(
+      (
+        limit: number,
+        _minMessages: number,
+        _archived: string,
+        _order: string,
+        profile: string,
+        filter: { offset?: number } = {}
+      ) => {
+        const offset = filter.offset ?? 0
+
+        return Promise.resolve({
+          limit,
+          offset,
+          profile_totals: { [profile]: rows.length },
+          sessions: rows.slice(offset, offset + limit),
+          total: rows.length
+        })
+      }
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    rows = [...rows, row('session-3')]
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
+    expect(listAllProfileSessions.mock.calls.map(call => call[5]?.offset)).toEqual([0, 0])
+    expect($sessions.get().map(session => session.id)).toEqual(['session-1', 'session-2', 'session-3'])
+  })
+
+  it('does not hydrate or reconcile a fractional initial explicit total', async () => {
+    const cached = [row('session-newest'), row('session-oldest', { last_active: 1 })]
+
+    setSessions(cached)
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [cached[0]], total: 1.5, profile_totals: { default: 1.5 } })
+    )
+    listAllProfileSessions.mockResolvedValue({
+      limit: SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      offset: 0,
+      profile_totals: { default: 1 },
+      sessions: [cached[0]],
+      total: 1
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+      await result.current.refreshSessions()
+    })
+
+    expect(listAllProfileSessions).not.toHaveBeenCalled()
+    expect($sessions.get().some(session => session.id === 'session-oldest')).toBe(true)
+    expect($sessions.get()).toHaveLength(cached.length)
+  })
+
+  it('retries hydration when a concrete page overshoots its advertised total', async () => {
+    const cached = [row('session-newest'), row('session-oldest', { last_active: 1 })]
+    const unexpected = row('session-unexpected', { last_active: 500 })
+
+    setSessions(cached)
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [cached[0]], total: 1, profile_totals: { default: 1 } })
+    )
+    listAllProfileSessions.mockResolvedValue({
+      limit: SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      offset: 0,
+      profile_totals: { default: 1 },
+      sessions: [cached[0], unexpected],
+      total: 1
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+      await result.current.refreshSessions()
+    })
+
+    // Overshoot is non-authoritative and is not memoized, so a later refresh
+    // retries hydration without removing the cached tail.
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
+    expect($sessions.get().some(session => session.id === 'session-oldest')).toBe(true)
+    expect($sessions.get()).toHaveLength(cached.length)
+  })
+
+  it('preserves the oldest cached row when a concrete page total drifts from the batched target', async () => {
+    const cached = [row('session-newest'), row('session-oldest', { last_active: 1 })]
+    const batchedTotal = 1
+
+    setSessions(cached)
+    listSidebarSessions.mockResolvedValue(
+      sidebar({
+        sessions: [cached[0]],
+        total: batchedTotal,
+        profile_totals: { default: batchedTotal }
+      })
+    )
+    listAllProfileSessions.mockResolvedValue({
+      limit: SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      offset: 0,
+      profile_totals: { default: batchedTotal + 1 },
+      sessions: [cached[0]],
+      total: batchedTotal + 1
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+      await result.current.refreshSessions()
+    })
+
+    // Total drift makes both concrete responses non-authoritative, so the
+    // cached catalog remains additive and hydration is retried later.
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(2)
+    expect($sessions.get().some(session => session.id === 'session-oldest')).toBe(true)
+    expect($sessions.get()).toHaveLength(cached.length)
+  })
+
+  it.each(['throws', 'returns no progress'] as const)(
+    'keeps the oldest cached row when a later hydration page %s',
+    async failure => {
+      const rows = Array.from({ length: SIDEBAR_SESSIONS_INITIAL_LIMIT + 1 }, (_, index) =>
+        row(`session-${index + 1}`, { last_active: SIDEBAR_SESSIONS_INITIAL_LIMIT - index })
+      )
+
+      const oldestId = rows.at(-1)!.id
+
+      setSessions(rows)
+      listSidebarSessions.mockResolvedValue(
+        sidebar({
+          sessions: rows.slice(0, SIDEBAR_SESSIONS_INITIAL_LIMIT),
+          total: rows.length,
+          profile_totals: { default: rows.length }
+        })
+      )
+      listAllProfileSessions.mockImplementation(
+        (
+          limit: number,
+          _minMessages: number,
+          _archived: string,
+          _order: string,
+          _profile: string,
+          filter: { offset?: number } = {}
+        ) => {
+          const offset = filter.offset ?? 0
+
+          if (offset === SIDEBAR_SESSIONS_INITIAL_LIMIT) {
+            if (failure === 'throws') {
+              return Promise.reject(new Error('page failed'))
+            }
+
+            return Promise.resolve({ limit, offset, sessions: [], total: rows.length })
+          }
+
+          return Promise.resolve({
+            limit,
+            offset,
+            sessions: rows.slice(offset, offset + limit),
+            total: rows.length
+          })
+        }
+      )
+
+      const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+      await act(async () => {
+        await result.current.refreshSessions()
+      })
+
+      expect(listAllProfileSessions.mock.calls.map(call => call[5]?.offset)).toEqual([
+        0,
+        SIDEBAR_SESSIONS_INITIAL_LIMIT
+      ])
+      expect($sessions.get().some(session => session.id === oldestId)).toBe(true)
+      expect($sessions.get()).toHaveLength(rows.length)
+    }
+  )
+
+  it.each(['reports errors', 'returns an empty first page'] as const)(
+    'preserves cached rows and does not reconcile when hydration %s',
+    async failure => {
+      const cached = [row('session-1'), row('session-oldest', { last_active: 1 })]
+
+      setSessions(cached)
+      listSidebarSessions.mockResolvedValue(
+        sidebar({ sessions: [], total: cached.length, profile_totals: { default: cached.length } })
+      )
+      listAllProfileSessions.mockImplementation((limit: number, ...args: unknown[]) => {
+        const filter = (args[4] as { offset?: number } | undefined) ?? {}
+        const page = { limit, offset: filter.offset ?? 0, sessions: [], total: cached.length }
+
+        return Promise.resolve(
+          failure === 'reports errors' ? { ...page, errors: [{ error: 'remote failed', profile: 'default' }] } : page
+        )
+      })
+
+      const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+      await act(async () => {
+        await result.current.refreshSessions()
+      })
+
+      expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
+      expect($sessions.get()).toBe(cached)
+      expect($sessions.get().map(session => session.id)).toContain('session-oldest')
+    }
+  )
+
+  it('preserves cached rows and skips reconciliation for result errors with an empty first page', async () => {
+    const cached = [
+      row('remote-newest', { profile: 'remote' }),
+      row('remote-oldest', { last_active: 1, profile: 'remote' })
+    ]
+
+    setSessions(cached)
+    listSidebarSessions.mockResolvedValue({
+      ...sidebar({ sessions: [], total: 0, profile_totals: { remote: 0 } }),
+      errors: [{ error: 'remote failed', profile: 'remote' }]
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'remote' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listAllProfileSessions).not.toHaveBeenCalled()
+    expect($sessions.get()).toBe(cached)
+  })
+
+  it('does not invent an authoritative concrete total when profile_totals omits that profile', async () => {
+    const cached = [
+      row('remote-newest', { profile: 'remote' }),
+      row('remote-oldest', { last_active: 1, profile: 'remote' })
+    ]
+
+    setSessions(cached)
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [], total: 0, profile_totals: {} }))
+    listAllProfileSessions.mockResolvedValue({
+      limit: SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      offset: 0,
+      sessions: [],
+      total: 0
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'remote' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listAllProfileSessions).not.toHaveBeenCalled()
+    expect($sessions.get()).toBe(cached)
+  })
+
   it('makes a single sidebar call and distributes recents / cron / messaging', async () => {
     const recents = [row('a'), row('b')]
     const cron = [row('c1', { source: 'cron', title: 'nightly' })]
     const messaging = [row('m1', { source: 'telegram', title: 'tg chat' })]
 
-    listSidebarSessions.mockResolvedValue(
-      sidebar({ sessions: recents, total: 2, profile_totals: { default: 2 } }, cron, messaging)
-    )
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: recents, total: 2 }, cron, messaging))
 
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
@@ -224,5 +621,45 @@ describe('refreshSessions batches slices into one request', () => {
     })
 
     expect(getCronJobs).toHaveBeenLastCalledWith('all')
+  })
+})
+
+describe('loadMoreSessionsForProfile bounded paging', () => {
+  it('requests one bounded next page and additively preserves the rank-51 row', async () => {
+    const previous = Array.from({ length: 51 }, (_, index) => row(`session-${index + 1}`))
+    const incoming = [row('session-52'), row('session-53')]
+    const otherProfile = row('work-1', { profile: 'work' })
+
+    setSessions([...previous, otherProfile])
+    listAllProfileSessions.mockResolvedValue({
+      limit: SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      offset: previous.length,
+      profile_totals: { default: previous.length + incoming.length },
+      sessions: incoming,
+      total: previous.length + incoming.length
+    })
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: '__all__' }))
+
+    await act(async () => {
+      await result.current.loadMoreSessionsForProfile('default')
+    })
+
+    expect(listAllProfileSessions).toHaveBeenCalledTimes(1)
+    expect(listAllProfileSessions).toHaveBeenCalledWith(
+      SIDEBAR_SESSIONS_INITIAL_LIMIT,
+      1,
+      'exclude',
+      'recent',
+      'default',
+      expect.objectContaining({ offset: previous.length })
+    )
+
+    const ids = $sessions.get().map(session => session.id)
+
+    expect(ids).toContain('session-51')
+    expect(ids).toContain('session-53')
+    expect(ids).toContain(otherProfile.id)
+    expect(new Set(ids).size).toBe(previous.length + incoming.length + 1)
   })
 })

@@ -1506,6 +1506,23 @@ BEGIN
     SELECT RAISE(ABORT, 'sidebar precreate resolutions overlap unbound evidence');
 END;
 
+CREATE TABLE IF NOT EXISTS session_sidebar_orphan_resolution_quarantine (
+    resolution_table TEXT NOT NULL CHECK (
+        resolution_table IN (
+            'session_sidebar_terminal_resolutions',
+            'session_sidebar_precreate_resolutions',
+            'session_sidebar_unbound_resolutions'
+        )
+    ),
+    original_resolution_rowid INTEGER NOT NULL,
+    job_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason = 'missing_parent_job'),
+    quarantined_at REAL NOT NULL,
+    PRIMARY KEY (resolution_table, original_resolution_rowid)
+);
+
 CREATE TABLE IF NOT EXISTS session_claude_visibility_jobs (
     id TEXT PRIMARY KEY,
     source_session_id TEXT NOT NULL UNIQUE,
@@ -1603,6 +1620,21 @@ CREATE TABLE IF NOT EXISTS session_claude_visibility_characterization_events (
     FOREIGN KEY (job_id, reserved_claude_uuid)
         REFERENCES session_claude_visibility_jobs(id, reserved_claude_uuid)
         ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS session_claude_visibility_characterization_event_quarantine (
+    original_event_rowid INTEGER PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    event_kind TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    reserved_claude_uuid TEXT NOT NULL,
+    evidence_digest TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    reason TEXT NOT NULL CHECK (reason = 'missing_parent_job'),
+    quarantined_at REAL NOT NULL
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_claude_characterization_event_identity
@@ -1802,6 +1834,41 @@ CREATE TABLE _session_claude_visibility_characterization_events_v28 (
 )
 """
 
+_CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (
+    "job_id",
+    "event_kind",
+    "operation_id",
+    "source_session_id",
+    "bridge_id",
+    "idempotency_key",
+    "reserved_claude_uuid",
+    "evidence_digest",
+    "created_at",
+)
+
+_CLAUDE_CHARACTERIZATION_EVENT_QUARANTINE_COLUMNS = (
+    "original_event_rowid",
+    *_CLAUDE_CHARACTERIZATION_EVENT_COLUMNS,
+    "reason",
+    "quarantined_at",
+)
+
+_SIDEBAR_RESOLUTION_TABLES = (
+    "session_sidebar_terminal_resolutions",
+    "session_sidebar_precreate_resolutions",
+    "session_sidebar_unbound_resolutions",
+)
+
+_SIDEBAR_ORPHAN_RESOLUTION_QUARANTINE_COLUMNS = (
+    "resolution_table",
+    "original_resolution_rowid",
+    "job_id",
+    "source_session_id",
+    "payload_json",
+    "reason",
+    "quarantined_at",
+)
+
 _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_SQL = (
     """CREATE TRIGGER trg_claude_characterization_event_identity
        BEFORE INSERT ON session_claude_visibility_characterization_events
@@ -1891,18 +1958,6 @@ _CLAUDE_CHARACTERIZATION_EVENT_TRIGGER_NAMES = (
     "trg_claude_characterization_abort_order",
     "trg_claude_characterization_event_no_update",
     "trg_claude_characterization_event_no_delete",
-)
-
-_CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (
-    "job_id",
-    "event_kind",
-    "operation_id",
-    "source_session_id",
-    "bridge_id",
-    "idempotency_key",
-    "reserved_claude_uuid",
-    "evidence_digest",
-    "created_at",
 )
 
 # Indexes that reference columns added in later schema versions must be
@@ -2889,6 +2944,7 @@ class SessionDB:
         cursor: sqlite3.Cursor,
         *,
         expected_rows: int | None = None,
+        check_foreign_keys: bool = True,
     ) -> None:
         table_name = "session_claude_visibility_characterization_events"
         schema_row = cursor.execute(
@@ -2955,7 +3011,7 @@ class SessionDB:
             ),
         ):
             raise RuntimeError("Claude characterization event foreign key changed")
-        if (
+        if check_foreign_keys and (
             cursor.execute(f'PRAGMA foreign_key_check("{table_name}")').fetchone()
             is not None
         ):
@@ -2990,7 +3046,12 @@ class SessionDB:
         if connection is None:
             raise RuntimeError("bridge migration requires an open database")
         if self._bridge_migration_applied(cursor, migration_name):
-            self._validate_claude_characterization_events_v28(cursor)
+            # v29 can preserve and quarantine historical rows whose parent jobs
+            # were deleted by a pre-foreign-key writer.  Validate v28's shape
+            # first, then let v29 perform the final referential validation.
+            self._validate_claude_characterization_events_v28(
+                cursor, check_foreign_keys=False
+            )
             return
         try:
             cursor.execute("BEGIN IMMEDIATE")
@@ -2999,7 +3060,9 @@ class SessionDB:
                 (migration_name,),
             ).fetchone()
             if applied is not None:
-                self._validate_claude_characterization_events_v28(cursor)
+                self._validate_claude_characterization_events_v28(
+                    cursor, check_foreign_keys=False
+                )
                 connection.commit()
                 return
 
@@ -3061,6 +3124,262 @@ class SessionDB:
             self._create_claude_characterization_event_triggers(cursor)
             self._validate_claude_characterization_events_v28(
                 cursor, expected_rows=source_rows
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    @staticmethod
+    def _validate_claude_characterization_event_quarantine(
+        cursor: sqlite3.Cursor,
+        *,
+        expected_rows: int | None = None,
+    ) -> None:
+        table_name = "session_claude_visibility_characterization_event_quarantine"
+        columns = tuple(
+            row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+        if columns != _CLAUDE_CHARACTERIZATION_EVENT_QUARANTINE_COLUMNS:
+            raise RuntimeError("Claude characterization event quarantine changed")
+        if expected_rows is not None:
+            actual_rows = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(actual_rows) != expected_rows:
+                raise RuntimeError("Claude characterization event quarantine changed")
+
+    def _apply_claude_characterization_event_orphan_quarantine_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Preserve and quarantine audit rows whose parent job is absent.
+
+        These rows cannot participate in any delivery or recovery operation.
+        Keeping them in an FK-free audit table repairs startup without losing
+        the exact historical evidence needed for operator review.
+        """
+
+        migration_name = "claude_characterization_event_orphan_quarantine_v29"
+        event_table = "session_claude_visibility_characterization_events"
+        quarantine_table = "session_claude_visibility_characterization_event_quarantine"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            self._validate_claude_characterization_events_v28(cursor)
+            self._validate_claude_characterization_event_quarantine(cursor)
+            return
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                self._validate_claude_characterization_events_v28(cursor)
+                self._validate_claude_characterization_event_quarantine(cursor)
+                connection.commit()
+                return
+
+            self._validate_claude_characterization_events_v28(
+                cursor, check_foreign_keys=False
+            )
+            self._validate_claude_characterization_event_quarantine(cursor)
+            event_columns = ", ".join(
+                f'event."{column}"'
+                for column in _CLAUDE_CHARACTERIZATION_EVENT_COLUMNS
+            )
+            orphan_rows = cursor.execute(
+                f"""SELECT event.rowid, {event_columns}
+                    FROM \"{event_table}\" AS event
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM session_claude_visibility_jobs AS job
+                        WHERE job.id = event.job_id
+                          AND job.reserved_claude_uuid = event.reserved_claude_uuid
+                    )
+                    ORDER BY event.rowid"""
+            ).fetchall()
+            source_rows = int(
+                cursor.execute(f'SELECT COUNT(*) FROM "{event_table}"').fetchone()[0]
+            )
+
+            if orphan_rows:
+                self._drop_claude_characterization_event_triggers(cursor)
+                insert_columns = ", ".join(
+                    f'"{column}"'
+                    for column in _CLAUDE_CHARACTERIZATION_EVENT_QUARANTINE_COLUMNS
+                )
+                placeholders = ", ".join(
+                    "?" for _ in _CLAUDE_CHARACTERIZATION_EVENT_QUARANTINE_COLUMNS
+                )
+                for orphan_row in orphan_rows:
+                    cursor.execute(
+                        f'INSERT INTO "{quarantine_table}" ({insert_columns}) '
+                        f"VALUES ({placeholders})",
+                        (
+                            *tuple(orphan_row),
+                            "missing_parent_job",
+                            time.time(),
+                        ),
+                    )
+                for orphan_row in orphan_rows:
+                    cursor.execute(
+                        f'DELETE FROM "{event_table}" WHERE rowid = ?',
+                        (orphan_row[0],),
+                    )
+                self._create_claude_characterization_event_triggers(cursor)
+
+            self._validate_claude_characterization_events_v28(
+                cursor, expected_rows=source_rows - len(orphan_rows)
+            )
+            self._validate_claude_characterization_event_quarantine(
+                cursor, expected_rows=len(orphan_rows)
+            )
+            cursor.execute(
+                """INSERT INTO session_bridge_migrations
+                   (migration_name, applied_at) VALUES (?, ?)""",
+                (migration_name, time.time()),
+            )
+            connection.commit()
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    @staticmethod
+    def _validate_sidebar_orphan_resolution_quarantine(
+        cursor: sqlite3.Cursor,
+        *,
+        expected_rows: int | None = None,
+    ) -> None:
+        table_name = "session_sidebar_orphan_resolution_quarantine"
+        columns = tuple(
+            row[1]
+            for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+        )
+        if columns != _SIDEBAR_ORPHAN_RESOLUTION_QUARANTINE_COLUMNS:
+            raise RuntimeError("sidebar orphan resolution quarantine changed")
+        if expected_rows is not None:
+            actual_rows = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(actual_rows) != expected_rows:
+                raise RuntimeError("sidebar orphan resolution quarantine changed")
+
+    def _apply_sidebar_resolution_orphan_quarantine_migration(
+        self, cursor: sqlite3.Cursor
+    ) -> None:
+        """Preserve stale sidebar-resolution evidence without blocking delivery.
+
+        The source rows have no parent sidebar job, so they cannot resolve or
+        suppress a delivery.  A single transaction moves their exact payloads
+        to a dedicated audit table and restores referential integrity.
+        """
+
+        migration_name = "sidebar_resolution_orphan_quarantine_v30"
+        quarantine_table = "session_sidebar_orphan_resolution_quarantine"
+        connection = self._conn
+        if connection is None:
+            raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            self._validate_sidebar_orphan_resolution_quarantine(cursor)
+            for table_name in _SIDEBAR_RESOLUTION_TABLES:
+                if cursor.execute(
+                    f'PRAGMA foreign_key_check("{table_name}")'
+                ).fetchone() is not None:
+                    raise RuntimeError("sidebar resolution foreign key violation")
+            return
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            applied = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if applied is not None:
+                self._validate_sidebar_orphan_resolution_quarantine(cursor)
+                for table_name in _SIDEBAR_RESOLUTION_TABLES:
+                    if cursor.execute(
+                        f'PRAGMA foreign_key_check("{table_name}")'
+                    ).fetchone() is not None:
+                        raise RuntimeError("sidebar resolution foreign key violation")
+                connection.commit()
+                return
+
+            self._validate_sidebar_orphan_resolution_quarantine(cursor)
+            quarantined_rows = 0
+            for table_name in _SIDEBAR_RESOLUTION_TABLES:
+                orphan_rows = cursor.execute(
+                    f"""SELECT resolution.rowid AS original_resolution_rowid,
+                               resolution.*
+                        FROM \"{table_name}\" AS resolution
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM session_sidebar_jobs AS job
+                            WHERE job.id = resolution.job_id
+                        )
+                        ORDER BY resolution.rowid"""
+                ).fetchall()
+                if not orphan_rows:
+                    continue
+                trigger_rows = cursor.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND tbl_name = ?",
+                    (table_name,),
+                ).fetchall()
+                if any(
+                    not isinstance(row["name"], str)
+                    or not isinstance(row["sql"], str)
+                    for row in trigger_rows
+                ):
+                    raise RuntimeError("sidebar resolution trigger is malformed")
+                for trigger_row in trigger_rows:
+                    trigger_name = trigger_row["name"].replace('"', '""')
+                    cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+                for orphan_row in orphan_rows:
+                    payload = dict(orphan_row)
+                    payload.pop("original_resolution_rowid", None)
+                    cursor.execute(
+                        f"""INSERT INTO \"{quarantine_table}\" (
+                                resolution_table, original_resolution_rowid,
+                                job_id, source_session_id, payload_json,
+                                reason, quarantined_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            table_name,
+                            orphan_row["original_resolution_rowid"],
+                            orphan_row["job_id"],
+                            orphan_row["source_session_id"],
+                            json.dumps(
+                                payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            "missing_parent_job",
+                            time.time(),
+                        ),
+                    )
+                for orphan_row in orphan_rows:
+                    cursor.execute(
+                        f'DELETE FROM "{table_name}" WHERE rowid = ?',
+                        (orphan_row["original_resolution_rowid"],),
+                    )
+                for trigger_row in trigger_rows:
+                    cursor.execute(trigger_row["sql"])
+                quarantined_rows += len(orphan_rows)
+
+            for table_name in _SIDEBAR_RESOLUTION_TABLES:
+                if cursor.execute(
+                    f'PRAGMA foreign_key_check("{table_name}")'
+                ).fetchone() is not None:
+                    raise RuntimeError("sidebar resolution foreign key violation")
+            self._validate_sidebar_orphan_resolution_quarantine(
+                cursor, expected_rows=quarantined_rows
             )
             cursor.execute(
                 """INSERT INTO session_bridge_migrations
@@ -3185,6 +3504,8 @@ class SessionDB:
         self._apply_bridge_migrations(cursor)
         self._apply_claude_characterization_abort_trigger_migration(cursor)
         self._apply_claude_characterization_events_v28_migration(cursor)
+        self._apply_claude_characterization_event_orphan_quarantine_migration(cursor)
+        self._apply_sidebar_resolution_orphan_quarantine_migration(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

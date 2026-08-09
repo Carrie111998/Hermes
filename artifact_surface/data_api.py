@@ -322,6 +322,64 @@ def _read_allowlist_live_gateway_imports(path: Path, errors: list[str]) -> dict[
     }
 
 
+def _coerce_config_id_list(raw: Any) -> frozenset[str]:
+    if raw is None:
+        return frozenset()
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items = raw
+    elif isinstance(raw, str):
+        items = (item for item in raw.split(",") if item.strip())
+    else:
+        items = (raw,)
+    return frozenset(str(item).strip() for item in items if str(item).strip())
+
+
+def _read_gateway_auth_summary(path: Path, errors: list[str]) -> dict[str, dict[str, object]]:
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        errors.append(f"gateway_config: {type(exc).__name__}: {exc}")
+        return {}
+    try:
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        errors.append("gateway_config: YAMLError: could not parse config")
+        return {}
+    except OSError as exc:
+        errors.append(f"gateway_config: {type(exc).__name__}: {exc}")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    nested = parsed.get("platforms") if isinstance(parsed.get("platforms"), dict) else {}
+    names = set(nested) | {
+        name for name, value in parsed.items()
+        if isinstance(value, dict) and name not in {"platforms", "gateway"}
+    }
+    out: dict[str, dict[str, object]] = {}
+    for name in sorted(names, key=str):
+        nested_block = nested.get(name, {}) if isinstance(nested, dict) else {}
+        nested_extra = nested_block.get("extra", {}) if isinstance(nested_block, dict) else {}
+        nested_extra = nested_extra if isinstance(nested_extra, dict) else {}
+        top_level = parsed.get(name, {})
+        top_level = top_level if isinstance(top_level, dict) else {}
+        merged = {**nested_extra}
+        for key in ("allow_admin_from", "group_allow_admin_from"):
+            if key in top_level:
+                merged[key] = top_level[key]
+        dm_ids = _coerce_config_id_list(merged.get("allow_admin_from"))
+        group_ids = _coerce_config_id_list(merged.get("group_allow_admin_from"))
+        out[str(name)] = {
+            "dm_configured": bool(dm_ids),
+            "dm_admin_count": len(dm_ids),
+            "group_configured": bool(group_ids),
+            "group_admin_count": len(group_ids),
+        }
+    return out
+
+
 def _parse_autonomy_gate(ref: object) -> Optional[dict]:
     if not isinstance(ref, str):
         return None
@@ -337,6 +395,15 @@ _DDP_SIDE_STATES = frozenset({
     "REVERT_REQUESTED", "REVERTED",
 })
 _DDP_MAX_PAGE_SIZE = 100
+_DDP_APPROVAL_QUEUE_DISPLAY_CAP = 200
+_DDP_TITLE_DISPLAY_CAP = 160
+_DDP_CRITERION_DISPLAY_CAP = 220
+
+
+def _truncate_display_text(value: object, limit: int) -> str:
+    """Bound an untrusted text field for read-only Canvas presentation."""
+    text = str(value)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _safe_request_summary(row: sqlite3.Row, *, lease: Optional[dict], latest_artifact: Optional[dict]) -> dict:
@@ -365,8 +432,13 @@ def _safe_request_summary(row: sqlite3.Row, *, lease: Optional[dict], latest_art
         "terminal_reason": row["terminal_reason"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
-        "title": str(envelope.get("title") or "(unreadable envelope)"),
-        "acceptance_criteria": [str(item) for item in criteria] if isinstance(criteria, list) else [],
+        "title": _truncate_display_text(
+            envelope.get("title") or "(unreadable envelope)", _DDP_TITLE_DISPLAY_CAP,
+        ),
+        "acceptance_criteria": [
+            _truncate_display_text(item, _DDP_CRITERION_DISPLAY_CAP)
+            for item in criteria
+        ] if isinstance(criteria, list) else [],
         "lease": lease,
         "latest_artifact": latest_artifact,
     }
@@ -424,6 +496,8 @@ def read_devflow(
     ledger_path: Optional[Path] = None,
     allowlist_path: Optional[Path] = None,
     sentinel_path: Optional[Path] = None,
+    gateway_config_path: Optional[Path] = None,
+    cron_jobs_path: Optional[Path] = None,
     now: Optional[str] = None,
     state: Optional[str] = None,
     source: Optional[str] = None,
@@ -445,10 +519,15 @@ def read_devflow(
                  else devflow_dir / "allowlist.json")
     sentinel = (Path(sentinel_path) if sentinel_path is not None
                 else devflow_dir / ".autonomy_enabled")
+    config_path = (Path(gateway_config_path) if gateway_config_path is not None
+                   else root / "profiles" / "main" / "config.yaml")
+    cron_path = (Path(cron_jobs_path) if cron_jobs_path is not None
+                 else root / "profiles" / "main" / "cron" / "jobs.json")
     generated_at = _iso_now(now)
     errors: list[str] = []
     result = {
         "generated_at": generated_at,
+        "ledger_available": False,
         "ledger_total": 0,
         "by_state": {},
         "by_source": {},
@@ -465,6 +544,11 @@ def read_devflow(
         "side_state_counts": {},
         "requests": [],
         "approval_queue": [],
+        "approval_queue_page": {
+            "limit": _DDP_APPROVAL_QUEUE_DISPLAY_CAP,
+            "next_cursor": None,
+            "has_more": False,
+        },
         "request_page": {"limit": 0, "next_cursor": None, "has_more": False},
         "request_detail": None,
         "ledger_freshness": {
@@ -474,15 +558,36 @@ def read_devflow(
         },
         "read_errors": errors,
     }
+    result["ddp_auth_readiness"] = _read_gateway_auth_summary(config_path, errors)
+    try:
+        result["tick_health"] = [
+            {
+                "name": job.get("name"),
+                "state": job.get("state"),
+                "last_run_at": job.get("last_run_at"),
+                "last_status": job.get("last_status"),
+                "consecutive_errors": job.get("consecutive_errors"),
+                "next_run_at": job.get("next_run_at"),
+            }
+            for job in read_cron(jobs_path=cron_path)
+            if isinstance(job.get("name"), str) and job["name"].startswith("devflow-")
+        ]
+    except Exception as exc:  # noqa: BLE001 - read-only API must fail soft
+        errors.append(f"tick_health: {type(exc).__name__}: {exc}")
+        result["tick_health"] = []
     clean_state, clean_source, clean_cursor, clean_limit = _parse_page_args(
         state=state, source=source, cursor=cursor, limit=limit, errors=errors,
     )
     result["request_page"]["limit"] = clean_limit
-    if request_id is not None and (not isinstance(request_id, str) or not request_id.startswith("dwr_")
-                                   or len(request_id) > 200):
+    invalid_request_id = (
+        request_id is not None
+        and (not isinstance(request_id, str) or not request_id.startswith("dwr_") or len(request_id) > 200)
+    )
+    if invalid_request_id:
         errors.append("query: invalid request_id")
-        return result
     if not db.exists():
+        result["ledger_available"] = True
+        result["ledger_freshness"]["last_successful_read_at"] = generated_at
         return result
 
     conn: Optional[sqlite3.Connection] = None
@@ -504,11 +609,19 @@ def read_devflow(
         result["side_state_counts"] = {
             key: value for key, value in result["by_state"].items() if key in _DDP_SIDE_STATES
         }
+        result["ledger_available"] = True
     except sqlite3.Error as exc:
         errors.append(f"requests: {type(exc).__name__}: {exc}")
+        if conn is not None:
+            conn.close()
         return result
 
     assert conn is not None
+    if invalid_request_id:
+        result["ledger_freshness"]["last_successful_read_at"] = generated_at
+        conn.close()
+        return result
+
     lease_by_request: dict[str, dict] = {}
     try:
         lease_rows = conn.execute("SELECT * FROM leases ORDER BY expires_at").fetchall()
@@ -537,6 +650,31 @@ def read_devflow(
                 })
     except sqlite3.Error as exc:
         errors.append(f"artifacts: {type(exc).__name__}: {exc}")
+
+    try:
+        approval_rows = conn.execute(
+            "SELECT request_id, state, source_agent, source_kind, target_repo, target_subsystem, "
+            "kind, severity, terminal_reason, created_at, updated_at, envelope_json "
+            "FROM requests WHERE state = 'TRIAGED' ORDER BY request_id DESC LIMIT ?",
+            (_DDP_APPROVAL_QUEUE_DISPLAY_CAP + 1,),
+        ).fetchall()
+        has_more = len(approval_rows) > _DDP_APPROVAL_QUEUE_DISPLAY_CAP
+        approval_rows = approval_rows[:_DDP_APPROVAL_QUEUE_DISPLAY_CAP]
+        result["approval_queue"] = [
+            _safe_request_summary(
+                row,
+                lease=lease_by_request.get(row["request_id"]),
+                latest_artifact=latest_artifact_by_request.get(row["request_id"]),
+            )
+            for row in approval_rows
+        ]
+        result["approval_queue_page"] = {
+            "limit": _DDP_APPROVAL_QUEUE_DISPLAY_CAP,
+            "next_cursor": approval_rows[-1]["request_id"] if has_more and approval_rows else None,
+            "has_more": has_more,
+        }
+    except sqlite3.Error as exc:
+        errors.append(f"approval_queue: {type(exc).__name__}: {exc}")
 
     try:
         latest_request = conn.execute("SELECT MAX(updated_at) FROM requests").fetchone()[0]
@@ -587,7 +725,6 @@ def read_devflow(
             "next_cursor": rows[-1]["request_id"] if rows else None,
             "has_more": has_more,
         }
-        result["approval_queue"] = [item for item in result["requests"] if item["state"] == "TRIAGED"]
     except sqlite3.Error as exc:
         errors.append(f"request_detail: {type(exc).__name__}: {exc}")
 
@@ -595,7 +732,7 @@ def read_devflow(
         detail = dict(result["requests"][0])
         try:
             transitions = conn.execute(
-                "SELECT from_state, to_state, actor, policy_version, evidence_ref, created_at "
+                "SELECT from_state, to_state, policy_version, evidence_ref, created_at "
                 "FROM transitions WHERE request_id=? ORDER BY id", (request_id,),
             ).fetchall()
             detail["transitions"] = [dict(row) for row in transitions]
@@ -615,7 +752,7 @@ def read_devflow(
             detail["evidence"] = []
         try:
             decisions = conn.execute(
-                "SELECT actor, decision, evidence_ref, created_at "
+                "SELECT decision, evidence_ref, created_at "
                 "FROM human_decisions WHERE request_id=? ORDER BY id",
                 (request_id,),
             ).fetchall()

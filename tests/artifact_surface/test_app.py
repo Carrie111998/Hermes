@@ -73,7 +73,10 @@ def test_api_cron_endpoint_present(client):
 def test_api_devflow_endpoint_present(client):
     r = client.get("/api/devflow")
     assert r.status_code == 200
-    assert {"ledger_total", "active_leases", "read_errors"} <= set(r.json())
+    assert {
+        "ledger_total", "active_leases", "read_errors", "ledger_available",
+        "approval_queue", "approval_queue_page", "ddp_auth_readiness", "tick_health",
+    } <= set(r.json())
 
 
 def test_api_devflow_accepts_bounded_detail_query(client):

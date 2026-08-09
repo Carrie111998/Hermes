@@ -1257,13 +1257,18 @@ class CodexSourceAdapter:
         native_id: str,
         *,
         source_kinds: tuple[str, ...] | None = None,
+        state_db_only: bool = False,
     ) -> CodexThreadSummary | None:
         if not isinstance(native_id, str) or not native_id.strip():
             return None
         self._ensure_initialized()
         wanted = native_id.strip()
 
-        active = self._fetch_inventory(archived=False, source_kinds=source_kinds)
+        active = self._fetch_inventory(
+            archived=False,
+            source_kinds=source_kinds,
+            state_db_only=state_db_only,
+        )
         found = next(
             (summary for summary in active if summary.native_id == wanted), None
         )
@@ -1271,7 +1276,11 @@ class CodexSourceAdapter:
             self._inventory_cache[wanted] = found
             return found
 
-        archived = self._fetch_inventory(archived=True, source_kinds=source_kinds)
+        archived = self._fetch_inventory(
+            archived=True,
+            source_kinds=source_kinds,
+            state_db_only=state_db_only,
+        )
         found = next(
             (summary for summary in archived if summary.native_id == wanted), None
         )
@@ -1359,15 +1368,20 @@ class CodexSourceAdapter:
         *,
         archived: bool,
         source_kinds: tuple[str, ...] | None = None,
+        state_db_only: bool = False,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
             summaries = self._fetch_inventory_pages(
-                archived=archived, source_kinds=None
+                archived=archived,
+                source_kinds=None,
+                state_db_only=state_db_only,
             )
             return self._refresh_trusted_origins(summaries)
         try:
             summaries = self._fetch_inventory_pages(
-                archived=archived, source_kinds=source_kinds
+                archived=archived,
+                source_kinds=source_kinds,
+                state_db_only=state_db_only,
             )
         except Exception as exc:
             retry_without_filter = _is_source_kinds_schema_error(exc)
@@ -1376,7 +1390,11 @@ class CodexSourceAdapter:
             return self._refresh_trusted_origins(summaries)
         if not retry_without_filter:
             raise failure
-        summaries = self._fetch_inventory_pages(archived=archived, source_kinds=None)
+        summaries = self._fetch_inventory_pages(
+            archived=archived,
+            source_kinds=None,
+            state_db_only=state_db_only,
+        )
         return self._refresh_trusted_origins(summaries)
 
     def _fetch_inventory_pages(
@@ -1875,8 +1893,19 @@ class CodexTargetAdapter:
     def _verify_inventory_target(
         self, *, native_id: str, title: str, cwd: str | None
     ) -> CodexThreadSummary:
+        """Verify a fresh target from Codex's state database only.
+
+        A normal ``thread/list`` scans and repairs every stored rollout. On a
+        large profile that can exceed the bridge's bounded verification window
+        even while the target thread is healthy. A just-created target is
+        already present in the state database, making it the authoritative
+        inventory for this exact, immediate verification.
+        """
+
         summaries = self._source_adapter._fetch_inventory(
-            archived=False, source_kinds=_TARGET_SOURCE_KINDS
+            archived=False,
+            source_kinds=_TARGET_SOURCE_KINDS,
+            state_db_only=True,
         )
         matches = [summary for summary in summaries if summary.native_id == native_id]
         if len(matches) != 1:

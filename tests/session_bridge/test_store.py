@@ -1067,6 +1067,8 @@ def test_v24_bridge_migration_is_independent_of_fts_schema_version(
         "claude_auth_recovery_call_started_v25",
         "claude_characterization_abort_max_attempts_v27",
         "claude_characterization_events_v28",
+        "claude_characterization_event_orphan_quarantine_v29",
+        "sidebar_resolution_orphan_quarantine_v30",
     }
     first._conn.execute(
         """UPDATE session_claude_visibility_jobs

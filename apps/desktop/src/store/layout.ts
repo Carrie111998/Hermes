@@ -18,6 +18,10 @@ export const FILE_BROWSER_MIN_WIDTH = '10rem'
 export const FILE_BROWSER_MAX_WIDTH = '20rem'
 
 export const SIDEBAR_SESSIONS_PAGE_SIZE = 50
+// Bound the batched first-page read independently from the 50-row incremental
+// UI pager. Histories larger than this are hydrated through concrete-profile
+// pages of the same bounded size instead of widening one request indefinitely.
+export const SIDEBAR_SESSIONS_INITIAL_LIMIT = 500
 
 const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
 const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
@@ -139,7 +143,7 @@ export const $sidebarAgentsGrouped = persistentAtom(SIDEBAR_AGENTS_GROUPED_STORA
 // preview rail move to the left — a mirror of the default layout.
 export const $panesFlipped = persistentAtom(PANES_FLIPPED_STORAGE_KEY, false, Codecs.bool)
 export const $isSidebarResizing = atom(false)
-export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
+export const $sessionsLimit = atom(SIDEBAR_SESSIONS_INITIAL_LIMIT)
 
 // Toggle a repo/worktree node's persisted collapse state (absent = open).
 export function toggleWorkspaceNodeCollapsed(id: string): void {
