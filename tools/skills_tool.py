@@ -745,8 +745,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 # by, so an accidental mismatch in the frontmatter
                 # (whitespace, case, typo, deliberate rebrand) would
                 # otherwise silently bypass disable checks and confuse
-                # path resolution. The frontmatter `name:` is still surfaced
-                # in the listing response as a display label below.
+                # path resolution. The listing entry carries only
+                # name/description/category — no separate display label.
                 name = skill_dir.name[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
@@ -1259,20 +1259,14 @@ def skill_view(
                     _record(None, categorized_path.with_suffix(".md"))
 
             # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
+            # like "foundations/runtime/explore-codebase" called by bare name).
+            # The directory name is the canonical identifier (#81839): the
+            # listing and the web API (`_find_skill`) only index by it, so a
+            # frontmatter `name:` that differs from the directory is NOT a
+            # lookup alias here either — matching it would resolve names in
+            # skill_view that the web API 404s on.
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
                 if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.

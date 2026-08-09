@@ -309,7 +309,7 @@ class TestSkillsList:
 
 
 class TestSkillView:
-    def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
+    def test_view_resolves_by_dir_name_only_not_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
                 tmp_path,
@@ -317,8 +317,11 @@ class TestSkillView:
                 frontmatter_extra="metadata:\n  hermes:\n    tags: [fine-tuning, llm]\n",
             )
             # The on-disk directory ("alias-dir") differs from the skill's
-            # frontmatter name ("real-skill-name"). skills_list() exposes the
-            # frontmatter name, so skill_view(name) must resolve it too.
+            # frontmatter name ("real-skill-name"). The directory name is the
+            # canonical identifier (#81839): the listing and the web API
+            # (`_find_skill`) only index by it, so skill_view must resolve
+            # the directory name and reject the frontmatter name — accepting
+            # it here would resolve names the web API 404s on.
             alias_dir = tmp_path / "alias-dir"
             alias_dir.mkdir(parents=True, exist_ok=True)
             (alias_dir / "SKILL.md").write_text(
@@ -330,7 +333,8 @@ class TestSkillView:
                 "Step 1: Do the thing.\n"
             )
             by_dir = json.loads(skill_view("my-skill"))
-            by_name = json.loads(skill_view("real-skill-name"))
+            by_alias = json.loads(skill_view("alias-dir"))
+            by_frontmatter = json.loads(skill_view("real-skill-name"))
 
         assert by_dir["success"] is True
         assert by_dir["name"] == "my-skill"
@@ -338,8 +342,12 @@ class TestSkillView:
         assert "fine-tuning" in by_dir["tags"]
         assert "llm" in by_dir["tags"]
 
-        assert by_name["success"] is True
-        assert "Step 1" in by_name["content"]
+        assert by_alias["success"] is True
+        assert by_alias["name"] == "real-skill-name"
+        assert "Step 1" in by_alias["content"]
+
+        assert by_frontmatter["success"] is False
+        assert by_frontmatter["error"] == "Skill 'real-skill-name' not found."
 
     def test_registered_view_tracks_use_with_task_and_session(self, tmp_path):
         from tools.skills_tool import _skill_view_with_bump
