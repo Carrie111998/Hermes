@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-_DROP_KEYS = {"observed_at", "timestamp", "source_id", "path", "inode", "offset", "pid"}
+_DROP_KEYS = {"observed_at", "timestamp", "source_id", "path", "inode", "offset", "pid", "request_id", "trace_id", "span_id", "event_id", "correlation_id"}
 
 def _stable(value: Any) -> Any:
     if isinstance(value, Mapping):
