@@ -196,6 +196,58 @@ def test_render_large_db_with_pending_rebuild_suggests_optimize():
     assert "optimize-storage" in blob
 
 
+def test_render_large_db_with_auto_prune_is_informational():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        holders=None,
+        auto_prune_enabled=True,
+        retention_days=180,
+    )
+    assert not [line for line in lines if line[0] == "warn"]
+    blob = " ".join(" ".join(str(p) for p in line) for line in lines)
+    assert "auto-prune enabled" in blob
+    assert "180-day retention" in blob
+
+
+@pytest.mark.parametrize("retention_days", [None, 0, True, "180"])
+def test_render_large_db_with_invalid_auto_prune_retention_still_warns(
+    retention_days,
+):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        holders=None,
+        auto_prune_enabled=True,
+        retention_days=retention_days,
+    )
+    warns = [line for line in lines if line[0] == "warn"]
+    assert warns
+    blob = " ".join(" ".join(str(p) for p in line) for line in warns)
+    assert "retention_days" in blob
+
+
+def test_render_large_db_pending_rebuild_still_warns_with_auto_prune():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_rebuild_pending=True),
+        holders=None,
+        auto_prune_enabled=True,
+        retention_days=180,
+    )
+    warns = [line for line in lines if line[0] == "warn"]
+    assert warns
+    blob = " ".join(" ".join(str(p) for p in line) for line in warns)
+    assert "optimize-storage" in blob
+    assert "auto_prune" not in blob
+
+
 def test_render_large_db_legacy_trigram_suggests_optimize():
     from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
