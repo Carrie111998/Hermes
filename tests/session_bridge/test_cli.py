@@ -21,6 +21,7 @@ if os.name == "nt" and "USERPROFILE" not in os.environ:
 import session_bridge.cli as cli_module
 from agent.transports.codex_app_server import CodexAppServerError
 
+from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.characterize import (
@@ -545,6 +546,68 @@ def test_serve_dispatches_and_closes_runtime(capsys):
 
     assert backend.calls == [("serve",), ("close",)]
     assert _json_output(capsys)["status"] == "stopped"
+
+
+def test_serve_uses_explicit_root_for_loader_and_restores_after_return(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    observed: list[Path] = []
+
+    class Backend:
+        def serve(self) -> None:
+            assert get_hermes_home() == root
+
+        def close(self) -> None:
+            return None
+
+    exit_code = main(
+        ["serve", "--config-home", str(root)],
+        config_loader=lambda: observed.append(get_hermes_home()) or BridgeConfig(),
+        backend_factory=lambda _config: Backend(),
+    )
+
+    assert exit_code == 0
+    assert observed == [root]
+    assert get_hermes_home() != root
+    assert json.loads(capsys.readouterr().out) == {"status": "stopped"}
+
+
+def test_serve_defaults_explicit_state_database_under_config_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_home = tmp_path / "root"
+    config_home.mkdir()
+    state_db = config_home / "state.db"
+    backend = ProductionBackend(BridgeConfig(), db_path=state_db)
+    opened_paths: list[Path | None] = []
+
+    class Database:
+        def close(self) -> None:
+            return None
+
+    class Store:
+        def __init__(self, database: Database) -> None:
+            assert database is backend._db
+
+    class Catalog:
+        def __init__(self, database: Database, store: Store) -> None:
+            assert database is backend._db
+            assert store is backend._store
+
+    def open_database(db_path: Path | None = None, **_kwargs: object) -> Database:
+        opened_paths.append(db_path)
+        return Database()
+
+    monkeypatch.setattr("session_bridge.cli.SessionDB", open_database)
+    monkeypatch.setattr("session_bridge.cli.SessionBridgeStore", Store)
+    monkeypatch.setattr("session_bridge.cli.UnifiedCatalog", Catalog)
+    try:
+        backend._require_catalog()
+        assert opened_paths == [state_db]
+    finally:
+        backend.close()
 
 
 def test_sidebar_skill_cli_installs_without_loading_bridge_runtime(
@@ -6519,6 +6582,7 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
     config = BridgeConfig(
         sidebar=SidebarConfig(enabled=True, continuous=True),
     )
+    state_db = Path("C:/hermetic/session-bridge.db")
     backend = ProductionBackend(
         replace(
             config,
@@ -6527,9 +6591,11 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
                 enabled=True,
                 continuous=True,
             ),
-        )
+        ),
+        db_path=state_db,
     )
     threads: list[object] = []
+    visibility_db_paths: list[Path | None] = []
 
     class VisibilityBackend:
         def claude_visibility_run_once(self) -> dict[str, object]:
@@ -6573,9 +6639,15 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
     monkeypatch.setattr(backend, "_require_store", lambda: object())
     monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
     monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
+    def build_visibility_backend(
+        _config: BridgeConfig, *, db_path: Path | None = None
+    ) -> VisibilityBackend:
+        visibility_db_paths.append(db_path)
+        return visibility_backend
+
     monkeypatch.setattr(
         "session_bridge.cli.ProductionBackend",
-        lambda _config: visibility_backend,
+        build_visibility_backend,
     )
     monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
     monkeypatch.setattr("uvicorn.run", lambda *_args, **_kwargs: None)
@@ -6596,6 +6668,7 @@ def test_production_serve_does_not_start_local_sidebar_recovery_worker(
     assert thread.kwargs["run_once"] == visibility_backend.claude_visibility_run_once
     assert thread.kwargs["close"] == visibility_backend.close
     assert thread.kwargs["stop"].is_set() is True
+    assert visibility_db_paths == [state_db]
     assert all(thread.name != "session-bridge-sidebar-recovery" for thread in started)
     assert all(
         thread.target is not cli_module._run_continuous_sidebar_recovery_worker

@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import asdict, replace
 import json
 import logging
@@ -21,7 +20,11 @@ import time
 from typing import Any, Protocol, cast
 
 from agent.transports.codex_app_server import CodexAppServerClient
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from hermes_state import SessionDB
 
 from .catalog import UnifiedCatalog
@@ -705,10 +708,13 @@ class RolloutGateBlocked(RuntimeError):
 class ProductionBackend:
     """Lazy production composition; tests inject a small fake backend."""
 
-    def __init__(self, config: BridgeConfig) -> None:
+    def __init__(
+        self, config: BridgeConfig, *, db_path: Path | None = None
+    ) -> None:
         if not isinstance(config, BridgeConfig):
             raise TypeError("config must be a BridgeConfig")
         self.config = config
+        self._db_path = Path(db_path) if db_path is not None else None
         self._db: SessionDB | None = None
         self._store: SessionBridgeStore | None = None
         self._catalog: UnifiedCatalog | None = None
@@ -790,7 +796,9 @@ class ProductionBackend:
                 self.config.claude_visibility.enabled
                 and self.config.claude_visibility.continuous
             ):
-                visibility_backend = ProductionBackend(self.config)
+                visibility_backend = ProductionBackend(
+                    self.config, db_path=self._db_path
+                )
                 visibility_stop = threading.Event()
                 visibility_thread = threading.Thread(
                     target=_run_continuous_visibility_worker,
@@ -2778,11 +2786,11 @@ class ProductionBackend:
             raise ConfigurationFailure("characterization_requires_all_providers")
         try:
             marker_key = resolve_marker_key()
-            with _temporary_environment("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1"):
-                report_path = run_live_characterization(
-                    claude_projects_root=_CLAUDE_PROJECTS_ROOT,
-                    provenance_secret=marker_key,
-                )
+            report_path = run_live_characterization(
+                claude_projects_root=_CLAUDE_PROJECTS_ROOT,
+                provenance_secret=marker_key,
+                live_tests_enabled=True,
+            )
             gate = resolve_characterization_gate()
         except LiveCharacterizationError as exc:
             raise ProviderDegraded("characterization_failed") from exc
@@ -3016,7 +3024,7 @@ class ProductionBackend:
 
     def _require_catalog(self) -> UnifiedCatalog:
         if self._catalog is None:
-            self._db = SessionDB()
+            self._db = SessionDB(db_path=self._db_path)
             self._store = SessionBridgeStore(self._db)
             self._catalog = UnifiedCatalog(self._db, self._store)
         return self._catalog
@@ -3292,7 +3300,9 @@ def build_parser() -> argparse.ArgumentParser:
         "install-claude-skill",
         help="install the personal Claude unified catalog skill",
     )
-    commands.add_parser("serve", help="serve the authenticated loopback MCP")
+    serve = commands.add_parser("serve", help="serve the authenticated loopback MCP")
+    serve.add_argument("--config-home", type=Path, metavar="PATH")
+    serve.add_argument("--state-db", type=Path, metavar="PATH")
 
     scan = commands.add_parser("scan", help="import provider history into the catalog")
     scan.add_argument("--provider", choices=("all", "claude", "codex"), default="all")
@@ -3626,6 +3636,32 @@ def main(
     backend_factory: Callable[[BridgeConfig], _Backend] = ProductionBackend,
 ) -> int:
     args = build_parser().parse_args(argv)
+    config_home = getattr(args, "config_home", None)
+    if args.command != "serve" or config_home is None:
+        return _main_unscoped(
+            argv,
+            config_loader=config_loader,
+            backend_factory=backend_factory,
+        )
+    scope_token = set_hermes_home_override(config_home)
+    try:
+        return _main_unscoped(
+            argv,
+            config_loader=config_loader,
+            backend_factory=backend_factory,
+        )
+    finally:
+        reset_hermes_home_override(scope_token)
+
+
+def _main_unscoped(
+    argv: Sequence[str] | None = None,
+    *,
+    config_loader: Callable[[], BridgeConfig] = BridgeConfig.load,
+    backend_factory: Callable[[BridgeConfig], _Backend] = ProductionBackend,
+) -> int:
+    args = build_parser().parse_args(argv)
+    config_home = getattr(args, "config_home", None)
     if args.command == "install-sidebar-skill":
         try:
             installed = install_sidebar_skill()
@@ -3645,14 +3681,23 @@ def main(
     if args.command == "sidebar-run-once":
         _emit({"error": "desktop_broker_required"})
         return EXIT_DEGRADED
+    backend: _Backend | None = None
     try:
         config = config_loader()
         if not isinstance(config, BridgeConfig):
             raise TypeError("config loader did not return BridgeConfig")
-        backend = backend_factory(config)
+        state_db = getattr(args, "state_db", None)
+        if args.command == "serve" and state_db is None and config_home is not None:
+            state_db = config_home / "state.db"
+        if args.command == "serve" and state_db is not None and backend_factory is ProductionBackend:
+            backend = ProductionBackend(config, db_path=state_db)
+        else:
+            backend = backend_factory(config)
     except Exception:
         _emit({"error": "configuration_error"})
         return EXIT_CONFIG
+
+    assert backend is not None
 
     try:
         if args.command == "serve":
@@ -5011,19 +5056,6 @@ def _claude_lineage_cursor_argument(value: str) -> Mapping[str, Any]:
             "cursor must be one strict JSON object emitted by the preceding page"
         )
     return parsed
-
-
-@contextmanager
-def _temporary_environment(name: str, value: str):
-    previous = os.environ.get(name)
-    os.environ[name] = value
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = previous
 
 
 if __name__ == "__main__":  # pragma: no cover

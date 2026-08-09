@@ -15,7 +15,11 @@ from typing import Any
 import pytest
 
 import session_bridge.config as bridge_config
-from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 _DEFAULT_CONFIG_DIRECTORY = tempfile.TemporaryDirectory(
     prefix="session-bridge-config-"
@@ -33,6 +37,35 @@ from session_bridge.config import (
     SidebarConfig,
     _ENV_NAMES,
 )
+
+
+def test_bridge_config_explicit_home_scopes_toml_and_yaml_and_restores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ambient_home = tmp_path / "ambient"
+    config_home = tmp_path / "root"
+    ambient_home.mkdir()
+    config_home.mkdir()
+    (config_home / "session_bridge.toml").write_text(
+        "[service]\nport = 8123\n", encoding="utf-8"
+    )
+    observed: list[Path] = []
+
+    def load_yaml() -> dict[str, object]:
+        observed.append(get_hermes_home())
+        return {"session_bridge": {"sidebar": {"enabled": True}}}
+
+    monkeypatch.setattr("hermes_cli.config.load_config", load_yaml)
+    token = set_hermes_home_override(ambient_home)
+    try:
+        config = BridgeConfig.load(config_home=config_home, environ={})
+        assert get_hermes_home() == ambient_home
+    finally:
+        reset_hermes_home_override(token)
+
+    assert config.service.port == 8123
+    assert config.sidebar.enabled is True
+    assert observed == [config_home]
 
 
 def _installed_default_bridge_config() -> BridgeConfig:
