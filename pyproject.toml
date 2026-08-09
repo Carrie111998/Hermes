@@ -84,7 +84,7 @@ dependencies = [
   "urllib3>=2.7.0,<3",
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
-  "cryptography==48.0.1",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf; ==48.0.1 (not 49.x): msal and alibabacloud-tea-openapi cap <49, hindsight-api-slim needs >=48.0.1
+  "cryptography>=50.0.0,<51",  # Cryptography 50 fixes the remaining PKCS#7 EnvelopedData decryption oracle advisories.
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
@@ -369,9 +369,10 @@ override-dependencies = [
   "pynacl>=1.6,<1.7",
 ]
 exclude-newer = "14 days"
-# h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
-# request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false }
+# Recent security releases bypass the 14-day stability window. h2 can return to
+# the normal window after 2026-08-17; cryptography 50 is required for the
+# PKCS#7 EnvelopedData decryption oracle advisories.
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, cryptography = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
