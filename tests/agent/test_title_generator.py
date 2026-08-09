@@ -560,3 +560,86 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class TestPersonalityMarkersNotTitleable:
+    """Regression: a personality-pivot marker must never become the session
+    title, mirroring TestModelSwitchMarkerNotTitleable above.
+
+    ``_apply_personality_to_session`` (tui_gateway/server.py) persists its
+    pivot notice with ``role="user"`` for the same reason
+    ``_append_model_switch_marker`` does (#48338): strict OpenAI-compatible
+    providers reject a system message that is not first. Switching
+    personality before asking the first real question titled the session
+    "[System: The user has changed the assistant's personality…" instead of
+    the user's actual question — the exact bug class #65891 fixed for the
+    model-switch marker, left open here.
+    """
+
+    SET_MARKER = (
+        "[System: The user has changed the assistant's personality. "
+        "From this point forward, adopt the following persona and respond "
+        "accordingly: You are a pirate.]"
+    )
+    CLEARED_MARKER = (
+        "[System: The user has cleared the personality overlay. "
+        "From this point forward, respond in your normal default style.]"
+    )
+
+    def test_marker_prefixes_match_gateway_constants(self):
+        """The guard must stay in sync with the gateway's marker builders."""
+        from tui_gateway.server import (
+            _PERSONALITY_CLEARED_MARKER,
+            _PERSONALITY_SET_MARKER_PREFIX,
+        )
+        from agent.title_generator import _MACHINE_PREFIXES
+
+        assert _PERSONALITY_SET_MARKER_PREFIX in _MACHINE_PREFIXES
+        assert _PERSONALITY_CLEARED_MARKER in _MACHINE_PREFIXES
+        assert self.SET_MARKER.startswith(_PERSONALITY_SET_MARKER_PREFIX)
+        assert self.CLEARED_MARKER == _PERSONALITY_CLEARED_MARKER
+
+    def test_set_marker_is_not_titleable(self):
+        from agent.title_generator import is_titleable_user_message
+
+        assert is_titleable_user_message(self.SET_MARKER) is False
+
+    def test_cleared_marker_is_not_titleable(self):
+        from agent.title_generator import is_titleable_user_message
+
+        assert is_titleable_user_message(self.CLEARED_MARKER) is False
+
+    def test_set_marker_not_counted_as_a_real_user_turn(self):
+        from agent.title_generator import _is_real_user_turn
+
+        assert _is_real_user_turn({"role": "user", "content": self.SET_MARKER}) is False
+
+    def test_real_question_after_marker_still_titles(self):
+        """The marker must not consume the session's one titling opportunity,
+        mirroring the model-switch marker's equivalent regression test."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.get_session_title_source.return_value = None
+        history = [
+            {"role": "user", "content": self.SET_MARKER},
+            {"role": "user", "content": "南京市秦淮区 小时级天气预报"},
+        ]
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-1", "南京市秦淮区 小时级天气预报", history)
+            assert called.wait(timeout=10), "auto_title never ran after marker"
+
+    def test_instant_title_skips_marker_uses_real_message(self):
+        from agent.title_generator import apply_instant_title
+
+        db = MagicMock()
+        db.get_session_title_source.return_value = None
+
+        assert apply_instant_title(db, "sess-1", self.SET_MARKER) is None
+        assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
+            "南京市秦淮区 小时级天气预报"
+        )

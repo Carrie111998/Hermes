@@ -142,6 +142,17 @@ _MACHINE_PREFIXES = (
     # actual question. Keep in sync with
     # tui_gateway.server._MODEL_SWITCH_MARKER_PREFIX.
     "[System: The active model for this chat has changed to ",
+    # Personality-pivot markers from tui_gateway.server._apply_personality_to_session.
+    # Same role="user" persistence, same failure mode as the model-switch
+    # marker above: switching personality before the first real message
+    # titled the session after the marker instead of the user's actual
+    # question. Keep in sync with tui_gateway.server._PERSONALITY_SET_MARKER_PREFIX
+    # and tui_gateway.server._PERSONALITY_CLEARED_MARKER.
+    "[System: The user has changed the assistant's personality. "
+    "From this point forward, adopt the following persona and respond "
+    "accordingly: ",
+    "[System: The user has cleared the personality overlay. "
+    "From this point forward, respond in your normal default style.]",
 )
 
 

@@ -3967,6 +3967,22 @@ def _is_model_switch_marker(entry: Any) -> bool:
     return isinstance(content, str) and content.startswith(_MODEL_SWITCH_MARKER_PREFIX)
 
 
+# Stable text of the two personality-pivot markers _apply_personality_to_session
+# injects, mirrored (not imported, to avoid a circular import) into
+# agent.title_generator._MACHINE_PREFIXES so switching personality before the
+# first real message never leaks a marker into the session title the same way
+# the model-switch marker did (#65891 / see _MODEL_SWITCH_MARKER_PREFIX above).
+_PERSONALITY_SET_MARKER_PREFIX = (
+    "[System: The user has changed the assistant's personality. "
+    "From this point forward, adopt the following persona and respond "
+    "accordingly: "
+)
+_PERSONALITY_CLEARED_MARKER = (
+    "[System: The user has cleared the personality overlay. "
+    "From this point forward, respond in your normal default style.]"
+)
+
+
 def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
     """Record a real system-history pivot after a live model switch.
 
@@ -6064,16 +6080,9 @@ def _apply_personality_to_session(
         # Inject a pivot marker into history so the model sees the change point.
         # This prevents it from pattern-matching its prior style.
         if new_prompt:
-            marker = (
-                "[System: The user has changed the assistant's personality. "
-                "From this point forward, adopt the following persona and respond "
-                f"accordingly: {new_prompt}]"
-            )
+            marker = f"{_PERSONALITY_SET_MARKER_PREFIX}{new_prompt}]"
         else:
-            marker = (
-                "[System: The user has cleared the personality overlay. "
-                "From this point forward, respond in your normal default style.]"
-            )
+            marker = _PERSONALITY_CLEARED_MARKER
         # Tagged like the model-switch marker (`_append_model_switch_marker`):
         # the marker rides as role=user so strict OpenAI-compatible providers
         # accept it mid-conversation, but `display_kind` keeps it out of the
