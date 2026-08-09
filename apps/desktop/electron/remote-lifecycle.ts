@@ -38,6 +38,15 @@ const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
 const DEFAULT_READY_TIMEOUT_MS = 45_000
 const READY_POLL_INTERVAL_MS = 750
 
+function classifySshReuseProof(proof, spawnNonce) {
+  return proof?.ok === true &&
+    proof.sshOwnerNonce === spawnNonce &&
+    proof.protocolVersion === PROTOCOL_VERSION &&
+    proof.runtimeIntact !== false
+    ? 'authenticated-ok'
+    : 'authenticated-stale'
+}
+
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
 }
@@ -874,6 +883,7 @@ async function connect(deps) {
 export {
   adoptOwnedServedToken,
   buildSpawnCommand,
+  classifySshReuseProof,
   cleanupStale,
   connect,
   DEFAULT_READY_TIMEOUT_MS,
