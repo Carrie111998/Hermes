@@ -982,6 +982,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
+        self._clarify_requesters: Dict[Any, str] = {}
         self._CLARIFY_RESOLVED_MAX = 1000
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
@@ -6969,14 +6970,26 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
 
-            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            team_id = self._metadata_team_id(metadata)
+            result = await self._get_client(
+                chat_id, team_id=team_id
+            ).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
                 # Mark unresolved so the action handler's atomic-pop guard can
                 # reject double-clicks (mirrors _approval_resolved).
-                self._clarify_resolved[msg_ts] = False
+                clarify_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._clarify_resolved[clarify_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._clarify_requesters[clarify_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._clarify_resolved, self._CLARIFY_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._clarify_requesters, self._CLARIFY_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -7366,13 +7379,18 @@ class SlackAdapter(BasePlatformAdapter):
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
+        clarify_key = self._workspace_message_marker(team_id, msg_ts)
+        if msg_ts in self._clarify_resolved:
+            clarify_key = msg_ts
+        expected_requester = self._clarify_requesters.get(clarify_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
@@ -7388,8 +7406,9 @@ class SlackAdapter(BasePlatformAdapter):
 
         # Double-click guard — atomic pop; first caller gets False (proceed),
         # any later click gets the True default and bails (mirrors approval).
-        if self._clarify_resolved.pop(msg_ts, True):
+        if self._clarify_resolved.pop(clarify_key, True):
             return
+        self._clarify_requesters.pop(clarify_key, None)
 
         # Preserve the original question so the resolved message keeps context.
         original_text = ""
