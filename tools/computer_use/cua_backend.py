@@ -43,6 +43,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -377,7 +378,7 @@ def _wsl_windows_path_to_posix(path: str) -> str:
     drive = (win.drive or "").rstrip(":").lower()
     if not drive:
         return path
-    return os.path.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
+    return posixpath.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
 
 
 class _EmbeddedCuaDaemon:
@@ -439,7 +440,7 @@ class _EmbeddedCuaDaemon:
             raise RuntimeError(cua_driver_install_hint())
         self._command, self._mcp_args = _resolve_mcp_invocation(self._driver_cmd)
         env = _sanitize_subprocess_env(self.child_env())
-        command = [
+        command = cua_driver_argv(
             self._command,
             "serve",
             "--embedded",
@@ -449,7 +450,7 @@ class _EmbeddedCuaDaemon:
             "--permission-mode",
             "unrestricted",
             "--dangerously-bypass-approvals",
-        ]
+        )
         self._process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -475,7 +476,7 @@ class _EmbeddedCuaDaemon:
                 )
             try:
                 probe = subprocess.run(
-                    [self._command, "status", "--socket", self.socket_path],
+                    cua_driver_argv(self._command, "status", "--socket", self.socket_path),
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
@@ -510,7 +511,7 @@ class _EmbeddedCuaDaemon:
 
             try:
                 subprocess.run(
-                    [self._command, "stop", "--socket", self.socket_path],
+                    cua_driver_argv(self._command, "stop", "--socket", self.socket_path),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -563,7 +564,7 @@ def _resolve_mcp_invocation(
     try:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
-            [driver_cmd, "manifest"],
+            cua_driver_argv(driver_cmd, "manifest"),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
@@ -635,7 +636,7 @@ def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
         # and MCP spawn; #53503/#55709/#58889 lineage).
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
-            [driver_cmd, "--help"],
+            cua_driver_argv(driver_cmd, "--help"),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3.0,
             stdin=subprocess.DEVNULL,
             creationflags=windows_hide_flags(),
@@ -689,6 +690,33 @@ def _has_path_separator(value: str) -> bool:
     return os.sep in value or (os.altsep is not None and os.altsep in value)
 
 
+def _wsl_init_can_launch(driver_cmd: str) -> bool:
+    """Whether WSL ``/init`` can launch a non-executable DrvFS Windows binary."""
+    if not re.match(r"^/mnt/[A-Za-z](?:/|$)", driver_cmd):
+        return False
+    if not driver_cmd.lower().endswith(".exe"):
+        return False
+    try:
+        from hermes_constants import is_wsl
+
+        if not is_wsl():
+            return False
+    except Exception:
+        return False
+    return (
+        os.path.isfile(driver_cmd)
+        and not os.access(driver_cmd, os.X_OK)
+        and os.path.isfile("/init")
+        and os.access("/init", os.X_OK)
+    )
+
+
+def cua_driver_argv(driver_cmd: str, *args: str) -> List[str]:
+    """Build argv for every cua-driver spawn, including narrow WSL interop."""
+    prefix = ["/init", driver_cmd] if _wsl_init_can_launch(driver_cmd) else [driver_cmd]
+    return [*prefix, *args]
+
+
 def _candidate_cua_driver_commands(override: Optional[str] = None) -> List[str]:
     """Return candidate cua-driver commands in resolution order.
 
@@ -735,7 +763,7 @@ def resolve_cua_driver_cmd(override: Optional[str] = None) -> Optional[str]:
     for candidate in _candidate_cua_driver_commands(override):
         expanded = os.path.expanduser(candidate)
         if _has_path_separator(expanded):
-            if shutil.which(expanded):
+            if shutil.which(expanded) or _wsl_init_can_launch(expanded):
                 return expanded
         else:
             resolved = shutil.which(expanded)
@@ -775,7 +803,7 @@ def cua_driver_update_check(*, timeout: Optional[float] = None) -> Optional[Dict
     try:
         from tools.environments.local import _sanitize_subprocess_env
         proc = subprocess.run(
-            [driver_cmd, "check-update", "--json"],
+            cua_driver_argv(driver_cmd, "check-update", "--json"),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
             # Some older drivers don't have the verb and fall through to a
             # stdin-reading mode rather than erroring — DEVNULL gives them EOF
@@ -1159,9 +1187,10 @@ class _CuaDriverSession:
                 command, args = _resolve_mcp_invocation(driver_cmd)
                 child_env = cua_driver_child_env()
             _t_manifest = _time.monotonic()
+            invocation = cua_driver_argv(command, *args)
             params = StdioServerParameters(
-                command=command,
-                args=args,
+                command=invocation[0],
+                args=invocation[1:],
                 # Apply the telemetry policy first (default: disabled), then
                 # sanitize Hermes-managed secrets out of the child env.
                 env=_sanitize_subprocess_env(child_env),
@@ -1557,13 +1586,13 @@ class _CuaDriverSession:
             driver_command = embedded_daemon.proxy_invocation()[0]
             child_env = embedded_daemon.child_env()
             socket_args = ["--socket", embedded_daemon.socket_path]
-        cmd = [
+        cmd = cua_driver_argv(
             driver_command,
             "call",
             name,
             json.dumps(call_args),
             *socket_args,
-        ]
+        )
         attempts = 4
         backoff = 0.5
         parsed: Any = None
