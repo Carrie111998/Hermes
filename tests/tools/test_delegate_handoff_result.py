@@ -73,6 +73,20 @@ def test_handoff_result_serializes_typed_frame_with_legacy_keys():
     json.dumps(frame)
 
 
+def test_handoff_result_preserves_legacy_empty_public_keys():
+    frame = HandoffResult.from_child_run(
+        task_index=1,
+        status="failed",
+        summary=None,
+        exit_reason="max_iterations",
+    ).to_dict()
+
+    assert frame["model"] is None
+    assert frame["tokens"] == {}
+    assert frame["tool_trace"] == []
+    assert frame["diagnostic_path"] is None
+
+
 def test_handoff_error_uses_formal_schema_and_exit_reason():
     frame = _handoff_error(
         task_index=0,
