@@ -74,12 +74,43 @@ def _get_user_plugins_dir() -> Optional[Path]:
 def _is_memory_provider_dir(path: Path) -> bool:
     """Heuristic: does *path* look like a memory provider plugin?
 
-    Checks for ``register_memory_provider`` or ``MemoryProvider`` in the
-    ``__init__.py`` source.  Cheap text scan — no import needed.
+    Checks for an explicit ``kind: exclusive`` manifest first.  Explicit
+    non-exclusive kinds are rejected; only manifests with no kind retain the
+    legacy source-text fallback.  The manifest check lets standalone
+    providers keep their implementation in another module without making
+    discovery import arbitrary user code.
     """
     init_file = path / "__init__.py"
     if not init_file.exists():
         return False
+
+    yaml_file = path / "plugin.yaml"
+    if not yaml_file.exists():
+        yaml_file = path / "plugin.yml"
+    if yaml_file.exists():
+        try:
+            import yaml
+
+            with open(yaml_file, encoding="utf-8-sig") as f:
+                meta = yaml.safe_load(f)
+        except Exception:
+            return False
+
+        if not isinstance(meta, dict):
+            return False
+
+        kind = meta.get("kind")
+        if kind is None:
+            kind = ""
+        elif isinstance(kind, str):
+            kind = kind.strip().lower()
+        else:
+            return False
+        if kind == "exclusive":
+            return True
+        if kind:
+            return False
+
     try:
         source = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
         return "register_memory_provider" in source or "MemoryProvider" in source
@@ -305,7 +336,7 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
-        collector = _ProviderCollector()
+        collector = _ProviderCollector(name)
         try:
             mod.register(collector)
             if collector.provider:
@@ -328,10 +359,27 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
 
 
 class _ProviderCollector:
-    """Fake plugin context that captures register_memory_provider calls."""
+    """Minimal provider context with host-owned plugin surfaces.
 
-    def __init__(self):
+    Memory providers use a separate loader from general plugins, so they do
+    not receive :class:`hermes_cli.plugins.PluginContext` directly. Keep the
+    registration sink small, but expose the same host-owned LLM facade so a
+    standalone provider does not need its own model credentials.
+    """
+
+    def __init__(self, plugin_id: str = ""):
+        self._plugin_id = plugin_id
+        self._llm = None
         self.provider = None
+
+    @property
+    def llm(self):
+        """Return the host-owned LLM facade for this provider plugin."""
+        if self._llm is None:
+            from agent.plugin_llm import PluginLlm
+
+            self._llm = PluginLlm(plugin_id=self._plugin_id)
+        return self._llm
 
     def register_memory_provider(self, provider):
         self.provider = provider

@@ -406,7 +406,19 @@ class TestPluginLoading:
 
         assert "hermes_plugins.ns_plugin" in sys.modules
 
-    def test_user_memory_plugin_auto_coerced_to_exclusive(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "manifest_extra",
+        [
+            pytest.param({}, id="missing-kind"),
+            pytest.param({"kind": None}, id="null-kind"),
+            pytest.param({"kind": ""}, id="empty-kind"),
+            pytest.param({"kind": "   "}, id="whitespace-kind"),
+            pytest.param({"kind": "exclusive"}, id="exclusive-kind"),
+        ],
+    )
+    def test_user_memory_plugin_kinds_auto_coerced_to_exclusive(
+        self, manifest_extra, tmp_path, monkeypatch
+    ):
         """User-installed memory plugins must NOT be loaded by the general
         PluginManager — they belong to plugins/memory discovery.
 
@@ -422,8 +434,9 @@ class TestPluginLoading:
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         plugin_dir = plugins_dir / "mempalace"
         plugin_dir.mkdir(parents=True)
-        # No explicit `kind:` — the heuristic should kick in.
-        (plugin_dir / "plugin.yaml").write_text(yaml.dump({"name": "mempalace"}))
+        # Legacy unspecified and explicit exclusive kinds must route to memory.
+        manifest = {"name": "mempalace", **manifest_extra}
+        (plugin_dir / "plugin.yaml").write_text(yaml.dump(manifest))
         (plugin_dir / "__init__.py").write_text(
             "class MemPalaceProvider:\n"
             "    pass\n"
@@ -450,6 +463,62 @@ class TestPluginLoading:
         assert not entry.enabled
         assert entry.module is None
         assert "exclusive" in (entry.error or "").lower()
+
+    @pytest.mark.parametrize(
+        "manifest",
+        [
+            pytest.param("kind: false\n", id="explicit-false-kind"),
+            pytest.param("kind: 0\n", id="explicit-zero-kind"),
+            pytest.param("kind: []\n", id="explicit-list-kind"),
+            pytest.param("kind: {}\n", id="explicit-map-kind"),
+            pytest.param("", id="empty-document"),
+            pytest.param("null\n", id="null-document"),
+            pytest.param("false\n", id="false-document"),
+            pytest.param("- mempalace\n", id="list-document"),
+            pytest.param("mempalace\n", id="scalar-document"),
+        ],
+    )
+    def test_invalid_memory_manifests_never_load_when_enabled(
+        self, manifest, tmp_path, monkeypatch
+    ):
+        """Invalid manifests must not reach enabled plugin imports."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(
+            plugins_dir,
+            "invalid_memory_manifest",
+            register_body="ctx.register_memory_provider('invalid', object())",
+        )
+        (plugin_dir / "plugin.yaml").write_text(manifest, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "invalid_memory_manifest" not in mgr._plugins
+
+    def test_user_memory_plugin_yml_unspecified_enabled_skips_generic_load(
+        self, tmp_path, monkeypatch
+    ):
+        """The generic scanner and memory scanner must agree on plugin.yml."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(
+            plugins_dir,
+            "yml_memory_manifest",
+            register_body="ctx.register_memory_provider('yml', object())",
+        )
+        (plugin_dir / "plugin.yaml").unlink()
+        (plugin_dir / "plugin.yml").write_text(
+            "name: yml_memory_manifest\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        entry = mgr._plugins["yml_memory_manifest"]
+        assert entry.manifest.kind == "exclusive"
+        assert not entry.enabled
+        assert entry.module is None
 
 
 # ── TestPluginHooks ────────────────────────────────────────────────────────
