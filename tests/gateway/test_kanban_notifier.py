@@ -24,6 +24,24 @@ class RecordingAdapter:
         self.handled.append(event)
 
 
+class NoPushAdapter:
+    """Adapter with no push channel — mirrors APIServerAdapter's
+    ``supports_async_delivery = False`` contract, the only real-world
+    adapter that can never text-send or wake-post a notification."""
+
+    supports_async_delivery = False
+
+    def __init__(self):
+        self.sent = []
+        self.handled = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
 
@@ -44,10 +62,10 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     # Most tests model the default gateway after its dispatcher acquired the
     # singleton lock. Tests for startup or non-owner gateways clear this.
@@ -615,3 +633,49 @@ def test_notifier_skips_authors_own_comment(tmp_path, monkeypatch):
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_never_claims_comment_for_non_push_adapter(tmp_path, monkeypatch):
+    """A `commented` event on a non-push adapter (api_server) must not be
+    claimed and silently lost (review on #82123).
+
+    `commented` is deliberately excluded from `_WAKE_KINDS`, so a platform
+    with no push channel has NO delivery path for it at all: no text send
+    (skipped for non-push adapters) and no wake self-post (not a wake kind).
+    Claiming the event anyway would still advance the subscription's cursor,
+    permanently dropping the notification with no retry. It must instead stay
+    unclaimed, exactly like the notify_on_comment-off default.
+    """
+    db_path = tmp_path / "comment-no-push-adapter.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"notify_on_comment": True}},
+    )
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="needs a note", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="api_server", chat_id="chat-1")
+        kb.add_comment(conn, tid, author="worker", body="blocked on missing credentials")
+    finally:
+        conn.close()
+
+    adapter = NoPushAdapter()
+    runner = _make_runner(adapter, platform=Platform.API_SERVER)
+    runner._kanban_notifier_profile = "orchestrator"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="api_server", chat_id="chat-1",
+            kinds=["commented"],
+        )
+    finally:
+        conn.close()
+    assert len(remaining) == 1

@@ -273,6 +273,33 @@ class GatewayKanbanWatchersMixin:
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
+                    # A "commented" event has no wake-worthy semantics (it's
+                    # intentionally excluded from _WAKE_KINDS below), so for a
+                    # platform whose only registered adapter(s) have no push
+                    # channel (api_server: supports_async_delivery=False)
+                    # there is NO delivery path for it at all: the text-send
+                    # skip further down leaves nothing to wake, yet the
+                    # cursor still advanced past it — silently dropping the
+                    # notification instead of ever retrying it. Rather than
+                    # claim-then-lose, exclude "commented" up front for those
+                    # platforms so the row is simply never selected (same
+                    # SQL-level skip the flag-off path already relies on) and
+                    # the cursor never advances past it. Coarse like
+                    # active_platforms above: a platform counts as push
+                    # capable if ANY known adapter for it (default or
+                    # per-profile) supports push.
+                    from gateway.wake import adapter_supports_push as _push_ok
+                    push_capable_platforms = {
+                        getattr(platform, "value", str(platform)).lower()
+                        for platform, adapter in self.adapters.items()
+                        if _push_ok(adapter)
+                    }
+                    for _profile_adapter_map in getattr(self, "_profile_adapters", {}).values():
+                        push_capable_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform, adapter in _profile_adapter_map.items()
+                            if _push_ok(adapter)
+                        )
 
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
@@ -365,13 +392,16 @@ class GatewayKanbanWatchersMixin:
                                             sub.get("task_id"), platform or "<missing>",
                                         )
                                         continue
+                                    sub_claim_kinds = claim_kinds
+                                    if "commented" in sub_claim_kinds and platform not in push_capable_platforms:
+                                        sub_claim_kinds = TERMINAL_KINDS
                                     old_cursor, cursor, events = _kb.claim_unseen_events_for_sub(
                                         conn,
                                         task_id=sub["task_id"],
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=claim_kinds,
+                                        kinds=sub_claim_kinds,
                                     )
                                     if not events:
                                         continue
