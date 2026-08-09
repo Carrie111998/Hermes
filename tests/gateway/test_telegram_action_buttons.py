@@ -54,10 +54,11 @@ async def test_send_action_buttons_renders_compact_numeric_buttons(monkeypatch):
     assert "1. staging" in kwargs["text"]
     assert "2. production" in kwargs["text"]
     rows = kwargs["reply_markup"].inline_keyboard
+    assert len(rows) == 1
     assert rows[0][0].text == "1"
     assert rows[0][0].callback_data == "act:aid:0"
-    assert rows[1][0].text == "2"
-    assert rows[1][0].callback_data == "act:aid:1"
+    assert rows[0][1].text == "2"
+    assert rows[0][1].callback_data == "act:aid:1"
     assert adapter._action_button_state["aid"] == "session-1"
 
 

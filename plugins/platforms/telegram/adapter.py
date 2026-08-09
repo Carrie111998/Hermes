@@ -5783,15 +5783,14 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             text = f"{text}\n\n{option_lines}"
 
-            rows = [
-                [
-                    InlineKeyboardButton(
-                        str(idx + 1),
-                        callback_data=f"act:{action_id}:{idx}",
-                    )
-                ]
+            number_buttons = [
+                InlineKeyboardButton(
+                    str(idx + 1),
+                    callback_data=f"act:{action_id}:{idx}",
+                )
                 for idx in range(len(safe_choices))
             ]
+            rows = [number_buttons]
 
             metadata = dict(metadata or {})
             if thread_id is not None:
