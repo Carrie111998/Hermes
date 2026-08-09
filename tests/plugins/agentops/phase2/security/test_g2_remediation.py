@@ -451,3 +451,17 @@ def test_cron_execution_json_max_age_is_enforced(tmp_path):
     source.write_text('{"execution":{"job_id":"j","observed_at":"'+old+'","exit_code":0,"completed":true,"max_age_seconds":1},"assertions":[]}')
     batch = CronCollector.from_json_file(source, required_assertion_ids=("cron_business_assertion_fresh",)).collect(_target(tmp_path))
     assert batch.health.reason == "cron_execution_stale"
+
+
+def test_manifest_mandatory_business_assertion_cannot_be_omitted(tmp_path):
+    source = tmp_path / "cron.json"; now = datetime.now(timezone.utc).isoformat()
+    source.write_text('{"execution":{"job_id":"j","observed_at":"'+now+'","exit_code":0,"completed":true},"assertions":[]}')
+    batch = CronCollector.from_json_file(source, required_assertion_ids=()).collect(_target(tmp_path))
+    assert not batch.health.healthy
+    assert any(signal.signal_type == "cron.business_assertion_missing" for signal in batch.signals)
+
+
+def test_cron_factory_has_safe_defaults_and_deadline():
+    from plugins.agentops.control.observer_models import CronExecution, CronObservation
+    collector = build_collector("cron", target_kind=TargetKind.CRON, source_path=Path("/tmp/status.json"), observation=CronObservation(CronExecution("j", datetime.now(timezone.utc), 0, True), ()))
+    assert collector.max_bytes > 0 and collector.deadline_seconds == 1

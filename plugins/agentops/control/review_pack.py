@@ -51,6 +51,10 @@ class ReviewPack:
     def mandatory_assertion_ids(self) -> frozenset[str]:
         return frozenset(item.id for item in self.assertions.values() if item.mandatory)
 
+    @property
+    def cron_mandatory_assertion_ids(self) -> frozenset[str]:
+        return frozenset(item for item in self.mandatory_assertion_ids if item.startswith("cron_business_assertion_"))
+
     def validate_collector(self, collector_id: str, target_kind: TargetKind | str) -> CollectorSpec:
         kind = target_kind.value if isinstance(target_kind, TargetKind) else str(target_kind)
         spec = self.collectors.get(collector_id)
@@ -96,7 +100,7 @@ def load_review_pack(path: Path | None = None) -> ReviewPack:
                 id=str(item["id"]), entry=str(item["entry"]),
                 capabilities=tuple(str(value) for value in item["capabilities"]),
                 target_kinds=tuple(str(value) for value in item["target_kinds"]),
-                max_bytes=int(item.get("max_bytes", 0)), max_items=int(item.get("max_items", 0)),
+                max_bytes=int(item.get("max_bytes", 64 * 1024)), max_items=int(item.get("max_items", 32)),
                 deadline_seconds=float(item["deadline_seconds"]), rate_limit_seconds=float(item["rate_limit_seconds"]),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -149,7 +153,9 @@ def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: R
     try:
         accepted = inspect.signature(cls).parameters
         runtime = {key: value for key, value in runtime.items() if key in accepted}
-        return cls(**runtime)
+        instance = cls(**runtime)
+        setattr(instance, "deadline_seconds", spec.deadline_seconds)
+        return instance
     except TypeError:
         # Most constructors take their asset as the first positional argument;
         # callers must still supply it, while pack budgets remain enforced.

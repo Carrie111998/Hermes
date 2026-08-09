@@ -56,6 +56,8 @@ class ProcessCollector:
     def collect(self, target: Target, cursor: LogCursor | None = None) -> CollectionBatch:
         labels = target.spec.labels
         service_label = labels.get("service_label")
+        if labels.get("process_observation") == "disabled":
+            return failed_batch(target, self.name, "process_observation_disabled", source_id=self.source_id)
         profile_marker = labels.get("process_marker")
         expected_fingerprint = labels.get("command_fingerprint")
         if not service_label:
