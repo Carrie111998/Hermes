@@ -205,8 +205,9 @@ class TestPrimaryClientWiring:
                 "_anthropic_prompt_cache_policy",
                 lambda **_kwargs: (False, False),
             )
-            monkeypatch.setattr(agent, "_ensure_lmstudio_runtime_loaded", lambda: None)
+            monkeypatch.setattr(agent, "_ensure_lmstudio_runtime_loaded", lambda *_a, **_kw: None)
             monkeypatch.setattr(agent, "context_compressor", None)
+            monkeypatch.setattr(agent, "_retire_shared_openai_client", lambda *_a, **_kw: None)
             startup_call_count = mock_openai.call_count
 
             agent.switch_model(

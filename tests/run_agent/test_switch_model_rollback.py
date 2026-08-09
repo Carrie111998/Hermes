@@ -276,6 +276,7 @@ def test_successful_switch_still_works_after_rollback_refactor():
     new_client = MagicMock(name="NewClient")
     agent._create_openai_client = lambda *_a, **_kw: new_client
     agent._close_openai_client = MagicMock()
+    agent._retire_shared_openai_client = MagicMock()
 
     with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
         agent.switch_model(
@@ -290,8 +291,8 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
-    agent._close_openai_client.assert_called_once_with(
-        old_client, reason="switch_model_commit", shared=True
+    agent._retire_shared_openai_client.assert_called_once_with(
+        old_client, reason="switch_model_commit"
     )
 
 
@@ -320,6 +321,7 @@ def test_late_finalization_failure_restores_nested_state_and_closes_new_client()
     new_client = MagicMock(name="NewClient")
     agent._create_openai_client = MagicMock(return_value=new_client)
     agent._close_openai_client = MagicMock()
+    agent._retire_shared_openai_client = MagicMock()
 
     def late_failure(**_kwargs):
         # Prove the graph snapshot survives nested in-place mutation while
@@ -362,8 +364,8 @@ def test_late_finalization_failure_restores_nested_state_and_closes_new_client()
     assert agent._cached_system_prompt == "cached"
     assert agent._use_prompt_caching is True
     assert agent._use_native_cache_layout is False
-    agent._close_openai_client.assert_called_once_with(
-        new_client, reason="switch_model_rollback", shared=True
+    agent._retire_shared_openai_client.assert_called_once_with(
+        new_client, reason="switch_model_rollback"
     )
     new_transport.close.assert_called_once_with()
     old_transport.close.assert_not_called()

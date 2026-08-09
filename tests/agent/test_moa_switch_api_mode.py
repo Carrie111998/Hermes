@@ -34,7 +34,9 @@ def _make_fake_agent():
     agent._config_context_length = 123456
     agent._transport_cache = {}
     agent._anthropic_prompt_cache_policy = lambda **_kwargs: (False, False)
-    agent._ensure_lmstudio_runtime_loaded = lambda: None
+    agent._ensure_lmstudio_runtime_loaded = lambda *_a, **_kw: None
+    agent._lmstudio_load_was_unverified = lambda *_a, **_kw: False
+    agent._effective_lmstudio_context_length = lambda *_a, **_kw: None
     agent.context_compressor = None
     agent._fallback_chain = []
     agent._fallback_activated = False
@@ -42,6 +44,7 @@ def _make_fake_agent():
     agent._fallback_model = None
     agent._session_db = None
     agent._close_openai_client = lambda *_args, **_kwargs: None
+    agent._retire_shared_openai_client = lambda *_args, **_kwargs: None
     agent.quiet_mode = True
     return agent
 
