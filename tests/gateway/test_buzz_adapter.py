@@ -2441,6 +2441,98 @@ class TestBuzzAdapterSend:
         assert args[args.index("--file") + 1] == str(img)
 
     @pytest.mark.asyncio
+    async def test_send_image_configured_handoff_uses_exact_pubkey(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-image-handoff", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="@Reviewer please check this screenshot",
+        )
+
+        assert result.success is True
+        args, text = cli.calls[0]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert text == "@Reviewer please check this screenshot"
+
+    @pytest.mark.asyncio
+    async def test_send_image_configured_handoff_fails_instead_of_downgrading(
+        self, tmp_path
+    ):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=1,
+            stderr="mention '@Reviewer' does not match a current channel member",
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="@Reviewer please check this screenshot",
+        )
+
+        assert result.success is False
+        assert len(cli.calls) == 1
+        args, text = cli.calls[0]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert text == "@Reviewer please check this screenshot"
+
+    @pytest.mark.asyncio
+    async def test_send_image_unresolved_prose_retry_keeps_configured_handoff(
+        self, tmp_path
+    ):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=1,
+            stderr="mention '@ghost' does not match a current channel member",
+        )
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-image-handoff", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="@Reviewer ask @ghost to check this screenshot",
+        )
+
+        assert result.success is True
+        second_args, second_text = cli.calls[1]
+        assert second_args[second_args.index("--mention") + 1] == OTHER_PUBKEY
+        assert second_text == "@Reviewer ask @\u200bghost to check this screenshot"
+
+    @pytest.mark.asyncio
     async def test_send_image_local_file_prefers_stable_thread_root(self, tmp_path):
         img = tmp_path / "shot.png"
         img.write_bytes(b"\x89PNG fake")

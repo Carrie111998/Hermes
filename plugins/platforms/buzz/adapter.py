@@ -1684,7 +1684,19 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         if reply_target and self._reply_to_mode != "off":
             args += ["--reply-to", str(reply_target)]
-        code, out, err = await self._run_message_send(args, caption or "")
+        send_content = caption or ""
+        protected_names: set[str] = set()
+        protected_pubkeys: List[str] = []
+        for key, (name, pubkey) in self.outbound_mention_pubkeys.items():
+            if _has_complete_mention(send_content, name):
+                protected_names.add(key)
+                protected_pubkeys.append(pubkey)
+        code, out, err = await self._run_message_send(
+            args,
+            send_content,
+            protected_mention_pubkeys=protected_pubkeys,
+            protected_mention_names=protected_names,
+        )
         if code != 0:
             return SendResult(
                 success=False,
