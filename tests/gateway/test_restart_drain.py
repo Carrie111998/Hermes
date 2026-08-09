@@ -15,8 +15,8 @@ from gateway.session import SessionEntry, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
-@pytest.mark.parametrize("raw_timeout", ["inf", "nan", "1e309"])
-def test_load_restart_drain_timeout_warns_for_nonfinite_values(
+@pytest.mark.parametrize("raw_timeout", ["inf", "nan", "1e309", "not-a-number"])
+def test_load_restart_drain_timeout_warns_for_invalid_values(
     monkeypatch, caplog, raw_timeout
 ):
     monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", raw_timeout)
@@ -381,5 +381,4 @@ async def test_drain_suppress_skips_home_channel_keeps_session_ping(tmp_path, mo
     assert "999" in sent_chat_ids
     assert "home-42" not in sent_chat_ids
     assert "shutting down" in adapter.sent[0]
-
 
