@@ -220,6 +220,20 @@ def _create_empty_database(path: Path) -> None:
         os.close(parent_descriptor)
 
 
+def _verify_database_path(path: Path, identity: tuple[int, int] | None = None) -> None:
+    meta = path.lstat()
+    if stat.S_ISLNK(meta.st_mode) or not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or _mode(path) != 0o600 or meta.st_nlink != 1:
+        raise ObserverStoreError("observer database identity changed")
+    if identity is not None and (meta.st_dev, meta.st_ino) != identity:
+        raise ObserverStoreError("observer database identity changed")
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            sm = sidecar.lstat()
+            if stat.S_ISLNK(sm.st_mode) or not stat.S_ISREG(sm.st_mode) or sm.st_uid != os.getuid() or sm.st_nlink != 1:
+                raise ObserverStoreError("observer database sidecar unsafe")
+
+
 class ObserverStore:
     """Transactional store for its fixed own database and redacted evidence."""
 
@@ -228,9 +242,16 @@ class ObserverStore:
         self._lock = threading.RLock()
         existed = self.path.exists()
         prior_version = _preflight_existing_database(self.path) if existed else 0
+        identity = None
+        if existed:
+            meta = self.path.lstat()
+            identity = (meta.st_dev, meta.st_ino)
+            _verify_database_path(self.path, identity)
         if not existed:
             _create_empty_database(self.path)
         try:
+            if existed:
+                _verify_database_path(self.path, identity)
             self._connection = sqlite3.connect(self.path, check_same_thread=False)
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=5000")

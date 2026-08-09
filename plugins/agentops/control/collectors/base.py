@@ -70,8 +70,15 @@ def collect_all(
                 continue
             _worker_slots += 1
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
-        future = executor.submit(collector.collect, target, cursor)
         slot_released = False
+        try:
+            future = executor.submit(collector.collect, target, cursor)
+        except Exception:
+            with _detached_lock:
+                _worker_slots = max(0, _worker_slots - 1)
+            executor.shutdown(wait=False, cancel_futures=True)
+            batches.append(failed_batch(target, name, "collector_submit_failed", source_id=source_id))
+            continue
         try:
             batch = future.result(timeout=min(deadline_seconds, float(getattr(collector, "deadline_seconds", deadline_seconds))))
             if not isinstance(batch, CollectionBatch) or batch.target_id != target.target_id:

@@ -62,6 +62,7 @@ class CronCollector:
         self.review_pack = review_pack if review_pack is not None else load_review_pack()
         self._caller_required_ids = configured
         self.required_assertion_ids = configured | self.review_pack.cron_mandatory_assertion_ids
+        self._assertion_ids_to_check = self.required_assertion_ids - {"cron_execution_completed"}
         self.max_assertions = max_assertions
         self.max_bytes = max_bytes
         self.min_interval_seconds = min_interval_seconds
@@ -156,7 +157,7 @@ class CronCollector:
         observed_at = utc_now()
         execution = observation.execution
         by_name = {assertion.name: assertion for assertion in observation.assertions}
-        missing = sorted(self.required_assertion_ids.difference(by_name))
+        missing = sorted(self._assertion_ids_to_check.difference(by_name))
         execution_ok = execution.completed and execution.exit_code == 0
         execution_fresh = 0 <= (observed_at - execution.observed_at).total_seconds() <= execution.max_age_seconds
         signals = [
@@ -177,7 +178,7 @@ class CronCollector:
             )
         ]
         failures = list(missing)
-        undeclared_required = sorted(self.required_assertion_ids.difference(self.review_pack.assertions))
+        undeclared_required = sorted(self._assertion_ids_to_check.difference(self.review_pack.assertions))
         if undeclared_required:
             failures.extend(undeclared_required)
             signals.extend(redact_signal(RawSignal(
@@ -218,7 +219,7 @@ class CronCollector:
                     )
                 )
             )
-        for assertion_id in self.required_assertion_ids:
+        for assertion_id in self._assertion_ids_to_check:
             assertion = by_name.get(assertion_id)
             if assertion is None:
                 signals.append(
