@@ -115,15 +115,20 @@ class TestAtomicSnapshotWrite:
         assert f"> '{snap}'" not in wrapped
         assert f"> {snap}\n" not in wrapped
 
-    def test_temp_path_uses_mktemp_not_shell_pid(self):
-        """Use mktemp because Apple bash 3.2 leaves BASHPID unset and ``$$``
-        stays the parent PID in background subshells."""
+    def test_temp_path_uses_mktemp_not_pid_variables(self):
+        """The temp name MUST be allocated by ``mktemp`` — never ``$$`` (in
+        ``&``-launched concurrent subshells it stays the parent shell's PID, so
+        two writers would pick the same temp name and publish a torn file) and
+        never ``$BASHPID`` (macOS ships bash 3.2, which lacks it — the name
+        expands empty, collapsing every writer onto one temp path and
+        reopening the #38249 race).  Regression for PR #54314."""
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
         assert "mktemp " in wrapped
-        assert ".tmp.XXXXXX" in wrapped
+        assert ".tmp.XXXXXXXXXX" in wrapped
         assert "$BASHPID" not in wrapped
+        # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
 
     def test_mktemp_template_with_spaces_is_quoted(self):
@@ -132,7 +137,7 @@ class TestAtomicSnapshotWrite:
         env._snapshot_ready = True
         env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "mktemp '/tmp/has space/hermes-snap-x.sh.tmp.XXXXXX'" in wrapped
+        assert "mktemp '/tmp/has space/hermes-snap-x.sh.tmp.XXXXXXXXXX'" in wrapped
 
     def test_wrap_command_mv_chained_on_export_success(self):
         """A failed/partial ``export -p`` must NOT mv a torn temp over a good
@@ -144,10 +149,10 @@ class TestAtomicSnapshotWrite:
         assert "export -p" in wrapped and "> " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
-    def test_init_session_bootstrap_also_atomic_and_uses_mktemp(self):
+    def test_init_session_bootstrap_also_atomic_and_mktemp(self):
         """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use a
-        portable unique temp file too."""
+        file a concurrent command could source — it must be atomic and use
+        ``mktemp`` too (no ``$BASHPID``: absent on macOS bash 3.2)."""
         env = _TestableEnv()
         captured = {}
 
@@ -193,8 +198,9 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH. Each writer uses ``mktemp`` so this remains unique
-    on Apple bash 3.2, where ``BASHPID`` is unset.
+    that would corrupt PATH.  Crucially it allocates the temp with ``mktemp``
+    (per-writer unique, works on macOS bash 3.2 which lacks ``$BASHPID``),
+    which is what closes the race; ``$$`` would still tear here.
     """
 
     def _run(self, script):
@@ -209,14 +215,14 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        snap_template = _q(snap + ".tmp.XXXXXX")
+        _tmpl = _q(snap + ".tmp.XXXXXXXXXX")
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"_hermes_snap_tmp=$(mktemp {snap_template}) && "
-            f"{{ export -p > \"$_hermes_snap_tmp\" && mv -f \"$_hermes_snap_tmp\" {_q(snap)}; }} "
-            "2>/dev/null || rm -f \"${_hermes_snap_tmp:-}\" 2>/dev/null || true; "
+            f"__hermes_snap_tmp=$(mktemp {_tmpl}) && "
+            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
+            "2>/dev/null || rm -f \"${__hermes_snap_tmp:-}\" 2>/dev/null || true; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
@@ -251,11 +257,11 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
         # Redirect export into an unwritable dir so the export side fails; mv
         # must then NOT run (&&) and not clobber snap.
-        bad_template = _q("/nonexistent-dir/snap.tmp.XXXXXX")
+        bad_tmp = _q("/nonexistent-dir/snap.tmp.XXXXXXXXXX")
         script = (
-            f"_hermes_snap_tmp=$(mktemp {bad_template}) && "
-            f"{{ export -p > \"$_hermes_snap_tmp\" && mv -f \"$_hermes_snap_tmp\" {_q(snap)}; }} "
-            "2>/dev/null || rm -f \"${_hermes_snap_tmp:-}\" 2>/dev/null || true"
+            f"__hermes_snap_tmp=$(mktemp {bad_tmp}) && "
+            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
+            "2>/dev/null || rm -f \"${__hermes_snap_tmp:-}\" 2>/dev/null || true"
         )
         self._run(script)
         out = self._run(f"cat {_q(snap)}")
