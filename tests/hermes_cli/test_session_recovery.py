@@ -648,4 +648,188 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         conn.close()
 
 
+class _AutoRollbackConnection:
+    """A destination whose transaction SQLite has already ended by itself.
+
+    SQLite rolls the active transaction back on its own for SQLITE_FULL,
+    SQLITE_IOERR, SQLITE_BUSY and SQLITE_NOMEM. The explicit ``ROLLBACK`` a
+    cleanup handler then issues raises ``cannot rollback - no transaction is
+    active``, which is exactly the sequence that used to replace the real
+    failure. This stands in for it at every write site.
+    """
+
+    def __init__(self, connection: sqlite3.Connection, make_failure):
+        self._connection = connection
+        self._make_failure = make_failure
+        self.rollback_attempts = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+    def execute(self, sql: str, *parameters):
+        statement = sql.strip().upper()
+        if statement.startswith("ROLLBACK"):
+            self.rollback_attempts += 1
+            # SQLite already unwound the transaction; undo it for real so the
+            # connection stays usable, then fail the way SQLite would.
+            self._connection.execute("ROLLBACK")
+            raise sqlite3.OperationalError(
+                "cannot rollback - no transaction is active"
+            )
+        if statement.startswith("COMMIT"):
+            raise self._make_failure()
+        return self._connection.execute(sql, *parameters)
+
+    def executemany(self, sql: str, parameters):
+        return self._connection.executemany(sql, parameters)
+
+
+def _recovery_pair(tmp_path: Path) -> tuple[sqlite3.Connection, sqlite3.Connection]:
+    """A populated source plus a fresh current-schema destination."""
+
+    source_path = tmp_path / "rollback-source.db"
+    _make_source(source_path)
+    destination_path = tmp_path / "rollback-destination.db"
+    destination_db = SessionDB(db_path=destination_path)
+    try:
+        destination_db.apply_telegram_topic_migration()
+    finally:
+        destination_db.close()
+    return (
+        sqlite3.connect(str(source_path), isolation_level=None),
+        sqlite3.connect(str(destination_path), isolation_level=None),
+    )
+
+
+# Every site in session_recovery.py that wraps a write in
+# ``except BaseException: ROLLBACK; raise``.
+_ROLLBACK_SITES = {
+    "_cleanup_partial_orphans": lambda source, destination: (
+        session_recovery._cleanup_partial_orphans(destination)
+    ),
+    "_copy_state_meta": lambda source, destination: (
+        session_recovery._copy_state_meta(
+            source,
+            destination,
+            chunk_size=1_000,
+            progress_cb=None,
+            source_rows=None,
+        )
+    ),
+    "_copy_table": lambda source, destination: session_recovery._copy_table(
+        source,
+        destination,
+        "messages",
+        chunk_size=1_000,
+        progress_cb=None,
+        source_rows=21,
+    ),
+    "_copy_table_salvage": lambda source, destination: (
+        session_recovery._copy_table_salvage(
+            source,
+            destination,
+            "messages",
+            chunk_size=1_000,
+            progress_cb=None,
+            source_rows=21,
+        )
+    ),
+    "_finalize_derived_metadata": lambda source, destination: (
+        session_recovery._finalize_derived_metadata(destination)
+    ),
+}
+
+
+@pytest.mark.parametrize("site", sorted(_ROLLBACK_SITES))
+def test_cleanup_rollback_never_replaces_the_real_write_failure(
+    site: str,
+    tmp_path: Path,
+) -> None:
+    source, destination = _recovery_pair(tmp_path)
+    guarded = _AutoRollbackConnection(
+        destination,
+        lambda: sqlite3.OperationalError("database or disk is full"),
+    )
+    try:
+        try:
+            surfaced = json.dumps(
+                _ROLLBACK_SITES[site](source, guarded), default=str
+            )
+        except sqlite3.Error as exc:
+            # The two cleanup sites propagate instead of reporting a dict.
+            surfaced = str(exc)
+    finally:
+        source.close()
+        destination.close()
+
+    # The salvage site retries narrower rowid ranges, so it rolls back more
+    # than once before it gives up and records the failure.
+    assert guarded.rollback_attempts >= 1
+    assert "database or disk is full" in surfaced
+    assert "cannot rollback" not in surfaced
+
+
+@pytest.mark.parametrize("site", sorted(_ROLLBACK_SITES))
+def test_interrupt_during_a_write_still_aborts_the_recovery(
+    site: str,
+    tmp_path: Path,
+) -> None:
+    """``except BaseException`` must roll back and then re-raise the interrupt.
+
+    A masked rollback turns Ctrl-C into a ``DatabaseError``, which the copy
+    sites treat as an ordinary damaged-source error — so the run continues
+    instead of stopping.
+    """
+
+    source, destination = _recovery_pair(tmp_path)
+    guarded = _AutoRollbackConnection(destination, KeyboardInterrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _ROLLBACK_SITES[site](source, guarded)
+    finally:
+        source.close()
+        destination.close()
+
+    assert guarded.rollback_attempts == 1
+
+
+def test_copy_table_reports_a_full_destination_not_a_rollback_failure(
+    tmp_path: Path,
+) -> None:
+    """End-to-end against real SQLite, with no stubbing of the failure."""
+
+    source_path = tmp_path / "page-spanning-source.db"
+    _make_page_spanning_source(source_path)
+    destination_path = tmp_path / "capped-destination.db"
+    destination_db = SessionDB(db_path=destination_path)
+    destination_db.close()
+
+    source = sqlite3.connect(str(source_path), isolation_level=None)
+    destination = sqlite3.connect(str(destination_path), isolation_level=None)
+    try:
+        source_rows = int(
+            source.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        )
+        # Leave room for the copy to begin and then run out part way through,
+        # which is what a destination filesystem filling up mid-run looks like.
+        pages = int(destination.execute("PRAGMA page_count").fetchone()[0])
+        destination.execute(f"PRAGMA max_page_count = {pages + 20}")
+
+        result = session_recovery._copy_table(
+            source,
+            destination,
+            "messages",
+            chunk_size=1_000,
+            progress_cb=None,
+            source_rows=source_rows,
+        )
+    finally:
+        source.close()
+        destination.close()
+
+    assert result["status"] == "failed"
+    assert "database or disk is full" in result["error"]
+    assert "cannot rollback" not in result["error"]
+
+
 
