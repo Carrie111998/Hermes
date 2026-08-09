@@ -319,6 +319,12 @@ def _(rid, params: dict) -> dict:
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    # Same reasoning for the Desktop connection mode (#82140): the user can
+    # switch the active connection or profile between turns, and an extension
+    # that acts on a stale "local" hands them a link to a file that lives on the
+    # gateway machine. The client re-announces on every submit; an omitted
+    # ``connection_mode`` (older client) leaves the stored value alone.
+    _remember_connection_mode(session, params)
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
