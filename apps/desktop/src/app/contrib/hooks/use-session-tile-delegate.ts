@@ -23,6 +23,7 @@ import type { SessionResumeResponse } from '@/types/hermes'
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
 import { singleFlightSessionResume } from '../../session/hooks/use-prompt-actions/single-flight-resume'
 import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
+import type { useSessionActions } from '../../session/hooks/use-session-actions'
 import {
   chatMessageArraysEquivalent,
   reconcileResumeMessages,
@@ -50,6 +51,7 @@ function mergeTileTranscript(
 
 interface SessionTileDelegateParams {
   archiveSession: (storedSessionId: string) => Promise<unknown>
+  branchLoadedSession: ReturnType<typeof useSessionActions>['branchLoadedSession']
   branchStoredSession: (storedSessionId: string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string) => Promise<unknown>
@@ -68,6 +70,7 @@ interface SessionTileDelegateParams {
  */
 export function useSessionTileDelegate({
   archiveSession,
+  branchLoadedSession,
   branchStoredSession,
   executeSlashCommand,
   removeSession,
@@ -135,6 +138,18 @@ export function useSessionTileDelegate({
       },
       branchSession: async storedSessionId => {
         await branchStoredSession(storedSessionId)
+      },
+      branchSessionAtMessage: async (storedSessionId, runtimeId, messageId) => {
+        const state = sessionStateByRuntimeIdRef.current.get(runtimeId)
+
+        return await branchLoadedSession({
+          busy: state?.busy ?? false,
+          cwd: state?.cwd,
+          messageId,
+          messages: state?.messages ?? [],
+          runtimeId,
+          storedSessionId
+        })
       },
       deleteSession: async storedSessionId => {
         await removeSession(storedSessionId)
@@ -368,6 +383,7 @@ export function useSessionTileDelegate({
     })
   }, [
     archiveSession,
+    branchLoadedSession,
     branchStoredSession,
     executeSlashCommand,
     removeSession,
