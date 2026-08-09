@@ -78,7 +78,7 @@ describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
 
     const button = await screen.findByRole('button', { name: 'Branch in new chat' })
     expect(button).toBeTruthy()
-    expect(button).not.toHaveAttribute('disabled')
+    expect(button.getAttribute('disabled')).toBeNull()
   })
 
   it('keeps the Branch in new chat button mounted but disabled when no handler is provided (#81846)', async () => {
@@ -90,6 +90,6 @@ describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
     render(<Harness />)
 
     const button = await screen.findByRole('button', { name: 'Branch in new chat' })
-    expect(button).toHaveAttribute('disabled')
+    expect(button.getAttribute('disabled')).not.toBeNull()
   })
 })
