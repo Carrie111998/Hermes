@@ -484,6 +484,8 @@ class _KanbanNotBeforeDispatchLease:
     """Task-scoped authorization held across the provider callback."""
 
     _LEASE_SECONDS = 300
+    _RENEW_INTERVAL_SECONDS = 60
+    _RENEW_RETRY_SECONDS = 1
 
     def __init__(self, function_name: str):
         self.function_name = function_name
@@ -492,9 +494,17 @@ class _KanbanNotBeforeDispatchLease:
         self.lease_hash = secrets.token_hex(32) if self.task_id and self.pinned_db else ""
         self.conn = None
         self.block: str | None = None
+        self._renewal_stop = threading.Event()
+        self._renewal_thread: threading.Thread | None = None
 
     def acquire(self) -> "_KanbanNotBeforeDispatchLease":
-        if not self.task_id or not self.pinned_db:
+        if not self.task_id:
+            return self
+        if not self.pinned_db:
+            self.block = (
+                f"tool execution blocked for Kanban task {self.task_id}: "
+                "pinned Kanban database is missing"
+            )
             return self
         try:
             from hermes_cli import kanban_db as kb
@@ -532,7 +542,14 @@ class _KanbanNotBeforeDispatchLease:
                         now + self._LEASE_SECONDS,
                     ),
                 )
+            self._renewal_thread = threading.Thread(
+                target=self._renew_until_released,
+                name=f"kanban-dispatch-lease-{self.task_id}",
+                daemon=True,
+            )
+            self._renewal_thread.start()
         except Exception as exc:
+            self.release()
             if self.conn is not None:
                 try:
                     self.conn.close()
@@ -551,7 +568,47 @@ class _KanbanNotBeforeDispatchLease:
             )
         return self
 
+    def _renew_until_released(self) -> None:
+        """Keep authorization live for callbacks longer than one lease term."""
+        from hermes_cli import kanban_db as kb
+
+        wait_seconds = self._RENEW_INTERVAL_SECONDS
+        while not self._renewal_stop.wait(wait_seconds):
+            try:
+                now = int(time.time())
+                with kb.connect_closing(db_path=Path(self.pinned_db)) as conn:
+                    with kb.write_txn(conn):
+                        updated = conn.execute(
+                            "UPDATE kanban_not_before_dispatch_leases "
+                            "SET expires_at = MAX(expires_at, ?) "
+                            "WHERE task_id = ? AND lease_hash = ?",
+                            (
+                                now + self._LEASE_SECONDS,
+                                self.task_id,
+                                self.lease_hash,
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            raise RuntimeError("dispatch lease row disappeared")
+                wait_seconds = self._RENEW_INTERVAL_SECONDS
+            except Exception as exc:
+                logger.error(
+                    "Kanban not-before dispatch lease renewal failed for task %s: %s",
+                    self.task_id,
+                    exc,
+                )
+                wait_seconds = self._RENEW_RETRY_SECONDS
+
     def release(self) -> None:
+        self._renewal_stop.set()
+        renewal_thread = self._renewal_thread
+        if (
+            renewal_thread is not None
+            and renewal_thread is not threading.current_thread()
+            and renewal_thread.is_alive()
+        ):
+            renewal_thread.join()
+        self._renewal_thread = None
         if self.conn is None:
             return
         try:
@@ -593,8 +650,13 @@ def _kanban_not_before_tool_block(function_name: str) -> str | None:
     """
     task_id = (os.getenv("HERMES_KANBAN_TASK") or "").strip()
     pinned_db = (os.getenv("HERMES_KANBAN_DB") or "").strip()
-    if not task_id or not pinned_db:
+    if not task_id:
         return None
+    if not pinned_db:
+        return (
+            f"tool execution blocked for Kanban task {task_id}: "
+            "pinned Kanban database is missing"
+        )
     try:
         from hermes_cli import kanban_db as kb
 

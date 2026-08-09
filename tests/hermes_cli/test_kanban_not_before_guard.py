@@ -317,6 +317,15 @@ def test_same_task_dispatches_hold_independent_leases_until_each_callback_finish
         task_id = kb.create_task(conn, title="parallel task", assignee="worker")
         db_path = kb.kanban_db_path()
 
+    clock = [int(tool_executor.time.time())]
+    monkeypatch.setattr(tool_executor.time, "time", lambda: clock[0])
+    monkeypatch.setattr(
+        tool_executor._KanbanNotBeforeDispatchLease, "_LEASE_SECONDS", 2
+    )
+    monkeypatch.setattr(
+        tool_executor._KanbanNotBeforeDispatchLease, "_RENEW_INTERVAL_SECONDS", 0.01
+    )
+
     agent = SimpleNamespace(
         quiet_mode=True,
         tool_progress_mode="off",
@@ -377,12 +386,37 @@ def test_same_task_dispatches_hold_independent_leases_until_each_callback_finish
 
         with kb.connect(db_path=db_path) as conn:
             leases = conn.execute(
-                "SELECT lease_hash FROM kanban_not_before_dispatch_leases "
+                "SELECT lease_hash, expires_at "
+                "FROM kanban_not_before_dispatch_leases "
                 "WHERE task_id = ?",
                 (task_id,),
             ).fetchall()
             assert len(leases) == 2
             assert len({row["lease_hash"] for row in leases}) == 2
+            assert {row["expires_at"] for row in leases} == {clock[0] + 2}
+
+        # Advance beyond both original deadlines while the callbacks remain
+        # active. The renewal threads must extend both authorizations.
+        clock[0] += 3
+        renewed = False
+        for _ in range(100):
+            threading.Event().wait(0.01)
+            with kb.connect(db_path=db_path) as conn:
+                expiries = {
+                    row["expires_at"]
+                    for row in conn.execute(
+                        "SELECT expires_at FROM kanban_not_before_dispatch_leases "
+                        "WHERE task_id = ?",
+                        (task_id,),
+                    )
+                }
+            if expiries == {clock[0] + 2}:
+                renewed = True
+                break
+        assert renewed
+
+        with kb.connect(db_path=db_path) as conn:
+            conn.create_function("unixepoch", 0, lambda: clock[0])
             with pytest.raises(sqlite3.IntegrityError, match="dispatch lease is active"):
                 with kb.write_txn(conn):
                     conn.execute(
@@ -394,6 +428,7 @@ def test_same_task_dispatches_hold_independent_leases_until_each_callback_finish
         workers["first"].join(timeout=5)
         assert not workers["first"].is_alive()
         with kb.connect(db_path=db_path) as conn:
+            conn.create_function("unixepoch", 0, lambda: clock[0])
             assert conn.execute(
                 "SELECT COUNT(*) FROM kanban_not_before_dispatch_leases "
                 "WHERE task_id = ?",
@@ -430,6 +465,52 @@ def test_same_task_dispatches_hold_independent_leases_until_each_callback_finish
 
     assert sorted(provider_mutations) == ["first", "second"]
     assert all(not outcome.blocked for outcome in outcomes.values())
+
+
+def test_task_scoped_dispatch_fails_closed_without_pinned_database(monkeypatch):
+    from agent import relay_tools, tool_executor
+
+    agent = SimpleNamespace(
+        quiet_mode=True,
+        tool_progress_mode="off",
+        _tool_guardrails=SimpleNamespace(
+            before_call=lambda _name, _args: SimpleNamespace(allows_execution=True)
+        ),
+    )
+    monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(tool_executor, "_emit_terminal_post_tool_call", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_tool_request_middleware",
+        lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware",
+        lambda _name, args, callback, **_kwargs: callback(args),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.resolve_pre_tool_block", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        relay_tools,
+        "execute",
+        lambda _name, args, callback, **_kwargs: (callback(args), args),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_board")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    provider_mutations = []
+
+    outcome = tool_executor._run_agent_tool_execution_middleware(
+        agent,
+        function_name="terminal",
+        function_args={"command": "must-not-run"},
+        effective_task_id="t_missing_board",
+        tool_call_id="missing-board-call",
+        execute=lambda _args: provider_mutations.append("ran"),
+    )
+
+    assert outcome.blocked is True
+    assert "pinned Kanban database is missing" in outcome.result
+    assert provider_mutations == []
 
 
 def test_dispatcher_and_default_assignment_make_no_mutation_before_release(

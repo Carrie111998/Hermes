@@ -76,6 +76,7 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "task" in d
     assert d["task"]["id"] == worker_env
     assert d["task"]["status"] == "running"
+    assert d["task"]["not_before"] is None
     assert "worker_context" in d
     assert "runs" in d
 
@@ -100,6 +101,7 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert d["count"] == 2
     assert d["tasks"][0]["title"] == "alpha"
     assert d["tasks"][0]["parent_count"] == 0
+    assert d["tasks"][0]["not_before"] is None
     assert b not in ids
 
     tenant_out = kt._handle_list({
@@ -426,6 +428,7 @@ def test_create_carries_not_before_to_persisted_child(worker_env):
     })
     d = json.loads(out)
     assert d["ok"] is True, d
+    assert d["not_before"] == "2030-01-01T00:00:00Z"
 
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
