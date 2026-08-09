@@ -37,7 +37,8 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     prerequisites:                # Optional — legacy runtime requirements
       env_vars: [API_KEY]         #   Legacy env var names are normalized into
                                   #   required_environment_variables on load.
-      commands: [curl, jq]        #   Command checks remain advisory only.
+      commands: [curl, jq]        #   Commands are probed on PATH at view time;
+                                  #   missing ones mark the skill setup_needed.
     compatibility: Requires X     # Optional (agentskills.io)
     metadata:                     # Optional, arbitrary key-value (agentskills.io)
       hermes:
@@ -74,6 +75,7 @@ import threading
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
+import shutil
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -1580,7 +1582,7 @@ def skill_view(
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
-        legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
+        legacy_env_vars, required_commands = _collect_prerequisite_values(frontmatter)
         required_env_vars = _get_required_environment_variables(
             frontmatter, legacy_env_vars
         )
@@ -1645,6 +1647,14 @@ def skill_view(
                     skill_name,
                     exc_info=True,
                 )
+
+        # Probe declared prerequisite commands on PATH. A missing command marks
+        # the skill setup_needed so the payload and cron preflight can name it.
+        missing_required_commands = [
+            cmd for cmd in required_commands if shutil.which(cmd) is None
+        ]
+        if missing_required_commands:
+            setup_needed = True
 
         rendered_content = content
         if preprocess:
@@ -1743,10 +1753,10 @@ def skill_view(
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,
-            "required_commands": [],
+            "required_commands": required_commands,
             "missing_required_environment_variables": remaining_missing_required_envs,
             "missing_credential_files": missing_cred_files,
-            "missing_required_commands": [],
+            "missing_required_commands": missing_required_commands,
             "setup_needed": setup_needed,
             "setup_skipped": capture_result["setup_skipped"],
             "readiness_status": SkillReadinessStatus.SETUP_NEEDED.value
@@ -1780,6 +1790,8 @@ def skill_view(
                 f"env ${env_name}" for env_name in remaining_missing_required_envs
             ] + [
                 f"file {path}" for path in missing_cred_files
+            ] + [
+                f"command '{cmd}'" for cmd in missing_required_commands
             ]
             setup_note = _build_setup_note(
                 SkillReadinessStatus.SETUP_NEEDED,

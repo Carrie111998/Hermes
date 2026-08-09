@@ -702,6 +702,39 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == ["SHELL_ONLY_KEY"]
         assert result["readiness_status"] == "setup_needed"
 
+    def test_missing_prerequisite_command_marks_setup_needed(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "cmd-gated-skill",
+                frontmatter_extra="prerequisites:\n  commands: [definitely_missing_cmd_xyz]\n",
+            )
+            raw = skill_view("cmd-gated-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is True
+        assert result["readiness_status"] == "setup_needed"
+        assert result["required_commands"] == ["definitely_missing_cmd_xyz"]
+        assert result["missing_required_commands"] == ["definitely_missing_cmd_xyz"]
+        assert "definitely_missing_cmd_xyz" in result.get("setup_note", "")
+
+    def test_present_prerequisite_command_stays_available(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "cmd-ready-skill",
+                frontmatter_extra="prerequisites:\n  commands: [python3]\n",
+            )
+            raw = skill_view("cmd-ready-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["setup_needed"] is False
+        assert result["readiness_status"] == "available"
+        assert result["required_commands"] == ["python3"]
+        assert result["missing_required_commands"] == []
+
     @pytest.mark.parametrize(
         "backend",
         ["ssh", "daytona", "docker", "singularity", "modal", "vercel_sandbox"],
