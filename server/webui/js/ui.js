@@ -716,7 +716,7 @@ export function hbarList(items, { color = 'var(--accent)', suffix = '' } = {}) {
     el('div', { class: 'ifz-hbar-row' },
       el('span', { class: 'ifz-bars-label' }, it.label),
       el('div', { class: 'ifz-hbar-track' },
-        el('div', { class: 'ifz-hbar-fill', style: { width: `${(it.value / max) * 100}%`, background: it.color || color } })),
+        el('div', { class: 'ifz-hbar-fill', style: { transform: `scaleX(${max ? it.value / max : 0})`, background: it.color || color } })),
       el('span', { class: 'ifz-hbar-val' }, `${fmt.num(it.value)}${suffix}`))));
 }
 

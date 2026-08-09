@@ -311,6 +311,10 @@ function fitSummary(lead, currentScore, hasResearch) {
           : 'evidence is still limited';
   }
 
+  // The basis line only earns its place next to an actual score. With no fit
+  // assessment it restates the badge word for word ("Fit not assessed yet /
+  // research available"), and on a list where few leads are scored that is
+  // twenty consecutive rows of the same four words.
   return el('div', { class: 'ifz-company-fit' },
     scoreBadge(score, {
       words: true,
@@ -320,7 +324,7 @@ function fitSummary(lead, currentScore, hasResearch) {
         ? 'Research is ready, but the fit assessment has not been calculated yet'
         : undefined,
     }),
-    el('span', {}, basis));
+    hasFitAssessment ? el('span', {}, basis) : null);
 }
 
 function contactRow(contact, actions = {}) {
@@ -495,7 +499,16 @@ export function companyRow(lead, contacts = [], handlers = {}) {
   el('span', { class: 'ifz-company-identity' },
     el('strong', {}, lead.company_name || 'Unnamed buyer'),
     el('span', {}, lead.industry || 'Buyer type not known')),
-  el('span', { class: 'ifz-company-market' }, location || 'Market not known'),
+  el('span', { class: 'ifz-company-market' },
+    el('strong', {}, location || 'Market not known'),
+    // The people used to be previewed as extra rows under every company,
+    // which roughly doubled the page and interleaved two different row
+    // shapes so the eye never settled. A count reads faster here, and the
+    // people themselves already live in the expanded panel, which is where
+    // you go once you have chosen a company.
+    el('span', {}, contacts.length
+      ? `${contacts.length} ${contacts.length === 1 ? 'person' : 'people'}`
+      : 'No contacts yet')),
   el('span', { class: 'ifz-company-state' },
     el('strong', {}, handlers.stateLabel || labelFor(lead.status)),
     handlers.stateDetail ? el('span', {}, handlers.stateDetail) : null),
@@ -505,22 +518,6 @@ export function companyRow(lead, contacts = [], handlers = {}) {
     class: `ifz-company-row${handlers.expanded ? ' is-open' : ''}${lead.do_not_contact || lead.status === 'do_not_contact' ? ' is-blocked' : ''}`,
     dataset: { leadId: lead.id },
   }, summary);
-
-  if (!handlers.expanded && contacts.length) {
-    article.append(el('ul', {
-      class: 'ifz-company-contact-preview',
-      'aria-label': `People at ${lead.company_name}`,
-    }, contacts.slice(0, 2).map(contact =>
-      el('li', {},
-        el('span', { class: 'ifz-company-preview-mark', 'aria-hidden': 'true' }),
-        el('strong', {}, contact.name || contact.email || 'Unnamed person'),
-        el('span', {}, contact.title || 'Role not known'),
-        badge(contact.do_not_contact ? 'do_not_contact' : (contact.email_status || 'unverified')))),
-    contacts.length > 2
-      ? el('li', { class: 'ifz-company-contact-preview-more' },
-          `and ${contacts.length - 2} more`)
-      : null));
-  }
 
   if (handlers.expanded) {
     const blocked = lead.do_not_contact || lead.status === 'do_not_contact';

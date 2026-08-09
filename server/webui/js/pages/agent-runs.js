@@ -86,7 +86,7 @@ export async function mountDetail(root, ctx) {
           el('div', { class: 'ifz-row' }, badge(run.status),
             run.status === 'running' ? el('span', { class: 'ifz-small ifz-muted' }, `${run.progress}%`) : null),
           run.status === 'running'
-            ? el('div', { class: 'ifz-progress ifz-mt-2' }, el('div', { class: 'ifz-progress-fill', style: { width: `${run.progress}%` } }))
+            ? el('div', { class: 'ifz-progress ifz-mt-2' }, el('div', { class: 'ifz-progress-fill', style: { transform: `scaleX(${(run.progress || 0) / 100})` } }))
             : null) }),
         card({ body: el('div', { class: 'ifz-col' },
           el('span', { class: 'ifz-overline' }, 'Type'),

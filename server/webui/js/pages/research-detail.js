@@ -50,7 +50,7 @@ export async function mount(root, ctx) {
         el('span', { class: 'ifz-funnel-index' }, String(index + 1).padStart(2, '0')),
         el('div', {}, el('span', { class: 'ifz-overline' }, label),
           el('strong', {}, String(metrics[key] ?? 0))),
-        el('div', { class: 'ifz-funnel-bar' }, el('span', { style: { width: `${Math.max(2, Number(metrics[key] || 0) / first * 100)}%` } })))) ) });
+        el('div', { class: 'ifz-funnel-bar' }, el('span', { style: { transform: `scaleX(${Math.max(0.02, Number(metrics[key] || 0) / first)})` } })))) ) });
   }
 
   function sourceProgress() {

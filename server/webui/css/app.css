@@ -1068,7 +1068,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-bars-label { font-size: var(--fs-sm); color: var(--muted); }
 .ifz-hbar-row { display: grid; grid-template-columns: minmax(110px, 30%) 1fr 48px; gap: 10px; align-items: center; padding: 6px 0; }
 .ifz-hbar-track { height: 8px; border-radius: 0; background: var(--surface-2); overflow: hidden; }
-.ifz-hbar-fill { height: 100%; border-radius: 0; background: var(--accent); transition: width 0.5s cubic-bezier(0.22, 0.9, 0.3, 1); }
+/* scaleX, not width: width is a layout property and animating it forces
+   layout on every frame. transform composites. */
+.ifz-hbar-fill { width: 100%; height: 100%; background: var(--accent); transform-origin: left center;
+  transition: transform var(--dur-standard) var(--ease-system); }
 .ifz-hbar-val { font-size: var(--fs-sm); font-weight: 650; color: var(--text-strong); text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ---------- Login ----------
@@ -1742,10 +1745,14 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-runlog .line { display: block; animation: ifz-fade 0.2s ease both; }
 .ifz-progress { height: 6px; border-radius: 0; background: var(--surface-2); overflow: hidden; }
 .ifz-progress-fill {
+  /* Full width, scaled by transform. Needs the 100% base or scaleX has
+     nothing to scale. */
+  width: 100%;
   height: 100%;
   border-radius: 0;
   background: var(--accent);
-  transition: width var(--dur-standard) var(--ease-system);
+  transform-origin: left center;
+  transition: transform var(--dur-standard) var(--ease-system);
 }
 
 /* ---------- Email preview ---------- */
@@ -2920,7 +2927,8 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-funnel-index { font: 600 10px/1 var(--font-mono); color: var(--faint); }
 .ifz-funnel-stage strong { display: block; margin-top: 4px; font: 650 24px/1 var(--font-display); color: var(--text-strong); }
 .ifz-funnel-bar { height: 7px; overflow: hidden; background: var(--surface-2); }
-.ifz-funnel-bar span { display: block; height: 100%; background: var(--accent); transition: width .5s cubic-bezier(.2,.8,.2,1); }
+.ifz-funnel-bar span { display: block; width: 100%; height: 100%; background: var(--accent);
+  transform-origin: left center; transition: transform var(--dur-standard) var(--ease-system); }
 .ifz-research-config { max-height: 620px; overflow: auto; margin: 0; padding: 18px; background: var(--text-strong); color: var(--surface); font: 12px/1.65 var(--font-mono); }
 .ifz-research-claims { display: flex; flex-direction: column; gap: var(--space-4); }
 .ifz-claim-card { border: 1px solid var(--accent); }
@@ -3450,9 +3458,13 @@ h1, h2, h3, h4, p { margin: 0; }
   align-items: center;
   margin-bottom: var(--space-6);
 }
+/* Page-title scale, matching Setup and Approvals. At 48px it was competing
+   with the funnel strip directly beneath it, which is the actual news, and
+   the rail already says which page this is. */
 .ifz-buyers .ifz-page-title {
-  font-size: clamp(34px, 4vw, 48px);
-  letter-spacing: -.045em;
+  font-size: var(--fs-2xl);
+  line-height: 1.05;
+  letter-spacing: var(--track-title);
 }
 .ifz-buyers .ifz-page-sub {
   max-width: 58ch;
@@ -3553,26 +3565,31 @@ h1, h2, h3, h4, p { margin: 0; }
 
 .ifz-buyers-filters {
   display: grid;
-  grid-template-columns: minmax(230px, 1.15fr) minmax(0, 1fr) minmax(0, 1.15fr);
-  gap: var(--space-3);
-  align-items: center;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr) auto;
+  gap: var(--space-3) var(--space-5);
+  align-items: start;
   margin-bottom: var(--space-3);
+}
+/* A rule between the two facets. Market and state are separate questions;
+   run together they read as one row of chips with two active "All"s in it. */
+.ifz-buyers-filters > .ifz-buyers-filter-scroll + .ifz-buyers-filter-scroll {
+  padding-left: var(--space-5);
+  border-left: 1px solid var(--border);
 }
 .ifz-buyers-search {
   width: 100%;
   min-width: 0;
   min-height: 44px;
 }
+/* Wrap, do not scroll. These were overflow-x: auto with the scrollbar hidden,
+   so "United Arab Emirates" was clipped to "United Arab Emirat" with nothing
+   on screen saying more filters existed. A filter you cannot see is a filter
+   you do not have. */
 .ifz-buyers-filter-scroll {
   min-width: 0;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  overflow-x: auto;
-  scrollbar-width: none;
-  overscroll-behavior-inline: contain;
-}
-.ifz-buyers-filter-scroll::-webkit-scrollbar {
-  display: none;
 }
 .ifz-buyers-filter-scroll .ifz-filter-chip {
   flex: 0 0 auto;
@@ -3638,8 +3655,12 @@ h1, h2, h3, h4, p { margin: 0; }
   width: 100%;
   height: 100%;
 }
+/* Signal Blue, matching the Setup map: blue means "a market you sell into".
+   This was --surface-3 against land at --map-land, two values apart, so the
+   highlight was invisible and the map looked like it had no data. Ink stays
+   reserved for .active, the market currently filtered to. */
 .ifz-buyers-map .ifz-minimap .country.t2 {
-  fill: var(--surface-3);
+  fill: var(--map-selected);
 }
 .ifz-buyers-map .ifz-minimap .country.t1 {
   fill: var(--map-recommended);
@@ -3677,7 +3698,9 @@ h1, h2, h3, h4, p { margin: 0; }
   display: grid;
   grid-template-columns: 28px minmax(210px, 1.2fr) minmax(140px, .7fr) minmax(165px, .85fr) minmax(165px, .9fr);
   gap: var(--space-4);
-  align-items: center;
+  /* start, not center: "Abu Dhabi, United Arab Emirates" wraps to two lines
+     and centring pushed every other cell in the row off the first baseline. */
+  align-items: start;
   padding: 15px 14px 15px 8px;
   border: 0;
   background: transparent;
@@ -3740,8 +3763,22 @@ h1, h2, h3, h4, p { margin: 0; }
   font-size: var(--fs-sm);
   line-height: 1.35;
 }
+/* Two lines now: where the buyer is, and how many people we know there.
+   The people used to be previewed as extra rows under every company, which
+   interleaved a second row shape into the list and doubled its length. */
 .ifz-company-market {
   margin-top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ifz-company-market strong {
+  color: var(--text);
+  font-weight: 500;
+}
+.ifz-company-market > span {
+  color: var(--faint);
+  font-size: var(--fs-xs);
 }
 .ifz-company-state strong {
   color: var(--text-strong);
@@ -3762,42 +3799,6 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-company-fit .ifz-score.unscored {
   color: var(--muted);
 }
-.ifz-company-contact-preview {
-  display: grid;
-  gap: 0;
-  margin: -5px 14px 12px 52px;
-  padding: 0;
-  list-style: none;
-}
-.ifz-company-contact-preview li {
-  min-height: 32px;
-  display: grid;
-  grid-template-columns: 8px minmax(130px, .8fr) minmax(130px, 1fr) auto;
-  gap: 9px;
-  align-items: center;
-  color: var(--muted);
-  font-size: var(--fs-xs);
-}
-.ifz-company-contact-preview strong {
-  overflow: hidden;
-  color: var(--text);
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.ifz-company-preview-mark {
-  width: 5px;
-  height: 5px;
-  background: var(--surface-3);
-}
-.ifz-company-contact-preview .ifz-badge {
-  justify-self: end;
-}
-.ifz-company-contact-preview-more {
-  padding-left: 17px;
-  font-style: italic;
-}
-
 .ifz-company-panel {
   display: grid;
   grid-template-columns: minmax(0, 1.1fr) minmax(310px, .9fr);
@@ -4202,11 +4203,7 @@ h1, h2, h3, h4, p { margin: 0; }
     align-items: flex-end;
     margin-top: 0;
     text-align: right;
-  }
-  .ifz-company-contact-preview {
-    margin-left: 48px;
-  }
-  .ifz-company-panel {
+  }  .ifz-company-panel {
     grid-template-columns: 1fr;
     grid-template-areas:
       "notice"
@@ -4274,22 +4271,7 @@ h1, h2, h3, h4, p { margin: 0; }
   .ifz-company-market,
   .ifz-company-state {
     grid-column: 2;
-  }
-  .ifz-company-contact-preview {
-    margin: 0 2px 14px 42px;
-  }
-  .ifz-company-contact-preview li {
-    min-height: 44px;
-    grid-template-columns: 7px minmax(0, 1fr) auto;
-  }
-  .ifz-company-contact-preview li > span:nth-of-type(2) {
-    grid-column: 2;
-  }
-  .ifz-company-contact-preview .ifz-badge {
-    grid-column: 3;
-    grid-row: 1 / 3;
-  }
-  .ifz-company-panel {
+  }  .ifz-company-panel {
     padding: 0 2px 18px 42px;
   }
   .ifz-company-section-head {

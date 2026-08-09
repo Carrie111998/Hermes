@@ -259,7 +259,10 @@ export async function mount(root, ctx) {
       nextKind = 'reply';
     } else if (actionable) {
       stateLabel = 'Email waiting for you';
-      stateDetail = 'Review before anything is saved or sent';
+      // No detail line. Every other branch puts row-specific data here (a
+      // timestamp); this one repeated the same policy sentence on every
+      // actionable row, and the label already says review is needed.
+      stateDetail = '';
       nextKind = 'review';
     } else if (sentWaiting) {
       stateLabel = 'Waiting for a reply';
@@ -693,7 +696,11 @@ export async function mount(root, ctx) {
     const map = renderMap(models, sequence);
     const unlinked = renderUnlinkedPeople();
 
-    page.replaceChildren(
+    // Spread through filter(Boolean). replaceChildren is native DOM, not the
+    // el() helper: a null argument is coerced to the string "null" and
+    // appended as a text node, which is why "null" printed under the list
+    // whenever every contact had a company.
+    page.replaceChildren(...[
       pageHead({
         title: 'Buyers',
         sub: 'Companies, the people inside them, and where each relationship stands.',
@@ -715,7 +722,7 @@ export async function mount(root, ctx) {
         `${filtered.length} buyer${filtered.length === 1 ? '' : 's'} shown`),
       renderRows(filtered),
       unlinked,
-    );
+    ].filter(Boolean));
 
     if (restoreSearch) {
       const search = page.querySelector('#ifz-buyers-search');
