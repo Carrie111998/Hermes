@@ -297,3 +297,48 @@ Residual risk:
 
 Next action:
 - Commit the deterministic fusion implementation, then perform the isolated llama-server live-validation phase.
+
+## Commit 7 — llama.cpp embedding capability probe
+
+Commit 7 adds an independent, stdlib-only capability probe. It is diagnostic infrastructure only: Production adapter code and all existing `plugins/semantic_graph/*` production paths remain unchanged.
+
+Changed files:
+- `scripts/semantic_graph_llama_embedding_probe.py`
+- `tests/plugins/test_semantic_graph_llama_cpp_probe.py`
+- `tests/plugins/test_semantic_graph_llama_cpp_live.py`
+- this implementation log
+
+Control and candidate profiles:
+- Control: `Qwen/Qwen3-Embedding-0.6B-GGUF`, alias `qwen3-embedding-0.6b-q8_0`, expected native dimension `1024`, port `8083`.
+- Candidate: `Etherll/Qwen3-VL-Embedding-2B-Q8_0-GGUF`, alias `qwen3-vl-embedding-2b-q8_0`, expected native dimension `2048`, port `8082`.
+- The probe accepts either profile through configuration but does not infer or auto-accept MRL dimensions.
+
+Probe contract:
+- Loopback HTTP only when explicitly invoked; stdlib `urllib.request` is used and no production HTTP client is introduced.
+- Checks `/health`, `/v1/models`, `/props` best-effort, `/v1/embeddings`, flat-vector shape, count/index coverage, exact dimension, finite/nonzero/unit norm, repeat stability, batch sizes `1,2,4,8,16,32`, semantic ordering, and optional soak requests.
+- Token matrices, nulls, NaN/Inf, zero vectors, dimension drift, missing/duplicate indices, and semantic-ordering failures are rejected.
+- Summary JSON contains no raw vectors, raw response, server logs, credentials, or absolute GGUF path. A SHA-256 is computed only when an explicit local `--gguf-path` is supplied.
+- Live pytest execution requires `HERMES_RUN_LLAMA_EMBEDDING_LIVE=1` plus `HERMES_TEST_LLAMA_EMBEDDING_URL`, `HERMES_TEST_LLAMA_EMBEDDING_MODEL`, `HERMES_TEST_LLAMA_EMBEDDING_REPO`, and `HERMES_TEST_LLAMA_EMBEDDING_DIMENSIONS`. Soak additionally requires `HERMES_LLAMA_EMBEDDING_SOAK=1` and at least 500 requests; normal CI never performs network calls.
+- `pass_text_only` is not a multimodal compatibility claim. Vision/image/video/mixed-input support remains untested.
+
+Verification evidence:
+- RED: the initial focused command failed with `file or directory not found` because the probe unit test had not yet been created (exit 4); a later canonical-runner pass also caught and fixed a stale removed `statistics` compatibility reference.
+- Focused probe tests: 17 passed, 2 explicitly skipped, exit 0.
+- The verdict gate requires English ordering, Japanese-to-English ordering, and an executed soak check; an unexecuted soak is not treated as a pass.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- Production boundary check: no changes in `plugins/semantic_graph/retrieval.py`, `runtime.py`, `config.py`, `store.py`, `embedding/base.py`, or `pyproject.toml`.
+- `llama-server --version`: version `10264`, build commit `81b08be15`, MSVC `19.44.35224.0`, Windows AMD64.
+- `llama-server --list-devices`: CUDA0 `NVIDIA GeForce RTX 5060 Ti`, `15173 MiB` free.
+- No llama-server process was running and no local Qwen Embedding GGUF was found in the checked cache/search locations.
+
+Live-validation status:
+- Control live verdict: `pending_live_validation` — control GGUF was not locally available and was not downloaded automatically.
+- Candidate live verdict: `pending_live_validation` — candidate GGUF was not locally available and was not downloaded automatically.
+- Therefore no model compatibility, dimension, pooling, semantic-quality, or soak PASS/FAIL claim is made by Commit 7.
+- The next safe live step is to obtain/pin both GGUFs, record their SHA-256 values, start control first on `127.0.0.1:8083`, then candidate on `127.0.0.1:8082`, and run the explicit live test separately.
+
+Residual risk:
+- `/v1/embeddings` behavior, Qwen3-VL text preprocessing/chat-template equivalence, `--pooling last`, actual dimension, Q8_0 quality, resource usage, and long-run stability remain unverified.
+- Production adapter creation remains correctly blocked on control/candidate live evidence.
