@@ -2667,6 +2667,22 @@ button[data-slot='aui_msg-reactions'] svg {
   /* The one surface that is always there, so the one that always takes the
      mouse — everything else in the shell earns it by being on screen. */
   pointer-events: auto;
+
+  /* The dock centres itself with `left-1/2` + `-translate-x-1/2`: half the
+     parent across, then half its OWN width back. Only the second half of that
+     pair survives here — `left` resolves to 0 in the HUD, so the translate
+     subtracts from zero and the dock lands at -50% of its own width (measured
+     x=-310 in a 620px HUD). The composer's text then starts off screen to the
+     left, and typing far enough walks the caret into view, which is why it
+     presents as "the composer is cut off" rather than as a layout bug.
+
+     Anchor both edges and centre with auto margins so the pairing cannot come
+     apart: nothing to cancel, and it still centres if the dock is ever
+     narrower than the HUD. */
+  left: 0;
+  right: 0;
+  translate: none;
+  margin-inline: auto;
 }
 
 /* HUD mode is the input and the log — nothing else. The dock stacks
@@ -2807,14 +2823,18 @@ button[data-slot='aui_msg-reactions'] svg {
   background: transparent !important;
   border: 0;
   color: var(--ui-text-primary) !important;
-  /* Focus only. A turn landing brings the transcript up but doesn't mean you
-     are reaching for the window controls, and at rest this is a lone chip
-     hovering over whatever you're actually working in. */
-  opacity: 0;
+  /* Always interactive, dim at rest. Gating the clicks on composer :focus made
+     the only visible way out of HUD mode depend on the thing most likely to be
+     broken when a user wants out: if focus never lands (see #81893) you cannot
+     type AND the exit chip silently ignores clicks, so the window is a dead
+     rectangle floating over the desktop with no in-app way to dismiss it.
+
+     Dim rather than invisible keeps the original intent — this should not be a
+     loud chip over the app behind — without making the escape hatch conditional
+     on the failure mode it exists for. */
+  opacity: 0.45;
   transition: opacity var(--hud-fade) var(--hud-ease-exit);
-  /* Clicks on exactly the same terms as the paint — a faded-out control that
-     still takes them is an invisible button floating over the app behind. */
-  pointer-events: none;
+  pointer-events: auto;
 }
 
 /* Flipped, "above the composer" is the reserved strip at the top of the
@@ -2824,9 +2844,12 @@ button[data-slot='aui_msg-reactions'] svg {
   top: 0;
 }
 
-[data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-exit] {
-  opacity: 0.75;
-  pointer-events: auto;
+/* Hover and focus-visible brighten it too, so pointing at the chip confirms it
+   is a control before you commit the click. */
+[data-hud-shell]:has([data-slot='composer-rich-input']:focus) [data-hud-exit],
+[data-hud-shell] [data-hud-exit]:hover,
+[data-hud-shell] [data-hud-exit]:focus-visible {
+  opacity: 0.9;
   transition-duration: var(--hud-reveal);
   transition-delay: 0s;
 }
