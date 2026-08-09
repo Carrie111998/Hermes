@@ -48,6 +48,9 @@ jobs:
         run: npm run lint:diagrams
         working-directory: website
 
+      - name: Lint docs for masked example phone numbers
+        run: python3 website/scripts/lint-masked-phones.py
+
       - name: Build Docusaurus
         # Build only the default (en) locale in CI — the full bilingual
         # build runs in deploy-site.yml on push-to-main / release.

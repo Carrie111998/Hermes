@@ -108,10 +108,10 @@ If agent terminal commands hang or time out immediately after working in your ow
 ```yaml
 terminal:
   backend: docker
-  docker_image: python:3.11-slim
+  docker_image: nikolaik/python-nodejs:python3.11-nodejs20
 ```
 
-**One persistent container, shared across the whole process.** Hermes starts a single long-lived container on first use (`docker run -d ... sleep infinity`) and routes every terminal, file, and `execute_code` call through `docker exec` into that same container. Working-directory changes, installed packages, environment tweaks, and files written to `/workspace` all carry over from one tool call to the next, across `/new`, `/reset`, and `delegate_task` subagents, for the lifetime of the Hermes process. The container is stopped and removed on shutdown.
+**One persistent container, shared across Hermes processes.** Hermes starts a single long-lived container on first use (`docker run -d ... sleep infinity`) and routes every terminal, file, and `execute_code` call through `docker exec` into that same container. Working-directory changes, installed packages, environment tweaks, and files written to `/workspace` all carry over from one tool call to the next, across `/new`, `/reset`, and `delegate_task` subagents — and from one Hermes process to the next. The container is **not** removed when a Hermes process exits; it keeps running and the next `hermes` invocation reuses it (controlled by `docker_persist_across_processes`, default `true`). See the [Container lifecycle](../configuration.md#container-lifecycle) rules for exact teardown behavior.
 
 This means the Docker backend behaves like a persistent sandbox VM, not a fresh container per command. If you `pip install foo` once, it's there for the rest of the session. If you `cd /workspace/project`, subsequent `ls` calls see that directory. See [Configuration → Docker Backend](../configuration.md#docker-backend) for the full lifecycle details and the `container_persistent` flag that controls whether `/workspace` and `/root` survive across Hermes restarts.
 
