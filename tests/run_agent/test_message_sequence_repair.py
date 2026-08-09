@@ -356,6 +356,39 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_sanitize_dedup_does_not_reintroduce_empty_tool_calls():
+    """Dedup removing every call of a later assistant turn must not
+    re-introduce ``tool_calls: []`` (#58755 follow-up).
+
+    After a dropped-tool-call re-prompt / retry in a long session, a later
+    assistant turn can repeat a tool_call_id already seen earlier in the
+    payload. The dedup pass then collapses that turn to zero calls; before
+    this fix it rewrote ``tool_calls: []`` AFTER the empty-array drop pass,
+    so strict OpenAI-compatible providers (opencode-go/zen, DeepSeek,
+    Fireworks) rejected the request with HTTP 400 "Invalid
+    'messages[N].tool_calls': empty array".
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    messages = [
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "calling", "tool_calls": [
+            {"id": "call_X", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_X", "content": "r1"},
+        {"role": "assistant", "content": "retry", "tool_calls": [
+            {"id": "call_X", "type": "function",
+             "function": {"name": "foo", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_X", "content": "r2"},
+    ]
+    out = sanitize_api_messages(list(messages))
+    for m in out:
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            assert m["tool_calls"], f"empty tool_calls survived: {m!r}"
+
+
 
 
 
