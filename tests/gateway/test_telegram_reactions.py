@@ -169,7 +169,8 @@ def _patch_index(monkeypatch, tmp_path):
 
 
 def _rx_adapter(
-    monkeypatch, tmp_path, *, authorized=True, thread_id="77", sender_id: str | None = "111"
+    monkeypatch, tmp_path, *, authorized=True, thread_id="77", sender_id: str | None = "111",
+    extra=None,
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
     store = _patch_index(monkeypatch, tmp_path)
@@ -177,6 +178,7 @@ def _rx_adapter(
     runner = SimpleNamespace(_is_user_authorized=Mock(return_value=authorized), _profile_adapters={})
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
+    adapter.config = PlatformConfig(enabled=True, token="fake-token", extra=extra or {})
     adapter.gateway_runner = runner
     adapter._bot = SimpleNamespace(id=111)
     adapter.handle_message = AsyncMock()
@@ -389,6 +391,35 @@ async def test_reaction_delta_routes_deferred_turn(monkeypatch, tmp_path, old, n
     assert "NO_REPLY" in ev.channel_prompt and "consequential or risky action" in ev.channel_prompt
     assert "answers a question" in ev.channel_prompt
     assert "do not call telegram_react" in ev.channel_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra", "old", "new", "expected"),
+    [
+        ({}, [], ["👍"], False),
+        ({"proposal_approval_reactions": ["👍"]}, [], ["👍"], True),
+        ({"proposal_approval_reactions": ["👍"]}, ["👍"], [], False),
+        ({"proposal_approval_reactions": ["🆒"]}, [], ["👍"], False),
+    ],
+)
+async def test_proposal_approval_reactions_are_opt_in_added_only(
+    monkeypatch, tmp_path, extra, old, new, expected
+):
+    adapter, _ = _rx_adapter(monkeypatch, tmp_path, extra=extra)
+    await adapter._handle_message_reaction(_rx_update(old=old, new=new))
+    guidance = getattr(adapter.handle_message, "await_args").args[0].channel_prompt
+    assert ("configured as approval of the exact proposal" in guidance) is expected
+    assert ("execute exactly that proposal in this turn" in guidance) is expected
+
+
+def test_proposal_approval_reactions_accept_only_standard_telegram_emoji(monkeypatch):
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.canonical_standard_emoji",
+        lambda value: value if value in {"👍", "🆒"} else None,
+    )
+    adapter = _make_adapter(proposal_approval_reactions=["👍", "🆒", "✅", "👍"])
+    assert adapter._proposal_approval_reactions() == {"👍", "🆒"}
 
 
 @pytest.mark.asyncio

@@ -10093,6 +10093,50 @@ class TelegramAdapter(BasePlatformAdapter):
             seen.pop(next(iter(seen)))
         return True
 
+    def _proposal_approval_reactions(self) -> Set[str]:
+        """Return configured standard reactions that approve one safe proposal."""
+        extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+        raw = extra.get("proposal_approval_reactions", ())
+        values = (raw,) if isinstance(raw, str) else raw
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            return set()
+        return {
+            canonical
+            for value in values
+            if (canonical := canonical_standard_emoji(str(value))) is not None
+        }
+
+    def _reaction_guidance(self, added: List[str]) -> str:
+        """Build ephemeral guidance for one authenticated reaction turn."""
+        configured = self._proposal_approval_reactions()
+        approvals = sorted(
+            canonical
+            for value in added
+            if (canonical := canonical_standard_emoji(value)) in configured
+        )
+        guidance = (
+            "An authorized Telegram user reacted to a Hermes-authored message. "
+            "Interpret the reaction against the quoted message and apply any explicit "
+            "reaction convention in the user's persistent profile. A reaction may "
+            "acknowledge a statement, express emotion, reverse feedback, approve a "
+            "proposed next action, or answer a question. If it answers a question or "
+            "otherwise advances the conversation, handle that context; otherwise return "
+            "exactly NO_REPLY. Reaction events have no outgoing Telegram target, so do "
+            "not call telegram_react. A reaction alone does not authorize consequential "
+            "or risky action."
+        )
+        if approvals:
+            joined = " ".join(approvals)
+            guidance += (
+                f" The added reaction {joined} is configured as approval of the exact "
+                "proposal in the quoted Hermes message. If and only if that message "
+                "contains a concrete, unambiguous, non-consequential next action, treat "
+                "this event as an action request and execute exactly that proposal in "
+                "this turn; do not merely acknowledge it or return NO_REPLY, and do not "
+                "broaden its scope."
+            )
+        return guidance
+
     async def _handle_message_reaction(self, update: Any, context: Any = None) -> None:
         """Route an authorised reaction through the normal message pipeline."""
         reaction = getattr(update, "message_reaction", None)
@@ -10149,13 +10193,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._claim_reaction_update(getattr(update, "update_id", None)):
             return
-        guidance = (
-            "An authorized Telegram user reacted to a Hermes message. Use the "
-            "reaction as context. If it answers a question or otherwise advances the "
-            "conversation, reply briefly; otherwise return NO_REPLY. "
-            "Reaction events have no outgoing Telegram target; do not call telegram_react. "
-            "A reaction alone does not authorize consequential or risky action."
-        )
+        guidance = self._reaction_guidance(added)
         try:
             from gateway.platforms.base import resolve_channel_prompt
             extra = getattr(getattr(self, "config", None), "extra", {}) or {}

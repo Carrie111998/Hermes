@@ -1238,6 +1238,33 @@ platforms:
 
 An authorized user's standard emoji additions and removals on Hermes messages start turns in the original chat and forum topic. Hermes ignores bot reactions and targets whose message, bot/profile ownership, or topic cannot be verified. Telegram's General topic remains logical thread `1`, although Bot API calls omit that ID. Reactions provide context only; consequential actions still require explicit text.
 
+To let selected reactions approve the exact non-consequential proposal in the
+Hermes message being reacted to, configure them explicitly:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      inbound_reactions: true
+      proposal_approval_reactions:
+        - "👍"
+```
+
+This setting is empty by default. When a configured reaction is **added**, the
+agent is instructed to carry out the proposal only if the target message contains
+a concrete, unambiguous and non-consequential next action. The instruction does
+not broaden the proposal, grant session or permanent permission, or replace the
+normal approval flow for risky operations. Removing a reaction does not add
+approval guidance.
+
+Use a [standard Telegram reaction](https://core.telegram.org/bots/api#reactiontypeemoji)
+that the intended users can select. `👍` is available to non-Premium users and
+is the recommended default.
+Symbols such as `✅` are used in some Hermes approval-button labels but are not
+standard Telegram message reactions. Custom-emoji reactions may require
+Telegram Premium, can be restricted by chat administrators, and are not handled
+by this inbound-reaction path.
+
 ## Per-Channel Prompts
 
 Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.
