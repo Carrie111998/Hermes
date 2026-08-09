@@ -1,10 +1,18 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    bind_exact_redactions,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +21,35 @@ def _ensure_redaction_enabled(monkeypatch):
     monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
     # Also patch the module-level snapshot so it reflects the cleared env var
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
+
+def test_exact_redactions_are_scoped_and_mandatory(monkeypatch):
+    secret = "opaque-run-secret-with-no-known-prefix"
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+
+    with bind_exact_redactions([secret]):
+        result = redact_sensitive_text(f"echoed {secret}")
+
+    assert secret not in result
+    assert "redacted" in result
+    assert redact_sensitive_text(f"echoed {secret}") == f"echoed {secret}"
+
+
+def test_exact_redactions_are_isolated_between_threads():
+    barrier = threading.Barrier(2)
+
+    def redact_in_scope(secret):
+        with bind_exact_redactions([secret]):
+            barrier.wait(timeout=10)
+            return redact_sensitive_text("run-secret-a run-secret-b")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = list(pool.map(redact_in_scope, ["run-secret-a", "run-secret-b"]))
+
+    assert "run-secret-a" not in outputs[0]
+    assert "run-secret-b" in outputs[0]
+    assert "run-secret-b" not in outputs[1]
+    assert "run-secret-a" in outputs[1]
 
 
 class TestKnownPrefixes:

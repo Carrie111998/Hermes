@@ -2,9 +2,11 @@
 import io
 import logging
 import os
+import queue
 import stat
 import sys
 import threading
+from logging.handlers import QueueListener
 from pathlib import Path
 from unittest.mock import patch
 
@@ -666,5 +668,32 @@ class TestAsyncQueueLogging:
             "agent.log" in getattr(h, "baseFilename", "")
             for h in hermes_logging.rotating_file_handlers()
         )
+
+    def test_exact_redactions_cross_queue_listener_thread(self):
+        from agent.redact import RedactingFormatter, bind_exact_redactions
+
+        secret = "opaque-paperclip-token-not-matched-by-prefix-rules"
+        stream = io.StringIO()
+        target = logging.StreamHandler(stream)
+        target.setFormatter(RedactingFormatter("%(message)s"))
+        records = queue.SimpleQueue()
+        queued = hermes_logging._NonFormattingQueueHandler(records)
+        listener = QueueListener(records, target)
+        logger = logging.getLogger("_test_async_exact_redaction")
+        logger.handlers = [queued]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
+
+        listener.start()
+        try:
+            with bind_exact_redactions([secret]):
+                logger.info("worker echoed %s", secret)
+        finally:
+            listener.stop()
+            logger.handlers = []
+
+        output = stream.getvalue()
+        assert secret not in output
+        assert "«redacted-secret»" in output
 
 

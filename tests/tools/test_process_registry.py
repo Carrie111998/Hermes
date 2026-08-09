@@ -279,8 +279,9 @@ class _FakeChunkProcess:
         return 0
 
 
-def _run_reader(registry, monkeypatch, chunks, sid="proc_utf8"):
+def _run_reader(registry, monkeypatch, chunks, sid="proc_utf8", exact_redactions=()):
     session = _make_session(sid=sid)
+    session.exact_redactions = tuple(exact_redactions)
     session.process = _FakeChunkProcess(chunks)
     monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
     monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
@@ -319,6 +320,33 @@ def test_reader_loop_still_replaces_genuinely_invalid_bytes(registry, monkeypatc
     assert session.output_buffer == "ok\ufffddone\n"
 
 
+def test_reader_loop_redacts_opaque_secret_split_across_chunks(registry):
+    """Background buffers, live output, and notifications retain no secret."""
+    secret = "opaque-paperclip-token-not-prefix-shaped"
+    session = _make_session(sid="proc_exact_notifications")
+    session.process = _FakeChunkProcess(
+        [b"before opaque-paperclip-", b"token-not-prefix-shaped after\n"]
+    )
+    session.exact_redactions = (secret,)
+    session.watch_patterns = ["after"]
+    session.notify_on_complete = True
+    emitted = []
+    registry.on_output = lambda _session, chunk: emitted.append(chunk)
+    registry._running[session.id] = session
+
+    registry._reader_loop(session)
+
+    events = []
+    while not registry.completion_queue.empty():
+        events.append(registry.completion_queue.get_nowait())
+    combined_events = repr(events)
+    assert secret not in session.output_buffer
+    assert secret not in "".join(emitted)
+    assert secret not in combined_events
+    assert "«redacted-secret»" in session.output_buffer
+    assert {event["type"] for event in events} == {"watch_match", "completion"}
+
+
 def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry, monkeypatch):
     """The PTY reader gets the same incremental-decode treatment."""
 
@@ -348,6 +376,39 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
     assert session.output_buffer == "café\n"
     assert "\ufffd" not in session.output_buffer
+
+
+def test_pty_reader_loop_redacts_opaque_secret_split_across_chunks(registry, monkeypatch):
+    secret = "opaque-paperclip-pty-token-not-prefix-shaped"
+
+    class _FakePty:
+        def __init__(self):
+            self._chunks = [
+                b"before opaque-paperclip-pty-",
+                b"token-not-prefix-shaped after\n",
+            ]
+            self.exitstatus = 0
+
+        def isalive(self):
+            return bool(self._chunks)
+
+        def read(self, _n):
+            return self._chunks.pop(0)
+
+        def wait(self):
+            return 0
+
+    session = _make_session(sid="proc_pty_exact_redaction")
+    session.exact_redactions = (secret,)
+    session._pty = _FakePty()
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda _s, _c: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda _s: None)
+
+    registry._pty_reader_loop(session)
+
+    assert secret not in session.output_buffer
+    assert "«redacted-secret»" in session.output_buffer
 
 
 # =========================================================================
@@ -643,10 +704,132 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+
+    @pytest.mark.parametrize(
+        ("runtime_env", "expected"),
+        [
+            ({}, "missing"),
+            (
+                {"PAPERCLIP_API_KEY": "scoped-token"},
+                "PAPERCLIP_API_KEY=scoped-token",
+            ),
+        ],
+    )
+    def test_spawn_local_pipe_restores_authoritative_scope_after_login_startup(
+        self, registry, tmp_path, runtime_env, expected
+    ):
+        from gateway.runtime_context import bind_runtime_env
+
+        home = tmp_path / "home"
+        home.mkdir()
+        startup_file = home / ".bash_profile"
+        startup_file.write_text(
+            "printf 'startup-sourced\\n'\n"
+            "export PAPERCLIP_API_KEY=stale-login-token\n"
+            "export Paperclip_Api_Key=mixed-case-stale-login-token\n",
+            encoding="utf-8",
+        )
+        command = (
+            "python3 -c \"import os; "
+            "matches=sorted(f'{k}={v}' for k,v in os.environ.items() "
+            "if k.upper() == 'PAPERCLIP_API_KEY'); "
+            "print('|'.join(matches) or 'missing')\""
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(home),
+                "BASH_ENV": str(startup_file),
+            },
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env(runtime_env):
+                session = registry.spawn_local(command, cwd=str(tmp_path))
+                result = registry.wait(session.id, timeout=10)
+
+        assert result["status"] == "exited"
+        assert result["output"].splitlines() == [expected]
+
+    def test_spawn_local_pipe_uses_authoritative_request_scope(self, registry):
+        from agent.redact import bind_exact_redactions
+        from gateway.runtime_context import bind_runtime_env
+
+        captured = {}
+        secret = "opaque-scoped-token-for-background-output"
+
+        def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/user",
+                "PAPERCLIP_API_KEY": "ambient-token",
+                "PAPERCLIP_RUN_ID": "ambient-run",
+            },
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch(
+            "subprocess.Popen", side_effect=fake_popen
+        ), patch("threading.Thread", return_value=MagicMock()), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env(
+                {"PAPERCLIP_API_KEY": "scoped-token"}
+            ), bind_exact_redactions([secret]):
+                session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert captured["env"]["PAPERCLIP_API_KEY"] == "scoped-token"
+        assert "PAPERCLIP_RUN_ID" not in captured["env"]
+        assert "scoped-token" not in captured["cmd"][-1]
+        assert captured["cmd"][1] == "-c"
+        assert session.exact_redactions == (secret,)
+
+    def test_spawn_local_pty_uses_authoritative_empty_request_scope(self, registry):
+        from gateway.runtime_context import bind_runtime_env
+
+        pty_proc = MagicMock()
+        pty_proc.pid = 4321
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/home/user",
+                "PAPERCLIP_API_KEY": "ambient-token",
+                "PAPERCLIP_RUN_ID": "ambient-run",
+            },
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch(
+            "ptyprocess.PtyProcess.spawn", return_value=pty_proc
+        ) as spawn, patch("threading.Thread", return_value=MagicMock()), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env({}):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        child_env = spawn.call_args.kwargs["env"]
+        child_argv = spawn.call_args.args[0]
+        assert "PAPERCLIP_API_KEY" not in child_env
+        assert "PAPERCLIP_RUN_ID" not in child_env
+        assert child_argv[1] == "-c"
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
         def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured["env"] = kwargs["env"]
             proc = MagicMock()
             proc.pid = 4321
@@ -684,6 +867,7 @@ class TestSpawnEnvSanitization:
         assert "FIRECRAWL_API_KEY" not in env
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
+        assert captured["cmd"][1] == "-lic"
 
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:

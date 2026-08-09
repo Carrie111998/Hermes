@@ -9,6 +9,9 @@ Covers:
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -190,6 +193,190 @@ class TestStartRun:
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
 
+    @pytest.mark.asyncio
+    async def test_start_scopes_runtime_env_to_tool_subprocess(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+        child_ran = threading.Event()
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    from tools.environments.local import _make_run_env
+
+                    child_env = _make_run_env({})
+                    captured["child"] = subprocess.check_output(
+                        [
+                            sys.executable,
+                            "-c",
+                            "import os; print(os.environ['PAPERCLIP_API_KEY']); print(os.environ['PAPERCLIP_RUN_ID'])",
+                        ],
+                        env=child_env,
+                        text=True,
+                    ).splitlines()
+                    child_ran.set()
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "environment": {
+                            "PAPERCLIP_API_KEY": "scoped-test-token",
+                            "PAPERCLIP_RUN_ID": "paperclip-run-1",
+                        },
+                    },
+                )
+                assert resp.status == 202
+                assert await asyncio.to_thread(child_ran.wait, 120)
+
+        assert captured["child"] == ["scoped-test-token", "paperclip-run-1"]
+        from gateway.runtime_context import get_runtime_env
+
+        assert get_runtime_env() is None
+
+    def test_runtime_env_isolated_between_concurrent_workers(self):
+        from gateway.runtime_context import bind_runtime_env, get_runtime_env
+        from tools.environments.local import _make_run_env
+
+        barrier = threading.Barrier(2)
+
+        def _read_bound_value(value):
+            with bind_runtime_env({"PAPERCLIP_API_KEY": value}):
+                barrier.wait(timeout=10)
+                return _make_run_env({})["PAPERCLIP_API_KEY"]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            values = list(pool.map(_read_bound_value, ["run-token-a", "run-token-b"]))
+
+        assert values == ["run-token-a", "run-token-b"]
+        assert get_runtime_env() is None
+
+    def test_runtime_scope_replaces_ambient_paperclip_values(self, monkeypatch):
+        from gateway.runtime_context import bind_runtime_env
+        from tools.environments.local import _make_run_env
+
+        monkeypatch.setenv("PAPERCLIP_API_KEY", "ambient-token")
+        monkeypatch.setenv("PAPERCLIP_RUN_ID", "ambient-run")
+        monkeypatch.setenv("Paperclip_Api_Key", "mixed-case-ambient-token")
+
+        with bind_runtime_env({}):
+            empty_scope = _make_run_env({})
+        with bind_runtime_env({"PAPERCLIP_API_KEY": "scoped-token"}):
+            scoped = _make_run_env({})
+
+        assert not any(
+            key.upper() in {"PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID"}
+            for key in empty_scope
+        )
+        assert scoped["PAPERCLIP_API_KEY"] == "scoped-token"
+        assert not any(
+            key != "PAPERCLIP_API_KEY" and key.upper() == "PAPERCLIP_API_KEY"
+            for key in scoped
+        )
+        assert "PAPERCLIP_RUN_ID" not in scoped
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_unallowlisted_runtime_env(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "runtime_env": {"PATH": "/tmp/unsafe"}},
+            )
+            conflict = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "runtime_env": {}, "environment": {}},
+            )
+        assert resp.status == 400
+        assert conflict.status == 400
+
+    def test_start_rejects_invalid_runtime_env_values(self):
+        from gateway.platforms.api_server import (
+            _RUN_RUNTIME_ENV_MAX_BYTES,
+            _parse_run_runtime_env,
+        )
+        from gateway.runtime_context import TRUSTED_RUNTIME_ENV_KEYS
+
+        _, nul_error = _parse_run_runtime_env(
+            {"runtime_env": {"PAPERCLIP_API_KEY": "bad\u0000value"}}
+        )
+        _, surrogate_error = _parse_run_runtime_env(
+            {"runtime_env": {"PAPERCLIP_API_KEY": "\ud800"}}
+        )
+        key = "PAPERCLIP_API_KEY"
+        boundary_value = "x" * (_RUN_RUNTIME_ENV_MAX_BYTES - len(key.encode("utf-8")))
+        _, boundary_error = _parse_run_runtime_env(
+            {"runtime_env": {key: boundary_value}}
+        )
+        _, oversized_error = _parse_run_runtime_env(
+            {"runtime_env": {key: boundary_value + "x"}}
+        )
+        accepted, allowlist_error = _parse_run_runtime_env(
+            {"runtime_env": {name: "value" for name in TRUSTED_RUNTIME_ENV_KEYS}}
+        )
+
+        assert nul_error is not None
+        assert surrogate_error is not None
+        assert boundary_error is None
+        assert oversized_error is not None
+        assert allowlist_error is None
+        assert set(accepted) == TRUSTED_RUNTIME_ENV_KEYS
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_non_object_json_body(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", json=[])
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["type"] == "invalid_request_error"
+        assert payload["error"]["message"] == "request body must be an object"
+
+    @pytest.mark.asyncio
+    async def test_run_output_exactly_redacts_scoped_api_key(self, adapter):
+        app = _create_runs_app(adapter)
+        token = "opaque-paperclip-test-value"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": f"tool echoed {token}"
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "runtime_env": {"PAPERCLIP_API_KEY": token},
+                    },
+                )
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert token not in status["output"]
+        assert "redacted" in status["output"].lower()
+
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):
@@ -330,6 +517,42 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_credentialed_run_suppresses_deltas_and_redacts_completion(self, adapter):
+        app = _create_runs_app(adapter)
+        token = "opaque-stream-test-secret"
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _run(**_kwargs):
+                    callback = mock_create.call_args.kwargs["stream_delta_callback"]
+                    callback(token[:10])
+                    callback(token[10:])
+                    return {"final_response": f"echoed {token}"}
+
+                mock_agent.run_conversation.side_effect = _run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "hello",
+                        "runtime_env": {"PAPERCLIP_API_KEY": token},
+                    },
+                )
+                run_id = (await resp.json())["run_id"]
+                events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                body = await events_resp.text()
+
+        assert "message.delta" not in body
+        assert token not in body
+        assert "redacted" in body.lower()
 
 
     @pytest.mark.asyncio

@@ -43,7 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import _find_shell, _resolve_safe_cwd
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -357,6 +357,8 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    exact_redactions: tuple[str, ...] = field(default_factory=tuple, repr=False)
+    _redaction_pending: str = field(default="", repr=False)
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
@@ -483,6 +485,58 @@ class ProcessRegistry:
             sink(session, chunk)
         except Exception:
             pass
+
+    @staticmethod
+    def _redact_process_output(
+        session: ProcessSession,
+        text: str,
+        *,
+        final: bool = False,
+    ) -> str:
+        """Redact request-local opaque values across arbitrary output chunks."""
+        secrets = session.exact_redactions
+        if not secrets:
+            return text
+
+        pending = session._redaction_pending + text
+        output: list[str] = []
+        while pending:
+            matches = [
+                (index, -len(secret), secret)
+                for secret in secrets
+                if (index := pending.find(secret)) >= 0
+            ]
+            if matches:
+                index, _negative_length, secret = min(matches)
+                output.append(pending[:index])
+                output.append("«redacted-secret»")
+                pending = pending[index + len(secret):]
+                continue
+
+            if final:
+                output.append(pending)
+                pending = ""
+                break
+
+            # Retain only a suffix that could be the beginning of a secret.
+            # Everything before it is safe to release to buffers/watchers/UI.
+            hold = 0
+            for secret in secrets:
+                max_prefix = min(len(pending), len(secret) - 1)
+                for size in range(max_prefix, 0, -1):
+                    if pending.endswith(secret[:size]):
+                        hold = max(hold, size)
+                        break
+            if hold:
+                output.append(pending[:-hold])
+                pending = pending[-hold:]
+            else:
+                output.append(pending)
+                pending = ""
+            break
+
+        session._redaction_pending = pending
+        return "".join(output)
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -966,6 +1020,29 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        # Build one authoritative local child environment for both PTY and
+        # pipe mode.  This applies trusted request-local values and, for an
+        # explicitly empty managed scope, removes ambient PAPERCLIP_* values
+        # instead of inheriting a stale gateway identity.
+        from agent.redact import get_exact_redactions
+        from gateway.runtime_context import get_runtime_env
+        from tools.environments.local import _make_run_env
+
+        runtime_env = get_runtime_env()
+        spawn_env = _make_run_env(env_vars or {})
+        # A managed request scope is already authoritative in ``spawn_env``.
+        # Do not run login/interactive startup files afterward: they could read
+        # or overwrite the request credential before the user command starts.
+        shell_flags = "-c" if runtime_env is not None else "-lic"
+        if runtime_env is not None:
+            # Non-interactive Bash and POSIX shells may still source a file from
+            # BASH_ENV/ENV. Remove aliases case-insensitively so managed runs do
+            # not regain a startup hook after switching away from ``-lic``.
+            for key in tuple(spawn_env):
+                if key.upper() in {"BASH_ENV", "ENV"}:
+                    spawn_env.pop(key, None)
+        shell_command = f"set +m; {safe_command}"
+
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -973,6 +1050,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            exact_redactions=get_exact_redactions(),
         )
 
         pty_scope_attempted = False
@@ -984,9 +1062,9 @@ class ProcessRegistry:
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                pty_env = dict(spawn_env)
                 pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+                pty_argv = [user_shell, shell_flags, shell_command]
 
                 # Cgroup isolation for PTY mode (#70716, reviewer gap #1):
                 # Wrap the PTY command in a systemd scope so interactive
@@ -1069,7 +1147,7 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env = dict(spawn_env)
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
@@ -1079,7 +1157,7 @@ class ProcessRegistry:
         # kills only the worker instead of taking down the whole gateway
         # cgroup (and the messaging control plane with it).  We only do this
         # for both pipe mode and the PTY path above.
-        shell_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+        shell_argv = [user_shell, shell_flags, shell_command]
         use_systemd_scope = False
         under_supervisor = False
         try:
@@ -1331,11 +1409,14 @@ class ProcessRegistry:
         # (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _append_chunk(chunk: str):
+        def _append_chunk(chunk: str, *, final: bool = False):
             nonlocal first_chunk
-            if first_chunk:
+            if first_chunk and chunk:
                 chunk = self._clean_shell_noise(chunk)
                 first_chunk = False
+            chunk = self._redact_process_output(session, chunk, final=final)
+            if not chunk:
+                return
             with session._lock:
                 session.output_buffer += chunk
                 if len(session.output_buffer) > session.max_output_chars:
@@ -1419,6 +1500,7 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
+            _append_chunk("", final=True)
             # Always reap the child to prevent zombie processes.
             try:
                 session.process.wait(timeout=5)
@@ -1496,7 +1578,10 @@ class ProcessRegistry:
         # (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _append_text(text: str):
+        def _append_text(text: str, *, final: bool = False):
+            text = self._redact_process_output(session, text, final=final)
+            if not text:
+                return
             with session._lock:
                 session.output_buffer += text
                 if len(session.output_buffer) > session.max_output_chars:
@@ -1527,6 +1612,7 @@ class ProcessRegistry:
                 _append_text(tail)
         except Exception:
             pass
+        _append_text("", final=True)
 
         # Process exited
         try:
