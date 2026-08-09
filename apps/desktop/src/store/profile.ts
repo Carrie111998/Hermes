@@ -476,12 +476,15 @@ export function selectBackend(target: BackendTarget): void {
 
   $showAllProfiles.set(false)
   $newChatProfile.set(profile)
+  const activate = ensureGatewayProfile(profile, options)
 
-  if (switching) {
-    requestFreshSession()
-  }
-
-  void ensureGatewayProfile(profile, options).catch(() => undefined)
+  void activate
+    .then(() => {
+      if (switching) {
+        requestFreshSession()
+      }
+    })
+    .catch(() => undefined)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse

@@ -106,3 +106,63 @@ Commands run:
 Concerns:
 
 - The brief's repo-root `bun run typecheck` command is not available in this checkout. I used the desktop package's real `typecheck` script instead, which passed after fixing one strict-boolean issue in the new helper.
+
+## Fix round 1 — review follow-up
+
+Summary:
+
+- Moved the `selectBackend()` fresh-session bump behind successful `ensureGatewayProfile()` activation so failed backend switches do not clear the visible session.
+- Added regression coverage that a failed `selectBackend()` leaves `$freshSessionRequest` unchanged.
+- Added direct regression coverage that `prewarmBackend()` throttles repeated prewarms for the same target.
+
+Changed files:
+
+- `apps/desktop/src/store/profile.ts`
+- `apps/desktop/src/store/profile.test.ts`
+- `.superpowers/sdd/2026-08-09-desktop-backend-rail-plan/task-3-report.md`
+
+Design decisions:
+
+- Kept `selectBackend()` as a fire-and-forget store action, but chained `requestFreshSession()` from the successful resolution of `ensureGatewayProfile(profile, options)`.
+- Preserved the prior background-failure behavior by continuing to swallow activation errors inside `selectBackend()`; on failure the active connection and visible session remain on the current backend.
+- Added a tiny `flushMicrotasks()` test helper so store tests can assert post-activation behavior deterministically without changing production code shape.
+- For direct `prewarmBackend()` throttle coverage, used fake time plus a non-active target (`local` while the active default connection is remote) so the test measures throttling rather than the active-target no-op guard.
+
+Commands run:
+
+1. Inspect current code and report
+   - `sed -n '1,260p' /Users/mosta/.codex/plugins/cache/claude-plugins-official/superpowers/6.2.0/skills/receiving-code-review/SKILL.md`
+   - `git -C /Users/mosta/.hermes/hermes-agent status --short && sed -n '1,260p' /Users/mosta/.hermes/hermes-agent/apps/desktop/src/store/profile.ts && sed -n '1,340p' /Users/mosta/.hermes/hermes-agent/apps/desktop/src/store/profile.test.ts && sed -n '1,260p' /Users/mosta/.hermes/hermes-agent/.superpowers/sdd/2026-08-09-desktop-backend-rail-plan/task-3-report.md`
+   - Exit status: `0`
+
+2. RED verification after adding the new regression tests
+   - `bunx vitest run --project ui src/store/profile.test.ts`
+   - Working directory: `/Users/mosta/.hermes/hermes-agent/apps/desktop`
+   - Exit status: `1`
+   - Relevant output:
+     - `2 failed | 24 passed (26)`
+     - `leaves the fresh-session request unchanged when the background switch fails`
+     - `throttles repeat pre-warms for the same backend target within the interval`
+     - failure detail: `expected 1 to be 0`
+
+3. Focused GREEN verification after moving the fresh-session trigger behind successful activation
+   - `bunx vitest run --project ui src/store/profile.test.ts`
+   - Working directory: `/Users/mosta/.hermes/hermes-agent/apps/desktop`
+   - Exit status: `0`
+   - Relevant output:
+     - `26 passed (26)`
+
+4. Desktop typecheck
+   - `bun run typecheck`
+   - Working directory: `/Users/mosta/.hermes/hermes-agent/apps/desktop`
+   - Exit status: `0`
+   - Relevant output:
+     - `$ tsc -p . --noEmit && tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.e2e.json --noEmit`
+
+5. Diff inspection for the fix round
+   - `git -C /Users/mosta/.hermes/hermes-agent diff -- apps/desktop/src/store/profile.ts apps/desktop/src/store/profile.test.ts .superpowers/sdd/2026-08-09-desktop-backend-rail-plan/task-3-report.md`
+   - Exit status: `0`
+
+Concerns:
+
+- The same repo-root script gap remains: `bun run typecheck` still does not exist at `/Users/mosta/.hermes/hermes-agent`, so the verified typecheck command for this task continues to be the desktop package script in `apps/desktop`.

@@ -59,6 +59,12 @@ const getConnection = vi.fn<
 >()
 const touchBackend = vi.fn(async () => ({ ok: true }))
 
+async function flushMicrotasks(count = 4): Promise<void> {
+  for (let index = 0; index < count; index += 1) {
+    await Promise.resolve()
+  }
+}
+
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
@@ -195,7 +201,7 @@ describe('selectBackend', () => {
     expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
   })
 
-  it('requests a fresh session only when the backend target changes', () => {
+  it('requests a fresh session only when the backend target changes', async () => {
     $activeGatewayProfile.set('default')
     $connection.set(localConn())
 
@@ -203,7 +209,20 @@ describe('selectBackend', () => {
     expect($freshSessionRequest.get()).toBe(0)
 
     selectBackend('remote')
+    await flushMicrotasks()
+
     expect($freshSessionRequest.get()).toBe(1)
+  })
+
+  it('leaves the fresh-session request unchanged when the background switch fails', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+    ensureGatewayForProfile.mockRejectedValueOnce(new Error('remote unavailable'))
+
+    selectBackend('remote')
+    await flushMicrotasks()
+
+    expect($freshSessionRequest.get()).toBe(0)
   })
 
   it('leaves the active connection in place when the background switch fails', async () => {
@@ -212,8 +231,7 @@ describe('selectBackend', () => {
     ensureGatewayForProfile.mockRejectedValueOnce(new Error('remote unavailable'))
 
     selectBackend('remote')
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushMicrotasks()
 
     expect($connection.get()?.mode).toBe('local')
   })
@@ -247,6 +265,20 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 
     expect(openGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('throttles repeat pre-warms for the same backend target within the interval', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2100-01-01T00:00:00.000Z'))
+    $connection.set(remoteConn({ profile: 'default' }))
+
+    prewarmBackend('local')
+    prewarmBackend('local')
+
+    expect(openGatewayForProfile).toHaveBeenNthCalledWith(1, 'default', { localOnly: true })
+    expect(openGatewayForProfile).toHaveBeenCalledTimes(1)
+
+    vi.useRealTimers()
   })
 
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
