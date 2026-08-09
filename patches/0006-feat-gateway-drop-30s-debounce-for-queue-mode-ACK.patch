@@ -1,0 +1,158 @@
+From dea456b593052a258545493a25038fe6cde3a0b3 Mon Sep 17 00:00:00 2001
+From: Leopold Li <leopold.lixiaoliang@gmail.com>
+Date: Mon, 20 Jul 2026 18:09:41 +0800
+Subject: [PATCH 6/6] feat(gateway): drop 30s debounce for queue-mode ACK
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem
+-------
+With the shared _busy_ack_ts 30s cooldown applied to queue ACK, only
+the first queued follow-up (B) got its "📥 排队 #1: ..." receipt.
+Subsequent follow-ups (C, D, ...) arriving within 30s were silently
+suppressed even though each contained distinct content. User could
+not tell whether C was received until the drain eventually replied
+to it minutes later.
+
+The 30s cooldown was inherited from interrupt/steer ACK where it
+serves a real purpose: preventing an "hurry up hurry up hurry up"
+spam burst from producing three identical "⚡ Interrupting" bubbles.
+That signal is redundant across the burst.
+
+Queue mode is different: B and C are two distinct messages, not two
+repeats of one intent. Silencing the second hides receipt information
+the user actually needs.
+
+Fix
+---
+_maybe_send_queue_ack now:
+  * Skips the 30s debounce check entirely — every queued message gets
+    its own "📥 排队 #N: 'preview...' (Queued)" ACK.
+  * Does NOT stamp _busy_ack_ts either, so a queue-mode chatter does
+    not silence a later interrupt/steer ACK that carries a different
+    intent.
+
+Interrupt/steer mode ACK debounce is unchanged.
+
+Tests
+-----
+test_busy_text_mode_queue_sends_ack_by_default rewritten:
+  * Sends two follow-ups back-to-back.
+  * Simulates the caller enqueueing the first between calls so the
+    second sees queue_depth=1.
+  * Asserts BOTH ACKs fired (was: only first fired due to debounce).
+  * Asserts positions increment: first #1, second #2.
+  * Asserts previews carry each message's own text.
+
+Full suite: 50/50 pass.
+---
+ gateway/run.py                         | 10 +++---
+ tests/gateway/test_busy_session_ack.py | 44 ++++++++++++++++++--------
+ 2 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 54e817e..4e85a4b 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5321,11 +5321,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if not busy_ack_enabled:
+                 return
+ 
+-            now = time.time()
+-            _BUSY_ACK_COOLDOWN = 30
+-            last_ack = self._busy_ack_ts.get(session_key, 0)
+-            if now - last_ack < _BUSY_ACK_COOLDOWN:
+-                return
++            # No debounce for queue-mode ACK: each queued message is distinct
++            # content that deserves its own receipt (unlike interrupt/steer
++            # ACKs where the shared 30s _busy_ack_ts window suppresses "hurry
++            # up" spam of the same intent).
+ 
+             from gateway.display_config import resolve_display_setting
+ 
+@@ -5368,7 +5367,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                 content = f"📥 排队: {preview} (Queued)"
+ 
+             reply_anchor = self._reply_anchor_for_event(event)
+-            self._busy_ack_ts[session_key] = now
+             await adapter._send_with_retry(
+                 chat_id=event.source.chat_id,
+                 content=content,
+diff --git a/tests/gateway/test_busy_session_ack.py b/tests/gateway/test_busy_session_ack.py
+index 9ed1d6d..b5836df 100644
+--- a/tests/gateway/test_busy_session_ack.py
++++ b/tests/gateway/test_busy_session_ack.py
+@@ -242,9 +242,9 @@ class TestBusySessionAck:
+ 
+     @pytest.mark.asyncio
+     async def test_busy_text_mode_queue_sends_ack_by_default(self, monkeypatch):
+-        """busy_text_mode=queue now sends a short 'Queued' ACK on the first
+-        follow-up so users know the message landed. Subsequent follow-ups
+-        within the 30s debounce window stay silent."""
++        """busy_text_mode=queue now sends a short 'Queued' ACK for EVERY
++        follow-up (no debounce): each queued message is distinct content
++        that deserves its own receipt."""
+         import gateway.run as _gr
+ 
+         monkeypatch.delenv("HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED", raising=False)
+@@ -264,28 +264,46 @@ class TestBusySessionAck:
+         runner.adapters[first.source.platform] = adapter
+         runner.adapters[second.source.platform] = adapter
+ 
++        # First follow-up: no queue depth yet -> position #1.
+         result1 = await runner._handle_active_session_busy_message(first, sk)
++        # Simulate the caller enqueueing "first" so the next follow-up sees
++        # depth=1 and gets position #2 (mirrors real _process_message_background).
++        adapter._pending_messages[sk] = first
+         result2 = await runner._handle_active_session_busy_message(second, sk)
+ 
+         assert result1 is False
+         assert result2 is False
+-        assert sk not in adapter._pending_messages
+         agent.interrupt.assert_not_called()
+ 
+-        # First call fires ACK, second is debounced (within 30s window).
+-        adapter._send_with_retry.assert_called_once()
+-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+-        # New unified format: "📥 排队 #N: "preview..." (Queued)"
+-        assert "Queued" in content, f"expected queue ACK marker, got: {content!r}"
+-        assert re.search(r"\u6392\u961f #\d+", content), (
+-            f"expected position marker like '排队 #N', got: {content!r}"
++        # Both follow-ups fire ACKs — debounce is gone for queue mode.
++        assert adapter._send_with_retry.call_count == 2, (
++            f"expected 2 queue ACKs, got {adapter._send_with_retry.call_count}"
+         )
++        calls = adapter._send_with_retry.call_args_list
++        content1 = calls[0].kwargs.get("content", "")
++        content2 = calls[1].kwargs.get("content", "")
++
++        # New unified format: "📥 排队 #N: \"preview...\" (Queued)"
++        for c in (content1, content2):
++            assert "Queued" in c, f"expected queue ACK marker, got: {c!r}"
++            assert re.search(r"\u6392\u961f #\d+", c), (
++                f"expected position marker like '排队 #N', got: {c!r}"
++            )
++
+         # ACK carries a preview of the message text so responses can be mapped
+         # back to inputs when they come out of visible order.
+-        assert '"part one"' in content or "part one" in content, (
+-            f"expected message preview in ACK, got: {content!r}"
++        assert '"part one"' in content1 or "part one" in content1, (
++            f"expected preview of part one in first ACK, got: {content1!r}"
++        )
++        assert '"part two"' in content2 or "part two" in content2, (
++            f"expected preview of part two in second ACK, got: {content2!r}"
+         )
+ 
++        # Positions increment: first was #1 (empty queue), second was #2
++        # (after we simulated the enqueue of first).
++        assert "#1" in content1, f"expected #1 in first ACK, got: {content1!r}"
++        assert "#2" in content2, f"expected #2 in second ACK, got: {content2!r}"
++
+     @pytest.mark.asyncio
+     async def test_busy_text_mode_queue_silent_when_ack_disabled(self, monkeypatch):
+         """Opt-out: HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED=false restores the
+-- 
+2.24.3 (Apple Git-128)
+

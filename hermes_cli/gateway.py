@@ -3965,6 +3965,9 @@ def generate_launchd_plist() -> str:
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    
     <key>StandardErrorPath</key>
     <string>{log_dir}/gateway.error.log</string>
 </dict>
@@ -3978,11 +3981,25 @@ def launchd_plist_is_current() -> bool:
     if not plist_path.exists():
         return False
 
-    installed = plist_path.read_text(encoding="utf-8")
-    expected = generate_launchd_plist()
-    return _normalize_launchd_plist_for_comparison(
-        installed
-    ) == _normalize_launchd_plist_for_comparison(expected)
+    import plistlib
+
+    expected_text = generate_launchd_plist()
+    try:
+        installed_dict = plistlib.loads(plist_path.read_bytes())
+        expected_dict = plistlib.loads(expected_text.encode("utf-8"))
+        # Normalize PATH in both (may differ across shell environments)
+        _PLIST_PATH_SENTINEL = "__HERMES_PATH__"
+        for d in (installed_dict, expected_dict):
+            env = d.get("EnvironmentVariables", {})
+            if "PATH" in env:
+                env["PATH"] = _PLIST_PATH_SENTINEL
+        return installed_dict == expected_dict
+    except Exception:
+        # Fall back to text comparison if plist parsing fails
+        installed_text = plist_path.read_text(encoding="utf-8")
+        return _normalize_launchd_plist_for_comparison(
+            installed_text
+        ) == _normalize_launchd_plist_for_comparison(expected_text)
 
 
 def refresh_launchd_plist_if_needed() -> bool:
@@ -4349,6 +4366,15 @@ def launchd_restart():
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
+                else:
+                    # The gateway cleared its PID file but may still be alive
+                    # for a brief moment while completing final cleanup.
+                    # kickstart -k sends SIGTERM to any still-running process,
+                    # causing a duplicate SIGTERM in the logs. A short settle
+                    # window ensures the process is fully dead before kickstart
+                    # runs, so kickstart -k starts fresh without a second kill.
+                    import time as _time
+                    _time.sleep(1.0)
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()

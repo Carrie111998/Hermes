@@ -1,0 +1,20 @@
+From: Leopold Li <leopold.lixiaoliang@gmail.com>
+Date: Sun, 9 Aug 2026 22:00:00 +0800
+Subject: [PATCH 9] fix(gateway): semantic plist comparison to prevent false refresh cascade
+
+launchd_plist_is_current() was comparing XML text after basic whitespace
+normalization. The installed plist (written by plistlib) uses tab-indented
+alphabetical key order; the template uses space-indented custom key order.
+The text comparison always returned False, causing every hermes gateway
+install/start to detect a "stale" plist and call refresh_launchd_plist_if_needed(),
+which runs bootout+bootstrap+kickstart → triggering restart cascades.
+
+Fix: parse both plists as Python dicts via plistlib and compare semantically.
+PATH value in EnvironmentVariables is still normalized (replaced with sentinel)
+to handle cross-shell PATH differences. Falls back to text comparison if
+plistlib parsing fails.
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+--- a/hermes_cli/gateway.py (launchd_plist_is_current, ~line 3978)
++++ b/hermes_cli/gateway.py
+Text comparison replaced with plistlib.loads() dict comparison.

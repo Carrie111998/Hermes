@@ -1,0 +1,27 @@
+From: Leopold Li <leopold.lixiaoliang@gmail.com>
+Date: Sun, 9 Aug 2026 22:00:00 +0800
+Subject: [PATCH 10] fix(gateway): add 1s settle time in launchd_restart to prevent double-SIGTERM
+
+launchd_restart() sends SIGTERM via terminate_pid(), waits for PID file
+to be cleared (_wait_for_gateway_exit), then calls kickstart -k.
+
+Race condition: gateway clears its PID file as one of the first shutdown
+steps (before fully dying). _wait_for_gateway_exit sees PID=None and
+returns immediately. kickstart -k then runs while the old process is still
+alive → kickstart -k sends a SECOND SIGTERM to the dying gateway.
+
+Result: logs show two "Received SIGTERM" entries 10-20ms apart for every
+hermes gateway restart command. With KeepAlive=true and no ThrottleInterval,
+this triggers a cascade (each kickstart-k-started gateway gets killed by
+another --replace gateway).
+
+Fix: after _wait_for_gateway_exit returns True (clean exit), sleep 1 second
+to allow the process to fully die before kickstart -k runs. If kickstart -k
+finds no living process, it starts fresh without any kill signal.
+
+Also related: ThrottleInterval=30 added to plist (patch 0009 companion).
+
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py  
+--- a/hermes_cli/gateway.py (launchd_restart, after _wait_for_gateway_exit block)
++++ b/hermes_cli/gateway.py
+Added: else: import time; time.sleep(1.0) after exited=True branch.

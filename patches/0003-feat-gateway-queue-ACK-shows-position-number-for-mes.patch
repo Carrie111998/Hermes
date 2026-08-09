@@ -1,0 +1,108 @@
+From 570bf44e63f30d00fb631bde1c07a70c3295d8d0 Mon Sep 17 00:00:00 2001
+From: Leopold Li <leopold.lixiaoliang@gmail.com>
+Date: Mon, 20 Jul 2026 17:23:59 +0800
+Subject: [PATCH 3/6] feat(gateway): queue ACK shows position number for
+ message tracking
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Problem
+-------
+The queue-mode ACK "📥 Queued (排队中)" told the user their message was
+received, but not WHICH message. With multiple follow-ups queued during
+a busy turn, responses arriving out of visible order made it impossible
+to map "which reply belongs to which input?".
+
+Fix
+---
+Include the queue position in the ACK: "📥 Queued #{N} (排队中)" where N
+is the slot this message will land in (current depth + 1, because
+_handle_active_session_busy_message runs BEFORE the caller enqueues).
+
+Position derived from GatewayRunner._queue_depth(session_key, adapter=..)
+which sums the adapter head slot + runner overflow list. Wrapped in
+try/except so a depth-lookup failure still delivers a bare "Queued" ACK
+rather than nothing.
+
+Example flow (user A busy, sends B and C during the turn):
+  B arrives → ACK: "📥 Queued #1 (排队中)"
+  C arrives within 30s → debounced, no ACK
+  Main turn finishes → response for A
+  Drain: B processed → response for B (user knows "#1" was B)
+  Drain: C processed → response for C (user infers "next")
+
+The 30s debounce still applies (interrupt/steer/queue share the window).
+Rapid-burst ACK spam prevention wins over per-message identification
+when user types 3+ follow-ups in quick succession.
+
+Tests
+-----
+test_busy_text_mode_queue_sends_ack_by_default now asserts the ACK
+matches r"Queued #\d+" — pins the position marker as a contract.
+Full suite: 50/50 pass.
+
+Backlog ref: agents/todo/backlog/2026-07-20_020_...ack-ux.md
+---
+ gateway/run.py                         | 16 +++++++++++++++-
+ tests/gateway/test_busy_session_ack.py |  6 ++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/run.py b/gateway/run.py
+index b922584..43b99b6 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5334,11 +5334,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             if not adapter:
+                 return
+ 
++            # Position of THIS message in the queue: current depth counts
++            # everything already queued; this message hasn't been enqueued
++            # yet (the caller does that after _handle_active_session_busy_message
++            # returns False), so +1 gives the slot this message will land in.
++            try:
++                position = self._queue_depth(session_key, adapter=adapter) + 1
++            except Exception:
++                position = None
++
++            if position is not None:
++                content = f"📥 Queued #{position} (排队中)"
++            else:
++                content = "📥 Queued (排队中)"
++
+             reply_anchor = self._reply_anchor_for_event(event)
+             self._busy_ack_ts[session_key] = now
+             await adapter._send_with_retry(
+                 chat_id=event.source.chat_id,
+-                content="📥 Queued (排队中)",
++                content=content,
+                 reply_to=reply_anchor,
+                 metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+             )
+diff --git a/tests/gateway/test_busy_session_ack.py b/tests/gateway/test_busy_session_ack.py
+index bb094c5..3c26657 100644
+--- a/tests/gateway/test_busy_session_ack.py
++++ b/tests/gateway/test_busy_session_ack.py
+@@ -3,6 +3,7 @@
+ Verifies that users get an immediate status response instead of total silence
+ when the agent is working on a task. See PR fix for the @Lonely__MH report.
+ """
++import re
+ import time
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+@@ -275,6 +276,11 @@ class TestBusySessionAck:
+         adapter._send_with_retry.assert_called_once()
+         content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+         assert "Queued" in content, f"expected queue ACK marker, got: {content!r}"
++        # ACK identifies position of the queued message so the user can
++        # match subsequent responses back to their inputs.
++        assert re.search(r"Queued #\d+", content), (
++            f"expected position marker like 'Queued #N', got: {content!r}"
++        )
+ 
+     @pytest.mark.asyncio
+     async def test_busy_text_mode_queue_silent_when_ack_disabled(self, monkeypatch):
+-- 
+2.24.3 (Apple Git-128)
+

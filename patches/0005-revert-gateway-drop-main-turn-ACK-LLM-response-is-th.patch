@@ -1,0 +1,290 @@
+From c60623d42998c6e194b86e89091fd3f9005a0b48 Mon Sep 17 00:00:00 2001
+From: Leopold Li <leopold.lixiaoliang@gmail.com>
+Date: Mon, 20 Jul 2026 18:01:14 +0800
+Subject: [PATCH 5/6] revert(gateway): drop main-turn ACK; LLM response is the
+ receipt
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Follow-up to 67a6d59 based on WeChat test feedback.
+
+Rationale
+---------
+The main-turn ACK "⏳ 处理中: ... (Working)" duplicated the LLM's own
+streamed response. When A hits an idle session, hermes starts the agent
+immediately; even a fast turn produces streaming output within seconds
+which itself confirms receipt. The gateway-side ACK layered on top
+looked like a duplicate message with no added information.
+
+The queue-mode ACK stays — B/C queued during a busy turn have no other
+signal until the drain fires, so the "📥 排队 #N: 'preview' (Queued)"
+receipt still delivers real UX value there.
+
+Analysis behind the decision
+----------------------------
+B and C ACKs are already async-independent from A's main turn:
+  * Each inbound spawns its own _process_message_background task.
+  * The session guard (_active_sessions[sk]) only serializes AGENT
+    execution, not inbound handling.
+  * _handle_active_session_busy_message + _maybe_send_queue_ack run
+    on B/C's own tasks, awaiting only adapter.send.
+So queue ACK latency is bounded by the platform send, not by whatever
+A's agent is doing. No need for a wider always-queue refactor.
+
+Revert scope
+------------
+Removed:
+  * ``_maybe_send_main_turn_ack`` helper method.
+  * ``busy_main_ack_enabled`` config → env bridge.
+  * ``HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED`` env var support.
+  * Invocation from ``_handle_message`` idle path.
+  * ``TestMainTurnAck`` test class (5 tests).
+
+Retained (from 67a6d59):
+  * ``_msg_preview_for_ack`` helper — still used by queue ACK.
+  * Queue ACK format: ``📥 排队 #{N}: "preview..." (Queued)``.
+  * Updated queue-ACK test assertion.
+
+Tests: 50/50 pass.
+---
+ gateway/run.py                         |  89 --------------------
+ tests/gateway/test_busy_session_ack.py | 111 -------------------------
+ 2 files changed, 200 deletions(-)
+
+diff --git a/gateway/run.py b/gateway/run.py
+index 43588a9..54e817e 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -1621,13 +1621,6 @@ if _config_path.exists():
+                 os.environ["HERMES_GATEWAY_BUSY_QUEUE_ACK_ENABLED"] = str(
+                     _display_cfg["busy_queue_ack_enabled"]
+                 )
+-            if (
+-                "busy_main_ack_enabled" in _display_cfg
+-                and "HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED" not in os.environ
+-            ):
+-                os.environ["HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED"] = str(
+-                    _display_cfg["busy_main_ack_enabled"]
+-                )
+         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
+         _tz_cfg = _cfg.get("timezone", "")
+         if _tz_cfg and isinstance(_tz_cfg, str):
+@@ -5303,80 +5296,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+             cleaned = cleaned[: max_chars].rstrip() + "..."
+         return f'"{cleaned}"'
+ 
+-    async def _maybe_send_main_turn_ack(
+-        self, event: "MessageEvent", session_key: str
+-    ) -> None:
+-        """Send a receipt when an inbound starts the main turn (session was idle).
+-
+-        Mirrors ``_maybe_send_queue_ack`` — same master ACK gate, same 30s
+-        ``_busy_ack_ts`` debounce, same failure semantics — but uses distinct
+-        wording (⏳ processing) since the message will be answered directly
+-        rather than queued. A separate per-mode toggle
+-        ``busy_main_ack_enabled`` / ``HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED``
+-        lets platforms opt out (default true).
+-
+-        Skipped for internal events (background-process completions,
+-        goal-continuations, etc.) since those are system-driven and would
+-        surprise users.
+-        """
+-        try:
+-            if getattr(event, "internal", False):
+-                return
+-
+-            busy_ack_enabled = os.environ.get(
+-                "HERMES_GATEWAY_BUSY_ACK_ENABLED", "true"
+-            ).strip().lower() == "true"
+-            if not busy_ack_enabled:
+-                return
+-
+-            now = time.time()
+-            _BUSY_ACK_COOLDOWN = 30
+-            last_ack = self._busy_ack_ts.get(session_key, 0)
+-            if now - last_ack < _BUSY_ACK_COOLDOWN:
+-                return
+-
+-            from gateway.display_config import resolve_display_setting
+-
+-            platform_key = _platform_config_key(event.source.platform)
+-            main_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED")
+-            if main_ack_env is not None:
+-                main_ack_enabled = main_ack_env.strip().lower() in {
+-                    "1", "true", "yes", "on",
+-                }
+-            else:
+-                main_ack_enabled = bool(
+-                    resolve_display_setting(
+-                        _load_gateway_config(),
+-                        platform_key,
+-                        "busy_main_ack_enabled",
+-                        True,
+-                    )
+-                )
+-            if not main_ack_enabled:
+-                logger.debug("Main-turn ack suppressed for session %s", session_key)
+-                return
+-
+-            adapter = self._adapter_for_source(event.source)
+-            if not adapter:
+-                return
+-
+-            preview = self._msg_preview_for_ack(event)
+-            content = f"⏳ 处理中: {preview} (Working)"
+-            reply_anchor = self._reply_anchor_for_event(event)
+-            self._busy_ack_ts[session_key] = now
+-            await adapter._send_with_retry(
+-                chat_id=event.source.chat_id,
+-                content=content,
+-                reply_to=reply_anchor,
+-                metadata=self._thread_metadata_for_source(event.source, reply_anchor),
+-            )
+-        except Exception:
+-            logger.debug(
+-                "Main-turn ack send failed (non-fatal) for session %s",
+-                session_key,
+-                exc_info=True,
+-            )
+-
+     async def _maybe_send_queue_ack(
+         self, event: "MessageEvent", session_key: str
+     ) -> None:
+@@ -10476,14 +10395,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         self._persist_active_agents()
+         _run_generation = self._begin_session_run_generation(_quick_key)
+ 
+-        # Main-turn ACK — mirrors busy-queue ACK behaviour but with
+-        # "处理中" wording. Same 30s debounce prevents rapid
+-        # send/reply/send churn from spamming the user with receipts.
+-        try:
+-            await self._maybe_send_main_turn_ack(event, _quick_key)
+-        except Exception:
+-            logger.debug("Main-turn ack invocation failed (non-fatal)", exc_info=True)
+-
+         try:
+             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+             # Goal continuation: after the agent returns a final response
+diff --git a/tests/gateway/test_busy_session_ack.py b/tests/gateway/test_busy_session_ack.py
+index 0b03ccb..9ed1d6d 100644
+--- a/tests/gateway/test_busy_session_ack.py
++++ b/tests/gateway/test_busy_session_ack.py
+@@ -943,114 +943,3 @@ class TestLongRunningNotificationOwnership:
+         assert runner._should_emit_long_running_notification(
+             "sess", agent, executor_task=live_task
+         ) is True
+-
+-
+-
+-class TestMainTurnAck:
+-    """Cover the receipt sent when an inbound starts the main turn.
+-
+-    See gateway/run.py::_maybe_send_main_turn_ack — same 30s debounce
+-    as busy/queue ACK, same master gate, opt-out via
+-    HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED or per-platform config.
+-    """
+-
+-    @pytest.mark.asyncio
+-    async def test_main_turn_ack_sends_processing_receipt(self, monkeypatch):
+-        import gateway.run as _gr
+-
+-        monkeypatch.delenv("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED", raising=False)
+-        monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+-
+-        runner, _ = _make_runner()
+-        adapter = _make_adapter()
+-        event = _make_event(text="first ever message this session")
+-        sk = build_session_key(event.source)
+-        runner.adapters[event.source.platform] = adapter
+-
+-        await runner._maybe_send_main_turn_ack(event, sk)
+-
+-        adapter._send_with_retry.assert_called_once()
+-        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+-        assert "Working" in content, f"expected main-turn marker, got: {content!r}"
+-        assert "\u5904\u7406\u4e2d" in content or "处理中" in content, (
+-            f"expected 处理中 marker, got: {content!r}"
+-        )
+-        assert "first ever" in content, (
+-            f"expected message preview, got: {content!r}"
+-        )
+-
+-    @pytest.mark.asyncio
+-    async def test_main_turn_ack_debounced_within_window(self, monkeypatch):
+-        import gateway.run as _gr, time as _time
+-
+-        monkeypatch.delenv("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED", raising=False)
+-        monkeypatch.delenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", raising=False)
+-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+-
+-        runner, _ = _make_runner()
+-        adapter = _make_adapter()
+-        event = _make_event(text="hello")
+-        sk = build_session_key(event.source)
+-        runner.adapters[event.source.platform] = adapter
+-
+-        # Prime the debounce window as if an earlier ACK just fired.
+-        runner._busy_ack_ts[sk] = _time.time()
+-
+-        await runner._maybe_send_main_turn_ack(event, sk)
+-
+-        adapter._send_with_retry.assert_not_called()
+-
+-    @pytest.mark.asyncio
+-    async def test_main_turn_ack_opt_out_via_env(self, monkeypatch):
+-        import gateway.run as _gr
+-
+-        monkeypatch.setenv("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED", "false")
+-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+-
+-        runner, _ = _make_runner()
+-        adapter = _make_adapter()
+-        event = _make_event(text="silent path")
+-        sk = build_session_key(event.source)
+-        runner.adapters[event.source.platform] = adapter
+-
+-        await runner._maybe_send_main_turn_ack(event, sk)
+-
+-        adapter._send_with_retry.assert_not_called()
+-
+-    @pytest.mark.asyncio
+-    async def test_main_turn_ack_skipped_for_internal_events(self, monkeypatch):
+-        """Background-process completions etc. must not surface a receipt."""
+-        import gateway.run as _gr
+-
+-        monkeypatch.delenv("HERMES_GATEWAY_BUSY_MAIN_ACK_ENABLED", raising=False)
+-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+-
+-        runner, _ = _make_runner()
+-        adapter = _make_adapter()
+-        event = _make_event(text="[Background process ... completed]")
+-        # Real internal events set this flag; simulate.
+-        event.internal = True
+-        sk = build_session_key(event.source)
+-        runner.adapters[event.source.platform] = adapter
+-
+-        await runner._maybe_send_main_turn_ack(event, sk)
+-
+-        adapter._send_with_retry.assert_not_called()
+-
+-    @pytest.mark.asyncio
+-    async def test_main_turn_ack_master_switch_off(self, monkeypatch):
+-        import gateway.run as _gr
+-
+-        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+-
+-        runner, _ = _make_runner()
+-        adapter = _make_adapter()
+-        event = _make_event(text="anything")
+-        sk = build_session_key(event.source)
+-        runner.adapters[event.source.platform] = adapter
+-
+-        await runner._maybe_send_main_turn_ack(event, sk)
+-
+-        adapter._send_with_retry.assert_not_called()
+-- 
+2.24.3 (Apple Git-128)
+
