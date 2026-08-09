@@ -93,12 +93,21 @@ def test_doctor_and_runtime_use_shared_init_invocation_for_nonexec_wsl_driver():
 
     completed = SimpleNamespace(returncode=1, stdout="")
     patches = _nonexec_wsl_driver()
+    cua_backend._cua_driver_supports_no_overlay.cache_clear()
     with (
         patches[0],
         patches[1],
         patches[2],
         patches[3],
+        # Force the Linux/WSL auto no_overlay path so the ``--help`` probe
+        # also runs (CI Linux runners hit this; Windows hosts often do not).
+        patch.object(cua_backend, "_cua_no_overlay", return_value=True),
         patch.object(cua_backend.subprocess, "run", return_value=completed) as mock_run,
     ):
         assert cua_backend._resolve_mcp_invocation(DRIVER) == (DRIVER, ["mcp"])
-    assert mock_run.call_args.args[0] == ["/init", DRIVER, "manifest"]
+    # First hop is always ``manifest``; auto no_overlay then probes ``--help``.
+    # Both must share the /init argv contract.
+    assert [call.args[0] for call in mock_run.call_args_list] == [
+        ["/init", DRIVER, "manifest"],
+        ["/init", DRIVER, "--help"],
+    ]
