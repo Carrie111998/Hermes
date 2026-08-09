@@ -297,10 +297,35 @@ class TestMcpTest:
         )
         from hermes_cli.mcp_config import cmd_mcp_test
 
-        cmd_mcp_test(_make_args(name="ink"))
+        exit_code = cmd_mcp_test(_make_args(name="ink"))
         out = capsys.readouterr().out
+        assert exit_code == 0
         assert "Connected" in out
         assert "Tools discovered: 2" in out
+
+    def test_unknown_server_returns_nonzero(self, tmp_path, capsys):
+        _seed_config(tmp_path, {})
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        exit_code = cmd_mcp_test(_make_args(name="missing"))
+
+        assert exit_code == 1
+        assert "not found" in capsys.readouterr().out
+
+    def test_probe_exception_returns_nonzero(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "ink": {"url": "https://mcp.ml.ink/mcp"},
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("probe failed")),
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        exit_code = cmd_mcp_test(_make_args(name="ink"))
+
+        assert exit_code == 1
+        assert "Connection failed" in capsys.readouterr().out
 
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
@@ -676,6 +701,21 @@ class TestDispatcher:
         mcp_command(_make_args(mcp_action=None))
         out = capsys.readouterr().out
         assert "Commands:" in out or "No MCP servers" in out
+
+    def test_test_action_propagates_handler_exit_code(self, monkeypatch):
+        from hermes_cli import mcp_config
+
+        monkeypatch.setattr(mcp_config, "cmd_mcp_test", lambda _args: 7)
+
+        assert mcp_config.mcp_command(_make_args(mcp_action="test")) == 7
+
+    def test_top_level_mcp_wrapper_propagates_dispatcher_exit_code(self, monkeypatch):
+        from hermes_cli import mcp_config
+        from hermes_cli.main import cmd_mcp
+
+        monkeypatch.setattr(mcp_config, "mcp_command", lambda _args: 9)
+
+        assert cmd_mcp(_make_args(mcp_action="test")) == 9
 
 
 # ---------------------------------------------------------------------------

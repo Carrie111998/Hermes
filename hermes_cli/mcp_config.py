@@ -721,7 +721,7 @@ def cmd_mcp_list(args=None):
 # ─── hermes mcp test ──────────────────────────────────────────────────────────
 
 def cmd_mcp_test(args):
-    """Test connection to an MCP server."""
+    """Test connection to an MCP server and return a process-style status."""
     name = args.name
     servers = _get_mcp_servers()
 
@@ -730,7 +730,7 @@ def cmd_mcp_test(args):
         available = list(servers.keys())
         if available:
             _info(f"Available: {', '.join(available)}")
-        return
+        return 1
 
     cfg = servers[name]
     print()
@@ -769,7 +769,7 @@ def cmd_mcp_test(args):
     except Exception as exc:
         elapsed_ms = (time.monotonic() - start) * 1000
         _error(f"Connection failed ({elapsed_ms:.0f}ms): {exc}")
-        return
+        return 1
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
@@ -780,6 +780,7 @@ def cmd_mcp_test(args):
             short = desc[:55] + "..." if len(desc) > 55 else desc
             print(f"    {color(tool_name, Colors.GREEN):36s} {short}")
     print()
+    return 0
 
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
@@ -1112,7 +1113,7 @@ def mcp_command(args):
 
     handler = handlers.get(action)
     if handler:
-        handler(args)
+        return handler(args)
     else:
         # No subcommand — drop the user into the catalog picker. This is the
         # "try enabling and it flows you into setup" UX matching `hermes plugin`.
