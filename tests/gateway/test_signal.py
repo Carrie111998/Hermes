@@ -385,6 +385,93 @@ class TestSignalSendImageFile:
         # Timestamp must be tracked for echo-back prevention
         assert 1234567890 in adapter._recent_sent_timestamps
 
+    @pytest.mark.asyncio
+    async def test_send_image_file_stages_for_sidecar_and_cleans_up(
+        self, monkeypatch, tmp_path
+    ):
+        staging_dir = tmp_path / "shared" / "signal"
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            attachment_staging_dir=str(staging_dir),
+        )
+        adapter._stop_typing_indicator = AsyncMock()
+        source = tmp_path / "private" / "chart.png"
+        source.parent.mkdir()
+        source.write_bytes(b"private image bytes")
+        captured_path = None
+
+        async def rpc(method, params, rpc_id=None):
+            nonlocal captured_path
+            captured_path = Path(params["attachments"][0])
+            assert captured_path.parent == staging_dir
+            assert captured_path.read_bytes() == source.read_bytes()
+            assert captured_path.stat().st_mode & 0o777 == 0o644
+            return {"timestamp": 1234567890}
+
+        adapter._rpc = rpc
+
+        result = await adapter.send_image_file(
+            chat_id="+155****4567",
+            image_path=str(source),
+        )
+
+        assert result.success is True
+        assert captured_path is not None
+        assert not captured_path.exists()
+        assert source.exists()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_keeps_already_shared_path(
+        self, monkeypatch, tmp_path
+    ):
+        staging_dir = tmp_path / "shared" / "signal"
+        staging_dir.mkdir(parents=True)
+        source = staging_dir / "chart.png"
+        source.write_bytes(b"shared image bytes")
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            attachment_staging_dir=str(staging_dir),
+        )
+        adapter._stop_typing_indicator = AsyncMock()
+        mock_rpc, captured = _stub_rpc({"timestamp": 1234567890})
+        adapter._rpc = mock_rpc
+
+        result = await adapter.send_image_file(
+            chat_id="+155****4567",
+            image_path=str(source),
+        )
+
+        assert result.success is True
+        assert captured[0]["params"]["attachments"] == [str(source)]
+        assert source.read_bytes() == b"shared image bytes"
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_fails_before_rpc_when_staging_fails(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            attachment_staging_dir=str(tmp_path / "shared"),
+        )
+        adapter._stop_typing_indicator = AsyncMock()
+        adapter._rpc = AsyncMock()
+        monkeypatch.setattr(
+            adapter,
+            "_stage_outbound_attachment",
+            MagicMock(side_effect=PermissionError("read-only mount")),
+        )
+        source = tmp_path / "chart.png"
+        source.write_bytes(b"image bytes")
+
+        result = await adapter.send_image_file(
+            chat_id="+155****4567",
+            image_path=str(source),
+        )
+
+        assert result.success is False
+        assert "rpc send image failed" in result.error.lower()
+        adapter._rpc.assert_not_awaited()
+
 
     @pytest.mark.asyncio
     async def test_send_image_file_too_large(self, monkeypatch, tmp_path):
@@ -1070,6 +1157,34 @@ class TestSignalSendMultipleImages:
         assert len(params["attachments"]) == 5
         # raise_on_rate_limit must be opted into so the retry loop sees 429s
         assert captured[0]["kwargs"].get("raise_on_rate_limit") is True
+
+    @pytest.mark.asyncio
+    async def test_batch_stages_all_paths_through_rpc_then_cleans_up(
+        self, monkeypatch, tmp_path
+    ):
+        staging_dir = tmp_path / "shared" / "signal"
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            attachment_staging_dir=str(staging_dir),
+        )
+        adapter._stop_typing_indicator = AsyncMock()
+        captured_paths = []
+
+        async def rpc(method, params, rpc_id=None, **kwargs):
+            captured_paths.extend(Path(path) for path in params["attachments"])
+            assert all(path.exists() for path in captured_paths)
+            assert all(path.parent == staging_dir for path in captured_paths)
+            return {"timestamp": 1}
+
+        adapter._rpc = rpc
+
+        await adapter.send_multiple_images(
+            chat_id="+155****4567",
+            images=_make_image_files(tmp_path, 3),
+        )
+
+        assert len(captured_paths) == 3
+        assert all(not path.exists() for path in captured_paths)
 
 
     @pytest.mark.asyncio

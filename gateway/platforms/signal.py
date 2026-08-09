@@ -266,6 +266,10 @@ class SignalAdapter(BasePlatformAdapter):
         self.http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
         self.account = extra.get("account", "")
         self.ignore_stories = extra.get("ignore_stories", True)
+        staging_dir = str(extra.get("attachment_staging_dir", "") or "").strip()
+        self.attachment_staging_dir = (
+            Path(staging_dir).expanduser() if staging_dir else None
+        )
 
         # Parse allowlists — group policy is derived from presence of group allowlist
         group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
@@ -1050,6 +1054,77 @@ class SignalAdapter(BasePlatformAdapter):
     # Sending
     # ------------------------------------------------------------------
 
+    def _stage_outbound_attachment(
+        self,
+        file_path: str,
+    ) -> Tuple[str, Optional[Path]]:
+        """Copy an attachment into a signal-cli-readable shared directory."""
+        stage_dir = self.attachment_staging_dir
+        if stage_dir is None:
+            return file_path, None
+
+        source = Path(file_path)
+        try:
+            resolved_source = source.resolve()
+            resolved_source.relative_to(stage_dir.resolve())
+            return str(resolved_source), None
+        except ValueError:
+            pass
+
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        fd, staged_name = tempfile.mkstemp(
+            prefix="hermes-signal-",
+            suffix=source.suffix[:16],
+            dir=stage_dir,
+        )
+        staged_path = Path(staged_name)
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "wb") as target, source.open("rb") as source_file:
+                shutil.copyfileobj(source_file, target)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            staged_path.unlink(missing_ok=True)
+            raise
+        return str(staged_path), staged_path
+
+    async def _rpc_send_attachments(
+        self,
+        params: Dict[str, Any],
+        **rpc_kwargs: Any,
+    ) -> Any:
+        """Send attachment params after staging paths for a sidecar daemon."""
+        staged_paths: List[str] = []
+        cleanup_paths: List[Path] = []
+        try:
+            for file_path in params.get("attachments", []):
+                staged_path, cleanup_path = self._stage_outbound_attachment(file_path)
+                staged_paths.append(staged_path)
+                if cleanup_path is not None:
+                    cleanup_paths.append(cleanup_path)
+        except OSError as exc:
+            logger.warning("Signal: failed to stage outbound attachment: %s", exc)
+            for cleanup_path in cleanup_paths:
+                cleanup_path.unlink(missing_ok=True)
+            return None
+
+        staged_params = dict(params, attachments=staged_paths)
+        try:
+            return await self._rpc("send", staged_params, **rpc_kwargs)
+        finally:
+            for cleanup_path in cleanup_paths:
+                try:
+                    cleanup_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Signal: failed to remove staged attachment %s: %s",
+                        cleanup_path,
+                        exc,
+                    )
+
     async def send(
         self,
         chat_id: str,
@@ -1276,8 +1351,8 @@ class SignalAdapter(BasePlatformAdapter):
                 await scheduler.acquire(n)
                 try:
                     _rpc_t0 = time.monotonic()
-                    result = await self._rpc(
-                        "send", params, raise_on_rate_limit=True, timeout=send_timeout,
+                    result = await self._rpc_send_attachments(
+                        params, raise_on_rate_limit=True, timeout=send_timeout,
                     )
                     _rpc_duration = time.monotonic() - _rpc_t0
                     if result is not None:
@@ -1404,7 +1479,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params)
+        result = await self._rpc_send_attachments(params)
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
@@ -1446,7 +1521,7 @@ class SignalAdapter(BasePlatformAdapter):
         else:
             params["recipient"] = [await self._resolve_recipient(chat_id)]
 
-        result = await self._rpc("send", params)
+        result = await self._rpc_send_attachments(params)
         if result is not None:
             success, err_msg = self._validate_send_result(result)
             if not success:
