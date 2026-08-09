@@ -66,10 +66,13 @@ class FleetRegistry:
     def coverage_report(self) -> FleetCoverage:
         registered = len(self._targets)
         snapshotted = len(self._snapshots)
-        disabled_count = sum(1 for target in self._targets.values() if target.spec.labels.get("process_observation") == "disabled")
-        coverage = 0 if registered == 0 else (max(0, snapshotted - disabled_count) * 100) // registered
+        out_scope = tuple(sorted(target.target_id for target in self._targets.values() if target.spec.labels.get("g2_scope") == "out_of_scope"))
+        core_targets = [target for target in self._targets.values() if target.spec.labels.get("g2_scope", "core") == "core"]
+        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots)
+        disabled_count = sum(1 for target in core_targets if target.spec.labels.get("process_observation") == "disabled")
+        coverage = 0 if not core_targets else (max(0, core_snapshots - disabled_count) * 100) // len(core_targets)
         disabled = ("processes",) if disabled_count else ()
-        return FleetCoverage(registered, snapshotted, coverage, disabled)
+        return FleetCoverage(len(core_targets), core_snapshots, coverage, disabled, out_scope)
 
 
 _PROFILE_TARGETS: tuple[tuple[str, str, str, Criticality, str], ...] = (
@@ -85,7 +88,7 @@ def bootstrap_gateway_registry() -> FleetRegistry:
     """Return the fixed five-profile inventory recorded during Phase 0."""
     def spec_for(profile, label, logs_path, criticality, label_profile):
         plist = Path(f"~/Library/LaunchAgents/{label}.plist").expanduser()
-        labels = {"service_label": label, "profile": label_profile}
+        labels = {"service_label": label, "profile": label_profile, "g2_scope": "core" if profile == "default" else "out_of_scope"}
         try:
             meta = plist.lstat()
             if stat.S_ISREG(meta.st_mode) and not stat.S_ISLNK(meta.st_mode) and meta.st_uid == os.getuid() and meta.st_nlink == 1 and meta.st_size <= 1024 * 1024:
