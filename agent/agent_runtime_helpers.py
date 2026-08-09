@@ -3458,7 +3458,14 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     seen_assistant_call_ids.add(cid)
                 kept_tcs.append(tc)
             if len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {**msg, "tool_calls": kept_tcs}
+                if kept_tcs:
+                    msg = {**msg, "tool_calls": kept_tcs}
+                else:
+                    # All calls were duplicate ids — drop the key entirely.
+                    # Setting tool_calls: [] makes strict providers (DeepSeek)
+                    # 400 with "empty array" even though the early sanitizer
+                    # pass already ran.
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()
@@ -3476,6 +3483,28 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # Final pass: dedup can leave assistant messages with tool_calls: [] when
+    # every call in a turn was a duplicate id. Strict providers reject that.
+    final: List[Dict[str, Any]] = []
+    dropped_empty_after_dedup = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "tool_calls" in msg
+            and not (isinstance(msg["tool_calls"], list) and msg["tool_calls"])
+        ):
+            msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            dropped_empty_after_dedup += 1
+        final.append(msg)
+    if dropped_empty_after_dedup:
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped empty tool_calls on %d assistant "
+            "message(s) after dedup",
+            dropped_empty_after_dedup,
+        )
+        messages = final
     return messages
 
 
