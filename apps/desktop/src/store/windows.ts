@@ -54,6 +54,25 @@ export function isHudWindow(): boolean {
   return result
 }
 
+/**
+ * Profile the HUD window was opened against (`?profile=` in the query before
+ * the hash). Empty when the opener did not carry one — boot then falls back to
+ * the primary preference (legacy single-profile path).
+ */
+export function hudWindowProfile(): null | string {
+  if (typeof window === 'undefined') {
+    return null
+  }
+
+  try {
+    const raw = new URLSearchParams(window.location.search).get('profile')
+
+    return raw && raw.trim() ? raw.trim() : null
+  } catch {
+    return null
+  }
+}
+
 // A "watch" window spectates a session that is being driven elsewhere (a
 // running subagent). It resumes lazily — the gateway registers history + a
 // transport for the live mirror without building an agent, so opening it is

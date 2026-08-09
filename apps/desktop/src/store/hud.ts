@@ -16,6 +16,7 @@
 import { atom } from 'nanostores'
 
 import { requestComposerDraftSync } from '@/store/composer'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { isHudWindow } from '@/store/windows'
 
 /** Whether a HUD window is currently up. In the HUD's own renderer this is
@@ -53,9 +54,14 @@ export function openHud(sessionId?: null | string): void {
   // a cross-window storage event that lands after it has already painted.
   requestComposerDraftSync('flush')
 
+  // Carry the active gateway profile with the session id. HUD boot adopts it
+  // from the URL; without it the HUD dials the primary/default backend and
+  // the focused non-primary conversation is not found (#82285).
+  const profile = normalizeProfileKey($activeGatewayProfile.get())
+
   $hudActive.set(true)
   $hudSession.set(sessionId ?? null)
-  void api.open({ sessionId: sessionId ?? null })
+  void api.open({ sessionId: sessionId ?? null, profile })
 }
 
 /** Leave HUD mode. Callable from either window — main closes the child, the

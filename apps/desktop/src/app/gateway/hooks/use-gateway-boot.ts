@@ -39,6 +39,7 @@ import {
   setSessionsLoading
 } from '@/store/session'
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
+import { hudWindowProfile, isHudWindow } from '@/store/windows'
 import type { RpcEvent } from '@/types/hermes'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
@@ -250,11 +251,34 @@ export function useGatewayBoot({
       }
     }
 
-    // Adopt the profile the primary (window) backend booted as, so same-profile
-    // resumes are no-op swaps and reconnects target the right backend.
-    // Best-effort: a missing preference means "default". Shared by boot + soft
-    // switch.
+    // HUD handoff carries `?profile=` so a non-primary conversation opens on
+    // the backend that owns it. Session ids alone are not enough across
+    // profiles (#82285).
+    function hudHandoffProfile(): null | string {
+      if (!isHudWindow()) {
+        return null
+      }
+
+      const raw = hudWindowProfile()
+
+      return raw ? normalizeProfileKey(raw) : null
+    }
+
+    // Adopt the profile this window should talk to. HUD windows prefer the
+    // handoff profile from the URL; the main window adopts the desktop's
+    // primary preference. Best-effort: a missing preference means "default".
+    // Shared by boot + soft switch.
     async function adoptPrimaryProfile() {
+      const handoff = hudHandoffProfile()
+
+      if (handoff) {
+        $activeGatewayProfile.set(handoff)
+        setPrimaryGateway(gateway, handoff)
+        void ensureGatewayForProfile(handoff)
+
+        return
+      }
+
       try {
         const pref = await desktop.profile?.get?.()
         const profileKey = (pref?.profile ?? '').trim() || 'default'
@@ -298,7 +322,10 @@ export function useGatewayBoot({
         gateway.close()
         closeSecondaryGateways()
 
-        const conn = await desktop.getConnection()
+        // Seed the handoff/primary profile before dialing so getConnection
+        // hits the right backend (same order as boot()).
+        await adoptPrimaryProfile()
+        const conn = await desktop.getConnection($activeGatewayProfile.get())
 
         if (cancelled) {
           return
@@ -312,9 +339,7 @@ export function useGatewayBoot({
           return
         }
 
-        // Same shape as boot(): profile first (session scope depends on it),
-        // then the independent fetches concurrently.
-        await adoptPrimaryProfile()
+        // Profile already adopted above; refresh the independent fetches.
         await Promise.all([
           seedDefaultCwd(),
           callbacksRef.current.refreshHermesConfig().catch(() => undefined),
@@ -488,7 +513,11 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
-        const conn = await desktop.getConnection()
+        // Profile before dial: HUD windows must connect to the handoff
+        // profile's backend, not the primary preference, or the session in the
+        // hash is resolved against the wrong state.db (#82285).
+        await adoptPrimaryProfile()
+        const conn = await desktop.getConnection($activeGatewayProfile.get())
 
         if (cancelled) {
           return
@@ -525,13 +554,6 @@ export function useGatewayBoot({
         if (cancelled) {
           return
         }
-
-        // Profile adoption must land first: refreshSessions scopes its fetch by
-        // $profileScope ← $activeGatewayProfile. The remaining three fetches
-        // (cwd seed, config, sessions) are independent REST calls — running
-        // them serially added their sum to time-to-populated-sidebar when only
-        // the max is needed.
-        await adoptPrimaryProfile()
 
         setDesktopBootStep({
           phase: 'renderer.config',
