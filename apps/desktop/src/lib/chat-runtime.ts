@@ -382,11 +382,11 @@ export function messageCreatedAt(message: Pick<ChatMessage, 'timestamp'>, nowMs 
     : new Date(nowMs)
 }
 
-export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
+export function toRuntimeMessage(message: ChatMessage, nowMs = Date.now()): ThreadMessage {
   const role =
     message.role === 'user' || message.role === 'assistant' || message.role === 'system' ? message.role : 'assistant'
 
-  const createdAt = messageCreatedAt(message)
+  const createdAt = messageCreatedAt(message, nowMs)
 
   // Reactions and the durable row id ride metadata.custom for every role — the
   // established channel for per-message extras (attachmentRefs below).

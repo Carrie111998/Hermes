@@ -59,3 +59,29 @@ def test_format_display_timestamp_normalizes_clock_to_surface_timezone(monkeypat
     )
 
     assert rendered == "2026-08-08 15:04:05 EDT"
+
+
+def test_format_display_timestamp_supports_portable_extension_directives():
+    instant = datetime(2026, 8, 8, 5, 4, 5, tzinfo=timezone.utc)
+
+    rendered = hermes_time.format_display_timestamp(
+        instant,
+        enabled=True,
+        format_string="%k|%l|%P|%s",
+        tz=timezone.utc,
+    )
+
+    assert rendered == f" 5| 5|am|{int(instant.timestamp())}"
+
+
+def test_format_display_timestamp_preserves_unknown_directives():
+    instant = datetime(2026, 8, 8, 19, 4, 5, tzinfo=timezone.utc)
+
+    rendered = hermes_time.format_display_timestamp(
+        instant,
+        enabled=True,
+        format_string="%H:%M %q",
+        tz=timezone.utc,
+    )
+
+    assert rendered == "19:04 %q"

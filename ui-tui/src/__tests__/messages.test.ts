@@ -130,6 +130,47 @@ describe('MessageLine', () => {
     expect(stripAnsi(output)).toContain('2026-08-08 15:04:05')
   })
 
+  it('does not clip an inline timestamp beside assistant markdown', () => {
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    let output = ''
+
+    Object.assign(stdout, { columns: 40, isTTY: false, rows: 24 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+    stdout.on('data', chunk => {
+      output += chunk.toString()
+    })
+
+    const timestamp = new Date(2026, 7, 8, 15, 4, 5).getTime()
+
+    const instance = renderSync(
+      React.createElement(MessageLine, {
+        cols: 40,
+        msg: {
+          role: 'assistant',
+          text: 'This is a somewhat long assistant response that should wrap cleanly.',
+          timestamp
+        },
+        showTimestamps: true,
+        t: DEFAULT_THEME,
+        timestampFormat: '%H:%M'
+      }),
+      {
+        patchConsole: false,
+        stderr: stderr as NodeJS.WriteStream,
+        stdin: stdin as NodeJS.ReadStream,
+        stdout: stdout as NodeJS.WriteStream
+      }
+    )
+
+    instance.unmount()
+    instance.cleanup()
+
+    expect(stripAnsi(output)).toContain('[15:04] This is')
+  })
+
   it('preserves a separator after compound user prompt glyphs in transcript rows', () => {
     const stdout = new PassThrough()
     const stdin = new PassThrough()

@@ -25,6 +25,9 @@ const FALLBACK_STATUS = getAutoStatus(false, false, false, false, undefined)
  */
 export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMessageRepository {
   const cacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
+  // Streaming replaces ChatMessage objects on every delta. Key timestamp-less
+  // UI creation times by stable row id so their rendered clock cannot drift.
+  const createdAtByMessageIdRef = useRef(new Map<string, number>())
   const toolMergeCacheRef = useRef(createToolMergeCache())
 
   return useMemo(() => {
@@ -34,7 +37,16 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
     let visibleParentId: string | null = null
     let headId: string | null = null
 
-    for (const message of coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)) {
+    const coalescedMessages = coalesceToolOnlyAssistants(messages, toolMergeCacheRef.current)
+    const currentIds = new Set(coalescedMessages.map(message => message.id))
+
+    for (const id of createdAtByMessageIdRef.current.keys()) {
+      if (!currentIds.has(id)) {
+        createdAtByMessageIdRef.current.delete(id)
+      }
+    }
+
+    for (const message of coalescedMessages) {
       // A repeated id is a transcript bug upstream, but it must not reach the
       // repository: MessageRepository throws on the second link ("A message
       // with the same id already exists in the parent tree") and takes the
@@ -59,11 +71,18 @@ export function useRuntimeMessageRepository(messages: ChatMessage[]): ExportedMe
       const cachedMessage = cacheRef.current.get(message)
 
       const runtimeMessage =
-        cachedMessage ?? fromThreadMessageLike(toRuntimeMessage(message), message.id, FALLBACK_STATUS)
+        cachedMessage ??
+        fromThreadMessageLike(
+          toRuntimeMessage(message, createdAtByMessageIdRef.current.get(message.id) ?? Date.now()),
+          message.id,
+          FALLBACK_STATUS
+        )
 
       if (!cachedMessage) {
         cacheRef.current.set(message, runtimeMessage)
       }
+
+      createdAtByMessageIdRef.current.set(message.id, runtimeMessage.createdAt.getTime())
 
       items.push({ message: runtimeMessage, parentId })
 

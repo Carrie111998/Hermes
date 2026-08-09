@@ -1,6 +1,6 @@
 import { MessageRepository } from '@assistant-ui/core/internal'
 import { renderHook } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 import { syncRepositoryIncrementally } from '@/lib/incremental-external-store-runtime'
@@ -50,6 +50,42 @@ describe('useRuntimeMessageRepository', () => {
     )
 
     expect(feedToRepository(result.current).map(item => item.id)).toEqual(['user-1', 'assistant-stream-1', 'user-2'])
+  })
+
+  it('keeps a timestamp-less streaming message creation time stable across immutable updates', () => {
+    vi.useFakeTimers()
+
+    try {
+      vi.setSystemTime(new Date('2026-08-08T19:04:05.000Z'))
+      const initial = text('assistant-stream-1', 'assistant', 'partial')
+
+      const { rerender, result } = renderHook(
+        ({ messages }: { messages: ChatMessage[] }) => useRuntimeMessageRepository(messages),
+        { initialProps: { messages: [initial] } }
+      )
+
+      const startedAt = result.current.messages[0]?.message.createdAt
+
+      expect(startedAt).toEqual(new Date('2026-08-08T19:04:05.000Z'))
+
+      vi.setSystemTime(new Date('2026-08-08T19:05:05.000Z'))
+      rerender({ messages: [{ ...initial, parts: [{ type: 'text', text: 'partial update' }] }] })
+
+      expect(result.current.messages[0]?.message.createdAt).toEqual(startedAt)
+
+      // A window/session transition can temporarily remove the row. Restore
+      // from the identity cache, then prove a later immutable delta still uses
+      // the original display timestamp rather than the current clock.
+      rerender({ messages: [] })
+      vi.setSystemTime(new Date('2026-08-08T19:06:05.000Z'))
+      rerender({ messages: [initial] })
+      vi.setSystemTime(new Date('2026-08-08T19:07:05.000Z'))
+      rerender({ messages: [{ ...initial, parts: [{ type: 'text', text: 'later update' }] }] })
+
+      expect(result.current.messages[0]?.message.createdAt).toEqual(startedAt)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('anchors a branch group to its fork point, and a windowed cut keeps it', () => {

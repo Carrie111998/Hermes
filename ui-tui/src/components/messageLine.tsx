@@ -1,4 +1,4 @@
-import { Ansi, Box, NoSelect, Text } from '@hermes/ink'
+import { Ansi, Box, NoSelect, stringWidth, Text } from '@hermes/ink'
 import { formatDisplayTimestamp } from '@hermes/shared/display-timestamp'
 import { memo, useState } from 'react'
 
@@ -154,6 +154,12 @@ export const MessageLine = memo(function MessageLine({
         })
       : ''
 
+  const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
+  const timestampLabel = timestamp ? '[' + timestamp + ']' : ''
+  const timestampLabelWidth = stringWidth(timestampLabel)
+  const timestampFitsInline = Boolean(timestampLabel && timestampLabelWidth + 1 < bodyWidth)
+  const contentWidth = timestampFitsInline ? bodyWidth - timestampLabelWidth - 1 : bodyWidth
+
   const showDetails =
     (toolsMode !== 'hidden' && Boolean(msg.tools?.length)) || (thinkingMode !== 'hidden' && Boolean(thinking))
 
@@ -190,15 +196,13 @@ export const MessageLine = memo(function MessageLine({
     }
 
     if (msg.role === 'assistant') {
-      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
-
       return isStreaming ? (
         // Incremental markdown: split at the last stable block boundary so
         // only the in-flight tail re-tokenizes per delta. See
         // streamingMarkdown.tsx for the cost model.
-        <StreamingMd cols={bodyWidth} compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
+        <StreamingMd cols={contentWidth} compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
       ) : (
-        <Md cols={bodyWidth} compact={compact} t={t} text={msg.text} />
+        <Md cols={contentWidth} compact={compact} t={t} text={msg.text} />
       )
     }
 
@@ -284,13 +288,22 @@ export const MessageLine = memo(function MessageLine({
           </Text>
         </NoSelect>
 
-        <Box width={transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)}>
+        <Box flexDirection={timestamp && !timestampFitsInline ? 'column' : 'row'} width={bodyWidth}>
           {timestamp && (
-            <Text color={t.color.muted} dimColor>
-              [{timestamp}]{' '}
-            </Text>
+            <NoSelect flexShrink={0}>
+              <Text color={t.color.muted} dimColor wrap="truncate-end">
+                {timestampLabel}
+                {timestampFitsInline ? ' ' : ''}
+              </Text>
+            </NoSelect>
           )}
-          {content}
+          {timestampFitsInline ? (
+            <Box flexDirection="column" width={contentWidth}>
+              {content}
+            </Box>
+          ) : (
+            content
+          )}
         </Box>
       </Box>
     </Box>

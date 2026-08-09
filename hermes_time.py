@@ -14,6 +14,7 @@ crashes due to a bad timezone string.
 """
 
 import logging
+import math
 import os
 from datetime import datetime
 from hermes_constants import get_config_path
@@ -133,6 +134,69 @@ def now() -> datetime:
     return datetime.now().astimezone()
 
 
+def _expand_portable_strftime_directives(dt: datetime, format_string: str) -> str:
+    """Expand directives unavailable on some Python platforms."""
+    parts = []
+    index = 0
+
+    while index < len(format_string):
+        char = format_string[index]
+        if char != "%" or index + 1 >= len(format_string):
+            parts.append(char)
+            index += 1
+            continue
+
+        directive = format_string[index + 1]
+        if directive == "%":
+            # Keep the escape intact for the final strftime pass.
+            parts.append("%%")
+        elif directive == "k":
+            parts.append(f"{dt.hour:2d}")
+        elif directive == "l":
+            parts.append(f"{dt.hour % 12 or 12:2d}")
+        elif directive == "P":
+            # A locale-derived replacement can theoretically contain a percent.
+            parts.append(dt.strftime("%p").lower().replace("%", "%%"))
+        elif directive == "s":
+            parts.append(str(math.floor(dt.timestamp())))
+        else:
+            parts.append(f"%{directive}")
+        index += 2
+
+    return "".join(parts)
+
+
+def _safe_strftime(dt: datetime, format_string: str) -> str:
+    """Apply strftime without letting one unsupported directive break UI."""
+    try:
+        return dt.strftime(format_string)
+    except (UnicodeError, ValueError):
+        # Windows rejects some unknown or POSIX-only directives that glibc
+        # preserves. Expand valid simple directives one at a time and leave the
+        # unsupported token literal, matching the shared TypeScript formatter.
+        parts = []
+        index = 0
+        while index < len(format_string):
+            char = format_string[index]
+            if char != "%" or index + 1 >= len(format_string):
+                parts.append(char)
+                index += 1
+                continue
+
+            directive = format_string[index + 1]
+            token = f"%{directive}"
+            if directive == "%":
+                parts.append("%")
+            else:
+                try:
+                    parts.append(dt.strftime(token))
+                except (UnicodeError, ValueError):
+                    parts.append(token)
+            index += 2
+
+        return "".join(parts)
+
+
 def format_display_timestamp(
     value: Any = None,
     *,
@@ -170,6 +234,5 @@ def format_display_timestamp(
             dt = dt.astimezone()
         dt = dt.astimezone(tz)
 
-    return dt.strftime(str(format_string or "%H:%M"))
-
-
+    portable_format = _expand_portable_strftime_directives(dt, str(format_string or "%H:%M"))
+    return _safe_strftime(dt, portable_format)
