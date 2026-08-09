@@ -7,7 +7,7 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import CompressionContext, MemoryProvider
 from agent.memory_manager import MemoryManager, inject_memory_provider_tools
 
 # ---------------------------------------------------------------------------
@@ -138,6 +138,18 @@ class TestMemoryProviderABC:
         p.sync_turn("user", "assistant")
         p.shutdown()
 
+    def test_compression_context_has_safe_defaults(self):
+        """Structured compression context has isolated mutable defaults."""
+        first = CompressionContext()
+        second = CompressionContext()
+
+        assert first.text == ""
+        assert first.key_facts == []
+
+        first.key_facts.append("important fact")
+
+        assert second.key_facts == []
+
 
 # ---------------------------------------------------------------------------
 # MemoryManager tests
@@ -159,6 +171,48 @@ class TestMemoryManager:
         mgr.add_provider(p)
         assert len(mgr.providers) == 1
         assert [p.name for p in mgr.providers] == ["test1"]
+
+
+    def test_pre_compress_merges_legacy_and_structured_context(self):
+        """Legacy strings and structured provider context are aggregated."""
+        mgr = MemoryManager()
+
+        legacy = FakeMemoryProvider("builtin")
+        legacy.on_pre_compress = MagicMock(
+            return_value="Legacy provider context"
+        )
+
+        structured = FakeMemoryProvider("external")
+        structured.on_pre_compress = MagicMock(
+            return_value=CompressionContext(
+                text="Structured provider context",
+                key_facts=[
+                    "Python version: 3.11",
+                    "Do not modify database schema",
+                ],
+            )
+        )
+
+        mgr.add_provider(legacy)
+        mgr.add_provider(structured)
+
+        messages = [{"role": "user", "content": "Continue the task"}]
+
+        result = mgr.on_pre_compress(messages)
+
+        assert isinstance(result, CompressionContext)
+        assert result.text == (
+            "Legacy provider context\n\n"
+            "Structured provider context"
+        )
+        assert result.key_facts == [
+            "Python version: 3.11",
+            "Do not modify database schema",
+        ]
+
+        legacy.on_pre_compress.assert_called_once_with(messages)
+        structured.on_pre_compress.assert_called_once_with(messages)
+
 
     def test_get_provider_by_name(self):
         mgr = MemoryManager()

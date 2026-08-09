@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.memory_provider import CompressionContext
 
 def _make_agent(memory_manager, compressor):
     from run_agent import AIAgent
@@ -84,6 +85,92 @@ def test_on_pre_compress_result_reaches_compressor_with_existing_options():
         "force": True,
         "memory_context": "Checkpoint id: ctx-orchestrator",
     }
+
+
+def test_structured_pre_compress_context_reaches_compressor():
+    """Structured memory context is rendered into the existing string boundary."""
+    manager = MagicMock()
+    manager.on_pre_compress.return_value = CompressionContext(
+        text="Project state: Hermes",
+        key_facts=[
+            "Python version: 3.11",
+            "Do not modify database schema",
+        ],
+    )
+
+    received = {}
+    compressor = MagicMock()
+
+    def capture_compress(
+        incoming,
+        current_tokens=None,
+        focus_topic=None,
+        force=False,
+        memory_context="",
+    ):
+        received["memory_context"] = memory_context
+        return [incoming[0], incoming[-1]]
+
+    compressor.compress.side_effect = capture_compress
+    _configure_engine_state(compressor)
+    agent = _make_agent(manager, compressor)
+
+    agent._compress_context(
+        _messages(),
+        "sys",
+        approx_tokens=100_000,
+    )
+
+    assert received["memory_context"] == (
+        "Project state: Hermes\n\n"
+        "MEMORY PROVIDER KEY FACTS:\n"
+        "- Python version: 3.11\n"
+        "- Do not modify database schema"
+    )
+
+
+def test_structured_key_facts_are_sanitized_before_compressor():
+    """Structured key facts cannot bypass the memory-context egress sanitizer."""
+    secret = "sk-" + "a" * 30
+
+    manager = MagicMock()
+    manager.on_pre_compress.return_value = CompressionContext(
+        text="Project state: Hermes",
+        key_facts=[
+            f"api key: {secret}",
+            "Python version: 3.11",
+        ],
+    )
+
+    received = []
+    compressor = MagicMock()
+
+    def capture_compress(
+        messages,
+        current_tokens=None,
+        memory_context="",
+        **_kwargs,
+    ):
+        received.append(memory_context)
+        return [messages[0], messages[-1]]
+
+    compressor.compress.side_effect = capture_compress
+    _configure_engine_state(compressor)
+    agent = _make_agent(manager, compressor)
+
+    agent._compress_context(
+        _messages(),
+        "sys",
+        approx_tokens=100_000,
+    )
+
+    assert len(received) == 1
+
+    context = received[0]
+
+    assert secret not in context
+    assert "Python version: 3.11" in context
+    assert "MEMORY PROVIDER KEY FACTS:" in context
 
 
 def test_legacy_engine_receives_only_supported_compression_arguments():

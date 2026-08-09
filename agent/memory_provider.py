@@ -25,7 +25,7 @@ Optional hooks (override to opt in):
   on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
   on_session_end(messages)               — end-of-session extraction
   on_session_switch(new_session_id, **kwargs) — mid-process session_id rotation
-  on_pre_compress(messages) -> str       — extract before context compression
+  on_pre_compress(messages) -> str | CompressionContext — extract before context compression
   on_memory_write(action, target, content, metadata=None) — mirror built-in memory writes
   on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
   backup_paths() -> list[str]            — extra on-disk paths to include in `hermes backup`
@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,14 @@ def is_trivial_prompt(text: Optional[str]) -> bool:
     if stripped.startswith("/"):
         return True
     return bool(TRIVIAL_PROMPT_RE.match(stripped))
+
+
+@dataclass
+class CompressionContext:
+    """Structured context supplied by memory providers before compression."""
+
+    text: str = ""
+    key_facts: List[str] = field(default_factory=list)
 
 
 class MemoryProvider(ABC):
@@ -255,15 +264,16 @@ class MemoryProvider(ABC):
         Default is no-op for backward compatibility.
         """
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str | CompressionContext:
         """Called before context compression discards old messages.
 
         Use to extract insights from messages about to be compressed.
         messages is the list that will be summarized/discarded.
 
-        Return text to include in the compression summary prompt so the
-        compressor preserves provider-extracted insights. Return empty
-        string for no contribution (backwards-compatible default).
+        Return either legacy freeform text or a CompressionContext with
+        structured key facts to preserve during compression. Returning a
+        string remains supported for backward compatibility. Return an
+        empty string for no contribution.
         """
         return ""
 
