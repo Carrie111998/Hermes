@@ -1728,4 +1728,59 @@ export const eu = defineLocale({
       emptyDesc: 'Ez dago automatizazio-blueprint-ik backend honetan.'
     }
   },
+
+  artifacts: {
+    search: 'Bilatu artifact-ak...',
+    refresh: 'Freskatu artifact-ak',
+    refreshing: 'Artifact-ak freskatzen',
+    indexing: 'Azken saioen artifact-ak indexatzen',
+    tabAll: 'Denak',
+    tabImages: 'Irudiak',
+    tabFiles: 'Fitxategiak',
+    tabLinks: 'Loturak',
+    noArtifactsTitle: 'Ez da artifact-ik aurkitu',
+    noArtifactsDesc: 'Sortutako irudiak eta fitxategi-irteerak hemen agertuko dira saioek ekoizten dituzten heinean.',
+    failedLoad: 'Artifact-ak kargatzeak huts egin du',
+    openFailed: 'Irekitzeak huts egin du',
+    itemsImage: 'irudiak',
+    itemsLink: 'loturak',
+    itemsFile: 'fitxategiak',
+    itemsGeneric: 'elementuak',
+    zero: '0',
+    rangeOf: (start, end, total) => `${total}-tik ${start}-${end}`,
+    goToPage: (itemLabel, page) => `Joan ${itemLabel} ${page}. orrira`,
+    colTitleLink: 'Loturaren izenburua',
+    colTitleFile: 'Izena',
+    colTitleDefault: 'Izenburua / izena',
+    colLocationLink: 'URLa',
+    colLocationFile: 'Bidea',
+    colLocationDefault: 'Kokapena',
+    colSession: 'Saioa',
+    kindImage: 'irudia',
+    kindFile: 'fitxategia',
+    kindLink: 'lotura',
+    chat: 'Txata',
+    copyUrl: 'Kopiatu URLa',
+    copyPath: 'Kopiatu bidea'
+  },
+
+  artifactCard: {
+    kind: { code: 'Kodea', html: 'Orri interaktiboa', svg: 'Grafikoa' },
+    generating: lines => `Sortzen… ${lines} lerro`,
+    versionBadge: count => `${count} bertsio`,
+    open: 'Ireki'
+  },
+
+  artifactPreview: {
+    versionOf: (current, total) => `${total}-tik v${current}`,
+    olderVersion: 'Bertsio zaharragoa',
+    newerVersion: 'Bertsio berriagoa',
+    latest: 'Azkena',
+    copyContent: 'Kopiatu edukia',
+    download: 'Deskargatu',
+    openInBrowser: 'Ireki nabigatzailean',
+    openInBrowserFailed: 'Ezin izan da nabigatzailean ireki',
+    missingTitle: 'Artifact-a ez dago erabilgarri',
+    missingBody: 'Artifact hau ez dago jada erregistro lokalean.'
+  },
 })
