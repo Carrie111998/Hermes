@@ -137,6 +137,161 @@ async def test_inbound_frame_reaches_handler(server):
         await t.disconnect()
 
 
+# ── outbound answers a RESULT when the socket is dead (never a raise/stall) ──
+
+
+async def _serve(handler):
+    """Start a throwaway ws server on an ephemeral port; return (server, url)."""
+    srv = await websockets.serve(handler, "127.0.0.1", 0)
+    port = next(iter(srv.sockets)).getsockname()[1]
+    return srv, f"ws://127.0.0.1:{port}"
+
+
+async def _await_reader_end(t) -> None:
+    """Block until the transport's read loop has ended (peer closed the socket)."""
+    for _ in range(300):
+        if t._reader is not None and t._reader.done():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("read loop did not end after the peer closed the socket")
+
+
+@pytest.mark.asyncio
+async def test_send_outbound_returns_result_after_peer_close():
+    """A send issued after the peer dropped the socket must RETURN a failure result.
+
+    ``RelayTransport.send_outbound`` is documented to return a result dict, and
+    ``RelayAdapter.send``/``send_for_platform``/``edit_message`` consume it with
+    no ``try`` — so a raise escapes into the send lane. Before this fix the
+    reader left ``self._ws`` pointing at the closed socket, so the
+    not-connected guard never fired and ``_send`` raised ``ConnectionClosed``.
+    """
+
+    async def handler(ws):
+        async for raw in ws:
+            for line in str(raw).split("\n"):
+                if not line.strip():
+                    continue
+                if json.loads(line).get("type") == "hello":
+                    await ws.send(
+                        json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n"
+                    )
+                    # Let the descriptor flush, then drop the socket.
+                    await asyncio.sleep(0.05)
+                    await ws.close()
+                    return
+
+    srv, url = await _serve(handler)
+    t = WebSocketRelayTransport(url, "discord", "appShared", outbound_timeout_s=4.0)
+    try:
+        await t.connect()
+        await t.handshake()
+        await _await_reader_end(t)
+        result = await t.send_outbound({"op": "send", "chat_id": "c1", "content": "hi"})
+        assert isinstance(result, dict)
+        assert result.get("success") is False
+        assert result.get("error")
+    finally:
+        await t.disconnect()
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_inflight_outbound_fails_fast_on_peer_close():
+    """An outbound already awaiting a result must settle when the socket dies.
+
+    Before this fix nothing settled ``_pending`` outside ``disconnect()``, so the
+    waiter rode the FULL outbound budget (30s in production) and then reported a
+    bogus "timed out" for a socket that had died immediately.
+    """
+
+    async def handler(ws):
+        async for raw in ws:
+            for line in str(raw).split("\n"):
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                if frame.get("type") == "hello":
+                    await ws.send(
+                        json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n"
+                    )
+                elif frame.get("type") == "outbound":
+                    # Never answer the request — just drop the socket under it.
+                    await asyncio.sleep(0.05)
+                    await ws.close()
+                    return
+
+    srv, url = await _serve(handler)
+    t = WebSocketRelayTransport(url, "discord", "appShared", outbound_timeout_s=4.0)
+    try:
+        await t.connect()
+        await t.handshake()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        result = await t.send_outbound({"op": "send", "chat_id": "c1", "content": "hi"})
+        elapsed = loop.time() - started
+        assert result.get("success") is False
+        assert result.get("error") == "relay connection lost"
+        # Fails fast on the close, rather than burning the whole 4s budget.
+        assert elapsed < 2.0, f"outbound rode the timeout budget ({elapsed:.2f}s)"
+    finally:
+        await t.disconnect()
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_settles_pending_outbound_with_result():
+    """disconnect() under an in-flight outbound answers the waiter with a result.
+
+    Same contract as above on the drain/shutdown path: the delivery router
+    branches on ``success``/``error``, so a ``RuntimeError`` raised into
+    ``RelayAdapter.send`` is not a failure it can route.
+    """
+    hold_open = asyncio.Event()
+
+    async def handler(ws):
+        async for raw in ws:
+            for line in str(raw).split("\n"):
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                if frame.get("type") == "hello":
+                    await ws.send(
+                        json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n"
+                    )
+                elif frame.get("type") == "outbound":
+                    # Leave the request unanswered so it is still pending.
+                    await hold_open.wait()
+                    return
+
+    srv, url = await _serve(handler)
+    t = WebSocketRelayTransport(url, "discord", "appShared", outbound_timeout_s=10.0)
+    try:
+        await t.connect()
+        await t.handshake()
+        call = asyncio.create_task(
+            t.send_outbound({"op": "send", "chat_id": "c1", "content": "hi"})
+        )
+        pending = False
+        for _ in range(300):
+            if t._pending:
+                pending = True
+                break
+            await asyncio.sleep(0.01)
+        assert pending, "expected an in-flight outbound before disconnect"
+        await t.disconnect()
+        result = await asyncio.wait_for(call, timeout=2.0)
+        assert result.get("success") is False
+        assert result.get("error") == "relay transport closed"
+    finally:
+        hold_open.set()
+        await t.disconnect()
+        srv.close()
+        await srv.wait_closed()
+
+
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────
 
 
