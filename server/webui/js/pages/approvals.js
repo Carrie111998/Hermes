@@ -10,6 +10,7 @@ import {
 } from './_page-utils.js';
 import { reviewCard } from './_components.js';
 import { openLeadEvidence } from './research-evidence.js';
+import { createCaret } from '../caret.js';
 
 function researchFor(leadId) {
   return db.research
@@ -162,8 +163,23 @@ export async function mount(root, ctx) {
     const message = queue[currentIndex] || null;
     const waiting = baseQueue();
 
+    // The caret reports the queue, not the page. `waiting` is what still
+    // needs a human, so that is what it counts — skipped emails included,
+    // because they are still unresolved.
+    const caret = createCaret(
+      busy
+        ? { state: 'working', label: 'Working' }
+        : waiting.length
+          ? {
+              state: 'waiting',
+              label: `${waiting.length} email${waiting.length === 1 ? '' : 's'} awaiting your approval`,
+            }
+          : { state: 'idle', label: 'Nothing waiting' },
+    );
+
     const header = pageHead({
       title: 'Emails waiting for you',
+      status: caret.el,
       sub: message
         ? 'Review one at a time. The main button always says whether it will save a draft or send.'
         : 'Your review queue, without campaign setup or delivery logs.',

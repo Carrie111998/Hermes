@@ -9,6 +9,7 @@ import { COUNTRY_NAMES } from '../catalog.js';
 import { hermesApi } from '../hermes-client.js';
 import { renderMiniMap } from './lead-map.js';
 import { waitForRun } from './_page-utils.js';
+import { createCaret } from '../caret.js';
 
 const MAX_EMAILS_PER_SEARCH = 6;
 const TERMINAL_OK = new Set(['completed', 'succeeded']);
@@ -510,17 +511,21 @@ export async function mount(root, ctx) {
       : null;
 
     const reviewPrompt = waiting
+      // The blinking caret marks the one place on this page where the machine
+      // has stopped and cannot continue without a person.
       ? el('section', { class: 'ifz-today-review' },
           el('div', {},
-            el('span', { class: 'ifz-today-kicker' }, 'Needs you'),
+            createCaret({ state: 'waiting', label: 'Needs you' }).el,
             el('strong', {}, `${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for you.`)),
           button('Review', {
             kind: 'primary',
             icon: 'arrowRight',
             onClick: () => ctx.navigate('/app/approvals'),
           }))
+      // An empty queue is an idle state, not an achievement — so it reads
+      // neutral. Green is reserved for mail that actually went out.
       : el('section', { class: 'ifz-today-clear' },
-          icon('check', 16),
+          createCaret({ state: 'idle', label: 'Clear' }).el,
           el('span', {}, 'No emails are waiting for review.'));
 
     const workNotice = work.sentence
@@ -529,10 +534,14 @@ export async function mount(root, ctx) {
           role: work.tone === 'error' ? 'alert' : 'status',
           'aria-live': 'polite',
         },
-        work.busy ? el('span', { class: 'ifz-spin', 'aria-hidden': 'true' }) : icon(
-          work.tone === 'success' ? 'check' : work.tone === 'error' ? 'warning' : 'bolt',
-          16,
-        ),
+        // A working caret says the same thing a spinner does, in the brand's
+        // own language. Failure keeps its icon — a caret cannot express it.
+        work.busy
+          ? createCaret({ state: 'working', showLabel: false }).el
+          : icon(
+              work.tone === 'success' ? 'check' : work.tone === 'error' ? 'warning' : 'bolt',
+              16,
+            ),
         el('span', {}, work.sentence))
       : null;
 

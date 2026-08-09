@@ -34,16 +34,42 @@ const NAV_GROUPS = [
   ]},
 ];
 
-const LOGO_MARKS = {
-  sidebar: `
-    <rect width="32" height="32" rx="4" fill="rgba(255,255,255,0.22)"/>
-    <path d="M16 7l7 9-7 9-7-9z" fill="#FFFFFF"/>
-    <path d="M16 12l3.5 4.5L16 21l-3.5-4.5z" fill="rgba(255,255,255,0.72)"/>`,
-  light: `
-    <rect width="32" height="32" rx="4" fill="#1C1B18"/>
-    <path d="M16 7l7 9-7 9-7-9z" fill="#FAF9F5"/>
-    <path d="M16 12l3.5 4.5L16 21l-3.5-4.5z" fill="#F3F1EB"/>`,
-};
+/* The square mark: `r_`. The letter identifies the product, the caret
+   identifies the house — the endorsed lockup compressed to 16 pixels.
+
+   Drawn as paths, never as <text>. This mark is also the favicon, and
+   favicons render outside the page context where Satoshi does not exist;
+   a text-based mark would silently fall back to a system font.
+
+   Only used where a wordmark cannot fit: favicon, app icon, avatar, and
+   the collapsed rail. The rail at full width shows the wordmark alone —
+   pairing them would print the caret twice in one lockup.
+
+   Signal Blue ground, white letter, and no caret. Two findings from
+   rasterising this against real Chrome tab-strip colours:
+
+     1. An ink ground disappears into a dark tab strip (#35363A). The
+        icon loses its edge and reads as a smudge — that, not the
+        letterform, was what made the first version look broken.
+     2. At 16px there are only ~256 pixels. A letter AND a device is one
+        thing too many; the caret was what turned it to mush.
+
+   So below wordmark scale the blue ground carries the house and the
+   letter carries the product. The caret lives in the wordmark, where it
+   has the room to be seen. */
+const R_MARK = `
+    <rect width="32" height="32" fill="#2563FF"/>
+    <path d="M12 25V13.5a6.5 6.5 0 0 1 6.5-6.5" fill="none" stroke="{ink}" stroke-width="6"/>`;
+
+export function squareMark({ size = 26, ink = '#FFFFFF' } = {}) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 32 32');
+  svg.setAttribute('width', size);
+  svg.setAttribute('height', size);
+  svg.setAttribute('aria-hidden', 'true');
+  svg.innerHTML = R_MARK.replace('{ink}', ink);
+  return svg;
+}
 
 function askReviewCount() {
   return (db.messages || []).filter(message => isApprovalActionable(message, {
@@ -103,17 +129,17 @@ function localAskAnswer(question) {
   return `The workspace has ${buyers} buyer${buyers === 1 ? '' : 's'}, ${waiting} email${waiting === 1 ? '' : 's'} waiting for review, and ${replies} recorded repl${replies === 1 ? 'y' : 'ies'}. I can answer questions about those records, but I can't take actions.`;
 }
 
+/* Wordmark alone — no accompanying square mark. The caret already lives
+   inside the word, so pairing the two prints it twice. Product name first,
+   Interfaze endorsement beneath: the buyer reads what the thing is called,
+   then who stands behind it. */
 export function logoNode({ compactTag = false, variant = 'sidebar' } = {}) {
-  const mark = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  mark.setAttribute('viewBox', '0 0 32 32');
-  mark.setAttribute('width', '26');
-  mark.setAttribute('height', '26');
-  mark.setAttribute('aria-hidden', 'true');
-  mark.innerHTML = LOGO_MARKS[variant] || LOGO_MARKS.sidebar;
   return el('div', { class: `ifz-logo${variant === 'light' ? ' light' : ''}` },
-    mark,
-    el('span', { class: 'ifz-logo-word' }, 'inter', el('em', {}, 'faze')),
-    compactTag ? null : el('span', { class: 'ifz-logo-tag' }, 'agent'));
+    el('span', { class: 'ifz-logo-stack' },
+      el('span', { class: 'ifz-logo-word' },
+        'rota',
+        el('i', { class: 'ifz-caret-mark', 'aria-hidden': 'true' })),
+      compactTag ? null : el('span', { class: 'ifz-logo-tag' }, 'by interfaze')));
 }
 
 let _shell = null;
@@ -437,7 +463,7 @@ export function mountShell(root) {
         role: 'menuitem',
         onclick: async () => {
           closeMenu();
-          if (!window.confirm('Log out of interfaze-agent?')) return;
+          if (!window.confirm('Log out of Rota?')) return;
           try { await call('auth.logout'); } catch { /* local session is cleared regardless */ }
           clearSession();
           resetReal();
@@ -510,7 +536,7 @@ export function mountShell(root) {
     // The visible title is each page's own pageHead(); this only names the
     // browser tab, so the name is not printed twice on every screen.
     setTitle(t) {
-      document.title = `${t} · interfaze-agent`;
+      document.title = `${t} · Rota`;
     },
     setActiveNav(path) {
       navHost.querySelectorAll('.ifz-nav-item').forEach(btn => {

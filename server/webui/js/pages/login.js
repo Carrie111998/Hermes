@@ -83,7 +83,7 @@ export function mount(root, ctx) {
         el('div', { class: 'ifz-login-point' }, 'Approve every email before it leaves your mailbox'))),
     el('div', { class: 'ifz-login-formside' }, form)));
 
-  document.title = 'Sign in · interfaze-agent';
+  document.title = 'Sign in · Rota';
 }
 
 function openLocalReset(token) {

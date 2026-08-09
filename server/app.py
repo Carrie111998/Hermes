@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -184,6 +185,13 @@ def _mount_webui(app: FastAPI, webui_dir: Path, settings: Settings) -> None:
         html = html.replace("__CSRF_TOKEN_JSON__", json.dumps(""))
         html = html.replace("__CHAT_ENABLED__", json.dumps(settings.chat_enabled))
         return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+    # StaticFiles resolves content types through the stdlib mimetypes registry,
+    # which has no entry for woff2 on Windows — fonts then go out as
+    # text/plain and the browser drops the <link rel="preload"> on type
+    # mismatch. Register explicitly so behaviour matches across platforms.
+    mimetypes.add_type("font/woff2", ".woff2")
+    mimetypes.add_type("font/woff", ".woff")
 
     app.mount("/", StaticFiles(directory=str(webui_dir)), name="webui")
 

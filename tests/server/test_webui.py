@@ -69,11 +69,35 @@ def test_static_assets_resolve_from_relative_hrefs():
         "/js/main.js",
         "/js/adapters.js",
         "/js/oauth-popup.js",
+        "/js/caret.js",
         "/css/app.css",
+        "/css/tokens.css",
+        "/css/caret.css",
+        "/css/fonts.css",
         "/assets/world.svg",
     ):
         res = client.get(path)
         assert res.status_code == 200, path
+
+
+def test_self_hosted_fonts_serve_with_the_woff2_media_type():
+    # CSP is font-src 'self', so the faces must be local. They also have to go
+    # out as font/woff2 — stdlib mimetypes has no woff2 entry on Windows, and
+    # the browser drops the preload when the served type disagrees with it.
+    _, client = make_client()
+    for path in (
+        "/fonts/satoshi-400.woff2",
+        "/fonts/satoshi-500.woff2",
+        "/fonts/satoshi-700.woff2",
+        "/fonts/inter-latin.woff2",
+        "/fonts/inter-latin-ext.woff2",
+        "/fonts/jetbrainsmono-latin.woff2",
+        "/fonts/jetbrainsmono-latin-ext.woff2",
+    ):
+        res = client.get(path)
+        assert res.status_code == 200, path
+        assert res.headers["content-type"] == "font/woff2", path
+        assert res.content[:4] == b"wOF2", f"{path} is not a valid woff2"
 
 
 def test_phase3_buyers_workspace_is_served_with_customer_safe_boundaries():

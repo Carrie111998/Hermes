@@ -1,77 +1,105 @@
 /* ============================================================
-   interfaze-agent — mobile-native design tokens
-   Warm filled surfaces, zero outlines, subtle 4px corners.
+   Rota — design tokens
+   An Interfaze product. Values follow the house design system
+   (Portfolyo/DESIGN.json), reinterpreted for an eight-hour tool.
+
+   House rules honoured here:
+     One Voice        Signal Blue under ~10% of any screen.
+     Tinted Black     Ink is #0a0a0a, never #000.
+     Flat Instrument  No shadows. Separate with tone or 1px line.
+     Square Corners   border-radius: 0 everywhere.
+     Cursor           The blue underscore is the state indicator.
+
+   Light theme is the Interfaze paper system verbatim.
+   Dark theme is the same system on ink.
+   Token NAMES are unchanged from the previous file — 70 of them
+   are consumed by app.css, analytics.js and ui.js. Values only.
    ============================================================ */
 
 :root {
-  --bg: #FAF9F5;
-  --surface: #F1ECE3;
-  --surface-2: #E6E0D3;
-  --surface-3: #D8D1C1;
+  /* ---- surfaces · paper axis ---- */
+  --bg: #FFFFFF;
+  --surface: #F4F4F5;
+  --surface-2: #E6E6E8;
+  --surface-3: #D2D2D6;
 
-  --apple-blue: #0062D6;
+  /* ---- ink ---- */
+  --text: #0A0A0A;
+  --text-strong: #0A0A0A;
+  --muted: #68686D;
+  --faint: #8A8A90;
 
-  --sidebar: #0A3E85;
-  --sidebar-2: rgba(255, 255, 255, 0.12);
-  --sidebar-active: rgba(255, 255, 255, 0.22);
-  --sidebar-text: rgba(255, 255, 255, 0.82);
-  --sidebar-text-strong: #FFFFFF;
-  --sidebar-faint: rgba(255, 255, 255, 0.55);
-  --sidebar-badge-bg: #FFFFFF;
-  --sidebar-badge-text: #0A3E85;
+  /* ---- line · never shadow ---- */
+  --border: #D2D2D6;
+  --border-strong: #A2A2A7;
 
-  --text: #2B2926;
-  --text-strong: #1C1B18;
-  --muted: #6B6860;
-  --faint: #9C9890;
+  /* ---- Signal Blue · the one voice ---- */
+  --apple-blue: #2563FF;
 
-  --accent: #1C1B18;
-  --accent-hover: #3A3834;
-  --accent-soft: #EBE8E0;
-  --accent-softer: #F3F1EB;
-  --accent-text: #1C1B18;
-  --accent-contrast: #FAF9F5;
+  --accent: #2563FF;
+  --accent-hover: #2145A0;
+  --accent-text: #2563FF;
+  --accent-contrast: #FFFFFF;
+  --accent-soft: #F4F4F5;
+  --accent-softer: #FBFBFC;
   --accent-glow: transparent;
 
-  --cta: #1C1B18;
-  --cta-hover: #3A3834;
-  --cta-soft: #EBE8E0;
-  --cta-contrast: #FAF9F5;
+  --cta: #2563FF;
+  --cta-hover: #2145A0;
+  --cta-soft: #F4F4F5;
+  --cta-contrast: #FFFFFF;
   --cta-glow: transparent;
 
-  --success: #2D6A4F;
-  --success-soft: #E4EFE8;
-  --warning: #8C6200;
-  --warning-soft: #F2E9D0;
-  --error: #B42318;
-  --error-soft: #F8E6E2;
-  --info: #1F63C9;
-  --info-soft: #E7EEFB;
+  /* ---- status · not accents. these report facts. ---- */
+  --success: #0F7A4A;
+  --success-soft: #ECF6F1;
+  --warning: #8A5A00;
+  --warning-soft: #FBF3E4;
+  --error: #C42B1C;
+  --error-soft: #FBEDEB;
+  --info: #2563FF;
+  --info-soft: #EFF3FF;
 
-  --score-high: #2D6A4F;
-  --score-mid: #9A6700;
-  --score-low: #9C9890;
+  --score-high: #0F7A4A;
+  --score-mid: #8A5A00;
+  --score-low: #8A8A90;
 
-  --border: #E6E0D2;
-  --border-strong: #CFC7B5;
+  /* ---- sidebar · ink rail on paper ---- */
+  --sidebar: #0A0A0A;
+  --sidebar-2: rgba(255, 255, 255, 0.08);
+  --sidebar-active: rgba(255, 255, 255, 0.14);
+  --sidebar-text: rgba(255, 255, 255, 0.72);
+  --sidebar-text-strong: #FFFFFF;
+  --sidebar-faint: rgba(255, 255, 255, 0.42);
+  --sidebar-badge-bg: #2563FF;
+  --sidebar-badge-text: #FFFFFF;
+  /* status on the ink rail — the rail is ink in both themes, so these
+     are tuned for a dark ground once and inherited by .dark */
+  --sidebar-ok: #3DBB7F;
+  --sidebar-warn: #D9A441;
 
-  --map-land: #D8D1C1;
-  --map-land-hover: #C9C1AD;
-  --map-border: transparent;
-  --map-selected: #1C1B18;
-  --map-selected-hover: #3A3834;
-  --map-recommended: #9C9890;
+  /* ---- map ---- */
+  --map-land: #E6E6E8;
+  --map-land-hover: #D2D2D6;
+  --map-border: #FFFFFF;
+  --map-selected: #2563FF;
+  --map-selected-hover: #2145A0;
+  --map-recommended: #A2A2A7;
   --map-water: transparent;
 
-  --focus-ring: none;
-  --focus-ring-cta: none;
+  /* ---- focus · restored. was `none`, which fails WCAG 2.4.7 ---- */
+  --focus-ring: 2px solid #2563FF;
+  --focus-ring-cta: 2px solid #0A0A0A;
+  --focus-offset: 3px;
 
-  --radius-sm: 4px;
-  --radius-md: 4px;
-  --radius-lg: 4px;
-  --radius-xl: 4px;
-  --radius-pill: 4px;
+  /* ---- square corners, all of them ---- */
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 0;
+  --radius-xl: 0;
+  --radius-pill: 0;
 
+  /* ---- space ---- */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
@@ -81,13 +109,24 @@
   --space-8: 48px;
   --space-10: 64px;
 
+  /* ---- a shadow anywhere in this system is a bug ---- */
   --shadow-1: none;
   --shadow-2: none;
   --shadow-3: none;
 
-  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
-  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
-  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  /* ---- type · Rota is mono-dominant ----
+     mono     the default voice. Navigation, tables, labels, codes,
+              statuses and every number. This is the instrument.
+     display  Satoshi. Page headlines only, 24px and up — geometric
+              bowls get ambiguous between I/l/1 below that.
+     ui       Inter. Running prose only: email bodies, descriptions,
+              help text. Anything a person reads a paragraph of.
+
+     Inter sits second in the display stack so any glyph Satoshi lacks
+     falls back per-glyph to a face we control, not to Arial. */
+  --font-display: Satoshi, Inter, "Segoe UI Variable Display", -apple-system, system-ui, sans-serif;
+  --font-ui: Inter, "Segoe UI Variable Text", "Segoe UI", -apple-system, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, Menlo, monospace;
 
   --fs-xs: 12px;
   --fs-sm: 13px;
@@ -98,59 +137,104 @@
   --fs-2xl: 28px;
   --fs-3xl: 34px;
 
+  /* display runs tight — house Tight-Display Rule */
+  --track-display: -0.055em;
+  --track-title: -0.03em;
+  --track-label: 0.08em;
+  --leading-display: 0.96;
+  --line-body: 1.5;
+
   --touch-min: 44px;
-  --line-body: 1.55;
+
+  /* ---- motion · one system ease ---- */
+  --ease-system: cubic-bezier(0.22, 1, 0.36, 1);
+  --dur-fast: 180ms;
+  --dur-standard: 220ms;
+
+  /* ---- the caret · house Cursor Rule ---- */
+  --caret: #2563FF;
+  --caret-idle: #A2A2A7;
+  --caret-sent: #0F7A4A;
+  --caret-h: 4px;
+  --caret-w: 18px;
 }
 
+/* ============================================================
+   Dark — the same instrument on ink.
+   Not an inversion: neutrals stay on the ink/paper axis, blue
+   steps up one stop so small text clears AA on a dark ground.
+   ============================================================ */
+
 :root.dark {
-  --bg: #141312;
-  --surface: #1E1D1B;
-  --surface-2: #282624;
-  --surface-3: #32302D;
+  --bg: #0A0A0A;
+  --surface: #141416;
+  --surface-2: #1C1C1E;
+  --surface-3: #2C2C2F;
 
-  --border: #34302B;
-  --border-strong: #48423A;
+  --text: #E6E6E8;
+  --text-strong: #FFFFFF;
+  --muted: #8F8F94;
+  --faint: #6D6D72;
 
-  --apple-blue: #0074E5;
+  /* Hairlines carry every division in a mono-dominant, shadowless UI.
+     Lifted from #2C2C2F so they survive an unmanaged factory monitor. */
+  --border: #313136;
+  --border-strong: #4C4C52;
 
-  --sidebar: #0C4488;
-  --sidebar-2: rgba(255, 255, 255, 0.1);
-  --sidebar-active: rgba(255, 255, 255, 0.2);
-  --sidebar-text: rgba(255, 255, 255, 0.82);
+  /* #2563ff on ink is 4.04:1 — fails AA as text.
+     #5B85FF is 5.8:1. Fills keep the canonical blue because
+     white on #2563ff is 4.84:1 and passes. */
+  --apple-blue: #5B85FF;
+
+  --accent: #2563FF;
+  --accent-hover: #5B85FF;
+  --accent-text: #5B85FF;
+  --accent-contrast: #FFFFFF;
+  --accent-soft: #1C1C1E;
+  --accent-softer: #141416;
+  --accent-glow: transparent;
+
+  --cta: #2563FF;
+  --cta-hover: #5B85FF;
+  --cta-soft: #1C1C1E;
+  --cta-contrast: #FFFFFF;
+  --cta-glow: transparent;
+
+  --success: #3DBB7F;
+  --success-soft: #10231A;
+  --warning: #D9A441;
+  --warning-soft: #241C0E;
+  --error: #F2685A;
+  --error-soft: #2A1412;
+  --info: #5B85FF;
+  --info-soft: #10182E;
+
+  --score-high: #3DBB7F;
+  --score-mid: #D9A441;
+  --score-low: #6D6D72;
+
+  /* the rail separates by line, not by hue */
+  --sidebar: #0A0A0A;
+  --sidebar-2: rgba(255, 255, 255, 0.06);
+  --sidebar-active: rgba(255, 255, 255, 0.12);
+  --sidebar-text: rgba(255, 255, 255, 0.70);
   --sidebar-text-strong: #FFFFFF;
-  --sidebar-faint: rgba(255, 255, 255, 0.5);
-  --sidebar-badge-bg: #FFFFFF;
-  --sidebar-badge-text: #0C4488;
+  --sidebar-faint: rgba(255, 255, 255, 0.40);
+  --sidebar-badge-bg: #2563FF;
+  --sidebar-badge-text: #FFFFFF;
 
-  --text: #E8E4DC;
-  --text-strong: #F5F3EE;
-  --muted: #A8A49C;
-  --faint: #7A766E;
+  --map-land: #1C1C1E;
+  --map-land-hover: #2C2C2F;
+  --map-border: #0A0A0A;
+  --map-selected: #2563FF;
+  --map-selected-hover: #5B85FF;
+  --map-recommended: #454548;
+  --map-water: transparent;
 
-  --accent: #F5F3EE;
-  --accent-hover: #E8E4DC;
-  --accent-soft: #32302D;
-  --accent-softer: #282624;
-  --accent-text: #F5F3EE;
-  --accent-contrast: #141312;
+  --focus-ring: 2px solid #5B85FF;
+  --focus-ring-cta: 2px solid #FFFFFF;
 
-  --cta: #F5F3EE;
-  --cta-hover: #E8E4DC;
-  --cta-soft: #32302D;
-  --cta-contrast: #141312;
-
-  --success: #5CB88A;
-  --success-soft: #1A2E24;
-  --warning: #D4A843;
-  --warning-soft: #2E2618;
-  --error: #E87A70;
-  --error-soft: #2E1A18;
-  --info: #6AA6F2;
-  --info-soft: #17233A;
-
-  --map-land: #32302D;
-  --map-land-hover: #3F3C38;
-  --map-selected: #F5F3EE;
-  --map-selected-hover: #E8E4DC;
-  --map-recommended: #7A766E;
+  --caret: #5B85FF;
+  --caret-idle: #454548;
+  --caret-sent: #3DBB7F;
 }

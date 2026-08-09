@@ -22,5 +22,5 @@ export function mount(root, ctx) {
         el('div', { class: 'ifz-login-note' }, 'Contact your interfaze administrator if access should already be active.'),
         el('div', { class: 'ifz-row ifz-mt-4' },
           button('Back to sign in', { kind: 'primary', onClick: () => ctx.navigate('/login') }))))));
-  document.title = 'Access pending · interfaze-agent';
+  document.title = 'Access pending · Rota';
 }

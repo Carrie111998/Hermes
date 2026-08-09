@@ -742,9 +742,12 @@ export function csvDownload(filename, rows) {
 }
 
 /* ---------- Page scaffolding ---------- */
-export function pageHead({ title, sub, actions }) {
+export function pageHead({ title, sub, actions, status }) {
   return el('div', { class: 'ifz-page-head' },
-    el('div', {},
+    el('div', { class: 'ifz-page-head-main' },
+      // `status` takes a caret (js/caret.js) so a page can report what the
+      // agent is doing right above the title, where the eye already is.
+      status ? el('div', { class: 'ifz-page-status' }, status) : null,
       el('h1', { class: 'ifz-page-title' }, title),
       sub ? el('p', { class: 'ifz-page-sub' }, sub) : null),
     actions ? el('div', { class: 'ifz-page-actions' }, actions) : null);

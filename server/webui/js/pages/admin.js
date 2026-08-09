@@ -48,7 +48,7 @@ export async function mountDashboard(root, ctx) {
     call('admin.logs', { query: { limit: 8 } }),
     call('agentRuns.list').catch(() => ({ items: [], total: 0 })),
   ]);
-  withAdmin(root, ctx, 'Admin Dashboard', 'Customer workspace operations for interfaze-agent.', '/admin/dashboard',
+  withAdmin(root, ctx, 'Admin Dashboard', 'Customer workspace operations for Rota.', '/admin/dashboard',
     el('div', {},
       el('div', { class: 'ifz-grid cols-4 ifz-mb-4' },
         statCard({ label: 'Companies', value: String(companies.total), delta: `${companies.items.filter(c => c.status === 'active').length} active`, deltaDir: 'up' }),

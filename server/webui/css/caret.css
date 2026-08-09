@@ -1,0 +1,116 @@
+/* ============================================================
+   Caret — state indicator + house Cursor Rule mark.
+   Flat by design: no glow, no shadow, no gradient. The house
+   donts rule out "glowing accent on black", so state is carried
+   by length, opacity and blink rather than by light.
+   ============================================================ */
+
+.ifz-caret {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--muted);
+  line-height: 1;
+}
+
+.ifz-caret-bar {
+  display: block;
+  flex: none;
+  width: var(--caret-w);
+  height: var(--caret-h);
+  background: var(--caret);
+  transition:
+    width var(--dur-standard) var(--ease-system),
+    background-color var(--dur-standard) var(--ease-system),
+    opacity var(--dur-standard) var(--ease-system);
+}
+
+.ifz-caret-label {
+  white-space: nowrap;
+}
+
+/* ---- sizes ---- */
+.ifz-caret--sm { font-size: 10px; }
+.ifz-caret--sm .ifz-caret-bar { width: 12px; height: 3px; }
+
+.ifz-caret--lg { font-size: var(--fs-sm); gap: var(--space-3); }
+.ifz-caret--lg .ifz-caret-bar { width: 28px; height: 6px; }
+
+/* ---- idle: dim and still. resisting motion here is what makes
+        the other states mean anything ---- */
+.ifz-caret[data-state="idle"] .ifz-caret-bar {
+  background: var(--caret-idle);
+}
+.ifz-caret[data-state="idle"] .ifz-caret-label {
+  color: var(--faint);
+}
+
+/* ---- working: sweeps. with a known fraction it becomes a real
+        gauge instead of a decoration ---- */
+.ifz-caret[data-state="working"] .ifz-caret-bar {
+  animation: ifz-caret-sweep 1.4s var(--ease-system) infinite alternate;
+  transform-origin: left center;
+}
+.ifz-caret[data-state="working"][data-determinate] .ifz-caret-bar {
+  animation: none;
+  width: calc(var(--caret-w) + (var(--caret-w) * 1.6 * var(--caret-fill, 0)));
+}
+.ifz-caret[data-state="working"] .ifz-caret-label {
+  color: var(--muted);
+}
+
+/* ---- waiting: the only state that asks for a human ---- */
+.ifz-caret[data-state="waiting"] .ifz-caret-bar {
+  animation: ifz-caret-blink 1.15s steps(1, end) infinite;
+}
+.ifz-caret[data-state="waiting"] .ifz-caret-label {
+  color: var(--text);
+}
+
+/* ---- sent: semantic green, used once, meaning one thing ---- */
+.ifz-caret[data-state="sent"] .ifz-caret-bar {
+  background: var(--caret-sent);
+}
+.ifz-caret[data-state="sent"] .ifz-caret-label {
+  color: var(--success);
+}
+
+/* ---- headline mark — the sanctioned flourish. primary headings
+        only, never every heading ---- */
+.ifz-caret-mark {
+  display: inline-block;
+  width: 0.5em;
+  height: 0.16em;
+  margin-left: 0.1em;
+  vertical-align: baseline;
+  background: var(--caret);
+}
+.ifz-caret-mark.is-blinking {
+  animation: ifz-caret-blink 1.15s steps(1, end) infinite;
+}
+
+@keyframes ifz-caret-blink {
+  0%, 48%   { opacity: 1; }
+  52%, 100% { opacity: 0.15; }
+}
+
+@keyframes ifz-caret-sweep {
+  from { transform: scaleX(0.45); }
+  to   { transform: scaleX(1.75); }
+}
+
+/* Blink runs at ~0.9Hz, well under the 3Hz flash threshold, but
+   motion still goes away on request — the label carries the state
+   on its own. */
+@media (prefers-reduced-motion: reduce) {
+  .ifz-caret-bar,
+  .ifz-caret-mark.is-blinking {
+    animation: none !important;
+    transition: none !important;
+  }
+  .ifz-caret[data-state="waiting"] .ifz-caret-bar { opacity: 1; }
+}

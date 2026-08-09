@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>interfaze-agent</title>
+<title>Rota</title>
 <!--
   interfaze-agent — B2B sales-agent web app, served by the interfaze-api
   FastAPI process (server/app.py) alongside the real /api/v1 backend.
@@ -22,9 +22,19 @@
     } catch (e) { /* storage unavailable — default light */ }
   })();
 </script>
+<!-- Mono is the primary face — nav, tables, labels and every number — so it
+     is the one that must not arrive late. Satoshi and Inter cover headlines
+     and prose respectively and can swap in a beat later. -->
+<link rel="preload" href="./fonts/jetbrainsmono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="./css/fonts.css">
 <link rel="stylesheet" href="./css/tokens.css">
 <link rel="stylesheet" href="./css/app.css">
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%231C1B18'/%3E%3Cpath d='M16 7l7 9-7 9-7-9z' fill='%23FAF9F5'/%3E%3Cpath d='M16 12l3.5 4.5L16 21l-3.5-4.5z' fill='%23F3F1EB'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./css/caret.css">
+<!-- Square mark: `r_` — the letter is Rota, the caret is Interfaze. Drawn as
+     paths because a favicon renders outside the page and cannot use Satoshi.
+     Kept in sync with squareMark() in js/shell.js. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%232563FF'/%3E%3Cpath d='M12 25V13.5a6.5 6.5 0 0 1 6.5-6.5' fill='none' stroke='%23FFFFFF' stroke-width='6'/%3E%3C/svg%3E">
+<meta name="theme-color" content="#2563FF">
 <script>window.__HERMES_CONFIG__={maxUploadBytes:__MAX_UPLOAD_BYTES__,csrfToken:__CSRF_TOKEN_JSON__,chatEnabled:__CHAT_ENABLED__};</script>
 <script>(function(){
   var cfg=window.__HERMES_CONFIG__||{},token=cfg.csrfToken||'';
