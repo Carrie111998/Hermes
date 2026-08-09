@@ -53,6 +53,23 @@ function patchUnixTerminalAsarPaths(destRoot) {
   }
 }
 
+function patchGetWindowsMacOSAsarHelperPath(destRoot) {
+  const filePath = join(destRoot, 'lib', 'macos.js')
+  const source = readFileSync(filePath, 'utf8')
+  const patched = source.replace(
+    "const binary = path.join(__dirname, '../main');",
+    "const binary = path.join(__dirname, '../main').replace(/app\\.asar(?!\\.unpacked)/, 'app.asar.unpacked');"
+  )
+
+  if (patched === source) {
+    throw new Error(
+      '[stage-native-deps] get-windows lib/macos.js helper path did not match the verified 9.3.0 layout'
+    )
+  }
+
+  writeFileSync(filePath, patched)
+}
+
 /**
  * Locate node-pty's package root via real module resolution, so this
  * works whether it's hoisted to a workspace root or local to this app.
@@ -431,15 +448,14 @@ export function stageGetWindowsInto(
   destRoot,
   { platform = process.platform, rebuild } = {}
 ) {
-  // The STAGED_WINDOWS_JS rewrite mirrors this exact version's export surface.
-  // A version bump must fail the build here until the rewrite is re-verified —
-  // otherwise it ships stale and fails soft as a generic "unavailable".
+  // Both the Windows shim and the macOS helper-path patch mirror this exact
+  // version's source. A version bump must fail here until both are re-verified.
   const srcVersion = JSON.parse(readFileSync(join(srcRoot, 'package.json'), 'utf8')).version
   if (srcVersion !== GET_WINDOWS_VERSION) {
     throw new Error(
-      `[stage-native-deps] get-windows is ${srcVersion} but the staged lib/windows.js ` +
-        `rewrite was verified against ${GET_WINDOWS_VERSION}. Re-verify the rewrite ` +
-        `(STAGED_WINDOWS_JS) against the new version, then update GET_WINDOWS_VERSION.`
+      `[stage-native-deps] get-windows is ${srcVersion} but the native staging rewrites ` +
+        `were verified against ${GET_WINDOWS_VERSION}. Re-verify STAGED_WINDOWS_JS and ` +
+        `the lib/macos.js helper-path patch, then update GET_WINDOWS_VERSION.`
     )
   }
 
@@ -457,6 +473,10 @@ export function stageGetWindowsInto(
     if (entry.isFile() && entry.name.endsWith('.js')) {
       cpSync(join(srcRoot, 'lib', entry.name), join(destRoot, 'lib', entry.name))
     }
+  }
+
+  if (platform === 'darwin') {
+    patchGetWindowsMacOSAsarHelperPath(destRoot)
   }
 
   writeFileSync(join(destRoot, 'lib', 'windows.js'), STAGED_WINDOWS_JS)

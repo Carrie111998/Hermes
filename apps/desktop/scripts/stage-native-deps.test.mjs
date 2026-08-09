@@ -366,6 +366,21 @@ function makeFakeGetWindows(srcRoot, { version = '9.3.0', bindings = [] } = {}) 
   fs.mkdirSync(join(srcRoot, 'lib'), { recursive: true })
   fs.writeFileSync(join(srcRoot, 'package.json'), JSON.stringify({ name: 'get-windows', version, main: 'index.js' }))
   fs.writeFileSync(join(srcRoot, 'index.js'), 'export {};')
+  fs.writeFileSync(
+    join(srcRoot, 'lib', 'macos.js'),
+    [
+      "import path from 'node:path';",
+      "import childProcess from 'node:child_process';",
+      "import {fileURLToPath} from 'node:url';",
+      '',
+      'const __dirname = path.dirname(fileURLToPath(import.meta.url));',
+      "const binary = path.join(__dirname, '../main');",
+      '',
+      'export function activeWindowSync() {',
+      "  return JSON.parse(childProcess.execFileSync(binary, [], {encoding: 'utf8'}));",
+      '}'
+    ].join('\n')
+  )
   fs.writeFileSync(join(srcRoot, 'lib', 'windows.js'), '// upstream pre-gyp loader')
   fs.writeFileSync(join(srcRoot, 'main'), '#!/bin/sh\n')
 
@@ -500,6 +515,64 @@ test('staging refuses a get-windows version the lib/windows.js rewrite was not v
     fs.rmSync(tmp, { recursive: true, force: true })
   }
 })
+
+test.skipIf(process.platform === 'win32')(
+  'darwin staging resolves the macOS wrapper helper from app.asar.unpacked',
+  async () => {
+    const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
+    try {
+      const srcRoot = join(tmp, 'get-windows')
+      const asarRoot = join(tmp, 'Hermes.app', 'Contents', 'Resources', 'app.asar')
+      const destRoot = join(asarRoot, 'dist', 'node_modules', 'get-windows')
+      const unpackedRoot = join(
+        tmp,
+        'Hermes.app',
+        'Contents',
+        'Resources',
+        'app.asar.unpacked',
+        'dist',
+        'node_modules',
+        'get-windows'
+      )
+
+      makeFakeGetWindows(srcRoot)
+      fs.writeFileSync(join(srcRoot, 'main'), '#!/bin/sh\nprintf \'{"from":"unpacked"}\'\n')
+
+      stageGetWindowsInto(srcRoot, destRoot, { platform: 'darwin' })
+      fs.cpSync(destRoot, unpackedRoot, { recursive: true })
+      fs.rmSync(join(destRoot, 'main'))
+
+      const stagedMacOSPath = join(destRoot, 'lib', 'macos.js')
+      const stagedMacOSSource = fs.readFileSync(stagedMacOSPath, 'utf8')
+      fs.writeFileSync(
+        stagedMacOSPath,
+        stagedMacOSSource.replace(
+          ".replace(/app\\.asar(?!\\.unpacked)/, 'app.asar.unpacked')",
+          ''
+        )
+      )
+      const oldMacOSUrl = pathToFileURL(stagedMacOSPath)
+      oldMacOSUrl.searchParams.set('t', `${Date.now()}-old`)
+      const oldMacOS = await import(oldMacOSUrl.href)
+      assert.throws(() => oldMacOS.activeWindowSync(), /ENOENT/)
+
+      fs.writeFileSync(stagedMacOSPath, stagedMacOSSource)
+      const stagedMacOSUrl = pathToFileURL(stagedMacOSPath)
+      stagedMacOSUrl.searchParams.set('t', `${Date.now()}-fixed`)
+      const stagedMacOS = await import(stagedMacOSUrl.href)
+
+      assert.deepEqual(stagedMacOS.activeWindowSync(), { from: 'unpacked' })
+
+      stageGetWindowsInto(srcRoot, unpackedRoot, { platform: 'darwin' })
+      const alreadyUnpackedMacOSUrl = pathToFileURL(join(unpackedRoot, 'lib', 'macos.js'))
+      alreadyUnpackedMacOSUrl.searchParams.set('t', `${Date.now()}-already-unpacked`)
+      const alreadyUnpackedMacOS = await import(alreadyUnpackedMacOSUrl.href)
+      assert.deepEqual(alreadyUnpackedMacOS.activeWindowSync(), { from: 'unpacked' })
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+  }
+)
 
 test('darwin staging ships the Swift helper executable and the rewritten windows.js', () => {
   const tmp = fs.mkdtempSync(join(os.tmpdir(), 'hermes-stage-'))
