@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 import tempfile
+import os
+
+os.environ.setdefault("AGENTOPS_ALLOW_SQLITE_TEST_ONLY", "1")
 
 import pytest
 
