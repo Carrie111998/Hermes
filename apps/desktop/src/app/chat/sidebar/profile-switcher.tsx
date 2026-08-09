@@ -43,6 +43,7 @@ import {
 } from '@/lib/reorder'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $connection } from '@/store/session'
 import {
   $activeGatewayProfile,
   $profileColors,
@@ -111,6 +112,7 @@ export function ProfileRail() {
   const profiles = useStore($profiles)
   const scope = useStore($profileScope)
   const gatewayProfile = useStore($activeGatewayProfile)
+  const connection = useStore($connection)
   const order = useStore($profileOrder)
   const colors = useStore($profileColors)
   const navigate = useNavigate()
@@ -154,7 +156,7 @@ export function ProfileRail() {
   const isAll = scope === ALL_PROFILES
   const activeKey = normalizeProfileKey(gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
-  const onDefault = !isAll && activeKey === 'default'
+  const onDefault = !isAll && activeKey === 'default' && connection?.mode !== 'remote'
 
   const named = sortByProfileOrder(
     profiles.filter(profile => !profile.is_default),

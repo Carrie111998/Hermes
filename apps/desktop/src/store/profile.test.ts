@@ -19,7 +19,7 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles } =
+const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles, selectProfile } =
   await import('./profile')
 
 const { $connection } = await import('./session')
@@ -89,6 +89,27 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
 
     expect(getConnection).toHaveBeenCalledWith('default')
     expect($connection.get()?.mode).toBe('local')
+  })
+
+  it('routes the local default explicitly when a remote default is active', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(remoteConn({ profile: 'default' }))
+    getConnection.mockResolvedValue(localConn())
+
+    await ensureGatewayProfile('default', { localOnly: true })
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { localOnly: true })
+    expect(getConnection).toHaveBeenCalledWith('default', { localOnly: true })
+    expect($connection.get()?.mode).toBe('local')
+  })
+
+  it('selects the local default instead of no-oping on a remote default with the same name', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(remoteConn({ profile: 'default' }))
+
+    selectProfile('default')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { localOnly: true })
   })
 
   it('leaves the prior connection intact when the descriptor fetch fails', async () => {
@@ -165,8 +186,22 @@ describe('refreshProfiles shared rail list (#49289)', () => {
     await refreshProfiles()
 
     expect(getProfiles).toHaveBeenNthCalledWith(1, 'remote-agent')
-    expect(getProfiles).toHaveBeenNthCalledWith(2, 'default')
+    expect(getProfiles).toHaveBeenNthCalledWith(2, 'default', { localOnly: true })
     expect($profiles.get().map(item => item.name)).toEqual(['default', 'local-worker', 'remote-agent'])
+  })
+
+  it('loads the local catalog when the active remote backend also uses default', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(remoteConn({ profile: 'default' }))
+    vi.mocked(getProfiles)
+      .mockResolvedValueOnce({ profiles: [profile('default', true), profile('remote-worker')] })
+      .mockResolvedValueOnce({ profiles: [profile('default', true), profile('local-worker')] })
+
+    await refreshProfiles()
+
+    expect(getProfiles).toHaveBeenNthCalledWith(1, null)
+    expect(getProfiles).toHaveBeenNthCalledWith(2, 'default', { localOnly: true })
+    expect($profiles.get().map(item => item.name)).toEqual(['default', 'local-worker', 'remote-worker'])
   })
 
   it('removes a deleted profile from the shared $profiles cache after Manage Profiles refreshes', async () => {

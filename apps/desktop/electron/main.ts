@@ -8104,9 +8104,11 @@ function localProfileExists(profile) {
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
-function profileRouteOptions(profile) {
+/** @param {{localOnly?: boolean}} [options] */
+function profileRouteOptions(profile, options = {}) {
   return {
     globalRemote: globalRemoteActive(),
+    localOnly: Reflect.get(options, 'localOnly') === true,
     localProfile: localProfileExists(profile),
     primaryBackendRemote: primaryBackendIsRemote(),
     primaryProfile: primaryProfileKey(),
@@ -8117,9 +8119,10 @@ function profileRouteOptions(profile) {
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
-async function ensureBackend(profile) {
+/** @param {{localOnly?: boolean}} [options] */
+async function ensureBackend(profile, options = {}) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
-  const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
+  const route = resolveProfileBackendRoute(key, profileRouteOptions(key, options))
 
   if (route.backend === 'primary') {
     const connection = await startHermes()
@@ -9946,7 +9949,7 @@ function createWindow() {
   })
 }
 
-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+ipcMain.handle('hermes:connection', async (_event, profile, options) => ensureBackend(profile, options))
 // Reconnect-after-wake recovery. A REMOTE primary backend has no child process,
 // so the 'exit'/'error' handlers that would clear a dead connection promise never
 // fire — once the remote becomes unreachable across a sleep/wake the renderer
@@ -10831,15 +10834,16 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const tornDownProfile = await prepareProfileDeleteRequest(request)
 
   const profile = request?.profile
+  const routeOptions = { localOnly: request?.localOnly === true }
   // After tearing down a backend for profile deletion, route to the primary
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
   const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
+  const connection = await ensureBackend(routeProfile, routeOptions)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile, routeOptions))
 
   const url = `${connection.baseUrl}${requestPath}`
 

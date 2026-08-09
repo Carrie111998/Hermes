@@ -379,6 +379,7 @@ function profileRemoteOverride(config, profile) {
 
 export interface ProfileRouteOptions {
   globalRemote?: boolean
+  localOnly?: boolean
   localProfile?: boolean
   primaryBackendRemote?: boolean
   primaryProfile?: null | string
@@ -422,6 +423,14 @@ export interface ProfileBackendRoute {
 function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): ProfileBackendRoute {
   const scopedProfile = connectionScopeKey(profile)
   const primaryProfile = connectionScopeKey(opts.primaryProfile) || 'default'
+
+  // An explicit local target is needed for the local root profile when the
+  // remote primary also uses the name "default". Without this escape hatch,
+  // the primary-profile fast path below makes both roots address the same
+  // backend.
+  if (opts.localOnly && opts.localProfile && opts.primaryBackendRemote) {
+    return { backend: 'pool', descriptorProfile: null, scopePath: false }
+  }
 
   if (!scopedProfile || scopedProfile === primaryProfile) {
     return { backend: 'primary', descriptorProfile: null, scopePath: false }

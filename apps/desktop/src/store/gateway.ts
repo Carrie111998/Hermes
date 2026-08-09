@@ -17,6 +17,14 @@ import { setGatewayState } from '@/store/session'
 // only ever have the primary, so their path is byte-for-byte unchanged.
 
 const normKey = (profile: string | null | undefined): string => (profile ?? '').trim() || 'default'
+const LOCAL_TARGET_PREFIX = '__local__:'
+
+export interface GatewayProfileOptions {
+  localOnly?: boolean
+}
+
+const targetKey = (profile: string, options: GatewayProfileOptions = {}): string =>
+  options.localOnly ? `${LOCAL_TARGET_PREFIX}${normKey(profile)}` : normKey(profile)
 
 // Read connection state through a call so TS control-flow analysis doesn't
 // narrow the getter to a constant across guards (it genuinely changes).
@@ -28,7 +36,9 @@ interface RegistryConfig {
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
 interface Secondary {
+  key: string
   profile: string
+  localOnly: boolean
   gateway: HermesGateway
   offEvent: () => void
   offState: () => void
@@ -56,6 +66,8 @@ interface GatewayRegistryState {
   primaryGateway: HermesGateway | null
   primaryProfile: string
   activeKey: string
+  activeProfile: string
+  activeLocalOnly: boolean
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
 }
@@ -68,6 +80,8 @@ function createRegistryState(): GatewayRegistryState {
     primaryGateway: null,
     primaryProfile: 'default',
     activeKey: 'default',
+    activeProfile: 'default',
+    activeLocalOnly: false,
     secondaries: new Map<string, Secondary>(),
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
@@ -153,8 +167,10 @@ export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(g.primaryProfile, state)
 }
 
-function setActive(profile: string): void {
-  g.activeKey = normKey(profile)
+function setActive(key: string, profile: string, localOnly = false): void {
+  g.activeKey = key
+  g.activeProfile = normKey(profile)
+  g.activeLocalOnly = localOnly
   const gateway = activeGateway()
   g.$gateway.set(gateway)
   setGatewayState(gateway?.connectionState ?? 'closed')
@@ -174,7 +190,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
     return
   }
 
-  const conn = await desktop.getConnection(entry.profile)
+  const conn = await desktop.getConnection(entry.profile, entry.localOnly ? { localOnly: true } : undefined)
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
   await entry.gateway.connect(wsUrl)
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
@@ -216,11 +232,13 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   }
 }
 
-function createSecondary(profile: string): Secondary {
+function createSecondary(key: string, profile: string, localOnly = false): Secondary {
   const gateway = new HermesGateway()
 
   const entry: Secondary = {
+    key,
     profile,
+    localOnly,
     gateway,
     offEvent: () => {},
     offState: () => {},
@@ -232,7 +250,7 @@ function createSecondary(profile: string): Secondary {
 
   entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
   entry.offState = gateway.onState(state => {
-    reportGatewayState(profile, state)
+    reportGatewayState(key, state)
 
     if (state === 'open') {
       entry.reconnectAttempt = 0
@@ -242,7 +260,7 @@ function createSecondary(profile: string): Secondary {
     }
   })
 
-  g.secondaries.set(profile, entry)
+  g.secondaries.set(key, entry)
 
   return entry
 }
@@ -253,14 +271,14 @@ function createSecondary(profile: string): Secondary {
 // it. No scheduleReconnect on failure: a hover is speculative, so a dead
 // backend must not start a background retry loop — the real switch owns retry
 // and error UX. An already-open (or primary) profile is a no-op.
-export async function openGatewayForProfile(profile: string): Promise<void> {
-  const key = normKey(profile)
+export async function openGatewayForProfile(profile: string, options: GatewayProfileOptions = {}): Promise<void> {
+  const key = targetKey(profile, options)
 
-  if (key === g.primaryProfile) {
+  if (!options.localOnly && key === g.primaryProfile) {
     return
   }
 
-  const entry = g.secondaries.get(key) ?? createSecondary(key)
+  const entry = g.secondaries.get(key) ?? createSecondary(key, profile, Boolean(options.localOnly))
   entry.wantOpen = true
 
   if (!isOpen(entry.gateway)) {
@@ -270,11 +288,11 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
 
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
-export async function ensureGatewayForProfile(profile: string): Promise<void> {
-  const key = normKey(profile)
+export async function ensureGatewayForProfile(profile: string, options: GatewayProfileOptions = {}): Promise<void> {
+  const key = targetKey(profile, options)
 
-  if (key === g.primaryProfile) {
-    setActive(key)
+  if (!options.localOnly && key === g.primaryProfile) {
+    setActive(key, profile)
 
     return
   }
@@ -282,7 +300,7 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
   let entry = g.secondaries.get(key)
 
   if (!entry) {
-    entry = createSecondary(key)
+    entry = createSecondary(key, profile, Boolean(options.localOnly))
   }
 
   entry.wantOpen = true
@@ -298,17 +316,32 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
     }
   }
 
-  setActive(key)
+  setActive(key, profile, Boolean(options.localOnly))
 }
 
 // Reconnect the active gateway after a transient request failure. Primary
 // reconnects are owned by use-gateway-boot, so we only drive secondaries here.
 export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
-  if (g.activeKey === g.primaryProfile) {
+  if (isActivePrimary()) {
     return g.primaryGateway
   }
 
-  const entry = g.secondaries.get(g.activeKey)
+  // The main-process pool can reap a backend while the renderer is asleep, and
+  // profile switches/reloads can briefly leave the active key without a
+  // secondary entry. Recreate the entry before declaring the active gateway
+  // disconnected; otherwise callers surface a permanent generic error instead
+  // of using the normal secondary reconnect path.
+  let entry = g.secondaries.get(g.activeKey)
+
+  if (!entry) {
+    try {
+      await ensureGatewayForProfile(g.activeProfile, { localOnly: g.activeLocalOnly })
+    } catch {
+      return null
+    }
+
+    entry = g.secondaries.get(g.activeKey)
+  }
 
   if (!entry) {
     return null
@@ -360,7 +393,7 @@ function disposeSecondary(entry: Secondary): void {
 // (profiles with a running / needs-input session). Bounds cost to live work.
 export function pruneSecondaryGateways(keep: Set<string>): void {
   for (const [key, entry] of [...g.secondaries]) {
-    if (key === g.activeKey || keep.has(key)) {
+    if (key === g.activeKey || keep.has(key) || keep.has(entry.profile)) {
       continue
     }
 

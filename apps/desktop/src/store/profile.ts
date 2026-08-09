@@ -11,8 +11,8 @@ import {
   storedStringArray,
   storedStringRecord
 } from '@/lib/storage'
-import { $gateway, ensureGatewayForProfile, openGatewayForProfile } from '@/store/gateway'
-import { setConnection } from '@/store/session'
+import { $gateway, ensureGatewayForProfile, openGatewayForProfile, type GatewayProfileOptions } from '@/store/gateway'
+import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -38,6 +38,10 @@ export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
 }
 
+function profileTargetOptions(name: string): GatewayProfileOptions {
+  return normalizeProfileKey(name) === 'default' && $connection.get()?.mode === 'remote' ? { localOnly: true } : {}
+}
+
 function mergeProfileCatalogs(
   activeProfiles: ProfileInfo[],
   localProfiles: ProfileInfo[],
@@ -52,10 +56,12 @@ function mergeProfileCatalogs(
   for (const item of activeProfiles) {
     const key = normalizeProfileKey(item.name)
 
-    // The active backend is authoritative for its own profile metadata. Local
-    // metadata wins for every other colliding name because mixed routing sends
-    // known local profiles to the Mac backend.
-    if (key === activeKey || !merged.has(key)) {
+    // The local root is the Desktop's canonical `default`. A remote backend may
+    // expose its own root under the same name, but showing that row would make
+    // the home button point at the remote primary instead of the Mac root.
+    // Local metadata wins for every other colliding name because mixed routing
+    // sends known local profiles to the Mac backend.
+    if (!merged.has(key) || (key !== 'default' && key === activeKey)) {
       merged.set(key, item)
     }
   }
@@ -65,18 +71,19 @@ function mergeProfileCatalogs(
 
 export async function refreshProfiles(): Promise<ProfileInfo[]> {
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
-  const { profiles: activeProfiles } = await getProfiles(activeKey)
-  let localProfiles = activeProfiles
+  const activeIsRemote = $connection.get()?.mode === 'remote'
+  const activeProfilesRequest =
+    activeKey === 'default'
+      ? activeIsRemote
+        ? getProfiles(null)
+        : getProfiles('default', { localOnly: true })
+      : getProfiles(activeKey)
+  const [{ profiles: activeProfiles }, localResponse] = await Promise.all([
+    activeProfilesRequest,
+    getProfiles('default', { localOnly: true }).catch(() => ({ profiles: [] }))
+  ])
 
-  if (activeKey !== 'default') {
-    // The picker is a Desktop-level catalog, not only the current gateway's
-    // catalog. Fetch the local default backend as well so a remote primary does
-    // not hide the Mac's local profiles.
-    const localResponse = await getProfiles('default').catch(() => ({ profiles: [] }))
-    localProfiles = localResponse.profiles
-  }
-
-  const profiles = mergeProfileCatalogs(activeProfiles, localProfiles, activeKey)
+  const profiles = mergeProfileCatalogs(activeProfiles, localResponse.profiles, activeKey)
   $profiles.set(profiles)
 
   return profiles
@@ -264,7 +271,9 @@ export function prewarmProfileBackend(name: string): void {
   }
 
   prewarmedAt.set(key, now)
-  openGatewayForProfile(key).catch(() => undefined)
+  const options = profileTargetOptions(key)
+  const prewarm = options.localOnly ? openGatewayForProfile(key, options) : openGatewayForProfile(key)
+  prewarm.catch(() => undefined)
 }
 
 let gatewaySwitch: Promise<void> | null = null
@@ -281,7 +290,7 @@ let gatewaySwitch: Promise<void> | null = null
 // browser and /api/media fetches targeted the wrong machine (#46651).
 // Best-effort: a failed descriptor fetch leaves the prior connection intact for
 // boot/reconnect to resync.
-async function syncConnectionToActiveProfile(profile: string): Promise<void> {
+async function syncConnectionToActiveProfile(profile: string, options: GatewayProfileOptions = {}): Promise<void> {
   const getConnection = window.hermesDesktop?.getConnection
 
   if (!getConnection) {
@@ -289,7 +298,8 @@ async function syncConnectionToActiveProfile(profile: string): Promise<void> {
   }
 
   try {
-    setConnection(await getConnection(profile))
+    const connection = options.localOnly ? await getConnection(profile, options) : await getConnection(profile)
+    setConnection(connection)
   } catch {
     // Leave the prior connection in place; boot/reconnect resyncs it later.
   }
@@ -300,7 +310,10 @@ async function syncConnectionToActiveProfile(profile: string): Promise<void> {
 // their sockets — so their sessions keep streaming concurrently. A null/empty
 // target means "no explicit profile" → keep the current gateway (a plain new
 // chat stays put; single-profile users never leave the primary).
-export async function ensureGatewayProfile(profile: string | null | undefined): Promise<void> {
+export async function ensureGatewayProfile(
+  profile: string | null | undefined,
+  options: GatewayProfileOptions = {}
+): Promise<void> {
   if (profile == null || !String(profile).trim()) {
     // "No explicit profile" = use the current gateway. But if an explicit swap
     // (e.g. the user just picked a profile in the switcher) is still in flight,
@@ -315,7 +328,12 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
 
   const target = normalizeProfileKey(profile)
 
-  if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+  const alreadyActive =
+    normalizeProfileKey($activeGatewayProfile.get()) === target &&
+    $gateway.get() &&
+    (!options.localOnly || $connection.get()?.mode !== 'remote')
+
+  if (alreadyActive) {
     return
   }
 
@@ -324,7 +342,12 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   if (gatewaySwitch) {
     await gatewaySwitch.catch(() => undefined)
 
-    if (normalizeProfileKey($activeGatewayProfile.get()) === target && $gateway.get()) {
+    const alreadyActiveAfterWait =
+      normalizeProfileKey($activeGatewayProfile.get()) === target &&
+      $gateway.get() &&
+      (!options.localOnly || $connection.get()?.mode !== 'remote')
+
+    if (alreadyActiveAfterWait) {
       return
     }
   }
@@ -333,11 +356,12 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
   gatewaySwitch = (async () => {
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
-    await ensureGatewayForProfile(target)
+    const gateway = options.localOnly ? ensureGatewayForProfile(target, options) : ensureGatewayForProfile(target)
+    await gateway
     $activeGatewayProfile.set(target)
     // The active backend just changed; resync $connection so remote-aware
     // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
-    await syncConnectionToActiveProfile(target)
+    await syncConnectionToActiveProfile(target, options)
   })()
 
   try {
@@ -378,9 +402,13 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // $activeGatewayProfile → name, so $profileScope follows).
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  const options = profileTargetOptions(target)
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
-  const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
+  const switching =
+    $showAllProfiles.get() ||
+    target !== normalizeProfileKey($activeGatewayProfile.get()) ||
+    Boolean(options.localOnly)
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
 
@@ -388,7 +416,7 @@ export function selectProfile(name: string): void {
     requestFreshSession()
   }
 
-  void ensureGatewayProfile(target)
+  void ensureGatewayProfile(target, options)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
@@ -401,7 +429,7 @@ export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
   $newChatProfile.set(target)
   requestFreshSession()
-  void ensureGatewayProfile(target)
+  void ensureGatewayProfile(target, profileTargetOptions(target))
 }
 
 export function setShowAllProfiles(value: boolean): void {

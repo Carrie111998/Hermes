@@ -294,6 +294,18 @@ for (const route of ROUTES) {
   })
 }
 
+test('resolveProfileBackendRoute sends an explicit local default to a pool beside a remote default primary', () => {
+  assert.deepEqual(
+    resolveProfileBackendRoute('default', {
+      localOnly: true,
+      localProfile: true,
+      primaryBackendRemote: true,
+      primaryProfile: 'default'
+    }),
+    { backend: 'pool', descriptorProfile: null, scopePath: false }
+  )
+})
+
 test('resolveProfileBackendRoute only tags a descriptor when the backend is shared', () => {
   // A pooled backend is already scoped to its profile, so tagging it would
   // imply a second scope the caller must reconcile. Only the shared
