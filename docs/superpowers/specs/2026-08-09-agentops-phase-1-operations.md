@@ -54,4 +54,3 @@ Phase 1 仅允许测试或人工前台 daemon。没有 plist、没有 `launchctl
 **Phase 1 回滚：** 停止测试 daemon，删除其临时 socket，恢复该测试/AgentOps Store 的最近验证备份；如果没有 AgentOps 服务，则无需触碰 launchd。Gateway 继续由已有 launchd/watchdog 管理。
 
 **安全事件：** 如果发现审计链异常、Secret 持久化、未知控制器或 UDS 权限不符合预期，停止 daemon（或保持无 store health）、保留脱敏证据，禁止进一步执行；本阶段不存在需要自动回滚的 Target 写动作。
-

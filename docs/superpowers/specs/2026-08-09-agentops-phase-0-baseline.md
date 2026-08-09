@@ -71,4 +71,3 @@ Phase 0/1 使用独立 worktree `/Users/molly/Desktop/Hermes-agentops-phase1`，
 - 当前用户修改已记录为受保护资产。
 
 **G0: implementation-authorized by active task objective; production/R1-R4 authorization remains absent.**
-

@@ -373,4 +373,3 @@ git commit -m "feat: add observe-only agentops foundation"
 - [ ] **Step 5: Request Sol review before merge/push**
 
 Provide branch SHA, touched files, raw test output, static scan output, G1 matrix, known limitations and the explicit statement that no launchd service or Target write capability was installed.
-
