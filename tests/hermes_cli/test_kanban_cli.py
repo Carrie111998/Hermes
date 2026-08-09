@@ -57,6 +57,29 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_completion_and_link_condition_flags_round_trip(kanban_home):
+    sha = "a" * 40
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="review", assignee="reviewer")
+        child = kb.create_task(conn, title="release", assignee="release")
+
+    completed = kc.run_slash(
+        f"complete {parent} --summary reviewed --outcome-code APPROVED "
+        f"--subject-sha {sha}"
+    )
+    linked = kc.run_slash(
+        f"link {parent} {child} --accept-outcome APPROVED --subject-sha {sha}"
+    )
+
+    assert f"Completed {parent}" in completed
+    assert f"Linked {parent} -> {child}" in linked
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, parent)
+        assert run.outcome_code == "APPROVED"
+        assert run.subject_sha == sha
+        assert kb.get_task(conn, child).status == "ready"
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
