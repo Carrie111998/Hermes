@@ -129,6 +129,21 @@ test('cancelAll invalidates every pending scope and exposes promises for quit', 
   assert.ok(results.every(result => result.status === 'rejected' && (result.reason as any).kind === 'superseded'))
 })
 
+test('cancelAll fences later bootstraps during app quit', async () => {
+  const coordinator = createBootstrapCoordinator()
+  let ran = false
+
+  coordinator.cancelAll()
+
+  await assert.rejects(
+    coordinator.start('late', 'x', async () => {
+      ran = true
+    }),
+    (error: any) => error.kind === 'cancelled'
+  )
+  assert.equal(ran, false)
+})
+
 test('cancelAndWait drains only the requested scope', async () => {
   const coordinator = createBootstrapCoordinator()
   const firstGate = deferred()

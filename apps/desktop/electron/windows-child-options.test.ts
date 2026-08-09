@@ -179,6 +179,26 @@ test('waitForBackendExit does not resolve until the force-killed backend exits',
   assert.equal(resolved, true)
 })
 
+test('waitForBackendExit resolves on close when spawn failed before exit', async () => {
+  const child = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    kill: () => {},
+    killed: false,
+    pid: undefined,
+    signalCode: null
+  })
+
+  const waiting = waitForBackendExit(child, { forceKillProcessTree: () => {}, isWindows: false }, 0)
+  child.emit('close', -2, null)
+
+  const result = await Promise.race([
+    waiting.then(() => 'closed'),
+    new Promise(resolve => setTimeout(() => resolve('pending'), 20))
+  ])
+
+  assert.equal(result, 'closed')
+})
+
 test('Windows update tree-kills captured roots without pre-signalling the primary backend', () => {
   const primary = makeChild({ pid: 101 })
   const pooled = makeChild({ pid: 202 })

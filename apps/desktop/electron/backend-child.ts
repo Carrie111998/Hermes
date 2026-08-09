@@ -43,7 +43,7 @@ export interface KillableChild extends BackendProcessRoot {
 export interface WaitableChild extends KillableChild {
   exitCode?: number | null
   signalCode?: string | null
-  once: (event: 'exit', listener: () => void) => unknown
+  once: (event: 'close' | 'exit', listener: () => void) => unknown
 }
 
 /**
@@ -95,10 +95,13 @@ export async function waitForBackendExit(
       }
     }, timeoutMs)
 
-    child.once('exit', () => {
+    const finish = () => {
       clearTimeout(timer)
       resolve()
-    })
+    }
+
+    child.once('exit', finish)
+    child.once('close', finish)
   })
 }
 

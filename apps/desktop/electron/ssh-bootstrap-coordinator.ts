@@ -23,8 +23,16 @@ function createBootstrapCoordinator() {
   const pending = new Map<string, any>()
   const generations = new Map<string, number>()
   const drains = new Map<string, Promise<void>>()
+  let cancelled = false
 
   function start(scope, fingerprint, run) {
+    if (cancelled) {
+      const error: any = new Error('SSH bootstrap was cancelled because the Desktop is quitting.')
+      error.kind = 'cancelled'
+
+      return Promise.reject(error)
+    }
+
     const current = pending.get(scope)
 
     if (current?.fingerprint === fingerprint) {
@@ -111,6 +119,8 @@ function createBootstrapCoordinator() {
   }
 
   function cancelAll() {
+    cancelled = true
+
     for (const entry of active) {
       entry.controller.abort()
     }
