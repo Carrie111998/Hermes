@@ -52,6 +52,7 @@ def _clean_state():
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    approval_module._generated_permanent_grants.clear()
     saved = {}
     for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
         if k in os.environ:
@@ -60,6 +61,7 @@ def _clean_state():
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    approval_module._generated_permanent_grants.clear()
     for k, v in saved.items():
         os.environ[k] = v
     for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
@@ -221,9 +223,8 @@ class TestCombinedWarnings:
            return_value=_tirith_result("warn",
                                        [{"rule_id": "homograph_url"}],
                                        "homograph URL"))
-    def test_combined_cli_always_persists_pattern_but_not_tirith(self, mock_tirith):
-        """Choosing Always on a mixed prompt permanently allowlists the
-        dangerous-pattern key while the tirith key stays session-scoped."""
+    def test_combined_cli_always_creates_generated_grant_but_not_tirith(self, mock_tirith):
+        """Always creates a bounded grant for a dangerous key only."""
         os.environ["HERMES_INTERACTIVE"] = "1"
         cb = MagicMock(return_value="always")
         result = check_all_command_guards(
@@ -234,8 +235,10 @@ class TestCombinedWarnings:
         # tirith key: session only, never permanent
         assert is_approved(session_key, "tirith:homograph_url")
         assert "tirith:homograph_url" not in _mod._permanent_approved
-        # dangerous-pattern key: permanent
-        assert "pipe remote content to shell" in _mod._permanent_approved
+        # Dangerous-pattern key is a bounded generated grant, never an
+        # unbounded legacy command_allowlist policy entry.
+        grant = _mod._generated_permanent_grants["pipe remote content to shell"]
+        assert grant.remaining_uses == 10
 
 
 # ---------------------------------------------------------------------------

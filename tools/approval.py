@@ -14,6 +14,7 @@ import fnmatch
 import functools
 import hashlib
 import logging
+import math
 import os
 import re
 import shlex
@@ -22,6 +23,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from dataclasses import dataclass
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2199,11 +2201,14 @@ def detect_dangerous_command(command: str) -> tuple:
 # Per-session approval state (thread-safe)
 # =========================================================================
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _pending: dict[str, dict] = {}
-_session_approved: dict[str, set] = {}
+_session_approved: dict[str, "_SessionGrantMap"] = {}
 _session_yolo: set[str] = set()
-_permanent_approved: set = set()
+# Legacy explicit command_allowlist literals/globs and historical pattern keys.
+_permanent_approved: set[str] = set()
+# Bounded approval-generated permanent grants, persisted separately from policy.
+_generated_permanent_grants: dict[str, "_GeneratedApprovalGrant"] = {}
 
 
 # =========================================================================
@@ -2512,7 +2517,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
-        entry.result = choice
+        allowed_scopes = {"once"}
+        if entry.data.get("allow_session", True):
+            allowed_scopes.add("session")
+        if entry.data.get("allow_permanent", True):
+            allowed_scopes.add("always")
+        entry.result = choice if choice in allowed_scopes or choice == "deny" else "deny"
         if reason:
             entry.reason = reason
         entry.event.set()
@@ -2531,10 +2541,57 @@ def submit_pending(session_key: str, approval: dict):
         _pending[session_key] = approval
 
 
+_GENERATED_GRANT_VERSION = 1
+_GENERATED_GRANT_SESSION_TTL_SECONDS = 60 * 60
+_GENERATED_GRANT_PERMANENT_TTL_SECONDS = 24 * 60 * 60
+_GENERATED_GRANT_MAX_USES = 10
+_GENERATED_GRANT_KINDS = frozenset({"pattern", "execute_code"})
+
+
+@dataclass
+class _GeneratedApprovalGrant:
+    """A bounded approval created by the approval UI, never user policy."""
+
+    kind: str
+    key: str
+    granted_at: float
+    expires_at: float
+    remaining_uses: int
+
+
+class _SessionGrantMap(dict[str, _GeneratedApprovalGrant]):
+    """Dict with set-like discard compatibility for test and plugin cleanup."""
+
+    def discard(self, key: str) -> None:
+        self.pop(key, None)
+
+
+def _approval_time() -> float:
+    """Return wall-clock time through one deterministic-test seam."""
+    return time.time()
+
+
+def _generated_grant_kind(pattern_key: str) -> str:
+    return "execute_code" if pattern_key == "execute_code" else "pattern"
+
+
+def _new_generated_grant(pattern_key: str, ttl_seconds: int) -> _GeneratedApprovalGrant:
+    now = _approval_time()
+    return _GeneratedApprovalGrant(
+        kind=_generated_grant_kind(pattern_key),
+        key=pattern_key,
+        granted_at=now,
+        expires_at=now + ttl_seconds,
+        remaining_uses=_GENERATED_GRANT_MAX_USES,
+    )
+
+
 def approve_session(session_key: str, pattern_key: str):
-    """Approve a pattern for this session only."""
+    """Create a bounded session grant for an approval-generated key."""
     with _lock:
-        _session_approved.setdefault(session_key, set()).add(pattern_key)
+        _session_approved.setdefault(session_key, _SessionGrantMap())[pattern_key] = _new_generated_grant(
+            pattern_key, _GENERATED_GRANT_SESSION_TTL_SECONDS
+        )
 
 
 def _release_permission_mode_dependents(session_key: str) -> None:
@@ -2605,28 +2662,97 @@ def is_current_session_yolo_enabled() -> bool:
     return is_session_yolo_enabled(get_current_session_key(default=""))
 
 
-def is_approved(session_key: str, pattern_key: str) -> bool:
-    """Check if a pattern is approved (session-scoped or permanent).
+def _consume_generated_grant(
+    grants: dict[str, _GeneratedApprovalGrant],
+    pattern_key: str,
+    aliases: set[str],
+) -> bool:
+    """Atomically consume one valid generated grant, removing invalid state."""
+    now = _approval_time()
+    for alias in aliases:
+        grant = grants.get(alias)
+        if grant is None:
+            continue
+        if (
+            not isinstance(grant, _GeneratedApprovalGrant)
+            or grant.kind not in _GENERATED_GRANT_KINDS
+            or grant.key != alias
+            or not isinstance(grant.granted_at, (int, float))
+            or isinstance(grant.granted_at, bool)
+            or not isinstance(grant.expires_at, (int, float))
+            or isinstance(grant.expires_at, bool)
+            or not math.isfinite(grant.granted_at)
+            or not math.isfinite(grant.expires_at)
+            or grant.expires_at <= grant.granted_at
+            or grant.expires_at <= now
+            or isinstance(grant.remaining_uses, bool)
+            or not isinstance(grant.remaining_uses, int)
+            or grant.remaining_uses <= 0
+            or grant.remaining_uses > _GENERATED_GRANT_MAX_USES
+        ):
+            grants.pop(alias, None)
+            continue
+        grant.remaining_uses -= 1
+        if grant.remaining_uses == 0:
+            grants.pop(alias, None)
+        return True
+    return False
 
-    Accept both the current canonical key and the legacy regex-derived key so
-    existing command_allowlist entries continue to work after key migrations.
+
+def is_approved(session_key: str, pattern_key: str) -> bool:
+    """Consume one bounded generated grant or honor legacy explicit policy.
+
+    Legacy ``command_allowlist`` entries retain their historical unbounded
+    literal/glob and pattern-key semantics. Only UI-generated grants use the
+    expiry/use model and they are removed on malformed, expired, or exhausted
+    reads.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
-        session_approvals = _session_approved.get(session_key, set())
-        return any(alias in session_approvals for alias in aliases)
+        session_grants = _session_approved.get(session_key)
+        if session_grants:
+            if _consume_generated_grant(session_grants, pattern_key, aliases):
+                if not session_grants:
+                    _session_approved.pop(session_key, None)
+                return True
+            if not session_grants:
+                _session_approved.pop(session_key, None)
+        if not _consume_generated_grant(
+            _generated_permanent_grants, pattern_key, aliases
+        ):
+            return False
+        # Permanent grants survive a process restart. Persist the decremented
+        # counter while still holding the approval lock; otherwise concurrent
+        # consumers could restore a stale use count after a restart.
+        if save_permanent_allowlist():
+            return True
+        _generated_permanent_grants.clear()
+        return False
+
+
+def _serialize_generated_grant(grant: _GeneratedApprovalGrant) -> dict:
+    return {
+        "version": _GENERATED_GRANT_VERSION,
+        "kind": grant.kind,
+        "key": grant.key,
+        "granted_at": grant.granted_at,
+        "expires_at": grant.expires_at,
+        "remaining_uses": grant.remaining_uses,
+    }
 
 
 def approve_permanent(pattern_key: str):
-    """Add a pattern to the permanent allowlist."""
+    """Create a bounded permanent grant without changing command_allowlist."""
     with _lock:
-        _permanent_approved.add(pattern_key)
+        _generated_permanent_grants[pattern_key] = _new_generated_grant(
+            pattern_key, _GENERATED_GRANT_PERMANENT_TTL_SECONDS
+        )
 
 
 def load_permanent(patterns: set):
-    """Bulk-load permanent allowlist entries from config."""
+    """Bulk-load legacy explicit allowlist entries from config."""
     with _lock:
         _permanent_approved.update(patterns)
 
@@ -2673,33 +2799,87 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
 # Config persistence for permanent allowlist
 # =========================================================================
 
-def load_permanent_allowlist() -> set:
-    """Load permanently allowed command patterns from config.
+def _parse_generated_grant(raw: object) -> _GeneratedApprovalGrant | None:
+    """Decode generated-grant config records; unknown/malformed records deny."""
+    if not isinstance(raw, dict) or raw.get("version") != _GENERATED_GRANT_VERSION:
+        return None
+    kind = raw.get("kind")
+    key = raw.get("key")
+    granted_at = raw.get("granted_at")
+    expires_at = raw.get("expires_at")
+    remaining_uses = raw.get("remaining_uses")
+    if (
+        kind not in _GENERATED_GRANT_KINDS
+        or not isinstance(key, str)
+        or not key
+        or _generated_grant_kind(key) != kind
+        or isinstance(granted_at, bool)
+        or isinstance(expires_at, bool)
+        or not isinstance(granted_at, (int, float))
+        or not isinstance(expires_at, (int, float))
+        or not math.isfinite(granted_at)
+        or not math.isfinite(expires_at)
+        or expires_at <= granted_at
+        or isinstance(remaining_uses, bool)
+        or not isinstance(remaining_uses, int)
+        or not 0 < remaining_uses <= _GENERATED_GRANT_MAX_USES
+    ):
+        return None
+    return _GeneratedApprovalGrant(kind, key, float(granted_at), float(expires_at), remaining_uses)
 
-    Also syncs them into the approval module so is_approved() works for
-    patterns added via 'always' in a previous session.
-    """
+
+def _load_generated_permanent_grants(records: object) -> None:
+    """Replace generated grants from config, pruning expired/malformed records."""
+    loaded: dict[str, _GeneratedApprovalGrant] = {}
+    if isinstance(records, list):
+        now = _approval_time()
+        for raw in records:
+            grant = _parse_generated_grant(raw)
+            if grant is not None and grant.expires_at > now:
+                loaded[grant.key] = grant
+    with _lock:
+        _generated_permanent_grants.clear()
+        _generated_permanent_grants.update(loaded)
+
+
+def load_permanent_allowlist() -> set:
+    """Load legacy allowlist policy plus bounded generated approval grants."""
     try:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
         patterns = set(config.get("command_allowlist", []) or [])
         if patterns:
             load_permanent(patterns)
+        _load_generated_permanent_grants(config.get("approval_grants", []))
         return patterns
     except Exception as e:
         logger.warning("Failed to load permanent allowlist: %s", e)
         return set()
 
 
-def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+def save_permanent_allowlist(patterns: set | None = None):
+    """Persist explicit legacy policy and separately stored generated grants.
+
+    ``patterns`` is the established explicit-policy API used by the approval
+    suggestion command. Approval UI call sites omit it so they never rewrite
+    the user's literal/glob ``command_allowlist`` entries.
+    """
     try:
         from hermes_cli.config import load_config, save_config
         config = load_config()
-        config["command_allowlist"] = list(patterns)
+        if patterns is not None:
+            config["command_allowlist"] = list(patterns)
+        with _lock:
+            config["approval_grants"] = [
+                _serialize_generated_grant(grant)
+                for grant in _generated_permanent_grants.values()
+                if grant.expires_at > _approval_time() and grant.remaining_uses > 0
+            ]
         save_config(config)
+        return True
     except Exception as e:
-        logger.warning("Could not save allowlist: %s", e)
+        logger.warning("Could not save approval grants: %s", e)
+        return False
 
 
 # =========================================================================
@@ -3316,7 +3496,7 @@ def _run_approval_gate(
             elif choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                save_permanent_allowlist()
             return {"approved": True, "message": None}
 
         # No notify callback (e.g. API server without an attached chat):
@@ -3394,7 +3574,7 @@ def _run_approval_gate(
     elif choice == "always":
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+        save_permanent_allowlist()
 
     return {"approved": True, "message": None}
 
@@ -4098,7 +4278,7 @@ def check_all_command_guards(command: str, env_type: str,
                     elif choice == "always":
                         approve_session(session_key, key)
                         approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                        save_permanent_allowlist()
 
             # A human approval (including an ESCALATE-then-approve or a
             # smart-DENY owner override) resets the consecutive-denial tally.
@@ -4214,7 +4394,7 @@ def check_all_command_guards(command: str, env_type: str,
                 # dangerous patterns: permanent allowed
                 approve_session(session_key, key)
                 approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+                save_permanent_allowlist()
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)
@@ -4449,7 +4629,7 @@ def check_execute_code_guard(code: str, env_type: str,
         elif choice == "always":
             approve_session(session_key, pattern_key)
             approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
+            save_permanent_allowlist()
     # choice == "once": no persistence — approval lasts this single call only.
 
     # A human approval resets the consecutive-denial tally.
