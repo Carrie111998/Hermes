@@ -304,6 +304,33 @@ function profileSshOverride(config, profile) {
   return normalizeSshConfig(entry)
 }
 
+function profileExplicitlyNonSsh(config, profile) {
+  const key = connectionScopeKey(profile)
+  const entry = key ? config?.profiles?.[key] : null
+
+  return Boolean(entry && typeof entry === 'object' && entry.mode !== 'ssh')
+}
+
+function resolveSshTerminalRoute(config, profile, hasEnvRemoteUrl = false) {
+  if (profileSshOverride(config, profile)) {
+    return 'profile-ssh'
+  }
+
+  if (profileRemoteOverride(config, profile)) {
+    return 'none'
+  }
+
+  if (profileExplicitlyNonSsh(config, profile)) {
+    return 'none'
+  }
+
+  if (hasEnvRemoteUrl) {
+    return 'none'
+  }
+
+  return config?.mode === 'ssh' ? 'global-ssh' : 'none'
+}
+
 function savedProfileSsh(config, profile) {
   const key = connectionScopeKey(profile)
   const entry = key ? config?.profiles?.[key] : null
@@ -577,11 +604,13 @@ export {
   normAuthMode,
   pathWithGlobalRemoteProfile,
   PRIVY_SESSION_COOKIE_VARIANTS,
+  profileExplicitlyNonSsh,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSshTerminalRoute,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,

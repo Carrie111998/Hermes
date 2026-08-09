@@ -32,11 +32,13 @@ import {
   normalizeSshConfig,
   normAuthMode,
   pathWithGlobalRemoteProfile,
+  profileExplicitlyNonSsh,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSshTerminalRoute,
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
@@ -217,6 +219,49 @@ test('saved SSH drafts are inactive and explicit overrides take precedence', () 
   config.profiles.coder = { mode: 'ssh', host: 'active' }
   assert.deepEqual(profileSshOverride(config, 'coder'), { mode: 'ssh', host: 'active' })
   assert.equal(profileHasRemoteConnection(config, 'coder'), true)
+})
+
+test('profileExplicitlyNonSsh blocks global SSH fallback for explicit non-SSH modes', () => {
+  const config = {
+    profiles: {
+      local: { mode: 'local' },
+      remote: { mode: 'remote', url: 'https://remote.example' },
+      cloud: { mode: 'cloud', url: 'https://cloud.example' },
+      ssh: { mode: 'ssh', host: 'box' }
+    }
+  }
+
+  assert.equal(profileExplicitlyNonSsh(config, 'local'), true)
+  assert.equal(profileExplicitlyNonSsh(config, 'remote'), true)
+  assert.equal(profileExplicitlyNonSsh(config, 'cloud'), true)
+  assert.equal(profileExplicitlyNonSsh(config, 'ssh'), false)
+  assert.equal(profileExplicitlyNonSsh(config, 'missing'), false)
+  assert.equal(profileExplicitlyNonSsh(config, ''), false)
+})
+
+test('resolveSshTerminalRoute preserves active SSH target precedence', () => {
+  const config = {
+    mode: 'ssh',
+    profiles: {
+      local: { mode: 'local' },
+      remote: { mode: 'remote', url: 'https://remote.example' },
+      cloud: { mode: 'cloud', url: 'https://cloud.example' },
+      other: { mode: 'other' },
+      ssh: { mode: 'ssh', host: 'profile-box' }
+    }
+  }
+
+  assert.equal(resolveSshTerminalRoute(config, 'local'), 'none')
+  assert.equal(resolveSshTerminalRoute(config, 'remote'), 'none')
+  assert.equal(resolveSshTerminalRoute(config, 'cloud'), 'none')
+  assert.equal(resolveSshTerminalRoute(config, 'other'), 'none')
+  assert.equal(resolveSshTerminalRoute(config, 'ssh'), 'profile-ssh')
+  assert.equal(resolveSshTerminalRoute(config, 'ssh', true), 'profile-ssh')
+  assert.equal(resolveSshTerminalRoute(config, 'missing'), 'global-ssh')
+  assert.equal(resolveSshTerminalRoute(config, ''), 'global-ssh')
+  assert.equal(resolveSshTerminalRoute(config, 'missing', true), 'none')
+  assert.equal(resolveSshTerminalRoute({ mode: 'remote' }, 'missing'), 'none')
+  assert.equal(resolveSshTerminalRoute({ mode: 'local' }, 'missing'), 'none')
 })
 
 // --- resolveProfileBackendRoute ---

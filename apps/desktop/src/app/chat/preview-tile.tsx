@@ -93,6 +93,7 @@ export function watchPreviewTiles(): void {
 
   $rightRailActiveTabId.listen(reveal)
   $previewTabs.listen(reveal)
+  reveal()
 
   // And the reverse: clicking a preview TAB activates its pane in the TREE
   // only, so the store's selection must follow or `$previewTarget` (⌘L quote

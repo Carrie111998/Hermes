@@ -35,10 +35,11 @@ function Harness() {
   return null
 }
 
-async function emitPreviewOpen(url = '/tmp/artifact-test.html') {
+async function emitPreviewOpen(url = '/tmp/artifact-test.html', profile?: string, remoteForward?: unknown) {
   await act(async () => {
     handleEvent({
-      payload: { label: 'hi bestie', url },
+      payload: { label: 'hi bestie', url, ...(remoteForward !== undefined ? { remote_forward: remoteForward } : {}) },
+      ...(profile ? { profile } : {}),
       session_id: RUNTIME_SESSION_ID,
       type: 'preview.open'
     } as unknown as RpcEvent)
@@ -82,6 +83,29 @@ describe('open_preview', () => {
 
     await waitFor(() => expect($previewTarget.get()?.path).toBe('/tmp/artifact-test.html'))
     expect($previewTabs.get()).toHaveLength(1)
+  })
+
+  it('passes the preview event profile to desktop normalization', async () => {
+    render(<Harness />)
+
+    await emitPreviewOpen('/tmp/profile.html', 'compass')
+
+    await waitFor(() => expect($previewTarget.get()?.path).toBe('/tmp/profile.html'))
+    expect(window.hermesDesktop.normalizePreviewTarget).toHaveBeenCalledWith('/tmp/profile.html', '/work', 'compass', false)
+  })
+
+  it('passes an explicit remote forwarding request to desktop normalization', async () => {
+    render(<Harness />)
+
+    await emitPreviewOpen('http://localhost:5173', 'compass', true)
+
+    await waitFor(() => expect($previewTarget.get()?.source).toBe('http://localhost:5173'))
+    expect(window.hermesDesktop.normalizePreviewTarget).toHaveBeenCalledWith(
+      'http://localhost:5173',
+      '/work',
+      'compass',
+      true
+    )
   })
 
   it('keeps the tab when the stored session id arrives afterwards', async () => {

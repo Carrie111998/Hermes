@@ -33,3 +33,29 @@ def test_emitter_failure_is_reported():
 
     desktop_ui.set_emitter(_boom)
     assert "no window" in json.loads(op.open_preview_tool("https://x.example"))["error"]
+
+
+def test_remote_forward_defaults_to_false_and_is_emitted_only_when_requested():
+    emitted = []
+
+    desktop_ui.set_emitter(lambda *_args: emitted.append(_args))
+
+    assert json.loads(op.open_preview_tool("http://localhost:5173"))["remote_forward"] is False
+    assert emitted[-1][2] == {"url": "http://localhost:5173", "label": "", "remote_forward": False}
+
+    assert json.loads(op.open_preview_tool("http://localhost:5173", remote_forward=True))["remote_forward"] is True
+    assert emitted[-1][2] == {"url": "http://localhost:5173", "label": "", "remote_forward": True}
+
+
+def test_registry_handler_passes_remote_forward_option():
+    emitted = []
+    desktop_ui.set_emitter(lambda *_args: emitted.append(_args))
+
+    entry = registry.get_entry("open_preview")
+    assert entry is not None
+
+    entry.handler({"url": "http://localhost:5173", "remote_forward": True})
+
+    assert emitted[-1][2]["remote_forward"] is True
+    assert op.OPEN_PREVIEW_SCHEMA["parameters"]["properties"]["remote_forward"]["type"] == "boolean"
+    assert "user-requested remote dev server" in op.OPEN_PREVIEW_SCHEMA["parameters"]["properties"]["remote_forward"]["description"]

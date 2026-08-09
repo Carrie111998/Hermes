@@ -72,6 +72,7 @@ import {
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
+  resolveSshTerminalRoute,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview
@@ -168,6 +169,7 @@ import {
   revalidatePooledRemoteBackends,
   revalidateRemoteConnection
 } from './remote-liveness'
+import { normalizeRemotePreviewTarget } from './remote-preview-target'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -186,6 +188,11 @@ import {
   redactSecrets,
   SshConnection
 } from './ssh-connection'
+import {
+  createOrReplaceSshPreviewForwarder,
+  isRemotePreviewForwardingRequested,
+  remotePreviewTargetForForwarding
+} from './ssh-preview-forwarding'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
@@ -4930,7 +4937,7 @@ function previewUrlTarget(rawTarget) {
   }
 }
 
-async function normalizePreviewTarget(rawTarget, baseDir) {
+async function normalizePreviewTarget(rawTarget, baseDir, optionalProfile, remoteForward) {
   const raw = String(rawTarget || '').trim()
 
   if (!raw) {
@@ -4939,6 +4946,30 @@ async function normalizePreviewTarget(rawTarget, baseDir) {
 
   try {
     if (/^https?:\/\//i.test(raw)) {
+      const sshTarget = activeSshTerminalTarget(optionalProfile)
+
+      const rewritten = await remotePreviewTargetForForwarding(
+        raw,
+        remoteForward,
+        sshTarget && sshTarget !== 'pending' ? sshTarget.previewForwarder : undefined
+      )
+
+      if (isRemotePreviewForwardingRequested(remoteForward)) {
+        if (!rewritten) {
+          return null
+        }
+
+        const publicTarget = normalizeRemotePreviewTarget(raw, rewritten)
+
+        if (publicTarget) {
+          return publicTarget
+        }
+
+        const target = previewUrlTarget(rewritten)
+
+        return target ? { ...target, source: raw } : null
+      }
+
       return previewUrlTarget(raw)
     }
 
@@ -7297,6 +7328,12 @@ async function teardownSshConnection(profile) {
   }
 
   try {
+    await state.previewForwarder?.close()
+  } catch {
+    // best effort
+  }
+
+  try {
     if (state.localPort && state.remotePort) {
       await state.ssh.cancelForward(state.localPort, state.remotePort)
     }
@@ -7314,30 +7351,30 @@ async function teardownSshConnection(profile) {
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
-// terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget() {
-  const profile = primaryProfileKey()
+// terminal/preview must NOT fall through to a global SSH host.
+function activeSshTerminalTarget(optionalProfile) {
+  const profile = optionalProfile && String(optionalProfile).trim() ? String(optionalProfile).trim() : primaryProfileKey()
   const config = readDesktopConnectionConfig()
 
-  if (profileSshOverride(config, profile)) {
+  const route = resolveSshTerminalRoute(config, profile, Boolean(process.env.HERMES_DESKTOP_REMOTE_URL))
+
+  if (route === 'profile-ssh') {
     const scope = sshScopeKey(profile)
     const state = sshConnections.get(scope)
 
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
+    return state && state.ssh
+      ? { previewForwarder: state.previewForwarder, ssh: state.ssh, scope }
+      : 'pending'
   }
 
-  if (profileRemoteOverride(config, profile)) {
-    return null
-  }
-
-  if (process.env.HERMES_DESKTOP_REMOTE_URL) {
+  if (route !== 'global-ssh') {
     return null
   }
 
   if (config.mode === 'ssh') {
     const state = sshConnections.get('')
 
-    return state && state.ssh ? { ssh: state.ssh, scope: '' } : 'pending'
+    return state && state.ssh ? { previewForwarder: state.previewForwarder, ssh: state.ssh, scope: '' } : 'pending'
   }
 
   return null
@@ -7379,23 +7416,19 @@ async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
 async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, source, fingerprint, lease) {
   const scope = sshScopeKey(profile)
   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
-  const existing = sshConnections.get(scope)
+  let existing = sshConnections.get(scope)
 
   if (existing && existing.fingerprint !== fingerprint) {
     await teardownSshConnection(profile)
+    existing = undefined
   }
 
-  let ssh = sshConnections.get(scope)?.ssh
+  let ssh = existing?.ssh
 
   if (ssh && !(await ssh.isAlive())) {
-    try {
-      await ssh.close()
-    } catch {
-      void 0
-    }
-
+    await teardownSshConnection(profile)
+    existing = undefined
     ssh = null
-    sshConnections.delete(scope)
   }
 
   const created = !ssh
@@ -7477,7 +7510,12 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     hostLabel,
     hermesVersion: result.hermesVersion || '',
     remotePlatform: result.platform?.os || '',
-    reused: result.reused
+    reused: result.reused,
+    previewForwarder: await createOrReplaceSshPreviewForwarder(existing?.previewForwarder, {
+      cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
+      forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
+      pickLocalPort: async () => Number(await pickLocalPort())
+    }, result.reused === true)
   })
 
   sshRememberLog(
@@ -10988,8 +11026,13 @@ ipcMain.handle('hermes:saveClipboardImage', async () => {
   return ''
 })
 
-ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir) =>
-  normalizePreviewTarget(String(target || ''), baseDir ? String(baseDir) : '')
+ipcMain.handle('hermes:normalizePreviewTarget', (_event, target, baseDir, profile, remoteForward) =>
+  normalizePreviewTarget(
+    String(target || ''),
+    baseDir ? String(baseDir) : '',
+    profile ? String(profile) : undefined,
+    remoteForward
+  )
 )
 
 ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(String(url || '')))

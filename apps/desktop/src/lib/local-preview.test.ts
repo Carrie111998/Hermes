@@ -44,6 +44,24 @@ describe('remote HTML previews', () => {
     expect(readDesktopFileDataUrl).toHaveBeenCalledWith('/srv/report.html')
   })
 
+  it('fails closed when explicit remote forwarding normalization returns null', async () => {
+    const normalizePreviewTarget = vi.fn(async () => null)
+    window.hermesDesktop = { normalizePreviewTarget } as never
+
+    await expect(
+      normalizeOrLocalPreviewTarget('http://localhost:5173', '/work', 'compass', true)
+    ).resolves.toBeNull()
+    expect(normalizePreviewTarget).toHaveBeenCalledWith('http://localhost:5173', '/work', 'compass', true)
+  })
+
+  it('passes the owning profile through the desktop normalizer', async () => {
+    const normalizePreviewTarget = vi.fn(async () => remoteTarget)
+    window.hermesDesktop = { normalizePreviewTarget } as never
+
+    await normalizeOrLocalPreviewTarget('/srv/report.html', '/work', 'compass')
+    expect(normalizePreviewTarget).toHaveBeenCalledWith('/srv/report.html', '/work', 'compass', false)
+  })
+
   it('falls back to source mode when the transport is not canonical HTML', async () => {
     readDesktopFileDataUrl.mockResolvedValue('data:text/plain;base64,SGVsbG8=')
 

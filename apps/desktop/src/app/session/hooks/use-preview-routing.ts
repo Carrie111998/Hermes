@@ -72,8 +72,9 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         // session that is NOT visible anywhere still can't yank the pane
         // open (offer, don't hijack). Routes through the same normalizer as
         // the file browser so URLs, localhost, and file paths all resolve.
-        const { url, label } = asRecord(event.payload)
+        const { remote_forward, url, label } = asRecord(event.payload)
         const target = typeof url === 'string' ? url.trim() : ''
+        const remoteForward = remote_forward === true
 
         const onScreen = (sid: string) =>
           sid === $focusedRuntimeId.get() ||
@@ -81,7 +82,12 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
           $sessionTiles.get().some(tile => tile.runtimeId === sid)
 
         if (target && (!event.session_id || onScreen(event.session_id))) {
-          void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
+          void normalizeOrLocalPreviewTarget(
+            target,
+            $currentCwd.get() || currentCwd || undefined,
+            event.profile,
+            remoteForward
+          ).then(resolved => {
             if (resolved) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
               openPreview(trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved, 'tool-result')

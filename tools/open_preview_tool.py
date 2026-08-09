@@ -33,7 +33,7 @@ def _normalize_target(raw: str) -> str:
     return v
 
 
-def open_preview_tool(url: str, label: str = "") -> str:
+def open_preview_tool(url: str, label: str = "", remote_forward: bool = False) -> str:
     """Ask the desktop GUI to show ``url`` in the preview pane beside the chat."""
     target = _normalize_target(url or "")
     if not target:
@@ -43,14 +43,20 @@ def open_preview_tool(url: str, label: str = "") -> str:
         )
 
     label = (label or "").strip()
+    remote_forward = remote_forward is True
     try:
-        ok = desktop_ui.emit("preview.open", {"url": target, "label": label})
+        ok = desktop_ui.emit(
+            "preview.open", {"url": target, "label": label, "remote_forward": remote_forward}
+        )
     except Exception as exc:
         return tool_error(f"Failed to open the preview pane: {exc}")
     if not ok:
         return tool_error("The preview pane is only available in the Hermes desktop app.")
 
-    return json.dumps({"success": True, "url": target, "label": label}, ensure_ascii=False)
+    return json.dumps(
+        {"success": True, "url": target, "label": label, "remote_forward": remote_forward},
+        ensure_ascii=False,
+    )
 
 
 OPEN_PREVIEW_SCHEMA = {
@@ -61,7 +67,11 @@ OPEN_PREVIEW_SCHEMA = {
         "preview pane — e.g. \"open cnn.com in the preview pane\" or \"preview "
         "localhost:3000\". Accepts a web URL (a bare domain like www.cnn.com is fine), "
         "a localhost dev-server URL, or a file path (HTML renders live; other files "
-        "show their contents). The pane opens for the current window only."
+        "show their contents). The pane opens for the current window only. Set "
+        "remote_forward only when the user explicitly requests a remote dev server; "
+        "only supported common dev-server ports (4173, 4174, 4200, 4321, 5000, "
+        "5173, 5174, 8000, 8080, 8081, 8888, and 9000) are forwarded, never "
+        "arbitrary internal services."
     ),
     "parameters": {
         "type": "object",
@@ -77,6 +87,16 @@ OPEN_PREVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Optional tab label; defaults to the target's name.",
             },
+            "remote_forward": {
+                "type": "boolean",
+                "description": (
+                    "Only for a user-requested remote dev server. Forwarding is limited "
+                    "to supported common dev-server ports (4173, 4174, 4200, 4321, "
+                    "5000, 5173, 5174, 8000, 8080, 8081, 8888, and 9000); do not "
+                    "use this to expose arbitrary internal services. Defaults to false."
+                ),
+                "default": False,
+            },
         },
         "required": ["url"],
     },
@@ -87,6 +107,10 @@ registry.register(
     name="open_preview",
     toolset="desktop_ui",
     schema=OPEN_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: open_preview_tool(url=args.get("url", ""), label=args.get("label", "")),
+    handler=lambda args, **kw: open_preview_tool(
+        url=args.get("url", ""),
+        label=args.get("label", ""),
+        remote_forward=args.get("remote_forward", False),
+    ),
     emoji="🖼️",
 )
