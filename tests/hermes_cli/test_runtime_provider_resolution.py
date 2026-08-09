@@ -1667,3 +1667,42 @@ def test_explicit_openrouter_mirror_still_uses_openrouter_plugin(monkeypatch):
 
     assert resolved["provider"] == "openrouter"
     assert resolved["base_url"] == "https://openrouter-proxy.example/v1"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "endpoint_provider"),
+    [
+        ("https://custom.invalid/v1", "custom"),
+        ("https://openrouter.ai/api/v1", "openrouter"),
+        ("https://openrouter.ai.attacker.test/v1", "custom"),
+    ],
+)
+def test_auto_env_endpoint_uses_effective_provider_plugin(
+    monkeypatch,
+    base_url,
+    endpoint_provider,
+):
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+    monkeypatch.setattr(rp, "resolve_provider", lambda *args, **kwargs: "openrouter")
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: None)
+    monkeypatch.setenv("CUSTOM_BASE_URL", base_url)
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        "providers.is_provider_plugin_active",
+        lambda _provider_id: True,
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["base_url"] == base_url
+
+    monkeypatch.setattr(
+        "providers.is_provider_plugin_active",
+        lambda provider_id: provider_id != endpoint_provider,
+    )
+    with pytest.raises(
+        rp.AuthError,
+        match=rf"Provider '{endpoint_provider}' is disabled by plugin configuration",
+    ):
+        rp.resolve_runtime_provider(requested="auto")

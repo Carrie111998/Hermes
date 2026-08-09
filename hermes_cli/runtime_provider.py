@@ -2332,6 +2332,14 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
     )
+    if requested_provider == "auto":
+        runtime_base_url = str(runtime.get("base_url") or "").strip()
+        endpoint_provider = (
+            "openrouter"
+            if base_url_host_matches(runtime_base_url, "openrouter.ai")
+            else "custom"
+        )
+        require_plugin_provider(endpoint_provider)
     runtime["requested_provider"] = requested_provider
     return runtime
 
