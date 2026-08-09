@@ -14,7 +14,7 @@ import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from
 import { playCompletionSound } from '@/lib/completion-sound'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
-import { modelOptionsQueryKey } from '@/lib/model-options'
+import { modelOptionsQueryKey, sessionProviderAdoptableFromCache } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
@@ -45,6 +45,7 @@ import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import { recordAgentReaction } from '@/store/reactions-local'
 import {
+  $activeSessionId,
   $currentCwd,
   $currentModel,
   $currentProvider,
@@ -54,7 +55,10 @@ import {
   setCurrentBranch,
   setCurrentCwdTransient,
   setCurrentFastMode,
+  setCurrentModel,
+  setCurrentModelSource,
   setCurrentPersonality,
+  setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -1316,6 +1320,21 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (looksLikeProviderSetup) {
           requestDesktopOnboarding(errorMessage)
+
+          // The composer may be holding a provider whose credentials are gone
+          // (adopted from a legacy session before the catalog proved it dead —
+          // e.g. "No xAI OAuth credentials stored"). Reset to the profile
+          // default so the next send stops failing with the same auth error
+          // instead of leaving the user stuck in a retry loop.
+          if (
+            isActiveEvent &&
+            sessionId === $activeSessionId.get() &&
+            !sessionProviderAdoptableFromCache($currentProvider.get())
+          ) {
+            setCurrentModel('')
+            setCurrentProvider('')
+            setCurrentModelSource('default')
+          }
         } else if (isDiskFullErrorMessage(errorMessage)) {
           notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {

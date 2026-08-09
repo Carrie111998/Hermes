@@ -71,8 +71,67 @@ export function requestModelOptions({
       params.explicit_only = true
     }
 
-    return gateway.request<ModelOptionsResponse>('model.options', params)
+    return rememberProviders(gateway.request<ModelOptionsResponse>('model.options', params))
   }
 
-  return getGlobalModelOptions({ explicitOnly, ...(refresh ? { refresh: true } : {}) })
+  return rememberProviders(getGlobalModelOptions({ explicitOnly, ...(refresh ? { refresh: true } : {}) }))
+}
+
+// The composer-sync paths (session runtime state → sticky composer atoms) run
+// outside React, where the queryClient cache is not reachable. Every catalog
+// fetch (chat view, model picker, model menu) funnels through
+// requestModelOptions, so mirror the last loaded provider list here for those
+// synchronous reads. The mirror is read-only: the query cache stays
+// authoritative for writes/refetches, and a stale mirror can at worst delay
+// adopting a provider the user just re-enabled until the next catalog fetch.
+let lastLoadedProviders: ModelOptionProvider[] | undefined
+
+/** @internal Reset the mirror for tests. */
+export function _resetLastLoadedProvidersForTests(): void {
+  lastLoadedProviders = undefined
+}
+
+async function rememberProviders(
+  response: ModelOptionsResponse | Promise<ModelOptionsResponse>
+): Promise<ModelOptionsResponse> {
+  const resolved = await response
+
+  lastLoadedProviders = resolved?.providers
+
+  return resolved
+}
+
+/**
+ * Whether the composer may adopt `provider` from a resumed session's runtime
+ * state.
+ *
+ * A session created under a provider whose credentials were later removed
+ * (OAuth revoked, API key deleted) keeps stamping the dead provider on every
+ * session.info heartbeat. Syncing it into the sticky composer state makes the
+ * next send fail with a cryptic auth error ("No xAI OAuth credentials
+ * stored...", "No Codex credentials stored..."). This guard blocks adoption
+ * only when a LOADED catalog proves the provider has no usable credentials; an
+ * unknown/not-yet-loaded catalog conservatively allows the sync — the same
+ * philosophy as `manualPickRemoved`, so a still-valid pick is never clobbered
+ * by a stale catalog.
+ *
+ * The chat catalog is fetched `explicitOnly`, so a loaded list contains only
+ * configured providers plus the current provider's skeleton row (which carries
+ * `authenticated: false` when it lost its credential). A present row with an
+ * explicit `authenticated: false` or a provider absent from the loaded list is
+ * therefore not usable right now.
+ */
+export function sessionProviderAdoptable(providers: ModelOptionProvider[] | undefined, provider: string): boolean {
+  if (!provider || !Array.isArray(providers)) {
+    return true
+  }
+
+  const row = providers.find(p => p.slug === provider || p.name === provider)
+
+  return !row ? false : row.authenticated !== false
+}
+
+/** `sessionProviderAdoptable` against the most recently loaded catalog. */
+export function sessionProviderAdoptableFromCache(provider: string): boolean {
+  return sessionProviderAdoptable(lastLoadedProviders, provider)
 }
