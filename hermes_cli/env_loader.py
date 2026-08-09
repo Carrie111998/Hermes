@@ -642,6 +642,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     except ImportError:
         return
 
+    _discover_configured_secret_source_plugins(cfg)
+
     try:
         report = apply_all(cfg, home_path)
     except Exception:  # noqa: BLE001 — belt-and-braces; apply_all shouldn't raise
@@ -692,6 +694,41 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             print(f"  {src.label}: {warn}", file=sys.stderr)
     for conflict in report.conflicts:
         print(f"  Secret sources: {conflict}", file=sys.stderr)
+
+
+def _discover_configured_secret_source_plugins(secrets_cfg: dict) -> None:
+    """Register configured plugin sources before ``apply_all`` validates them.
+
+    Dotenv loading precedes ordinary plugin discovery in several entrypoints.
+    When ``secrets.sources`` names an installed plugin source, that ordering
+    previously made the registry warn that the source was unknown and skip it
+    on the first process pass.  Only pay for discovery when the explicit order
+    contains a source the registry does not know yet.  Both registry lookup and
+    ``discover_plugins`` are idempotent, so repeated dotenv loads remain cheap.
+
+    This helper only discovers/registers plugins; fetching remains exclusively
+    in the subsequent ``apply_all`` call.  Discovery failures are deliberately
+    swallowed without interpolating the exception: startup is fail-open and an
+    exception raised by third-party code may contain credential material.
+    """
+    explicit = secrets_cfg.get("sources") if isinstance(secrets_cfg, dict) else None
+    if not isinstance(explicit, list):
+        return
+
+    configured = [name for name in explicit if isinstance(name, str)]
+    if not configured:
+        return
+
+    try:
+        from agent.secret_sources.registry import get_source
+
+        if all(get_source(name) is not None for name in configured):
+            return
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:  # noqa: BLE001 — plugin discovery must not block startup
+        return
 
 
 def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:

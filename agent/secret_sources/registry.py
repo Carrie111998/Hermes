@@ -236,7 +236,10 @@ def _fetch_with_timeout(
             return res
         except Exception as exc:  # noqa: BLE001 — contract violation, contain it
             res = FetchResult()
-            res.error = f"fetch raised {type(exc).__name__}: {exc}"
+            # Do not interpolate a third-party exception. Secret-manager SDKs
+            # and helper wrappers sometimes include the rejected value in an
+            # exception message; this error is printed during startup.
+            res.error = f"fetch raised {type(exc).__name__}"
             res.error_kind = ErrorKind.INTERNAL
             return res
     finally:
