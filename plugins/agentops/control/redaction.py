@@ -13,12 +13,12 @@ from plugins.agentops.control.observer_models import RawSignal, Signal, stable_s
 _SENSITIVE_NAME = r"(?:api[_-]?key|token|cookie|password|secret|authorization|credential|session)"
 _SENSITIVE_KEY = re.compile(_SENSITIVE_NAME, re.I)
 _SENSITIVE_VALUE = re.compile(
-    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._-]{8,}\b|\bgh[pousr]_[A-Za-z0-9]{8,})",
+    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._-]{1,}\b|\bgh[pousr]_[A-Za-z0-9]{8,}\b|\b(?:Authorization|Cookie)\s*[:=]\s*[^\s,;}]+)",
     re.I,
 )
 _SENSITIVE_ASSIGNMENT = re.compile(
     rf"(?P<prefix>(?:(?:\"|')?{_SENSITIVE_NAME}(?:\"|')?)\s*[:=]\s*)"
-    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^\s,;}]+)",
+    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^,;}]+)",
     re.I,
 )
 _REDACTED = "[REDACTED]"
@@ -46,8 +46,10 @@ DEFAULT_POLICY = RedactionPolicy()
 def redact_text(value: str, policy: RedactionPolicy = DEFAULT_POLICY) -> str:
     if not isinstance(value, str):
         raise RedactionError("invalid text value")
-    value = _SENSITIVE_VALUE.sub(policy.replacement, value)
-    return _SENSITIVE_ASSIGNMENT.sub(lambda match: match.group("prefix") + policy.replacement, value)
+    # Assignment redaction runs first so ``Authorization: Bearer token`` does
+    # not leave the token tail behind after the Bearer marker is replaced.
+    value = _SENSITIVE_ASSIGNMENT.sub(lambda match: match.group("prefix") + policy.replacement, value)
+    return _SENSITIVE_VALUE.sub(policy.replacement, value)
 
 
 def redact_value(value: Any, policy: RedactionPolicy = DEFAULT_POLICY) -> Any:

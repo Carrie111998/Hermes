@@ -5,14 +5,22 @@ import json
 import re
 from typing import Any, Mapping
 
-_DROP_KEYS = {"observed_at", "timestamp", "source_id", "path", "inode", "offset", "pid", "request_id", "trace_id", "span_id", "event_id", "correlation_id"}
+_DROP_KEYS = {
+    "observed_at", "timestamp", "source_id", "path", "inode", "offset", "pid",
+    "request_id", "trace_id", "span_id", "event_id", "correlation_id", "message_id",
+    "session_id", "task_id", "run_id", "execution_id", "attempt_id",
+}
 
 def _stable(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(k): _stable(v) for k, v in sorted(value.items()) if str(k) not in _DROP_KEYS}
+        return {
+            str(key): _stable(child)
+            for key, child in sorted(value.items(), key=lambda item: str(item[0]))
+            if str(key).lower() not in _DROP_KEYS
+        }
     if isinstance(value, (list, tuple)):
         return [_stable(item) for item in value]
-    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}", value): return "<uuid>"
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", value): return "<uuid>"
     return value
 
 def incident_fingerprint(signal_type: str, payload: Mapping[str, Any], *, collector: str = "") -> str:
