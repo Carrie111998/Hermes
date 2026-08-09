@@ -496,10 +496,22 @@ def test_default_process_binding_accepts_exact_command_without_string_markers():
         pytest.skip("default deployment asset unavailable")
     class P:
         pid = 42
-        def name(self): return "python"
+        def name(self): return "python3.11"
         def cmdline(self): return ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
         def uids(self):
             class U: real = os.getuid()
             return U()
     batch = ProcessCollector(name_contains="python", process_iter=lambda: [P()]).collect(target)
     assert batch.health.healthy and len(batch.signals) == 1
+    class Wrong(P):
+        def name(self): return "python3.10"
+    assert not ProcessCollector(name_contains="python", process_iter=lambda: [Wrong()]).collect(target).health.healthy
+
+
+def test_coverage_requires_process_health_evidence():
+    from plugins.agentops.control.registry import bootstrap_gateway_registry
+    from plugins.agentops.control.observer_models import TargetSnapshot
+    registry = bootstrap_gateway_registry(); target = registry.get_target("hermes:profile:default:gateway")
+    registry.record_target_snapshot(TargetSnapshot(target.target_id, datetime.now(timezone.utc), {"ok": True}))
+    registry.record_process_result(target.target_id, False)
+    assert registry.coverage_report().coverage_percent == 0
