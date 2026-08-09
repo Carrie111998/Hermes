@@ -39,6 +39,10 @@ function isInsideAngleAutolink(text: string, index: number): boolean {
   return text.lastIndexOf('<', index) > text.lastIndexOf('>', index)
 }
 
+function isInsideRawUrl(text: string, index: number): boolean {
+  return /(?:^|[^A-Za-z0-9_])https?:\/\/[^\s<>`]*$/i.test(text.slice(0, index))
+}
+
 function isInsideMarkdownLinkDestination(text: string, index: number): boolean {
   const destinationStart = text.lastIndexOf('](', index)
   const destinationEnd = text.lastIndexOf(')', index)
@@ -73,6 +77,7 @@ function isInsideMarkdownLinkLabel(text: string, index: number): boolean {
 function shouldLeaveKanbanCardTokenUnchanged(text: string, index: number): boolean {
   return (
     isInsideAngleAutolink(text, index) ||
+    isInsideRawUrl(text, index) ||
     isInsideMarkdownLinkDestination(text, index) ||
     isInsideMarkdownLinkLabel(text, index)
   )
