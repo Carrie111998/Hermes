@@ -3794,9 +3794,14 @@ def _mcp_tool_approval_check(
     tool_name: str,
     args: dict,
     state_key: Optional[_ServerStateKey] = None,
+    registration_home: Optional[str] = None,
 ) -> Optional[str]:
     """Run one MCP approval check in the owning profile's config scope."""
-    approval_home = state_key[0] if isinstance(state_key, tuple) else None
+    approval_home = (
+        state_key[0]
+        if isinstance(state_key, tuple)
+        else registration_home
+    )
     if approval_home is None:
         return _mcp_tool_approval_check_scoped(
             server_name,
@@ -5255,6 +5260,7 @@ def _make_tool_handler(
             tool_name,
             args,
             state_key,
+            registration_home,
         )
         if approval_error is not None:
             return approval_error
@@ -6532,6 +6538,11 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    from hermes_constants import get_hermes_home
+
+    registration_home = str(
+        Path(get_hermes_home()).expanduser().resolve()
+    )
     fingerprint = config_fingerprint(config)
     tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
     tools_filter = config.get("tools") or {}
@@ -6549,7 +6560,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             return not matches_name_filter(tool_name, exclude_set)
         return True
 
-    check_fn = _make_check_fn(name)
+    check_fn = _make_check_fn(name, registration_home)
     cached_tools = [
         raw
         for raw in tools_from_cache_entry(entry)
@@ -6569,6 +6580,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             for raw in cached_tools
             if raw.get("name")
         ],
+        registration_home,
     )
     for raw in cached_tools:
         raw_name = raw.get("name")
@@ -6598,14 +6610,19 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                registration_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, registration_home)
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -6631,19 +6648,23 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=util_name,
             toolset=toolset_name,
             schema=schema,
-            handler=handler_factories[handler_key](name, tool_timeout),
+            handler=handler_factories[handler_key](
+                name,
+                tool_timeout,
+                registration_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
-        _track_mcp_tool_server(util_name, name)
+        _track_mcp_tool_server(util_name, name, registration_home)
         registered_names.append(util_name)
 
     if registered_names:
         registry.register_toolset_alias(name, toolset_name)
-        state_key = _server_state_key(name)
+        state_key = _server_state_key(name, registration_home)
         with _lock:
             _lazy_server_configs[state_key] = dict(config)
             _lazy_server_fingerprints[state_key] = fingerprint
