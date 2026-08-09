@@ -77,6 +77,7 @@ Uma barra de status persistente fica acima da área de input, atualizando em tem
 | 🗜️ N | **Contagem de compressão de contexto** — quantas vezes a sessão em execução foi comprimida automaticamente. Aparece depois que a primeira compressão ocorre. |
 | ▶ N | **Tarefas em background ativas** — quantos prompts `/background` ainda estão rodando na sessão atual. Aparece sempre que pelo menos uma tarefa está em andamento. |
 | Duração | Tempo decorrido da sessão |
+| Título da sessão | Depois que a sessão tem um título, ele aparece como um badge dourado preso à borda direita. Títulos longos truncam antes de deslocar os campos essenciais de modelo e contexto. |
 | ⚠ YOLO | **Aviso do modo YOLO** — exibido sempre que `HERMES_YOLO_MODE` está ativo (seja `hermes --yolo` na inicialização ou `/yolo` alternado no meio da sessão). Espelha o aviso da linha do banner para você não esquecer que está no modo de aprovação automática. |
 
 A barra se adapta à largura do terminal — layout completo com ≥ 76 colunas, compacto entre 52–75, mínimo (modelo + duração, mais o badge YOLO quando ativo) abaixo de 52.

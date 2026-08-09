@@ -197,6 +197,8 @@ Desconfigure a variável ou passe `--resume <id>` explicitamente para sobrescrev
 
 A linha de status da TUI acompanha o estado do agente em tempo real:
 
+Depois que a sessão é nomeada, o título aparece como um badge na cor de destaque na borda direita da linha de status. O título ocupa o lugar do rótulo do workspace e trunca em terminais estreitos.
+
 | Status | Significado |
 |--------|---------|
 | `starting agent…` | Session ID está ativo; tools e skills ainda entrando online. Você pode digitar — mensagens enfileiram e enviam quando prontas. |

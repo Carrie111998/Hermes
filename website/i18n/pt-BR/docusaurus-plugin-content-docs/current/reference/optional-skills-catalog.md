@@ -34,7 +34,7 @@ hermes skills uninstall <skill-name>
 | [**antigravity-cli**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-antigravity-cli) | Opera o CLI do Antigravity (agy): plugins, autenticação, sandbox. |
 | [**blackbox**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-blackbox) | Delega tarefas de programação ao agente CLI Blackbox AI. Agente multi-modelo com um juiz embutido que executa tarefas em vários LLMs e escolhe o melhor resultado. Requer o CLI blackbox e uma chave de API do Blackbox AI. |
 | [**grok**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-grok) | Delega programação para o CLI xAI Grok Build (features, PRs). |
-| [**honcho**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho) | Configura e usa a memória Honcho com o Hermes -- modelagem de usuário entre sessões, isolamento de pares multiperfil, configuração de observação, raciocínio dialético, resumos de sessão e aplicação de orçamento de contexto. Use ao configurar o Honcho, resolver problemas... |
+| [**honcho**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-honcho) | Configura e depura a memória Honcho para o Hermes. |
 | [**openhands**](/docs/user-guide/skills/optional/autonomous-ai-agents/autonomous-ai-agents-openhands) | Delega programação para o CLI OpenHands (agnóstico de modelo, LiteLLM). |
 
 ## blockchain
@@ -49,38 +49,49 @@ hermes skills uninstall <skill-name>
 
 | Skill | Descrição |
 |-------|-------------|
-| [**one-three-one-rule**](/docs/user-guide/skills/optional/communication/communication-one-three-one-rule) | Framework estruturado de tomada de decisão para propostas técnicas e análise de trade-offs. Quando o usuário enfrenta uma escolha entre várias abordagens (decisões de arquitetura, seleção de ferramentas, estratégias de refatoração, caminhos de migração), esta skill p... |
+| [**one-three-one-rule**](/docs/user-guide/skills/optional/communication/communication-one-three-one-rule) | Briefs de decisão 1-3-1: problema, três opções, uma escolha. |
 
 ## creative
 
 | Skill | Descrição |
 |-------|-------------|
+| [**audiocraft-audio-generation**](/docs/user-guide/skills/optional/creative/creative-audiocraft-audio-generation) | AudioCraft: MusicGen texto-para-música, AudioGen texto-para-som. |
 | [**baoyu-article-illustrator**](/docs/user-guide/skills/optional/creative/creative-baoyu-article-illustrator) | Ilustrações de artigos: consistência de tipo × estilo × paleta. |
 | [**baoyu-comic**](/docs/user-guide/skills/optional/creative/creative-baoyu-comic) | Quadrinhos de conhecimento (知识漫画): educacionais, biográficos, tutoriais. |
 | [**blender-mcp**](/docs/user-guide/skills/optional/creative/creative-blender-mcp) | Opera o Blender via o MCP blender do catálogo, com receitas bpy. |
-| [**concept-diagrams**](/docs/user-guide/skills/optional/creative/creative-concept-diagrams) | Gera diagramas SVG planos e minimalistas, adaptados para modo claro/escuro, como arquivos HTML autônomos, usando uma linguagem visual educacional unificada com 9 rampas de cor semânticas, tipografia em sentence-case e modo escuro automático. Mais adequado para conteúdo educacional e... |
+| [**concept-diagrams**](/docs/user-guide/skills/optional/creative/creative-concept-diagrams) | Gera visuais SVG educacionais planos e minimalistas como HTML. |
 | [**creative-ideation**](/docs/user-guide/skills/optional/creative/creative-creative-ideation) | Gera ideias via métodos nomeados da prática criativa. |
-| [**hyperframes**](/docs/user-guide/skills/optional/creative/creative-hyperframes) | Cria composições de vídeo baseadas em HTML, cartões de título animados, overlays sociais, vídeos com legendas de talking-head, visuais reativos a áudio e transições com shaders usando HyperFrames. HTML é a fonte da verdade para vídeo. Use quando o usuário quiser... |
-| [**kanban-video-orchestrator**](/docs/user-guide/skills/optional/creative/creative-kanban-video-orchestrator) | Planeja, configura e monitora um pipeline de produção de vídeo multiagente com base no Hermes Kanban. Use quando o usuário quiser fazer QUALQUER vídeo — filme narrativo, produto/marketing, videoclipe, explicativo, arte ASCII/terminal, loop abstrato/generativo... |
+| [**heartmula**](/docs/user-guide/skills/optional/creative/creative-heartmula) | HeartMuLa: geração de músicas estilo Suno a partir de letras + tags. |
+| [**hyperframes**](/docs/user-guide/skills/optional/creative/creative-hyperframes) | Renderiza vídeos MP4/WebM a partir de composições HTML. |
+| [**kanban-video-orchestrator**](/docs/user-guide/skills/optional/creative/creative-kanban-video-orchestrator) | Planeja e executa pipelines de produção de vídeo multiagente. |
 | [**meme-generation**](/docs/user-guide/skills/optional/creative/creative-meme-generation) | Gera imagens de meme reais escolhendo um template e sobrepondo texto com Pillow. Produz arquivos .png de meme reais. |
 | [**pixel-art**](/docs/user-guide/skills/optional/creative/creative-pixel-art) | Pixel art com paletas de época (NES, Game Boy, PICO-8). |
-| [**unreal-mcp**](/docs/user-guide/skills/optional/creative/creative-unreal-mcp) | Use quando o usuário quiser fazer qualquer coisa na Unreal Engine através do servidor MCP oficial embutido no editor da Epic (entrada do catálogo: unreal-engine) — construir/iluminar/popular cenas, posicionar e transformar atores, criar Blueprints, animar com Sequence... |
+| [**social-media-content-calendar**](/docs/user-guide/skills/optional/creative/creative-social-media-content-calendar) | Planeja campanhas sociais multiplataforma: do brief à publicação. |
+| [**tldraw-offline**](/docs/user-guide/skills/optional/creative/creative-tldraw-offline) | Controla e cria scripts em canvases offline do tldraw com um agente. |
+| [**unreal-mcp**](/docs/user-guide/skills/optional/creative/creative-unreal-mcp) | Automatiza cenas, atores e renders do editor Unreal Engine. |
+
+## data-science
+
+| Skill | Descrição |
+|-------|-------------|
+| [**jupyter-notebook**](/docs/user-guide/skills/optional/data-science/data-science-jupyter-notebook) | Python iterativo via kernel Jupyter ao vivo (hamelnb). |
 
 ## devops
 
 | Skill | Descrição |
 |-------|-------------|
-| [**inference-sh-cli**](/docs/user-guide/skills/optional/devops/devops-cli) | Executa mais de 150 apps de IA via o CLI inference.sh (infsh) — geração de imagem, criação de vídeo, LLMs, busca, 3D, automação social. Usa a ferramenta terminal. Gatilhos: inference.sh, infsh, ai apps, flux, veo, geração de imagem, geração de vídeo, seedrea... |
-| [**docker-management**](/docs/user-guide/skills/optional/devops/devops-docker-management) | Gerencia containers, imagens, volumes, redes e stacks Compose do Docker — operações de ciclo de vida, depuração, limpeza e otimização de Dockerfile. |
-| [**hermes-s6-container-supervision**](/docs/user-guide/skills/optional/devops/devops-hermes-s6-container-supervision) | Modifica, depura ou estende a árvore de supervisão s6-overlay dentro da imagem Docker do Hermes Agent — adicionando novos serviços, depurando gateways de perfil, entendendo o padrão main-program da Arquitetura B. |
-| [**pinggy-tunnel**](/docs/user-guide/skills/optional/devops/devops-pinggy-tunnel) | Túneis localhost sem instalação via SSH usando o Pinggy. |
+| [**actual-setup**](/docs/user-guide/skills/optional/devops/devops-actual-setup) | Configura inferência Actual Computer (actual.inc) no Hermes. |
+| [**docker-management**](/docs/user-guide/skills/optional/devops/devops-docker-management) | Gerencia containers, imagens, volumes e Compose do Docker. |
+| [**hermes-s6-container-supervision**](/docs/user-guide/skills/optional/devops/devops-hermes-s6-container-supervision) | Modifica ou depura serviços s6 na imagem Docker do Hermes. |
+| [**inference-sh-cli**](/docs/user-guide/skills/optional/devops/devops-inference-sh-cli) | Executa 150+ apps de IA (imagem, vídeo, LLM) via CLI inference.sh. |
+| [**pinggy-tunnel**](/docs/user-guide/skills/optional/devops/devops-pinggy-tunnel) | Túneis localhost sem instalação via SSH usando Pinggy. |
 | [**watchers**](/docs/user-guide/skills/optional/devops/devops-watchers) | Monitora RSS, APIs JSON e GitHub com deduplicação por watermark. |
 
 ## dogfood
 
 | Skill | Descrição |
 |-------|-------------|
-| [**adversarial-ux-test**](/docs/user-guide/skills/optional/dogfood/dogfood-adversarial-ux-test) | Interpreta o usuário mais difícil e resistente à tecnologia para o seu produto. Navega pelo app como essa persona, encontra todo ponto de dor de UX e depois filtra as reclamações por uma camada de pragmatismo para separar problemas reais de ruído. Cria tickets acionáveis... |
+| [**adversarial-ux-test**](/docs/user-guide/skills/optional/dogfood/dogfood-adversarial-ux-test) | Interpreta um usuário hostil para achar e triar dores de UX. |
 
 ## email
 
@@ -98,6 +109,7 @@ hermes skills uninstall <skill-name>
 | [**excel-author**](/docs/user-guide/skills/optional/finance/finance-excel-author) | Constrói planilhas Excel auditáveis sem interface com openpyxl — convenções de células azul/preto/verde, fórmulas em vez de valores fixos, intervalos nomeados, verificações de balanço, tabelas de sensibilidade. Use para modelos financeiros, saídas de auditoria, reconciliações. |
 | [**lbo-model**](/docs/user-guide/skills/optional/finance/finance-lbo-model) | Constrói modelos de leveraged buyout no Excel — fontes & usos, cronograma de dívida, cash sweep, múltiplo de saída, sensibilidade de IRR/MOIC. Combina com excel-author. Use para triagem de PE, valuation de sponsor-case ou LBO ilustrativo em um pitch. |
 | [**merger-model**](/docs/user-guide/skills/optional/finance/finance-merger-model) | Constrói modelos de acréscimo/diluição (fusão) no Excel — P&L pro-forma, sinergias, mix de financiamento, impacto no EPS. Combina com excel-author. Use para pitches de M&A, materiais de board ou avaliação de negócios. |
+| [**polymarket**](/docs/user-guide/skills/optional/finance/finance-polymarket) | Consulta o Polymarket: mercados, preços, livros de ordens, histórico. |
 | [**pptx-author**](/docs/user-guide/skills/optional/finance/finance-pptx-author) | Constrói apresentações do PowerPoint sem interface com python-pptx. Combina com excel-author para apresentações baseadas em modelo, onde cada número remete a uma célula da planilha. Use para pitch decks, memorandos de IC, notas de resultados. |
 | [**stocks**](/docs/user-guide/skills/optional/finance/finance-stocks) | Cotações de ações, histórico, busca, comparação, criptomoedas via Yahoo. |
 
@@ -112,14 +124,14 @@ hermes skills uninstall <skill-name>
 
 | Skill | Descrição |
 |-------|-------------|
-| [**fitness-nutrition**](/docs/user-guide/skills/optional/health/health-fitness-nutrition) | Planejador de treino de ginástica e rastreador de nutrição. Busca mais de 690 exercícios por músculo, equipamento ou categoria via wger. Consulta macros e calorias de mais de 380.000 alimentos via USDA FoodData Central. Calcula IMC, TDEE, uma repetição máxima, divisão de macros e composição... |
-| [**neuroskill-bci**](/docs/user-guide/skills/optional/health/health-neuroskill-bci) | Conecta a uma instância NeuroSkill em execução e incorpora o estado cognitivo e emocional em tempo real do usuário (foco, relaxamento, humor, carga cognitiva, sonolência, frequência cardíaca, HRV, estágios do sono e mais de 40 escores EXG derivados) nas respostas.... |
+| [**fitness-nutrition**](/docs/user-guide/skills/optional/health/health-fitness-nutrition) | Planejamento de treino, macros e métricas corporais via wger/USDA. |
+| [**neuroskill-bci**](/docs/user-guide/skills/optional/health/health-neuroskill-bci) | Usa estado cognitivo e de humor BCI ao vivo do NeuroSkill. |
 
 ## mcp
 
 | Skill | Descrição |
 |-------|-------------|
-| [**fastmcp**](/docs/user-guide/skills/optional/mcp/mcp-fastmcp) | Constrói, testa, inspeciona, instala e implanta servidores MCP com FastMCP em Python. Use ao criar um novo servidor MCP, encapsular uma API ou banco de dados como ferramentas MCP, expor resources ou prompts, ou preparar um servidor FastMCP para o Claude Code, Cur... |
+| [**fastmcp**](/docs/user-guide/skills/optional/mcp/mcp-fastmcp) | Constrói, testa e implanta servidores MCP em Python. |
 | [**mcp-oauth-remote-gateway**](/docs/user-guide/skills/optional/mcp/mcp-mcp-oauth-remote-gateway) | OAuth manual para servidores MCP remotos em gateways headless. |
 | [**mcporter**](/docs/user-guide/skills/optional/mcp/mcp-mcporter) | Usa o CLI mcporter para listar, configurar, autenticar e chamar servidores/ferramentas MCP diretamente (HTTP ou stdio), incluindo servidores ad-hoc, edições de configuração e geração de CLI/tipos. |
 
@@ -127,42 +139,43 @@ hermes skills uninstall <skill-name>
 
 | Skill | Descrição |
 |-------|-------------|
-| [**openclaw-migration**](/docs/user-guide/skills/optional/migration/migration-openclaw-migration) | Migra a pegada de customização do OpenClaw de um usuário para o Hermes Agent. Importa memórias compatíveis com o Hermes, SOUL.md, listas de permissão de comandos, skills do usuário e ativos selecionados do workspace a partir de ~/.openclaw, depois relata exatamente o que não pôde ser migr... |
+| [**openclaw-migration**](/docs/user-guide/skills/optional/migration/migration-openclaw-migration) | Importa um setup OpenClaw (memórias, skills) para o Hermes. |
 
 ## mlops
 
 | Skill | Descrição |
 |-------|-------------|
-| [**huggingface-accelerate**](/docs/user-guide/skills/optional/mlops/mlops-accelerate) | API de treinamento distribuído mais simples. 4 linhas para adicionar suporte distribuído a qualquer script PyTorch. API unificada para DeepSpeed/FSDP/Megatron/DDP. Posicionamento automático de device, precisão mista (FP16/BF16/FP8). Configuração interativa, comando de lançamento único... |
+| [**accelerate**](/docs/user-guide/skills/optional/mlops/mlops-accelerate) | Treina PyTorch em múltiplas GPUs com mudanças mínimas. |
 | [**axolotl**](/docs/user-guide/skills/optional/mlops/mlops-training-axolotl) | Axolotl: fine-tuning de LLM via YAML (LoRA, DPO, GRPO). |
-| [**chroma**](/docs/user-guide/skills/optional/mlops/mlops-chroma) | Banco de dados de embeddings de código aberto para aplicações de IA. Armazena embeddings e metadados, realiza busca vetorial e full-text, filtra por metadados. API simples de 4 funções. Escala de notebooks a clusters de produção. Use para busca semântica, RAG... |
-| [**clip**](/docs/user-guide/skills/optional/mlops/mlops-clip) | Modelo da OpenAI que conecta visão e linguagem. Permite classificação de imagens zero-shot, correspondência imagem-texto e recuperação cross-modal. Treinado em 400M pares imagem-texto. Use para busca de imagens, moderação de conteúdo ou tarefas de visão-linguagem q... |
-| [**dspy**](/docs/user-guide/skills/optional/mlops/mlops-research-dspy) | DSPy: programas declarativos de LM, otimização automática de prompts, RAG. |
-| [**faiss**](/docs/user-guide/skills/optional/mlops/mlops-faiss) | Biblioteca do Facebook para busca de similaridade eficiente e clustering de vetores densos. Suporta bilhões de vetores, aceleração por GPU e vários tipos de índice (Flat, IVF, HNSW). Use para busca k-NN rápida, recuperação de vetores em larga escala, ou onde... |
-| [**optimizing-attention-flash**](/docs/user-guide/skills/optional/mlops/mlops-flash-attention) | Otimiza a atenção de transformers com Flash Attention para 2-4x de aceleração e 10-20x de redução de memória. Use ao treinar/executar transformers com sequências longas (>512 tokens), ao encontrar problemas de memória de GPU com atenção, ou quando precisar de inferên... mais rápida |
-| [**guidance**](/docs/user-guide/skills/optional/mlops/mlops-guidance) | Controla a saída de LLM com regex e grammars, garante geração válida de JSON/XML/código, impõe formatos estruturados e constrói workflows multi-etapa com Guidance - o framework de geração restrita da Microsoft Research |
-| [**huggingface-tokenizers**](/docs/user-guide/skills/optional/mlops/mlops-huggingface-tokenizers) | Tokenizadores rápidos otimizados para pesquisa e produção. Implementação em Rust tokeniza 1GB em menos de 20 segundos. Suporta algoritmos BPE, WordPiece e Unigram. Treina vocabulários customizados, rastreia alinhamentos, trata padding/truncamento. Integ... |
-| [**instructor**](/docs/user-guide/skills/optional/mlops/mlops-instructor) | Extrai dados estruturados de respostas de LLM com validação Pydantic, tenta novamente extrações falhas automaticamente, faz parsing de JSON complexo com type safety e transmite resultados parciais com Instructor - biblioteca de saída estruturada testada em produção |
-| [**lambda-labs-gpu-cloud**](/docs/user-guide/skills/optional/mlops/mlops-lambda-labs) | Instâncias de nuvem GPU reservadas e sob demanda para treinamento e inferência de ML. Use quando precisar de instâncias de GPU dedicadas com acesso SSH simples, sistemas de arquivos persistentes, ou clusters multi-node de alto desempenho para treinamento em larga escala. |
-| [**llava**](/docs/user-guide/skills/optional/mlops/mlops-llava) | Assistente de Linguagem e Visão de Grande Escala. Permite ajuste de instrução visual e conversas baseadas em imagem. Combina o encoder de visão CLIP com modelos de linguagem Vicuna/LLaMA. Suporta chat de imagem multi-turno, resposta a perguntas visuais e instru... |
-| [**modal-serverless-gpu**](/docs/user-guide/skills/optional/mlops/mlops-modal) | Plataforma de nuvem GPU serverless para executar workloads de ML. Use quando precisar de acesso a GPU sob demanda sem gerenciamento de infraestrutura, implantando modelos de ML como APIs, ou executando jobs em batch com escalonamento automático. |
-| [**nemo-curator**](/docs/user-guide/skills/optional/mlops/mlops-nemo-curator) | Curadoria de dados acelerada por GPU para treinamento de LLM. Suporta texto/imagem/vídeo/áudio. Recursos: deduplicação fuzzy (16x mais rápida), filtragem de qualidade (mais de 30 heurísticas), deduplicação semântica, redação de PII, detecção de NSFW. Escala entre GPUs com... |
+| [**chroma**](/docs/user-guide/skills/optional/mlops/mlops-chroma) | Banco de embeddings para RAG e busca semântica. |
+| [**clip**](/docs/user-guide/skills/optional/mlops/mlops-clip) | Classificação de imagens zero-shot e busca imagem-texto. |
+| [**dspy**](/docs/user-guide/skills/optional/mlops/mlops-research-dspy) | DSPy: programas declarativos de LM, otimização de prompts, RAG. |
+| [**faiss**](/docs/user-guide/skills/optional/mlops/mlops-faiss) | Busca rápida de similaridade vetorial em escala de bilhões. |
+| [**flash-attention**](/docs/user-guide/skills/optional/mlops/mlops-flash-attention) | Acelera treino e inferência de transformers de sequência longa. |
+| [**guidance**](/docs/user-guide/skills/optional/mlops/mlops-guidance) | Restringe saída de LLM com grammars; garante JSON válido. |
+| [**huggingface-tokenizers**](/docs/user-guide/skills/optional/mlops/mlops-huggingface-tokenizers) | Tokenização BPE/WordPiece rápida e treino de vocabulário customizado. |
+| [**instructor**](/docs/user-guide/skills/optional/mlops/mlops-instructor) | Saídas estruturadas de LLM validadas com Pydantic. |
+| [**lambda-labs**](/docs/user-guide/skills/optional/mlops/mlops-lambda-labs) | Instâncias de nuvem GPU sob demanda para treino de ML. |
+| [**llava**](/docs/user-guide/skills/optional/mlops/mlops-llava) | Chat visão-linguagem: VQA, legendas, diálogo com imagem. |
+| [**modal**](/docs/user-guide/skills/optional/mlops/mlops-modal) | Nuvem GPU serverless para jobs de ML e APIs de modelo. |
+| [**nemo-curator**](/docs/user-guide/skills/optional/mlops/mlops-nemo-curator) | Curadoria de dados de treino de LLM: dedupe, filtro, redação de PII. |
 | [**obliteratus**](/docs/user-guide/skills/optional/mlops/mlops-obliteratus) | OBLITERATUS: remove recusas de LLM por abliteração (diff-in-means). |
 | [**outlines**](/docs/user-guide/skills/optional/mlops/mlops-inference-outlines) | Outlines: geração estruturada de LLM em JSON/regex/Pydantic. |
-| [**peft-fine-tuning**](/docs/user-guide/skills/optional/mlops/mlops-peft) | Fine-tuning eficiente em parâmetros para LLMs usando LoRA, QLoRA e mais de 25 métodos. Use ao fazer fine-tuning de modelos grandes (7B-70B) com memória de GPU limitada, quando precisar treinar menos de 1% dos parâmetros com perda mínima de acurácia, ou para configurações multi-adaptador... |
-| [**pinecone**](/docs/user-guide/skills/optional/mlops/mlops-pinecone) | Banco de dados vetorial gerenciado para aplicações de IA em produção. Totalmente gerenciado, com auto-escalonamento, busca híbrida (densa + esparsa), filtragem por metadados e namespaces. Baixa latência (menos de 100ms p95). Use para RAG em produção, sistemas de recomendação, ou se... |
-| [**pytorch-fsdp**](/docs/user-guide/skills/optional/mlops/mlops-pytorch-fsdp) | Orientação especializada para treinamento Fully Sharded Data Parallel com PyTorch FSDP - sharding de parâmetros, precisão mista, offloading de CPU, FSDP2 |
-| [**pytorch-lightning**](/docs/user-guide/skills/optional/mlops/mlops-pytorch-lightning) | Framework PyTorch de alto nível com a classe Trainer, treinamento distribuído automático (DDP/FSDP/DeepSpeed), sistema de callbacks e boilerplate mínimo. Escala do laptop ao supercomputador com o mesmo código. Use quando quiser loops de treinamento limpos... |
-| [**qdrant-vector-search**](/docs/user-guide/skills/optional/mlops/mlops-qdrant) | Motor de busca por similaridade vetorial de alto desempenho para RAG e busca semântica. Use ao construir sistemas RAG de produção que exigem busca rápida de vizinhos mais próximos, busca híbrida com filtragem, ou armazenamento vetorial escalável com desempenho movido a Rust... |
-| [**sparse-autoencoder-training**](/docs/user-guide/skills/optional/mlops/mlops-saelens) | Fornece orientação para treinar e analisar Sparse Autoencoders (SAEs) usando SAELens para decompor ativações de redes neurais em features interpretáveis. Use ao descobrir features interpretáveis, analisar superposição ou estudar... |
-| [**simpo-training**](/docs/user-guide/skills/optional/mlops/mlops-simpo) | Otimização de Preferência Simples para alinhamento de LLM. Alternativa sem modelo de referência ao DPO com melhor desempenho (+6.4 pontos no AlpacaEval 2.0). Não precisa de modelo de referência, mais eficiente que o DPO. Use para alinhamento de preferência quando quiser simpl... |
-| [**slime-rl-training**](/docs/user-guide/skills/optional/mlops/mlops-slime) | Fornece orientação para pós-treinamento de LLM com RL usando slime, um framework Megatron+SGLang. Use ao treinar modelos GLM, implementar workflows customizados de geração de dados, ou precisar de integração estreita com Megatron-LM para escalonamento de RL. |
-| [**stable-diffusion-image-generation**](/docs/user-guide/skills/optional/mlops/mlops-stable-diffusion) | Geração de texto-para-imagem de última geração com modelos Stable Diffusion via HuggingFace Diffusers. Use ao gerar imagens a partir de prompts de texto, realizar tradução imagem-para-imagem, inpainting, ou construir pipelines de difusão customizados. |
-| [**tensorrt-llm**](/docs/user-guide/skills/optional/mlops/mlops-tensorrt-llm) | Otimiza inferência de LLM com NVIDIA TensorRT para máximo throughput e menor latência. Use para implantação em produção em GPUs NVIDIA (A100/H100), quando precisar de inferência 10-100x mais rápida que PyTorch, ou para servir modelos com quantizaçã... |
-| [**distributed-llm-pretraining-torchtitan**](/docs/user-guide/skills/optional/mlops/mlops-torchtitan) | Fornece pré-treinamento distribuído de LLM nativo em PyTorch usando torchtitan com paralelismo 4D (FSDP2, TP, PP, CP). Use ao pré-treinar Llama 3.1, DeepSeek V3, ou modelos customizados em escala de 8 a mais de 512 GPUs com Float8, torch.compile, e dist... |
-| [**fine-tuning-with-trl**](/docs/user-guide/skills/optional/mlops/mlops-training-trl-fine-tuning) | TRL: SFT, DPO, PPO, GRPO, reward modeling para RLHF de LLM. |
+| [**peft**](/docs/user-guide/skills/optional/mlops/mlops-peft) | Fine-tune de LLMs grandes com LoRA em GPU limitada. |
+| [**pinecone**](/docs/user-guide/skills/optional/mlops/mlops-pinecone) | DB vetorial gerenciado para RAG e busca em produção. |
+| [**pytorch-fsdp**](/docs/user-guide/skills/optional/mlops/mlops-pytorch-fsdp) | Treino fully sharded data-parallel para modelos grandes. |
+| [**pytorch-lightning**](/docs/user-guide/skills/optional/mlops/mlops-pytorch-lightning) | Loops de treino limpos com suporte distribuído embutido. |
+| [**qdrant**](/docs/user-guide/skills/optional/mlops/mlops-qdrant) | Motor de busca vetorial para sistemas RAG de produção. |
+| [**saelens**](/docs/user-guide/skills/optional/mlops/mlops-saelens) | Treina sparse autoencoders para interpretar features do modelo. |
+| [**segment-anything-model**](/docs/user-guide/skills/optional/mlops/mlops-models-segment-anything-model) | SAM: segmentação zero-shot via pontos, caixas e máscaras. |
+| [**simpo**](/docs/user-guide/skills/optional/mlops/mlops-simpo) | Alinhamento de preferência sem referência, mais simples que DPO. |
+| [**slime**](/docs/user-guide/skills/optional/mlops/mlops-slime) | Pós-treino RL para LLMs com Megatron e SGLang. |
+| [**stable-diffusion**](/docs/user-guide/skills/optional/mlops/mlops-stable-diffusion) | Geração texto-para-imagem, inpainting e img2img. |
+| [**tensorrt-llm**](/docs/user-guide/skills/optional/mlops/mlops-tensorrt-llm) | Inferência de LLM de alto throughput em GPUs NVIDIA. |
+| [**torchtitan**](/docs/user-guide/skills/optional/mlops/mlops-torchtitan) | Pré-treina LLMs em escala com paralelismo 4D do PyTorch. |
+| [**trl-fine-tuning**](/docs/user-guide/skills/optional/mlops/mlops-training-trl-fine-tuning) | TRL: SFT, DPO, GRPO, RLOO reward modeling para RLHF de LLM. |
 | [**unsloth**](/docs/user-guide/skills/optional/mlops/mlops-training-unsloth) | Unsloth: fine-tuning LoRA/QLoRA 2-5x mais rápido, menos VRAM. |
-| [**whisper**](/docs/user-guide/skills/optional/mlops/mlops-whisper) | Modelo de reconhecimento de fala de propósito geral da OpenAI. Suporta 99 idiomas, transcrição, tradução para o inglês e identificação de idioma. Seis tamanhos de modelo, de tiny (39M parâmetros) a large (1550M parâmetros). Use para fala-para-texto, podcast... |
+| [**whisper**](/docs/user-guide/skills/optional/mlops/mlops-whisper) | Transcreve e traduz fala em 99 idiomas. |
 
 ## payments
 
@@ -176,9 +189,9 @@ hermes skills uninstall <skill-name>
 
 | Skill | Descrição |
 |-------|-------------|
-| [**canvas**](/docs/user-guide/skills/optional/productivity/productivity-canvas) | Integração com o Canvas LMS — busca cursos matriculados e tarefas usando autenticação por token de API. |
-| [**here.now**](/docs/user-guide/skills/optional/productivity/productivity-here-now) | Publica sites estáticos em &#123;slug&#125;.here.now e armazena arquivos privados em Drives na nuvem para handoff agente-para-agente. |
-| [**memento-flashcards**](/docs/user-guide/skills/optional/productivity/productivity-memento-flashcards) | Sistema de flashcards por repetição espaçada. Cria cartões a partir de fatos ou texto, conversa com flashcards usando respostas em texto livre avaliadas pelo agente, gera quizzes a partir de transcrições do YouTube, revisa cartões pendentes com agendamento adaptativo, e exporta/impor... |
+| [**canvas**](/docs/user-guide/skills/optional/productivity/productivity-canvas) | Busca cursos e tarefas do Canvas LMS via token de API. |
+| [**here-now**](/docs/user-guide/skills/optional/productivity/productivity-here-now) | Publica sites em &#123;slug&#125;.here.now e armazena arquivos em Drives. |
+| [**memento-flashcards**](/docs/user-guide/skills/optional/productivity/productivity-memento-flashcards) | Flashcards por repetição espaçada: criar, revisar, quiz, exportar. |
 | [**shop**](/docs/user-guide/skills/optional/productivity/productivity-shop) | Busca em catálogo de loja, checkout, rastreamento de pedidos, devoluções. |
 | [**shopify**](/docs/user-guide/skills/optional/productivity/productivity-shopify) | APIs GraphQL Admin & Storefront do Shopify via curl. Produtos, pedidos, clientes, estoque, metafields. |
 | [**siyuan**](/docs/user-guide/skills/optional/productivity/productivity-siyuan) | API do SiYuan Note para buscar, ler, criar e gerenciar blocos e documentos em uma base de conhecimento auto-hospedada via curl. |
@@ -188,14 +201,15 @@ hermes skills uninstall <skill-name>
 
 | Skill | Descrição |
 |-------|-------------|
-| [**bioinformatics**](/docs/user-guide/skills/optional/research/research-bioinformatics) | Gateway para mais de 400 skills de bioinformática do bioSkills e ClawBio. Cobre genômica, transcriptômica, célula única, chamada de variantes, farmacogenômica, metagenômica, biologia estrutural, e mais. Busca material de referência específico do domínio... |
+| [**bioinformatics**](/docs/user-guide/skills/optional/research/research-bioinformatics) | Gateway para 400+ skills de genômica e biologia computacional. |
 | [**darwinian-evolver**](/docs/user-guide/skills/optional/research/research-darwinian-evolver) | Evolui prompts/regex/SQL/código com o loop evolutivo da Imbue. |
 | [**domain-intel**](/docs/user-guide/skills/optional/research/research-domain-intel) | Reconhecimento passivo de domínio usando a stdlib do Python. Descoberta de subdomínios, inspeção de certificado SSL, consultas WHOIS, registros DNS, verificações de disponibilidade de domínio e análise em massa multi-domínio. Sem necessidade de chaves de API. |
-| [**drug-discovery**](/docs/user-guide/skills/optional/research/research-drug-discovery) | Assistente de pesquisa farmacêutica para workflows de descoberta de fármacos. Busca compostos bioativos no ChEMBL, calcula drug-likeness (Lipinski Ro5, QED, TPSA, acessibilidade sintética), consulta interações medicamentosas via OpenFDA, interpreta ADMET... |
+| [**drug-discovery**](/docs/user-guide/skills/optional/research/research-drug-discovery) | Descoberta de fármacos: busca ChEMBL, drug-likeness, interações. |
 | [**duckduckgo-search**](/docs/user-guide/skills/optional/research/research-duckduckgo-search) | Busca web gratuita via DuckDuckGo — texto, notícias, imagens, vídeos. Sem necessidade de chave de API. Prefere o CLI `ddgs` quando instalado; use a biblioteca Python DDGS apenas depois de verificar que `ddgs` está disponível no runtime atual. |
 | [**gitnexus-explorer**](/docs/user-guide/skills/optional/research/research-gitnexus-explorer) | Indexa uma base de código com GitNexus e serve um grafo de conhecimento interativo via UI web + túnel Cloudflare. |
-| [**osint-investigation**](/docs/user-guide/skills/optional/research/research-osint-investigation) | Framework de investigação OSINT de registros públicos — arquivamentos do SEC EDGAR, contratos do USAspending, lobby do Senado, sanções OFAC, leaks offshore do ICIJ, registros de propriedade de NYC (ACRIS), registros da OpenCorporates, registros judiciais do CourtListener, Wayback... |
+| [**osint-investigation**](/docs/user-guide/skills/optional/research/research-osint-investigation) | Siga o dinheiro via registros públicos e dados de sanções. |
 | [**parallel-cli**](/docs/user-guide/skills/optional/research/research-parallel-cli) | Skill opcional de fornecedor para o CLI Parallel — busca web nativa para agentes, extração, pesquisa profunda, enriquecimento, FindAll e monitoramento. Prefere saída JSON e fluxos não interativos. |
+| [**pinecone-research**](/docs/user-guide/skills/optional/research/research-pinecone-research) | RAG de agente e memória de longo prazo com Pinecone. |
 | [**qmd**](/docs/user-guide/skills/optional/research/research-qmd) | Busca bases de conhecimento pessoais, notas, documentos e transcrições de reuniões localmente usando qmd — um motor de recuperação híbrido com BM25, busca vetorial e reranking por LLM. Suporta integração via CLI e MCP. |
 | [**scrapling**](/docs/user-guide/skills/optional/research/research-scrapling) | Web scraping com Scrapling - fetching HTTP, automação de navegador furtiva, bypass do Cloudflare e crawling spider via CLI e Python. |
 | [**searxng-search**](/docs/user-guide/skills/optional/research/research-searxng-search) | Meta-busca gratuita via SearXNG — agrega resultados de mais de 70 motores de busca. Auto-hospedado ou use uma instância pública. Sem necessidade de chave de API. Recai automaticamente quando o toolset de busca web não está disponível. |
@@ -206,10 +220,10 @@ hermes skills uninstall <skill-name>
 |-------|-------------|
 | [**1password**](/docs/user-guide/skills/optional/security/security-1password) | Configura e usa o CLI do 1Password (op). Use ao instalar o CLI, ativar a integração com o app desktop, fazer login e ler/injetar segredos para comandos. |
 | [**godmode**](/docs/user-guide/skills/optional/security/security-godmode) | Jailbreak de LLMs: Parseltongue, GODMODE, ULTRAPLINIAN. |
-| [**oss-forensics**](/docs/user-guide/skills/optional/security/security-oss-forensics) | Investigação de supply chain, recuperação de evidências e análise forense para repositórios do GitHub. Cobre recuperação de commits excluídos, detecção de force-push, extração de IOC, coleta de evidências multi-fonte, formação/validação de hipóteses, e st... |
+| [**oss-forensics**](/docs/user-guide/skills/optional/security/security-oss-forensics) | Forense de supply chain no GitHub: recuperação, IOCs, relatórios. |
 | [**sherlock**](/docs/user-guide/skills/optional/security/security-sherlock) | Busca OSINT de nome de usuário em mais de 400 redes sociais. Rastreia contas de redes sociais por nome de usuário. |
 | [**unbroker**](/docs/user-guide/skills/optional/security/security-unbroker) | Remove autonomamente suas informações de sites de corretores de dados. |
-| [**web-pentest**](/docs/user-guide/skills/optional/security/security-web-pentest) | Teste de penetração autorizado de aplicações web — reconhecimento, análise de vulnerabilidades, exploração baseada em prova e relatório profissional. Adapta a metodologia "No Exploit, No Report" de Shannon com salvaguardas rígidas para escopo, autoriza... |
+| [**web-pentest**](/docs/user-guide/skills/optional/security/security-web-pentest) | Pentest web autorizado: recon, exploits com prova, relatório. |
 
 ## software-development
 
@@ -224,15 +238,21 @@ hermes skills uninstall <skill-name>
 | Skill | Descrição |
 |-------|-------------|
 | [**cloudflare-temporary-deploy**](/docs/user-guide/skills/optional/web-development/web-development-cloudflare-temporary-deploy) | Implanta um Worker em produção, sem conta, via wrangler --temporary. |
-| [**page-agent**](/docs/user-guide/skills/optional/web-development/web-development-page-agent) | Incorpora o alibaba/page-agent na sua própria aplicação web — um agente de GUI dentro da página, em JavaScript puro, distribuído como uma única tag &lt;script> ou pacote npm, que permite que usuários finais do seu site operem a UI com linguagem natural ("clicar em login, preencher usuári... |
+| [**page-agent**](/docs/user-guide/skills/optional/web-development/web-development-page-agent) | Incorpora um copiloto GUI em linguagem natural em apps web. |
+
+## yuanbao
+
+| Skill | Descrição |
+|-------|-------------|
+| [**yuanbao**](/docs/user-guide/skills/optional/yuanbao/yuanbao-yuanbao) | Grupos Yuanbao (元宝): @mencionar usuários, consultar info/membros. |
 
 ---
 
-## Contribuindo com Skills Opcionais {#contributing-optional-skills}
+## Contributing Optional Skills
 
-Para adicionar uma nova skill opcional ao repositório:
+To add a new optional skill to the repository:
 
-1. Crie um diretório em `optional-skills/<category>/<skill-name>/`
-2. Adicione um `SKILL.md` com o frontmatter padrão (name, description, version, author)
-3. Inclua qualquer arquivo de suporte nos subdiretórios `references/`, `templates/` ou `scripts/`
-4. Envie um pull request — a skill aparecerá neste catálogo e receberá sua própria página de documentação após o merge
+1. Create a directory under `optional-skills/<category>/<skill-name>/`
+2. Add a `SKILL.md` with standard frontmatter (name, description, version, author)
+3. Include any supporting files in `references/`, `templates/`, or `scripts/` subdirectories
+4. Submit a pull request — the skill will appear in this catalog and get its own docs page once merged

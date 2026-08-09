@@ -213,6 +213,21 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 
 ### Problemas de Provedor e Modelo {#provider--model-issues}
 
+#### O agente diz que a "Hermes policy" ou os "Hermes guardrails" recusaram meu pedido {#the-agent-says-hermes-policy-or-hermes-guardrails-refused-my-request}
+
+Um modelo não consegue identificar com confiabilidade por que recusou um pedido. Se a recusa aparece só na prosa do assistente, a afirmação de que uma política oculta de runtime do Hermes causou isso pode ser uma explicação alucinada ou uma restrição aplicada pelo modelo ou provedor selecionado.
+
+A enforcement do Hermes é explícita: uma ação de ferramenta bloqueada retorna um erro de ferramenta nomeando o comando ou caminho negado, e uma ação que exige aprovação mostra um prompt de aprovação. O Hermes não transforma silenciosamente esses controles de execução em uma camada geral de recusa de conteúdo. Controles no nível do provedor ainda podem se aplicar quando configurados, como Amazon Bedrock Guardrails.
+
+Para isolar a origem:
+
+1. Rode `/status` para confirmar o modelo e o provedor ativos.
+2. Verifique se a recusa inclui um erro de ferramenta real do Hermes ou um prompt de aprovação. Se for só prosa, não trate a atribuição do modelo como evidência de runtime.
+3. Tente de novo em uma sessão limpa com outro modelo ou provedor configurado. Uma recusa que muda com o modelo é comportamento do modelo/provedor, não um controle de execução do Hermes.
+4. Se aparecer um erro de ferramenta explícito, use o texto exato ao reportar o problema.
+
+Veja [Segurança](/user-guide/security) para os controles de execução documentados do Hermes e [Provedores](/integrations/providers) para configuração de provedor.
+
 #### `/model` mostra apenas um provedor / não consigo trocar de provedor {#model-only-shows-one-provider--cant-switch-providers}
 
 **Causa:** `/model` (dentro de uma sessão de chat) só pode alternar entre provedores que você **já configurou**. Se você só configurou o OpenRouter, isso é tudo que `/model` vai mostrar.

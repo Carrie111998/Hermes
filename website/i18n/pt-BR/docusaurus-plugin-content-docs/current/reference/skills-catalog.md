@@ -27,14 +27,9 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 |-------|-------------|------|
 | [`claude-code`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-claude-code) | Delega programação para o CLI do Claude Code (features, PRs). | `autonomous-ai-agents/claude-code` |
 | [`codex`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-codex) | Delega programação para o CLI do OpenAI Codex (features, PRs). | `autonomous-ai-agents/codex` |
-| [`hermes-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) | Configura, estende ou contribui com o Hermes Agent. | `autonomous-ai-agents/hermes-agent` |
+| [`computer-use`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-computer-use) | Controla o desktop em segundo plano sem roubar o foco. | `autonomous-ai-agents/computer-use` |
+| [`hermes-agent`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-hermes-agent) | Usa, configura, tema, estende e orquestra o Hermes Agent. | `autonomous-ai-agents/hermes-agent` |
 | [`opencode`](/docs/user-guide/skills/bundled/autonomous-ai-agents/autonomous-ai-agents-opencode) | Delega programação para o CLI do OpenCode (features, revisão de PR). | `autonomous-ai-agents/opencode` |
-
-## computer-use
-
-| Skill | Descrição | Caminho |
-|-------|-------------|------|
-| [`computer-use`](/docs/user-guide/skills/bundled/computer-use/computer-use-computer-use) | Opera o desktop do usuário em segundo plano — clicando, digitando, rolando, arrastando — sem roubar o cursor, o foco de teclado ou trocar áreas de trabalho virtuais / Spaces. Multiplataforma: macOS, Windows, Linux. Funciona com qualquer... | `computer-use` |
 
 ## creative
 
@@ -136,7 +131,8 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Cria, lê, une, preenche e protege arquivos PDF. | `productivity/pdf` |
 | [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Cria, lê e edita decks .pptx com python-pptx. | `productivity/powerpoint` |
 | [`product-price-monitor`](/docs/user-guide/skills/bundled/productivity/productivity-product-price-monitor) | Monitora preços de produtos, voos ou anúncios; alerta no alvo. | `productivity/product-price-monitor` |
-| [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Opera o pipeline de resumo de reuniões do Teams via CLI do Hermes — resumir reuniões, inspecionar o status do pipeline, reexecutar jobs, gerenciar assinaturas do Microsoft Graph. | `productivity/teams-meeting-pipeline` |
+| [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Resumos de reuniões do Teams, replay de jobs, assinaturas Graph. | `productivity/teams-meeting-pipeline` |
+| [`weekly-review-planning`](/docs/user-guide/skills/bundled/productivity/productivity-weekly-review-planning) | Reset semanal: compromissos, trabalho parado, plano da próxima semana. | `productivity/weekly-review-planning` |
 | [`xlsx`](/docs/user-guide/skills/bundled/productivity/productivity-xlsx) | Cria, lê e edita workbooks Excel .xlsx e CSVs. | `productivity/xlsx` |
 
 ## research
@@ -145,8 +141,9 @@ Se uma skill estiver ausente desta lista mas presente no repositório, o catálo
 |-------|-------------|------|
 | [`arxiv`](/docs/user-guide/skills/bundled/research/research-arxiv) | Busca artigos no arXiv por palavra-chave, autor, categoria ou ID. | `research/arxiv` |
 | [`blogwatcher`](/docs/user-guide/skills/bundled/research/research-blogwatcher) | Monitora blogs e feeds RSS/Atom via a ferramenta blogwatcher-cli. | `research/blogwatcher` |
+| [`competitor-news-monitor`](/docs/user-guide/skills/bundled/research/research-competitor-news-monitor) | Monitora empresas nomeadas por notícias relevantes; digests citados. | `research/competitor-news-monitor` |
+| [`grounded-citations`](/docs/user-guide/skills/bundled/research/research-grounded-citations) | Fundamenta respostas e documentos em fontes citadas e verificáveis. | `research/grounded-citations` |
 | [`llm-wiki`](/docs/user-guide/skills/bundled/research/research-llm-wiki) | LLM Wiki do Karpathy: constrói/consulta uma base de conhecimento markdown interligada. | `research/llm-wiki` |
-| [`polymarket`](/docs/user-guide/skills/bundled/research/research-polymarket) | Consulta o Polymarket: mercados, preços, livros de ordens, histórico. | `research/polymarket` |
 | [`research-paper-writing`](/docs/user-guide/skills/bundled/research/research-research-paper-writing) | Escreve artigos de ML para NeurIPS/ICML/ICLR: do design à submissão. | `research/research-paper-writing` |
 
 ## smart-home
