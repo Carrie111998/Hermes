@@ -32,7 +32,11 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
+import {
+  stopBackendChild as stopBackendChildImpl,
+  stopBackendTreesForUpdate,
+  waitForBackendExit as waitForBackendExitImpl
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -2646,6 +2650,8 @@ let isQuittingForHandoff = false
 // (the app.quit() that follows re-enters before-quit and must pass through).
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
+let backendQuitTeardownPromise: Promise<void> | null = null
+let backendQuitTeardownDone = false
 
 // Resolve the staged updater binary the desktop may hand an update to. On
 // Windows that binary owns ALL repo mutation — running `hermes update` +
@@ -8047,34 +8053,7 @@ function sendConnectionApplied() {
 }
 
 async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
-  }
-
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
-  }
-
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
-
-      resolve()
-    }, timeoutMs)
-
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
+  await waitForBackendExitImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS }, timeoutMs)
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -12504,6 +12483,26 @@ app.on('before-quit', event => {
   // exactly as it was.
   if (heldQuitForActiveWork(event)) {
     return
+  }
+
+  const backendProcesses = [
+    backendConnectionState.getProcess(),
+    ...[...backendPool.values()].map(entry => entry.process)
+  ].filter(child => child && child.exitCode === null && child.signalCode === null)
+
+  if (!backendQuitTeardownDone && backendProcesses.length > 0) {
+    event.preventDefault()
+
+    if (!backendQuitTeardownPromise) {
+      for (const child of backendProcesses) {
+        stopBackendChild(child)
+      }
+
+      backendQuitTeardownPromise = Promise.all(backendProcesses.map(child => waitForBackendExit(child))).then(() => {
+        backendQuitTeardownDone = true
+        app.quit()
+      })
+    }
   }
 
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 
 import { test } from 'vitest'
 
-import { stopBackendChild, stopBackendTreesForUpdate } from './backend-child'
+import { stopBackendChild, stopBackendTreesForUpdate, waitForBackendExit } from './backend-child'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 test('hiddenWindowsChildOptions adds windowsHide:true on Windows when unset', () => {
@@ -129,6 +130,26 @@ test('stopBackendChild swallows errors thrown by the kill strategy', () => {
       isWindows: false
     })
   })
+})
+
+test('waitForBackendExit force-kills a backend that ignores SIGTERM', async () => {
+  const calls: string[] = []
+
+  const child = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    kill: (signal: string) => calls.push(signal),
+    killed: true,
+    pid: 4242,
+    signalCode: null
+  })
+
+  await waitForBackendExit(
+    child,
+    { forceKillProcessTree: () => {}, isWindows: false },
+    0
+  )
+
+  assert.deepEqual(calls, ['SIGKILL'])
 })
 
 test('Windows update tree-kills captured roots without pre-signalling the primary backend', () => {
