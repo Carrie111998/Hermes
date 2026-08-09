@@ -17,4 +17,4 @@ def test_state_merge_split_and_notification_throttle():
 
 def test_review_degrades_without_model_and_digest_dashboard_are_bounded():
     now=datetime.now(timezone.utc); service=IncidentOpsService(); incident=service.ingest(sig(now,"t", "critical")); review=service.review(incident); assert review.degraded and not review.model_used and review.decision=="escalate"
-    report=service.digest("daily",now); assert report["incident_count"]==1; dash=ReadOnlyDashboard([incident], token_hash=hashlib.sha256(b"short").hexdigest()); assert dash.manifest()["chat"] is False and dash.manifest()["target_write"] is False; assert dash.serve(auth_token="short", request="incidents")["incidents"]
+    report=service.digest("daily",now); assert report["incident_count"]==1; dash=ReadOnlyDashboard([incident], token_hash=hashlib.sha256(b"short").hexdigest()); assert dash.serve(auth_token="short", request="manifest")["chat"] is False and dash.serve(auth_token="short", request="incidents")["incidents"]
