@@ -2558,9 +2558,11 @@ def run_conversation(
                 try:
                     from hermes_cli.lifecycle import (
                         has_hook,
-                        invoke_hook as _invoke_hook,
+                        has_mandatory_hook,
+                        invoke_hook_enforced as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    from hermes_cli.plugins import MandatoryHookError
+                    if has_hook("pre_api_request") or has_mandatory_hook("pre_api_request"):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2610,6 +2612,26 @@ def run_conversation(
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
                         )
+                except MandatoryHookError as exc:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent.iteration_budget.refund()
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    final_response = str(exc)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": final_response,
+                        "failure_reason": exc.code,
+                    }
                 except Exception:
                     pass
 

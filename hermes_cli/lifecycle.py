@@ -37,6 +37,32 @@ def has_hook(hook_name: str) -> bool:
     return plugins.has_hook(hook_name)
 
 
+def has_mandatory_hook(hook_name: str) -> bool:
+    """Return whether a plugin hook has a fail-closed contract configured."""
+    from hermes_cli import plugins
+
+    return plugins.has_mandatory_hook(hook_name)
+
+
+def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Notify observers and enforce configured mandatory plugin callbacks."""
+    if not has_mandatory_hook(hook_name):
+        # Preserve the public observer seam (including callers/tests that patch
+        # module-level invoke_hook) when no mandatory contract is configured.
+        return invoke_hook(hook_name, **kwargs)
+
+    try:
+        from hermes_cli.observability import observe_lifecycle
+
+        observe_lifecycle(hook_name, **kwargs)
+    except Exception:
+        logger.warning("Built-in observability hook failed", exc_info=True)
+
+    from hermes_cli import plugins
+
+    return plugins.invoke_hook_enforced(hook_name, **kwargs)
+
+
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
     try:

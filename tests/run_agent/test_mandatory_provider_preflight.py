@@ -1,0 +1,243 @@
+"""End-to-end contract tests for mandatory provider preflight hooks."""
+
+import json
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
+from unittest.mock import MagicMock, patch
+
+import pytest
+import yaml
+
+import hermes_cli.plugins as plugins_mod
+from hermes_cli.plugins import PluginManager
+from run_agent import AIAgent
+
+
+PLUGIN_NAME = "synthetic-policy-guard"
+OFFICIAL_CODEX_URL = "https://chatgpt.com/backend-api/codex"
+
+
+def _write_plugin(hermes_home: Path, mode: str) -> None:
+    plugin_dir = hermes_home / "plugins" / PLUGIN_NAME
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": PLUGIN_NAME, "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    callback_body = {
+        "raise": 'raise RuntimeError("callback leaked secret SENTINEL-CREDENTIAL")',
+        "malformed": 'return "not-a-directive"',
+        "block": (
+            'return {"action": "block", "reason": '
+            '"route denied opaque-secret-1234567890: '
+            'https://blocked.invalid/v1?token=SENTINEL-CREDENTIAL"}'
+        ),
+        "route": (
+            f'if kw.get("provider") == "openai-codex" and '
+            f'kw.get("base_url") == {OFFICIAL_CODEX_URL!r}:\n'
+            '        return {"action": "allow"}\n'
+            '    return {"action": "block", "reason": "route denied"}'
+        ),
+    }[mode]
+    (plugin_dir / "__init__.py").write_text(
+        "def _preflight(**kw):\n"
+        f"    {callback_body}\n\n"
+        "def register(ctx):\n"
+        '    ctx.register_hook("pre_api_request", _preflight)\n',
+        encoding="utf-8",
+    )
+
+
+def _configure_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mode: Optional[str],
+    mandatory: bool = True,
+) -> Path:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    if mode is not None:
+        _write_plugin(hermes_home, mode)
+    plugins_cfg: Dict[str, Any] = {"enabled": [PLUGIN_NAME]}
+    if mandatory:
+        plugins_cfg["mandatory_hooks"] = {"pre_api_request": [PLUGIN_NAME]}
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": plugins_cfg}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    plugins_mod._plugin_manager = PluginManager()
+    plugins_mod.discover_plugins()
+    return hermes_home
+
+
+def _response(content: str = "allowed") -> SimpleNamespace:
+    message = SimpleNamespace(content=content, tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], model="synthetic-response", usage=None)
+
+
+def _run_agent(*, provider: str = "custom", base_url: str = "https://blocked.invalid/v1"):
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="SENTINEL-CREDENTIAL",
+            provider=provider,
+            model="SENTINEL-MODEL",
+            base_url=base_url,
+            api_mode="chat_completions",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = _response()
+    agent._persist_session = MagicMock()
+    agent._save_trajectory = MagicMock()
+    agent._cleanup_task_resources = MagicMock()
+    return agent
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        (None, "mandatory_hook_missing"),
+        ("raise", "mandatory_hook_exception"),
+        ("malformed", "mandatory_hook_malformed_result"),
+        ("block", "mandatory_hook_blocked"),
+    ],
+)
+def test_mandatory_preflight_failures_stop_before_provider_dispatch(
+    tmp_path,
+    monkeypatch,
+    mode,
+    expected_code,
+):
+    _configure_home(tmp_path, monkeypatch, mode=mode)
+    agent = _run_agent()
+
+    result = agent.run_conversation("SENTINEL-MESSAGE")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["failure_reason"] == expected_code
+    assert result["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+    assert "SENTINEL-CREDENTIAL" not in result["final_response"]
+    assert "opaque-secret-1234567890" not in result["final_response"]
+    assert "https://blocked.invalid" not in result["final_response"]
+    if mode == "block":
+        assert "route denied" in result["final_response"]
+
+
+def test_approved_openai_codex_official_route_dispatches_once(tmp_path, monkeypatch):
+    _configure_home(tmp_path, monkeypatch, mode="route")
+    agent = _run_agent(provider="openai-codex", base_url=OFFICIAL_CODEX_URL)
+
+    result = agent.run_conversation("approved request")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "allowed"
+    assert result["api_calls"] == 1
+    agent.client.chat.completions.create.assert_called_once()
+
+
+def test_malformed_mandatory_hook_config_fails_closed(tmp_path, monkeypatch):
+    hermes_home = _configure_home(
+        tmp_path, monkeypatch, mode="route", mandatory=False
+    )
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "enabled": [PLUGIN_NAME],
+                    "mandatory_hooks": ["pre_api_request"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    agent = _run_agent()
+
+    result = agent.run_conversation("must not dispatch")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "mandatory_hook_config_invalid"
+    assert result["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_non_mandatory_observer_exception_remains_isolated(tmp_path, monkeypatch):
+    _configure_home(tmp_path, monkeypatch, mode="raise", mandatory=False)
+    agent = _run_agent()
+
+    result = agent.run_conversation("observer failure must not block")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "allowed"
+    agent.client.chat.completions.create.assert_called_once()
+
+
+def test_mandatory_audit_event_is_key_allowlisted_and_payload_free(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    _configure_home(tmp_path, monkeypatch, mode="block")
+    agent = _run_agent()
+
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+        agent.run_conversation("SENTINEL-MESSAGE")
+
+    audit_records = [
+        record for record in caplog.records
+        if record.name == "hermes_cli.plugins" and '"event": "mandatory_hook_preflight"' in record.message
+    ]
+    assert len(audit_records) == 1
+    event = json.loads(audit_records[0].message)
+    assert set(event) == {"event", "hook", "outcome", "plugin"}
+    assert event == {
+        "event": "mandatory_hook_preflight",
+        "hook": "pre_api_request",
+        "outcome": "blocked",
+        "plugin": PLUGIN_NAME,
+    }
+    audit_text = audit_records[0].message
+    for forbidden in (
+        "SENTINEL-MESSAGE",
+        "SENTINEL-CREDENTIAL",
+        "SENTINEL-MODEL",
+        "https://blocked.invalid",
+    ):
+        assert forbidden not in audit_text
+
+
+def test_default_and_legacy_config_leave_mandatory_hooks_disabled(tmp_path, monkeypatch):
+    from hermes_cli.config import DEFAULT_CONFIG, load_config, migrate_config, read_raw_config
+
+    hermes_home = tmp_path / "legacy-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "_config_version": DEFAULT_CONFIG["_config_version"] - 1,
+                "model": "legacy-model",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    migrate_config(interactive=False, quiet=True)
+    loaded = load_config()
+    raw = read_raw_config()
+    assert loaded["model"] == "legacy-model"
+    assert raw["_config_version"] == DEFAULT_CONFIG["_config_version"]
+    assert "mandatory_hooks" not in raw.get("plugins", {})
+    assert plugins_mod._get_mandatory_hook_plugins("pre_api_request") == []

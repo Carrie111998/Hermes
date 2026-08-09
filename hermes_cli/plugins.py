@@ -38,8 +38,10 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import os
+import re
 import sys
 import threading
 import types
@@ -75,6 +77,27 @@ class PluginToolOverrideError(PermissionError):
     """Raised when a plugin attempts to override a built-in tool without
     operator opt-in via ``plugins.entries.<plugin_id>.allow_tool_override``.
     """
+
+
+class MandatoryHookError(RuntimeError):
+    """Fail-closed result from a configured mandatory plugin hook."""
+
+    def __init__(
+        self,
+        code: str,
+        hook_name: str,
+        plugin_id: str,
+        reason: str = "",
+    ) -> None:
+        self.code = code
+        self.hook_name = hook_name
+        self.plugin_id = plugin_id
+        self.reason = reason
+        detail = f": {reason}" if reason else ""
+        super().__init__(
+            f"Provider request blocked by mandatory preflight "
+            f"({hook_name}/{plugin_id}){detail}"
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -272,6 +295,97 @@ def _get_enabled_plugins() -> Optional[set]:
         return set(enabled)
     except Exception:
         return None
+
+
+_MANDATORY_PLUGIN_ID_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+
+
+def _get_mandatory_hook_plugins(hook_name: str) -> List[str]:
+    """Return configured plugin ids that must enforce *hook_name*.
+
+    The contract is ``plugins.mandatory_hooks.<hook>: [plugin-id, ...]``.
+    Absence is backward-compatible and leaves all hooks observer-only. Once a
+    hook is configured, malformed configuration is itself fail-closed.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    configured = cfg_get(
+        load_config_readonly(), "plugins", "mandatory_hooks", default={}
+    )
+    if configured in (None, {}):
+        return []
+    if not isinstance(configured, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    required = configured.get(hook_name, [])
+    if required in (None, []):
+        return []
+    if not isinstance(required, list):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+
+    normalized: List[str] = []
+    for plugin_id in required:
+        if (
+            not isinstance(plugin_id, str)
+            or not plugin_id
+            or not _MANDATORY_PLUGIN_ID_RE.fullmatch(plugin_id)
+        ):
+            raise MandatoryHookError(
+                "mandatory_hook_config_invalid", hook_name, "config"
+            )
+        if plugin_id not in normalized:
+            normalized.append(plugin_id)
+    return normalized
+
+
+def has_mandatory_hook(hook_name: str) -> bool:
+    """Return whether *hook_name* has a mandatory contract configured.
+
+    Invalid configuration returns ``True`` so the enforced invocation path can
+    surface its deterministic fail-closed error instead of skipping the hook.
+    """
+    try:
+        return bool(_get_mandatory_hook_plugins(hook_name))
+    except MandatoryHookError:
+        return True
+
+
+def _sanitize_mandatory_hook_reason(value: Any) -> str:
+    """Return a bounded, secret-redacted reason safe for local display."""
+    if not isinstance(value, str):
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        cleaned = redact_sensitive_text(value, force=True)
+    except Exception:
+        return "Policy blocked the provider request."
+    cleaned = re.sub(r"https?://\S+", "[endpoint]", cleaned)
+    cleaned = re.sub(r"\b[A-Za-z0-9_-]{18,}\b", "[redacted]", cleaned)
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:240]
+
+
+def _audit_mandatory_hook(
+    hook_name: str,
+    plugin_id: str,
+    outcome: str,
+) -> None:
+    """Emit a payload-free, key-allowlisted mandatory-hook audit event."""
+    logger.warning(
+        json.dumps(
+            {
+                "event": "mandatory_hook_preflight",
+                "hook": hook_name,
+                "outcome": outcome,
+                "plugin": plugin_id,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1226,6 +1340,8 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         self._manager._hooks.setdefault(hook_name, []).append(callback)
+        plugin_id = self.manifest.key or self.manifest.name
+        self._manager._hook_owners.setdefault(hook_name, []).append(plugin_id)
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1312,6 +1428,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_owners: Dict[str, List[Optional[str]]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -1354,6 +1471,7 @@ class PluginManager:
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_owners.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -2137,6 +2255,94 @@ class PluginManager:
                 )
         return results
 
+    def invoke_hook_enforced(self, hook_name: str, **kwargs: Any) -> List[Any]:
+        """Invoke a hook with fail-closed semantics for configured plugins.
+
+        Non-mandatory callbacks retain :meth:`invoke_hook`'s isolated observer
+        behavior. Configured mandatory callbacks must be present, must not
+        raise, and may return ``None`` or ``{"action": "allow"}`` to proceed.
+        Any other result is malformed; ``{"action": "block"}`` vetoes the
+        provider request with a sanitized local reason.
+        """
+        required = _get_mandatory_hook_plugins(hook_name)
+        if not required:
+            return self.invoke_hook(hook_name, **kwargs)
+
+        callbacks = self._hooks.get(hook_name, [])
+        owners = self._hook_owners.get(hook_name, [])
+        owner_by_index = [
+            owners[index] if index < len(owners) else None
+            for index in range(len(callbacks))
+        ]
+        available = {
+            owner
+            for owner in owner_by_index
+            if owner
+            and owner in self._plugins
+            and self._plugins[owner].enabled
+        }
+        missing = next(
+            (plugin_id for plugin_id in required if plugin_id not in available),
+            None,
+        )
+        if missing is not None:
+            _audit_mandatory_hook(hook_name, missing, "missing")
+            raise MandatoryHookError(
+                "mandatory_hook_missing", hook_name, missing
+            )
+
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[Any] = []
+        for cb, owner in zip(callbacks, owner_by_index):
+            if owner not in required:
+                try:
+                    ret = cb(**kwargs)
+                    if ret is not None:
+                        results.append(ret)
+                except Exception as exc:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        exc,
+                    )
+                continue
+
+            try:
+                ret = cb(**kwargs)
+            except Exception:
+                _audit_mandatory_hook(hook_name, owner, "exception")
+                raise MandatoryHookError(
+                    "mandatory_hook_exception", hook_name, owner
+                ) from None
+
+            if ret is None:
+                continue
+            if not isinstance(ret, dict):
+                _audit_mandatory_hook(hook_name, owner, "malformed_result")
+                raise MandatoryHookError(
+                    "mandatory_hook_malformed_result", hook_name, owner
+                )
+            action = ret.get("action")
+            action = action.strip().lower() if isinstance(action, str) else ""
+            if action == "allow":
+                results.append(ret)
+                continue
+            if action == "block":
+                reason = _sanitize_mandatory_hook_reason(
+                    ret.get("reason") or ret.get("message")
+                )
+                _audit_mandatory_hook(hook_name, owner, "blocked")
+                raise MandatoryHookError(
+                    "mandatory_hook_blocked", hook_name, owner, reason
+                )
+            _audit_mandatory_hook(hook_name, owner, "malformed_result")
+            raise MandatoryHookError(
+                "mandatory_hook_malformed_result", hook_name, owner
+            )
+
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2296,6 +2502,15 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a hook with configured mandatory-plugin enforcement."""
+    if not _get_mandatory_hook_plugins(hook_name):
+        # Preserve the public observer seam (including callers/tests that patch
+        # module-level invoke_hook) when no mandatory contract is configured.
+        return invoke_hook(hook_name, **kwargs)
+    return get_plugin_manager().invoke_hook_enforced(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
