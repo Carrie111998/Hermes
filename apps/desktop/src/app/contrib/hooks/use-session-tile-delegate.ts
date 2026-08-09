@@ -7,6 +7,7 @@ import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
 import { withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
+import type { BranchSessionMessageOptions } from '../../session/hooks/use-session-actions'
 import { resolveSessionProfile } from '../../session/hooks/use-session-actions/utils'
 import type { useSessionStateCache } from '../../session/hooks/use-session-state-cache'
 import type { GatewayRequester } from '../types'
@@ -15,6 +16,7 @@ type SessionStateCache = ReturnType<typeof useSessionStateCache>
 
 interface SessionTileDelegateParams {
   archiveSession: (storedSessionId: string) => Promise<unknown>
+  branchSessionMessage: (options: BranchSessionMessageOptions) => Promise<unknown>
   branchStoredSession: (storedSessionId: string) => Promise<unknown>
   executeSlashCommand: ReturnType<typeof usePromptActions>['executeSlashCommand']
   removeSession: (storedSessionId: string) => Promise<unknown>
@@ -33,6 +35,7 @@ interface SessionTileDelegateParams {
  */
 export function useSessionTileDelegate({
   archiveSession,
+  branchSessionMessage,
   branchStoredSession,
   executeSlashCommand,
   removeSession,
@@ -74,6 +77,22 @@ export function useSessionTileDelegate({
     setSessionTileDelegate({
       archiveSession: async storedSessionId => {
         await archiveSession(storedSessionId)
+      },
+      branchMessage: async (runtimeId, storedSessionId, messageId) => {
+        const state = sessionStateByRuntimeIdRef.current.get(runtimeId)
+
+        if (!state) {
+          throw new Error('session state is not available')
+        }
+
+        await branchSessionMessage({
+          busy: state.busy,
+          cwd: state.cwd,
+          messageId,
+          messages: state.messages,
+          parentStoredId: storedSessionId,
+          sourceSessionId: runtimeId
+        })
       },
       branchSession: async storedSessionId => {
         await branchStoredSession(storedSessionId)
@@ -150,6 +169,7 @@ export function useSessionTileDelegate({
     })
   }, [
     archiveSession,
+    branchSessionMessage,
     branchStoredSession,
     executeSlashCommand,
     removeSession,

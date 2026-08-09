@@ -11742,7 +11742,8 @@ def test_session_branch_full_history_by_default_truncates_by_row_id(monkeypatch,
 
         def append_messages_batch(self, session_id, messages, **kwargs):
             captured["msgs"] = [dict(m, session_id=session_id) for m in messages]
-            return list(range(1, len(messages) + 1))
+            captured["return_row_ids"] = kwargs.get("return_row_ids")
+            return list(range(101, 101 + len(messages)))
 
         def set_session_title(self, key, title):
             return True
@@ -11787,9 +11788,12 @@ def test_session_branch_full_history_by_default_truncates_by_row_id(monkeypatch,
         monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
         req = {"id": "1", "method": "session.branch", "params": {"session_id": "parent", "name": "forked"}}
         req["params"].update(params or {})
-        resp = server.handle_request(req)
-        assert "result" in resp, resp
-        return captured["msgs"]
+        captured.pop("msgs", None)
+        response = server.handle_request(req)
+        if "result" in response:
+            child_sid = response["result"]["session_id"]
+            captured["live_history"] = server._sessions[child_sid]["history"]
+        return response
 
     try:
         history = [
@@ -11803,18 +11807,28 @@ def test_session_branch_full_history_by_default_truncates_by_row_id(monkeypatch,
         # No truncation params → the whole raw history is copied, tool rows
         # included. (The desktop used to send a merged-message count here,
         # which sliced history[:4] and lost a2 + t2 — the branch bug.)
-        msgs = _run_branch(history, {"count": 4})
+        resp = _run_branch(history, {"count": 4})
+        assert "result" in resp, resp
+        msgs = captured["msgs"]
         assert [m["content"] for m in msgs] == ["q1", "a1", "t1-result", "q2", "a2", "t2-result"]
+        assert captured["return_row_ids"] is True
+        assert [m["_row_id"] for m in captured["live_history"]] == [101, 102, 103, 104, 105, 106]
 
         # Branch from the first assistant reply: up_to_row_id=2 keeps exactly
         # the rows up to and including that durable row.
-        msgs = _run_branch(history, {"up_to_row_id": 2})
+        resp = _run_branch(history, {"up_to_row_id": 2})
+        assert "result" in resp, resp
+        msgs = captured["msgs"]
         assert [m["content"] for m in msgs] == ["q1", "a1", "t1-result"]
+        assert [m["_row_id"] for m in captured["live_history"]] == [101, 102, 103]
 
-        # A row id that is not in the live history (unflushed turn) falls back
-        # to the full history instead of mis-slicing.
-        msgs = _run_branch(history, {"up_to_row_id": 999})
-        assert len(msgs) == 6
+        # A row id that is not in the live history must fail instead of silently
+        # becoming a full-history branch. The desktop resolves the id from the
+        # authoritative transcript before calling session.branch, but this is
+        # still a critical backend guard for stale or display-only ids.
+        resp = _run_branch(history, {"up_to_row_id": 999})
+        assert resp["error"]["code"] == 4009
+        assert "branch target row not found" in resp["error"]["message"]
     finally:
         for k in list(server._sessions):
             server._sessions.pop(k, None)

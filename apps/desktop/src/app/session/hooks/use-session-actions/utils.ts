@@ -1,6 +1,6 @@
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
-import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
+import { assistantTextPart, type ChatMessage, chatMessageText, textPart, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
@@ -30,7 +30,13 @@ import {
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  SessionRuntimeInfo
+} from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -774,6 +780,46 @@ export const toBranchMessages = (messages: ChatMessage[]): BranchMessage[] =>
   messages
     .map(message => ({ content: chatMessageText(message), role: message.role, source: message }))
     .filter(({ content, role }) => content.trim() && (role === 'assistant' || role === 'user'))
+
+const normalizedForkMessageText = (message: ChatMessage): string => chatMessageText(message).replace(/\s+/g, ' ').trim()
+
+/**
+ * Resolve a live renderer message to the durable row represented by the
+ * authoritative REST transcript. Live bubbles use ephemeral ids and do not
+ * receive row ids until a resume round-trip, while the REST path exposes the
+ * SQLite id on every raw row. Match the same visible role/text occurrence so
+ * repeated messages do not resolve to the wrong row.
+ */
+export function resolveDurableRowIdForMessage(
+  messages: ChatMessage[],
+  targetIndex: number,
+  persistedMessages: SessionMessage[]
+): number | undefined {
+  const target = messages[targetIndex]
+
+  if (!target || target.hidden) {
+    return undefined
+  }
+
+  const targetText = normalizedForkMessageText(target)
+
+  if (!targetText) {
+    return undefined
+  }
+
+  const isSameVisibleMessage = (candidate: ChatMessage) =>
+    !candidate.hidden && candidate.role === target.role && normalizedForkMessageText(candidate) === targetText
+
+  const occurrence = messages.slice(0, targetIndex + 1).filter(isSameVisibleMessage).length
+
+  if (!occurrence) {
+    return undefined
+  }
+
+  const authoritative = toChatMessages(persistedMessages).filter(isSameVisibleMessage)
+
+  return authoritative[occurrence - 1]?.rowId
+}
 
 export function upsertOptimisticSession(
   created: SessionCreateResponse,

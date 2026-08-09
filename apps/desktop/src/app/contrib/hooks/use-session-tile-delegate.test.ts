@@ -37,6 +37,7 @@ function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
   renderHook(() =>
     useSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
+      branchSessionMessage: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
       executeSlashCommand: vi.fn(async () => undefined) as never,
       removeSession: vi.fn(async () => undefined),

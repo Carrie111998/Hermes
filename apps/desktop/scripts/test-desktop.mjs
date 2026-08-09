@@ -358,10 +358,11 @@ function validateBundle() {
     }
   }
 
-  // Renderer payload check (either unpacked or in the asar)
-  if (exists(APP.unpackedDistIndex)) {
-    return { stamp, nodeBinaries }
-  }
+  // The package entry must remain inside app.asar. dist/** is intentionally
+  // unpacked for the embedded web server, so electron-main.mjs itself cannot
+  // be package.json#main: Node's ESM loader resolves that path literally as
+  // app.asar/dist/electron-main.mjs. The in-asar bridge loads the real main
+  // bundle from app.asar.unpacked.
   if (!exists(APP.asarPath)) {
     die(`Missing renderer payload: neither ${APP.unpackedDistIndex} nor ${APP.asarPath} exists`)
   }
@@ -370,6 +371,13 @@ function validateBundle() {
   // backslash-prefixed entries on Windows ('\\dist\\index.html') and
   // forward-slash on Unix.
   const normalized = files.map(f => f.replace(/\\/g, '/').replace(/^\/+/, ''))
+  if (!normalized.includes('electron-main-entry.mjs')) {
+    die(`Missing in-asar Electron entry bridge: ${APP.asarPath} (expected electron-main-entry.mjs)`)
+  }
+  // Renderer payload check (either unpacked or in the asar)
+  if (exists(APP.unpackedDistIndex)) {
+    return { stamp, nodeBinaries }
+  }
   if (!normalized.includes('dist/index.html')) {
     die(`Missing renderer payload file in app.asar: ${APP.asarPath} (expected dist/index.html)`)
   }

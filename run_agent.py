@@ -2282,15 +2282,24 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
+                row_ids = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    return_row_ids=True,
                 )
-                for _written in _batch_msgs:
-                    _written[_DB_PERSISTED_MARKER] = True
+                if isinstance(row_ids, (list, tuple)) and len(row_ids) == len(_batch_msgs):
+                    for _written, row_id in zip(_batch_msgs, row_ids):
+                        _written["_row_id"] = row_id
+                        _written[_DB_PERSISTED_MARKER] = True
+                else:
+                    # Keep compatibility with lightweight SessionDB doubles
+                    # and alternate persistence adapters that only return the
+                    # historical inserted count.
+                    for _written in _batch_msgs:
+                        _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
