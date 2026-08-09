@@ -464,7 +464,7 @@ class GitHubAuth:
             if resp.status_code == 201:
                 return resp.json().get("token")
         except Exception as e:
-            logger.debug(f"GitHub App auth failed: {e}")
+            logger.debug("GitHub App auth failed: %s", e)
 
         return None
 
@@ -625,7 +625,7 @@ class GitHubSource(SkillSource):
                     if query_lower in searchable:
                         results.append(skill)
             except Exception as e:
-                logger.debug(f"Failed to search {tap['repo']}: {e}")
+                logger.debug("Failed to search %s: %s", tap['repo'], e)
                 continue
 
         # Deduplicate by identifier, preferring higher trust levels.
@@ -3834,6 +3834,17 @@ def install_from_quarantine(
         bundle.trust_level, scan_result.verdict,
         content_hash(install_dir),
     )
+
+    try:
+        from tools.skill_usage import record_installed
+
+        record_installed(safe_skill_name)
+    except Exception:
+        logger.debug(
+            "Unable to record skill install lifecycle for %s",
+            safe_skill_name,
+            exc_info=True,
+        )
 
     return install_dir
 
