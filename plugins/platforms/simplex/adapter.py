@@ -1506,15 +1506,16 @@ class SimplexAdapter(BasePlatformAdapter):
         no-longer-pending and unusable-reaction replies — goes out through
         here rather than through :meth:`send`.
 
-        :meth:`send` composes a DM as ``@<chat_id> <text>``, and the daemon
-        parses ``@x`` as a *display-name* lookup: on any contact whose
-        display name is not literally its numeric id it answers
-        ``contactNotFound`` and nothing reaches the chat, while the send
-        still reports success. (Verified against simplex-chat v7.0.0.11:
-        ``@3 hi`` → ``chatCmdError/contactNotFound``, the structured form →
-        ``newChatItems``. The media paths already use the structured form;
-        only DM text is affected. That is a separate bug in ``send`` and is
-        not fixed here.) A user who taps ✅ and sees no reply reads the tap
+        Historical note: when this flow was built, :meth:`send` composed a
+        DM as ``@<chat_id> <text>``, which the daemon parses as a
+        *display-name* lookup — silently dropping the message for any
+        contact whose display name is not literally its numeric id
+        (verified against simplex-chat v7.0.0.11: ``@3 hi`` →
+        ``chatCmdError/contactNotFound``). :meth:`send` has since moved to
+        the structured form on main, so both paths now address by id; this
+        helper remains as the approval flow's self-contained send path and
+        the home of the display-name fallback below. A user who taps ✅
+        and sees no reply reads the tap
         as broken, so the approval flow must not depend on that branch.
 
         Chats with no numeric ``ChatRef`` — DMs addressed by display name —

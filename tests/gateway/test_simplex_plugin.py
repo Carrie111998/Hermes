@@ -674,7 +674,9 @@ async def test_exec_approval_text_only_when_chat_id_is_a_display_name():
     assert result.success is True
     assert sent == []  # never touched /_send or /_reaction
     frame = json.loads(adapter._ws.send.call_args[0][0])
-    assert frame["cmd"].startswith("@alice ")
+    # send() moved to the structured form on main — display-name chats are
+    # addressed as ``/_send @<name> json [...]`` now, not bare ``@name text``.
+    assert frame["cmd"].startswith("/_send @alice json ")
     assert "tap a reaction" not in frame["cmd"]
     assert "/approve" in frame["cmd"]
 
