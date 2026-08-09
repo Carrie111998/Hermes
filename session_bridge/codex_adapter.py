@@ -1253,13 +1253,18 @@ class CodexSourceAdapter:
         native_id: str,
         *,
         source_kinds: tuple[str, ...] | None = None,
+        state_db_only: bool = False,
     ) -> CodexThreadSummary | None:
         if not isinstance(native_id, str) or not native_id.strip():
             return None
         self._ensure_initialized()
         wanted = native_id.strip()
 
-        active = self._fetch_inventory(archived=False, source_kinds=source_kinds)
+        active = self._fetch_inventory(
+            archived=False,
+            source_kinds=source_kinds,
+            state_db_only=state_db_only,
+        )
         found = next(
             (summary for summary in active if summary.native_id == wanted), None
         )
@@ -1267,7 +1272,11 @@ class CodexSourceAdapter:
             self._inventory_cache[wanted] = found
             return found
 
-        archived = self._fetch_inventory(archived=True, source_kinds=source_kinds)
+        archived = self._fetch_inventory(
+            archived=True,
+            source_kinds=source_kinds,
+            state_db_only=state_db_only,
+        )
         found = next(
             (summary for summary in archived if summary.native_id == wanted), None
         )
