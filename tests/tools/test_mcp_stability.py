@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -1058,6 +1059,234 @@ class TestStdioSubprocessDeadFailFast:
                 mcp_mod._server_connecting.clear()
                 mcp_mod._stdio_pids.clear()
                 mcp_mod._watchdog_fired_servers.clear()
+                mcp_mod._server_error_counts.clear()
+                mcp_mod._server_breaker_opened_at.clear()
+                mcp_mod._server_trust_levels.clear()
+            mcp_mod._stop_mcp_loop()
+
+    def test_transport_teardown_cancels_in_flight_call_into_retry(self):
+        """Transport teardown cancels the in-flight call and retry runs.
+
+        Triage scenario for #81995: the stdio subprocess is ALIVE but
+        stalled, so the PID-poll watchdog's ``_stdio_subprocess_dead``
+        never turns True (a live PID is tracked) and the fail-fast never
+        fires. The transport-teardown path
+        (``_cancel_in_flight_calls_for_server`` — ``_run_stdio``'s
+        finally / ``shutdown``) must cancel the pending ``call_tool``
+        future instead. ``_call`` remaps the surfaced CancelledError via
+        ``_call_dead_servers`` to ``MCPStdioSubprocessDeadError`` so the
+        handler's reconnect-and-retry chain runs (the supervisor respawns
+        a fresh session) instead of waiting out ``tool_timeout``.
+        """
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        import tools.mcp_tool as mcp_mod
+
+        server_name = "teardown-retry-srv"
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_connecting.clear()
+            mcp_mod._stdio_pids.clear()
+            mcp_mod._watchdog_fired_servers.clear()
+            mcp_mod._call_dead_servers.clear()
+            mcp_mod._in_flight_call_tasks.clear()
+            mcp_mod._server_error_counts.clear()
+            mcp_mod._server_breaker_opened_at.clear()
+            mcp_mod._server_trust_levels.clear()
+
+        # First call_tool hangs forever (the stalled subprocess never
+        # answers); the teardown cancels it. Retry succeeds.
+        srv = MagicMock()
+        srv._rpc_lock = asyncio.Lock()
+        srv._reconnect_event = asyncio.Event()
+        srv._reconnect_event.set()
+
+        def _fake_call_tool(*args, **kwargs):
+            if _fake_call_tool.calls == 0:
+                _fake_call_tool.calls += 1
+                return asyncio.sleep(60)  # hangs until cancelled
+            _fake_call_tool.calls += 1
+            ok = SimpleNamespace(
+                isError=False,
+                structuredContent=None,
+                content=[SimpleNamespace(type="text", text="recovered")],
+            )
+            return asyncio.sleep(0.001, result=ok)
+
+        _fake_call_tool.calls = 0
+        srv.session.call_tool = MagicMock(side_effect=_fake_call_tool)
+        with mcp_mod._lock:
+            mcp_mod._servers[server_name] = srv
+
+        try:
+            mcp_mod._ensure_mcp_loop()
+
+            async def _simulate_teardown():
+                # The supervisor decided the session is dead and tore the
+                # transport down — the stalled subprocess is still alive,
+                # so NO PID is removed here (that is the triage scenario).
+                # Wait until the call registered its in-flight future so
+                # the cancellation is deterministic. Runs on the MCP loop
+                # itself, as the real teardown path does (task.cancel()
+                # must not be called cross-thread).
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    with mcp_mod._lock:
+                        if server_name in mcp_mod._in_flight_call_tasks:
+                            break
+                    await asyncio.sleep(0.01)
+                mcp_mod._cancel_in_flight_calls_for_server(server_name)
+
+            teardown_fut = asyncio.run_coroutine_threadsafe(
+                _simulate_teardown(), mcp_mod._mcp_loop
+            )
+
+            async def _run_call_with_teardown():
+                call_task = asyncio.ensure_future(
+                    asyncio.to_thread(mcp_mod._make_tool_handler(
+                        server_name, "do-thing", 5.0
+                    ), {"arg": 1})
+                )
+                try:
+                    result = await call_task
+                    return result
+                finally:
+                    if not call_task.done():
+                        call_task.cancel()
+
+            def _fake_reconnect(*args, **kwargs):
+                # The supervisor respawned the transport; the fresh
+                # session's initialize (_mark_lifecycle_started) clears
+                # the teardown mark before the session readies.
+                with mcp_mod._lock:
+                    mcp_mod._call_dead_servers.discard(server_name)
+                return True
+
+            with patch.object(
+                mcp_mod, "_signal_reconnect_and_wait",
+                side_effect=_fake_reconnect,
+            ) as mock_reconnect:
+                result = asyncio.run(_run_call_with_teardown())
+                # The teardown coroutine returns right after cancelling,
+                # well before the retry chain completes — surface any
+                # error it raised.
+                teardown_fut.result(timeout=5)
+
+            # The teardown cancellation was remapped, the reconnect was
+            # signalled once, and the retry surfaced the recovered result.
+            assert result == '{"result": "recovered"}'
+            assert mock_reconnect.call_count == 1
+            assert mock_reconnect.call_args[0][0] == server_name
+            assert _fake_call_tool.calls == 2
+            # The teardown mark was consumed by the respawn, not dangling.
+            with mcp_mod._lock:
+                assert server_name not in mcp_mod._call_dead_servers
+                assert server_name not in mcp_mod._watchdog_fired_servers
+                assert server_name not in mcp_mod._in_flight_call_tasks
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_connecting.clear()
+                mcp_mod._stdio_pids.clear()
+                mcp_mod._watchdog_fired_servers.clear()
+                mcp_mod._call_dead_servers.clear()
+                mcp_mod._in_flight_call_tasks.clear()
+                mcp_mod._server_error_counts.clear()
+                mcp_mod._server_breaker_opened_at.clear()
+                mcp_mod._server_trust_levels.clear()
+            mcp_mod._stop_mcp_loop()
+
+    def test_transport_teardown_marks_pending_rpc_lock_waiters(self):
+        """A call queued behind _rpc_lock when the transport tears down
+        fails fast instead of issuing a call on the dead session.
+
+        The teardown can race a call that is still waiting for the
+        per-server ``_rpc_lock``: the call_tool future is not registered
+        yet, so ``_cancel_in_flight_calls_for_server`` cannot cancel it.
+        The unconditional ``_call_dead_servers`` mark makes such waiters
+        fail fast on lock acquisition (pre-flight check in ``_call``) and
+        reach the retry path once the supervisor brings a fresh session
+        up and clears the mark.
+        """
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        import tools.mcp_tool as mcp_mod
+
+        server_name = "teardown-rpclock-srv"
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_connecting.clear()
+            mcp_mod._stdio_pids.clear()
+            mcp_mod._watchdog_fired_servers.clear()
+            mcp_mod._call_dead_servers.clear()
+            mcp_mod._in_flight_call_tasks.clear()
+            mcp_mod._server_error_counts.clear()
+            mcp_mod._server_breaker_opened_at.clear()
+            mcp_mod._server_trust_levels.clear()
+
+        srv = MagicMock()
+        srv._rpc_lock = asyncio.Lock()
+        srv._reconnect_event = asyncio.Event()
+        srv._reconnect_event.set()
+
+        def _fake_call_tool(*args, **kwargs):
+            _fake_call_tool.calls += 1
+            ok = SimpleNamespace(
+                isError=False,
+                structuredContent=None,
+                content=[SimpleNamespace(type="text", text="after-respawn")],
+            )
+            return asyncio.sleep(0.001, result=ok)
+
+        _fake_call_tool.calls = 0
+        srv.session.call_tool = MagicMock(side_effect=_fake_call_tool)
+        with mcp_mod._lock:
+            mcp_mod._servers[server_name] = srv
+
+        try:
+            mcp_mod._ensure_mcp_loop()
+            handler = mcp_mod._make_tool_handler(server_name, "do-thing", 5.0)
+
+            # Teardown races the call while it is still queued behind
+            # _rpc_lock: no call_tool future exists, so the helper only
+            # marks the server as teardown-dead.
+            mcp_mod._cancel_in_flight_calls_for_server(server_name)
+            with mcp_mod._lock:
+                assert server_name in mcp_mod._call_dead_servers
+                assert server_name not in mcp_mod._in_flight_call_tasks
+
+            def _fake_reconnect(*args, **kwargs):
+                # The supervisor respawned the transport; the fresh
+                # session's initialize clears the mark before readying.
+                with mcp_mod._lock:
+                    mcp_mod._call_dead_servers.discard(server_name)
+                return True
+
+            with patch.object(
+                mcp_mod, "_signal_reconnect_and_wait",
+                side_effect=_fake_reconnect,
+            ) as mock_reconnect:
+                result = handler({"arg": 1})
+
+            # The queued call failed fast on the dead mark (never issued
+            # a call_tool on the dead transport) and was retried exactly
+            # once after the reconnect cleared the mark.
+            assert result == '{"result": "after-respawn"}'
+            assert mock_reconnect.call_count == 1
+            assert _fake_call_tool.calls == 1
+            with mcp_mod._lock:
+                assert server_name not in mcp_mod._call_dead_servers
+                assert server_name not in mcp_mod._in_flight_call_tasks
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_connecting.clear()
+                mcp_mod._stdio_pids.clear()
+                mcp_mod._watchdog_fired_servers.clear()
+                mcp_mod._call_dead_servers.clear()
+                mcp_mod._in_flight_call_tasks.clear()
                 mcp_mod._server_error_counts.clear()
                 mcp_mod._server_breaker_opened_at.clear()
                 mcp_mod._server_trust_levels.clear()

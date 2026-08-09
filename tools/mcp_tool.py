@@ -2203,6 +2203,9 @@ class MCPServerTask:
         self._lifecycle_started_at = now
         self._last_tool_call_at = now
         self._recycled_reason = None
+        # A fresh transport is live: a stale teardown-cancellation mark
+        # must not remap an unrelated cancellation on the new session.
+        _clear_call_dead_servers(self.name)
 
     def _stdio_recycle_reason(self, now: Optional[float] = None) -> Optional[str]:
         """Return the stdio recycle reason if idle/age limits have elapsed."""
@@ -2809,6 +2812,13 @@ class MCPServerTask:
             # teardown failed (common when the task is cancelled mid-way
             # on Linux, where setsid() children escape the parent cgroup).
             # Mark them as orphans so the next cleanup sweep can reap them.
+            # The transport is closing here — a response can never arrive
+            # on its read stream. Cancel any in-flight call_tool futures
+            # so pending calls fail fast instead of waiting out
+            # ``tool_timeout``; the PID-poll watchdog alone cannot cover
+            # this case because a stalled-but-alive subprocess leaves
+            # ``_stdio_subprocess_dead`` at ``False`` (#81995 triage).
+            _cancel_in_flight_calls_for_server(self.name)
             if new_pids:
                 from gateway.status import _pid_exists
                 _killpg = getattr(os, "killpg", None)
@@ -3787,6 +3797,10 @@ class MCPServerTask:
             await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
             self._pending_refresh_tasks.clear()
         self._deregister_tools()
+        # The session is being discarded — cancel any in-flight calls so
+        # they fail fast rather than waiting out ``tool_timeout`` on a
+        # read stream that is going away (#81995 triage).
+        _cancel_in_flight_calls_for_server(self.name)
         self.session = None
 
     def _deregister_tools(self) -> None:
@@ -4793,6 +4807,30 @@ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 # cancellation and propagates unchanged (#81995).
 _watchdog_fired_servers: Set[str] = set()
 
+# Server names whose stdio transport has been torn down (transport
+# teardown / session invalidation: the supervisor decided the session is
+# dead — keepalive failure, recycle, shutdown — or an exception exited
+# ``_run_stdio``). Set in ``_run_stdio``'s finally, cleared when the next
+# transport finishes initializing (``_mark_lifecycle_started``). ``_call``
+# consults this (alongside ``_watchdog_fired_servers``) when it surfaces
+# ``asyncio.CancelledError``: a teardown-cancelled call is remapped to
+# ``MCPStdioSubprocessDeadError`` so the sync handler's
+# reconnect-and-retry path runs against the fresh session the supervisor
+# spawns (#81995 triage: a stalled-but-alive subprocess never trips the
+# PID-poll watchdog because ``_stdio_subprocess_dead`` sees a live PID,
+# so the transport-teardown signal is the authoritative fail-fast
+# trigger; the PID poll stays as a backstop).
+_call_dead_servers: Set[str] = set()
+
+# In-flight ``call_tool`` futures, keyed by server name. Registered by
+# ``_call`` while a tool call is awaiting a response and discarded when
+# the call finishes. The transport teardown path
+# (``_cancel_in_flight_calls_for_server``) cancels every pending future
+# for a server when its session is being torn down, so pending calls
+# fail fast instead of waiting out ``tool_timeout`` on a read stream
+# that will never deliver.
+_in_flight_call_tasks: Dict[str, set] = {}
+
 # PIDs that survived their session context exit (SDK teardown failed to
 # terminate them).  These are detected in _run_stdio's finally block and
 # can be cleaned up asynchronously by _kill_orphaned_mcp_children().
@@ -4898,6 +4936,62 @@ async def _watch_stdio_subprocess(
         # outcome. Re-raise so the surrounding ``try/finally`` sees the
         # cancellation cleanly.
         raise
+
+
+def _mark_in_flight_call(server_name: str, call_task: "asyncio.Future") -> None:
+    """Register an in-flight ``call_tool`` future for ``server_name``."""
+    with _lock:
+        _in_flight_call_tasks.setdefault(server_name, set()).add(call_task)
+
+
+def _unmark_in_flight_call(server_name: str, call_task: "asyncio.Future") -> None:
+    """Discard a finished ``call_tool`` future for ``server_name``."""
+    with _lock:
+        pending = _in_flight_call_tasks.get(server_name)
+        if pending is None:
+            return
+        pending.discard(call_task)
+        if not pending:
+            _in_flight_call_tasks.pop(server_name, None)
+
+
+def _cancel_in_flight_calls_for_server(server_name: str) -> None:
+    """Cancel every pending ``call_tool`` future for ``server_name``.
+
+    Called from the stdio transport teardown path (``_run_stdio``'s
+    finally) and ``MCPServerTask.shutdown``. A session that is being torn
+    down will never deliver a response on its read stream, so the
+    in-flight calls would otherwise sit until ``tool_timeout`` (default
+    300s) — the stalled-subprocess case where the PID-poll watchdog can't
+    fire because the subprocess is alive. Cancelling the futures surfaces
+    ``asyncio.CancelledError`` at ``await call_task``; ``_call`` remaps it
+    to ``MCPStdioSubprocessDeadError`` via ``_call_dead_servers`` so the
+    handler's reconnect-and-retry path runs against the fresh session the
+    supervisor spawns (#81995).
+
+    Also marks the server in ``_call_dead_servers`` unconditionally (even
+    when nothing is pending) so a call that is still waiting on
+    ``_rpc_lock`` when the teardown happens sees the mark when it
+    acquires the lock and fails fast instead of issuing a call on the
+    dead transport. The mark is cleared when the next transport
+    initializes (``_mark_lifecycle_started``).
+    """
+    with _lock:
+        _call_dead_servers.add(server_name)
+        pending = _in_flight_call_tasks.get(server_name)
+        for call_task in list(pending or ()):
+            if not call_task.done():
+                call_task.cancel()
+
+
+def _clear_call_dead_servers(server_name: str) -> None:
+    """Clear the teardown-cancellation mark for ``server_name``.
+
+    Called when a fresh transport finishes initializing, so a stale mark
+    can never remap a later, unrelated cancellation of the new session.
+    """
+    with _lock:
+        _call_dead_servers.discard(server_name)
 
 
 def _snapshot_child_pids() -> set:
@@ -5591,6 +5685,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
+                    # Transport teardown raced this call: the session is
+                    # being discarded (stalled subprocess / supervisor
+                    # recycle / shutdown) and a response can never arrive.
+                    # Fail fast instead of issuing a call on the dead
+                    # transport — the handler's reconnect-and-retry path
+                    # will use the fresh session the supervisor spawns
+                    # (#81995). The mark is cleared once the next
+                    # transport initializes, so the retry's re-entry into
+                    # ``_call`` passes this check.
+                    with _lock:
+                        transport_dead = server_name in _call_dead_servers
+                    if transport_dead:
+                        raise MCPStdioSubprocessDeadError(
+                            f"MCP stdio subprocess for server "
+                            f"'{server_name}' is being torn down; failing "
+                            f"fast (#81995)."
+                        )
                     # Fail-fast watchdog: when the stdio subprocess dies
                     # mid-call, the MCP read stream EOFs but the SDK's
                     # in-flight ``call_tool`` coroutine can sit waiting on
@@ -5611,23 +5722,46 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     watchdog_task = asyncio.ensure_future(
                         _watch_stdio_subprocess(server_name, call_task)
                     )
+                    # Register the in-flight future so the transport
+                    # teardown path can cancel it (see
+                    # ``_cancel_in_flight_calls_for_server``).
+                    _mark_in_flight_call(server_name, call_task)
                     try:
                         result = await call_task
                     except asyncio.CancelledError:
                         # The watchdog cancelled ``call_task`` because the
-                        # stdio subprocess died mid-call (#81995): remap the
-                        # surfaced CancelledError (a BaseException, which the
-                        # sync handler's ``except Exception`` cannot see) to
+                        # stdio subprocess died mid-call, or the transport
+                        # teardown cancelled it because the session was
+                        # invalidated (stalled subprocess case — the PID
+                        # poll can't fire while a live PID is tracked):
+                        # remap the surfaced CancelledError (a
+                        # BaseException, which the sync handler's
+                        # ``except Exception`` cannot see) to
                         # ``MCPStdioSubprocessDeadError`` so the handler's
-                        # reconnect-and-retry path actually runs. A genuine
-                        # user cancellation (``_run_on_mcp_loop`` interrupt
-                        # or timeout) leaves the flag unset and re-raises
-                        # unchanged.
+                        # reconnect-and-retry path actually runs (#81995).
+                        # A genuine user cancellation (``_run_on_mcp_loop``
+                        # interrupt or timeout) leaves both flags unset and
+                        # re-raises unchanged.
                         with _lock:
-                            watchdog_fired = server_name in _watchdog_fired_servers
+                            watchdog_fired = (
+                                server_name in _watchdog_fired_servers
+                            )
                             if watchdog_fired:
+                                # Consumed here — a later, unrelated
+                                # cancellation must not be remapped.
                                 _watchdog_fired_servers.discard(server_name)
-                        if watchdog_fired:
+                            teardown_fired = server_name in _call_dead_servers
+                            # ``_call_dead_servers`` is deliberately NOT
+                            # consumed here: the teardown cancelled every
+                            # in-flight call (parallel-safe servers can
+                            # have several) AND marks calls still queued
+                            # behind ``_rpc_lock``, so the flag must stay
+                            # visible to all of them. It is cleared once
+                            # the supervisor's fresh transport
+                            # initializes (``_mark_lifecycle_started``),
+                            # which happens before the retry re-enters
+                            # this code.
+                        if watchdog_fired or teardown_fired:
                             raise MCPStdioSubprocessDeadError(
                                 f"MCP stdio subprocess for server "
                                 f"'{server_name}' died during an in-flight "
@@ -5635,6 +5769,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             ) from None
                         raise
                     finally:
+                        _unmark_in_flight_call(server_name, call_task)
                         # Always cancel the watchdog so it doesn't outlive
                         # the call (and so its ``asyncio.wait`` releases).
                         if not watchdog_task.done():
