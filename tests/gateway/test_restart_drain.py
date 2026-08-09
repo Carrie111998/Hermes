@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import shutil
 import subprocess
 from datetime import datetime
@@ -12,6 +13,20 @@ from gateway.platforms.base import MessageEvent, MessageType
 from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 from gateway.session import SessionEntry, build_session_key
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+
+
+@pytest.mark.parametrize("raw_timeout", ["inf", "nan", "1e309"])
+def test_load_restart_drain_timeout_warns_for_nonfinite_values(
+    monkeypatch, caplog, raw_timeout
+):
+    monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", raw_timeout)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        value = gateway_run.GatewayRunner._load_restart_drain_timeout()
+
+    assert value == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    assert "Invalid restart_drain_timeout" in caplog.text
+    assert raw_timeout in caplog.text
 
 
 @pytest.mark.asyncio

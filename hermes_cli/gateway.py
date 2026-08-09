@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -3289,12 +3291,19 @@ def _get_restart_drain_timeout() -> float:
     if not raw:
         cfg = read_raw_config()
         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(agent_cfg, Mapping):
+            agent_cfg = {}
         raw = str(
             agent_cfg.get(
                 "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
             )
         )
     return parse_restart_drain_timeout(raw)
+
+
+def _get_launchd_exit_timeout() -> int:
+    """Allow a restart drain to finish before launchd forces termination."""
+    return max(30, math.ceil(_get_restart_drain_timeout() + 30))
 
 
 def _get_restart_after_turn_timeout() -> float:
@@ -4143,6 +4152,7 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
+    exit_timeout = _get_launchd_exit_timeout()
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
     # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
@@ -4237,13 +4247,13 @@ def generate_launchd_plist() -> str:
 
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
-         respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain
-         headroom before launchd escalates from SIGTERM to SIGKILL on stop. -->
+         respawn storm; ExitTimeOut covers the configured graceful-drain budget
+         plus 30s before launchd escalates from SIGTERM to SIGKILL on stop. -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
     <key>ExitTimeOut</key>
-    <integer>25</integer>
+    <integer>{exit_timeout}</integer>
 {nofile_block}
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>

@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -8456,8 +8457,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         value = parse_restart_drain_timeout(raw)
         if raw and value == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT:
             try:
-                float(raw)
+                invalid = not math.isfinite(float(raw))
             except (TypeError, ValueError):
+                invalid = True
+            if invalid:
                 logger.warning(
                     "Invalid restart_drain_timeout '%s', using default %.0fs",
                     raw,
