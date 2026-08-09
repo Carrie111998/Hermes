@@ -79,13 +79,13 @@ describe('openSessionInNewWindow', () => {
     expect(notifyError).not.toHaveBeenCalled()
   })
 
-  it('forwards the watch flag for spectator (subagent) windows', async () => {
+  it('forwards the watch flag and owning profile for spectator (subagent) windows', async () => {
     const open = vi.fn().mockResolvedValue({ ok: true })
     installBridge(open)
 
-    await openSessionInNewWindow('s1', { watch: true })
+    await openSessionInNewWindow('s1', { profile: 'life', watch: true })
 
-    expect(open).toHaveBeenCalledWith('s1', { watch: true })
+    expect(open).toHaveBeenCalledWith('s1', { profile: 'life', watch: true })
     expect(notifyError).not.toHaveBeenCalled()
   })
 
