@@ -18,10 +18,11 @@ from tools.mcp_oauth import _is_valid_authorization_url, _make_redirect_handler
         "https://auth.example.com/authorize?client_id=1",
         "http://127.0.0.1:8080/authorize",
         "http://localhost:3000/oauth",
+        "http://[::1]:8080/authorize",
         "https://[::1]/443/authorize",
     ],
 )
-def test_accepts_http_https_authorization_urls(url):
+def test_accepts_https_and_loopback_http_authorization_urls(url):
     assert _is_valid_authorization_url(url) is True
 
 
@@ -32,13 +33,15 @@ def test_accepts_http_https_authorization_urls(url):
         "file:///etc/passwd",
         "data:text/html,hi",
         "ftp://example.com/auth",
+        "http://attacker.example/authorize",  # non-loopback http
+        "http://169.254.169.254/latest/meta-data",  # link-local, not loopback
         "https://",  # scheme only, no host
         "not a url",
         "",
         "   ",
     ],
 )
-def test_rejects_non_http_authorization_urls(url):
+def test_rejects_non_https_or_non_loopback_authorization_urls(url):
     assert _is_valid_authorization_url(url) is False
 
 

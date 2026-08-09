@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import ipaddress
 import json
 import logging
 import os
@@ -694,10 +695,23 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _is_valid_authorization_url(authorization_url: str) -> bool:
-    """Return True only for http(s) authorization URLs with a host.
+def _is_loopback_host(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    host = hostname.strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
-    MCP OAuth authorization endpoints are HTTPS (or HTTP on loopback).
+
+def _is_valid_authorization_url(authorization_url: str) -> bool:
+    """Return True for https authorization URLs, or http on loopback only.
+
+    Per the MCP authorization spec, authorization server endpoints MUST use
+    HTTPS; plain HTTP is only tolerable for loopback during local development.
     Rejecting other schemes before ``webbrowser.open`` / dashboard publish
     avoids navigating to ``javascript:``, ``file:``, or similar if a
     compromised or misconfigured MCP server returns a hostile URL.
@@ -705,7 +719,13 @@ def _is_valid_authorization_url(authorization_url: str) -> bool:
     if not isinstance(authorization_url, str) or not authorization_url.strip():
         return False
     parsed = urlparse(authorization_url.strip())
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    if not parsed.netloc:
+        return False
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme == "http":
+        return _is_loopback_host(parsed.hostname)
+    return False
 
 
 def _make_redirect_handler(port: int, redirect_uri: str | None = None):
