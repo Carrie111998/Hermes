@@ -803,19 +803,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     except Exception:
         pass
 
-    # Reap MCP stdio orphans left behind by this session's reconnects. The
-    # Desktop backend stays alive across session rotations, so nothing else
-    # runs this sweep between sessions -- without it, orphaned PIDs just sit
-    # in ``_orphan_stdio_pids`` until the cron ticker happens to fire (#81880).
-    # Safe here: only PIDs already flagged as orphaned by ``_run_stdio``'s
-    # finally block are reaped, never a still-active server shared with other
-    # sessions.
-    try:
-        from tools.mcp_tool import _kill_orphaned_mcp_children
-        _kill_orphaned_mcp_children()
-    except Exception:
-        pass
-
 
 # End reasons where the BACKEND reclaimed a session the client never asked to
 # close: the idle-TTL reaper, the LRU cap, and the WS-orphan reap. A client
