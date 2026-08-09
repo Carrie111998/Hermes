@@ -149,6 +149,17 @@ def test_invalid_repo_rejected(kanban_home, tmp_path, monkeypatch):
     assert result["task_id"] is None
 
 
+def test_relative_local_repo_rejected(kanban_home, git_repo, monkeypatch):
+    monkeypatch.setattr(dpt, "check_dev_pipeline_requirements", lambda: True)
+    import os
+
+    rel = os.path.relpath(str(git_repo), start=os.getcwd())
+    raw = dpt.delegate_development(repo=rel, task="nope")
+    result = _parse_result(raw)
+    assert result["success"] is False
+    assert "absolute" in (result.get("message") or "").lower()
+
+
 def test_check_fn_reflects_cursor_binary(monkeypatch):
     monkeypatch.setattr(
         "tools.dev_pipeline_tool.check_cursor_agent_requirements",

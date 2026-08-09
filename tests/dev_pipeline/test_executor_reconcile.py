@@ -1,10 +1,16 @@
-"""Reconcile matrix tests (mock systemctl)."""
+"""Reconcile matrix and executor-level integration tests."""
 
 from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from hermes_cli import dev_executor as ex
+from hermes_cli import kanban_db as kb
 
 
 @pytest.mark.parametrize(
@@ -15,6 +21,8 @@ from hermes_cli import dev_executor as ex
         (False, False, "abc123", "RUNNING", 1, 2, "resume", "VERIFYING", None),
         (False, False, None, "RUNNING", 1, 2, "retry", "RUNNING", None),
         (False, False, None, "RUNNING", 2, 2, "block", None, "executor_restarted"),
+        (False, False, "abc", "REVIEWING", 1, 2, "resume", "REVIEWING", None),
+        (False, False, "abc", "PUBLISHING", 1, 2, "resume", "PUBLISHING", None),
     ],
 )
 def test_reconcile_task_state_matrix(
@@ -43,56 +51,269 @@ def test_reconcile_task_state_matrix(
         assert decision.reason == expected_reason
 
 
-def test_reconcile_board_adopts_active_unit(kanban_home_fixture):
-    from hermes_cli import kanban_db as kb
-
-    conn = kanban_home_fixture
-    task_id = kb.create_task(
-        conn,
-        title="t",
-        body="{}",
-        workspace_kind="scratch",
-        board="dev",
-    )
-    conn.execute(
-        "UPDATE tasks SET status='running' WHERE id=?",
-        (task_id,),
-    )
-    conn.execute(
-        "INSERT INTO task_runs (task_id, status, started_at, metadata) VALUES (?, 'running', ?, ?)",
-        (
-            task_id,
-            1,
-            '{"dev_pipeline": {"phase": "RUNNING", "unit_name": "hermes-dev-t-1", "unit_pid": 99, "host_start_time": 42, "candidate_commit": "deadbeef"}}',
-        ),
-    )
-    conn.commit()
-
-    def fake_active(unit):
-        return unit == "hermes-dev-t-1", "active"
-
-    def fake_pid(pid, start):
-        return pid == 99 and start == 42
-
-    cfg = {"board": "dev", "max_attempts": 2}
-    decisions = ex.reconcile_board(
-        conn,
-        cfg,
-        is_active_fn=fake_active,
-        pid_match_fn=fake_pid,
-    )
-    assert any(d.adopt for d in decisions)
-
-
 @pytest.fixture
 def kanban_home_fixture(tmp_path, monkeypatch):
-    from pathlib import Path
-
-    from hermes_cli import kanban_db as kb
-
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.create_board("dev")
     return kb.connect(board="dev")
+
+
+def _seed_running_task(conn, metadata: dict) -> tuple[str, int]:
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body=json.dumps({"repo": "/tmp/r", "branch": "main", "task": "work"}),
+        workspace_kind="scratch",
+        board="dev",
+    )
+    conn.execute(
+        "UPDATE tasks SET status='running', claim_lock='dev-executor', claim_expires=? WHERE id=?",
+        (int(time.time()) + 900, task_id),
+    )
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, metadata, claim_lock, claim_expires) "
+        "VALUES (?, 'running', ?, ?, 'dev-executor', ?)",
+        (
+            task_id,
+            int(time.time()),
+            json.dumps({"dev_pipeline": metadata}),
+            int(time.time()) + 900,
+        ),
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+    conn.commit()
+    return task_id, int(run_id)
+
+
+def test_reconcile_applies_adopt_to_executor_active_set(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "RUNNING",
+            "unit_pid": 99,
+            "host_start_time": 42,
+            "last_jsonl_size": 100,
+            "last_jsonl_growth_at": 1234.5,
+        },
+    )
+    unit = ex.unit_name(task_id, run_id)
+    conn.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (
+            json.dumps(
+                {
+                    "dev_pipeline": {
+                        "phase": "RUNNING",
+                        "unit_name": unit,
+                        "unit_pid": 99,
+                        "host_start_time": 42,
+                        "last_jsonl_size": 100,
+                        "last_jsonl_growth_at": 1234.5,
+                    }
+                }
+            ),
+            run_id,
+        ),
+    )
+    conn.commit()
+
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+
+    def fake_active(u):
+        return u == unit, "active"
+
+    def fake_pid(pid, start):
+        return pid == 99 and start == 42
+
+    ex.reconcile_board(
+        conn,
+        executor.cfg,
+        executor=executor,
+        is_active_fn=fake_active,
+        pid_match_fn=fake_pid,
+    )
+    assert task_id in executor._active
+    assert executor._active[task_id].phase == ex.PHASE_RUNNING
+    assert executor._active[task_id].last_jsonl_size == 100
+
+
+def test_reconcile_resume_reviewing_advances_executor(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "REVIEWING",
+            "candidate_commit": "deadbeef",
+            "repo_path": "/tmp/fake",
+            "logs_root": "/tmp/logs",
+            "base_commit": "aaa",
+            "contract": {"task_summary": "x", "acceptance_commands": ["true"]},
+            "mechanical_pass": True,
+        },
+    )
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+
+    with patch.object(ex, "unified_diff", return_value="safe"):
+        with patch.object(executor, "_phase_reviewing") as mock_review:
+            ex.reconcile_board(
+                conn,
+                executor.cfg,
+                executor=executor,
+                is_active_fn=lambda _u: (False, "inactive"),
+            )
+            assert task_id in executor._active
+            assert executor._active[task_id].phase == ex.PHASE_REVIEWING
+            mock_review.assert_called_once()
+
+
+def test_reconcile_retry_spawns_attempt(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, _run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "RUNNING",
+            "repo_path": "/tmp/repo",
+            "logs_root": "/tmp/logs",
+            "contract": {"task_summary": "x"},
+        },
+    )
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+
+    with patch.object(executor, "_spawn_attempt") as mock_spawn:
+        ex.reconcile_board(
+            conn,
+            executor.cfg,
+            executor=executor,
+            is_active_fn=lambda _u: (False, "inactive"),
+        )
+        assert task_id in executor._active
+        mock_spawn.assert_called_once()
+
+
+def test_reconcile_block_marks_task_blocked(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, _run_id = _seed_running_task(conn, {"phase": "RUNNING"})
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome) "
+        "VALUES (?, 'crashed', ?, ?, 'crashed')",
+        (task_id, int(time.time()), int(time.time())),
+    )
+    conn.commit()
+
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    ex.reconcile_board(
+        conn,
+        executor.cfg,
+        executor=executor,
+        is_active_fn=lambda _u: (False, "inactive"),
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "blocked"
+    assert task_id not in executor._active
+
+
+def test_fresh_executor_tick_adopts_running_task_after_restart(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, run_id = _seed_running_task(
+        conn,
+        {"phase": "PLANNING", "repo": "/tmp/r", "branch": "main"},
+    )
+    conn.execute(
+        "UPDATE task_runs SET metadata=? WHERE id=?",
+        (
+            json.dumps(
+                {"dev_pipeline": {"phase": "PLANNING", "repo": "/tmp/r", "branch": "main"}}
+            ),
+            run_id,
+        ),
+    )
+    conn.commit()
+
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+
+    contract = {
+        "task_summary": "x",
+        "lane_hint": "cursor",
+        "estimated_minutes": 10,
+        "allowed_paths": ["src/**"],
+        "acceptance_commands": ["true"],
+        "broad_flags": {
+            "migration": False,
+            "repo_wide_change": False,
+            "toolchain_change": False,
+            "multi_subsystem": False,
+            "long_verification": False,
+        },
+        "blocked_reasons": [],
+        "step_plan": [{"id": "s1", "description": "d", "verifiable": True}],
+        "assumptions": [],
+    }
+
+    with patch.object(ex, "clone_repo", return_value=(True, "/tmp/r")):
+        with patch.object(ex, "build_repo_summary", return_value="summary"):
+            with patch.object(ex, "run_planning", return_value=(contract, "", [])):
+                ex.reconcile_board(
+                    conn,
+                    executor.cfg,
+                    executor=executor,
+                    is_active_fn=lambda _u: (False, "inactive"),
+                )
+                assert task_id in executor._active
+                executor._advance(conn, task_id)
+                meta = ex.load_run_metadata(conn, executor._active[task_id].run_id)
+                assert ex.pipeline_state(meta).get("phase") in {
+                    ex.PHASE_ROUTING,
+                    ex.PHASE_PREPARING,
+                    ex.PHASE_RUNNING,
+                }
