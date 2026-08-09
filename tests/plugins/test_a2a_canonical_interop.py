@@ -415,3 +415,170 @@ class TestOutboundDriftPin:
         bogus = {"SendMessage", "Bogus/Op"}
         offenders = {s for s in bogus if s not in ACCEPTED_METHODS}
         assert offenders == {"Bogus/Op"}
+
+
+# --------------------------------------------------------------------------
+# Debate-adjudicated coverage (Wave 10, /tmp/w10-debate-f3.md)
+# Accepted: #1 v1 stream dispatch, #2+#3 version gate + parity, #4 reverse
+# mapping closure, #5 wrapped-vs-bare shape parity.
+# Deferred: #6 batch-array deviation pin (low-traffic input no real peer
+# sends; cheap to add later), #8 auth-precedence ordering (belongs in the
+# security suite, not this interop file).
+# --------------------------------------------------------------------------
+
+ADAPTER_PATH = REPO_ROOT / "plugins" / "platforms" / "a2a" / "adapter.py"
+
+
+def _posted_with_headers(monkeypatch, body: dict, headers: dict | None):
+    """_posted variant that lets a test set extra request headers."""
+    handler = _fake_handler(monkeypatch, body)
+    for k, v in (headers or {}).items():
+        handler.headers[k] = v
+    handler.do_POST()  # noqa: N802
+    handler.wfile.seek(0)
+    raw = handler.wfile.read().decode("utf-8")
+    head, _, payload = raw.partition("\r\n\r\n")
+    status = int(head.split()[1])
+    return status, head, (json.loads(payload) if payload else {})
+
+
+class TestA2AVersionGate:
+    """Debate #2 + #3: the A2A-Version header gate is an interop chokepoint
+    and the outbound version must stay inside the inbound accepted set."""
+
+    def _send_body(self):
+        return {
+            "jsonrpc": "2.0", "id": 7, "method": "SendMessage",
+            "params": {"message": protocol.text_message(protocol.ROLE_USER, "hi")},
+        }
+
+    def test_absent_version_header_dispatches(self, monkeypatch):
+        # Legacy peers send no header — must NOT be rejected.
+        status, _, resp = _posted_with_headers(monkeypatch, self._send_body(), None)
+        assert status == 200
+        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+
+    def test_version_1_0_dispatches(self, monkeypatch):
+        status, _, resp = _posted_with_headers(
+            monkeypatch, self._send_body(), {"A2A-Version": "1.0"})
+        assert status == 200
+        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+
+    def test_version_1_0_0_dispatches(self, monkeypatch):
+        status, _, resp = _posted_with_headers(
+            monkeypatch, self._send_body(), {"A2A-Version": "1.0.0"})
+        assert status == 200
+        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+
+    @pytest.mark.parametrize("bad", ["0.3", "1.1", "2"])
+    def test_unknown_version_rejected_invalid_params(self, monkeypatch, bad):
+        status, _, resp = _posted_with_headers(
+            monkeypatch, self._send_body(), {"A2A-Version": bad})
+        assert status == 200
+        assert resp["error"]["code"] == protocol.ERR_INVALID_PARAMS
+        assert bad in resp["error"]["message"]
+
+    def test_outbound_protocol_version_is_inbound_accepted(self, monkeypatch):
+        """Debate #3 round-trip on the VERSION axis: whatever tools.py sends
+        as A2A-Version must pass our own inbound gate (silent-drift pin —
+        bumping PROTOCOL_VERSION becomes a visible, reviewed change)."""
+        status, _, resp = _posted_with_headers(
+            monkeypatch, self._send_body(),
+            {"A2A-Version": protocol.PROTOCOL_VERSION})
+        assert status == 200
+        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS, (
+            "outbound PROTOCOL_VERSION is rejected by our own inbound gate")
+
+
+class TestReverseMappingClosure:
+    """Debate #4: the inbound mapping table must not grow stray entries that
+    no spec section documents. One-directional drift pins are not enough."""
+
+    def test_inbound_mapping_keys_match_accepted_universe(self):
+        tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"))
+        keys: set[str] = set()
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_method_info":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Dict):
+                        found = True
+                        for k in sub.keys:
+                            assert isinstance(k, ast.Constant), (
+                                "_method_info mapping keys must stay constant "
+                                "literals for this closure pin to hold")
+                            keys.add(k.value)
+        assert found, "_method_info mapping dict not found in adapter.py"
+        assert keys == ACCEPTED_METHODS, (
+            f"inbound mapping drifted from the accepted universe: "
+            f"extra={sorted(keys - ACCEPTED_METHODS)} "
+            f"missing={sorted(ACCEPTED_METHODS - keys)}")
+
+    def test_each_operation_has_exactly_one_v1_spelling(self):
+        v1_spellings: dict[str, list[str]] = {}
+        for name, (op, is_v1) in (
+            (m, _method_info(m)) for m in ACCEPTED_METHODS):
+            if is_v1:
+                v1_spellings.setdefault(op, []).append(name)
+        assert set(v1_spellings) == set(CANONICAL_V1.values())
+        for op, names in v1_spellings.items():
+            assert len(names) == 1, f"operation {op} has {len(names)} v1 spellings: {names}"
+
+
+class TestResponseShapeParity:
+    """Debate #5: spelling selects response shape — v1 SendMessage wraps the
+    task, legacy message/send returns it bare. The heart of dual-spelling
+    compat, pinned hermetically."""
+
+    def _posted_send(self, monkeypatch, method: str):
+        handler = _fake_handler(monkeypatch, {
+            "jsonrpc": "2.0", "id": 21, "method": method,
+            "params": {"message": protocol.text_message(protocol.ROLE_USER, "shape")},
+        })
+        handler.server.adapter._await_reply = lambda pending: (protocol.STATE_COMPLETED, "pong")
+        handler.do_POST()  # noqa: N802
+        handler.wfile.seek(0)
+        raw = handler.wfile.read().decode("utf-8")
+        _, _, payload = raw.partition("\r\n\r\n")
+        return json.loads(payload)
+
+    def test_v1_sendmessage_result_is_wrapped_task(self, monkeypatch):
+        resp = self._posted_send(monkeypatch, "SendMessage")
+        assert "error" not in resp, resp.get("error")
+        assert set(resp["result"].keys()) == {"task"}, (
+            "v1 SendMessage result must be the SendMessageResponse task wrapper")
+
+    def test_legacy_message_send_result_is_bare(self, monkeypatch):
+        resp = self._posted_send(monkeypatch, "message/send")
+        assert "error" not in resp, resp.get("error")
+        assert "task" not in resp["result"], (
+            "legacy message/send must return a BARE task, not the wrapper")
+        assert "status" in resp["result"]
+
+
+class TestV1StreamDispatch:
+    """Debate #1: the PascalCase v1 stream spelling must reach the SSE path
+    end-to-end hermetically (previously only the mapping table was tested;
+    the only SSE dispatch test used the legacy spelling over live HTTP)."""
+
+    def test_do_post_v1_stream_method_serves_sse_frames(self, monkeypatch):
+        handler = _fake_handler(monkeypatch, {
+            "jsonrpc": "2.0", "id": 31, "method": "SendStreamingMessage",
+            "params": {"message": protocol.text_message(protocol.ROLE_USER, "stream")},
+        })
+        handler.server.adapter._await_reply = lambda pending, keepalive=None: (
+            protocol.STATE_COMPLETED, "done-streaming")
+        handler.do_POST()  # noqa: N802
+        handler.wfile.seek(0)
+        raw = handler.wfile.read().decode("utf-8")
+        head, _, body = raw.partition("\r\n\r\n")
+        assert "text/event-stream" in head, head
+        frames = [ln[len("data:"):].strip() for ln in body.splitlines()
+                  if ln.startswith("data:")]
+        assert frames, "SSE stream emitted no data frames"
+        for frame in frames:
+            env = json.loads(frame)
+            assert env.get("jsonrpc") == "2.0"
+            assert env.get("id") == 31
+            assert "result" in env, f"frame missing result: {env}"
+        assert ": done" in body, "stream must end with the done comment"
