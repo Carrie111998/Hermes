@@ -59,12 +59,24 @@ class TestBlocksMutationsInSourceRepo:
         self, repo, tmp_path, path_style
     ):
         native = str(repo)
+        cwd = tmp_path
+        source_root = repo
         if path_style == "native":
             target = native
         else:
-            drive, tail = native.split(":", 1)
-            target = f"/{drive.lower()}{tail.replace(chr(92), '/') }"
-        hit, _ = _detect(f'git -C "{target}" checkout pr-51020', tmp_path, repo)
+            if ":" in native:
+                drive, tail = native.split(":", 1)
+                target = f"/{drive.lower()}{tail.replace(chr(92), '/') }"
+            else:
+                # POSIX has no drive to translate. Pair the distinct /c/ form
+                # with the equivalent logical native path for this resolver.
+                drive = "c"
+                target = f"/{drive}{native}"
+                source_root = Path(f"{drive}:{native}")
+                cwd = Path("/")
+            assert target.startswith(f"/{drive.lower()}/")
+            assert target != native
+        hit, _ = _detect(f'git -C "{target}" checkout pr-51020', cwd, source_root)
         assert hit is True
 
     def test_rejects_chained_explicit_targets(self, repo, tmp_path):
