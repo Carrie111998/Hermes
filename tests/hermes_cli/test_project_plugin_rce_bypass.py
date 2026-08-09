@@ -38,6 +38,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_cli import web_server
+from hermes_cli.agent_plugins import PLUGIN_SCHEMA_V1
 from hermes_cli.plugin_activation import PluginActivationState
 
 
@@ -93,6 +94,35 @@ def _write_runtime_plugin(
             )
             manifest["api"] = "api.py"
         (dashboard_dir / "manifest.json").write_text(json.dumps(manifest))
+    return plugin_root
+
+
+def _write_portable_runtime_plugin(
+    root: Path,
+    directory: str,
+    *,
+    runtime_name: str,
+    dashboard_name: str,
+    valid_manifest: bool = True,
+) -> Path:
+    """Create an Agent Plugins v1 package with a dashboard API."""
+    plugin_root = root / directory
+    dashboard_dir = plugin_root / "dashboard"
+    dashboard_dir.mkdir(parents=True)
+    if valid_manifest:
+        portable_manifest = {
+            "$schema": PLUGIN_SCHEMA_V1,
+            "name": runtime_name,
+        }
+        (plugin_root / "plugin.json").write_text(json.dumps(portable_manifest))
+    else:
+        (plugin_root / "plugin.json").write_text("{not-json")
+    (dashboard_dir / "api.py").write_text(
+        "from fastapi import APIRouter\nrouter = APIRouter()\n"
+    )
+    (dashboard_dir / "manifest.json").write_text(
+        json.dumps({"name": dashboard_name, "api": "api.py"})
+    )
     return plugin_root
 
 
@@ -154,6 +184,97 @@ class TestProjectPluginsEnvGate:
 
 
 class TestDashboardDiscoveryScopeAndWinners:
+    @pytest.mark.parametrize(
+        (
+            "valid_manifest",
+            "activation",
+            "expected_name",
+            "expected_status",
+            "should_import",
+        ),
+        [
+            (
+                True,
+                PluginActivationState(
+                    enabled=frozenset({"ui.foo"}),
+                    disabled=frozenset({"portable.test"}),
+                ),
+                "portable.test",
+                "disabled",
+                False,
+            ),
+            (
+                True,
+                PluginActivationState(enabled=frozenset({"portable.test"})),
+                "portable.test",
+                "enabled",
+                True,
+            ),
+            (
+                False,
+                PluginActivationState(
+                    enabled=frozenset({"portable-dir", "ui.foo"})
+                ),
+                "portable-dir",
+                "not enabled",
+                False,
+            ),
+        ],
+    )
+    def test_portable_dashboard_uses_canonical_runtime_gate(
+        self,
+        tmp_path,
+        monkeypatch,
+        valid_manifest,
+        activation,
+        expected_name,
+        expected_status,
+        should_import,
+    ):
+        bundled = tmp_path / "bundled"
+        user_home = tmp_path / "home"
+        bundled.mkdir()
+        user_home.mkdir()
+        plugin_root = _write_portable_runtime_plugin(
+            user_home / "plugins",
+            "portable-dir",
+            runtime_name="portable.test",
+            dashboard_name="ui.foo",
+            valid_manifest=valid_manifest,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(user_home))
+
+        with patch(
+            "hermes_cli.plugins.get_bundled_plugins_dir",
+            return_value=bundled,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=activation,
+        ):
+            plugins = web_server._get_dashboard_plugins(force_rescan=True)
+            portable = next(p for p in plugins if p["name"] == "ui.foo")
+            assert portable["_runtime_managed"] is True
+            assert portable["_runtime_name"] == expected_name
+            assert portable["_runtime_key"] == expected_name
+            assert web_server._dashboard_plugin_status(
+                portable,
+                activation=activation,
+            ) == expected_status
+
+            with patch(
+                "importlib.util.spec_from_file_location",
+                side_effect=RuntimeError("portable API import probe"),
+            ) as spec:
+                web_server._mount_plugin_api_routes()
+
+        if should_import:
+            spec.assert_called_once_with(
+                "hermes_dashboard_plugin_ui.foo",
+                plugin_root / "dashboard" / "api.py",
+            )
+        else:
+            spec.assert_not_called()
+
     def test_populated_project_cache_is_invalidated_on_cwd_change(
         self,
         tmp_path,

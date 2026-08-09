@@ -16850,6 +16850,7 @@ def _discover_dashboard_plugins() -> list:
     3. Project plugins: ./.hermes/plugins/  (only if HERMES_ENABLE_PROJECT_PLUGINS)
     """
     from hermes_cli.plugins import get_bundled_plugins_dir
+    from hermes_cli.plugins_cmd import _read_manifest_info
     bundled_root = get_bundled_plugins_dir()
     try:
         runtime_entries = _discover_dashboard_runtime_entries()
@@ -16924,11 +16925,20 @@ def _discover_dashboard_plugins() -> list:
                 runtime_manifest = child / "plugin.yaml"
                 if not runtime_manifest.exists():
                     runtime_manifest = child / "plugin.yml"
+                portable_manifest = child / "plugin.json"
                 # Memory providers have an exclusive selector and are not
                 # candidates in general runtime winner discovery. Preserve
                 # their dashboard-only treatment instead of misclassifying
                 # them as a missing (therefore inactive) runtime winner.
-                runtime_managed = runtime_manifest.exists() and (
+                # A portable manifest remains runtime-managed even when it is
+                # disabled (and therefore absent from ``runtime_entries``) or
+                # malformed. In either case it must not fall back to the
+                # dashboard-only identity and bypass its canonical gate.
+                runtime_managed = (
+                    runtime_manifest.exists()
+                    or portable_manifest.exists()
+                    or portable_manifest.is_symlink()
+                ) and (
                     plugins_root != bundled_root / "memory"
                 )
 
@@ -16943,23 +16953,14 @@ def _discover_dashboard_plugins() -> list:
                     # prefix=""). This also lets us identify a losing bundled
                     # dashboard whose user/project winner has no dashboard.
                     runtime_name = child.name
-                    runtime_kind = "standalone"
-                    try:
-                        manifest_data = yaml.safe_load(
-                            runtime_manifest.read_text(encoding="utf-8")
-                        ) or {}
-                        if isinstance(manifest_data, dict):
-                            manifest_name = manifest_data.get("name")
-                            if isinstance(manifest_name, str) and manifest_name.strip():
-                                runtime_name = manifest_name.strip()
-                            manifest_kind = manifest_data.get("kind")
-                            if isinstance(manifest_kind, str) and manifest_kind.strip():
-                                runtime_kind = manifest_kind.strip().lower()
-                    except Exception:
-                        # Malformed runtime identity is not a dashboard-only
-                        # escape hatch. Keep it runtime-managed and fail closed.
-                        pass
                     runtime_key = runtime_name
+                    runtime_kind = "standalone"
+                    manifest_info = _read_manifest_info(child, "")
+                    if manifest_info is not None:
+                        runtime_name = str(manifest_info[0])
+                        runtime_key = str(manifest_info[3])
+                        if len(manifest_info) > 4:
+                            runtime_kind = str(manifest_info[4])
                     runtime_source = (
                         "git" if source == "user" and (child / ".git").exists()
                         else source
