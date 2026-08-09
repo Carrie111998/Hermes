@@ -30,6 +30,19 @@ P0 Semantic Graph hardening is closed as an immutable baseline. Phase 2 starts f
 - No mandatory vector database or new mandatory HTTP dependency is introduced.
 - Unit tests do not call a live embedding server.
 
+## 設計固定 — llama-server専用Embedding backend
+
+- Production backend: `LlamaCppEmbeddingBackend` only.
+- Server: operator-managed dedicated `llama-server` process with `--embedding`.
+- Endpoint: `POST /v1/embeddings` only; `/embedding` and `/embeddings` are not used.
+- Model: `Qwen/Qwen3-Embedding-0.6B-GGUF`; F16 is the primary baseline and Q8_0 is the later A/B comparison.
+- Dimensions: 1024 initially. Any 512-dimensional truncation is a later `truncate -> L2 normalize -> benchmark` decision, not an initial assumption.
+- Pooling: `last`; server-side normalization is expected with `--embd-normalize 2`; client-side defensive normalization belongs to Commit 5.
+- Query serialization uses the Qwen instruction form; document serialization uses only canonical node fields and no instruction.
+- Default deployment is loopback-only at `127.0.0.1:8082`, with `allow_remote: false`; no API key is persisted.
+- The plugin connects to the operator-managed server but does not auto-start it. Failure fails open to lexical retrieval with cooldown.
+- Generic `LocalHttpEmbeddingBackend`, external Embeddings APIs, and external vector databases are not part of the production design.
+
 ## 実装順
 
 1. Freeze and record the lexical retrieval benchmark baseline.
@@ -111,9 +124,37 @@ Verification evidence:
 - Secret/local-path scan: no findings.
 - No live embedding server call performed.
 
+## Commit 3 — canonical embedding serializer and source hash
+
+Commit 3 adds deterministic Qwen3 query/document serialization and SHA-256 source hashing only. It does not connect the serializer to production retrieval, SQLite, runtime, config, HTTP, or CLI paths.
+
+Implemented files:
+- `plugins/semantic_graph/embedding/serializer.py`
+- `plugins/semantic_graph/embedding/__init__.py` exports
+- `tests/plugins/test_semantic_graph_embedding_serializer.py`
+
+Contract decisions:
+- Query text uses the Qwen3 instruction form: `Instruct: {instruction}` followed by `Query:{query}`.
+- Documents use exactly five fixed lines: `Type`, `Subtype`, `Label`, `Summary`, and `Identity`.
+- Only semantic node fields are read; status, authority, confidence, salience, run/session identifiers, timestamps, metadata, evidence, and extra keys are excluded.
+- Shared `sanitize_text` is reused; values are normalized deterministically and bounded per field.
+- `node_type` and `label` are required; optional fields remain as empty values so the five-line shape is stable.
+- `source_text_hash` is SHA-256 over the final canonical UTF-8 text. No Python `hash()` or random identifier is used.
+- Query/document serialization is separate; vector normalization and packing remain deferred to Commit 5.
+
+Verification evidence:
+- RED: canonical runner failed during collection before implementation with `ModuleNotFoundError: No module named 'plugins.semantic_graph.embedding.serializer'` (exit 1).
+- GREEN: canonical runner, 4 files / 43 tests passed, exit 0.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- Secret/local-path scan: no findings.
+- Production files `retrieval.py`, `store.py`, `runtime.py`, `config.py`, and `pyproject.toml` are unchanged.
+- No live embedding server call performed.
+
 ## 現在の変更範囲
 
-The current branch contains the lexical benchmark baseline, the Phase 2 start log, and the Commit 2 embedding backend contract only. No SQLite migration, dependency change, production retrieval change, HTTP adapter, or CLI has been made.
+The current branch contains the lexical benchmark baseline, the Phase 2 start log, the Commit 2 backend contract, and the Commit 3 canonical serializer/source hash. No SQLite migration, dependency change, production retrieval change, HTTP adapter, or CLI has been made.
 
 
 ## 検証計画
@@ -131,8 +172,10 @@ The current branch contains the lexical benchmark baseline, the Phase 2 start lo
 
 ## 次のアクション
 
-Add the lexical-only benchmark baseline as the first logical commit, without changing production retrieval code. Record its measured metrics here after fresh canonical-runner verification.
+Implement the transactional SQLite embedding migration as the next isolated commit, without connecting embeddings to production retrieval yet.
 
 ## 変更履歴
 
 - 2026-08-09: Phase 2 start record created from merged `origin/main`.
+- 2026-08-09: llama-server-only production backend and 1024-dimensional Qwen3 policy locked.
+- 2026-08-09: Commit 3 serializer and source-hash verification recorded.
