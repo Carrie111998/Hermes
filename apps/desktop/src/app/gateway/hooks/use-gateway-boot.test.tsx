@@ -199,6 +199,7 @@ beforeEach(() => {
   setPrimaryBackendMode.mockClear()
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
+  $connection.set(null)
   $gatewayState.set('idle')
   $desktopBoot.set({
     error: null,
