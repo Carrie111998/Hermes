@@ -225,6 +225,7 @@ import {
   MIN_HEIGHT as WINDOW_MIN_HEIGHT,
   MIN_WIDTH as WINDOW_MIN_WIDTH
 } from './window-state'
+import { initialWindowTranslucencyOptions, opacityForTranslucency } from './window-translucency'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 import {
   buildPathExtCandidates,
@@ -775,11 +776,14 @@ let translucencyIntensity = readPersistedTranslucency()
 // Map the 0–100 lever to a window opacity. Floor at 0.3 so the most see-through
 // setting is still usable rather than nearly invisible. 0 → fully opaque.
 function windowOpacity() {
-  return 1 - (translucencyIntensity / 100) * 0.7
+  return opacityForTranslucency(translucencyIntensity)
 }
 
 // Re-apply translucency to a live window (runtime toggle, no recreation).
 // `setOpacity` is a no-op on Linux, which is fine — it just stays opaque there.
+// On Windows, setting this back to 1 restores visual opacity but Electron keeps
+// the existing HWND layered until the window is recreated. Cold opaque starts
+// avoid that compositor path through initialWindowTranslucencyOptions().
 function applyWindowTranslucency(win) {
   if (!win || win.isDestroyed() || typeof win.setOpacity !== 'function') {
     return
@@ -8864,7 +8868,7 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...initialWindowTranslucencyOptions(translucencyIntensity, IS_WINDOWS),
     icon,
     // Don't show until the renderer's first themed paint is ready. macOS
     // `vibrancy` ignores `backgroundColor` and paints a translucent OS
@@ -8946,7 +8950,7 @@ function createInstanceWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...initialWindowTranslucencyOptions(translucencyIntensity, IS_WINDOWS),
     icon,
     show: false,
     backgroundColor: getWindowBackgroundColor(),
@@ -9716,7 +9720,7 @@ function createWindow() {
     titleBarOverlay: getTitleBarOverlayOptions(),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
-    opacity: windowOpacity(),
+    ...initialWindowTranslucencyOptions(translucencyIntensity, IS_WINDOWS),
     icon,
     // Hidden until the first themed paint so macOS `vibrancy` (which ignores
     // `backgroundColor` and follows the OS appearance) can't flash a light
