@@ -194,12 +194,24 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    # A max-iterations fallback that still produced a real final answer (the
+    # summary call succeeded) is a completed turn for persistence and event
+    # purposes: the user saw an actual final response, so downstream surfaces
+    # must treat it as finished (terminal finish_reason, no resume_pending,
+    # no "incomplete" client state). Only a fallback with NO response
+    # (failed/interrupted, or the empty placeholder string) stays False.
+    iteration_limit_with_response = (
+        str(_turn_exit_reason).startswith("max_iterations_reached(")
+        and final_response is not None
+        and str(final_response).strip() != ""
+    )
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or iteration_limit_with_response
         )
     )
 
