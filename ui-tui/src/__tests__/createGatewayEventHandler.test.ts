@@ -748,6 +748,25 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]?.tools ?? []).toEqual([])
   })
 
+  it('appends a per-turn tool summary event line after a completed tool turn', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const diff = '--- a/foo.ts\n+++ b/foo.ts\n@@\n-old\n+new'
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { context: 'foo.ts', name: 'patch', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({ payload: { inline_diff: diff, summary: 'patched', tool_id: 'tool-1' }, type: 'tool.complete' } as any)
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    // The turn summary (CLI display.turn_summary parity) lands as the last
+    // transcript line: a dim ◈ event whose text tallies the turn's tools.
+    const summary = appended.find(msg => msg.kind === 'event')
+    expect(summary).toBeDefined()
+    expect(summary?.role).toBe('system')
+    expect(summary?.text).toMatch(/^⋯ \d+(\.\d+)?s · edited 1 file \+1 -1$/)
+    expect(appended[appended.length - 1]).toBe(summary)
+  })
+
   it('shows setup panel for missing provider startup error', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

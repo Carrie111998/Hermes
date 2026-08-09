@@ -26,6 +26,7 @@ import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { upsertSubagent } from '@/store/subagents'
 import { setSessionTodos } from '@/store/todos'
+import { recordTurnSummary, renderTurnSummary } from '@/store/turn-summaries'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -650,6 +651,28 @@ export function useMessageStream({
             }
           } else if (finalText) {
             nextMessages = [...prev, newAssistantFromCompletion()]
+          }
+        }
+
+        // Per-turn tool summary (CLI display.turn_summary parity): rendered
+        // once from the per-session collector, which is fed by tool.complete
+        // events across ALL segments of the turn — an interim-sealed tool
+        // bubble followed by a distinct text-only final would otherwise lose
+        // the tally. Wall-clock from turnStartedAt, not tool durations.
+        // Hard error turns (no kept partial text) skip the summary — same as
+        // the pre-rework behavior where the error branch returned early.
+        const isHardErrorTurn = Boolean(completionError && !keepFailedPartialText)
+
+        if (!isHardErrorTurn) {
+          const summaryElapsed = state.turnStartedAt ? Math.max(0, (Date.now() - state.turnStartedAt) / 1000) : 0
+          const turnSummary = renderTurnSummary(sessionId, summaryElapsed)
+
+          if (turnSummary) {
+            const finalBubble = [...nextMessages].reverse().find(m => m.role === 'assistant' && !m.hidden)
+
+            if (finalBubble) {
+              recordTurnSummary(finalBubble.id, turnSummary)
+            }
           }
         }
 
