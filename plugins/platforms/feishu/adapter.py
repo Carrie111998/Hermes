@@ -2061,25 +2061,29 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
         The buttons carry ``hermes_action`` in their value dict so that
         ``_handle_card_action_event`` can intercept them and call
         ``resolve_gateway_approval()`` to unblock the waiting agent thread.
+        ``approval_id`` is the gateway request identity this card shows;
+        it rides in the callback state so a click resolves exactly that
+        request or nothing.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         try:
-            approval_id = next(self._approval_counter)
+            callback_ref = next(self._approval_counter)
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": label},
                     "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                    "value": {"hermes_action": action_name, "approval_id": callback_ref},
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
@@ -2117,10 +2121,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_exec_approval failed")
             if result.success:
-                self._approval_state[approval_id] = {
+                self._approval_state[callback_ref] = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
+                    "approval_id": approval_id or "",
                 }
             return result
         except Exception as exc:
@@ -2921,7 +2926,10 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            count = resolve_gateway_approval(
+                state["session_key"], choice,
+                expected_approval_id=str(state.get("approval_id") or "") or None,
+            )
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,

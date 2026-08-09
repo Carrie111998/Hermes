@@ -968,6 +968,12 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.approval import resolve_gateway_approval
 
+        # The approval.request event carries the queued request's
+        # approval_id; a client that echoes it back binds this decision to
+        # exactly that request — a stale/duplicate/replaced id resolves 0
+        # instead of whatever is at the head of the queue.  Clients that
+        # omit it keep the legacy FIFO behavior.
+        expected_approval_id = str(params.get("approval_id") or "").strip() or None
         return _ok(
             rid,
             {
@@ -975,6 +981,7 @@ def _(rid, params: dict) -> dict:
                     session["session_key"],
                     params.get("choice", "deny"),
                     resolve_all=params.get("all", False),
+                    expected_approval_id=expected_approval_id,
                 )
             },
         )

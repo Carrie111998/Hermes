@@ -211,13 +211,35 @@ class TestResolveApproval:
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
             "chat_id": "oc_12345",
+            "approval_id": "ab" * 16,
         }
 
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        # The click is bound to the exact request the card showed.
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345", "once",
+            expected_approval_id="ab" * 16,
+        )
         assert 1 not in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_legacy_state_without_id_resolves_unbound(self):
+        adapter = _make_adapter()
+        adapter._approval_state[1] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_001",
+            "chat_id": "oc_12345",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
+
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345", "once",
+            expected_approval_id=None,
+        )
 
 
     @pytest.mark.asyncio

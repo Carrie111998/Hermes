@@ -644,6 +644,228 @@ def _format_exec_approval_fallback(
     )
 
 
+def _format_pending_approval_recovery(
+    snapshot: dict,
+    command_prefix: str = "/",
+    *,
+    superseded: bool = False,
+    bulk_refused: bool = False,
+) -> str:
+    """Re-present a still-pending dangerous-command approval.
+
+    Two callers:
+
+    * the busy-text recovery path, when ordinary text arrives while the
+      agent is parked on an approval whose UI may already be dead
+      (``superseded=False``): show the exact pending request and how to
+      answer it, and make explicit that the text was NOT consent;
+    * the approve/deny revalidation path, when a delayed approve no longer
+      matches the request the user was shown (``superseded=True``): state
+      that nothing was executed and show what is actually pending now.
+
+    ``snapshot`` is a :func:`tools.approval.peek_blocking_approval`-shaped
+    dict.  The command is redacted here (#48456) so no caller can forget.
+
+    ``bulk_refused`` adds the one-at-a-time instruction used when an
+    ``approve all``/``deny all`` was refused because a single advertised
+    head cannot authorize the rest of the queue.
+    """
+    cmd = _redact_approval_command(snapshot.get("command", ""))
+    cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+    description = snapshot.get("description") or "dangerous command"
+    if superseded:
+        heading = (
+            "⚠️ **That approval is no longer pending — nothing was "
+            "executed.** This is what is awaiting a decision now:"
+        )
+    else:
+        heading = (
+            "⏳ **A dangerous command is still waiting for your decision.** "
+            "Your message was not treated as approval and was not queued:"
+        )
+    lines = [
+        heading,
+        f"```\n{cmd_preview}\n```",
+        f"Reason: {description}",
+    ]
+    try:
+        extra = int(snapshot.get("pending_count", 1) or 1) - 1
+    except (TypeError, ValueError):
+        extra = 0
+    if extra > 0:
+        lines.append(f"(+{extra} more pending after this one)")
+    if bulk_refused:
+        lines.append(
+            "Bulk resolution (`approve all` / `deny all`) is refused here: "
+            "only the request shown above has been re-confirmed to you. "
+            "Approve or deny recovered requests one at a time."
+        )
+    lines.append(
+        f"Reply `{command_prefix}approve` to run it, "
+        f"`{command_prefix}deny` to cancel it, or "
+        f"`{command_prefix}stop` to abort the whole turn."
+    )
+    return "\n".join(lines)
+
+
+def _record_prompt_advertised(
+    session_key: str,
+    approval_id: str,
+    command: str,
+) -> None:
+    """Bind delayed typed consent to the prompt that was just delivered.
+
+    Called after a SUCCESSFUL approval-prompt delivery: the exact request
+    identity and frozen command carried by the delivered prompt are
+    recorded as the one the user can now see, and a later typed
+    ``/approve``/``/deny`` resolves exactly that request (revalidated
+    under the queue lock) or nothing.  Under concurrency the delivered
+    prompt is not necessarily the queue head — a parallel subagent's
+    request may sit in front of it — so advertising the head here would
+    let a typed approve execute a command the user was never shown.  A
+    failed delivery deliberately records nothing — an unbound typed
+    approve is refused fail-safe and triggers a visible re-present
+    instead.  Never raises; bookkeeping must not break the prompt flow
+    itself.
+    """
+    try:
+        from tools.approval import advertise_blocking_approval
+        advertise_blocking_approval(
+            session_key,
+            approval_id=approval_id,
+            command=command,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to record advertised approval prompt for %s",
+            session_key, exc_info=True,
+        )
+
+
+def _send_gateway_approval_prompt(
+    status_adapter,
+    chat_id,
+    *,
+    loop,
+    thread_metadata,
+    session_key: str,
+    approval_data: dict,
+) -> None:
+    """Send a dangerous-command approval prompt from the agent thread.
+
+    If the adapter supports interactive button-based approvals (e.g.
+    Discord's ``send_exec_approval``), use that for a richer UX.  Otherwise
+    fall back to a plain text message with ``/approve`` instructions.
+
+    On a successful delivery (either path) the exact request this prompt
+    carries is advertised via :func:`_record_prompt_advertised`, binding a
+    later typed approve/deny to exactly the request the user was shown —
+    not to whatever sits at the head of the queue at delivery time.
+
+    Module-level (rather than inline in the per-run notify closure) so the
+    delivery→advertise wiring is unit-testable — same rationale as
+    ``_redact_approval_command``.
+    """
+    # Pause the typing indicator while the agent waits for
+    # user approval.  Critical for Slack's Assistant API where
+    # assistant_threads_setStatus disables the compose box — the
+    # user literally cannot type /approve while "is thinking..."
+    # is active.  The approval message send auto-clears the Slack
+    # status; pausing prevents _keep_typing from re-setting it.
+    # Typing resumes in _handle_approve_command/_handle_deny_command.
+    status_adapter.pause_typing_for_chat(chat_id)
+
+    # Freeze the action identity before scheduling any async send. A sender or
+    # other holder of the presentation dict cannot change what the eventual
+    # delivery receipt advertises.
+    approval_id = str(approval_data.get("approval_id", ""))
+    approval_command = str(approval_data.get("command", ""))
+    cmd = approval_command
+    desc = approval_data.get("description", "dangerous command")
+
+    # Redact credentials from the command before displaying it in
+    # the approval prompt — Tirith's findings are already redacted,
+    # but the raw command string still leaks secrets to the chat
+    # platform (#48456). Applied here so BOTH the button-based
+    # (send_exec_approval) and plain-text fallback paths below use
+    # the redacted value.
+    cmd = _redact_approval_command(cmd)
+
+    # Prefer button-based approval when the adapter supports it.
+    # Check the *class* for the method, not the instance — avoids
+    # false positives from MagicMock auto-attribute creation in tests.
+    if getattr(type(status_adapter), "send_exec_approval", None) is not None:
+        try:
+            _approval_fut = safe_schedule_threadsafe(
+                status_adapter.send_exec_approval(
+                    chat_id=chat_id,
+                    command=cmd,
+                    session_key=session_key,
+                    description=desc,
+                    metadata=thread_metadata,
+                    allow_permanent=approval_data.get("allow_permanent", True),
+                    allow_session=approval_data.get("allow_session", True),
+                    smart_denied=approval_data.get("smart_denied", False),
+                    approval_id=approval_id,
+                ),
+                loop,
+                logger=logger,
+                log_message="send_exec_approval scheduling error",
+            )
+            if _approval_fut is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            _approval_result = _approval_fut.result(timeout=15)
+            if _approval_result.success:
+                _record_prompt_advertised(
+                    session_key, approval_id, approval_command,
+                )
+                return
+            logger.warning(
+                "Button-based approval failed (send returned error), falling back to text: %s",
+                _approval_result.error,
+            )
+        except Exception as _e:
+            logger.warning(
+                "Button-based approval failed, falling back to text: %s", _e
+            )
+
+    # Fallback: plain text approval prompt.  Use the adapter's
+    # typed prefix so Slack/Matrix users are told the form they
+    # can actually type (`!approve`) — typed "/" is blocked in
+    # Slack threads and reserved by Matrix clients.
+    _p = getattr(status_adapter, "typed_command_prefix", "/")
+    msg = _format_exec_approval_fallback(
+        cmd,
+        desc,
+        _p,
+        allow_permanent=approval_data.get("allow_permanent", True),
+        allow_session=approval_data.get("allow_session", True),
+        smart_denied=approval_data.get("smart_denied", False),
+    )
+    try:
+        _approval_send_fut = safe_schedule_threadsafe(
+            status_adapter.send(
+                chat_id,
+                msg,
+                metadata=thread_metadata,
+            ),
+            loop,
+            logger=logger,
+            log_message="Approval text-send scheduling error",
+        )
+        if _approval_send_fut is not None:
+            _send_result = _approval_send_fut.result(timeout=15)
+            if (
+                _send_result is not None
+                and getattr(_send_result, "success", False) is True
+            ):
+                _record_prompt_advertised(
+                    session_key, approval_id, approval_command,
+                )
+    except Exception as _e:
+        logger.error("Failed to send approval request: %s", _e)
+
+
 def _gateway_provider_error_reply(text: str) -> str:
     """Map raw provider/API errors to a short user-safe Telegram reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
@@ -5300,93 +5522,19 @@ class TurnRunner:
         def _approval_notify_sync(approval_data: dict) -> None:
             """Send the approval request to the user from the agent thread.
 
-                If the adapter supports interactive button-based approvals
-                (e.g. Discord's ``send_exec_approval``), use that for a richer
-                UX.  Otherwise fall back to a plain text message with
-                ``/approve`` instructions.
-                """
-            # Pause the typing indicator while the agent waits for
-            # user approval.  Critical for Slack's Assistant API where
-            # assistant_threads_setStatus disables the compose box — the
-            # user literally cannot type /approve while "is thinking..."
-            # is active.  The approval message send auto-clears the Slack
-            # status; pausing prevents _keep_typing from re-setting it.
-            # Typing resumes in _handle_approve_command/_handle_deny_command.
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
-
-            cmd = approval_data.get("command", "")
-            desc = approval_data.get("description", "dangerous command")
-
-            # Redact credentials from the command before displaying it in
-            # the approval prompt — Tirith's findings are already redacted,
-            # but the raw command string still leaks secrets to the chat
-            # platform (#48456). Applied here so BOTH the button-based
-            # (send_exec_approval) and plain-text fallback paths below use
-            # the redacted value.
-            cmd = _redact_approval_command(cmd)
-
-            # Prefer button-based approval when the adapter supports it.
-            # Check the *class* for the method, not the instance — avoids
-            # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
-                try:
-                    _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
-                        ctx._loop_for_step,
-                        logger=logger,
-                        log_message="send_exec_approval scheduling error",
-                    )
-                    if _approval_fut is None:
-                        raise RuntimeError("send_exec_approval: loop unavailable")
-                    _approval_result = _approval_fut.result(timeout=15)
-                    if _approval_result.success:
-                        return
-                    logger.warning(
-                        "Button-based approval failed (send returned error), falling back to text: %s",
-                        _approval_result.error,
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "Button-based approval failed, falling back to text: %s", _e
-                    )
-
-            # Fallback: plain text approval prompt.  Use the adapter's
-            # typed prefix so Slack/Matrix users are told the form they
-            # can actually type (`!approve`) — typed "/" is blocked in
-            # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
+            Thin per-run binding over the module-level prompt sender (see
+            :func:`_send_gateway_approval_prompt`), which also records the
+            delivered prompt as the advertised request so typed delayed
+            consent binds to exactly what the user was shown.
+            """
+            _send_gateway_approval_prompt(
+                ctx._status_adapter,
+                ctx._status_chat_id,
+                loop=ctx._loop_for_step,
+                thread_metadata=ctx._status_thread_metadata,
+                session_key=_approval_session_key,
+                approval_data=approval_data,
             )
-            try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=ctx._status_thread_metadata,
-                    ),
-                    ctx._loop_for_step,
-                    logger=logger,
-                    log_message="Approval text-send scheduling error",
-                )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
-            except Exception as _e:
-                logger.error("Failed to send approval request: %s", _e)
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -9065,6 +9213,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
             return False
+
+        # --- Pending-approval recovery (#27352 family) ---
+        # Reaching here means the text matched no approve/deny form above.
+        # The agent thread is parked on a threading.Event inside
+        # tools/approval.py, so nothing the busy paths below do (queue /
+        # steer / interrupt) can run until the approval resolves — the
+        # reply would silently wedge behind the parked turn until the
+        # approval times out and auto-denies.  And the prompt's own UI may
+        # already be dead (Discord buttons expire after minutes).  So:
+        # re-present the exact pending request with how to answer it, and
+        # record it as the request the user is now looking at — a later
+        # explicit approve resolves precisely this request or nothing
+        # (tools.approval revalidates the identity under its lock
+        # immediately before resolution).
+        try:
+            from tools.approval import advertise_blocking_approval
+            _recovery_text = (event.text or "").strip()
+            if (
+                event.message_type == MessageType.TEXT
+                and _recovery_text
+                and not _recovery_text.startswith(("/", "!"))
+            ):
+                _approval_snap = advertise_blocking_approval(session_key)
+                if _approval_snap is not None:
+                    _prefix = getattr(adapter, "typed_command_prefix", "/") or "/"
+                    _anchor = self._reply_anchor_for_event(event)
+                    await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=_format_pending_approval_recovery(
+                            _approval_snap, _prefix,
+                        ),
+                        reply_to=_anchor,
+                        metadata=self._thread_metadata_for_source(
+                            event.source, _anchor,
+                        ),
+                    )
+                    logger.info(
+                        "Re-presented pending approval for session %s "
+                        "(id=%s) — text follow-up is not consent and was "
+                        "not queued",
+                        session_key, _approval_snap.get("approval_id"),
+                    )
+                    return True
+        except Exception:
+            logger.warning(
+                "Pending-approval recovery failed for session %s; "
+                "falling through to busy handling",
+                session_key, exc_info=True,
+            )
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None

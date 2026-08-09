@@ -5387,6 +5387,52 @@ class GatewaySlashCommandsMixin:
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
 
+    def _represent_pending_approval(
+        self,
+        source,
+        session_key: str,
+        *,
+        superseded: bool,
+        bulk_refused: bool = False,
+    ) -> Optional[str]:
+        """Re-present the head request after a typed consent was refused.
+
+        Three refusal shapes share this reply:
+
+        * no advertised binding existed (initial prompt send failed, or the
+          binding was consumed) — ``superseded=False``: never resolve on
+          blind consent; show the exact pending request and require a fresh
+          explicit approval;
+        * the advertised request is gone/superseded — ``superseded=True``:
+          nothing was executed; show what is pending NOW;
+        * bulk resolution was refused — ``bulk_refused=True``: a single
+          advertised head cannot authorize the rest of the queue.
+
+        The head is recorded as the new advertised request, so the next
+        explicit approve/deny binds to it.  Returns None when nothing is
+        pending anymore (caller falls back to its no-pending reply).
+        """
+        from tools.approval import advertise_blocking_approval
+
+        snapshot = advertise_blocking_approval(session_key)
+        if snapshot is None:
+            return None
+        from gateway.run import _format_pending_approval_recovery
+
+        adapter = self.adapters.get(source.platform)
+        prefix = getattr(adapter, "typed_command_prefix", "/")
+        if not isinstance(prefix, str) or not prefix:
+            prefix = "/"
+        logger.info(
+            "Refused typed approval consent for session %s "
+            "(superseded=%s, bulk_refused=%s); re-presented pending id=%s",
+            session_key, superseded, bulk_refused,
+            snapshot.get("approval_id"),
+        )
+        return _format_pending_approval_recovery(
+            snapshot, prefix, superseded=superseded, bulk_refused=bulk_refused,
+        )
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -5396,25 +5442,34 @@ class GatewaySlashCommandsMixin:
         flow as the CLI's synchronous input() approval.
 
         Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
+        execute_code) via a per-session queue.  Typed consent is bound to
+        the request the user was shown (the advertised head, recorded when
+        the prompt was successfully delivered or re-presented): ``/approve``
+        resolves exactly that request or nothing.  ``/approve all`` is
+        refused while more than one request is pending — a single shown
+        prompt cannot authorize a queue tail the user may never have seen —
+        and each request is approved one at a time instead.
 
         Usage:
-            /approve              — approve oldest pending command once
-            /approve all          — approve ALL pending commands at once
-            /approve session      — approve oldest + remember for session
-            /approve all session  — approve all + remember for session
-            /approve always       — approve oldest + remember permanently
-            /approve all always   — approve all + remember permanently
+            /approve              — approve the request you were shown
+            /approve session      — same + remember pattern for session
+            /approve always       — same + remember pattern permanently
+            /approve all [...]    — only valid with a single pending request
         """
         source = event.source
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            clear_advertised_approval,
+            get_advertised_approval,
+            has_blocking_approval,
+            peek_blocking_approval,
+            resolve_gateway_approval,
         )
 
         if not has_blocking_approval(session_key):
+            # Nothing pending — any recovery-flow binding is moot.
+            clear_advertised_approval(session_key)
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
@@ -5432,8 +5487,58 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        # Delayed-consent revalidation.  Typed approval binds to "the
+        # request the user was shown": the advertised identity, recorded
+        # when the initial prompt was successfully DELIVERED
+        # (gateway.run._send_gateway_approval_prompt) or when a recovery
+        # path re-presented the request.  No binding — the send failed, or
+        # the bound request already resolved — means blind consent: refuse,
+        # re-present the exact pending request (creating the binding), and
+        # require a fresh explicit approval.
+        _advertised = get_advertised_approval(session_key)
+        if _advertised is None:
+            _fresh = self._represent_pending_approval(
+                source, session_key, superseded=False,
+            )
+            if _fresh is not None:
+                return _fresh
+            return t("gateway.approve.no_pending")
+
+        if resolve_all:
+            # A single advertised head cannot authorize the rest of the
+            # queue — entries behind it may have arrived after the user
+            # read the prompt.  Refuse bulk resolution outright (the
+            # resolver enforces the same rule under its lock) and walk one
+            # explicit consent at a time.  Bulk-of-one degrades to the
+            # ordinary single resolve below.
+            _head_now = peek_blocking_approval(session_key)
+            try:
+                _pending_n = int((_head_now or {}).get("pending_count", 1) or 1)
+            except (TypeError, ValueError):
+                _pending_n = 1
+            if _pending_n > 1:
+                _bulk = self._represent_pending_approval(
+                    source, session_key, superseded=False, bulk_refused=True,
+                )
+                if _bulk is not None:
+                    return _bulk
+                return t("gateway.approve.no_pending")
+
+        # resolve_gateway_approval revalidates the identity under its lock
+        # immediately before resolution; if the advertised request is gone
+        # or superseded, it resolves NOTHING (timeout is never consent) and
+        # we re-present whatever is actually pending now.
+        count = resolve_gateway_approval(
+            session_key, choice, resolve_all=resolve_all,
+            expected_approval_id=_advertised.get("approval_id"),
+            expected_command=_advertised.get("command"),
+        )
         if not count:
+            _superseded = self._represent_pending_approval(
+                source, session_key, superseded=True,
+            )
+            if _superseded is not None:
+                return _superseded
             return t("gateway.approve.no_pending")
 
         # Resume typing indicator — agent is about to continue processing.
@@ -5460,10 +5565,16 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            clear_advertised_approval,
+            get_advertised_approval,
+            has_blocking_approval,
+            peek_blocking_approval,
+            resolve_gateway_approval,
         )
 
         if not has_blocking_approval(session_key):
+            # Nothing pending — any recovery-flow binding is moot.
+            clear_advertised_approval(session_key)
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.deny.stale")
@@ -5483,11 +5594,47 @@ class GatewaySlashCommandsMixin:
         if reason:
             reason = reason[:280].strip()
 
+        # Same delayed-consent identity rules as /approve: a typed deny
+        # refers to the request the user was shown.  Denying a request they
+        # never saw would silently kill a command they might want — refuse
+        # and re-present instead, both when no binding exists and when the
+        # bound request is gone/superseded; and a single advertised head
+        # never authorizes a bulk deny of the queue behind it.
+        _advertised = get_advertised_approval(session_key)
+        if _advertised is None:
+            _fresh = self._represent_pending_approval(
+                source, session_key, superseded=False,
+            )
+            if _fresh is not None:
+                return _fresh
+            return t("gateway.deny.no_pending")
+
+        if resolve_all:
+            _head_now = peek_blocking_approval(session_key)
+            try:
+                _pending_n = int((_head_now or {}).get("pending_count", 1) or 1)
+            except (TypeError, ValueError):
+                _pending_n = 1
+            if _pending_n > 1:
+                _bulk = self._represent_pending_approval(
+                    source, session_key, superseded=False, bulk_refused=True,
+                )
+                if _bulk is not None:
+                    return _bulk
+                return t("gateway.deny.no_pending")
+
         count = resolve_gateway_approval(
             session_key, "deny", resolve_all=resolve_all,
             reason=reason or None,
+            expected_approval_id=_advertised.get("approval_id"),
+            expected_command=_advertised.get("command"),
         )
         if not count:
+            _superseded = self._represent_pending_approval(
+                source, session_key, superseded=True,
+            )
+            if _superseded is not None:
+                return _superseded
             return t("gateway.deny.no_pending")
 
         # Resume typing indicator — agent continues (with BLOCKED result).

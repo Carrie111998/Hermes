@@ -6972,6 +6972,12 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        # The approval.request SSE event carries the queued request's
+        # approval_id; a client that echoes it back binds this decision to
+        # exactly that request — a stale/duplicate/replaced id resolves
+        # nothing (409) instead of whatever is at the head of the queue.
+        # Clients that omit it keep the legacy FIFO behavior.
+        expected_approval_id = str(body.get("approval_id") or "").strip() or None
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -6979,6 +6985,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                expected_approval_id=expected_approval_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)

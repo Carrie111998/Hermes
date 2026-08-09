@@ -1756,6 +1756,7 @@ class RelayAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Native-button exec approval over the relay (Phase 3).
 
@@ -1791,7 +1792,13 @@ class RelayAdapter(BasePlatformAdapter):
 
         prompt_id = self._mint_prompt(
             "exec_approval",
-            {"session_key": session_key, "chat_id": str(chat_id)},
+            {
+                "session_key": session_key,
+                "chat_id": str(chat_id),
+                # Gateway request identity this prompt shows — the press
+                # resolves exactly this request or nothing.
+                "approval_id": approval_id or "",
+            },
         )
         result = await self._send_prompt(
             chat_id,
@@ -1940,7 +1947,10 @@ class RelayAdapter(BasePlatformAdapter):
                     if option_id in {"once", "session", "always", "deny"}
                     else "deny"
                 )
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key, choice,
+                    expected_approval_id=str(state.get("approval_id") or "") or None,
+                )
                 label = {
                     "once": "✅ Approved once",
                     "session": "✅ Approved for session",

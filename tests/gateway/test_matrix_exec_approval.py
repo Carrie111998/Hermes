@@ -18,6 +18,37 @@ class TestMatrixExecApprovalReactions:
         # Resolve user_id so _is_self_sender doesn't defensively drop all traffic (#15763).
         adapter._user_id = "@bot:example.org"
         adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
+            session_key="sess-1", chat_id="!room:example.org", message_id="$target",
+            approval_id="ab" * 16,
+        )
+        adapter._approval_prompt_by_session["sess-1"] = "$target"
+
+        content = {"m.relates_to": {"event_id": "$target", "key": "✅"}}
+        event = types.SimpleNamespace(
+            sender="@liizfq:liizfq.top",
+            event_id="$react1",
+            room_id="!room:example.org",
+            content=content,
+        )
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+            await adapter._on_reaction(event)
+
+        # The reaction is bound to the exact request the prompt showed.
+        mock_resolve.assert_called_once_with(
+            "sess-1", "once", expected_approval_id="ab" * 16
+        )
+        assert "$target" not in adapter._approval_prompts_by_event
+        assert "sess-1" not in adapter._approval_prompt_by_session
+
+    @pytest.mark.asyncio
+    async def test_legacy_prompt_without_id_resolves_unbound(self, monkeypatch):
+        monkeypatch.setenv("MATRIX_ALLOWED_USERS", "@liizfq:liizfq.top")
+        from plugins.platforms.matrix.adapter import MatrixAdapter, _MatrixApprovalPrompt
+
+        adapter = MatrixAdapter(PlatformConfig(enabled=True, token="tok", extra={"homeserver": "https://matrix.example.org"}))
+        adapter._user_id = "@bot:example.org"
+        adapter._approval_prompts_by_event["$target"] = _MatrixApprovalPrompt(
             session_key="sess-1", chat_id="!room:example.org", message_id="$target"
         )
         adapter._approval_prompt_by_session["sess-1"] = "$target"
@@ -33,6 +64,6 @@ class TestMatrixExecApprovalReactions:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._on_reaction(event)
 
-        mock_resolve.assert_called_once_with("sess-1", "once")
-        assert "$target" not in adapter._approval_prompts_by_event
-        assert "sess-1" not in adapter._approval_prompt_by_session
+        mock_resolve.assert_called_once_with(
+            "sess-1", "once", expected_approval_id=None
+        )

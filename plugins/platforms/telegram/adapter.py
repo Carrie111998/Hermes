@@ -871,8 +871,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # Approval button state: callback ref → (session_key, gateway
+        # approval_id).  The approval_id rides along so a button click
+        # resolves exactly the request its prompt showed — callback_data's
+        # 64-byte cap is why the full identity can't live in the payload.
+        self._approval_state: Dict[int, tuple] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -5556,11 +5559,14 @@ class TelegramAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
         The buttons call ``resolve_gateway_approval()`` to unblock the waiting
         agent thread — same mechanism as the text ``/approve`` flow.
+        ``approval_id`` is the gateway request identity this prompt shows;
+        clicks resolve exactly that request or nothing.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
@@ -5571,26 +5577,26 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
+            # callback_data is capped at 64 bytes, too small for
+            # session_key + approval_id — use a monotonic counter as the
+            # callback ref and keep the real identity in _approval_state.
             import itertools
             if not hasattr(self, "_approval_counter"):
                 self._approval_counter = itertools.count(1)
-            approval_id = next(self._approval_counter)
+            callback_ref = next(self._approval_counter)
 
             buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
+                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{callback_ref}")
             ]
             if not smart_denied and allow_session:
                 buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
+                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{callback_ref}")
                 )
                 if allow_permanent:
                     buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{callback_ref}")
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
+            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{callback_ref}"))
             # Pair into rows (2x2 for the full set) so labels stay readable on
             # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
             rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
@@ -5617,8 +5623,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Store the request identity keyed by callback ref for the handler
+            self._approval_state[callback_ref] = (session_key, approval_id or "")
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -6481,7 +6487,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                state = self._approval_state.pop(approval_id, None)
+                if isinstance(state, tuple):
+                    session_key, gateway_approval_id = state
+                else:
+                    # Legacy bare session_key entry (pre-identity prompt).
+                    session_key, gateway_approval_id = state, ""
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
@@ -6496,7 +6507,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 # regression follow-up: 60s waits made stale taps common).
                 try:
                     from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    count = resolve_gateway_approval(
+                        session_key, choice,
+                        expected_approval_id=gateway_approval_id or None,
+                    )
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,

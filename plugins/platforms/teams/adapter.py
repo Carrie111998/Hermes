@@ -1130,7 +1130,25 @@ class TeamsAdapter(BasePlatformAdapter):
                 ),
             )
 
-        resolve_gateway_approval(session_key, choice)
+        # Bind the click to the exact request this card shows; a stale or
+        # duplicate click resolves nothing instead of the FIFO head.
+        count = resolve_gateway_approval(
+            session_key, choice,
+            expected_approval_id=str(data.get("approval_id") or "") or None,
+        )
+        if not count:
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([TextBlock(
+                        text="⌛ Approval expired — command was not run "
+                             "(already timed out or resolved elsewhere).",
+                        wrap=True,
+                    )])
+                ),
+            )
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1165,8 +1183,13 @@ class TeamsAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
-        """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
+        """Send an Adaptive Card approval prompt with Allow/Deny buttons.
+
+        ``approval_id`` rides in the button data so a click resolves
+        exactly the request this card shows, never the FIFO head.
+        """
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
 
@@ -1174,6 +1197,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # Truncated for button data payload — just enough to reconstruct the card body.
         btn_data_base = {
             "session_key": session_key,
+            "approval_id": approval_id or "",
             "cmd": command[:200] + "..." if len(command) > 200 else command,
             "desc": description,
         }

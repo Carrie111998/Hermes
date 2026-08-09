@@ -49,6 +49,7 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+    mod._advertised_approvals.clear()
 
 
 def _make_runner():
@@ -83,12 +84,23 @@ def _make_runner():
 
 
 def _register_blocking_approval(runner):
-    """Register a real blocking approval entry for the runner's session."""
-    from tools.approval import _ApprovalEntry, _gateway_queues
+    """Register a real blocking approval entry for the runner's session.
+
+    Also advertises it, simulating the successfully DELIVERED initial
+    prompt: production binds typed consent at delivery time
+    (gateway.run._send_gateway_approval_prompt), and an unbound approve is
+    refused fail-safe.
+    """
+    from tools.approval import (
+        _ApprovalEntry,
+        _gateway_queues,
+        advertise_blocking_approval,
+    )
     source = _make_source()
     session_key = runner._session_key_for_source(source)
     entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
     _gateway_queues.setdefault(session_key, []).append(entry)
+    advertise_blocking_approval(session_key)
     return session_key, entry
 
 

@@ -519,6 +519,7 @@ class _MatrixApprovalPrompt:
         resolved: bool = False,
         requester_user_id: str | None = None,
         expires_at: float | None = None,
+        approval_id: str = "",
     ):
         self.session_key = session_key
         self.chat_id = chat_id
@@ -526,6 +527,9 @@ class _MatrixApprovalPrompt:
         self.resolved = resolved
         self.requester_user_id = requester_user_id
         self.expires_at = expires_at
+        # Gateway request identity this prompt shows: a reaction resolves
+        # exactly this request or nothing (never the FIFO head).
+        self.approval_id = approval_id or ""
         self.bot_reaction_events: dict[str, str] = {}  # emoji -> event_id
 
 
@@ -2617,8 +2621,14 @@ class MatrixAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
-        """Send a reaction-based exec approval prompt for Matrix."""
+        """Send a reaction-based exec approval prompt for Matrix.
+
+        ``approval_id`` binds the prompt's reactions to the exact queued
+        request it shows, so a stale reaction can never resolve a
+        different pending command.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -2655,6 +2665,7 @@ class MatrixAdapter(BasePlatformAdapter):
             message_id=result.message_id,
             requester_user_id=requester_user_id,
             expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
+            approval_id=approval_id,
         )
         old_event = self._approval_prompt_by_session.get(session_key)
         if old_event:
@@ -4022,7 +4033,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import resolve_gateway_approval
 
-                    count = resolve_gateway_approval(prompt.session_key, choice)
+                    count = resolve_gateway_approval(
+                        prompt.session_key, choice,
+                        expected_approval_id=prompt.approval_id or None,
+                    )
                     if count:
                         prompt.resolved = True
                         self._approval_prompts_by_event.pop(reacts_to, None)

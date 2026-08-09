@@ -856,8 +856,11 @@ class TestDefaultInteractionDispatch:
 
         resolve_calls = []
 
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
+        def fake_resolve(session_key, choice, resolve_all=False,
+                         expected_approval_id=None):
+            resolve_calls.append(
+                (session_key, choice, resolve_all, expected_approval_id)
+            )
             return 1
 
         # Patch the *module-level* function that _default_interaction_dispatch
@@ -877,7 +880,45 @@ class TestDefaultInteractionDispatch:
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("agent:main:qqbot:c2c:u-42", "once", False)]
+        # Legacy button_data (no packed approval_id) → unbound FIFO resolve.
+        assert resolve_calls == [("agent:main:qqbot:c2c:u-42", "once", False, None)]
+
+    @pytest.mark.asyncio
+    async def test_approval_click_passes_packed_approval_id(self):
+        """button_data packed by encode_approval_callback_value binds the
+        click to the exact request the prompt showed."""
+        adapter = self._make_adapter()
+
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, resolve_all=False,
+                         expected_approval_id=None):
+            resolve_calls.append(
+                (session_key, choice, resolve_all, expected_approval_id)
+            )
+            return 1
+
+        approval_id = "ab" * 16  # 32-hex uuid shape
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i",
+                "chat_type": 2,
+                "user_openid": "u-42",
+                "data": {"resolved": {"button_data": (
+                    f"approve:agent:main:qqbot:c2c:u-42|{approval_id}:allow-once"
+                )}},
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == [
+            ("agent:main:qqbot:c2c:u-42", "once", False, approval_id)
+        ]
 
 
     @pytest.mark.asyncio

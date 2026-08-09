@@ -340,12 +340,14 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # fallback path, same as after a gateway restart).
         #   _clarify_state:        clarify_id → session_key (resolves via
         #                          tools.clarify_gateway.resolve_gateway_clarify)
-        #   _exec_approval_state:  approval_id → session_key (resolves via
-        #                          tools.approval.resolve_gateway_approval)
+        #   _exec_approval_state:  callback_ref → (session_key, gateway
+        #                          approval_id) (resolves via
+        #                          tools.approval.resolve_gateway_approval,
+        #                          bound to the exact request the prompt shows)
         #   _slash_confirm_state:  confirm_id → session_key (resolves via
         #                          tools.slash_confirm.resolve)
         self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
-        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, tuple]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
 
         # Runtime
@@ -852,6 +854,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Render a dangerous-command approval prompt with native buttons.
 
@@ -859,6 +862,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         waiting agent via ``tools.approval.resolve_gateway_approval`` —
         same mechanism as the text ``/approve`` flow. The agent thread
         is blocked until the user taps or types a response.
+        ``approval_id`` is the gateway request identity this prompt
+        shows; taps resolve exactly that request or nothing.
         """
         if self._http_client is None:
             return SendResult(success=False, error="Not connected")
@@ -875,7 +880,10 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             + ("\n\nSmart DENY: owner override applies to this one operation only." if smart_denied else "")
         )
 
-        approval_id = uuid.uuid4().hex[:12]
+        # Button ids are size-limited, so a short random ref goes on the
+        # wire and the real identity (session_key + gateway approval_id)
+        # stays in _exec_approval_state.
+        callback_ref = uuid.uuid4().hex[:12]
         reply_to = (metadata or {}).get("reply_to_message_id") if metadata else None
 
         interactive = {
@@ -885,11 +893,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "buttons": [
                     {
                         "type": "reply",
-                        "reply": {"id": f"appr:{approval_id}:approve", "title": "✅ Approve"},
+                        "reply": {"id": f"appr:{callback_ref}:approve", "title": "✅ Approve"},
                     },
                     {
                         "type": "reply",
-                        "reply": {"id": f"appr:{approval_id}:deny", "title": "❌ Deny"},
+                        "reply": {"id": f"appr:{callback_ref}:deny", "title": "❌ Deny"},
                     },
                 ],
             },
@@ -897,7 +905,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         result = await self._post_interactive(chat_id, interactive, reply_to=reply_to)
         if result.success:
-            self._bounded_put(self._exec_approval_state, approval_id, session_key)
+            self._bounded_put(
+                self._exec_approval_state,
+                callback_ref,
+                (session_key, approval_id or ""),
+            )
         return result
 
     async def send_slash_confirm(
@@ -1793,22 +1805,27 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             return True
 
-        # Exec approval: appr:<approval_id>:approve|deny
+        # Exec approval: appr:<callback_ref>:approve|deny
         if button_id.startswith("appr:"):
             parts = button_id.split(":", 2)
             if len(parts) != 3:
                 return False
-            _, approval_id, choice = parts
-            session_key = self._exec_approval_state.pop(approval_id, None)
+            _, callback_ref, choice = parts
+            state = self._exec_approval_state.pop(callback_ref, None)
+            if isinstance(state, tuple):
+                session_key, gateway_approval_id = state
+            else:
+                # Legacy bare session_key entry (pre-identity prompt).
+                session_key, gateway_approval_id = state, ""
             if not session_key:
                 logger.info(
                     "[whatsapp_cloud] approval tap with no matching state "
-                    "(approval_id=%s) — likely stale; falling back to text",
-                    approval_id,
+                    "(callback_ref=%s) — likely stale; falling back to text",
+                    callback_ref,
                 )
                 return False
             if choice not in ("approve", "deny"):
-                self._exec_approval_state[approval_id] = session_key
+                self._exec_approval_state[callback_ref] = state
                 return False
             try:
                 from tools.approval import resolve_gateway_approval
@@ -1817,7 +1834,10 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
                 return False
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key, choice,
+                expected_approval_id=gateway_approval_id or None,
+            )
             if not count:
                 logger.info(
                     "[whatsapp_cloud] approval resolver reported no waiter "

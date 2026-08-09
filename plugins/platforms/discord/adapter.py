@@ -7057,12 +7057,16 @@ class DiscordAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
 
         The buttons call ``resolve_gateway_approval()`` to unblock the waiting
         agent thread — this replaces the text-based ``/approve`` flow on Discord.
+        ``approval_id`` binds the buttons to the exact queued request this
+        prompt shows, so a stale or duplicate click can never resolve a
+        different pending command.
         """
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")
@@ -7133,6 +7137,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                approval_id=approval_id,
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -8400,9 +8405,13 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            approval_id: str = "",
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            # Identity of the exact queued request this prompt shows. A
+            # click resolves this request or nothing — never the FIFO head.
+            self.approval_id = approval_id or ""
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -8476,7 +8485,10 @@ def _define_discord_view_classes() -> None:
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(
+                    self.session_key, choice,
+                    expected_approval_id=self.approval_id or None,
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

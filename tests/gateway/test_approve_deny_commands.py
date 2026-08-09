@@ -74,6 +74,7 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+    mod._advertised_approvals.clear()
 
 
 def _wait_until(predicate, timeout=30.0, interval=0.02):
@@ -169,9 +170,13 @@ class TestApproveCommand:
 
 
     @pytest.mark.asyncio
-    async def test_approve_all_resolves_multiple(self):
-        """/approve all resolves all pending approvals."""
-        from tools.approval import _ApprovalEntry, _gateway_queues
+    async def test_approve_all_refused_walks_one_at_a_time(self):
+        """/approve all is refused with multiple pending: a single shown
+        prompt cannot authorize entries the user may never have seen.
+        Recovery is one explicit approve per request."""
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, advertise_blocking_approval,
+        )
 
         runner = _make_runner()
         source = _make_source()
@@ -180,29 +185,46 @@ class TestApproveCommand:
         e1 = _ApprovalEntry({"command": "cmd1"})
         e2 = _ApprovalEntry({"command": "cmd2"})
         _gateway_queues[session_key] = [e1, e2]
+        advertise_blocking_approval(session_key)  # delivered prompt = head
 
         result = await runner._handle_approve_command(_make_event("/approve all"))
-        assert "2 commands" in result
+        assert "one at a time" in result.lower()
+        assert not e1.event.is_set()
+        assert not e2.event.is_set()
+
+        # First explicit approve resolves exactly the shown head.
+        await runner._handle_approve_command(_make_event("/approve"))
         assert e1.event.is_set()
+        assert e1.result == "once"
+        assert not e2.event.is_set()
+
+        # The next approve has no binding yet → re-presents e2, then a
+        # fresh approve resolves it.
+        await runner._handle_approve_command(_make_event("/approve"))
+        assert not e2.event.is_set()
+        await runner._handle_approve_command(_make_event("/approve"))
         assert e2.event.is_set()
+        assert e2.result == "once"
 
     @pytest.mark.asyncio
-    async def test_approve_all_session(self):
-        """/approve all session resolves all with session scope."""
-        from tools.approval import _ApprovalEntry, _gateway_queues
+    async def test_approve_all_session_single_pending(self):
+        """Bulk-of-one degrades to a single resolve with the session scope
+        preserved — no unseen tail exists to protect."""
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, advertise_blocking_approval,
+        )
 
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
         e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        _gateway_queues[session_key] = [e1]
+        advertise_blocking_approval(session_key)
 
         result = await runner._handle_approve_command(_make_event("/approve all session"))
         assert "session" in result.lower()
         assert e1.result == "session"
-        assert e2.result == "session"
 
 
 # ------------------------------------------------------------------
@@ -227,6 +249,8 @@ class TestDenyCommand:
 
         entry = _ApprovalEntry({"command": "test"})
         _gateway_queues[session_key] = [entry]
+        from tools.approval import advertise_blocking_approval
+        advertise_blocking_approval(session_key)  # delivered prompt binding
 
         result = await runner._handle_deny_command(
             _make_event("/deny that path is still in use")
@@ -236,9 +260,13 @@ class TestDenyCommand:
         assert "that path is still in use" in result
 
     @pytest.mark.asyncio
-    async def test_deny_all_with_reason(self):
-        """/deny all <reason> denies everything and relays one reason."""
-        from tools.approval import _ApprovalEntry, _gateway_queues
+    async def test_deny_all_refused_then_single_deny_with_reason(self):
+        """/deny all is refused with multiple pending (same identity rule
+        as /approve all); a single /deny with a reason then resolves the
+        shown head only."""
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, advertise_blocking_approval,
+        )
 
         runner = _make_runner()
         source = _make_source()
@@ -247,13 +275,22 @@ class TestDenyCommand:
         e1 = _ApprovalEntry({"command": "cmd1"})
         e2 = _ApprovalEntry({"command": "cmd2"})
         _gateway_queues[session_key] = [e1, e2]
+        advertise_blocking_approval(session_key)
 
         result = await runner._handle_deny_command(
             _make_event("/deny all wrong directory")
         )
-        assert "2 commands" in result
-        assert all(e.result == "deny" for e in [e1, e2])
-        assert all(e.reason == "wrong directory" for e in [e1, e2])
+        assert "one at a time" in result.lower()
+        assert not e1.event.is_set()
+        assert not e2.event.is_set()
+
+        result = await runner._handle_deny_command(
+            _make_event("/deny wrong directory")
+        )
+        assert e1.result == "deny"
+        assert e1.reason == "wrong directory"
+        assert "wrong directory" in result
+        assert not e2.event.is_set()
 
 
 # ------------------------------------------------------------------

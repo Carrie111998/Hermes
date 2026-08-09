@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2440,22 +2441,55 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # resolves every pending approval in the session.
 
 
+class _FrozenApprovalData(dict):
+    """Read-only dict payload shared with asynchronous prompt adapters."""
+
+    @staticmethod
+    def _blocked(*args, **kwargs):
+        raise TypeError("approval request data is immutable")
+
+    __setitem__ = _blocked
+    __delitem__ = _blocked
+    clear = _blocked
+    pop = _blocked
+    popitem = _blocked
+    setdefault = _blocked
+    update = _blocked
+    __ior__ = _blocked
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = (
+        "event", "data", "command", "result", "reason",
+        "approval_id", "created_ts",
+    )
 
     def __init__(self, data: dict):
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
+        self.approval_id: str = uuid.uuid4().hex
+        # Own the request payload and freeze the executable action separately.
+        # Callers and async prompt senders must not be able to mutate what a
+        # later approval authorizes after the user has seen the prompt.
+        owned = dict(data)
+        owned["approval_id"] = self.approval_id
+        self.data = _FrozenApprovalData(owned)
+        self.command = str(self.data.get("command", ""))
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        self.created_ts: float = time.time()
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+# session_key → snapshot of the request the gateway most recently
+# RE-PRESENTED to the user (expired-UI / busy-text recovery). A later
+# explicit approve/deny is bound to this identity: resolution revalidates the
+# exact live entry (which may be mid-queue) and refuses when it no longer matches.
+_advertised_approvals: dict[str, dict] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2478,6 +2512,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _advertised_approvals.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
@@ -2485,7 +2520,10 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             *,
+                             expected_approval_id: Optional[str] = None,
+                             expected_command: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2497,25 +2535,78 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    *expected_approval_id* / *expected_command* bind the resolution to a
+    specific request identity (see :func:`advertise_blocking_approval`).
+    When set, the exact live entry carrying that identity is located
+    ANYWHERE in the session queue under the lock immediately before
+    resolution — never substituted with the FIFO head — and it alone is
+    removed and resolved; every other entry stays pending.  If no live
+    entry carries the identity (it timed out, was resolved elsewhere, or
+    the consent is a duplicate/replayed/stale callback) NOTHING is
+    resolved and 0 is returned.  Timeout is never consent, and a spent
+    identity never resolves a neighbour.
+
+    Returns the number of approvals resolved (0 means nothing was pending
+    or the expected identity no longer matched).
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
-            targets = list(queue)
-            queue.clear()
+
+        def _unresolved(entry) -> bool:
+            return entry.result is None and not entry.event.is_set()
+
+        if expected_approval_id is not None:
+            target = next(
+                (e for e in queue if e.approval_id == expected_approval_id),
+                None,
+            )
+            if target is None or not _unresolved(target):
+                return 0
+            if (
+                expected_command is not None
+                and target.command != str(expected_command)
+            ):
+                return 0
+            if resolve_all and len(queue) > 1:
+                # A single advertised request can never authorize the rest
+                # of the queue — later entries may have arrived after the
+                # user read the prompt they are consenting to.  Refuse bulk
+                # resolution outright; callers walk the queue one explicit
+                # consent at a time.
+                return 0
+            queue.remove(target)
+            targets = [target]
+        elif resolve_all:
+            targets = [entry for entry in queue if _unresolved(entry)]
+            if not targets:
+                return 0
+            for target in targets:
+                queue.remove(target)
         else:
+            target = queue[0]
+            if not _unresolved(target):
+                return 0
             targets = [queue.pop(0)]
         if not queue:
             _gateway_queues.pop(session_key, None)
-
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
+        # The advertised request (if any) is consumed by its own
+        # resolution so a stale binding can't gate a later, unrelated
+        # approve.
+        adv = _advertised_approvals.get(session_key)
+        if adv is not None and any(
+            t.approval_id == adv.get("approval_id") for t in targets
+        ):
+            _advertised_approvals.pop(session_key, None)
+        # Complete the winner while the same lock that selected and removed
+        # it is still held. Interrupt/timeout and a duplicate callback cannot
+        # slip into the remove→event window and overwrite the outcome.
+        for entry in targets:
+            entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.event.set()
     return len(targets)
 
 
@@ -2523,6 +2614,143 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def _entry_snapshot_locked(session_key: str, entry) -> dict:
+    """Snapshot one pending approval entry. Caller must hold ``_lock``."""
+    queue = _gateway_queues.get(session_key) or []
+    return {
+        "approval_id": entry.approval_id,
+        "command": entry.command,
+        "description": str(entry.data.get("description", "")),
+        "created_ts": entry.created_ts,
+        "pending_count": len(queue),
+    }
+
+
+def _head_snapshot_locked(session_key: str) -> Optional[dict]:
+    """Snapshot the oldest pending approval. Caller must hold ``_lock``."""
+    queue = _gateway_queues.get(session_key)
+    if not queue:
+        return None
+    return _entry_snapshot_locked(session_key, queue[0])
+
+
+def peek_blocking_approval(session_key: str) -> Optional[dict]:
+    """Return a snapshot of the oldest pending approval, or None.
+
+    This is the request a plain ``/approve`` would resolve.  The snapshot
+    is a copy — mutating it does not affect the queue.
+    """
+    with _lock:
+        return _head_snapshot_locked(session_key)
+
+
+def advertise_blocking_approval(
+    session_key: str,
+    *,
+    approval_id: Optional[str] = None,
+    command: Optional[str] = None,
+) -> Optional[dict]:
+    """Record a request as "the prompt the user was just shown".
+
+    Two callers, two shapes:
+
+    * ``approval_id`` given — the prompt-delivery path, right after a
+      SUCCESSFUL send: bind to the exact request the delivered prompt
+      carried.  Under concurrency the delivered prompt is not necessarily
+      the FIFO head (a parallel subagent's request may sit in front of
+      it), so the entry is located anywhere in the live queue by identity;
+      *command*, when given, must also match.  If no live entry carries
+      the identity — it resolved or timed out while the send was in
+      flight — nothing is recorded and any older advertisement is cleared.
+      The newly delivered prompt was the latest thing the user saw, so a
+      plain typed decision must re-present instead of falling back to an
+      older request.  None is returned.
+    * no ``approval_id`` — gateway recovery paths right before they
+      re-present the HEAD request whose original UI is gone (expired
+      buttons, missed prompt): record the head, or clear any stale record
+      and return None when nothing is pending.
+
+    A later explicit approve/deny is revalidated against the recorded
+    identity — it resolves exactly this request or nothing.
+
+    Returns the recorded snapshot, or None when nothing was recorded.
+    """
+    with _lock:
+        if approval_id is not None:
+            queue = _gateway_queues.get(session_key) or []
+            entry = next(
+                (e for e in queue if e.approval_id == approval_id), None,
+            )
+            if entry is None:
+                _advertised_approvals.pop(session_key, None)
+                return None
+            if (
+                command is not None
+                and entry.command != str(command)
+            ):
+                _advertised_approvals.pop(session_key, None)
+                return None
+            snap = _entry_snapshot_locked(session_key, entry)
+        else:
+            snap = _head_snapshot_locked(session_key)
+            if snap is None:
+                _advertised_approvals.pop(session_key, None)
+                return None
+        _advertised_approvals[session_key] = {
+            "approval_id": snap["approval_id"],
+            "command": snap["command"],
+        }
+        return snap
+
+
+def get_advertised_approval(session_key: str) -> Optional[dict]:
+    """Return the identity last advertised for this session, or None."""
+    with _lock:
+        adv = _advertised_approvals.get(session_key)
+        return dict(adv) if adv is not None else None
+
+
+# ``_ApprovalEntry.approval_id`` is always ``uuid.uuid4().hex``.
+_APPROVAL_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def encode_approval_callback_value(session_key: str, approval_id: str = "") -> str:
+    """Pack a session key + request identity into one button-payload string.
+
+    Platform button payloads (Slack Block Kit ``value``, Feishu card value,
+    …) predate request identity and carried only the session key.  Append
+    the approval_id behind a ``|`` so every callback can resolve exactly
+    the request its prompt showed.  An empty/malformed id degrades to the
+    bare session key (legacy FIFO resolution).
+    """
+    approval_id = str(approval_id or "")
+    if _APPROVAL_ID_RE.fullmatch(approval_id):
+        return f"{session_key}|{approval_id}"
+    return str(session_key or "")
+
+
+def decode_approval_callback_value(value: str) -> tuple[str, Optional[str]]:
+    """Split a button-payload string into ``(session_key, approval_id|None)``.
+
+    Inverse of :func:`encode_approval_callback_value`.  The id is only
+    recognized when the final ``|``-separated segment is a full 32-char
+    hex uuid, so legacy payloads (bare session key, even one containing
+    ``|``) fall back to ``(value, None)`` — the unbound FIFO path.
+    """
+    value = str(value or "")
+    if "|" in value:
+        head, tail = value.rsplit("|", 1)
+        if _APPROVAL_ID_RE.fullmatch(tail):
+            return head, tail
+    return value, None
+
+
+def clear_advertised_approval(session_key: str) -> None:
+    """Drop the advertised-request binding for a session."""
+    with _lock:
+        _advertised_approvals.pop(session_key, None)
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -2583,6 +2811,7 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _advertised_approvals.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -3616,12 +3845,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
-    command = approval_data.get("command", "")
+    entry = _ApprovalEntry(approval_data)
+    # From this point onward the queue-owned copy and frozen command are the
+    # source of truth. The caller may retain and mutate its original dict.
+    approval_data = entry.data
+    command = entry.command
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
-
-    entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 
@@ -3685,6 +3916,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # excludes it (#79719).
     with human_wait_window(session_key):
         while True:
+            # Observe a decision that already won before considering a later
+            # interrupt. Both writers use the approval lock, so the first
+            # outcome is final.
+            if entry.event.is_set():
+                resolved = True
+                break
             # Respect interrupt signals (e.g. /stop, /new, or an inactivity
             # timeout from the gateway) so a pending approval doesn't keep the
             # session wedged on threading.Event.wait() until the 5-minute approval
@@ -3698,8 +3935,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                     "returning deny for session %s",
                     session_key,
                 )
-                entry.result = "deny"
-                entry.event.set()
+                with _lock:
+                    if entry.result is None and not entry.event.is_set():
+                        entry.result = "deny"
+                        entry.event.set()
                 resolved = True
                 break
             _remaining = _deadline - time.monotonic()

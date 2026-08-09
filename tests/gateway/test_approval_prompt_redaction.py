@@ -111,9 +111,15 @@ class TestApprovalCommandWiring:
         )
 
     def test_chat_platform_path_redacts_before_send(self):
+        # The chat-platform prompt sender lives in the module-level
+        # _send_gateway_approval_prompt (the per-run _approval_notify_sync
+        # closure is a thin binding over it, extracted so the
+        # delivery→advertise wiring is unit-testable).
         import gateway.run as run
 
-        self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
+        self._assert_redacts_then_uses(
+            run, "_send_gateway_approval_prompt", "send_exec_approval"
+        )
 
     def test_sse_api_path_redacts_before_enqueue(self):
         from gateway.platforms import api_server

@@ -1166,7 +1166,14 @@ class QQAdapter(BasePlatformAdapter):
 
         approval = parse_approval_button_data(button_data)
         if approval is not None:
-            session_key, decision = approval
+            packed_session_key, decision = approval
+            # The button_data session slot may carry the gateway request
+            # identity appended by encode_approval_callback_value; legacy
+            # buttons decode to (session_key, None) → unbound FIFO.
+            from tools.approval import decode_approval_callback_value
+            session_key, gateway_approval_id = decode_approval_callback_value(
+                packed_session_key
+            )
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
@@ -1185,7 +1192,10 @@ class QQAdapter(BasePlatformAdapter):
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key, choice,
+                    expected_approval_id=gateway_approval_id,
+                )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s "
                     "(choice=%s, operator=%s)",
@@ -2708,6 +2718,7 @@ class QQAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        approval_id: str = "",
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
 
@@ -2715,6 +2726,9 @@ class QQAdapter(BasePlatformAdapter):
         agent is blocked waiting for approval. Button clicks resolve via
         :func:`tools.approval.resolve_gateway_approval` — dispatched by the
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
+        ``approval_id`` rides in the button_data session slot (see
+        :func:`tools.approval.encode_approval_callback_value`) so a click
+        resolves exactly the request this prompt shows.
         """
         del metadata  # QQ doesn't have thread_id / DM targeting overrides.
         del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
@@ -2726,8 +2740,9 @@ class QQAdapter(BasePlatformAdapter):
         # seen; the last inbound msg_id is the natural choice.
         msg_id = self._last_msg_id.get(chat_id)
 
+        from tools.approval import encode_approval_callback_value
         req = ApprovalRequest(
-            session_key=session_key,
+            session_key=encode_approval_callback_value(session_key, approval_id),
             title="Execute this command?",
             description=description,
             command_preview=command,
