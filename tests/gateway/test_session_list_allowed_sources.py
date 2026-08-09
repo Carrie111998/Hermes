@@ -69,3 +69,16 @@ def test_session_list_surfaces_all_user_facing_sources(monkeypatch):
     assert "tool-1" not in ids
 
 
+def test_session_list_filters_ghost_zero_message_sessions(monkeypatch):
+    """Issue #81888: ghost sessions (0 messages) must not clutter the picker.
+
+    ``session.list`` must ask ``list_sessions_rich`` to filter them at the
+    query level (``min_message_count=1``), the same way the desktop
+    project-tree sidebar already does.
+    """
+    db = _StubDB([{"id": "real-1", "source": "tui", "started_at": 1, "message_count": 3}])
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    _call(limit=10)
+
+    assert db.calls[-1].get("min_message_count") == 1
