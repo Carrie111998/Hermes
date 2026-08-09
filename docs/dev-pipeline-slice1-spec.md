@@ -9,7 +9,7 @@ One user entrypoint: `delegate_development(repo, task)`. Hermes plans via the co
 
 ## Non-goals (hard exclusions for this slice)
 
-- No GLM/Claude Code endurance lane (adapter not qualified yet — and it does not ship until it meets the observability bar below).
+- No GLM endurance lane in this slice (deferred to slice 2). **Lane harness decision (2026-08-10, user-directed and probed): the GLM lane is the SAME Cursor Agent CLI in its hidden "agent-cli-local" mode — `CURSOR_LOCAL_AGENT_BASE_URL` + `CURSOR_LOCAL_AGENT_API_KEY` pointing at the Alibaba coding-plan OpenAI-compatible endpoint, `--model glm-5.2`. Probed live: chat, tool use (edit tool wrote a file), and full stream-json events all work. Claude Code is OUT of the design entirely.** Slice 2 = an endurance profile of the same attempt runner (different model/env, longer budget, checkpoint cadence), not a second harness. It still does not ship until the observability bar below is met for that profile.
 - No ambiguous-task probe lane, no Cursor→GLM escalation, no runtime lane switching.
 - No learned routing, semantic progress scoring, or LLM-judged test greenness.
 - No concurrent writers, multi-host scheduling, auto-merge, or deployment.
@@ -20,7 +20,7 @@ One user entrypoint: `delegate_development(repo, task)`. Hermes plans via the co
 
 A lane may not ship unless the user can see what it is doing while it runs, without asking a model to summarize. Minimum bar:
 
-1. **Structured event stream per attempt.** Cursor: its `--output-format stream-json` JSONL. GLM/Claude Code (slice 2): its headless stream-json equivalent — qualification MUST prove the stream is parseable; if it is not, the lane waits.
+1. **Structured event stream per attempt.** Cursor bounded lane: its `--output-format stream-json` JSONL. GLM endurance lane (slice 2): same harness in `agent-cli-local` mode, same stream shape — verified by live probe on 2026-08-10.
 2. **Condensed progress events on the Kanban card.** The executor tails the attempt stream and writes coarse `task_events` rows (file edited, command run + exit code, checkpoint created, no-output warnings). Queryable via `hermes kanban show <id>` and by the agent mid-run.
 3. **Checkpoint commits as timeline.** Every meaningful step becomes a commit whose message names the milestone; the job branch's `git log` is the progress feed.
 4. **Phase-change thread updates.** The existing kanban notifier posts phase transitions (planned → running → verifying → reviewing → done/blocked) to the origin thread as ordinary messages; only the terminal message replies/mentions. Quiet between phases, but state is always queryable.
@@ -90,7 +90,7 @@ Phases:
 - Spawn attempt as a named transient systemd unit, outside the executor's cgroup:
   `systemd-run --unit=hermes-dev-<task_id>-<run_id> --property=RuntimeMaxSec=2400 --property=MemoryMax=6G --property=OOMScoreAdjust=500 --working-directory=<workspace repo> --setenv=HOME=/root --setenv=PATH=<sanitized> ... /root/hermes-agent/.venv/bin/python -m hermes_cli.dev_executor attempt <task_id> <run_id>`
   (Resolve paths at runtime; never hardcode blindly — use the running interpreter and installed package location.)
-- The `attempt` subcommand: builds a sanitized environment (allowlist: HOME, PATH, LANG/LC_*, git author/committer from config, Cursor config dirs; explicitly strip `GH_TOKEN`, `GITHUB_TOKEN`, any `*_API_KEY`, `*_OAUTH*`), then execs:
+- The `attempt` subcommand takes a lane profile argument (`--lane cursor-bounded`; slice 1 implements only this one, but the parameter and config seam exist from day one so slice 2 adds `glm-endurance` as config, not surgery): builds a sanitized environment (allowlist: HOME, PATH, LANG/LC_*, git author/committer from config, Cursor config dirs; explicitly strip `GH_TOKEN`, `GITHUB_TOKEN`, any `*_API_KEY`, `*_OAUTH*` — slice 2's glm-endurance profile is the ONLY exception, injecting exactly `CURSOR_LOCAL_AGENT_BASE_URL` + `CURSOR_LOCAL_AGENT_API_KEY` from the Hermes secrets store, never from the repo or task text), then execs:
   `agent -p --trust --force --model kimi-k3-high --output-format stream-json "<attempt prompt>"`
   streaming JSONL to `<board logs root>/<task_id>/attempt-<run_id>.jsonl`.
 - Attempt prompt: task text, plan contract JSON, rules: delegate implementation to `implementer`, then review to `reviewer`, fix blocking findings via implementer, commit with conventional message, do not push, do not create PRs, report structured final summary. (Mirror the proven prompt shape from the cursor-bridge skill.)
