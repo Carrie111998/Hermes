@@ -38,6 +38,9 @@ def _fmt_pending_list(subsystem: str) -> str:
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
+        candidate = r.get("refinement_candidate")
+        if isinstance(candidate, dict) and candidate.get("id"):
+            tag += f" [candidate {str(candidate['id'])[:8]}]"
         lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
@@ -122,16 +125,32 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
-    applied, failed = 0, []
+    applied, failed, details = 0, [], []
     for rec in targets:
-        ok, msg = _apply_one(subsystem, rec, memory_store)
+        candidate = rec.get("refinement_candidate")
+        try:
+            if subsystem == wa.SKILLS and isinstance(candidate, dict):
+                with wa.refinement_candidate_transaction(rec) as latest:
+                    ok, msg = _apply_one(subsystem, latest, memory_store)
+                    if ok and not wa.discard_pending(subsystem, latest["id"]):
+                        ok, msg = False, "Applied candidate could not be removed from pending state."
+            else:
+                ok, msg = _apply_one(subsystem, rec, memory_store)
+                if ok:
+                    wa.discard_pending(subsystem, rec["id"])
+        except Exception as exc:
+            ok, msg = False, str(exc)
         if ok:
-            wa.discard_pending(subsystem, rec["id"])
             applied += 1
+            if msg:
+                details.append(f"{rec['id']}: {msg}")
         else:
             failed.append(f"{rec['id']}: {msg}")
 
     out = [f"Approved {applied} {subsystem} write(s)."]
+    if details:
+        out.append("Applied:")
+        out.extend(f"  {detail}" for detail in details)
     if failed:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
@@ -140,6 +159,17 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
 def _apply_one(subsystem: str, rec, memory_store):
     payload = rec.get("payload", {})
+    candidate = rec.get("refinement_candidate") if subsystem == wa.SKILLS else None
+
+    def _record_failure(message: str) -> str:
+        if isinstance(candidate, dict):
+            stored, guard_error = wa.record_refinement_candidate_outcome(
+                rec, "failed"
+            )
+            if not stored:
+                return f"{message} ({guard_error})"
+        return message
+
     try:
         if subsystem == wa.MEMORY:
             if memory_store is None:
@@ -148,11 +178,58 @@ def _apply_one(subsystem: str, rec, memory_store):
             result = apply_memory_pending(payload, memory_store)
             return bool(result.get("success")), result.get("error", "")
         else:
+            snapshot = None
+            if isinstance(candidate, dict):
+                ok, message = wa.can_attempt_refinement_apply(rec)
+                if not ok:
+                    return False, message
+                ok, message = wa.validate_refinement_candidate_base(rec)
+                if not ok:
+                    return False, _record_failure(message)
+                from agent.curator_backup import snapshot_skills
+
+                snapshot = snapshot_skills(
+                    reason=f"pre-refinement {candidate.get('id', '')}"
+                )
+                if snapshot is None:
+                    return False, _record_failure(
+                        "Required Curator snapshot failed or is disabled; "
+                        "the refinement was not applied."
+                    )
+
             from tools.skill_manager_tool import apply_skill_pending
-            result = json.loads(apply_skill_pending(payload))
-            return bool(result.get("success")), result.get("error", "")
+            result = json.loads(
+                apply_skill_pending(payload, refinement_candidate=candidate)
+            )
+            if not result.get("success"):
+                message = result.get("error", "")
+                if snapshot is not None:
+                    message = f"{message} (recovery snapshot: {snapshot.name})"
+                return False, _record_failure(message)
+
+            if isinstance(candidate, dict):
+                ok, message = wa.validate_refinement_candidate_result(rec)
+                if not ok:
+                    return False, _record_failure(
+                        f"{message} (recovery snapshot: {snapshot.name})"
+                    )
+                stored, guard_error = wa.record_refinement_candidate_outcome(
+                    rec, "applied"
+                )
+                if not stored:
+                    retained = dict(rec)
+                    retained["refinement_apply_state"] = "applied_guard_error"
+                    retained["refinement_apply_error"] = guard_error
+                    wa.replace_pending_record(wa.SKILLS, retained)
+                    return False, (
+                        "Refinement write was applied, but the loop-guard outcome "
+                        f"failed and the pending record was retained: {guard_error}"
+                    )
+                detail = f"refinement applied; recovery snapshot: {snapshot.name}"
+                return True, detail
+            return True, ""
     except Exception as e:
-        return False, str(e)
+        return False, _record_failure(str(e))
 
 
 def _reject(subsystem: str, rest: List[str]) -> str:
@@ -160,11 +237,46 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
-        n = 0
+        n, failed = 0, []
         for rec in wa.list_pending(subsystem):
-            if wa.discard_pending(subsystem, rec["id"]):
+            if isinstance(rec.get("refinement_candidate"), dict):
+                try:
+                    with wa.refinement_candidate_transaction(rec) as latest:
+                        stored, message = wa.record_refinement_candidate_outcome(
+                            latest, "rejected"
+                        )
+                        if not stored:
+                            failed.append(f"{rec['id']}: {message}")
+                            continue
+                        if wa.discard_pending(subsystem, latest["id"]):
+                            n += 1
+                except Exception as exc:
+                    failed.append(f"{rec['id']}: {exc}")
+                    continue
+            elif wa.discard_pending(subsystem, rec["id"]):
                 n += 1
-        return f"Rejected {n} pending {subsystem} write(s)."
+        out = [f"Rejected {n} pending {subsystem} write(s)."]
+        if failed:
+            out.append("Failed:")
+            out.extend(f"  {item}" for item in failed)
+        return "\n".join(out)
+
+    rec = wa.get_pending(subsystem, target)
+    if not rec:
+        return f"No pending {subsystem} write with id '{target}'."
+    if isinstance(rec.get("refinement_candidate"), dict):
+        try:
+            with wa.refinement_candidate_transaction(rec) as latest:
+                stored, message = wa.record_refinement_candidate_outcome(
+                    latest, "rejected"
+                )
+                if not stored:
+                    return f"Could not reject refinement candidate '{target}': {message}"
+                if wa.discard_pending(subsystem, target):
+                    return f"Rejected pending {subsystem} write '{target}'."
+        except Exception as exc:
+            return f"Could not reject refinement candidate '{target}': {exc}"
+        return f"No pending {subsystem} write with id '{target}'."
     if wa.discard_pending(subsystem, target):
         return f"Rejected pending {subsystem} write '{target}'."
     return f"No pending {subsystem} write with id '{target}'."
@@ -178,6 +290,19 @@ def _diff(rest: List[str]) -> str:
         return f"No pending skill write with id '{rest[0]}'."
     diff = wa.skill_pending_diff(rec)
     header = f"# Pending skill write {rec['id']}: {rec.get('summary', '')}\n"
+    candidate = rec.get("refinement_candidate")
+    if isinstance(candidate, dict):
+        evidence = candidate.get("evidence", {})
+        base = candidate.get("base", {})
+        proposed = candidate.get("proposed", {})
+        header += (
+            f"Candidate: {candidate.get('id', '')}\n"
+            f"Evidence: origin={evidence.get('origin', '')} "
+            f"session={evidence.get('session_id', '')} "
+            f"task={evidence.get('task_id', '')}\n"
+            f"Base: {base.get('state', '')} {base.get('sha256', '')}\n"
+            f"Proposed: {proposed.get('state', '')} {proposed.get('sha256', '')}\n"
+        )
     return header + "\n" + diff
 
 

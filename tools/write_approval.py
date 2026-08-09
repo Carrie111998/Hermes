@@ -42,11 +42,16 @@ web dashboard.
 
 from __future__ import annotations
 
+import difflib
+import hashlib
 import json
 import logging
+import math
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +70,15 @@ _SUBSYSTEMS = (MEMORY, SKILLS)
 # "block all writes" state — to disable a subsystem entirely use its own
 # enable flag (e.g. ``memory.memory_enabled: false``).
 CONFIG_KEY = "write_approval"
+
+# Hard safety bounds for repeated background-review proposals. These are
+# intentionally fixed rather than configurable in the first slice: changing
+# policy must be an explicit code review, not an autonomous config mutation.
+REFINEMENT_COOLDOWN_SECONDS = 24 * 60 * 60
+REFINEMENT_ATTEMPT_WINDOW_SECONDS = 7 * 24 * 60 * 60
+REFINEMENT_MAX_ATTEMPTS = 3
+_refinement_guard_lock = threading.RLock()
+_refinement_guard_state = threading.local()
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +126,8 @@ def _pending_dir(subsystem: str) -> Path:
 
 
 def stage_write(subsystem: str, payload: Dict[str, Any],
-                *, summary: str, origin: str) -> Dict[str, Any]:
+                *, summary: str, origin: str,
+                refinement_candidate: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
 
     Args:
@@ -124,6 +139,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             For skills this is the LLM/heuristic gist; for memory it can be the
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
+        refinement_candidate: optional immutable proposal envelope for a
+            background-review mutation of an existing skill.
 
     Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
     logs and still returns a record (the write is simply lost, which is the
@@ -139,16 +156,30 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
         "created_at": time.time(),
         "payload": payload,
     }
+    if refinement_candidate is not None:
+        record["refinement_candidate"] = refinement_candidate
     try:
-        d = _pending_dir(subsystem)
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{pid}.json"
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        replace_pending_record(subsystem, record)
     except Exception as e:  # pragma: no cover - disk failure path
         logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
     return record
+
+
+def replace_pending_record(subsystem: str, record: Dict[str, Any]) -> None:
+    """Atomically replace one pending record after validating its identity."""
+    if subsystem not in _SUBSYSTEMS:
+        raise ValueError(f"invalid pending subsystem: {subsystem}")
+    pending_id = str(record.get("id") or "")
+    if len(pending_id) != 8 or any(ch not in "0123456789abcdef" for ch in pending_id):
+        raise ValueError("invalid pending record id")
+    if record.get("subsystem") != subsystem:
+        raise ValueError("pending record subsystem mismatch")
+    d = _pending_dir(subsystem)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{pending_id}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def list_pending(subsystem: str) -> List[Dict[str, Any]]:
@@ -382,8 +413,549 @@ def _prompt_inline_memory_approval(summary: str, detail: str) -> Optional[bool]:
 
 
 # ---------------------------------------------------------------------------
-# Skill-specific helpers (gist + diff for the review affordances)
+# Skill-specific helpers (refinement candidate + review affordances)
 # ---------------------------------------------------------------------------
+
+_REFINEMENT_ACTIONS = {"patch"}
+
+
+def _canonical_sha256(value: Any) -> str:
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _text_state(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {"state": "missing", "sha256": ""}
+    content = path.read_text(encoding="utf-8")
+    return {
+        "state": "present",
+        "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+
+
+def _resolve_refinement_target(payload: Dict[str, Any]):
+    """Return (skill root, target path, display label, error)."""
+    from tools.skill_manager_tool import _find_skill, _resolve_skill_target
+
+    name = str(payload.get("name") or "")
+    existing = _find_skill(name)
+    if not existing:
+        return None, None, "", f"Skill '{name}' is not an existing skill."
+    skill_dir = existing["path"]
+    rel = str(payload.get("file_path") or "SKILL.md")
+    target, error = _resolve_skill_target(skill_dir, rel)
+    return skill_dir, target, rel, error
+
+
+def build_skill_refinement_candidate(
+    payload: Dict[str, Any], *, origin: str
+) -> Optional[Dict[str, Any]]:
+    """Freeze a background-review proposal against one existing skill file.
+
+    New-skill creation and whole-skill deletion deliberately remain ordinary
+    pending writes. This first native refinement slice only covers bounded
+    improvements to an existing skill.
+    """
+    action = str(payload.get("action") or "")
+    if origin != "background_review" or action not in _REFINEMENT_ACTIONS:
+        return None
+
+    skill_dir, target, target_label, error = _resolve_refinement_target(payload)
+    if error or skill_dir is None or target is None:
+        raise ValueError(error or "Could not resolve refinement target.")
+
+    current = target.read_text(encoding="utf-8") if target.exists() else ""
+    if not target.exists():
+        raise ValueError(f"Refinement target does not exist: {target_label}")
+    from tools.fuzzy_match import fuzzy_find_and_replace
+
+    proposed, _count, _strategy, match_error = fuzzy_find_and_replace(
+        current,
+        str(payload.get("old_string") or ""),
+        payload.get("new_string"),
+        bool(payload.get("replace_all", False)),
+    )
+    if match_error:
+        raise ValueError(match_error)
+
+    before_lines = current.splitlines(keepends=True)
+    after_lines = [] if proposed is None else proposed.splitlines(keepends=True)
+    frozen_diff = "".join(difflib.unified_diff(
+        before_lines,
+        after_lines,
+        fromfile=f"a/{target_label}",
+        tofile=f"b/{target_label}",
+    )) or "(no textual change)"
+
+    proposed_state = (
+        {"state": "missing", "sha256": ""}
+        if proposed is None
+        else {
+            "state": "present",
+            "sha256": hashlib.sha256(proposed.encode("utf-8")).hexdigest(),
+        }
+    )
+    candidate = {
+        "schema_version": 1,
+        "id": uuid.uuid4().hex,
+        "action": action,
+        "target": {
+            "skill": str(payload.get("name") or ""),
+            "file": target_label,
+            "root": str(skill_dir.resolve()),
+        },
+        "evidence": {
+            "origin": origin,
+            "task_id": str(payload.get("task_id") or ""),
+            "session_id": str(payload.get("session_id") or ""),
+        },
+        "base": _text_state(target),
+        "proposed": proposed_state,
+        "payload_sha256": _canonical_sha256(payload),
+        "diff": frozen_diff,
+    }
+    candidate["fingerprint"] = _canonical_sha256({
+        "action": candidate["action"],
+        "target": candidate["target"],
+        "base": candidate["base"],
+        "proposed": candidate["proposed"],
+        "diff": candidate["diff"],
+    })
+    candidate["integrity_sha256"] = _canonical_sha256(candidate)
+    return candidate
+
+
+def _validate_candidate_integrity(record: Dict[str, Any]):
+    candidate = record.get("refinement_candidate")
+    if not isinstance(candidate, dict):
+        return True, ""
+    expected = str(candidate.get("integrity_sha256") or "")
+    unsigned = dict(candidate)
+    unsigned.pop("integrity_sha256", None)
+    if not expected or _canonical_sha256(unsigned) != expected:
+        return False, "Refinement candidate integrity check failed."
+    if candidate.get("payload_sha256") != _canonical_sha256(record.get("payload", {})):
+        return False, "Refinement candidate payload integrity check failed."
+    return True, ""
+
+
+def _refinement_guard_path() -> Path:
+    return get_hermes_home() / "pending" / "refinement_guard.json"
+
+
+def _refinement_guard_lock_path() -> Path:
+    return get_hermes_home() / "pending" / ".refinement_guard.lock"
+
+
+@contextmanager
+def _locked_refinement_guard():
+    """Serialize guard decisions across threads and Hermes processes."""
+    with _refinement_guard_lock:
+        depth = int(getattr(_refinement_guard_state, "depth", 0))
+        if depth:
+            _refinement_guard_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                _refinement_guard_state.depth = depth
+            return
+
+        lock_path = _refinement_guard_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _refinement_guard_state.depth = 1
+            try:
+                yield
+            finally:
+                _refinement_guard_state.depth = 0
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def refinement_candidate_transaction(record: Dict[str, Any]):
+    """Hold the lifecycle lock from final validation through pending removal."""
+    with _locked_refinement_guard():
+        pending_id = str(record.get("id") or "")
+        latest = get_pending(SKILLS, pending_id)
+        if latest is None:
+            raise RuntimeError(
+                f"Refinement candidate '{pending_id}' is no longer pending."
+            )
+        if (
+            _canonical_sha256(latest.get("payload"))
+            != _canonical_sha256(record.get("payload"))
+            or _canonical_sha256(latest.get("refinement_candidate"))
+            != _canonical_sha256(record.get("refinement_candidate"))
+        ):
+            raise RuntimeError(
+                f"Refinement candidate '{pending_id}' changed during approval."
+            )
+        yield latest
+
+
+def _validate_guard_entry(entry: Any, *, label: str) -> None:
+    if not isinstance(entry, dict):
+        raise RuntimeError(f"Refinement loop guard entry '{label}' is invalid.")
+    for field in ("attempts", "failures"):
+        values = entry.get(field, [])
+        if not isinstance(values, list):
+            raise RuntimeError(
+                f"Refinement loop guard field '{label}.{field}' is invalid."
+            )
+        for value in values:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise RuntimeError(
+                    f"Refinement loop guard timestamp '{label}.{field}' is invalid."
+                )
+    outcome = entry.get("last_outcome")
+    if outcome is not None and outcome not in {"staged", "rejected", "failed", "applied"}:
+        raise RuntimeError(
+            f"Refinement loop guard outcome '{label}' is invalid."
+        )
+    outcome_at = entry.get("last_outcome_at")
+    if outcome_at is not None and (
+        isinstance(outcome_at, bool)
+        or not isinstance(outcome_at, (int, float))
+        or not math.isfinite(float(outcome_at))
+        or float(outcome_at) < 0
+    ):
+        raise RuntimeError(
+            f"Refinement loop guard outcome timestamp '{label}' is invalid."
+        )
+
+
+def _validate_refinement_guard(data: Any, path: Path) -> Dict[str, Any]:
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise RuntimeError(f"Refinement loop guard has an invalid schema: {path}")
+    for bucket_name in ("fingerprints", "skills"):
+        bucket = data.get(bucket_name)
+        if not isinstance(bucket, dict):
+            raise RuntimeError(f"Refinement loop guard has an invalid schema: {path}")
+        for key, entry in bucket.items():
+            if not isinstance(key, str) or not key:
+                raise RuntimeError(
+                    f"Refinement loop guard key in '{bucket_name}' is invalid."
+                )
+            _validate_guard_entry(entry, label=f"{bucket_name}.{key}")
+    return data
+
+
+def _load_refinement_guard() -> Dict[str, Any]:
+    path = _refinement_guard_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"schema_version": 1, "fingerprints": {}, "skills": {}}
+    except Exception as exc:
+        raise RuntimeError(f"Refinement loop guard is unreadable: {path}") from exc
+
+    return _validate_refinement_guard(data, path)
+
+
+def _save_refinement_guard(data: Dict[str, Any]) -> None:
+    _validate_refinement_guard(data, _refinement_guard_path())
+    now = time.time()
+    cutoff = now - REFINEMENT_ATTEMPT_WINDOW_SECONDS
+    for bucket_name in ("skills", "fingerprints"):
+        bucket = data.setdefault(bucket_name, {})
+        for key, entry in list(bucket.items()):
+            entry["attempts"] = _recent_timestamps(entry.get("attempts"), now)
+            entry["failures"] = _recent_timestamps(entry.get("failures"), now)
+            try:
+                last_outcome_at = float(entry.get("last_outcome_at") or 0)
+            except (TypeError, ValueError):
+                last_outcome_at = 0
+            if (
+                not entry["attempts"]
+                and not entry["failures"]
+                and last_outcome_at < cutoff
+            ):
+                bucket.pop(key, None)
+
+    path = _refinement_guard_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _recent_timestamps(values: Any, now: float) -> List[float]:
+    cutoff = now - REFINEMENT_ATTEMPT_WINDOW_SECONDS
+    recent = []
+    for value in values if isinstance(values, list) else []:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            continue
+        if timestamp >= cutoff:
+            recent.append(timestamp)
+    return recent
+
+
+def _guard_entry(data: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
+    fingerprint = str(candidate.get("fingerprint") or "")
+    entries = data.setdefault("fingerprints", {})
+    entry = entries.setdefault(fingerprint, {})
+    entry["skill"] = str(candidate.get("target", {}).get("skill") or "")
+    return entry
+
+
+def _skill_guard_entry(data: Dict[str, Any], skill: str) -> Dict[str, Any]:
+    skills = data.setdefault("skills", {})
+    return skills.setdefault(skill, {})
+
+
+def stage_refinement_write(
+    payload: Dict[str, Any], *, summary: str, origin: str,
+    candidate: Dict[str, Any]
+):
+    """Atomically enforce anti-loop policy and stage one refinement proposal."""
+    ok, message = _validate_candidate_integrity({
+        "payload": payload,
+        "refinement_candidate": candidate,
+    })
+    if not ok:
+        return None, message
+
+    skill = str(candidate.get("target", {}).get("skill") or "")
+    fingerprint = str(candidate.get("fingerprint") or "")
+    if not skill or not fingerprint:
+        return None, "Refinement candidate is missing its loop-guard identity."
+
+    with _locked_refinement_guard():
+        for pending in list_pending(SKILLS):
+            active = pending.get("refinement_candidate")
+            if not isinstance(active, dict):
+                continue
+            active_skill = str(active.get("target", {}).get("skill") or "")
+            if active_skill == skill:
+                return None, (
+                    f"Skill '{skill}' already has an active refinement candidate "
+                    f"({pending.get('id', '')})."
+                )
+
+        now = time.time()
+        try:
+            data = _load_refinement_guard()
+        except RuntimeError as exc:
+            return None, str(exc)
+        fingerprint_entry = _guard_entry(data, candidate)
+        skill_entry = _skill_guard_entry(data, skill)
+        attempts = _recent_timestamps(skill_entry.get("attempts"), now)
+        failures = _recent_timestamps(skill_entry.get("failures"), now)
+        skill_entry["attempts"] = attempts
+        skill_entry["failures"] = failures
+
+        fingerprint_attempts = _recent_timestamps(
+            fingerprint_entry.get("attempts"), now
+        )
+        fingerprint_entry["attempts"] = fingerprint_attempts
+        if (
+            fingerprint_attempts
+            and fingerprint_entry.get("last_outcome")
+            in {"rejected", "failed", "applied"}
+        ):
+            return None, (
+                f"Duplicate refinement candidate blocked for skill '{skill}'; "
+                "the same base and diff were already decided in this guard window."
+            )
+
+        if len(attempts) >= REFINEMENT_MAX_ATTEMPTS:
+            return None, (
+                f"Refinement attempt limit reached for skill '{skill}' "
+                f"({REFINEMENT_MAX_ATTEMPTS} per 7 days)."
+            )
+
+        last_outcome = str(skill_entry.get("last_outcome") or "")
+        try:
+            last_outcome_at = float(skill_entry.get("last_outcome_at") or 0)
+        except (TypeError, ValueError):
+            last_outcome_at = 0
+        if (
+            last_outcome in {"rejected", "failed"}
+            and now - last_outcome_at < REFINEMENT_COOLDOWN_SECONDS
+        ):
+            return None, (
+                f"Refinement cooldown is active for skill '{skill}' after "
+                f"{last_outcome}."
+            )
+
+        record = stage_write(
+            SKILLS,
+            payload,
+            summary=summary,
+            origin=origin,
+            refinement_candidate=candidate,
+        )
+        if get_pending(SKILLS, record["id"]) is None:
+            return None, "Refinement candidate could not be persisted safely."
+
+        for entry in (skill_entry, fingerprint_entry):
+            own_attempts = _recent_timestamps(entry.get("attempts"), now)
+            entry["attempts"] = own_attempts + [now]
+            entry["last_outcome"] = "staged"
+            entry["last_outcome_at"] = now
+        try:
+            _save_refinement_guard(data)
+        except Exception as exc:
+            discard_pending(SKILLS, record["id"])
+            return None, f"Refinement loop guard could not be persisted: {exc}"
+        return record, ""
+
+
+def can_attempt_refinement_apply(record: Dict[str, Any]):
+    """Block immediate retries and cap failed applies for one candidate."""
+    candidate = record.get("refinement_candidate")
+    if not isinstance(candidate, dict):
+        return True, ""
+    if record.get("refinement_apply_state") == "applied_guard_error":
+        return False, (
+            "Refinement write was already applied but its guard outcome failed; "
+            "the pending record is retained and must not be retried."
+        )
+    ok, message = _validate_candidate_integrity(record)
+    if not ok:
+        return False, message
+
+    with _locked_refinement_guard():
+        now = time.time()
+        data = _load_refinement_guard()
+        skill = str(candidate.get("target", {}).get("skill") or "")
+        entry = _skill_guard_entry(data, skill)
+        failures = _recent_timestamps(entry.get("failures"), now)
+        if len(failures) >= REFINEMENT_MAX_ATTEMPTS:
+            return False, (
+                "Refinement apply attempt limit reached; reject this candidate "
+                "and create a corrected proposal after the guard window."
+            )
+        if failures:
+            try:
+                last_outcome_at = float(entry.get("last_outcome_at") or 0)
+            except (TypeError, ValueError):
+                last_outcome_at = 0
+            if (
+                entry.get("last_outcome") == "failed"
+                and now - last_outcome_at < REFINEMENT_COOLDOWN_SECONDS
+            ):
+                return False, "Refinement apply cooldown is active after the last failure."
+    return True, ""
+
+
+def record_refinement_candidate_outcome(
+    record: Dict[str, Any], outcome: str
+):
+    """Persist rejected/failed/applied outcomes for anti-loop enforcement."""
+    if outcome not in {"rejected", "failed", "applied"}:
+        return False, f"Unsupported refinement outcome: {outcome}"
+    candidate = record.get("refinement_candidate")
+    if not isinstance(candidate, dict):
+        return True, ""
+    integrity_ok, message = _validate_candidate_integrity(record)
+    if not integrity_ok and outcome != "rejected":
+        return False, message
+
+    try:
+        with _locked_refinement_guard():
+            now = time.time()
+            data = _load_refinement_guard()
+            payload = record.get("payload", {})
+            skill = str(
+                payload.get("name")
+                or candidate.get("target", {}).get("skill")
+                or ""
+            )
+            entries = [_skill_guard_entry(data, skill)]
+            if integrity_ok:
+                entries.append(_guard_entry(data, candidate))
+            for entry in entries:
+                entry["attempts"] = _recent_timestamps(
+                    entry.get("attempts"), now
+                )
+                failures = _recent_timestamps(entry.get("failures"), now)
+                if outcome == "failed":
+                    failures.append(now)
+                entry["failures"] = failures
+                entry["last_outcome"] = outcome
+                entry["last_outcome_at"] = now
+            _save_refinement_guard(data)
+        return True, ""
+    except Exception as exc:
+        return False, f"Refinement loop guard update failed: {exc}"
+
+
+def validate_refinement_candidate_base(record: Dict[str, Any]):
+    """Fail closed when the approved candidate no longer matches its base."""
+    ok, message = _validate_candidate_integrity(record)
+    if not ok:
+        return ok, message
+    candidate = record.get("refinement_candidate")
+    if not isinstance(candidate, dict):
+        return True, ""
+    try:
+        skill_dir, target, label, error = _resolve_refinement_target(
+            record.get("payload", {})
+        )
+    except Exception as exc:
+        return False, f"Refinement candidate target check failed: {exc}"
+    if error or skill_dir is None or target is None:
+        return False, f"Refinement candidate base changed: {error or label}"
+    bound_root = str(candidate.get("target", {}).get("root") or "")
+    if str(skill_dir.resolve()) != bound_root:
+        return False, "Refinement target root changed; create a new candidate."
+    if _text_state(target) != candidate.get("base"):
+        return False, "Refinement candidate base changed; create and approve a new candidate."
+    return True, ""
+
+
+def validate_refinement_candidate_result(record: Dict[str, Any]):
+    """Verify that the approved skill write produced the frozen result."""
+    candidate = record.get("refinement_candidate")
+    if not isinstance(candidate, dict):
+        return True, ""
+    try:
+        skill_dir, target, label, error = _resolve_refinement_target(
+            record.get("payload", {})
+        )
+    except Exception as exc:
+        return False, f"Refinement result check failed: {exc}"
+    if error or skill_dir is None or target is None:
+        return False, f"Refinement result target missing: {error or label}"
+    bound_root = str(candidate.get("target", {}).get("root") or "")
+    if str(skill_dir.resolve()) != bound_root:
+        return False, "Refinement target root changed after apply."
+    if _text_state(target) != candidate.get("proposed"):
+        return False, "Refinement result hash did not match the approved candidate."
+    return True, ""
+
 
 def skill_gist(action: str, name: str, *, content: str = "",
                file_path: str = "", old_string: str = "",
@@ -427,14 +999,18 @@ def _frontmatter_description(content: str) -> str:
 
 
 def skill_pending_diff(record: Dict[str, Any]) -> str:
-    """Build a full unified diff (or full content) for a staged skill write.
+    """Build the review diff for a staged skill write.
 
-    Used by /skills diff <id> on a surface that can render it (CLI pager, web
-    dashboard, or by opening the pending JSON file). For create this is the new
-    file content; for edit/patch it is a unified diff against the current
-    on-disk skill.
+    Refinement candidates return the integrity-bound frozen diff captured at
+    staging. Ordinary pending writes retain the legacy live-diff behaviour.
     """
-    import difflib
+    candidate = record.get("refinement_candidate")
+    if isinstance(candidate, dict):
+        ok, message = _validate_candidate_integrity(record)
+        if not ok:
+            return f"({message})"
+        return str(candidate.get("diff") or "(no textual change)")
+
     payload = record.get("payload", {})
     action = payload.get("action", "")
     name = payload.get("name", "")
