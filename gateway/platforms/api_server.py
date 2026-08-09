@@ -3976,9 +3976,10 @@ class APIServerAdapter(BasePlatformAdapter):
             asyncio.CancelledError,
             ConnectionResetError,
             ConnectionAbortedError,
+            ConnectionError,
             BrokenPipeError,
             OSError,
-        ):
+        ) as disconnect_exc:
             agent = agent_ref[0]
             if agent is not None:
                 try:
@@ -3990,7 +3991,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 _reap_disconnected_agent_processes(agent)
             task.cancel()
-            raise
+            if isinstance(disconnect_exc, asyncio.CancelledError):
+                raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
