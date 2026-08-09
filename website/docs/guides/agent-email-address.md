@@ -26,9 +26,13 @@ Ask Hermes to do this for you — the skill contains the full procedure — or d
 
 ```bash
 # Pre-built binary (Linux/macOS)
-curl -sSL https://raw.githubusercontent.com/pimalaya/himalaya/master/install.sh | PREFIX=~/.local sh
+# Pin a tagged release instead of master: the installer from an unpinned
+# master can change between runs and there is no checksum verification.
+curl -sSL https://raw.githubusercontent.com/pimalaya/himalaya/v1.1.0/install.sh | PREFIX=~/.local sh
 himalaya --version
 ```
+
+If the pinned tag above is outdated, check the [himalaya releases page](https://github.com/pimalaya/himalaya/releases) for the current version and substitute it; prefer installing via your package manager (`brew install himalaya`, `cargo install himalaya`, distro package) when available.
 
 Then create `~/.config/himalaya/config.toml` with the account's IMAP/SMTP settings. The skill's `references/configuration.md` covers auth options in detail; a minimal Gmail-style config looks like:
 

@@ -759,6 +759,10 @@ API_SERVER_HOST=0.0.0.0
 - `API_SERVER_KEY` is required for non-loopback binding. Pick a strong random string.
 - The API server runs on port 8642 by default (change with `API_SERVER_PORT` if needed).
 
+:::warning Plaintext control channel on your LAN
+The proxy path above sends conversation traffic and the `GATEWAY_PROXY_KEY` bearer between the VM container and your host over plain HTTP (`GATEWAY_PROXY_URL: http://...:8642`). On an untrusted network this leaks message content and the bearer that authenticates the whole bridge. Prefer a private/VPN network between the two machines, or front the API server with TLS (e.g. a reverse proxy terminating HTTPS and forwarding to 8642), then use `https://` in `GATEWAY_PROXY_URL`.
+:::
+
 Start the gateway:
 
 ```bash

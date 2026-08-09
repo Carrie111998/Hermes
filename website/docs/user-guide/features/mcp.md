@@ -762,6 +762,10 @@ mcp_servers:
       log_level: "info"        # Audit log level: debug, info, or warning (default: info)
 ```
 
+:::warning Sampling costs you tokens
+`sampling/createMessage` lets the MCP server spend **your** inference budget on its own behalf. It's enabled by default, and with `allowed_models: []` the server may request any model. For untrusted or third-party MCP servers, set `sampling.enabled: false` (see below) or restrict `allowed_models` to a cheap specific model.
+:::
+
 The sampling handler includes a sliding-window rate limiter, per-request timeouts, and tool-loop depth limits to prevent runaway usage. Metrics (request count, errors, tokens used) are tracked per server instance.
 
 To disable sampling for a specific server:

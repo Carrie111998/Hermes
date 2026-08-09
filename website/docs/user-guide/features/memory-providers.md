@@ -635,6 +635,8 @@ Base URL precedence is `supermemory.json` → `SUPERMEMORY_BASE_URL` → `https:
 
 Structured long-term memory using Memori Cloud, with background completed-turn capture, tool-aware turn context, and explicit recall tools for facts, summaries, quota, signup, and feedback.
 
+> **Not bundled.** Unlike the eight provider plugins above, Memori is a separately installed third-party integration — `pip install hermes-memori` + `hermes-memori install`. It does not ship in the `plugins/memory/` directory and is not counted in the "ships with 8 external memory provider plugins" figure.
+
 | | |
 |---|---|
 | **Best for** | Agent-controlled recall with structured project and session attribution |
