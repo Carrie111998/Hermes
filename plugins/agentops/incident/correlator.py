@@ -5,10 +5,11 @@ from .fingerprint import incident_fingerprint
 from .models import Incident, IncidentSignal
 
 class IncidentCorrelator:
-    def __init__(self, *, window_seconds: int = 900, max_incidents: int = 1000) -> None:
+    def __init__(self, *, window_seconds: int = 900, max_incidents: int = 1000, max_history: int = 5000) -> None:
         if window_seconds <= 0 or max_incidents <= 0: raise ValueError("invalid correlation budget")
         self.window = timedelta(seconds=window_seconds)
         self.max_incidents = max_incidents
+        self.max_history = max_history
         self._incidents: dict[str, Incident] = {}
         self._history: list[Incident] = []
         self._seen: set[str] = set()
@@ -28,6 +29,7 @@ class IncidentCorrelator:
         elif signal.observed_at - incident.last_seen > self.window:
             incident = Incident(fp, signal.observed_at, signal.observed_at, severity=signal.severity)
             self._history.append(incident); self._incidents[fp] = incident
+            if len(self._history) > self.max_history: self._history.pop(0)
         if incident.state == "resolved": incident.state = "reopened"; incident.history.append("reopened")
         if signal.severity in {"critical", "error"}: incident.severity = signal.severity
         incident.first_seen = min(incident.first_seen, signal.observed_at)
@@ -37,3 +39,4 @@ class IncidentCorrelator:
         return incident
 
     def incidents(self) -> tuple[Incident, ...]: return tuple(self._incidents.values())
+    def history(self) -> tuple[Incident, ...]: return tuple(self._history)
