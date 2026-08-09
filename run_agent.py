@@ -63,7 +63,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, apply_configured_ipv4_preference
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -125,6 +125,9 @@ from hermes_cli.timeouts import (
 )
 
 _hermes_home = get_hermes_home()
+# Honor network.force_ipv4 for the hermes-agent / library entry path
+# (hermes_cli.main already does this for the `hermes` console script).
+apply_configured_ipv4_preference(hermes_home=_hermes_home)
 _project_env = Path(__file__).parent / '.env'
 _loaded_env_paths = load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 if _loaded_env_paths:

@@ -2,7 +2,7 @@
 
 import importlib
 import socket
-
+import sys
 
 
 def _reload_constants():
@@ -22,7 +22,6 @@ class TestApplyIPv4Preference:
     def teardown_method(self):
         """Restore the original getaddrinfo after each test."""
         socket.getaddrinfo = self._original
-
 
     def test_patches_getaddrinfo_when_forced(self):
         """Patches socket.getaddrinfo when force=True."""
@@ -45,7 +44,6 @@ class TestApplyIPv4Preference:
         from hermes_constants import apply_ipv4_preference
 
         calls = []
-        original = socket.getaddrinfo
 
         def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             calls.append(family)
@@ -63,7 +61,6 @@ class TestApplyIPv4Preference:
         from hermes_constants import apply_ipv4_preference
 
         calls = []
-        original = socket.getaddrinfo
 
         def mock_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
             calls.append(family)
@@ -76,4 +73,156 @@ class TestApplyIPv4Preference:
         assert calls[-1] == socket.AF_INET6, "Explicit AF_INET6 should pass through"
 
 
+class TestApplyConfiguredIPv4Preference:
+    """Tests for apply_configured_ipv4_preference()."""
 
+    def test_returns_false_when_config_missing(self, monkeypatch, tmp_path):
+        hermes_constants = _reload_constants()
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(tmp_path) is False
+        assert calls == []
+
+    def test_reads_force_ipv4_from_config(self, monkeypatch, tmp_path):
+        hermes_constants = _reload_constants()
+        (tmp_path / "config.yaml").write_text(
+            "network:\n  force_ipv4: true\n", encoding="utf-8"
+        )
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(tmp_path) is True
+        assert calls == [True]
+
+    def test_ignores_invalid_network_section(self, monkeypatch, tmp_path):
+        hermes_constants = _reload_constants()
+        (tmp_path / "config.yaml").write_text("network: enabled\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(tmp_path) is False
+        assert calls == []
+
+    def test_scalar_root_config_is_safe(self, monkeypatch, tmp_path):
+        """Non-mapping YAML roots must not raise during import-time bootstrap."""
+        hermes_constants = _reload_constants()
+        (tmp_path / "config.yaml").write_text("true\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(tmp_path) is False
+        assert calls == []
+
+    def test_list_root_config_is_safe(self, monkeypatch, tmp_path):
+        hermes_constants = _reload_constants()
+        (tmp_path / "config.yaml").write_text("- a\n- b\n", encoding="utf-8")
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(tmp_path) is False
+        assert calls == []
+
+    def test_managed_scope_overlay_wins(self, monkeypatch, tmp_path):
+        """Administrator-pinned network.force_ipv4 must override user config."""
+        hermes_constants = _reload_constants()
+        user_home = tmp_path / "user"
+        managed_dir = tmp_path / "managed"
+        user_home.mkdir()
+        managed_dir.mkdir()
+        (user_home / "config.yaml").write_text(
+            "network:\n  force_ipv4: false\n", encoding="utf-8"
+        )
+        (managed_dir / "config.yaml").write_text(
+            "network:\n  force_ipv4: true\n", encoding="utf-8"
+        )
+
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        # Clear managed-scope caches so the override is picked up.
+        from hermes_cli import managed_scope
+        managed_scope.invalidate_managed_cache()
+
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_ipv4_preference",
+            lambda force=False: calls.append(force),
+        )
+
+        assert hermes_constants.apply_configured_ipv4_preference(user_home) is True
+        assert calls == [True]
+
+
+class TestBootstrapWiring:
+    """Entry points should apply the config-driven IPv4 preference on import."""
+
+    def setup_method(self):
+        self._saved = {name: sys.modules.get(name) for name in ("cli", "run_agent")}
+
+    def teardown_method(self):
+        for name, module in self._saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_run_agent_bootstrap_applies_configured_ipv4(self, monkeypatch):
+        import hermes_constants
+
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_configured_ipv4_preference",
+            lambda hermes_home=None: calls.append(hermes_home),
+        )
+        sys.modules.pop("run_agent", None)
+
+        run_agent = importlib.import_module("run_agent")
+
+        assert calls == [run_agent._hermes_home]
+
+    def test_cli_bootstrap_applies_configured_ipv4(self, monkeypatch):
+        import hermes_constants
+
+        calls = []
+        monkeypatch.setattr(
+            hermes_constants,
+            "apply_configured_ipv4_preference",
+            lambda hermes_home=None: calls.append(hermes_home),
+        )
+        sys.modules.pop("cli", None)
+
+        cli = importlib.import_module("cli")
+
+        assert calls == [cli._hermes_home]
+
+
+class TestConfigDefault:
+    """Verify network section exists in DEFAULT_CONFIG."""
+
+    def test_network_force_ipv4_default_is_false(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        network = DEFAULT_CONFIG.get("network", {})
+        assert isinstance(network, dict)
+        assert network.get("force_ipv4") is False

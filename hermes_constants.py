@@ -1355,6 +1355,53 @@ def apply_ipv4_preference(force: bool = False) -> None:
     socket.getaddrinfo = _ipv4_getaddrinfo  # type: ignore[assignment]
 
 
+def apply_configured_ipv4_preference(hermes_home: Path | None = None) -> bool:
+    """Apply ``network.force_ipv4`` from ``config.yaml`` when enabled.
+
+    Used by entry points that do not go through ``hermes_cli.main`` bootstrap
+    (``run_agent``, legacy ``cli``). Best-effort and never raises.
+
+    Honors managed-scope overlays so an administrator-pinned
+    ``network.force_ipv4`` wins the same way the canonical CLI bootstrap does.
+    """
+    try:
+        import yaml
+    except Exception:
+        return False
+
+    config_path = (hermes_home or get_hermes_home()) / "config.yaml"
+    try:
+        with config_path.open(encoding="utf-8") as fh:
+            config = yaml.safe_load(fh)
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+    # yaml.safe_load may return a scalar/list for valid YAML — guard before .get
+    if not isinstance(config, dict):
+        return False
+
+    # Match hermes_cli/main.py: managed overlay before reading force_ipv4.
+    # Fail-open so a managed-scope import failure never blocks startup.
+    try:
+        from hermes_cli import managed_scope
+
+        config = managed_scope.apply_managed_overlay(config)
+    except Exception:
+        pass
+
+    if not isinstance(config, dict):
+        return False
+
+    network_cfg = config.get("network", {})
+    if not isinstance(network_cfg, dict):
+        return False
+    force = bool(network_cfg.get("force_ipv4"))
+    apply_ipv4_preference(force=force)
+    return force
+
+
 # ─── Streaming Response Constants ────────────────────────────────────────────
 
 # Response ID for partial stream stubs used during error recovery
