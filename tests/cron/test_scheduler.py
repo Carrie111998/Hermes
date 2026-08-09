@@ -1107,6 +1107,7 @@ class TestRunJobWakeGate:
 
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, '{"wakeAgent": false}')), \
+             patch("hermes_state.SessionDB") as session_db_cls, \
              patch("run_agent.AIAgent") as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
@@ -1114,7 +1115,41 @@ class TestRunJobWakeGate:
         assert err is None
         assert final == SILENT_MARKER
         assert "Script gate returned `wakeAgent=false`" in doc
+        session_db_cls.assert_not_called()
         agent_cls.assert_not_called()
+
+    def test_prompt_injection_block_does_not_open_session_db(self):
+        """A blocked prompt exits before acquiring agent-only resources."""
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(True, '{"wakeAgent": true}')), \
+             patch.object(
+                 scheduler,
+                 "_build_job_prompt",
+                 side_effect=scheduler.CronPromptInjectionBlocked("blocked"),
+             ), \
+             patch("hermes_state.SessionDB") as session_db_cls:
+            success, _doc, _final, err = scheduler.run_job(self._make_job())
+
+        assert success is False
+        assert err == "blocked"
+        session_db_cls.assert_not_called()
+
+    def test_empty_prompt_does_not_open_session_db(self):
+        """A prompt-less script tick exits before opening the session store."""
+        import cron.scheduler as scheduler
+
+        with patch.object(scheduler, "_run_job_script",
+                          return_value=(True, '{"wakeAgent": true}')), \
+             patch.object(scheduler, "_build_job_prompt", return_value=None), \
+             patch("hermes_state.SessionDB") as session_db_cls:
+            success, _doc, final, err = scheduler.run_job(self._make_job())
+
+        assert success is True
+        assert final == SILENT_MARKER
+        assert err is None
+        session_db_cls.assert_not_called()
 
     def test_wake_true_runs_agent_with_injected_output(self):
         """When the script returns {wakeAgent: true, data: ...}, the agent is
@@ -1123,15 +1158,19 @@ class TestRunJobWakeGate:
 
         script_output = '{"wakeAgent": true, "data": {"new": 3}}'
         agent = MagicMock()
+        fake_db = MagicMock()
         agent.run_conversation = MagicMock(return_value={
             "final_response": "ok", "messages": []
         })
         with patch.object(scheduler, "_run_job_script",
                           return_value=(True, script_output)), \
+             patch("hermes_state.SessionDB", return_value=fake_db) as session_db_cls, \
              patch("run_agent.AIAgent", return_value=agent) as agent_cls:
             success, doc, final, err = scheduler.run_job(self._make_job())
 
         agent_cls.assert_called_once()
+        session_db_cls.assert_called_once_with()
+        fake_db.close.assert_called_once_with()
         # The script output should be visible in the prompt passed to
         # run_conversation.
         call_kwargs = agent.run_conversation.call_args
@@ -1974,5 +2013,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 
