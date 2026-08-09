@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from hermes_cli.sqlite_safe_read import _live_connections
 from hermes_state import SessionDB
 
 
@@ -41,6 +42,25 @@ def test_read_conn_is_per_thread(db):
 
 def test_read_conn_reused_within_thread(db):
     assert db._get_read_conn() is db._get_read_conn()
+
+
+@pytest.mark.requires_wal
+def test_completed_reader_threads_close_their_connections(db):
+    """Thread-local readers must close when their short-lived thread exits."""
+    tracked_path = str(db.db_path.resolve())
+    baseline_connections = _live_connections[tracked_path]
+
+    def reader():
+        assert db.get_session("s1")["id"] == "s1"
+
+    threads = [threading.Thread(target=reader) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not db._read_conns
+    assert _live_connections[tracked_path] == baseline_connections
 
 
 @pytest.mark.requires_wal

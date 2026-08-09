@@ -28,6 +28,7 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -1902,6 +1903,30 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
+class _ThreadReadConnection:
+    """Close a SessionDB reader when its owning thread exits."""
+
+    def __init__(self, db, conn: sqlite3.Connection):
+        self._db_ref = weakref.ref(db)
+        self.conn: Optional[sqlite3.Connection] = conn
+
+    def close(self) -> None:
+        conn, self.conn = self.conn, None
+        if conn is None:
+            return
+        db = self._db_ref()
+        if db is not None:
+            with db._read_conns_lock:
+                db._read_conns.discard(conn)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
+
+
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
     """``sqlite3.connect`` that registers the open fd for lock-safety.
 
@@ -2224,10 +2249,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # read-only connections so they never queue behind writer flushes on
         # self._lock. See _read_ctx().
         self._read_local = threading.local()
-        # Strong set of all live read connections across all threads.  We
-        # hold a reference so short-lived reader threads' connections are
-        # not GC'd without close() — that would leak tracked fds in
-        # _live_connections.  close() drains this set.
+        # Strong set of all live read connections across all threads. Thread-
+        # local _ThreadReadConnection owners remove and close their connection
+        # when their thread exits; close() drains readers still owned by live
+        # threads.
         self._read_conns: "set[sqlite3.Connection]" = set()
         self._read_conns_lock = threading.Lock()
         # Set when close() begins.  _get_read_conn checks this under the
@@ -2478,7 +2503,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not self._wal_active or self.read_only:
             return None
-        conn = getattr(self._read_local, "conn", None)
+        holder = getattr(self._read_local, "read_conn", None)
+        conn = holder.conn if holder is not None else None
         if conn is not None:
             return conn
         if getattr(self._read_local, "failed", False):
@@ -2499,21 +2525,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # registry, not the database file, so mode=ro is fine.
             if self._fts_cjk_loaded:
                 load_fts5_cjk_extension(conn)
+            holder = _ThreadReadConnection(self, conn)
+            self._read_local.read_conn = holder
             with self._read_conns_lock:
-                if self._read_conns_closed:
-                    # close() already drained — don't register; close
-                    # immediately so no tracked fd leaks.
-                    conn.close()
-                    self._read_local.failed = True
-                    return None
-                self._read_conns.add(conn)
+                closed = self._read_conns_closed
+                if not closed:
+                    self._read_conns.add(conn)
+            if closed:
+                # close() already drained — don't register; close immediately
+                # so no tracked fd leaks.
+                holder.close()
+                self._read_local.failed = True
+                return None
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
             self._read_local.failed = True
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             return None
-        self._read_local.conn = conn
         return conn
 
     @contextmanager
@@ -3040,13 +3069,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # (instance, function), so this removes exactly our registration;
         # no-op when the writer never started.
         atexit.unregister(self._drain_token_queue_at_exit)
-        # Close all read-only connections across all threads.  Per-thread
-        # connections live in threading.local() and would otherwise be GC'd
-        # without calling close(), leaking tracked fds in _live_connections.
-        # The strong set holds references so short-lived reader threads'
-        # connections survive until close() drains them.  Setting the closed
-        # flag under the lock prevents a reader from registering a new
-        # connection after the drain.
+        # Close all read-only connections across all live threads. Thread-
+        # local owners close completed threads' readers themselves; the set
+        # lets shutdown drain the remaining live readers. Setting the closed
+        # flag under the lock prevents a reader from registering after drain.
         with self._read_conns_lock:
             self._read_conns_closed = True
             read_conns = list(self._read_conns)
@@ -3056,7 +3082,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.close()
             except Exception:
                 pass
-        self._read_local.conn = None
+        self._read_local.read_conn = None
         with self._lock:
             if self._conn:
                 if not self.read_only:
