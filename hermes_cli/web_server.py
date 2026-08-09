@@ -2997,6 +2997,30 @@ _TOPOLOGY_CACHE_TTL = 10.0
 _CONFIG_MUTATION_LOCK = threading.RLock()
 
 
+def _serialized_config_write(fn):
+    """Run a config read-modify-write under :data:`_CONFIG_MUTATION_LOCK`.
+
+    Applied to handlers that perform the load->mutate->save span *off* the
+    event loop, where the loop no longer serializes them for free. Two shapes
+    reach that state here: work dispatched through ``asyncio.to_thread``, and
+    plain ``def`` FastAPI route handlers, which the framework runs in its own
+    threadpool. Both can interleave, and the later save then writes back a
+    snapshot read before the other side committed.
+
+    A decorator rather than an inline ``with`` so the handler bodies keep their
+    indentation and diff cleanly. ``functools.wraps`` preserves ``__wrapped__``,
+    which is what FastAPI follows to build the request signature.
+    """
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _CONFIG_MUTATION_LOCK:
+            return fn(*args, **kwargs)
+
+    return _wrapped
+
+
+
+
 def _topology_cache_get(fn: Any) -> Optional[Dict[str, Any]]:
     if (
         _TOPOLOGY_CACHE["data"] is not None
@@ -6561,6 +6585,7 @@ def get_moa_models(profile: Optional[str] = None):
 
 
 @app.put("/api/model/moa")
+@_serialized_config_write
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
     try:
@@ -6695,6 +6720,7 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         raise HTTPException(status_code=500, detail="Failed to save model assignment")
 
 
+@_serialized_config_write
 def _apply_model_assignment_sync(
     scope: str, provider: str, model: str, task: str, base_url: str, api_key: str = ""
 ):
@@ -7527,6 +7553,7 @@ def list_custom_endpoints(profile: Optional[str] = None):
 
 
 @app.post("/api/providers/custom-endpoints")
+@_serialized_config_write
 def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = None):
     """Create or update a v12+ ``providers`` custom endpoint entry."""
     try:
@@ -7546,6 +7573,7 @@ def upsert_custom_endpoint(body: CustomEndpointUpdate, profile: Optional[str] = 
 
 
 @app.post("/api/providers/custom-endpoints/{endpoint_id}/activate")
+@_serialized_config_write
 def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Set a configured custom endpoint as the default model provider."""
     try:
@@ -7580,6 +7608,7 @@ def activate_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
 
 
 @app.delete("/api/providers/custom-endpoints/{endpoint_id}")
+@_serialized_config_write
 def delete_custom_endpoint(endpoint_id: str, profile: Optional[str] = None):
     """Remove a configured custom endpoint from ``providers``."""
     try:

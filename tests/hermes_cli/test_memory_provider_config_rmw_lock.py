@@ -86,3 +86,96 @@ class TestMemoryProviderConfigLock:
             "PUT /api/memory/providers/{name}/config is not holding "
             "_CONFIG_MUTATION_LOCK around its read-modify-write span"
         )
+
+
+class TestOffLoopConfigWritersHoldTheLock:
+    """Every off-loop config read-modify-write must serialize on the same lock.
+
+    Two shapes run off the event loop and so lose its free serialization:
+    work dispatched via ``asyncio.to_thread``, and plain ``def`` FastAPI route
+    handlers, which the framework runs in its own threadpool. A scan keyed only
+    on ``_run`` closures missed the latter entirely.
+    """
+
+    def test_the_known_off_loop_writers_are_wrapped(self):
+        from hermes_cli import web_server
+
+        for name in (
+            "set_moa_models",
+            "upsert_custom_endpoint",
+            "activate_custom_endpoint",
+            "delete_custom_endpoint",
+            "_apply_model_assignment_sync",
+        ):
+            fn = getattr(web_server, name)
+            assert hasattr(fn, "__wrapped__"), (
+                f"{name} performs an off-loop config read-modify-write but is not "
+                "serialized on _CONFIG_MUTATION_LOCK"
+            )
+
+    def test_the_wrapper_actually_holds_the_lock(self):
+        from hermes_cli import web_server
+
+        held = {}
+
+        @web_server._serialized_config_write
+        def _probe():
+            held["locked"] = web_server._CONFIG_MUTATION_LOCK._is_owned()
+            return "ok"
+
+        assert _probe() == "ok"
+        assert held["locked"] is True
+        assert web_server._CONFIG_MUTATION_LOCK._is_owned() is False
+
+    def test_fastapi_still_sees_the_real_signature(self):
+        """FastAPI builds the request model from the signature; wraps must not hide it."""
+        import inspect
+
+        from hermes_cli import web_server
+
+        params = inspect.signature(web_server.upsert_custom_endpoint).parameters
+        assert "body" in params, "the decorator hid the handler's parameters from FastAPI"
+
+    def test_no_unlocked_off_loop_writer_remains(self):
+        """Scan the module rather than trusting a hand-kept list.
+
+        Reachability is what matters: a sync ``@app.*`` handler and anything
+        dispatched with ``to_thread`` both run off-loop. Anything else in the
+        file is either loop-serialized or reached from inside a locked span.
+        """
+        import inspect
+        import re
+
+        from hermes_cli import web_server
+
+        src = inspect.getsource(web_server)
+        lines = src.split("\n")
+        offenders = []
+        for i, line in enumerate(lines):
+            m = re.match(r"^def (\w+)\(", line)
+            if not m:
+                continue
+            decorators = []
+            j = i - 1
+            while j >= 0 and lines[j].startswith("@"):
+                decorators.append(lines[j])
+                j -= 1
+            if not any(d.startswith("@app.") for d in decorators):
+                continue
+            if any("_serialized_config_write" in d for d in decorators):
+                continue
+            end = len(lines)
+            for k in range(i + 1, len(lines)):
+                if lines[k] and not lines[k][0].isspace() and not lines[k].startswith("@"):
+                    end = k
+                    break
+            body = "\n".join(lines[i:end])
+            reads = re.search(r"\b(load_config|read_raw_config)\s*\(", body)
+            writes = re.search(r"\bsave_config\s*\(", body)
+            if reads and writes and "_CONFIG_MUTATION_LOCK" not in body:
+                offenders.append(m.group(1))
+
+        assert not offenders, (
+            "sync FastAPI handlers doing an unserialized config read-modify-write: "
+            f"{offenders}"
+        )
