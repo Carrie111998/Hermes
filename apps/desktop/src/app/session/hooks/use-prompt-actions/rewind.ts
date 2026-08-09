@@ -34,36 +34,34 @@ type RequestGateway = <T = unknown>(method: string, params?: Record<string, unkn
  * transcript (restore/regenerate the first user turn), which the gateway gates
  * behind `confirm_empty_truncate` on top of that.
  */
-export function truncateSubmitParams(truncateOrdinal: number | undefined): Record<string, unknown> {
-  if (truncateOrdinal === undefined) {
+export function truncateSubmitParams(
+  truncateOrdinal: number | undefined,
+  truncateMessageId?: string
+): Record<string, unknown> {
+  if (truncateOrdinal === undefined && !truncateMessageId) {
     return {}
   }
 
   return {
     confirm_truncate: true,
-    truncate_before_user_ordinal: truncateOrdinal,
+    ...(truncateOrdinal !== undefined ? { truncate_before_user_ordinal: truncateOrdinal } : {}),
+    ...(truncateMessageId ? { truncate_before_message_id: truncateMessageId } : {}),
     ...(truncateOrdinal === 0 ? { confirm_empty_truncate: true } : {})
   }
 }
 
 /**
  * Rewind a turn: `prompt.submit` with an optional `truncate_before_user_ordinal`
- * (drops that user turn + everything after). Idle rewinds submit directly
- * (interrupting an idle agent can leave a stale interrupt flag that cancels the
- * fresh turn); live/stuck turns interrupt first, and a raced "session busy"
- * response interrupts + retries through the shared busy gate.
- *
- * A rewind runs right after `cancelRun`, and interrupting can drop the
- * gateway's in-memory session — so the follow-up submit hits a dead runtime id
- * and used to surface a bare "session not found" ("Restore checkpoint" failing
- * after a stop). Pass `recovery` so a stale id re-registers and retries like
- * every other session-scoped RPC.
+ * / `truncate_before_message_id` (drops that user turn + everything after).
+ * Idle rewinds submit directly; live/stuck turns interrupt first, and a raced
+ * "session busy" response interrupts + retries through the shared busy gate.
  */
 export async function runRewindSubmit(
   requestGateway: RequestGateway,
   sessionId: string,
   text: string,
   truncateOrdinal: number | undefined,
+  truncateMessageId: string | undefined,
   interruptFirst: boolean,
   recovery?: { storedSessionId?: null | string; onSessionRecovered?: (sessionId: string) => void }
 ): Promise<void> {
@@ -85,7 +83,7 @@ export async function runRewindSubmit(
       {
         session_id: targetId,
         text,
-        ...truncateSubmitParams(truncateOrdinal)
+        ...truncateSubmitParams(truncateOrdinal, truncateMessageId)
       },
       PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
     )
@@ -133,6 +131,7 @@ export interface ReloadPlan {
   branchGroupId: string
   text: string
   truncateOrdinal: number
+  truncateMessageId?: string
   userIndex: number
 }
 
@@ -164,6 +163,7 @@ export function planReload(messages: ChatMessage[], parentId: null | string): nu
     branchGroupId: targetAssistant?.branchGroupId ?? branchGroupForUser(userMessage),
     text,
     truncateOrdinal: visibleUserOrdinal(messages, userIndex),
+    truncateMessageId: userMessage.id,
     userIndex
   }
 }
@@ -202,6 +202,7 @@ export interface RestorePlan {
   sourceIndex: number
   text: string
   truncateOrdinal: number
+  truncateMessageId?: string
 }
 
 /** Resolve the user turn to rewind to; throws with a user-facing reason. */
@@ -231,7 +232,7 @@ export function planRestore(messages: ChatMessage[], messageId: string, target?:
       ? visibleUserOrdinal(messages, sourceIndex)
       : target.userOrdinal
 
-  return { sourceIndex, text, truncateOrdinal }
+  return { sourceIndex, text, truncateOrdinal, truncateMessageId: source.id }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +245,7 @@ export interface EditPlan {
   sourceIndex: number
   text: string
   truncateOrdinal: number | undefined
+  truncateMessageId?: string
 }
 
 /** Resolve the edited user turn, or null when nothing changed / invalid. */
@@ -272,7 +274,8 @@ export function planEdit(messages: ChatMessage[], edited: AppendMessage): EditPl
     isFailedTurn,
     sourceIndex,
     text,
-    truncateOrdinal: isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex)
+    truncateOrdinal: isFailedTurn ? undefined : visibleUserOrdinal(messages, sourceIndex),
+    truncateMessageId: isFailedTurn ? undefined : source.id
   }
 }
 

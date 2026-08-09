@@ -809,7 +809,7 @@ export function usePromptActions({
           {
             session_id: sessionId,
             text: plan.text,
-            ...truncateSubmitParams(plan.truncateOrdinal)
+            ...truncateSubmitParams(plan.truncateOrdinal, plan.truncateMessageId)
           },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
@@ -825,18 +825,15 @@ export function usePromptActions({
     [activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
   )
 
-  // Cursor-style "restore checkpoint": rewind the conversation to a past user
-  // prompt and run it again from there. Reuses the edit composer's rewind
-  // mechanism — `prompt.submit` with `truncate_before_user_ordinal` drops that
-  // user turn and everything after it from the session history, then the same
-  // text is submitted as a fresh turn. Callers confirm before invoking; errors
-  // are rethrown so callers can surface failures. Idle rewinds submit directly:
-  // interrupting an idle agent can leave a stale interrupt flag that cancels the
-  // fresh turn. Live/stuck turns interrupt first, and a raced "session busy"
-  // response interrupts + retries through the shared busy gate.
   const submitRewindPrompt = useCallback(
-    (sessionId: string, text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) =>
-      runRewindSubmit(requestGateway, sessionId, text, truncateOrdinal, interruptFirst, {
+    (
+      sessionId: string,
+      text: string,
+      truncateOrdinal: number | undefined,
+      truncateMessageId: string | undefined,
+      interruptFirst: boolean
+    ) =>
+      runRewindSubmit(requestGateway, sessionId, text, truncateOrdinal, truncateMessageId, interruptFirst, {
         storedSessionId: selectedStoredSessionIdRef.current,
         onSessionRecovered: recoveredId => {
           activeSessionIdRef.current = recoveredId
@@ -873,7 +870,13 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          plan.truncateMessageId,
+          busyRef.current || $busy.get()
+        )
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -921,17 +924,25 @@ export function usePromptActions({
       updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
 
       const isStaleTargetError = (err: unknown) =>
-        /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
+        /no longer in session history|not in session history|does not match/i.test(
+          err instanceof Error ? err.message : String(err)
+        )
 
       try {
-        await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+        await submitRewindPrompt(
+          sessionId,
+          plan.text,
+          plan.truncateOrdinal,
+          plan.truncateMessageId,
+          busyRef.current || $busy.get()
+        )
       } catch (err) {
         let surfaced = err
 
         if (!plan.isFailedTurn && isStaleTargetError(err)) {
           try {
             // Already interrupted on the first attempt — submit as a plain resend.
-            await submitRewindPrompt(sessionId, plan.text, undefined, false)
+            await submitRewindPrompt(sessionId, plan.text, undefined, undefined, false)
 
             return
           } catch (retryErr) {

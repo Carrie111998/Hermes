@@ -4394,6 +4394,115 @@ def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
         server._sessions.pop("unconfirmed-trunc-sid", None)
 
 
+def test_prompt_submit_truncates_by_message_id(monkeypatch):
+    """#82756: truncate_before_message_id resolves target message and cuts history accurately."""
+    replaced = []
+
+    class _FakeDB:
+        def replace_messages(self, key, messages, active_only=False):
+            replaced.append((key, list(messages)))
+
+    history = [
+        {"id": "msg-1", "role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply 1"},
+        {"id": "msg-2", "role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+    server._sessions["msg-id-trunc-sid"] = _session(history=list(history))
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: None
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "msg-id-trunc-sid",
+                    "text": "new turn",
+                    "truncate_before_message_id": "msg-2",
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert resp.get("result") is not None
+        assert len(replaced) == 1
+        assert replaced[0][1] == history[:2]
+    finally:
+        server._sessions.pop("msg-id-trunc-sid", None)
+
+
+def test_prompt_submit_refuses_ordinal_and_message_id_mismatch(monkeypatch):
+    """#82756: A mismatch between truncate_before_user_ordinal and truncate_before_message_id must return 4030."""
+    history = [
+        {"id": "msg-1", "role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply 1"},
+        {"id": "msg-2", "role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+    server._sessions["mismatch-trunc-sid"] = _session(history=list(history))
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "mismatch-trunc-sid",
+                    "text": "new turn",
+                    "truncate_before_message_id": "msg-2",  # ordinal index 1
+                    "truncate_before_user_ordinal": 0,      # mismatch (stale 0)
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert resp.get("error") is not None
+        assert resp["error"]["code"] == 4030
+        assert "does not match" in resp["error"]["message"]
+    finally:
+        server._sessions.pop("mismatch-trunc-sid", None)
+
+
+def test_prompt_submit_refuses_boolean_ordinal(monkeypatch):
+    """Boolean truncate_before_user_ordinal must return 4004 instead of coercing to 1."""
+    history = [
+        {"id": "msg-1", "role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply 1"},
+    ]
+    server._sessions["bool-trunc-sid"] = _session(history=list(history))
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "bool-trunc-sid",
+                    "text": "new turn",
+                    "truncate_before_user_ordinal": True,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+        assert resp.get("error") is not None
+        assert resp["error"]["code"] == 4004
+        assert "must be an integer" in resp["error"]["message"]
+    finally:
+        server._sessions.pop("bool-trunc-sid", None)
+
+
+
+
 def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     """A confirmed rewind still must not wipe a non-empty transcript by accident.
 

@@ -162,13 +162,99 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
-        if truncate_user_ordinal is not None:
-            try:
-                ordinal = int(truncate_user_ordinal)
-            except (TypeError, ValueError):
-                return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
+        truncate_message_id = params.get("truncate_before_message_id")
+        if is_truthy_value(params.get("confirm_truncate")) and truncate_user_ordinal is None and truncate_message_id is None:
+            return _err(
+                rid,
+                4004,
+                "confirm_truncate requires truncate_before_user_ordinal or truncate_before_message_id",
+            )
+        if truncate_user_ordinal is not None or truncate_message_id is not None:
             history = session.get("history", [])
-            # An ordinal alone is not consent. A client that carries a leftover
+            user_indices = [
+                i for i, m in enumerate(history)
+                if m.get("role") == "user" and not m.get("display_kind")
+            ]
+
+            target_idx = None
+            ordinal = None
+
+            if truncate_message_id is not None:
+                msg_id_str = str(truncate_message_id)
+                found_match = None
+                for u_ord, h_idx in enumerate(user_indices):
+                    msg = history[h_idx]
+                    if msg.get("id") == msg_id_str or msg.get("message_id") == msg_id_str:
+                        found_match = (u_ord, h_idx)
+                        break
+
+                if found_match is None:
+                    return _err(
+                        rid,
+                        4018,
+                        "target user message is no longer in session history",
+                    )
+
+                msg_ordinal, target_idx = found_match
+
+                if truncate_user_ordinal is not None:
+                    if isinstance(truncate_user_ordinal, bool):
+                        return _err(
+                            rid,
+                            4004,
+                            "truncate_before_user_ordinal must be an integer",
+                        )
+                    try:
+                        ordinal = int(truncate_user_ordinal)
+                    except (TypeError, ValueError):
+                        return _err(
+                            rid,
+                            4004,
+                            "truncate_before_user_ordinal must be an integer",
+                        )
+                    if ordinal != msg_ordinal:
+                        logger.warning(
+                            "prompt.submit: REFUSED truncation due to ordinal mismatch for session %s "
+                            "(ordinal=%d, message_id_ordinal=%d, message_id=%s). "
+                            "Stale truncate_before_user_ordinal detected.",
+                            sid,
+                            ordinal,
+                            msg_ordinal,
+                            msg_id_str,
+                        )
+                        return _err(
+                            rid,
+                            4030,
+                            f"truncate_before_user_ordinal ({ordinal}) does not match "
+                            f"truncate_before_message_id target turn ({msg_ordinal})",
+                        )
+                else:
+                    ordinal = msg_ordinal
+            else:
+                if isinstance(truncate_user_ordinal, bool):
+                    return _err(
+                        rid,
+                        4004,
+                        "truncate_before_user_ordinal must be an integer",
+                    )
+                try:
+                    ordinal = int(truncate_user_ordinal)
+                except (TypeError, ValueError):
+                    return _err(
+                        rid,
+                        4004,
+                        "truncate_before_user_ordinal must be an integer",
+                    )
+
+                if ordinal < 0 or ordinal >= len(user_indices):
+                    return _err(
+                        rid,
+                        4018,
+                        "target user message is no longer in session history",
+                    )
+                target_idx = user_indices[ordinal]
+
+            # An ordinal/id alone is not consent. A client that carries a leftover
             # ordinal into an ORDINARY submit sends a request that is
             # indistinguishable, field by field, from a real rewind — same
             # method, same shape, an in-range target — and the cut it asks for
@@ -180,8 +266,8 @@ def _(rid, params: dict) -> dict:
                 logger.warning(
                     "prompt.submit: REFUSED unconfirmed truncation of session %s "
                     "(%d messages held; ordinal=%d). The client attached "
-                    "truncate_before_user_ordinal without confirm_truncate — "
-                    "likely a stale ordinal on an ordinary submit.",
+                    "truncation parameters without confirm_truncate — "
+                    "likely a stale parameter on an ordinary submit.",
                     sid,
                     len(history),
                     ordinal,
@@ -189,22 +275,12 @@ def _(rid, params: dict) -> dict:
                 return _err(
                     rid,
                     4029,
-                    "truncate_before_user_ordinal requires confirm_truncate=true; "
+                    "truncation requires confirm_truncate=true; "
                     "an ordinary prompt.submit must not drop session history "
                     "(update your Hermes client if a rewind was intended)",
                 )
-            user_indices = [
-                i for i, m in enumerate(history)
-                if m.get("role") == "user" and not m.get("display_kind")
-            ]
-            # Reject out-of-range ordinals on BOTH ends. A negative value would
-            # otherwise sail past the upper-bound check and hit Python's negative
-            # indexing below (user_indices[-1] -> the LAST user turn), silently
-            # truncating history to everything before it and persisting that loss
-            # via replace_messages — an unrecoverable overwrite of the session DB.
-            if ordinal < 0 or ordinal >= len(user_indices):
-                return _err(rid, 4018, "target user message is no longer in session history")
-            truncated = history[: user_indices[ordinal]]
+
+            truncated = history[:target_idx]
             # Second gate, on top of confirm_truncate: ordinal 0 resolves to
             # history[:0] == [] and replace_messages() DELETEs every durable
             # row. A confirmed rewind that happens to erase the whole
@@ -233,11 +309,12 @@ def _(rid, params: dict) -> dict:
             log_fn = logger.warning if not truncated else logger.info
             log_fn(
                 "prompt.submit: truncating session %s history %d -> %d messages "
-                "(ordinal=%d)",
+                "(ordinal=%d, message_id=%s)",
                 sid,
                 len(history),
                 len(truncated),
                 ordinal,
+                truncate_message_id or "",
             )
             # Write-before-memory (mirrors gateway hygiene / manual /compress):
             # persist the truncated transcript first. If replace_messages fails
