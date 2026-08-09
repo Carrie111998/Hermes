@@ -947,6 +947,7 @@ class DockerEnvironment(BaseEnvironment):
 
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
+        explicitly_mounted_destinations = set()
         workspace_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
@@ -957,6 +958,12 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
+                # The source path may itself contain a colon (for example on
+                # Windows), so split from the right and account for an
+                # optional mount mode.
+                volume_parts = vol.rsplit(":", 2)
+                destination = volume_parts[-2] if len(volume_parts) == 3 else volume_parts[-1]
+                explicitly_mounted_destinations.add(destination)
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
             else:
@@ -1014,6 +1021,13 @@ class DockerEnvironment(BaseEnvironment):
             )
 
             for mount_entry in get_credential_file_mounts():
+                if mount_entry["container_path"] in explicitly_mounted_destinations:
+                    logger.info(
+                        "Docker: skipping automatic credential mount for explicitly "
+                        "mounted destination %s",
+                        mount_entry["container_path"],
+                    )
+                    continue
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
