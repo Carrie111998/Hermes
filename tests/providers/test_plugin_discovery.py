@@ -460,6 +460,10 @@ def test_disabling_provider_refreshes_all_derived_surfaces(
     )
     assert "refresh-provider" in models._KNOWN_PROVIDER_NAMES
     assert "REFRESH_PROVIDER_API_KEY" in config.OPTIONAL_ENV_VARS
+    assert (
+        "REFRESH_PROVIDER_API_KEY"
+        in auth.get_observed_provider_security_env_names()
+    )
 
     _write_activation(
         home,
@@ -475,6 +479,10 @@ def test_disabling_provider_refreshes_all_derived_surfaces(
     )
     assert "refresh-provider" not in models._KNOWN_PROVIDER_NAMES
     assert "REFRESH_PROVIDER_API_KEY" not in config.OPTIONAL_ENV_VARS
+    assert (
+        "REFRESH_PROVIDER_API_KEY"
+        in auth.get_observed_provider_security_env_names()
+    )
 
 
 def test_failed_provider_import_rolls_back_registry_aliases_and_modules(

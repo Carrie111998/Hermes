@@ -349,9 +349,13 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist(
 
 
 def _get_current_provider_env_blocklist() -> frozenset[str]:
-    """Return static compatibility keys plus the current active-profile keys."""
-    return _HERMES_PROVIDER_ENV_BLOCKLIST | _build_provider_env_blocklist(
-        include_active=True,
+    """Return static, active, and process-observed provider credential names."""
+    from hermes_cli.auth import get_observed_provider_security_env_names
+
+    return (
+        _HERMES_PROVIDER_ENV_BLOCKLIST
+        | _build_provider_env_blocklist(include_active=True)
+        | get_observed_provider_security_env_names()
     )
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.

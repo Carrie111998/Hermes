@@ -413,8 +413,8 @@ class TestBlocklistCoverage:
         assert {"GMI_API_KEY", "GMI_BASE_URL"}.issubset(blocklist)
         assert {"GMI_OVERRIDE_API_KEY", "GMI_OVERRIDE_BASE_URL"}.issubset(blocklist)
 
-    def test_late_active_provider_is_filtered_by_all_local_paths(self, monkeypatch):
-        """Each real sanitizer snapshots active provider metadata per call."""
+    def test_late_active_provider_remains_filtered_after_disable(self, monkeypatch):
+        """Observed provider names remain blocked for the process lifetime."""
         from hermes_cli import auth
         from tools.environments.local import (
             _make_run_env,
@@ -423,20 +423,44 @@ class TestBlocklistCoverage:
         )
 
         active = auth.ProviderConfig(
-            id="late-active",
+            id="late-local",
             name="Late active",
             auth_type="api_key",
-            api_key_env_vars=("LATE_ACTIVE_API_KEY",),
+            api_key_env_vars=("LATE_LOCAL_API_KEY",),
+            base_url_env_var="LATE_LOCAL_BASE_URL",
         )
         monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
-        source = {"LATE_ACTIVE_API_KEY": "secret", "PATH": os.defpath}
+        source = {
+            "LATE_LOCAL_API_KEY": "secret",
+            "LATE_LOCAL_BASE_URL": "https://provider.invalid/v1",
+            "PATH": os.defpath,
+        }
 
-        assert "LATE_ACTIVE_API_KEY" not in _sanitize_subprocess_env(source)
+        assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+            _sanitize_subprocess_env(source)
+        )
         with patch.dict(os.environ, source, clear=True):
-            assert "LATE_ACTIVE_API_KEY" not in hermes_subprocess_env()
-            assert "LATE_ACTIVE_API_KEY" not in _make_run_env({})
+            assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+                hermes_subprocess_env()
+            )
+            assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+                _make_run_env({})
+            )
 
-    def test_current_blocklist_does_not_retain_previous_profile_key(self, monkeypatch):
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {})
+
+        assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+            _sanitize_subprocess_env(source)
+        )
+        with patch.dict(os.environ, source, clear=True):
+            assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+                hermes_subprocess_env()
+            )
+            assert not {"LATE_LOCAL_API_KEY", "LATE_LOCAL_BASE_URL"} & set(
+                _make_run_env({})
+            )
+
+    def test_current_blocklist_retains_previous_profile_key(self, monkeypatch):
         from hermes_cli import auth
         from tools.environments.local import (
             _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -456,7 +480,7 @@ class TestBlocklistCoverage:
 
         monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {})
 
-        assert "PROFILE_ONLY_API_KEY_73132" not in _get_current_provider_env_blocklist()
+        assert "PROFILE_ONLY_API_KEY_73132" in _get_current_provider_env_blocklist()
 
     def test_bedrock_bearer_token_is_in_blocklist(self):
         """auth_type='aws_sdk' providers contribute their Hermes-managed

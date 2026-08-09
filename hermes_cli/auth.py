@@ -607,6 +607,38 @@ _PROVIDER_REGISTRY_LKG_BY_SECURITY_IDENTITY: dict[
     tuple[tuple[str, str], object], Dict[str, ProviderConfig]
 ] = {}
 _PROVIDER_REGISTRY_CACHE_LOCK = threading.RLock()
+_PROVIDER_SECURITY_ENV_EXEMPT = frozenset({"CLAUDE_CODE_OAUTH_TOKEN"})
+
+
+def _provider_security_env_names(
+    provider_configs: Iterable[ProviderConfig],
+) -> set[str]:
+    names: set[str] = set()
+    for config in provider_configs:
+        names.update(config.api_key_env_vars)
+        if config.base_url_env_var:
+            names.add(config.base_url_env_var)
+    names.difference_update(_PROVIDER_SECURITY_ENV_EXEMPT)
+    return names
+
+
+_OBSERVED_PROVIDER_SECURITY_ENV_NAMES = _provider_security_env_names(
+    _STATIC_PROVIDER_REGISTRY.values()
+)
+
+
+def _record_observed_provider_security_env_names(
+    provider_configs: Iterable[ProviderConfig],
+) -> None:
+    names = _provider_security_env_names(provider_configs)
+    with _PROVIDER_REGISTRY_CACHE_LOCK:
+        _OBSERVED_PROVIDER_SECURITY_ENV_NAMES.update(names)
+
+
+def get_observed_provider_security_env_names() -> frozenset[str]:
+    """Return provider credential names observed during this process lifetime."""
+    with _PROVIDER_REGISTRY_CACHE_LOCK:
+        return frozenset(_OBSERVED_PROVIDER_SECURITY_ENV_NAMES)
 
 
 def _provider_config_from_profile(profile) -> ProviderConfig | None:
@@ -686,6 +718,9 @@ def _compute_provider_registry_snapshot() -> Dict[str, ProviderConfig]:
                 dynamic_keys.add(alias)
 
     with _PROVIDER_REGISTRY_CACHE_LOCK:
+        _OBSERVED_PROVIDER_SECURITY_ENV_NAMES.update(
+            _provider_security_env_names(replacement.values())
+        )
         _PROVIDER_REGISTRY_CACHE[cache_key] = (
             catalog,
             replacement,
@@ -783,8 +818,9 @@ def get_known_provider_configs() -> tuple[ProviderConfig, ...]:
     Built-in entries remain visible to security consumers when their bundled
     plugin is disabled. Active same-ID overrides are appended instead of
     replacing built-in security metadata; identical objects and aliases are
-    de-duplicated by identity. Unknown inactive third-party metadata remains a
-    follow-up for a durable manifest inventory, not process-observed state.
+    de-duplicated by identity. Successfully discovered credential names remain
+    blocked for the process lifetime; never-observed inactive third-party
+    metadata remains a follow-up for a durable manifest inventory.
     """
     known = list(get_builtin_provider_configs())
     seen = {id(config) for config in known}
@@ -792,7 +828,9 @@ def get_known_provider_configs() -> tuple[ProviderConfig, ...]:
         if id(config) not in seen:
             known.append(config)
             seen.add(id(config))
-    return tuple(known)
+    snapshot = tuple(known)
+    _record_observed_provider_security_env_names(snapshot)
+    return snapshot
 
 
 def get_nous_service_config() -> ProviderConfig:
