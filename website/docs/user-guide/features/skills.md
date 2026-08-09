@@ -113,7 +113,26 @@ commands).
 
 # Pasted notes / a described procedure
 /learn filing an expense: open the portal, New > Expense, attach the receipt, submit
+
+# A whole book, paper stack, or large docs corpus — becomes a knowledge-base skill
+/learn ~/books/designing-data-intensive-applications.pdf
 ```
+
+### Large sources become knowledge-base skills
+
+When the source is a book, a stack of papers, a spec, or a large docs folder,
+the agent doesn't cram it into one file or reduce it to a lossy summary.
+Instead it authors an **expansive knowledge-base skill**: a lean `SKILL.md`
+carrying the source's core mental models plus an index, with one distilled
+file per chapter or topic under `references/` (plus a glossary or cheatsheet
+when the source earns them). Reference files cost nothing until a question
+needs one — the agent loads them on demand with `skill_view`, so query cost
+stays proportional to the answer, not the source. Re-running `/learn` with new
+material on the same topic folds it into the existing skill rather than
+creating a duplicate.
+
+The distillation synthesizes structure — frameworks, definitions, decision
+rules, anti-patterns — and never reproduces passages of the source text.
 
 Because the live agent does the sourcing, `/learn` works the same in the CLI,
 the messaging gateway, the TUI, and the dashboard — and on any terminal backend
@@ -812,7 +831,7 @@ hermes skills install my-org/hermes-skills/deploy-runbook
 
 #### Non-default paths
 
-If your skills don't live under `skills/` (common when you're adding a `skills/` subtree to an existing project), edit the tap entry in `~/.hermes/.hub/taps.json`:
+If your skills don't live under `skills/` (common when you're adding a `skills/` subtree to an existing project), edit the tap entry in `~/.hermes/skills/.hub/taps.json`:
 
 ```json
 {
@@ -854,7 +873,7 @@ Inside a running session:
 /skills tap remove myorg/skills-repo
 ```
 
-Taps are stored in `~/.hermes/.hub/taps.json` (created on demand).
+Taps are stored in `~/.hermes/skills/.hub/taps.json` (created on demand).
 
 ## Bundled skill updates (`hermes skills reset`)
 

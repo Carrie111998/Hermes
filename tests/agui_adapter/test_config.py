@@ -19,6 +19,14 @@ def isolated_hermes_home(tmp_path, monkeypatch):
     config_module._RAW_CONFIG_CACHE.clear()
 
 
+def test_agui_config_and_secret_metadata_are_registered():
+    assert "agui" in config_module.DEFAULT_CONFIG
+    assert "agui" in config_module._KNOWN_ROOT_KEYS
+
+    token_metadata = config_module.OPTIONAL_ENV_VARS["HERMES_AGUI_SESSION_TOKEN"]
+    assert token_metadata["password"] is True
+
+
 def test_listener_settings_come_from_config_yaml(isolated_hermes_home, monkeypatch):
     save_config({"agui": {"host": "0.0.0.0", "port": 9123}})
     monkeypatch.setenv("HERMES_AGUI_HOST", "legacy.example.com")
