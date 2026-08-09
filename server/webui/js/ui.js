@@ -769,6 +769,26 @@ export function field(labelText, inputNode, { hint, required } = {}) {
     inputNode,
     hint ? el('div', { class: 'ifz-hint', id: hintId }, hint) : null);
 }
+/** Attach (or clear, with message == null) a validation message on a control's
+    surrounding field(). No-op for controls rendered outside a field wrapper. */
+export function setFieldError(inputNode, message) {
+  const fieldEl = inputNode.closest('.ifz-field');
+  if (!fieldEl) return;
+  let err = fieldEl.querySelector('.ifz-field-error');
+  if (!message) {
+    inputNode.classList.remove('is-invalid');
+    inputNode.removeAttribute('aria-invalid');
+    if (err) err.remove();
+    return;
+  }
+  inputNode.classList.add('is-invalid');
+  inputNode.setAttribute('aria-invalid', 'true');
+  if (!err) {
+    err = el('div', { class: 'ifz-field-error', role: 'alert' });
+    fieldEl.append(err);
+  }
+  err.textContent = message;
+}
 export function input(attrs = {}) { return el('input', { class: 'ifz-input', ...attrs }); }
 export function select(options, attrs = {}) {
   return el('select', { class: 'ifz-select', ...attrs }, options.map(o =>

@@ -17,11 +17,12 @@
 # Notes / deliberate choices:
 #   * Python is pinned to 3.13 — pyproject requires ">=3.11,<3.14" and 3.13
 #     matches what the upstream image and `[tool.ty.environment]` target.
-#   * Dependencies are resolved fresh from pyproject (`.[web,interfaze]`)
-#     rather than from uv.lock: as of this commit uv.lock's `interfaze`
-#     extra only lists asyncpg and is missing ddgs / scrapling / markdownify,
-#     so `uv sync --locked` would fail and `--frozen` would silently ship an
-#     image whose lead-discovery skill has no web-search backend.
+#   * Dependencies come from uv.lock (`uv sync --locked`), so the image ships
+#     the exact pinned set CI resolved. `--locked` (not `--frozen`) makes a
+#     stale lockfile a build failure instead of a silently-wrong image — the
+#     failure mode we hit when uv.lock's `interfaze` extra was missing
+#     ddgs / scrapling / markdownify and the lead-discovery skill shipped with
+#     no web-search backend.
 #   * server/api_cli.py defaults to 127.0.0.1; we pass --host on the command
 #     line (see CMD) instead of patching the file.
 #   * Writable state (SQLite DB, uploads, hermes home, synced skills) all
@@ -47,7 +48,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_LINK_MODE=copy \
     UV_NO_CACHE=1 \
-    UV_COMPILE_BYTECODE=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON=/usr/local/bin/python3 \
+    UV_PYTHON_DOWNLOADS=never
+# UV_PROJECT_ENVIRONMENT: `uv sync` writes to the project environment; point
+#   that at the venv the runtime stage copies out instead of /src/.venv.
+# UV_PYTHON / UV_PYTHON_DOWNLOADS: the base image's interpreter is already the
+#   pinned 3.13, so don't let uv fetch a second managed toolchain into the layer.
 
 COPY --from=uv /uv /usr/local/bin/uv
 
@@ -64,8 +72,12 @@ COPY . /src
 # `[web]` = fastapi/uvicorn/starlette/python-multipart.
 # `[interfaze]` = asyncpg + the web-research stack the lead-discovery skill
 # needs (ddgs, scrapling[fetchers], markdownify).
-RUN uv venv /opt/venv \
-    && uv pip install --python /opt/venv/bin/python ".[web,interfaze]"
+#
+# `--no-editable` installs the project as a built wheel rather than a .pth
+# pointing back at /src, which the runtime stage does not carry — an editable
+# install would produce a venv that ImportErrors the moment it's copied out.
+# `--no-dev` keeps pytest/ruff/ty out of the shipped image.
+RUN uv sync --locked --no-dev --no-editable --extra web --extra interfaze
 
 # Fail the build here rather than at container start if either console script
 # or the app package went missing.
@@ -140,8 +152,10 @@ WORKDIR /data/workspace
 EXPOSE 8000
 VOLUME ["/data"]
 
+# Exec form (DL3025). The shell is explicit because the probe needs
+# ${INTERFAZE_PORT} expanded at run time, which exec form alone won't do.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -fsS "http://127.0.0.1:${INTERFAZE_PORT:-8000}/health" || exit 1
+    CMD ["/bin/sh", "-c", "curl -fsS \"http://127.0.0.1:${INTERFAZE_PORT:-8000}/health\" || exit 1"]
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 # Sync bundled skills into $HERMES_HOME/skills (idempotent; user edits under

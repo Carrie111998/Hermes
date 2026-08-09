@@ -129,8 +129,8 @@ Legend: **EXISTS** = paths match · **ADAPTED** = real route with client normali
 | UI group (api.js) | Routes | Backend | Status | Group-specific notes |
 |---|---|---|---|---|
 | auth | 6 | [routes/auth.py](routes/auth.py) | PARTIAL | Login returns `{access_token, refresh_token, token_type, expires_in}`; UI expects `{token, user, company}` → composite adapter (§3.3.4). `/auth/me` returns flat principal vs mock's `{user, company}`. |
-| admin companies | 8 | [routes/admin.py](routes/admin.py) | EXISTS | Bare-array lists (§3.3.1). |
-| admin users | 8 | routes/admin.py | EXISTS | reset-password/disable return 204 → `null` through api.js; pages tolerate. |
+| admin companies | 8 | [routes/admin.py](routes/admin.py) | ADAPTED | Bare-array lists (§3.3.1). `CompanyCreate`/`CompanyPatch` are `extra="forbid"`: `website`, `plan` and every other profile attribute are packed into `data` by `adaptRequest` and flattened back by `adminCompany`. `CompanyPatch` has no `status` — lifecycle uses activate/disable/suspend. |
+| admin users | 8 | routes/admin.py | ADAPTED | `UserCreate`/`UserPatch` are `extra="forbid"` and store no display name: `name` rides in `data`. Roles are `admin`\|`customer` only. Create requires a ≥10-char password (no password ⇒ no usable credential; Supabase mode 422s). reset-password requires `{password}` and returns 204 → `null` through api.js, so the page owns the confirmation text. |
 | admin errors/logs | 2 | [routes/admin.py](routes/admin.py) | EXISTS | Admin-only, secret-safe operational summaries promoted in Phase 4. |
 | company profile/positioning/sales-prefs | 6 | [routes/company.py](routes/company.py) | PARTIAL | GET returns section envelope `{company_id, data, updated_at}`; PATCH requires `{data: {...}}` (§3.3.2). |
 | onboarding | 11 | [routes/onboarding.py](routes/onboarding.py) | ADAPTED | Eight persisted steps; the original five remain the completion compatibility boundary. PATCH uses `{data}` and status is normalized for the view-model. |

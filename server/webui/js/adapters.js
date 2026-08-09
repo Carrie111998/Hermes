@@ -291,6 +291,32 @@ export function adaptRequest(name, body) {
     if (name === 'campaigns.create' || lead_ids !== undefined) request.lead_ids = lead_ids || [];
     return request;
   }
+  if (name === 'admin.companies.create' || name === 'admin.companies.update') {
+    // CompanyCreate/CompanyPatch are extra="forbid": `website`, `plan` and every
+    // other profile attribute is a 422 at the top level and belongs in `data`,
+    // where adminCompany() flattens it back out on the response.
+    const { name: companyName, legal_name, status, data, ...extra } = body || {};
+    const request = { data: { ...(data || {}), ...extra } };
+    if (companyName !== undefined) request.name = companyName;
+    if (legal_name !== undefined) request.legal_name = legal_name;
+    // CompanyPatch has no `status`; lifecycle moves go through activate/disable/suspend.
+    if (name === 'admin.companies.create' && status !== undefined) request.status = status;
+    return request;
+  }
+  if (name === 'admin.users.create' || name === 'admin.users.update') {
+    // UserCreate/UserPatch are extra="forbid" and store no display name of their
+    // own — `name` rides in `data`, which adminUser() reads back.
+    const { email, password, role, company_id, status, data, ...extra } = body || {};
+    const request = { data: { ...(data || {}), ...extra } };
+    if (email !== undefined) request.email = email;
+    if (role !== undefined) request.role = role;
+    if (company_id !== undefined) request.company_id = company_id;
+    // UserCreate rejects `status`; UserPatch rejects `password` (reset-password owns it).
+    if (name === 'admin.users.create') {
+      if (password) request.password = password;
+    } else if (status !== undefined) request.status = status;
+    return request;
+  }
   if (name === 'messages.update') return { content: body || {} };
   if (name === 'campaigns.generateMessages' || name === 'campaigns.send' || name === 'brain.build' || name === 'brain.rebuild') {
     return body || {};

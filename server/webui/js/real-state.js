@@ -42,6 +42,25 @@ function merge(key, payload, topic = key) {
   emit(topic, db[key]);
 }
 
+/* db.admin holds its collections one level down, so the flat helpers above do
+   not apply. Every admin surface reads companies/users out of this store —
+   usersTable resolves a user's company name from db.admin.companies, and the
+   user modal builds its company options from it — so real responses have to
+   land here or the UI falls back to "Platform" for every row. */
+function replaceAdmin(key, payload) {
+  db.admin[key] = items(payload);
+  emit('admin', db.admin);
+}
+
+function upsertAdmin(key, value) {
+  if (!value?.id) return;
+  if (!Array.isArray(db.admin[key])) db.admin[key] = [];
+  const index = db.admin[key].findIndex(item => item.id === value.id);
+  if (index === -1) db.admin[key].unshift(value);
+  else db.admin[key][index] = value;
+  emit('admin', db.admin);
+}
+
 function remove(key, id, topic = key) {
   if (!id || !Array.isArray(db[key])) return;
   db[key] = db[key].filter(item => item.id !== id);
@@ -103,7 +122,16 @@ export function syncRealResponse(name, payload, { params = {}, query = {} } = {}
     emit('company', db.company);
   } else if (name === 'onboarding.status' || name === 'onboarding.start' || name.startsWith('onboarding.update') || name === 'onboarding.reviewBrain' || name === 'onboarding.complete') {
     syncOnboarding(payload);
-  } else if (name === 'products.list') replace('products', payload);
+  } else if (name === 'admin.companies.list') replaceAdmin('companies', payload);
+  else if (['admin.companies.get', 'admin.companies.create', 'admin.companies.update',
+    'admin.companies.activate', 'admin.companies.disable', 'admin.companies.suspend'].includes(name)) {
+    upsertAdmin('companies', payload);
+  } else if (name === 'admin.users.list') replaceAdmin('users', payload);
+  else if (['admin.users.get', 'admin.users.create', 'admin.users.update',
+    'admin.users.assignCompany'].includes(name)) upsertAdmin('users', payload);
+  else if (name === 'admin.errors') replaceAdmin('errors', payload);
+  else if (name === 'admin.logs') replaceAdmin('logs', payload);
+  else if (name === 'products.list') replace('products', payload);
   else if (['products.create', 'products.get', 'products.update'].includes(name)) upsert('products', payload);
   else if (name === 'products.delete') remove('products', params.productId);
   else if (name === 'documents.list') replace('documents', payload);
