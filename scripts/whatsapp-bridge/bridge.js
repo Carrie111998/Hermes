@@ -34,6 +34,12 @@ import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
+  createMessageConsumerQueues,
+  normalizeConsumerId,
+  parseConsumerRoutes,
+  selectConsumerForEvent,
+} from './message_consumers.js';
+import {
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
@@ -267,9 +273,18 @@ let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
 
-// Message queue for polling
-const messageQueue = [];
+// The gateway continues to poll the default queue.  Explicitly configured
+// command routes may instead target a named local consumer, allowing a second
+// local integration without a race to drain the one Baileys socket.
 const MAX_QUEUE_SIZE = 100;
+const messageConsumers = createMessageConsumerQueues(MAX_QUEUE_SIZE);
+const CONSUMER_ROUTES = parseConsumerRoutes(process.env.WHATSAPP_CONSUMER_ROUTES_JSON);
+
+function enqueueInboundEvent(event) {
+  const consumer = selectConsumerForEvent(event, CONSUMER_ROUTES);
+  messageConsumers.enqueue(event, consumer);
+  return consumer;
+}
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -375,10 +390,7 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
-  if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
-  }
+  enqueueInboundEvent(event);
 }
 
 function rememberSentId(id) {
@@ -760,7 +772,7 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
-      messageQueue.push(event);
+      const consumer = enqueueInboundEvent(event);
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
@@ -769,11 +781,9 @@ async function startSocket() {
         bodyLength: event.body.length,
         hasMedia: event.hasMedia,
         mediaType: event.mediaType,
-        queueLength: messageQueue.length,
+        consumer,
+        queueLength: messageConsumers.defaultQueueLength(),
       });
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
-      }
     }
   });
 }
@@ -815,8 +825,11 @@ app.use((req, res, next) => {
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
-  res.json(msgs);
+  const consumer = normalizeConsumerId(req.query.consumer);
+  if (!consumer) {
+    return res.status(400).json({ error: 'Invalid consumer identifier' });
+  }
+  return res.json(messageConsumers.drain(consumer));
 });
 
 // Send a message
@@ -1107,7 +1120,8 @@ app.get('/chat/:id', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
-    queueLength: messageQueue.length,
+    queueLength: messageConsumers.defaultQueueLength(),
+    consumerQueueLengths: messageConsumers.lengths(),
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,

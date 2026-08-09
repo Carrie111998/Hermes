@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -685,6 +686,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            # Optional command routes are declared in config.yaml but consumed
+            # only by the local Node bridge. This keeps the Python gateway on
+            # its unchanged default queue while another local integration can
+            # poll a named queue without racing it.
+            consumer_routes = self.config.extra.get("consumer_routes")
+            if consumer_routes:
+                try:
+                    bridge_env["WHATSAPP_CONSUMER_ROUTES_JSON"] = json.dumps(consumer_routes)
+                except (TypeError, ValueError):
+                    logger.warning("[%s] Ignoring non-serializable consumer_routes", self.name)
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge
