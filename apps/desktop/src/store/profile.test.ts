@@ -52,6 +52,8 @@ beforeEach(() => {
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
+  vi.mocked(getProfiles).mockReset()
+  vi.mocked(getProfiles).mockResolvedValue({ profiles: [] })
   vi.stubGlobal('window', { hermesDesktop: { getConnection } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
@@ -154,6 +156,19 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
 })
 
 describe('refreshProfiles shared rail list (#49289)', () => {
+  it('merges the local catalog into the active remote catalog', async () => {
+    $activeGatewayProfile.set('remote-agent')
+    vi.mocked(getProfiles)
+      .mockResolvedValueOnce({ profiles: [profile('default', true), profile('remote-agent')] })
+      .mockResolvedValueOnce({ profiles: [profile('default', true), profile('local-worker')] })
+
+    await refreshProfiles()
+
+    expect(getProfiles).toHaveBeenNthCalledWith(1, 'remote-agent')
+    expect(getProfiles).toHaveBeenNthCalledWith(2, 'default')
+    expect($profiles.get().map(item => item.name)).toEqual(['default', 'local-worker', 'remote-agent'])
+  })
+
   it('removes a deleted profile from the shared $profiles cache after Manage Profiles refreshes', async () => {
     $profiles.set([profile('default', true), profile('test1')])
     vi.mocked(getProfiles).mockResolvedValueOnce({ profiles: [profile('default', true)] })

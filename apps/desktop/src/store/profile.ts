@@ -38,8 +38,45 @@ export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
 }
 
+function mergeProfileCatalogs(
+  activeProfiles: ProfileInfo[],
+  localProfiles: ProfileInfo[],
+  activeKey: string
+): ProfileInfo[] {
+  const merged = new Map<string, ProfileInfo>()
+
+  for (const item of localProfiles) {
+    merged.set(normalizeProfileKey(item.name), item)
+  }
+
+  for (const item of activeProfiles) {
+    const key = normalizeProfileKey(item.name)
+
+    // The active backend is authoritative for its own profile metadata. Local
+    // metadata wins for every other colliding name because mixed routing sends
+    // known local profiles to the Mac backend.
+    if (key === activeKey || !merged.has(key)) {
+      merged.set(key, item)
+    }
+  }
+
+  return [...merged.values()]
+}
+
 export async function refreshProfiles(): Promise<ProfileInfo[]> {
-  const { profiles } = await getProfiles()
+  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  const { profiles: activeProfiles } = await getProfiles(activeKey)
+  let localProfiles = activeProfiles
+
+  if (activeKey !== 'default') {
+    // The picker is a Desktop-level catalog, not only the current gateway's
+    // catalog. Fetch the local default backend as well so a remote primary does
+    // not hide the Mac's local profiles.
+    const localResponse = await getProfiles('default').catch(() => ({ profiles: [] }))
+    localProfiles = localResponse.profiles
+  }
+
+  const profiles = mergeProfileCatalogs(activeProfiles, localProfiles, activeKey)
   $profiles.set(profiles)
 
   return profiles

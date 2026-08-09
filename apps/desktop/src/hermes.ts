@@ -1473,8 +1473,9 @@ export function instantiateAutomationBlueprint(
   })
 }
 
-export function getProfiles(): Promise<ProfilesResponse> {
+export function getProfiles(profile?: null | string): Promise<ProfilesResponse> {
   return window.hermesDesktop.api<ProfilesResponse>({
+    ...profileScoped(profile),
     path: '/api/profiles',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
