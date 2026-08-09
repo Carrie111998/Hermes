@@ -45,6 +45,15 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
+
+# Skill categories demoted to names-only in messaging platforms (WeChat, Slack,
+# etc.). These are primarily coding/cron/infra/agent-internal skills that are
+# not relevant to chat-based user interactions. Descriptions are dropped but
+# names stay visible — skill_view still loads them on demand.
+_MESSAGING_COMPACT_SKILL_CATEGORIES = (
+    "bot", "coding", "computer-use", "cron", "data-science", "devops",
+    "engineering", "finance", "infra", "invest", "report", "research",
+)
 from utils import is_truthy_value
 
 
@@ -311,10 +320,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+
+        # Messaging platforms (WeChat, Slack, etc.): demote coding/cron/infra
+        # skill categories to names-only. Chat users rarely need these — they
+        # add noise to the index and cause unnecessary skill_view loads.
+        # Non-messaging platforms (CLI, TUI, API) keep the full index.
+        if agent.platform in ("weixin", "slack", "telegram", "wecom", "qqbot", "yuanbao"):
+            _compact_cats = _compact_cats | frozenset(_MESSAGING_COMPACT_SKILL_CATEGORIES)
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            platform=agent.platform or "",
         )
     else:
         skills_prompt = ""
