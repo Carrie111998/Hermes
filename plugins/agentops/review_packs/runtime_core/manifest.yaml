@@ -1,0 +1,22 @@
+schema_version: 1
+name: runtime_core
+description: Read-only runtime evidence pack for Hermes Gateway fleet review.
+authority_mode: observe_only
+execution: disabled
+inputs:
+  collectors:
+    - logs
+    - processes
+    - launchd
+    - cron
+    - sqlite_health
+    - git_state
+  redaction_policy_version: 1
+evidence:
+  required_fields:
+    - target_id
+    - collected_at
+    - collector
+    - signal_id
+    - redaction_version
+actions: []
