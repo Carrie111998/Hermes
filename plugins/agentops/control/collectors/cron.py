@@ -26,6 +26,7 @@ from plugins.agentops.control.observer_models import (
     utc_now,
 )
 from plugins.agentops.control.redaction import redact_signal
+from plugins.agentops.control.review_pack import ReviewPack, load_review_pack
 
 
 class CronCollector:
@@ -40,6 +41,7 @@ class CronCollector:
         max_assertions: int = 32,
         max_bytes: int = 64 * 1024,
         min_interval_seconds: float = 0.0,
+        review_pack: ReviewPack | None = None,
     ) -> None:
         if not isinstance(observation, CronObservation):
             raise ValueError("cron collector requires a detached observation")
@@ -54,6 +56,7 @@ class CronCollector:
         self.source_path = Path(source_path)
         self.source_id = asset_source_id(self.source_path)
         self.required_assertion_ids = frozenset(required_assertion_ids)
+        self.review_pack = review_pack if review_pack is not None else load_review_pack()
         self.max_assertions = max_assertions
         self.max_bytes = max_bytes
         self.min_interval_seconds = min_interval_seconds
@@ -95,7 +98,9 @@ class CronCollector:
                     evidence=item.get("evidence", {}),
                     observed_at=datetime.fromisoformat(item["observed_at"].replace("Z", "+00:00")),
                     max_age_seconds=item.get("max_age_seconds", 300),
-                    mandatory=item.get("mandatory", True),
+                    # Unlabelled ad-hoc status fields are informational; a
+                    # producer must explicitly mark an assertion mandatory.
+                    mandatory=item.get("mandatory", False),
                     severity=item.get("severity", "warning"),
                 )
                 for item in assertions_data
@@ -138,6 +143,7 @@ class CronCollector:
         by_name = {assertion.name: assertion for assertion in observation.assertions}
         missing = sorted(self.required_assertion_ids.difference(by_name))
         execution_ok = execution.completed and execution.exit_code == 0
+        execution_fresh = 0 <= (observed_at - execution.observed_at).total_seconds() <= execution.max_age_seconds
         signals = [
             redact_signal(
                 RawSignal(
@@ -156,6 +162,25 @@ class CronCollector:
             )
         ]
         failures = list(missing)
+        unknown = sorted(
+            assertion.name for assertion in observation.assertions
+            if assertion.mandatory and assertion.name not in self.review_pack.assertions
+        )
+        if unknown:
+            failures.extend(unknown)
+            for name in unknown:
+                signals.append(redact_signal(RawSignal(
+                    target_id=target.target_id, collector=self.name,
+                    signal_type="cron.business_assertion_unknown", observed_at=observed_at,
+                    severity="critical", payload={"name": name},
+                )))
+        if not execution_fresh:
+            failures.append("execution_stale")
+            signals.append(redact_signal(RawSignal(
+                target_id=target.target_id, collector=self.name,
+                signal_type="cron.execution_stale", observed_at=observed_at,
+                severity="warning", payload={"execution_observed_at": execution.observed_at.isoformat()},
+            )))
         if not self.required_assertion_ids:
             failures.append("required_assertions_not_configured")
             signals.append(
@@ -234,6 +259,8 @@ class CronCollector:
         reason = None
         if not execution_ok:
             reason = "cron_execution_unhealthy"
+        elif not execution_fresh:
+            reason = "cron_execution_stale"
         elif failures:
             reason = "cron_assertions_missing" if not self.required_assertion_ids else "cron_business_assertions_unhealthy"
         return CollectionBatch(

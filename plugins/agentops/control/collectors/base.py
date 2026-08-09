@@ -22,14 +22,14 @@ class Collector(Protocol):
     def collect(self, target: Target, cursor: LogCursor | None = None) -> CollectionBatch: ...
 
 
-def failed_batch(target: Target, collector: str, reason: str, *, source_id: str = "") -> CollectionBatch:
+def failed_batch(target: Target, collector: str, reason: str, *, source_id: str = "", worker_detached: bool = False) -> CollectionBatch:
     """Return non-echoing bounded failure evidence, never an exception payload."""
     return CollectionBatch(
         target_id=target.target_id,
         collector=collector,
         collected_at=utc_now(),
         signals=(),
-        health=CollectorHealth(healthy=False, reason=reason),
+        health=CollectorHealth(healthy=False, reason=reason, worker_detached=worker_detached),
         source_id=source_id,
     )
 
@@ -77,7 +77,9 @@ def collect_all(
                 )
         except (FutureTimeout, TimeoutError):
             future.cancel()
-            batch = failed_batch(target, name, "collector_timeout", source_id=source_id)
+            # Python threads cannot be force-killed safely.  Surface the detached
+            # worker explicitly so readiness never treats this as a clean timeout.
+            batch = failed_batch(target, name, "collector_timeout", source_id=source_id, worker_detached=True)
         except Exception:
             batch = failed_batch(target, name, "collector_failed", source_id=source_id)
         finally:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,14 +27,15 @@ class BoundedBridgeBuffer:
         if not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("invalid bridge capacity")
         self.capacity = capacity
-        self._pending: deque[str] = deque()
+        self._pending: deque[tuple[str, str]] = deque()
+        self._inflight: set[str] = set()
         self._lock = threading.Lock()
         self._dropped = 0
 
     @property
     def depth(self) -> int:
         with self._lock:
-            return len(self._pending)
+            return len(self._pending) + len(self._inflight)
 
     @property
     def dropped(self) -> int:
@@ -57,10 +59,13 @@ class BoundedBridgeBuffer:
     def _enqueue(self, serialized: str) -> bool:
         self._delivery_copy(serialized)
         with self._lock:
-            if len(self._pending) >= self.capacity:
+            if len(self._pending) + len(self._inflight) >= self.capacity:
+                if not self._pending:
+                    self._dropped += 1
+                    return False
                 self._pending.popleft()
                 self._dropped += 1
-            self._pending.append(serialized)
+            self._pending.append((uuid.uuid4().hex, serialized))
         return True
 
     def publish(self, event: EventEnvelope, deliver: Callable[[EventEnvelope], None]) -> BridgeResult:
@@ -85,13 +90,16 @@ class BoundedBridgeBuffer:
             with self._lock:
                 if not self._pending:
                     return delivered
-                serialized = self._pending[0]
+                token, serialized = self._pending.popleft()
+                self._inflight.add(token)
             try:
                 event = self._delivery_copy(serialized)
                 deliver(event)
             except Exception:
+                with self._lock:
+                    self._inflight.discard(token)
+                    self._pending.appendleft((token, serialized))
                 return delivered
             with self._lock:
-                if self._pending and self._pending[0] == serialized:
-                    self._pending.popleft()
-                    delivered += 1
+                self._inflight.discard(token)
+                delivered += 1

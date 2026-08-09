@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from plugins.agentops.control.config import AgentOpsConfig, STATE_MARKER, _marker_is_valid
 from plugins.agentops.control.observer_models import CollectionBatch, LogCursor, RawSignal, Signal, TargetSnapshot, thaw_value
-from plugins.agentops.control.redaction import RedactionError, redact_signal, redact_value, verify_redacted_signal
+from plugins.agentops.control.redaction import RedactionError, contains_secret, redact_signal, redact_text, redact_value, verify_redacted_signal
 
 
 OBSERVER_SCHEMA_VERSION = 2
@@ -27,9 +27,28 @@ _CURRENT_TABLES = _LEGACY_TABLES | {
     "source_cursors",
 }
 
+_SCHEMA_COLUMNS = {
+    "schema_migrations": (("version", "INTEGER", 0, 1),),
+    "target_snapshots": (("target_id", "TEXT", 0, 1), ("observed_at", "TEXT", 1, 0), ("facts_json", "TEXT", 1, 0), ("collector_version", "TEXT", 1, 0)),
+    "signals": (("signal_id", "TEXT", 0, 1), ("target_id", "TEXT", 1, 0), ("collector", "TEXT", 1, 0), ("signal_type", "TEXT", 1, 0), ("observed_at", "TEXT", 1, 0), ("severity", "TEXT", 1, 0), ("redaction_version", "INTEGER", 1, 0), ("payload_json", "TEXT", 1, 0)),
+    "collector_cursors": (("target_id", "TEXT", 1, 1), ("collector", "TEXT", 1, 2), ("inode", "INTEGER", 1, 0), ("offset", "INTEGER", 1, 0)),
+    "observer_metadata": (("key", "TEXT", 0, 1), ("value", "TEXT", 1, 0)),
+    "collection_runs": (("observation_id", "TEXT", 0, 1), ("target_id", "TEXT", 1, 0), ("collector", "TEXT", 1, 0), ("source_id", "TEXT", 1, 0), ("collected_at", "TEXT", 1, 0), ("healthy", "INTEGER", 1, 0), ("reason", "TEXT", 0, 0), ("signal_count", "INTEGER", 1, 0)),
+    "signal_occurrences": (("signal_id", "TEXT", 0, 1), ("first_seen", "TEXT", 1, 0), ("last_seen", "TEXT", 1, 0), ("occurrence_count", "INTEGER", 1, 0)),
+    "collection_run_signals": (("observation_id", "TEXT", 1, 1), ("signal_id", "TEXT", 1, 2)),
+    "source_cursors": (("target_id", "TEXT", 1, 1), ("collector", "TEXT", 1, 2), ("source_id", "TEXT", 1, 3), ("inode", "INTEGER", 1, 0), ("offset", "INTEGER", 1, 0)),
+}
+
 
 class ObserverStoreError(RuntimeError):
     """Raised before untrusted or non-AgentOps state can be changed."""
+
+
+def _safe_text(value: object, field: str) -> str:
+    text = redact_text(str(value))
+    if contains_secret(text):
+        raise ObserverStoreError(f"unredacted persisted field: {field}")
+    return text
 
 
 def _mode(path: Path) -> int:
@@ -99,6 +118,29 @@ def _table_names(connection: sqlite3.Connection) -> frozenset[str]:
     return frozenset(str(row[0]) for row in rows)
 
 
+def _validate_schema_shape(connection: sqlite3.Connection, version: int) -> None:
+    tables = _LEGACY_TABLES if version == 1 else _CURRENT_TABLES
+    for table in tables:
+        rows = tuple((str(r[1]), str(r[2]).upper(), int(r[3]), int(r[5])) for r in connection.execute(f"PRAGMA table_info({table})"))
+        if rows != _SCHEMA_COLUMNS[table]:
+            raise ObserverStoreError("observer database schema incompatible")
+    expected_fk = {
+        ("signal_occurrences", "signals", "signal_id", "signal_id"),
+        ("collection_run_signals", "collection_runs", "observation_id", "observation_id"),
+        ("collection_run_signals", "signals", "signal_id", "signal_id"),
+    }
+    actual_fk = set()
+    for table in tables:
+        for row in connection.execute(f"PRAGMA foreign_key_list({table})"):
+            actual_fk.add((table, str(row[2]), str(row[3]), str(row[4])))
+    if actual_fk != (expected_fk if version == 2 else set()):
+        raise ObserverStoreError("observer database constraints incompatible")
+    for table in tables:
+        for row in connection.execute(f"PRAGMA index_list({table})"):
+            if int(row[2]) and str(row[3]) != "pk":
+                raise ObserverStoreError("observer database indexes incompatible")
+
+
 def _preflight_existing_database(path: Path) -> int:
     """Read schema/integrity before any writable SQLite connection or WAL change."""
     try:
@@ -110,12 +152,14 @@ def _preflight_existing_database(path: Path) -> int:
             tables = _table_names(connection)
             if "schema_migrations" not in tables:
                 raise ObserverStoreError("unmanaged observer database")
-            row = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
-            version = 0 if row is None or row[0] is None else int(row[0])
-            if version == 1 and tables == _LEGACY_TABLES:
+            versions = [int(row[0]) for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")]
+            version = versions[-1] if versions else 0
+            if version == 1 and versions == [1] and tables == _LEGACY_TABLES:
+                _validate_schema_shape(connection, version)
                 return version
-            if version != OBSERVER_SCHEMA_VERSION or tables != _CURRENT_TABLES:
+            if version != OBSERVER_SCHEMA_VERSION or versions != [1, 2] or tables != _CURRENT_TABLES:
                 raise ObserverStoreError("unmanaged observer database")
+            _validate_schema_shape(connection, version)
             kind = connection.execute(
                 "SELECT value FROM observer_metadata WHERE key='store_kind'"
             ).fetchone()
@@ -269,7 +313,7 @@ class ObserverStore:
                     collector_version=excluded.collector_version
                 WHERE excluded.observed_at >= target_snapshots.observed_at
                 """,
-                (snapshot.target_id, snapshot.observed_at.isoformat(), payload, snapshot.collector_version),
+                (_safe_text(snapshot.target_id, "target_id"), _safe_text(snapshot.observed_at.isoformat(), "observed_at"), payload, _safe_text(snapshot.collector_version, "collector_version")),
             )
 
     @staticmethod
@@ -309,13 +353,13 @@ class ObserverStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        batch.observation_id,
-                        batch.target_id,
-                        batch.collector,
-                        batch.source_id,
-                        batch.collected_at.isoformat(),
+                        _safe_text(batch.observation_id, "observation_id"),
+                        _safe_text(batch.target_id, "target_id"),
+                        _safe_text(batch.collector, "collector"),
+                        _safe_text(batch.source_id, "source_id"),
+                        _safe_text(batch.collected_at.isoformat(), "collected_at"),
                         int(batch.health.healthy),
-                        batch.health.reason,
+                        None if batch.health.reason is None else _safe_text(batch.health.reason, "reason"),
                         len(safe_signals),
                     ),
                 )
@@ -334,12 +378,12 @@ class ObserverStore:
                             payload_json=excluded.payload_json
                         """,
                         (
-                            signal.signal_id,
-                            signal.target_id,
-                            signal.collector,
-                            signal.signal_type,
-                            signal.observed_at.isoformat(),
-                            signal.severity,
+                            _safe_text(signal.signal_id, "signal_id"),
+                            _safe_text(signal.target_id, "target_id"),
+                            _safe_text(signal.collector, "collector"),
+                            _safe_text(signal.signal_type, "signal_type"),
+                            _safe_text(signal.observed_at.isoformat(), "observed_at"),
+                            _safe_text(signal.severity, "severity"),
                             signal.redaction_version,
                             payload,
                         ),
@@ -349,10 +393,11 @@ class ObserverStore:
                         INSERT INTO signal_occurrences(signal_id, first_seen, last_seen, occurrence_count)
                         VALUES (?, ?, ?, 1)
                         ON CONFLICT(signal_id) DO UPDATE SET
-                            last_seen=excluded.last_seen,
+                            first_seen=MIN(signal_occurrences.first_seen, excluded.first_seen),
+                            last_seen=MAX(signal_occurrences.last_seen, excluded.last_seen),
                             occurrence_count=signal_occurrences.occurrence_count + 1
                         """,
-                        (signal.signal_id, signal.observed_at.isoformat(), signal.observed_at.isoformat()),
+                        (_safe_text(signal.signal_id, "signal_id"), _safe_text(signal.observed_at.isoformat(), "first_seen"), _safe_text(signal.observed_at.isoformat(), "last_seen")),
                     )
                     self._connection.execute(
                         "INSERT INTO collection_run_signals(observation_id, signal_id) VALUES (?, ?)",
@@ -366,11 +411,12 @@ class ObserverStore:
                         ON CONFLICT(target_id, collector, source_id) DO UPDATE SET
                             inode=excluded.inode,
                             offset=excluded.offset
+                        WHERE excluded.inode != source_cursors.inode OR excluded.offset >= source_cursors.offset
                         """,
                         (
-                            batch.target_id,
-                            batch.collector,
-                            batch.source_id,
+                            _safe_text(batch.target_id, "target_id"),
+                            _safe_text(batch.collector, "collector"),
+                            _safe_text(batch.source_id, "source_id"),
                             batch.next_cursor.inode,
                             batch.next_cursor.offset,
                         ),

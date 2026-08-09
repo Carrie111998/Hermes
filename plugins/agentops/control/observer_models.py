@@ -263,10 +263,13 @@ class Signal:
 class CollectorHealth:
     healthy: bool
     reason: str | None = None
+    worker_detached: bool = False
 
     def __post_init__(self) -> None:
         if self.reason is not None and (not isinstance(self.reason, str) or not self.reason):
             raise ValueError("invalid collector health reason")
+        if not isinstance(self.worker_detached, bool):
+            raise ValueError("invalid worker lifecycle state")
 
 
 @dataclass(frozen=True)
@@ -307,12 +310,15 @@ class CronExecution:
     observed_at: datetime
     exit_code: int | None
     completed: bool
+    max_age_seconds: int = 300
 
     def __post_init__(self) -> None:
         if not isinstance(self.job_id, str) or not self.job_id:
             raise ValueError("invalid cron job id")
         if self.exit_code is not None and not isinstance(self.exit_code, int):
             raise ValueError("invalid cron exit code")
+        if not isinstance(self.max_age_seconds, int) or self.max_age_seconds <= 0:
+            raise ValueError("invalid cron execution freshness")
         object.__setattr__(self, "observed_at", _require_aware(self.observed_at))
 
 

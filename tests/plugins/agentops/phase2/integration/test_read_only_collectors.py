@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
-import hashlib
 import plistlib
+import hashlib
 import sqlite3
 
 from plugins.agentops.control.collectors.cron import CronCollector
@@ -92,9 +92,21 @@ def test_plist_process_and_git_collectors_expose_read_only_fingerprints(tmp_path
             return "hermes-gateway"
 
         def cmdline(self):
-            return ["hermes", "--token", "secret"]
+            return ["hermes", "ai.hermes.gateway", "g2test", "--token", "secret"]
 
-    process_batch = ProcessCollector(process_iter=lambda: [Process()]).collect(target)
+        def uids(self):
+            import os
+            class Uids: real = os.getuid()
+            return Uids()
+
+    command = Process().cmdline()
+    fingerprint = "sha256:" + hashlib.sha256("\x00".join(command).encode()).hexdigest()
+    bound_target = TargetSpec(
+        target_id=target.target_id, profile=target.spec.profile, kind=target.spec.kind,
+        criticality=target.spec.criticality, observed_paths=target.spec.observed_paths,
+        labels={"service_label": "ai.hermes.gateway", "process_marker": "g2test", "command_fingerprint": fingerprint},
+    )
+    process_batch = ProcessCollector(process_iter=lambda: [Process()]).collect(Target(bound_target))
     assert process_batch.signals[0].payload["command_fingerprint"].startswith("sha256:")
 
     git_dir = tmp_path / "repo" / ".git"

@@ -281,3 +281,53 @@ Phase 2 remains an isolated read-only observer only.
   interpreter dependencies.
 - [x] Worktree is clean after a remediation-only commit; no push, merge or
   Phase 3 transition has occurred.
+
+## Sol G2 Remediation Addendum 2 (2026-08-09)
+
+**Trigger:** Sol's second G2 review found additional counterexamples. The
+previous remediation evidence is superseded again until the exact invariants
+below are implemented and independently re-reviewed.
+
+- [x] **Exact store schema preflight.** Validate every expected table column,
+  SQLite type, primary/foreign key and uniqueness constraint, schema version
+  monotonicity and store marker in a read-only connection before opening a
+  writable handle. Same-name incompatible v1 stores, DELETE→WAL changes and
+  bytes changes are negative-tested and rejected.
+- [x] **Full-record secret gate.** Redact and rescan every persisted string,
+  including run reason, source/collector metadata, snapshot version, IDs,
+  timestamps, report/manifest fields and sidecars. A canary cannot occur in
+  DB/WAL/SHM, spool, quarantine or emitted report data.
+- [x] **Cron freshness and manifest authority.** Execution freshness is checked
+  independently from exit code. Every mandatory assertion must be declared by
+  the loaded Review Pack; unknown, missing, stale and failed assertions are
+  unhealthy, including assertions with `mandatory=True` that are absent from
+  the manifest.
+- [x] **Git exact registered-root containment.** `.git`, gitdir, commondir,
+  loose refs and packed refs resolve only beneath the registered repository
+  root or its explicitly registered canonical Git metadata roots. Every parent
+  component is checked for symlinks.
+- [x] **Process identity binding.** Match target profile label, command
+  fingerprint and owner; a PID observed under another Profile is not accepted
+  merely because a service label exists.
+- [x] **Worker and inspection budgets.** Collector deadlines expose worker
+  lifecycle/termination state and isolate unkillable workers. Process budgets
+  count every inspected item, not only emitted matches; all budget failures
+  remain bounded and observable.
+- [x] **Bridge exactly-once drain acknowledgement.** Concurrent drains claim
+  an item once, mark it in-flight and remove it only after successful delivery;
+  no event is delivered twice.
+- [x] **Monotonic evidence commits.** Out-of-order collection batches cannot
+  move `last_seen`, cursors or source observations backward; observation IDs
+  and sequence/ordering guards reject stale commits.
+- [x] **Executable Review Pack validation.** A loader resolves collector entry
+  points, enforces capability/target-kind compatibility and validates all
+  budget/rate limits before any collector can run. Missing, over-budget or
+  mismatched declarations are rejected.
+
+### Additional second-round tests
+
+- [x] incompatible same-name v1 schema, full-field canary scan, stale/unknown
+  Cron and manifest-mandatory assertion tests
+- [x] Git symlink/root escape and cross-profile PID tests
+- [x] timed-out worker lifecycle, inspected-item budget, concurrent Bridge
+  drain, out-of-order signal/cursor and manifest loader contract tests

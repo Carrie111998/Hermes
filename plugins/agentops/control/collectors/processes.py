@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -53,8 +54,14 @@ class ProcessCollector:
         return "sha256:" + digest
 
     def collect(self, target: Target, cursor: LogCursor | None = None) -> CollectionBatch:
-        if not target.spec.labels.get("service_label"):
+        labels = target.spec.labels
+        service_label = labels.get("service_label")
+        profile_marker = labels.get("process_marker")
+        expected_fingerprint = labels.get("command_fingerprint")
+        if not service_label:
             return failed_batch(target, self.name, "asset_unbound", source_id=self.source_id)
+        if not profile_marker or not expected_fingerprint:
+            return failed_batch(target, self.name, "process_binding_unconfigured", source_id=self.source_id)
         with self._rate_lock:
             now = time.monotonic()
             if now - self._last_collection < self.min_interval_seconds:
@@ -62,14 +69,25 @@ class ProcessCollector:
             self._last_collection = now
         observed_at = utc_now()
         signals = []
+        inspected = 0
         try:
             processes = self._process_iter()
             for process in processes:
-                if len(signals) >= self.max_items:
+                inspected += 1
+                if inspected > self.max_items:
                     break
                 try:
                     name = str(process.name())
                     if self.name_contains and self.name_contains not in name.casefold():
+                        continue
+                    command = [str(part) for part in process.cmdline()]
+                    fingerprint = self._command_fingerprint(process)
+                    if profile_marker not in command and f"--profile={profile_marker}" not in command:
+                        continue
+                    if service_label not in command:
+                        continue
+                    owner = process.uids().real
+                    if int(owner) != os.getuid() or fingerprint != expected_fingerprint:
                         continue
                     signals.append(
                         redact_signal(
@@ -81,7 +99,9 @@ class ProcessCollector:
                                 payload={
                                     "pid": int(process.pid),
                                     "name": name,
-                                    "command_fingerprint": self._command_fingerprint(process),
+                                    "command_fingerprint": fingerprint,
+                                    "profile_marker": profile_marker,
+                                    "owner_uid": int(owner),
                                 },
                             )
                         )

@@ -27,6 +27,7 @@ from plugins.agentops.control.observer_models import (
     Criticality,
     CronExecution,
     CronObservation,
+    LogCursor,
     RawSignal,
     Target,
     TargetKind,
@@ -35,6 +36,7 @@ from plugins.agentops.control.observer_models import (
 )
 from plugins.agentops.control.observer_store import ObserverStoreError, open_observer_store
 from plugins.agentops.control.redaction import redact_signal
+from plugins.agentops.control.review_pack import ManifestValidationError, load_review_pack
 
 
 def _target(path: Path) -> Target:
@@ -264,9 +266,16 @@ def test_process_plist_and_cron_collectors_enforce_item_or_byte_budgets(tmp_path
             return "hermes-gateway"
 
         def cmdline(self):
-            return ["hermes", "gateway"]
+            return ["hermes", "ai.hermes.gateway-g2test", "g2test"]
 
-    process_batch = ProcessCollector(process_iter=lambda: [Process(1), Process(2)], max_items=1).collect(target)
+        def uids(self):
+            class Uids: real = __import__("os").getuid()
+            return Uids()
+
+    command = Process(1).cmdline()
+    fingerprint = "sha256:" + hashlib.sha256("\x00".join(command).encode()).hexdigest()
+    bound = Target(TargetSpec(target_id=target.target_id, profile=target.spec.profile, kind=target.spec.kind, criticality=target.spec.criticality, observed_paths=target.spec.observed_paths, labels={"service_label": "ai.hermes.gateway-g2test", "process_marker": "g2test", "command_fingerprint": fingerprint}))
+    process_batch = ProcessCollector(process_iter=lambda: [Process(1), Process(2)], max_items=1).collect(bound)
     assert len(process_batch.signals) == 1
 
     plist = tmp_path / "too-large.plist"
@@ -307,3 +316,67 @@ def test_unrelated_existing_observer_database_is_unchanged_before_preflight(writ
     finally:
         check.close()
     assert unrelated.read_bytes() == before
+
+
+def test_same_named_incompatible_observer_schema_is_rejected_without_wal_or_bytes_change(write_config):
+    config = load_agentops_config(write_config())
+    path = config.state_dir / "observer.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES (1); CREATE TABLE target_snapshots(target_id TEXT PRIMARY KEY); CREATE TABLE signals(signal_id TEXT PRIMARY KEY); CREATE TABLE collector_cursors(target_id TEXT, collector TEXT, inode INTEGER, offset INTEGER, PRIMARY KEY(target_id,collector));")
+    db.commit(); db.close(); path.chmod(0o600)
+    before = path.read_bytes()
+    with pytest.raises(ObserverStoreError):
+        open_observer_store(config)
+    assert path.read_bytes() == before
+    assert not path.with_name("observer.db-wal").exists()
+
+
+def test_all_persisted_record_strings_are_redacted_and_occurrences_cursors_are_monotonic(tmp_path, write_config):
+    target = _target(tmp_path)
+    now = datetime.now(timezone.utc)
+    signal = redact_signal(RawSignal(target.target_id, "test.collector", "signal.record", now, {"ok": True}))
+    store = open_observer_store(load_agentops_config(write_config()))
+    try:
+        newer = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(False, "password=hunter2"), next_cursor=None, source_id="sha256:" + "1" * 64)
+        store.commit_collection(newer)
+        older = CollectionBatch(target.target_id, "test.collector", now - timedelta(seconds=5), (signal,), CollectorHealth(True), next_cursor=LogCursor(1, 1, "sha256:" + "1" * 64), source_id="sha256:" + "1" * 64)
+        store.commit_collection(older)
+        raw = b"".join(path.read_bytes() for path in store.path.parent.glob("observer.db*"))
+        assert b"hunter2" not in raw
+        assert store.get_cursor(target.target_id, "test.collector", "sha256:" + "1" * 64).offset == 1
+        row = store._connection.execute("SELECT first_seen,last_seen FROM signal_occurrences WHERE signal_id=?", (signal.signal_id,)).fetchone()
+        assert row[0] <= row[1]
+    finally:
+        store.close()
+
+
+def test_cron_unknown_mandatory_and_stale_execution_are_unhealthy(tmp_path):
+    source = tmp_path / "status.json"; source.write_text("{}")
+    old = datetime.now(timezone.utc) - timedelta(hours=1)
+    observation = CronObservation(CronExecution("job", old, 0, True, max_age_seconds=10), (BusinessAssertion("not-in-pack", True, {}, datetime.now(timezone.utc), mandatory=True),))
+    batch = CronCollector(observation, source_path=source, required_assertion_ids=("not-in-pack",)).collect(_target(tmp_path))
+    assert not batch.health.healthy
+    assert any(signal.signal_type == "cron.business_assertion_unknown" for signal in batch.signals)
+    assert any(signal.signal_type == "cron.execution_stale" for signal in batch.signals)
+
+
+def test_bridge_concurrent_drain_claims_each_event_once(make_event):
+    bridge = BoundedBridgeBuffer(capacity=8)
+    for index in range(4):
+        bridge.publish(make_event(f"evt-drain-{index}"), lambda _: (_ for _ in ()).throw(ConnectionError()))
+    seen = []; lock = threading.Lock()
+    def deliver(event):
+        time.sleep(0.01)
+        with lock: seen.append(event.event_id)
+    threads = [threading.Thread(target=lambda: bridge.drain(deliver)) for _ in range(3)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert len(seen) == len(set(seen)) == 4
+
+
+def test_manifest_loader_executes_entry_capability_and_budget_validation(tmp_path):
+    pack = load_review_pack()
+    assert pack.validate_collector("logs", TargetKind.GATEWAY).entry.endswith(":LogCollector")
+    bad = tmp_path / "manifest.yaml"
+    bad.write_text("schema_version: 2\nauthority_mode: observe_only\nexecution: {no_write: true, action_execution: disabled}\npack: {id: x, version: 1}\ntarget_kinds: [gateway]\ninputs: {retention_days: 1, collectors: [{id: logs, entry: plugins.agentops.control.collectors.logs:Missing, capabilities: [read], target_kinds: [gateway], max_bytes: 99999999, max_items: 1, deadline_seconds: 1, rate_limit_seconds: 1}]}\nassertions: [{id: a, severity: warning, mandatory: true}]\n")
+    with pytest.raises(ManifestValidationError): load_review_pack(bad)
