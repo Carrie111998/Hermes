@@ -904,6 +904,10 @@ def _resolve_skin_file(skins_path: Path, name: str) -> Optional[Path]:
         return None
     if "/" in name or "\\" in name:
         return None
+    # Pathological-length guard: is_file() raises OSError(ENAMETOOLONG)
+    # past the filesystem name limit (~255 bytes) — treat as a miss.
+    if len(name.encode("utf-8")) > 200:
+        return None
     candidate = skins_path / f"{name}.yaml"
     try:
         normalized = candidate.absolute()
