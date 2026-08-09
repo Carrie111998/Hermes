@@ -31,6 +31,8 @@ export const de = defineLocale({
     copyFailed: 'Kopieren fehlgeschlagen',
     delete: 'Löschen',
     docs: 'Doku',
+    expand: 'Ausklappen',
+    formatJson: 'JSON formatieren',
     done: 'Fertig',
     error: 'Fehler',
     failed: 'Fehlgeschlagen',
@@ -48,6 +50,30 @@ export const de = defineLocale({
     update: 'Aktualisieren',
     on: 'An',
     off: 'Aus'
+  },
+
+  fileMenu: {
+    copyPath: 'Pfad kopieren',
+    copyRelativePath: 'Relativen Pfad kopieren',
+    rename: 'Umbenennen…',
+    delete: 'Löschen',
+    renameTitle: 'Umbenennen',
+    renameLabel: 'Neuer Name',
+    deleteTitle: (name) => `${name} löschen?`,
+    deleteBody: 'Wird in den Papierkorb verschoben — von dort kannst du es wiederherstellen.',
+    pathCopied: 'Pfad kopiert',
+    revealFinder: 'Im Finder anzeigen',
+    revealExplorer: 'Im Explorer anzeigen',
+    revealFileManager: 'Enthaltenden Ordner öffnen',
+    revealInSidebar: 'Im Dateibaum anzeigen'
+  },
+
+  billingBlock: {
+    titleNous: 'Nous-Guthaben aufgebraucht',
+    fallbackMessage: 'Dein Konto hat kein Guthaben mehr. Lade Guthaben auf, um fortzufahren.',
+    openBilling: 'Abrechnung öffnen',
+    addCredits: 'Guthaben aufladen',
+    dismiss: 'Ausblenden'
   },
 
   boot: {
@@ -167,6 +193,11 @@ export const de = defineLocale({
   },
 
   titlebar: {
+    enterHud: 'HUD-Modus',
+    exitHud: 'HUD-Modus verlassen',
+    layoutEditor: 'Layout-Editor',
+    layoutEditorTitle: 'Layout-Editor — ⌘-Klick setzt Layout zurück',
+    openStarmap: 'Speichergraph öffnen',
     hideSidebar: 'Seitenleiste ausblenden',
     showSidebar: 'Seitenleiste anzeigen',
     search: 'Suchen',
@@ -183,6 +214,7 @@ export const de = defineLocale({
 
   keybinds: {
     title: 'Tastenkürzel',
+    search: 'Shortcuts durchsuchen…',
     subtitle: open => `Klicke auf ein Kürzel, um es neu zu belegen · ${open} öffnet dieses Panel erneut.`,
     rebind: 'Neu belegen',
     reset: 'Auf Standard zurücksetzen',
@@ -268,6 +300,11 @@ export const de = defineLocale({
     }
   },
 
+  findInPage: {
+    next: 'Nächster Treffer',
+    previous: 'Vorheriger Treffer'
+  },
+
   language: {
     label: 'Sprache',
     description: 'Wähle die Sprache für die Desktop-Oberfläche.',
@@ -288,6 +325,10 @@ export const de = defineLocale({
     resetFailed: 'Zurücksetzen fehlgeschlagen',
     nav: {
       providers: 'Provider',
+      billing: 'Abrechnung',
+      keybinds: 'Tastenkürzel',
+      plugins: 'Plugins',
+      providerCustomEndpoints: 'Benutzerdefinierte Endpunkte',
       providerAccounts: 'Konten',
       providerApiKeys: 'API-Keys',
       gateway: 'Gateway',
@@ -301,6 +342,18 @@ export const de = defineLocale({
     },
     notifications: {
       title: 'Benachrichtigungen',
+      intro: 'Betriebssystem-Benachrichtigungen (keine In-App-Toasts). Pro Gerät.',
+      kinds: {
+        credits: {
+          label: 'Guthaben-Warnungen',
+          description: 'Guthabenzugriff wurde pausiert oder wiederhergestellt.'
+        },
+        plugin: {
+          label: 'Plugin-Benachrichtigungen',
+          description: 'Ein Desktop-Plugin hat eine Benachrichtigung gesendet während Hermes im Hintergrund war.'
+        }
+      },
+      testSent: 'Test gesendet. Wenn nichts erscheint, überprüfe deine Betriebssystem-Benachrichtigungen und Fokus/Nicht-stören.',
       intro:
         'Native Desktop-Benachrichtigungen, getrennt von den In-App-Hinweisen. Diese sind gerätelokal — jeder Rechner behält seine eigenen Einstellungen.',
       enableAll: 'Benachrichtigungen aktivieren',
@@ -665,6 +718,16 @@ export const de = defineLocale({
     },
     config: {
       none: 'Keine',
+      keepAwakeTitle: 'Rechner wach halten',
+      keepAwakeDesc: 'Verhindert den Ruhezustand dieses Rechners, damit lange Übernachtläufe weiterlaufen. Display kann trotzdem dimmen.',
+      attachmentSizeTitle: 'Max. Vorschau- / Bildladegröße',
+      attachmentSizeDesc: 'Max. Vorschau- / Bildladegröße in Megabytes',
+      attachmentSizeUnit: 'MB',
+      attachmentSizeLabel: 'Max. Vorschau- / Bildladegröße in Megabytes',
+      searchPlaceholder: 'Suchen…',
+      noResults: 'Keine Ergebnisse gefunden',
+      systemDefault: 'Systemstandard',
+      builtinOnly: 'Nur eingebaute',
       noneParen: '(keine)',
       notSet: 'Nicht gesetzt',
       commaSeparated: 'kommagetrennte Werte',
@@ -690,6 +753,8 @@ export const de = defineLocale({
       actionsFor: label => `Aktionen für ${label}`,
       credentialActions: 'Zugangsdaten-Aktionen',
       docs: 'Doku',
+    expand: 'Ausklappen',
+    formatJson: 'JSON formatieren',
       hideValue: 'Wert verbergen',
       revealValue: 'Wert anzeigen',
       replace: 'Ersetzen',
@@ -1397,6 +1462,24 @@ export const de = defineLocale({
     promptScheduleRequired: 'Prompt und Zeitplan sind erforderlich.',
     saveChanges: 'Änderungen speichern',
     createAction: 'Cron erstellen'
+  },
+
+  artifactCard: {
+    kind: 'Typ',
+    open: 'Öffnen'
+  },
+
+  artifactPreview: {
+    copyContent: 'Inhalt kopieren',
+    download: 'Herunterladen',
+    latest: 'Neueste',
+    newerVersion: 'Neuere Version',
+    olderVersion: 'Ältere Version',
+    openInBrowser: 'Im Browser öffnen',
+    openInBrowserFailed: 'Konnte nicht im Browser geöffnet werden',
+    missingTitle: 'Artefakt nicht verfügbar',
+    missingBody: 'Dieses Artefakt ist nicht mehr in der lokalen Registry.',
+    versionOf: (current, total) => `v${current} von ${total}`
   },
 
   artifacts: {
@@ -2221,4 +2304,122 @@ export const de = defineLocale({
       toggle: 'Seitenleiste umschalten'
     }
   }
+  starmap: {
+  close: 'Speichergraph schließen',
+  copied: 'Kopiert!',
+  copy: 'Map-Code kopieren',
+  emptyDesc: 'Wenn Hermes Skills und Erinnerungen für deine Arbeit aufbaut, erscheinen sie hier.',
+  emptyTitle: 'Noch nichts gelernt',
+  filterAll: 'Alle',
+  filterLearned: 'Gelernt',
+  filterUsed: 'Genutzt',
+  loadFailed: 'Konnte Speichergraph nicht laden',
+  loading: 'Lädt…',
+  memory: 'Speicher',
+  refresh: 'Aktualisieren',
+  resetToMine: 'Zurück zu meiner Map',
+  share: 'Map teilen',
+  sharePlaceholder: 'Map-Code einfügen…',
+  shareTitle: 'Map importieren / exportieren',
+  subtitle: '__FN__:(\'nodes\', \'clusters\')',
+  title: 'Speichergraph',
+  viewGraph: 'Graph',
+  },
+
+  webhooks: {
+  all: '(alle)',
+  copy: 'Kopieren',
+  create: 'Erstellen',
+  createFailed: '__FN__:(\'detail\',)',
+  created: 'Erstellt',
+  createdSecretHint: 'Kopiere das Secret jetzt — es wird nur einmal angezeigt.',
+  createdTitle: 'Abonnement erstellt',
+  creating: 'Erstelle…',
+  delete: 'Löschen',
+  deleteDescPrefix: 'Dies wird dauerhaft entfernt: ',
+  deleteDescSuffix: '. Das kann nicht rückgängig gemacht werden.',
+  deleteTitle: 'Webhook löschen',
+  deleted: 'Webhook gelöscht',
+  deleting: 'Lösche…',
+  deliverOnly: 'nur zustellen',
+  deliverOptions: {
+    discord: 'Discord',
+    email: 'E-Mail',
+    github_comment: 'GitHub-Kommentar',
+    log: 'Log',
+    slack: 'Slack',
+    telegram: 'Telegram',
+  },
+  disableRow: 'Deaktivieren',
+  disabledTitle: 'Webhook-Empfänger deaktiviert',
+  done: 'Fertig',
+  empty: 'Noch keine Webhook-Abonnements.',
+  enable: 'Webhooks aktivieren',
+  enableRow: 'Aktivieren',
+  enabledRestarting: 'Webhooks aktiviert; Gateway startet neu…',
+  enabling: 'Aktiviere…',
+  fieldDeliver: 'Zustellen an',
+  fieldDeliverOnly: 'Nur Payload zustellen',
+  fieldDescription: 'Beschreibung',
+  fieldDescriptionPlaceholder: 'Wozu dieser Webhook dient (optional)',
+  fieldEvents: 'Ereignisse',
+  fieldEventsPlaceholder: 'kommagetrennt, leer für alle',
+  fieldName: 'Name',
+  fieldNamePlaceholder: 'z.B. github-push',
+  fieldPrompt: 'Prompt',
+  fieldPromptPlaceholder: 'Anweisungen für den Agenten wenn dieser Webhook ausgelöst wird (optional)',
+  fieldSkills: 'Skills',
+  fieldSkillsPlaceholder: 'kommagetrennte Skill-Namen (optional)',
+  hint: 'Abonnement-Änderungen werden live übernommen, sobald der Empfänger läuft. Deaktivierte Abonnements weisen eingehende Ereignisse ab.',
+  loadFailed: 'Webhooks konnten nicht geladen werden',
+  loading: 'Lade Webhooks…',
+  nameRequired: 'Name erforderlich',
+  newSubscription: 'Neues Abonnement',
+  restartFailed: '__FN__:(\'detail\',)',
+  restartGateway: 'Gateway neu starten',
+  restartNeeded: 'Webhooks sind aktiviert, aber das Gateway braucht noch einen Neustart, bevor der Empfänger online gehen kann.',
+  restarting: 'Gateway startet neu…',
+  restartingGateway: 'Starte neu…',
+  search: 'Webhooks durchsuchen…',
+  secretOnce: 'Secret (einmalig angezeigt)',
+  subscriptions: '__FN__:(\'count\',)',
+  webhookUrl: 'Webhook-URL',
+  deleteFailed: '__FN__:(\'detail\',)',
+  disabled: 'Deaktiviert',
+  enabled: 'Aktiviert',
+  toggleFailed: 'Umschalten fehlgeschlagen',
+  },
+
+  zones: {
+  closeAll: 'Alle schließen',
+  closeOthers: 'Andere schließen',
+  closeRunningConfirm: 'Tab schließen',
+  closeRunningTitle: 'Laufenden Tab schließen?',
+  closeToRight: 'Rechts schließen',
+  custom: 'Benutzerdefiniert',
+  editHint: 'Layout wählen oder Panes zwischen Zonen ziehen.',
+  editTitle: 'Layouts',
+  editorHintPost: ' dreht die Linie · über Zonen ziehen zum Zusammenführen · geteilte Kanten zum Skalieren ziehen',
+  editorHintPre: 'Klick zum Teilen · ',
+  hideHeader: 'Header ausblenden',
+  minimize: 'Minimieren',
+  nameLayoutPlaceholder: 'Layout benennen…',
+  newGridLayout: 'Neues Grid-Layout',
+  newSessionTab: 'Neuer Sitzungs-Tab',
+  notExpressible: 'diese Anordnung verzahnt sich (Windrad) — noch nicht als geschachtelte Splits darstellbar',
+  pluginDisabledBody: 'In Einstellungen → Plugins wieder aktivieren, um das Pane zurückzubringen.',
+  reload: 'Neu laden',
+  reset: 'Zurücksetzen',
+  restore: 'Wiederherstellen',
+  saveApply: 'Speichern & anwenden',
+  saveCurrentAs: 'Aktuelle Anordnung als Vorlage speichern',
+  showHeader: 'Header anzeigen',
+  templateColumns: 'Spalten',
+  templateGrid: 'Grid',
+  templatePriority: 'Priorität',
+  templateRows: 'Zeilen',
+  templates: 'Vorlagen',
+  zoneEditorTitle: 'Zonen-Editor',
+  },
+
 })
