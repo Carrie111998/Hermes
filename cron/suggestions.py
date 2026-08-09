@@ -38,6 +38,21 @@ from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
+
+# When a PyPI ``utils`` package shadows our local ``utils.py`` (webui Docker),
+# remove the shadowed entry so the regular import finds our module.
+import sys as _sys
+_hermes_root = Path(__file__).resolve().parent.parent
+_hermes_root_str = str(_hermes_root)
+if _hermes_root_str not in _sys.path:
+    _sys.path.insert(0, _hermes_root_str)
+_utils_mod = _sys.modules.get("utils")
+if _utils_mod is not None:
+    _mod_file = getattr(_utils_mod, "__file__", None)
+    if _mod_file is None or not str(_mod_file).startswith(_hermes_root_str):
+        del _sys.modules["utils"]
+del _hermes_root, _hermes_root_str  # cleanup
+
 from utils import atomic_replace
 
 logger = logging.getLogger(__name__)

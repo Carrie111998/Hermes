@@ -38,6 +38,22 @@ from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
 
+# When a PyPI ``utils`` package is installed in the same venv (webui Docker
+# setup), ``from utils import ...`` resolves to that package and fails.  If
+# the ``utils`` entry in ``sys.modules`` is *not* the hermes local module,
+# remove it so the next import finds our ``utils.py`` on the filesystem.
+import sys as _sys
+_hermes_root = Path(__file__).resolve().parent.parent
+_hermes_root_str = str(_hermes_root)
+if _hermes_root_str not in _sys.path:
+    _sys.path.insert(0, _hermes_root_str)
+_utils_mod = _sys.modules.get("utils")
+if _utils_mod is not None:
+    _mod_file = getattr(_utils_mod, "__file__", None)
+    if _mod_file is None or not str(_mod_file).startswith(_hermes_root_str):
+        del _sys.modules["utils"]
+del _hermes_root, _hermes_root_str  # cleanup
+
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
 
