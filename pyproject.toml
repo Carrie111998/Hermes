@@ -380,7 +380,7 @@ override-dependencies = [
   "pynacl>=1.6,<1.7",
 ]
 exclude-newer = "14 days"
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, cryptography = false, aiohttp = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, cryptography = false, aiohttp = false, h2 = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
