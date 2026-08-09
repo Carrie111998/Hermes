@@ -275,8 +275,8 @@ class TestSocketModeRestart:
 
 
     @pytest.mark.asyncio
-    async def test_watchdog_restarts_when_transport_disconnected(self, adapter):
-        """A transport that reports itself down still triggers a reconnect."""
+    async def test_watchdog_restarts_when_disconnect_persists(self, adapter):
+        """A sustained disconnected transport still triggers a reconnect."""
         live_task = MagicMock()
         live_task.done.return_value = False
         adapter._socket_mode_task = live_task
@@ -291,7 +291,45 @@ class TestSocketModeRestart:
         adapter._restart_socket_mode = _fake_restart
         adapter._socket_transport_connected = AsyncMock(return_value=False)
         adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_reconnect_grace_s = 0.02
 
         await adapter._socket_watchdog_loop()
 
         assert reasons == ["transport disconnected"]
+
+    @pytest.mark.asyncio
+    async def test_watchdog_defers_to_native_transient_reconnect(self, adapter):
+        """One failed probe must not tear down an SDK reconnect in progress.
+
+        The production incident started with slack_sdk abandoning an old
+        websocket and establishing a replacement about one second later.  The
+        watchdog ran between those events, closed the shared aiohttp session,
+        and left the SDK retrying against that closed session forever.
+        """
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        adapter._socket_mode_task = live_task
+        adapter._handler = MagicMock()
+
+        reasons: list[str] = []
+        probes = iter([False, True])
+
+        async def _probe():
+            connected = next(probes)
+            if connected:
+                adapter._running = False
+            return connected
+
+        async def _fake_restart(reason: str) -> None:
+            reasons.append(reason)
+            adapter._running = False
+
+        adapter._restart_socket_mode = _fake_restart
+        adapter._socket_transport_connected = _probe
+        adapter._socket_watchdog_interval_s = 0.01
+        adapter._socket_reconnect_grace_s = 1.0
+
+        await adapter._socket_watchdog_loop()
+
+        assert reasons == []
+        assert adapter._socket_unhealthy_since_monotonic is None

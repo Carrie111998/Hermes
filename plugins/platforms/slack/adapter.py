@@ -1056,6 +1056,13 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # The Slack SDK performs its own reconnect while the websocket is
+        # momentarily disconnected.  Do not tear the handler down on the first
+        # failed probe: doing so can close the SDK's shared aiohttp session
+        # while its reconnect coroutine is still inside connect(), leaving a
+        # zombie task that retries "Session is closed" forever.
+        self._socket_unhealthy_since_monotonic: Optional[float] = None
+        self._socket_reconnect_grace_s = 30.0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
         self._socket_handler_started_monotonic: Optional[float] = None
@@ -1214,7 +1221,26 @@ class SlackAdapter(BasePlatformAdapter):
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         self._socket_handler_started_monotonic = time.monotonic()
+        self._socket_unhealthy_since_monotonic = None
         task.add_done_callback(self._on_socket_mode_task_done)
+
+    def _socket_restart_grace_elapsed(self) -> bool:
+        """Return True only after a transport fault survives the grace window.
+
+        A single disconnected/stale observation commonly occurs while
+        slack_sdk is already replacing its websocket.  Waiting for a second,
+        sustained observation lets that native reconnect finish and prevents
+        the watchdog from racing it.  Missing/stopped top-level handler tasks
+        remain immediate restart conditions because no SDK reconnect can
+        recover those states.
+        """
+        now = time.monotonic()
+        if self._socket_unhealthy_since_monotonic is None:
+            self._socket_unhealthy_since_monotonic = now
+            return False
+        return (
+            now - self._socket_unhealthy_since_monotonic
+        ) >= self._socket_reconnect_grace_s
 
     async def _stop_socket_mode_handler(self) -> None:
         """Stop Socket Mode handler and task.
@@ -1339,21 +1365,33 @@ class SlackAdapter(BasePlatformAdapter):
 
                 task = self._socket_mode_task
                 if task is None:
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task missing")
                     continue
 
                 if task.done():
+                    self._socket_unhealthy_since_monotonic = None
                     await self._restart_socket_mode("socket task stopped")
                     continue
 
                 connected = await self._socket_transport_connected()
-                if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
-                elif self._socket_ping_pong_stale():
+                stale = self._socket_ping_pong_stale()
+                if connected is False or stale:
+                    if not self._socket_restart_grace_elapsed():
+                        continue
+                    reason = (
+                        "transport disconnected"
+                        if connected is False
+                        else "ping/pong stale"
+                    )
                     # is_connected() can lie when the aiohttp session is closed
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                    await self._restart_socket_mode(reason)
+                else:
+                    # A native Slack SDK reconnect completed within the grace
+                    # window, so a future fault must start a fresh observation.
+                    self._socket_unhealthy_since_monotonic = None
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
