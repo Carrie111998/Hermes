@@ -10,6 +10,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -23,7 +24,7 @@ from plugins.semantic_graph.sanitize import normalize_text, sanitize_text
 from plugins.semantic_graph.store import SemanticGraphStore
 
 FIXTURE = Path(__file__).parents[1] / "tests" / "fixtures" / "semantic_graph_retrieval_benchmark.json"
-CODE_REVISION = "0c89ef566343dbed810cedff81c9ac405febf0da"
+CONTROL_CODE_REVISION = "0c89ef566343dbed810cedff81c9ac405febf0da"
 CONTROL = {
     "repo": "KGESH/nsfw-bge-m3",
     "family": "BGE-M3 fine-tune",
@@ -44,6 +45,16 @@ TOP_K = 8
 LEXICAL_CANDIDATES = 30
 DENSE_CANDIDATES = 30
 RRF_K = 60
+
+
+def benchmark_code_revision() -> str:
+    """Resolve the exact checked-out benchmark revision at execution time."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "uncommitted-or-unavailable"
 
 
 def load_fixture() -> dict[str, Any]:
@@ -152,7 +163,14 @@ def _rank(expected: Sequence[str], rows: Sequence[dict[str, Any]]) -> int | None
     return min(ranks) if ranks else None
 
 
-def _summary(results: list[dict[str, Any]], latencies: dict[str, list[float]]) -> dict[str, Any]:
+def _summary(
+    results: list[dict[str, Any]],
+    latencies: dict[str, list[float]],
+    *,
+    rejected_or_superseded: int,
+    cross_run: int,
+    secret_recall: int,
+) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     for result in results:
         group = groups.setdefault(result["group"], {"count": 0, "hits": 0, "mrr_sum": 0.0})
@@ -172,9 +190,9 @@ def _summary(results: list[dict[str, Any]], latencies: dict[str, list[float]]) -
         "negative_no_result_precision": sum(int(not result["returned_any"]) for result in negatives) / len(negatives),
         "context_chars_max": max((result["context_chars"] for result in results), default=0),
         "latency_ms": {name: _latency_summary(values) for name, values in latencies.items()},
-        "rejected_or_superseded_leak_rate": 0.0,
-        "cross_run_leak_rate": 0.0,
-        "secret_recall_count": 0,
+        "rejected_or_superseded_leak_count": rejected_or_superseded,
+        "cross_run_leak_count": cross_run,
+        "secret_recall_count": secret_recall,
         "state_mutation_count": 0,
     }
 
@@ -190,6 +208,9 @@ def run_variant(
     dense: bool, client: HttpEmbeddingClient | None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
+    rejected_or_superseded = 0
+    cross_run = 0
+    secret_recall = 0
     latencies = {name: [] for name in (
         "query_embedding_ms", "lexical_ms", "dense_scan_ms", "rrf_ms", "end_to_end_ms",
     )}
@@ -237,6 +258,11 @@ def run_variant(
             latencies["rrf_ms"].append((time.perf_counter() - rrf_started) * 1000)
 
         rank = _rank(query["expected"], rows)
+        rejected_or_superseded += sum(
+            int(row.get("status") in {"rejected", "superseded"}) for row in rows
+        )
+        cross_run += sum(int(row.get("node_id") == "run-b-only") for row in rows)
+        secret_recall += sum(int("opaque-secret" in json.dumps(row, ensure_ascii=False)) for row in rows)
         results.append({
             "group": query["group"], "expected": query["expected"],
             "returned": [row["identity_key"] for row in rows], "hit": rank is not None,
@@ -248,7 +274,13 @@ def run_variant(
 
     after = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
              for row in store.list_nodes(limit=5000)}
-    summary = _summary(results, latencies)
+    summary = _summary(
+        results,
+        latencies,
+        rejected_or_superseded=rejected_or_superseded,
+        cross_run=cross_run,
+        secret_recall=secret_recall,
+    )
     summary["state_mutation_count"] = int(before != after)
     return summary
 
@@ -272,15 +304,20 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
     lexical = run_variant(store, fixture, run_a, dense=False, client=None)
     hybrid = run_variant(store, fixture, run_a, dense=True, client=client)
     result = {
-        "benchmark_schema_version": 1, "code_revision": CODE_REVISION, "control": CONTROL,
+        "benchmark_schema_version": 1,
+        "control_code_revision": CONTROL_CODE_REVISION,
+        "benchmark_code_revision": benchmark_code_revision(),
+        "control": CONTROL,
         "retrieval": {"top_k": TOP_K, "lexical_candidates": LEXICAL_CANDIDATES,
                       "dense_candidates": DENSE_CANDIDATES, "rrf_k": RRF_K},
         "backfill": {"document_count": len(documents), "duration_ms": backfill_ms},
         "variants": {"A_lexical": lexical, "B_hybrid_bge_m3": hybrid},
         "gates": {
             "japanese_to_english_recall_no_regression": hybrid["groups"].get("japanese_to_english", {}).get("recall_at_8") == 1.0,
-            "leak_free": all(hybrid[key] == 0.0 for key in ("rejected_or_superseded_leak_rate", "cross_run_leak_rate"))
-            and hybrid["secret_recall_count"] == 0 and hybrid["state_mutation_count"] == 0,
+            "leak_free": hybrid["rejected_or_superseded_leak_count"] == 0
+            and hybrid["cross_run_leak_count"] == 0
+            and hybrid["secret_recall_count"] == 0
+            and hybrid["state_mutation_count"] == 0,
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -299,7 +336,8 @@ def main() -> int:
     live = args.live or os.environ.get("SEMANTIC_GRAPH_LIVE_BENCHMARK") == "1"
     result = run_benchmark(base_url=args.base_url, model=args.model, db_path=args.db, live=live, output=args.output)
     print(json.dumps({
-        "code_revision": result["code_revision"],
+        "control_code_revision": result["control_code_revision"],
+        "benchmark_code_revision": result["benchmark_code_revision"],
         "variants": {key: value["overall_recall_at_8"] for key, value in result["variants"].items()},
         "output": "<benchmark-output>",
     }, ensure_ascii=False))
@@ -309,4 +347,4 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-__all__ = ["CODE_REVISION", "CONTROL", "HttpEmbeddingClient", "make_store", "run_benchmark", "run_variant", "serialize_bge_query"]
+__all__ = ["CONTROL_CODE_REVISION", "CONTROL", "HttpEmbeddingClient", "benchmark_code_revision", "make_store", "run_benchmark", "run_variant", "serialize_bge_query"]
