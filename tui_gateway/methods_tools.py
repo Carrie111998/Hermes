@@ -1811,20 +1811,21 @@ def _(rid, params: dict) -> dict:
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
-            _discover_plugin_display_entries,
-            _get_disabled_set,
-            _get_enabled_set,
+            _discover_plugin_display_records,
             _is_portable_plugin_dir,
-            _plugin_status,
         )
 
         def _rows():
-            enabled = _get_enabled_set()
-            disabled = _get_disabled_set()
             out = []
-            for name, version, desc, source, _dir, key, kind in sorted(
-                _discover_plugin_display_entries()
+            for entry, status in sorted(
+                _discover_plugin_display_records(),
+                key=lambda record: (
+                    record[0][0],
+                    record[0][5],
+                    record[0][3],
+                ),
             ):
+                name, version, desc, source, _dir, key, _kind = entry
                 out.append(
                     {
                         "name": name,
@@ -1835,14 +1836,7 @@ def _(rid, params: dict) -> dict:
                         "version": str(version or ""),
                         "description": desc or "",
                         "source": source,
-                        "status": _plugin_status(
-                            name,
-                            enabled,
-                            disabled,
-                            key=key,
-                            source=source,
-                            kind=kind,
-                        ),
+                        "status": status,
                         # Agent Plugins v1 package (plugin.json — the portable
                         # skills/MCP format) vs a native Hermes plugin.
                         "portable": _is_portable_plugin_dir(_dir),

@@ -6,6 +6,24 @@ from hermes_cli import plugins_cmd
 from hermes_cli.plugin_activation import PluginActivationState
 
 
+_GROUP_DENY_CANDIDATES = [
+    ("legacy-copy", "1.0", "Bundled", "bundled", None, "shared", "backend"),
+    ("new-copy", "2.0", "User", "user", None, "shared", "standalone"),
+]
+_PORTABLE_SHADOW_CANDIDATES = [
+    ("portable-user", "1.0", "Portable", "user", None, "shared", "standalone"),
+    (
+        "project-shadow",
+        "2.0",
+        "Project",
+        "project",
+        None,
+        "shared",
+        "standalone",
+    ),
+]
+
+
 def _args(**kwargs):
     defaults = {
         "enabled": False,
@@ -25,14 +43,17 @@ def test_filter_plugin_entries_enabled_only():
         ("old-plugin", "1.0.0", "Old", "user", None, "old-plugin", "standalone"),
     ]
 
-    filtered = plugins_cmd._filter_plugin_entries(
-        entries,
-        _args(enabled=True),
-        enabled={"disk-cleanup", "web-search-plus"},
-        disabled={"old-plugin"},
-    )
+    records = [
+        (entries[0], "enabled"),
+        (entries[1], "enabled"),
+        (entries[2], "disabled"),
+    ]
+    filtered = plugins_cmd._filter_plugin_entries(records, _args(enabled=True))
 
-    assert [entry[0] for entry in filtered] == ["disk-cleanup", "web-search-plus"]
+    assert [entry[0][0] for entry in filtered] == [
+        "disk-cleanup",
+        "web-search-plus",
+    ]
 
 
 def test_cmd_list_plain_compact_output(monkeypatch, capsys):
@@ -42,12 +63,9 @@ def test_cmd_list_plain_compact_output(monkeypatch, capsys):
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_entries",
-        lambda: entries,
+        "_discover_plugin_display_records",
+        lambda: [(entry, "enabled") for entry in entries],
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"web-search-plus"})
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
-
     plugins_cmd.cmd_list(_args(plain=True, no_bundled=True))
 
     out = capsys.readouterr().out
@@ -63,12 +81,9 @@ def test_cmd_list_json_preserves_name_and_adds_canonical_key(monkeypatch, capsys
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_entries",
-        lambda: entries,
+        "_discover_plugin_display_records",
+        lambda: [(entry, "enabled") for entry in entries],
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
-
     plugins_cmd.cmd_list(_args(json=True))
 
     payload = json.loads(capsys.readouterr().out)
@@ -83,12 +98,9 @@ def test_cmd_list_plain_disambiguates_duplicate_manifest_names(monkeypatch, caps
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_entries",
-        lambda: entries,
+        "_discover_plugin_display_records",
+        lambda: [(entry, "enabled") for entry in entries],
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
-
     plugins_cmd.cmd_list(_args(plain=True))
 
     out = capsys.readouterr().out
@@ -129,14 +141,177 @@ def test_cmd_list_uses_active_bundled_winner_over_inactive_user_copy(
         "hermes_cli.config.load_plugin_activation_state",
         lambda: PluginActivationState(),
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
-
     plugins_cmd.cmd_list(_args(json=True))
 
     payload = json.loads(capsys.readouterr().out)
     assert [(row["name"], row["source"]) for row in payload] == [
         ("bundled-shared", "bundled")
+    ]
+
+
+def test_display_records_preserve_group_deny_and_list_uses_it(
+    monkeypatch,
+    capsys,
+):
+    candidates = _GROUP_DENY_CANDIDATES
+    activation = PluginActivationState(
+        enabled=frozenset({"new-copy"}),
+        disabled=frozenset({"legacy-copy"}),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_plugin_activation_state",
+        lambda: activation,
+    )
+
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == []
+    assert plugins_cmd._discover_plugin_display_records() == [
+        (candidates[1], "disabled")
+    ]
+    assert plugins_cmd._discover_plugin_display_entries() == [candidates[1]]
+
+    plugins_cmd.cmd_list(_args(json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload[0]["name"] == "new-copy"
+    assert payload[0]["status"] == "disabled"
+
+    plugins_cmd.cmd_list(_args(plain=True))
+    assert "disabled" in capsys.readouterr().out
+
+    plugins_cmd.cmd_list(_args())
+    assert "disabled" in capsys.readouterr().out
+
+    plugins_cmd.cmd_list(_args(json=True, enabled=True))
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_cmd_toggle_uses_enabled_winner_not_inactive_project_shadow(
+    monkeypatch,
+):
+    candidates = _PORTABLE_SHADOW_CANDIDATES
+    activation = PluginActivationState(
+        enabled=frozenset({"portable-user"}),
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_plugin_activation_state",
+        lambda: activation,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", set)
+    monkeypatch.setattr(plugins_cmd, "_get_current_memory_provider", lambda: "")
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_current_context_engine",
+        lambda: "compressor",
+    )
+    monkeypatch.setattr(plugins_cmd.sys.stdin, "isatty", lambda: True)
+
+    def _capture(_curses, keys, labels, selected, *_args):
+        captured.update(keys=keys, labels=labels, selected=selected)
+
+    monkeypatch.setattr(plugins_cmd, "_run_composite_ui", _capture)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_run_composite_fallback",
+        lambda keys, labels, selected, *_args: captured.update(
+            keys=keys,
+            labels=labels,
+            selected=selected,
+        ),
+    )
+
+    plugins_cmd.cmd_toggle()
+
+    assert captured["keys"] == ["shared"]
+    assert captured["selected"] == {0}
+    assert "portable-user" in captured["labels"][0]
+    assert "project-shadow" not in captured["labels"][0]
+
+
+def test_composite_toggle_enable_clears_same_key_legacy_deny(monkeypatch):
+    candidates = _GROUP_DENY_CANDIDATES
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", set)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+    changed = plugins_cmd._persist_composite_plugin_selection(
+        ["shared"],
+        set(),
+        {0},
+        {"legacy-copy"},
+    )
+
+    assert changed is True
+    assert saved == {"enabled": {"shared"}, "disabled": set()}
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[1]
+    ]
+
+
+def test_composite_confirm_preserves_user_alias_and_active_winner(monkeypatch):
+    candidates = _PORTABLE_SHADOW_CANDIDATES
+    saves = []
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_candidates",
+        lambda: candidates,
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_get_enabled_set",
+        lambda: {"portable-user"},
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saves.append(("enabled", set(value))),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saves.append(("disabled", set(value))),
+    )
+    changed = plugins_cmd._persist_composite_plugin_selection(
+        ["shared"],
+        {0},
+        {0},
+        set(),
+    )
+
+    assert changed is False
+    assert saves == []
+    activation = PluginActivationState(
+        enabled=frozenset({"portable-user"}),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[0]
     ]
 
 

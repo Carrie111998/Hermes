@@ -19,12 +19,9 @@ def _call(params):
 def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_entries",
-        lambda: list(_ENTRIES),
+        "_discover_plugin_display_records",
+        lambda: [(entry, "enabled") for entry in _ENTRIES],
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
-
     rows = _call({"action": "list"})["plugins"]
 
     assert [row["name"] for row in rows] == ["xai", "xai"]
@@ -34,11 +31,9 @@ def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
 def test_plugins_manage_toggle_targets_key_and_returns_matching_row(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_entries",
-        lambda: list(_ENTRIES),
+        "_discover_plugin_display_records",
+        lambda: [(entry, "enabled") for entry in _ENTRIES],
     )
-    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"video_gen/xai"})
-    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: set())
     calls = []
 
     def _toggle(identifier, *, enabled):
@@ -63,3 +58,26 @@ def test_plugins_manage_toggle_targets_key_and_returns_matching_row(monkeypatch)
     assert result["name"] == "xai"
     assert result["key"] == "video_gen/xai"
     assert result["plugin"]["key"] == "video_gen/xai"
+
+
+def test_plugins_manage_preserves_resolved_group_deny(monkeypatch):
+    entry = (
+        "new-copy",
+        "2.0",
+        "",
+        "user",
+        "/plugins/new",
+        "shared",
+        "standalone",
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_discover_plugin_display_records",
+        lambda: [(entry, "disabled")],
+    )
+
+    rows = _call({"action": "list"})["plugins"]
+
+    assert [(row["name"], row["status"]) for row in rows] == [
+        ("new-copy", "disabled")
+    ]

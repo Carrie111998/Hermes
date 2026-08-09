@@ -223,9 +223,10 @@ class TestFilterPluginEntries:
         args.user = False
         args.enabled = True
 
-        result = _filter_plugin_entries(entries, args, {"web/tavily"}, set())
+        records = [(entries[0], "enabled"), (entries[1], "not enabled")]
+        result = _filter_plugin_entries(records, args)
         assert len(result) == 1
-        assert result[0][5] == "web/tavily"
+        assert result[0][0][5] == "web/tavily"
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +268,7 @@ class TestCmdListJson:
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     def test_json_status_uses_key(self, mock_user_dir, mock_bundled_dir, tmp_path, capsys):
+        from hermes_cli.plugin_activation import PluginActivationState
         from hermes_cli.plugins_cmd import cmd_list
 
         _make_category_plugin(tmp_path, "web", "tavily", {
@@ -276,7 +278,11 @@ class TestCmdListJson:
         mock_bundled_dir.return_value = tmp_path / "nonexistent"
 
         # Patch config to return web/tavily as enabled
-        with patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"web/tavily"}):
+        activation = PluginActivationState(enabled=frozenset({"web/tavily"}))
+        with patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=activation,
+        ):
             args = MagicMock()
             args.json = True
             args.plain = False

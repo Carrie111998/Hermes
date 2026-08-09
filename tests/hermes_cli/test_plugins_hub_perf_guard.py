@@ -24,6 +24,7 @@ _PLUGIN_ROW = [
 
 
 def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugins=None):
+    discover_entries = discover_all_plugins or (lambda: list(_PLUGIN_ROW))
     monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda force_rescan=False: [])
     monkeypatch.setattr(
         web_server,
@@ -32,8 +33,8 @@ def _patch_minimal_hub_dependencies(monkeypatch, *, check_fn, discover_all_plugi
     )
     monkeypatch.setattr(
         web_server,
-        "_discover_dashboard_plugin_entries",
-        discover_all_plugins or (lambda: list(_PLUGIN_ROW)),
+        "_discover_dashboard_plugin_records",
+        lambda: [(entry, "enabled") for entry in discover_entries()],
     )
     monkeypatch.setattr(
         web_server,
@@ -84,6 +85,25 @@ def test_plugins_hub_does_not_probe_cold_check_fns(monkeypatch):
     assert payload["plugins"][0]["name"] == "demo"
     assert payload["plugins"][0]["key"] == "category/demo"
     assert threading.current_thread() not in calls["threads"]
+
+
+def test_plugins_hub_preserves_resolved_group_deny_label(monkeypatch):
+    web_server._invalidate_plugins_hub_cache()
+    _patch_minimal_hub_dependencies(monkeypatch, check_fn=lambda: True)
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_plugin_records",
+        lambda: [(_PLUGIN_ROW[0], "disabled")],
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_discover_dashboard_runtime_entries",
+        list,
+    )
+
+    payload = web_server._merged_plugins_hub(force_refresh=True)
+
+    assert payload["plugins"][0]["runtime_status"] == "disabled"
 
 
 def test_plugins_hub_cold_cache_schedules_background_probe(monkeypatch):

@@ -16810,18 +16810,18 @@ def _discover_dashboard_runtime_entries() -> list:
         reset_hermes_home_override(token)
 
 
-def _discover_dashboard_plugin_entries() -> list:
-    """Discover display winners in the dashboard process-home scope."""
+def _discover_dashboard_plugin_records() -> list:
+    """Discover display winners and resolved status in process-home scope."""
     from hermes_constants import (
         reset_hermes_home_override,
         set_hermes_home_override,
     )
     from hermes_cli.config import load_plugin_activation_state
-    from hermes_cli.plugins_cmd import _discover_plugin_display_entries
+    from hermes_cli.plugins_cmd import _discover_plugin_display_records
 
     token = set_hermes_home_override(get_process_hermes_home())
     try:
-        return _discover_plugin_display_entries(load_plugin_activation_state())
+        return _discover_plugin_display_records(load_plugin_activation_state())
     finally:
         reset_hermes_home_override(token)
 
@@ -17422,7 +17422,7 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         for plugin in dashboard_list
         if (root := _dashboard_plugin_root(plugin)) is not None
     }
-    runtime_entries = _discover_dashboard_plugin_entries()
+    runtime_records = _discover_dashboard_plugin_records()
     try:
         active_runtime_entries = _discover_dashboard_runtime_entries()
         activation = _load_dashboard_plugin_activation_state()
@@ -17441,7 +17441,8 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
 
     matched_dashboard_roots: set[Path] = set()
-    for name, version, description, source, dir_str, key, kind in runtime_entries:
+    for entry, resolved_status in runtime_records:
+        name, version, description, source, dir_str, key, kind = entry
         dir_path = Path(dir_str)
         try:
             runtime_root = dir_path.resolve()
@@ -17451,20 +17452,23 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         if dm is not None:
             matched_dashboard_roots.add(runtime_root)
         has_dash_manifest = dm is not None or (dir_path / "dashboard" / "manifest.json").exists()
-        runtime_status = _dashboard_plugin_status(
-            dm or {
-                "name": name,
-                "source": source,
-                "_plugin_dir": str(dir_path),
-                "_runtime_name": name,
-                "_runtime_key": key,
-                "_runtime_source": source,
-                "_runtime_kind": kind,
-                "_runtime_managed": True,
-            },
-            active_runtime_entries,
-            activation,
-        )
+        if resolved_status == "disabled":
+            runtime_status = "disabled"
+        else:
+            runtime_status = _dashboard_plugin_status(
+                dm or {
+                    "name": name,
+                    "source": source,
+                    "_plugin_dir": str(dir_path),
+                    "_runtime_name": name,
+                    "_runtime_key": key,
+                    "_runtime_source": source,
+                    "_runtime_kind": kind,
+                    "_runtime_managed": True,
+                },
+                active_runtime_entries,
+                activation,
+            )
         if runtime_status == "not enabled":
             runtime_status = "inactive"
 

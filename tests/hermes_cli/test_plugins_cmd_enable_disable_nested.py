@@ -421,11 +421,10 @@ class TestCompositeMenuWritesCanonicalKey:
         # key differs from the manifest name, mirroring web/firecrawl.
         plugin_keys = ["web/firecrawl"]
         plugin_labels = ["web-firecrawl — firecrawl [bundled]"]
-        plugin_selected = set()  # unchecked → should be disabled
+        plugin_selected = {0}  # active initially, then explicitly unchecked
 
-        # First input() toggles nothing (blank Enter confirms immediately),
-        # second (category prompt) is skipped with blank Enter.
-        with patch("builtins.input", return_value=""):
+        answers = iter(["1", ""])
+        with patch("builtins.input", side_effect=lambda _prompt: next(answers)):
             _run_composite_fallback(
                 plugin_keys, plugin_labels, plugin_selected,
                 set(), [], Console(),
