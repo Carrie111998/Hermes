@@ -301,6 +301,54 @@ def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch
     ]
 
 
+def test_dashboard_disable_user_override_preserves_sibling_key_deny(monkeypatch):
+    candidates = [
+        ("shared", "1", "Target", "bundled", None, "target/key", "backend"),
+        ("shared", "1", "Sibling", "bundled", None, "sibling/key", "backend"),
+        ("target-user", "2", "Target", "user", None, "target/key", "backend"),
+    ]
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_resolve_plugin_key_and_source",
+        lambda _name: ("target/key", "user", "target-user", "backend"),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"target/key"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"shared"})
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_toggle_plugin_toolset", lambda *args, **kwargs: None
+    )
+
+    result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+        "target/key",
+        enabled=False,
+    )
+
+    assert result["unchanged"] is False
+    assert saved == {
+        "enabled": set(),
+        "disabled": {"target/key", "sibling/key"},
+    }
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == []
+
+
 def test_runtime_identities_do_not_treat_key_leaf_as_identity(monkeypatch):
     candidates = [
         (

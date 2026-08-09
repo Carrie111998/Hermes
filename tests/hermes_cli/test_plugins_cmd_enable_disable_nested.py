@@ -293,6 +293,52 @@ class TestEnableDisableNested:
             candidates[1]
         ]
 
+    def test_disable_user_override_preserves_sibling_canonical_deny(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("shared", "1", "Target", "bundled", None, "target/key", "backend"),
+            ("shared", "1", "Sibling", "bundled", None, "sibling/key", "backend"),
+            ("target-user", "2", "Target", "user", None, "target/key", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("target/key", "user", "target-user", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"target/key"})
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", lambda: {"shared"})
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+
+        plugins_cmd.cmd_disable("target/key")
+
+        assert saved == {
+            "enabled": set(),
+            "disabled": {"target/key", "sibling/key"},
+        }
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == []
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable — built-in tool override consent (issue #29249)

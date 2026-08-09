@@ -1046,9 +1046,11 @@ def cmd_disable(name: str) -> None:
         key,
         enabled,
     )
+    _, preserved_denies = _plugin_runtime_identity_changes(key, disabled)
     enabled.difference_update(identities)
     enabled.update(preserved_enables)
     disabled.difference_update(identities)
+    disabled.update(preserved_denies)
     disabled.add(key)
     _save_enabled_set(enabled)
     _save_disabled_set(disabled)
@@ -2250,9 +2252,11 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         return {"ok": True, "name": name, "key": key, "unchanged": True}
 
     identities, preserved_enables = _plugin_runtime_identity_changes(key, en)
+    _, preserved_denies = _plugin_runtime_identity_changes(key, dis)
     en.difference_update(identities)
     en.update(preserved_enables)
     dis.difference_update(identities)
+    dis.update(preserved_denies)
     dis.add(key)
     _save_enabled_set(en)
     _save_disabled_set(dis)
