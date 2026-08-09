@@ -826,6 +826,14 @@ class WebSocketRelayTransport:
             # ConnectionClosed. Report it the same way as the not-connected
             # case three lines up. CancelledError is a BaseException, so
             # cancellation still propagates.
+            #
+            # Record the traceback before returning. The returned string carries
+            # the exception's text but nothing about where it came from, so
+            # without this an ordinary dead socket and a genuine defect in the
+            # frame-building above it are the same line in the log. Same debug
+            # level and exc_info the other best-effort catches in this module
+            # use (go_dormant's close, the inbound ack).
+            logger.debug("relay %s send failed", frame_type, exc_info=True)
             return {"success": False, "error": f"relay send failed: {exc}"}
         finally:
             self._pending.pop(request_id, None)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 import pytest_asyncio
@@ -147,13 +148,19 @@ async def _serve(handler):
     return srv, f"ws://127.0.0.1:{port}"
 
 
-async def _await_reader_end(t) -> None:
-    """Block until the transport's read loop has ended (peer closed the socket)."""
-    for _ in range(300):
-        if t._reader is not None and t._reader.done():
-            return
-        await asyncio.sleep(0.01)
-    raise AssertionError("read loop did not end after the peer closed the socket")
+async def _await_reader_end(t, timeout_s: float = 3.0) -> None:
+    """Block until the transport's read loop has ended (peer closed the socket).
+
+    ``t._reader`` is the reader ``Task``, so wait on it rather than spin-polling
+    ``done()``: this wakes the instant the task settles instead of on the next
+    10ms tick, which is what makes it deterministic under CI load. ``asyncio.wait``
+    specifically, because it neither retrieves the task's result nor cancels it
+    on timeout — the caller's ``disconnect()`` still owns the reader's lifecycle.
+    """
+    assert t._reader is not None, "connect() should have started the read loop"
+    _done, pending = await asyncio.wait({t._reader}, timeout=timeout_s)
+    if pending:
+        raise AssertionError("read loop did not end after the peer closed the socket")
 
 
 @pytest.mark.asyncio
@@ -195,6 +202,45 @@ async def test_send_outbound_returns_result_after_peer_close():
         await t.disconnect()
         srv.close()
         await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_outbound_answers_a_result_when_the_send_itself_raises(caplog):
+    """The socket dies BETWEEN the not-connected guard and the send.
+
+    That window cannot be closed by any ``self._ws is None`` check, so ``_send``
+    still raises there and the catch-all is what keeps the documented result-dict
+    contract. Two things it has to do: answer with the same shape as the
+    not-connected case, and record the traceback — the returned string carries
+    the exception's text but not its origin, so without a traceback a genuine
+    defect in the frame-building above it is indistinguishable from an ordinary
+    dead socket.
+
+    The one test in this file that substitutes the socket: the window is by
+    definition a race, so it cannot be scheduled deterministically against a
+    live server.
+    """
+
+    class _SocketThatDiedMidSend:
+        async def send(self, _payload):
+            raise ConnectionResetError("peer closed between the guard and the send")
+
+    t = WebSocketRelayTransport("ws://127.0.0.1:1", "discord", "appShared", outbound_timeout_s=4.0)
+    t._ws = _SocketThatDiedMidSend()
+
+    caplog.set_level(logging.DEBUG, logger="gateway.relay.ws_transport")
+    result = await t.send_outbound({"op": "send", "chat_id": "c1", "content": "hi"})
+
+    assert result == {
+        "success": False,
+        "error": "relay send failed: peer closed between the guard and the send",
+    }
+    # The waiter is discarded rather than left to accumulate per request id.
+    assert t._pending == {}
+
+    traced = [r for r in caplog.records if r.exc_info]
+    assert traced, "the catch-all must record the traceback, not just the message"
+    assert traced[0].exc_info[0] is ConnectionResetError
 
 
 @pytest.mark.asyncio
