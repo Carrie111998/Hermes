@@ -1325,6 +1325,12 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # PR-2/PR-3: child_memory allows the subagent to persist/read its own memory
+    # via the existing MemoryStore. Default False = no memory (current behaviour).
+    child_memory: bool = False,
+    # PR-2/PR-3: allowed_toolsets restricts the child's toolset to an explicit
+    # subset (intersected with the parent's). None = inherit full parent toolset.
+    allowed_toolsets: Optional[List[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1334,6 +1340,15 @@ def _build_child_agent(
     those credentials instead of inheriting from the parent.  This enables
     routing subagents to a different provider:model pair (e.g. cheap/fast
     model on OpenRouter while the parent runs on Nous Portal).
+
+    When allowed_toolsets is provided, the child's toolset is the intersection
+    of allowed_toolsets with the parent's available toolsets.  This creates a
+    permission boundary: the child cannot use tools outside this set.  Default
+    None preserves the current behaviour (full inheritance).
+
+    When child_memory=True, the child gets its own MemoryStore (skip_memory=False)
+    so it can persist and read observations across delegations via the same
+    HERMES_HOME/memories/ files the parent uses.
     """
     from run_agent import AIAgent
     import uuid as _uuid
@@ -1379,7 +1394,17 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    if allowed_toolsets is not None:
+        # PR-2/PR-3: explicit permission boundary — intersect with parent so the
+        # child never gains tools the parent doesn't have, then strip blocked.
+        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+        child_toolsets = [t for t in allowed_toolsets if t in expanded_parent]
+        if _get_inherit_mcp_toolsets():
+            child_toolsets = _preserve_parent_mcp_toolsets(
+                child_toolsets, parent_toolsets
+            )
+        child_toolsets = _strip_blocked_tools(child_toolsets)
+    elif toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -1425,6 +1450,16 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+
+    # PR-2/PR-3: when child_memory=True, re-add the 'memory' toolset that
+    # _strip_blocked_tools removed, and remove the memory deny-toolset so
+    # the child's MemoryStore is actually created and functional (agent_init.py
+    # gates on "memory" in enabled_toolsets when skip_memory=False).
+    if child_memory and "memory" not in child_toolsets:
+        child_toolsets.append("memory")
+        child_disabled_toolsets = [
+            name for name in child_disabled_toolsets if name != "memory"
+        ]
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -1634,7 +1669,7 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
-            skip_memory=True,
+            skip_memory=not child_memory,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
             session_db=getattr(parent_agent, "_session_db", None),
@@ -3129,18 +3164,29 @@ def delegate_task(
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     parent_agent=None,
+    # PR-2/PR-3: child_memory enables per-child persistent memory (default False = current behaviour)
+    child_memory: bool = False,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
       - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Batch:  provide tasks array [{goal, context, role, ...}]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    When child_memory=True, the child agent gets its own persistent memory
+    (skip_memory=False) so it can accumulate observations across delegations
+    via the same HERMES_HOME/memories/ files the parent uses.
+
+    Each task dict may carry ``allowed_toolsets`` (List[str] | None) to create
+    a permission boundary for that child. The child's toolset becomes the
+    intersection of allowed_toolsets with the parent's available tools.
+    Default None = full inheritance (current behaviour).
 
     Returns JSON with results array, one entry per task.
     """
@@ -3340,6 +3386,9 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
+            # PR-2/PR-3: per-child memory and permission boundary from task dict
+            child_memory=is_truthy_value(t.get("child_memory", child_memory), default=False),
+            allowed_toolsets=t.get("allowed_toolsets"),
             model=creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
