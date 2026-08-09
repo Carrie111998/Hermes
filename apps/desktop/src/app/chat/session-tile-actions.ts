@@ -16,12 +16,12 @@ import type { ClientSessionState } from '@/app/types'
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
-import { SLASH_COMMAND_RE } from '@/lib/chat-runtime'
+import { isSlashCommandText } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
-import { notifyError } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
@@ -240,7 +240,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       listTileSession(visibleText)
 
-      if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
+      if (isSlashCommandText(visibleText)) {
+        if (attachments.length) {
+          notify({
+            kind: 'warning',
+            title: copy.slashCommandIgnoredTitle,
+            message: copy.slashCommandIgnoredBody
+          })
+
+          return false
+        }
+
         triggerHaptic('selection')
         await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
 
