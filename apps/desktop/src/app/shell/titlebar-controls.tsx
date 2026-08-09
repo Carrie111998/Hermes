@@ -24,6 +24,7 @@ import {
   toggleSidebarOpen
 } from '@/store/layout'
 import { $unreadSessionCount } from '@/store/session-dot-state'
+import { $reviewOpen, revealReview } from '@/store/review'
 
 import { appViewForPath, isOverlayView } from '../routes'
 
@@ -134,6 +135,7 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
   const hapticsMuted = useStore($hapticsMuted)
   const fileBrowserOpen = useStore($fileBrowserOpen)
   const panesFlipped = useStore($panesFlipped)
+  const reviewOpen = useStore($reviewOpen)
   const sidebarOpen = useStore($sidebarOpen)
   const unreadCount = useStore($unreadSessionCount)
   const unreadBadge = unreadCount > 0 ? unreadCount : undefined
@@ -200,6 +202,17 @@ export function TitlebarControls({ leftTools = [], tools = [], onOpenSettings }:
 
   // Static system tools — always pinned to the screen's right edge.
   const systemTools: TitlebarTool[] = [
+    {
+      actionId: 'view.toggleReview',
+      active: reviewOpen,
+      icon: <TitlebarIcon name="source-control" />,
+      id: 'git',
+      label: t.titlebar.openGit,
+      onSelect: () => {
+        triggerHaptic('open')
+        revealReview()
+      }
+    },
     {
       className: 'group/tool',
       // Hover + held ⌘/Ctrl morphs the glyph into its reset form (see

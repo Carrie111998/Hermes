@@ -212,6 +212,7 @@ export const en: Translations = {
     hideRightSidebar: 'Hide right sidebar',
     showRightSidebar: 'Show right sidebar',
     unreadSessions: count => (count === 1 ? '1 unread session' : `${count} unread sessions`),
+    openGit: 'Open Git source control',
     muteHaptics: 'Mute haptics',
     unmuteHaptics: 'Unmute haptics',
     openSettings: 'Open settings',
