@@ -1367,6 +1367,58 @@ def is_disk_full_error(exc: BaseException | str | None) -> bool:
     return any(marker in lowered for marker in _DISK_FULL_MARKERS)
 
 
+# Every cause bucket classify_persistence_error can return. Consumers that
+# enumerate causes (e.g. the cron scheduler's explainer-variant suppression)
+# must iterate this tuple instead of hardcoding the list, so adding a bucket
+# can never silently desynchronize them.
+PERSISTENCE_ERROR_CAUSES = ("locked", "disk", "unknown")
+
+
+def classify_persistence_error(exc_or_str) -> str:
+    """Classify a session-persistence failure into a coarse cause bucket.
+
+    Fast-failing a turn on a SessionDB write error is deliberate (the
+    transcript would otherwise be lost on restart), but the *guidance* the
+    user gets must match the cause: sustained SQLite write-lock contention
+    ("database is locked" on a shared state.db) needs "storage was busy,
+    send it again", while a full disk or read-only database needs the
+    disk-space/permissions advice. Returns one of PERSISTENCE_ERROR_CAUSES:
+
+    * ``"locked"``  — lock/busy contention (another process holds the write
+      lock, or a live compression lease refused the write); transient,
+      retry-later guidance applies.
+    * ``"disk"``    — disk full / read-only / permission-shaped failures
+      (delegates the disk-full patterns to :func:`is_disk_full_error` so the
+      two classifiers can never drift apart — e.g. ENOSPC).
+    * ``"unknown"`` — anything else (or no visible exception at all).
+    """
+    if exc_or_str is None:
+        return "unknown"
+    # A refused write during a live compression lease is contention, not
+    # storage damage — but its message ("is being compressed by another
+    # writer" / "Compression lease lost") contains neither "locked" nor
+    # "busy", so it must be matched by type and by phrase (for strings that
+    # survived RPC wrapping).
+    if isinstance(exc_or_str, CompressionSessionBusyError):
+        return "locked"
+    text = str(exc_or_str).lower()
+    if (
+        "locked" in text
+        or "busy" in text
+        or "being compressed" in text
+        or "compression lease" in text
+    ):
+        return "locked"
+    if (
+        is_disk_full_error(exc_or_str)
+        or "disk" in text
+        or "readonly" in text
+        or "read-only" in text
+    ):
+        return "disk"
+    return "unknown"
+
+
 def _claim_repair_attempt(db_path: Path) -> bool:
     """Claim the one-shot repair attempt for *db_path* in this process.
 
@@ -2160,6 +2212,184 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             pass
         finally:
             handle.close()
+
+
+# ── Read-only health/stats probes (hermes doctor, dashboards) ──────────
+
+
+def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
+    """Best-effort, strictly read-only stats snapshot of a state.db file.
+
+    Opens the database with ``mode=ro`` (URI) and a short timeout so it can
+    run against a *live* database held by a gateway without ever taking a
+    write lock or mutating the file. Every field is collected independently:
+    a failed pragma/SELECT yields ``None`` for that field, and the helper
+    itself never raises.
+
+    Deliberately does NOT instantiate :class:`SessionDB` — its constructor
+    runs schema DDL (migrations, FTS table creation), which is exactly the
+    kind of write a diagnostics probe must never perform.
+
+    Returned keys (all present, any may be None on failure):
+
+    - ``page_count``, ``page_size``, ``freelist_count`` — PRAGMA values
+    - ``logical_size_bytes`` — page_count * page_size (post-checkpoint size)
+    - ``wal_size_bytes`` — stat() of ``<db>-wal`` (0 when absent)
+    - ``journal_mode`` — PRAGMA journal_mode string
+    - ``messages`` / ``sessions`` — row counts
+    - ``fts_tables`` — dict of {table_name: bool} presence for
+      messages_fts / messages_fts_trigram / messages_fts_cjk
+    - ``fts_storage_version`` — int from state_meta, None when the marker is
+      absent (legacy pre-v23 inline layout)
+    - ``fts_rebuild_pending`` — True when the deferred v23 backfill has not
+      finished (high_water present and progress < high_water)
+    - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
+    """
+    stats: Dict[str, Any] = {
+        "page_count": None,
+        "page_size": None,
+        "freelist_count": None,
+        "logical_size_bytes": None,
+        "wal_size_bytes": None,
+        "journal_mode": None,
+        "messages": None,
+        "sessions": None,
+        "fts_tables": None,
+        "fts_storage_version": None,
+        "fts_rebuild_pending": None,
+        "fts_rebuild_high_water": None,
+        "fts_rebuild_progress": None,
+    }
+
+    # WAL sidecar size needs no connection at all.
+    try:
+        wal_path = Path(str(db_path) + "-wal")
+        stats["wal_size_bytes"] = wal_path.stat().st_size if wal_path.exists() else 0
+    except OSError:
+        pass
+
+    conn = None
+    try:
+        # mode=ro refuses to create the file and refuses every write; a
+        # short timeout keeps doctor snappy when a writer holds the lock.
+        # Route through the tracked connect so byte-probe helpers
+        # (read_header_bytes_preopen) see this connection and refuse raw
+        # opens that could cancel our POSIX locks mid-read.
+        conn = _connect_tracked_db(
+            f"file:{Path(db_path)}?mode=ro",
+            tracking_path=Path(db_path),
+            uri=True,
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.debug("collect_state_db_stats: cannot open %s read-only: %s",
+                     db_path, exc)
+        return stats
+
+    def _scalar(sql: str) -> Any:
+        try:
+            row = conn.execute(sql).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    try:
+        pc = _scalar("PRAGMA page_count")
+        ps = _scalar("PRAGMA page_size")
+        stats["page_count"] = int(pc) if pc is not None else None
+        stats["page_size"] = int(ps) if ps is not None else None
+        if stats["page_count"] is not None and stats["page_size"] is not None:
+            stats["logical_size_bytes"] = stats["page_count"] * stats["page_size"]
+
+        fl = _scalar("PRAGMA freelist_count")
+        stats["freelist_count"] = int(fl) if fl is not None else None
+
+        jm = _scalar("PRAGMA journal_mode")
+        stats["journal_mode"] = str(jm) if jm is not None else None
+
+        msgs = _scalar("SELECT COUNT(*) FROM messages")
+        stats["messages"] = int(msgs) if msgs is not None else None
+        sess = _scalar("SELECT COUNT(*) FROM sessions")
+        stats["sessions"] = int(sess) if sess is not None else None
+
+        # FTS table presence via sqlite_master (never SELECTs from the
+        # virtual tables themselves — a corrupt index must not fail stats).
+        try:
+            names = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN (?, ?, ?)",
+                    ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+                ).fetchall()
+            }
+            stats["fts_tables"] = {
+                t: (t in names)
+                for t in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+            }
+        except Exception:
+            pass
+
+        # Raw state_meta reads — cheap, and independent of SessionDB.
+        def _meta_int(key: str) -> Optional[int]:
+            try:
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+            except Exception:
+                return None
+
+        stats["fts_storage_version"] = _meta_int("fts_storage_version")
+        high_water = _meta_int("fts_rebuild_high_water")
+        progress = _meta_int("fts_rebuild_progress")
+        stats["fts_rebuild_high_water"] = high_water
+        stats["fts_rebuild_progress"] = progress
+        if high_water is None:
+            stats["fts_rebuild_pending"] = False
+        else:
+            stats["fts_rebuild_pending"] = (progress or 0) < high_water
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    return stats
+
+
+def count_db_holders(db_path: Path) -> Optional[int]:
+    """Best-effort count of processes holding ``db_path`` open (Linux only).
+
+    Scans ``/proc/*/fd`` symlinks for the resolved database path. Returns
+    the number of distinct PIDs with the file open, or ``None`` on any
+    error or on non-Linux platforms. Never raises; no lsof dependency.
+    Unreadable per-process fd dirs (other users' processes without root)
+    are silently skipped, so the count is a lower bound.
+    """
+    try:
+        if not sys.platform.startswith("linux"):
+            return None
+        target = os.path.realpath(str(db_path))
+        holders = 0
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue  # process gone or not ours
+            for fd in fds:
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") == target:
+                        holders += 1
+                        break  # one hit per PID
+                except OSError:
+                    continue
+        return holders
+    except Exception:
+        return None
 
 
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
@@ -5667,6 +5897,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
 
+    # Title provenance, lowest to highest authority. An auto-titling write may
+    # only replace a title of strictly lower authority, so the instant
+    # ``derived`` title upgrades to the model's ``llm`` title exactly once and
+    # nothing the agent generates can ever clobber a name the user typed.
+    TITLE_SOURCE_DERIVED = "derived"
+    TITLE_SOURCE_LLM = "llm"
+    TITLE_SOURCE_USER = "user"
+    _TITLE_SOURCE_RANK = {
+        TITLE_SOURCE_DERIVED: 0,
+        TITLE_SOURCE_LLM: 1,
+        TITLE_SOURCE_USER: 2,
+    }
+
+    @classmethod
+    def _title_rank(cls, source: Optional[str]) -> int:
+        """Rank a stored title_source. NULL means a pre-provenance row.
+
+        Rows written before this column existed carry NULL. They were almost
+        always set by the old auto-titler, but a manual ``/title`` from that
+        era is indistinguishable — so treat NULL as ``user`` and refuse to
+        overwrite it. Auto-titling only ever fills genuinely empty titles on
+        legacy rows, which is the conservative direction.
+        """
+        if source is None:
+            return cls._TITLE_SOURCE_RANK[cls.TITLE_SOURCE_USER]
+        return cls._TITLE_SOURCE_RANK.get(str(source), 0)
+
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
         """Validate and sanitize a session title.
@@ -5757,17 +6014,35 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         title: str,
         *,
-        only_if_empty: bool,
+        source: str,
     ) -> bool:
+        """Write a title, enforcing provenance precedence.
+
+        ``source`` is one of ``TITLE_SOURCE_{DERIVED,LLM,USER}``. A ``user``
+        write always lands — an explicit rename is authoritative. An automatic
+        write (``derived``/``llm``) lands only when the row is untitled or the
+        stored title has strictly lower authority, so the instant ``derived``
+        title upgrades to ``llm`` exactly once and neither can ever overwrite a
+        name the user typed. Re-running the titler on an already-``llm`` row is
+        a no-op, which is what stops a session renaming itself.
+
+        The read and the write are one compare-and-swap inside a single
+        transaction, so a manual ``/title`` racing an in-flight generation
+        cannot be clobbered by the late arrival.
+        """
         title = self.sanitize_title(title)
+        is_user = source == self.TITLE_SOURCE_USER
+        new_rank = self._title_rank(source) if not is_user else None
 
         def _do(conn):
-            if only_if_empty:
-                current = conn.execute(
-                    "SELECT title FROM sessions WHERE id = ?",
-                    (session_id,),
-                ).fetchone()
-                if current is None or current["title"] is not None:
+            current = conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                return 0
+            if not is_user and current["title"] is not None:
+                if self._title_rank(current["title_source"]) >= new_rank:
                     return 0
 
             if title:
@@ -5801,10 +6076,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
                         )
-            predicate = " AND title IS NULL" if only_if_empty else ""
+            # Compare-and-swap on the exact values we just read (``IS`` is
+            # NULL-safe in SQLite), so a concurrent write between the SELECT
+            # and here loses instead of being silently overwritten.
             cursor = conn.execute(
-                f"UPDATE sessions SET title = ? WHERE id = ?{predicate}",
-                (title, session_id),
+                "UPDATE sessions SET title = ?, title_source = ? "
+                "WHERE id = ? AND title IS ? AND title_source IS ?",
+                (
+                    title,
+                    source if title else None,
+                    session_id,
+                    current["title"],
+                    current["title_source"],
+                ),
             )
             return cursor.rowcount
 
@@ -5812,23 +6096,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return rowcount > 0
 
     def set_session_title(self, session_id: str, title: str) -> bool:
-        """Set or update a session's title.
+        """Set or update a session's title on the user's behalf.
 
         Returns True if session was found and title was set.
         Raises ValueError if title is already in use by another session,
         or if the title fails validation (too long, invalid characters).
         Empty/whitespace-only strings are normalized to None (clearing the title).
+
+        This records ``user`` provenance, so auto-titling will never replace
+        the result. Automatic callers must use :meth:`set_auto_title`.
         """
-        return self._set_session_title(session_id, title, only_if_empty=False)
+        return self._set_session_title(
+            session_id, title, source=self.TITLE_SOURCE_USER
+        )
+
+    def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
+        """Set an automatically generated title, honoring provenance precedence.
+
+        Returns True when the title was written, False when a higher-authority
+        title already holds the row (nothing is modified in that case).
+        """
+        if source not in (self.TITLE_SOURCE_DERIVED, self.TITLE_SOURCE_LLM):
+            raise ValueError(f"invalid automatic title source: {source!r}")
+        return self._set_session_title(session_id, title, source=source)
 
     def set_auto_title_if_empty(self, session_id: str, title: str) -> bool:
-        """Set an auto-generated title only when the current title is NULL.
+        """Back-compat shim: set an LLM title only if nothing better exists.
 
-        The predicate and write run in one transaction so a concurrent manual
-        rename cannot be overwritten. Validation and uniqueness behavior match
-        :meth:`set_session_title`.
+        Retained because older callers (and third-party plugins) reference it
+        by name. New code should call :meth:`set_auto_title` with an explicit
+        source.
         """
-        return self._set_session_title(session_id, title, only_if_empty=True)
+        return self.set_auto_title(
+            session_id, title, source=self.TITLE_SOURCE_LLM
+        )
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -5838,6 +6139,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             row = cursor.fetchone()
         return row["title"] if row else None
+
+    def get_session_title_source(self, session_id: str) -> Optional[str]:
+        """Get the provenance of a session's title, or None when untitled."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT title, title_source FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+        if not row or row["title"] is None:
+            return None
+        return row["title_source"]
+
+    def set_session_title_source(self, session_id: str, source: str) -> bool:
+        """Overwrite a title's provenance without touching the title text.
+
+        Used when a title is carried across a session boundary (compression
+        rotation) and the copy must keep the original's authority rather than
+        the authority of whichever setter performed the copy.
+        """
+        if source not in self._TITLE_SOURCE_RANK:
+            raise ValueError(f"invalid title source: {source!r}")
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET title_source = ? "
+                "WHERE id = ? AND title IS NOT NULL",
+                (source, session_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do) > 0
 
     def set_session_archived(self, session_id: str, archived: bool) -> bool:
         """Archive or unarchive a session.
@@ -6681,6 +7014,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return meta
 
+    @staticmethod
+    def _reasoning_json_text(value: Any) -> Optional[str]:
+        """Serialize a structured reasoning field for its TEXT column.
+
+        ``reasoning_details`` / ``codex_reasoning_items`` / ``codex_message_items``
+        arrive as list/dict structures from the live runtime, but callers that
+        round-trip stored rows — ``get_messages`` straight into
+        ``replace_messages``, e.g. the POST /api/sessions/{id}/fork handler —
+        hand back the raw TEXT these columns already hold, because
+        ``get_messages`` only deserializes ``content`` and ``tool_calls``.
+        Re-dumping that TEXT double-encodes it, and the forked session's next
+        ``get_messages_as_conversation`` json.loads then yields the inner
+        string instead of the original list, so every reasoning-replay consumer
+        (all of which check ``isinstance(..., list)``) silently drops it.
+        Strings are therefore stored as-is; structures are dumped.
+        """
+        if not value:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+
     def append_message(
         self,
         session_id: str,
@@ -6729,18 +7084,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # context role/content replayed to providers.
         display_metadata_json = self._encode_display_metadata(display_metadata)
         # Serialize structured fields to JSON before entering the write txn
-        reasoning_details_json = (
-            json.dumps(reasoning_details)
-            if reasoning_details else None
-        )
-        codex_items_json = (
-            json.dumps(codex_reasoning_items)
-            if codex_reasoning_items else None
-        )
-        codex_message_items_json = (
-            json.dumps(codex_message_items)
-            if codex_message_items else None
-        )
+        reasoning_details_json = self._reasoning_json_text(reasoning_details)
+        codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+        codex_message_items_json = self._reasoning_json_text(codex_message_items)
         # tool_calls may arrive as a Python list (from the live agent) or
         # as a JSON string (from import/export). Parse first to avoid
         # double-encoding.
@@ -7175,15 +7521,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             codex_message_items = (
                 msg.get("codex_message_items") if role == "assistant" else None
             )
-            reasoning_details_json = (
-                json.dumps(reasoning_details) if reasoning_details else None
-            )
-            codex_items_json = (
-                json.dumps(codex_reasoning_items) if codex_reasoning_items else None
-            )
-            codex_message_items_json = (
-                json.dumps(codex_message_items) if codex_message_items else None
-            )
+            reasoning_details_json = self._reasoning_json_text(reasoning_details)
+            codex_items_json = self._reasoning_json_text(codex_reasoning_items)
+            codex_message_items_json = self._reasoning_json_text(codex_message_items)
             # tool_calls may arrive as a Python list (from the live agent)
             # or as a JSON string (from import_sessions / export_session,
             # which store it as TEXT). json.dumps on an already-serialized
@@ -7486,6 +7826,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
+
+    def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
+        """Tool results in these sessions that mention a GitHub PR url.
+
+        A candidate scan, deliberately loose: it hands back every tool result
+        containing ``/pull/`` and leaves the caller to decide which ones make a
+        claim (see the desktop's PR recovery, which only accepts an output that
+        is a bare PR url — the signature of ``gh pr create``). Ordered
+        oldest-first per session so the caller can take the last match.
+        """
+        found: List[Dict[str, Any]] = []
+        ids = [s for s in session_ids if s]
+        for start in range(0, len(ids), 900):  # SQLite's bound-variable ceiling.
+            chunk = ids[start : start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    f"""SELECT session_id, content FROM messages
+                        WHERE session_id IN ({placeholders})
+                          AND role = 'tool' AND content LIKE '%/pull/%'
+                        ORDER BY id ASC""",
+                    chunk,
+                ).fetchall()
+            found.extend({"session_id": row[0], "content": row[1]} for row in rows)
+        return found
 
     def get_messages_around(
         self,
