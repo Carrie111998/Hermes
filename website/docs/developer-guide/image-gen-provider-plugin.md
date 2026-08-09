@@ -109,6 +109,9 @@ class MyBackendImageGenProvider(ImageGenProvider):
                     "key": "MY_BACKEND_API_KEY",
                     "prompt": "My Backend API key",
                     "url": "https://my-backend.example.com/api-keys",
+                    # Optional; defaults to True. Set False when the key is
+                    # only needed for some configurations (e.g. keyless SSO).
+                    "required": True,
                 },
             ],
         }
@@ -220,6 +223,54 @@ requires_env:
 ```
 
 `kind: backend` is what routes the plugin to the image-gen registration path. `requires_env` is prompted during `hermes plugins install`.
+
+## Non-secret settings: `config_fields`
+
+`.env` is for credentials only. Everything else a backend needs — endpoints, deployment names, region ids, API versions — belongs in `config.yaml`. Declare those in `config_fields` and `hermes tools` prompts for them alongside your `env_vars`, then writes them to the active profile's `config.yaml` at the dotted key you name:
+
+```python
+def get_setup_schema(self) -> Dict[str, Any]:
+    return {
+        "name": "My Backend",
+        "env_vars": [{"key": "MY_BACKEND_API_KEY", "required": False}],
+        "config_fields": [
+            {
+                "key": "image_gen.my_backend.endpoint",
+                "prompt": "Endpoint URL",
+                "required": True,
+                "normalize": normalize_my_endpoint,   # optional
+            },
+            {
+                "key": "image_gen.my_backend.deployment",
+                "prompt": "Deployment name",
+                "required": True,
+            },
+        ],
+    }
+```
+
+| Field key | Purpose |
+|---|---|
+| `key` | Dotted `config.yaml` path the value is written to |
+| `prompt` | Label shown at setup |
+| `required` | A missing value reports `needs_setup` in the picker |
+| `default` | Pre-filled suggestion |
+| `normalize` | `normalize(value) -> str` — validate/canonicalize |
+
+These values never pass through credential storage or password-masked input. A `normalize` callback owns provider-specific validation: return the canonical string, or raise `ValueError("<short correction>")` to have the setup UI show your correction and re-prompt. Nothing invalid is written.
+
+## Endpoint-aware readiness: `readiness_check`
+
+By default a row is `needs_keys` until every required `env_var` is present. When a credential is optional for *some* configurations (keyless SSO against one endpoint family, an API key against another), that decision belongs to your provider, not to a globally mandatory key. Return `readiness_check` from your setup schema:
+
+```python
+def picker_readiness_status(self, config, get_secret) -> str:
+    if get_secret("MY_BACKEND_API_KEY"):
+        return "ready"
+    return "ready" if supports_keyless(config) else "needs_auth"
+```
+
+The callback receives the loaded config plus a secret accessor, and must return one of `ready`, `needs_keys`, `needs_auth`, or `needs_setup`. It runs after credential and `config_fields` presence checks, and fails closed to `needs_setup` if it raises or returns anything else. Do not mint tokens or make network calls here — the picker calls it while rendering.
 
 ## ABC reference
 
