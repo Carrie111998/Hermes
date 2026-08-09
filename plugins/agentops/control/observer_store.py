@@ -354,8 +354,8 @@ class ObserverStore:
         """Persist a collection run, recurring signals and source cursor atomically."""
         if not isinstance(batch, CollectionBatch):
             raise ObserverStoreError("invalid collection batch")
-        if batch.next_cursor is not None and not batch.source_id:
-            raise ObserverStoreError("cursor source is required")
+        if not batch.source_id:
+            raise ObserverStoreError("collection source is required")
         try:
             safe_signals = self._safe_signals(batch)
         except RedactionError as exc:
