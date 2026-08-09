@@ -2054,6 +2054,10 @@ export interface Translations {
       noChanges: string
       notRepo: string
       noDiff: string
+      changes: string
+      history: string
+      commitHistory: string
+      noHistory: string
       scopeUncommitted: string
       scopeBranch: string
       scopeLastTurn: string

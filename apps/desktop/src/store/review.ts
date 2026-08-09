@@ -3,7 +3,7 @@ import { atom, computed } from 'nanostores'
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
-import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
+import type { HermesGitCommit, HermesReviewFile, HermesReviewShipInfo } from '@/global'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
@@ -31,6 +31,7 @@ export const REVIEW_PANE_ID = 'review'
 const OPEN_KEY = 'hermes.desktop.reviewOpen'
 const COMMIT_DEFAULT_KEY = 'hermes.desktop.reviewCommitDefault'
 const TREE_MODE_KEY = 'hermes.desktop.reviewTreeMode'
+const VIEW_KEY = 'hermes.desktop.reviewView'
 const SELECTED_KEY = 'hermes.desktop.reviewSelectedPath'
 const REVIEW_REFRESH_DEBOUNCE_MS = 100
 const SHIP_INFO_STALE_MS = 30_000
@@ -58,6 +59,16 @@ export function toggleReviewTreeMode(): void {
   $reviewTreeMode.set($reviewTreeMode.get() === 'tree' ? 'list' : 'tree')
 }
 
+// Review has two intentionally separate sources of truth: uncommitted files
+// and immutable commits. Keeping the selection transient avoids restoring a
+// commit from a different worktree after a session switch.
+export type ReviewView = 'changes' | 'history'
+
+export const $reviewView = persistentAtom<ReviewView>(VIEW_KEY, 'changes', {
+  decode: raw => (raw === 'history' ? 'history' : 'changes'),
+  encode: value => value
+})
+
 export const $reviewFiles = atom<HermesReviewFile[]>([])
 export const $reviewLoading = atom(false)
 // False when the active session isn't in a local git repo (detached/fresh chat,
@@ -76,6 +87,11 @@ export const $reviewMaxChurn = computed($reviewFiles, files =>
 export const $reviewSelectedPath = persistentAtom<null | string>(SELECTED_KEY, null, Codecs.nullableText)
 export const $reviewDiff = atom<null | string>(null)
 export const $reviewDiffLoading = atom(false)
+export const $reviewHistory = atom<HermesGitCommit[]>([])
+export const $reviewHistoryLoading = atom(false)
+export const $reviewSelectedCommit = atom<null | string>(null)
+export const $reviewHistoryDiff = atom<null | string>(null)
+export const $reviewHistoryDiffLoading = atom(false)
 
 // Ship state: gh availability + this branch's PR, and a busy flag for the
 // commit/push/PR action bar (disables buttons + shows progress).
@@ -104,6 +120,7 @@ const repoCwd = reviewRepoCwd
 type ReviewBridge = NonNullable<NonNullable<NonNullable<Window['hermesDesktop']>['git']>['review']>
 let reviewRefreshSeq = 0
 let reviewRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let historyRefreshSeq = 0
 let shipInfoSeq = 0
 let shipInfoLastCheckedAt = 0
 
@@ -188,7 +205,7 @@ function scheduleReviewRefresh(): void {
 
   reviewRefreshTimer = setTimeout(() => {
     reviewRefreshTimer = null
-    void refreshReview()
+    refreshActiveReviewView()
   }, REVIEW_REFRESH_DEBOUNCE_MS)
 }
 
@@ -226,6 +243,97 @@ export function clearReviewSelection(): void {
   $reviewSelectedPath.set(null)
   $reviewDiff.set(null)
   $reviewDiffLoading.set(false)
+}
+
+export async function refreshReviewHistory(): Promise<void> {
+  const ctx = reviewCtx()
+  const seq = (historyRefreshSeq += 1)
+
+  if (!$reviewOpen.get() || !ctx) {
+    $reviewHistory.set([])
+
+    if (seq === historyRefreshSeq) {
+      $reviewHistoryLoading.set(false)
+    }
+
+    return
+  }
+
+  $reviewHistoryLoading.set(true)
+
+  try {
+    const commits = await ctx.review.history(ctx.cwd, 50)
+
+    if (seq !== historyRefreshSeq || repoCwd() !== ctx.cwd) {
+      return
+    }
+
+    $reviewHistory.set(commits)
+
+    if ($reviewSelectedCommit.get() && !commits.some(commit => commit.sha === $reviewSelectedCommit.get())) {
+      clearReviewCommitSelection()
+    }
+  } catch {
+    if (seq === historyRefreshSeq) {
+      $reviewHistory.set([])
+    }
+  } finally {
+    if (seq === historyRefreshSeq) {
+      $reviewHistoryLoading.set(false)
+    }
+  }
+}
+
+export async function selectReviewCommit(commit: HermesGitCommit): Promise<void> {
+  $reviewSelectedCommit.set(commit.sha)
+
+  const ctx = reviewCtx()
+
+  if (!ctx) {
+    $reviewHistoryDiff.set(null)
+
+    return
+  }
+
+  $reviewHistoryDiffLoading.set(true)
+
+  try {
+    const diff = await ctx.review.historyDiff(ctx.cwd, commit.sha)
+
+    if ($reviewSelectedCommit.get() === commit.sha) {
+      $reviewHistoryDiff.set(diff || '')
+    }
+  } catch {
+    if ($reviewSelectedCommit.get() === commit.sha) {
+      $reviewHistoryDiff.set('')
+    }
+  } finally {
+    if ($reviewSelectedCommit.get() === commit.sha) {
+      $reviewHistoryDiffLoading.set(false)
+    }
+  }
+}
+
+export function clearReviewCommitSelection(): void {
+  $reviewSelectedCommit.set(null)
+  $reviewHistoryDiff.set(null)
+  $reviewHistoryDiffLoading.set(false)
+}
+
+export function setReviewView(view: ReviewView): void {
+  $reviewView.set(view)
+
+  if (view === 'history') {
+    void refreshReviewHistory()
+  }
+}
+
+function refreshActiveReviewView(): void {
+  if ($reviewView.get() === 'history') {
+    void refreshReviewHistory()
+  } else {
+    void refreshReview()
+  }
 }
 
 // ── View state ───────────────────────────────────────────────────────────────
@@ -268,7 +376,7 @@ export function openReview(scopeCwd: null | string = null, scopeTarget = 'main')
   $reviewScopeCwd.set(scopeCwd?.trim() || null)
   $reviewScopeTarget.set(scopeTarget.trim() || 'main')
   $reviewOpen.set(true)
-  void refreshReview()
+  refreshActiveReviewView()
   void refreshShipInfo()
 }
 
@@ -277,6 +385,7 @@ export function closeReview(): void {
   $reviewScopeCwd.set(null)
   $reviewScopeTarget.set('main')
   clearReviewSelection()
+  clearReviewCommitSelection()
 }
 
 export function toggleReview(scopeCwd: null | string = null, scopeTarget = 'main'): void {
@@ -382,6 +491,7 @@ export async function openReviewForPath(
 // working tree changed). A failure is swallowed by the caller's notify wrapper.
 async function afterMutation(): Promise<void> {
   await refreshReview()
+  void refreshReviewHistory()
   void refreshRepoStatus(repoCwd())
 
   const selected = $reviewSelectedPath.get()
@@ -457,6 +567,7 @@ export async function commitChanges(message: string, opts: { push?: boolean } = 
   await runShip(async () => {
     await ctx.review.commit(ctx.cwd, message.trim(), Boolean(opts.push))
     await refreshReview()
+    void refreshReviewHistory()
     void refreshRepoStatus(repoCwd())
     void refreshShipInfo()
   })
@@ -595,8 +706,11 @@ $busy.subscribe(busy => {
 function onReviewRepoMoved(): void {
   if ($reviewOpen.get()) {
     clearReviewSelection()
+    clearReviewCommitSelection()
     $reviewFiles.set([])
+    $reviewHistory.set([])
     $reviewLoading.set(true)
+    $reviewHistoryLoading.set(true)
     scheduleReviewRefresh()
     void refreshShipInfo()
   }
