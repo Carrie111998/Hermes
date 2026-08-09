@@ -11624,12 +11624,11 @@ async def get_logs(
     else:
         comp_prefixes = None
 
-    # Session filter: records are tagged " [session_id]" by
-    # hermes_logging._install_session_record_factory(), so a plain substring
-    # match against the formatted line (same approach the CLI's `hermes logs
-    # --session` already uses via _matches_filters) is sufficient — no
-    # separate parsing path needed.
-    session_filter = session.strip() if session and session.strip() else None
+    # Session ids are stamped as a delimited ``[session_id]`` field. Search
+    # that exact marker so an id cannot match a longer id or message text that
+    # merely mentions it.
+    session_id = session.strip() if session and session.strip() else None
+    session_filter = f"[{session_id}]" if session_id else None
 
     has_filters = bool(min_level or comp_prefixes or search or session_filter)
     result = _read_tail(

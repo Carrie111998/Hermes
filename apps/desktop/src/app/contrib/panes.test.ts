@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { resolveLogsSessionQueryValue } from './panes'
+import { logsSessionsForProfile, resolveLogsSessionQueryValue } from './panes'
 
 describe('LogsPane session filter routing', () => {
   it('serializes Current as the stored/logged session id, not the runtime id', () => {
@@ -39,5 +39,22 @@ describe('LogsPane session filter routing', () => {
         resolvedFilter: 'picked-stored-session'
       })
     ).toBe('picked-stored-session')
+  })
+})
+
+describe('LogsPane profile scoping', () => {
+  it('keeps only sessions owned by the active gateway profile', () => {
+    const sessions = [
+      { id: 'default-session', profile: null },
+      { id: 'work-session', profile: 'work' },
+      { id: 'other-session', profile: 'other' }
+    ]
+
+    expect(logsSessionsForProfile(sessions as never, 'work').map(session => session.id)).toEqual([
+      'work-session'
+    ])
+    expect(logsSessionsForProfile(sessions as never, 'default').map(session => session.id)).toEqual([
+      'default-session'
+    ])
   })
 })

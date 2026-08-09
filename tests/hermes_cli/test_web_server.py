@@ -2149,10 +2149,7 @@ class TestNewEndpoints:
     def test_get_logs_session_filter(self):
         """GET /api/logs?session=<id> narrows to lines tagged with that
         session (#70828). Log lines get " [session_id]" stamped by
-        hermes_logging's record factory via set_session_context(); the
-        endpoint's session_filter is a plain substring match against the
-        formatted line, mirroring `hermes logs --session` (_matches_filters
-        in hermes_cli/logs.py)."""
+        hermes_logging's record factory via set_session_context()."""
         from hermes_constants import get_hermes_home
 
         log_path = get_hermes_home() / "logs" / "agent.log"
@@ -2161,14 +2158,17 @@ class TestNewEndpoints:
             "2026-07-24 12:00:00 INFO [session-alpha] agent: alpha line one\n"
             "2026-07-24 12:00:01 INFO [session-beta] agent: beta line one\n"
             "2026-07-24 12:00:02 INFO [session-alpha] agent: alpha line two\n"
+            "2026-07-24 12:00:03 INFO [session-alpha-extra] agent: prefix collision\n"
+            "2026-07-24 12:00:04 INFO [session-beta] agent: mentions session-alpha\n"
         )
 
         resp = self.client.get("/api/logs?file=agent&session=session-alpha")
         assert resp.status_code == 200
         data = resp.json()
         assert len(data["lines"]) == 2
-        assert all("session-alpha" in line for line in data["lines"])
+        assert all("[session-alpha]" in line for line in data["lines"])
         assert not any("session-beta" in line for line in data["lines"])
+        assert not any("session-alpha-extra" in line for line in data["lines"])
 
     def test_get_logs_session_filter_no_match(self):
         from hermes_constants import get_hermes_home

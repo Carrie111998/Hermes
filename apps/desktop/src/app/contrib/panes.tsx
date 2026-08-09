@@ -18,8 +18,8 @@ import { ReviewPane } from '@/app/right-sidebar/review'
 import type { GroupSetter } from '@/app/shell/group-setter'
 import type { StatusbarItem } from '@/app/shell/statusbar-controls'
 import type { TitlebarTool } from '@/app/shell/titlebar-controls'
-import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { DecodeText } from '@/components/ui/decode-text'
+import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
@@ -28,7 +28,9 @@ import { sessionTitle } from '@/lib/chat-runtime'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { openPreview } from '@/store/preview'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $selectedStoredSessionId, $sessions } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
 
 // ---------------------------------------------------------------------------
 // Logs — live agent-log tail. OPTIONAL chrome: not in any default layout,
@@ -64,11 +66,23 @@ export function resolveLogsSessionQueryValue({
   return resolvedFilter
 }
 
+export function logsSessionsForProfile(sessions: SessionInfo[], activeGatewayProfile: string): SessionInfo[] {
+  const profile = normalizeProfileKey(activeGatewayProfile)
+
+  return sessions.filter(session => normalizeProfileKey(session.profile) === profile)
+}
+
 export function LogsPane() {
   const activeSessionId = useStore($activeSessionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
   const sessions = useStore($sessions)
   const [sessionFilter, setSessionFilter] = useState<string>(LOGS_SESSION_FILTER_ALL)
+
+  const profileSessions = useMemo(
+    () => logsSessionsForProfile(sessions, activeGatewayProfile),
+    [activeGatewayProfile, sessions]
+  )
 
   // A specific picked session id can go stale (session closed/deleted) —
   // fall back to "all" rather than silently filtering on a dead id forever.
@@ -76,8 +90,11 @@ export function LogsPane() {
     if (sessionFilter === LOGS_SESSION_FILTER_ALL || sessionFilter === LOGS_SESSION_FILTER_CURRENT) {
       return sessionFilter
     }
-    return sessions.some(session => session.id === sessionFilter) ? sessionFilter : LOGS_SESSION_FILTER_ALL
-  }, [sessionFilter, sessions])
+
+    return profileSessions.some(session => session.id === sessionFilter)
+      ? sessionFilter
+      : LOGS_SESSION_FILTER_ALL
+  }, [profileSessions, sessionFilter])
 
   const sessionQueryValue = resolveLogsSessionQueryValue({
     activeSessionId,
@@ -96,15 +113,17 @@ export function LogsPane() {
       { id: LOGS_SESSION_FILTER_ALL, label: 'All' },
       { id: LOGS_SESSION_FILTER_CURRENT, label: 'Current' }
     ]
+
     // Recent sessions beyond "current", most-recently-active first, capped
     // so the picker stays usable rather than listing every stored session.
-    const recents = [...sessions]
+    const recents = [...profileSessions]
       .sort((a, b) => (b.last_active || b.started_at || 0) - (a.last_active || a.started_at || 0))
       .filter(session => session.id !== (selectedStoredSessionId ?? activeSessionId))
       .slice(0, 8)
       .map(session => ({ id: session.id, label: sessionTitle(session) }))
+
     return [...base, ...recents]
-  }, [activeSessionId, selectedStoredSessionId, sessions])
+  }, [activeSessionId, profileSessions, selectedStoredSessionId])
 
   if (error) {
     return <div className="p-3 text-xs text-(--ui-text-quaternary)">log unavailable: {String(error)}</div>
