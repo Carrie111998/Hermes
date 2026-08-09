@@ -2716,6 +2716,15 @@ button[data-slot='aui_msg-reactions'] svg {
   max-width: none !important;
   transform: none !important;
   translate: none !important;
+  /* The dock's own class is `-translate-x-1/2` (Tailwind v4 → the standalone
+     `translate` property, driven by --tw-translate-*). Lightning CSS folds
+     `translate: none` into `transform` and DROPS it from the output, so the
+     cancel above alone leaves the full-width dock shifted -50% — half of it
+     hangs off the window's left edge and the input sits off-screen. Zeroing
+     the Tailwind variables neutralizes the shift at the source; custom
+     properties survive the optimizer. */
+  --tw-translate-x: 0 !important;
+  --tw-translate-y: 0 !important;
   padding: 0 !important;
 }
 
