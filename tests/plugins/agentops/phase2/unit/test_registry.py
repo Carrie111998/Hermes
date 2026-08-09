@@ -25,6 +25,9 @@ def test_bootstrap_registry_has_the_five_phase_zero_profiles_in_observe_only_mod
 
 def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targets():
     registry = bootstrap_gateway_registry()
+    default = registry.get_target("hermes:profile:default:gateway")
+    assert default.spec.labels.get("process_observation") == "enabled"
+    assert default.spec.labels.get("process_marker") == "default"
     observed_at = datetime(2026, 8, 9, tzinfo=timezone.utc)
 
     for target in registry.list_targets():
@@ -33,8 +36,8 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
         )
 
     coverage = registry.coverage_report()
-    assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (1, 1, 0)
-    assert "processes" in coverage.unmanaged_collectors
+    assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (1, 1, 100)
+    assert "processes" not in coverage.unmanaged_collectors
     assert len(coverage.out_of_scope_targets) == 4
 
 

@@ -86,7 +86,7 @@ class ProcessCollector:
                     fingerprint = self._command_fingerprint(process)
                     if profile_marker not in command and f"--profile={profile_marker}" not in command:
                         continue
-                    if service_label not in command:
+                    if service_label not in command and labels.get("process_command_label_optional") != "true":
                         continue
                     owner = process.uids().real
                     if int(owner) != os.getuid() or fingerprint != expected_fingerprint:

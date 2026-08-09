@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import os
 import plistlib
+import json
 import stat
 from pathlib import Path
 from typing import Iterable
@@ -92,11 +93,20 @@ def bootstrap_gateway_registry() -> FleetRegistry:
         try:
             meta = plist.lstat()
             if stat.S_ISREG(meta.st_mode) and not stat.S_ISLNK(meta.st_mode) and meta.st_uid == os.getuid() and meta.st_nlink == 1 and meta.st_size <= 1024 * 1024:
-                data = plistlib.loads(plist.read_bytes())
-                args = data.get("ProgramArguments")
+                raw = plist.read_bytes()
+                try:
+                    data = plistlib.loads(raw)
+                    args = data.get("ProgramArguments")
+                except (plistlib.InvalidFileException, ValueError):
+                    data = {"Label": label, "ProgramArguments": json.loads(raw.decode("utf-8"))}
+                    args = data["ProgramArguments"]
                 if data.get("Label") == label and isinstance(args, list) and all(isinstance(x, str) for x in args):
+                    expected = ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+                    if profile == "default" and args != expected:
+                        labels["process_observation"] = "disabled"
+                        return TargetSpec(target_id=f"hermes:profile:{profile}:gateway", profile=profile, kind=TargetKind.GATEWAY, criticality=criticality, observed_paths=(logs_path, f"~/Library/LaunchAgents/{label}.plist"), labels=labels, existing_writer="launchd+hermes_gateway_watchdog")
                     digest = hashlib.sha256("\x00".join(args).encode()).hexdigest()
-                    labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled")
+                    labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled", process_command_label_optional="true")
                 else:
                     labels["process_observation"] = "disabled"
             else:
