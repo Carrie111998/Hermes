@@ -208,6 +208,42 @@ def test_static_model_alias_cannot_revive_disabled_provider(monkeypatch):
     assert models._resolve_static_model_alias("sonnet", set()) is None
 
 
+def test_openrouter_fallback_cannot_revive_disabled_provider(monkeypatch):
+    from hermes_cli import models
+
+    monkeypatch.setattr(
+        models,
+        "_provider_is_routable",
+        lambda provider: provider != "openrouter",
+    )
+    monkeypatch.setattr(
+        models,
+        "_find_openrouter_slug",
+        lambda _name: pytest.fail("disabled OpenRouter catalog was queried"),
+    )
+
+    assert (
+        models.detect_provider_for_model(
+            "openrouter-only-model",
+            "openai-api",
+        )
+        is None
+    )
+
+
+def test_openrouter_fallback_still_routes_when_enabled(monkeypatch):
+    from hermes_cli import models
+
+    slug = "poolside/laguna-m.1:free"
+    monkeypatch.setattr(models, "_provider_is_routable", lambda _provider: True)
+    monkeypatch.setattr(models, "_find_openrouter_slug", lambda _name: slug)
+
+    assert models.detect_provider_for_model(
+        "laguna-m.1:free",
+        "openai-api",
+    ) == ("openrouter", slug)
+
+
 def test_disabled_provider_catalogs_do_not_leak_static_or_disk_cache(monkeypatch):
     from hermes_cli import models
 

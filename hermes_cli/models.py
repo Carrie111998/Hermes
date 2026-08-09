@@ -2871,6 +2871,8 @@ def detect_provider_for_model(
         return None
 
     # --- Step 2: check OpenRouter catalog ---
+    if not _provider_is_routable("openrouter"):
+        return None
     # First try exact match (handles provider/model format)
     or_slug = _find_openrouter_slug(name)
     if or_slug:
