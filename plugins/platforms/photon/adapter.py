@@ -703,6 +703,10 @@ class PhotonAdapter(BasePlatformAdapter):
     # of leaving a stale tofu square (▉) behind when edit attempts fail.
     SUPPORTS_MESSAGE_EDITING = False
 
+    # iMessage tapbacks via the sidecar's /react endpoint; add_reaction /
+    # remove_reaction already implement the unified base contract below.
+    SUPPORTS_REACTIONS = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("photon"))
         extra = config.extra or {}
