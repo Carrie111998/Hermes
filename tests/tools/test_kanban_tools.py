@@ -416,6 +416,27 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_carries_not_before_to_persisted_child(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "scheduled child",
+        "assignee": "peer",
+        "not_before": "2030-01-01T00:00:00Z",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.not_before == "2030-01-01T00:00:00Z"
+        assert child.status == "scheduled"
+    finally:
+        conn.close()
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

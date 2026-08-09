@@ -192,47 +192,110 @@ def normalize_not_before(value: Optional[str]) -> Optional[str]:
 
 
 _NOT_BEFORE_OVERRIDE_SEAL = object()
+_VERIFIED_OWNER_SEAL = object()
 
 
 @dataclass(frozen=True)
-class HumanNotBeforeOverride:
-    """Sealed capability issued by an already-authenticated human surface.
+class VerifiedKanbanOwner:
+    """Identity minted by a trusted dashboard/CLI authentication seam."""
 
-    Agent-facing Kanban tools intentionally have no way to construct or pass
-    this object.  A trusted CLI/dashboard surface must authenticate its human,
-    call :func:`authenticated_human_not_before_override`, and pass the returned
-    capability directly to the guarded DB operation.  Every accepted use is
-    recorded on the task event stream.
-    """
-
-    actor: str
-    reason: str
+    identity: str
     authenticated_by: str
     _seal: object = field(repr=False, compare=False)
 
 
-def authenticated_human_not_before_override(
-    *, actor: str, reason: str, authenticated_by: str
-) -> HumanNotBeforeOverride:
-    """Mint a not-before override after the caller authenticated a human.
+@dataclass(frozen=True)
+class OwnerNotBeforeOverride:
+    """Single-task capability issued by the owner control plane."""
 
-    This is a capability boundary, not an authentication mechanism.  Callers
-    must pass a non-empty identity and authentication provenance (for example
-    ``local_tty_os_user`` or ``gateway_api_key``).  The worker tool schema does
-    not expose this factory or the capability, so an agent cannot request an
-    override through ``kanban_complete``/``kanban_create``.
+    task_id: str
+    owner_identity: str
+    reason: str
+    token: str = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+
+# Keep the old type name importable for callers that only used annotations, but
+# do not retain its self-asserted construction semantics.
+HumanNotBeforeOverride = OwnerNotBeforeOverride
+
+
+def authenticated_human_not_before_override(**_kwargs) -> OwnerNotBeforeOverride:
+    """Reject the retired self-asserted override boundary.
+
+    Authentication and task ownership must be established by the dashboard or
+    CLI control plane before it calls :func:`mint_owner_not_before_override`.
+    Worker-supplied identity/provenance strings are never authorization.
     """
-    actor = str(actor or "").strip()
-    reason = str(reason or "").strip()
+    raise ValueError(
+        "owner-authenticated not-before override required; self-asserted "
+        "actor/reason/authenticated_by capabilities are not accepted"
+    )
+
+
+def _verified_kanban_owner(
+    identity: str,
+    authenticated_by: str,
+) -> VerifiedKanbanOwner:
+    """Create an owner identity only for an already-verified control seam."""
+    identity = str(identity or "").strip()
     authenticated_by = str(authenticated_by or "").strip()
-    if not actor or not reason or not authenticated_by:
-        raise ValueError(
-            "human not-before override requires actor, reason, and authenticated_by"
-        )
-    return HumanNotBeforeOverride(
-        actor=actor,
-        reason=reason,
+    if not identity or not authenticated_by:
+        raise ValueError("verified Kanban owner requires identity and provenance")
+    return VerifiedKanbanOwner(
+        identity=identity,
         authenticated_by=authenticated_by,
+        _seal=_VERIFIED_OWNER_SEAL,
+    )
+
+
+def mint_owner_not_before_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    owner: VerifiedKanbanOwner,
+    reason: str,
+) -> OwnerNotBeforeOverride:
+    """Mint a task-bound, one-use override in the owner control plane."""
+    if not (
+        isinstance(owner, VerifiedKanbanOwner)
+        and owner._seal is _VERIFIED_OWNER_SEAL
+        and owner.identity.strip()
+        and owner.authenticated_by.strip()
+    ):
+        raise ValueError("owner authentication is required for not-before override")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("not-before override reason is required")
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        raise ValueError("task id is required for not-before override")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"task {task_id} not found")
+        conn.execute(
+            "INSERT INTO kanban_not_before_overrides "
+            "(token_hash, task_id, owner_identity, authenticated_by, reason, issued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                token_hash,
+                task_id,
+                owner.identity,
+                owner.authenticated_by,
+                reason,
+                int(time.time()),
+            ),
+        )
+    return OwnerNotBeforeOverride(
+        task_id=task_id,
+        owner_identity=owner.identity,
+        reason=reason,
+        token=token,
         _seal=_NOT_BEFORE_OVERRIDE_SEAL,
     )
 
@@ -279,15 +342,37 @@ def not_before_pending(value: Optional[str], *, now: Optional[float] = None) -> 
 
 
 def _valid_not_before_override(
-    override: Optional[HumanNotBeforeOverride],
+    override: Optional[OwnerNotBeforeOverride],
 ) -> bool:
     return bool(
-        isinstance(override, HumanNotBeforeOverride)
+        isinstance(override, OwnerNotBeforeOverride)
         and override._seal is _NOT_BEFORE_OVERRIDE_SEAL
-        and override.actor.strip()
+        and override.task_id.strip()
+        and override.owner_identity.strip()
         and override.reason.strip()
-        and override.authenticated_by.strip()
+        and override.token.strip()
     )
+
+
+def _authorized_not_before_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    override: Optional[OwnerNotBeforeOverride],
+) -> Optional[sqlite3.Row]:
+    """Validate the sealed capability against its one-use DB record."""
+    if not _valid_not_before_override(override):
+        return None
+    assert isinstance(override, OwnerNotBeforeOverride)
+    if override.task_id != task_id:
+        return None
+    token_hash = hashlib.sha256(override.token.encode("utf-8")).hexdigest()
+    return conn.execute(
+        "SELECT owner_identity, authenticated_by, reason FROM "
+        "kanban_not_before_overrides "
+        "WHERE token_hash = ? AND task_id = ? AND owner_identity = ? "
+        "AND reason = ? AND used_at IS NULL",
+        (token_hash, task_id, override.owner_identity, override.reason),
+    ).fetchone()
 
 
 def _append_not_before_block_once(
@@ -332,7 +417,7 @@ def _not_before_blocks(
     task_id: str,
     *,
     operation: str,
-    override: Optional[HumanNotBeforeOverride] = None,
+    override: Optional[OwnerNotBeforeOverride] = None,
     now: Optional[float] = None,
 ) -> Optional[str]:
     """Transactional guard. Return the blocking deadline, else ``None``."""
@@ -344,8 +429,9 @@ def _not_before_blocks(
     not_before = str(row["not_before"])
     if not not_before_pending(not_before, now=now):
         return None
-    if _valid_not_before_override(override):
-        assert isinstance(override, HumanNotBeforeOverride)
+    authorized_override = _authorized_not_before_override(conn, task_id, override)
+    if authorized_override is not None:
+        assert isinstance(override, OwnerNotBeforeOverride)
         _append_event(
             conn,
             task_id,
@@ -353,11 +439,36 @@ def _not_before_blocks(
             {
                 "operation": operation,
                 "not_before": not_before,
-                "actor": override.actor,
+                "owner_identity": override.owner_identity,
                 "reason": override.reason,
-                "authenticated_by": override.authenticated_by,
+                "authenticated_by": authorized_override["authenticated_by"],
             },
             run_id=_current_run_id(conn, task_id),
+        )
+        consumed = conn.execute(
+            "UPDATE kanban_not_before_overrides SET used_at = ? "
+            "WHERE token_hash = ? AND task_id = ? AND used_at IS NULL",
+            (
+                int(time.time()),
+                hashlib.sha256(override.token.encode("utf-8")).hexdigest(),
+                task_id,
+            ),
+        )
+        if consumed.rowcount != 1:
+            _append_not_before_block_once(
+                conn,
+                task_id,
+                operation=operation,
+                not_before=not_before,
+            )
+            return not_before
+        # The capability is a deliberate release, so clear the gate in the
+        # same transaction that audits and consumes it. Subsequent guards in
+        # the same lifecycle operation observe the released task.
+        conn.execute(
+            "UPDATE tasks SET not_before = NULL "
+            "WHERE id = ? AND not_before = ?",
+            (task_id, not_before),
         )
         return None
     _append_not_before_block_once(
@@ -1569,6 +1680,29 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- One-use owner-authenticated capabilities for releasing a task gate. The
+-- raw token never persists; task, verified owner identity, provenance, and
+-- reason are all bound in this row for validation and audit.
+CREATE TABLE IF NOT EXISTS kanban_not_before_overrides (
+    token_hash       TEXT PRIMARY KEY,
+    task_id          TEXT NOT NULL,
+    owner_identity   TEXT NOT NULL,
+    authenticated_by TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    issued_at        INTEGER NOT NULL,
+    used_at          INTEGER
+);
+
+-- Short-lived dispatch authorization. A task gate cannot be changed while a
+-- provider/tool call owns this task-scoped lease; the lease is released after
+-- the callback returns and expires safely if a worker disappears.
+CREATE TABLE IF NOT EXISTS kanban_not_before_dispatch_leases (
+    task_id      TEXT PRIMARY KEY,
+    lease_hash   TEXT NOT NULL,
+    issued_at    INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1639,6 +1773,22 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_not_before_overrides_task
+    ON kanban_not_before_overrides(task_id, used_at);
+CREATE INDEX IF NOT EXISTS idx_not_before_dispatch_leases_expiry
+    ON kanban_not_before_dispatch_leases(expires_at);
+
+CREATE TRIGGER IF NOT EXISTS kanban_not_before_reject_leased_change
+BEFORE UPDATE OF not_before ON tasks
+WHEN OLD.not_before IS NOT NEW.not_before
+ AND EXISTS (
+     SELECT 1 FROM kanban_not_before_dispatch_leases AS lease
+     WHERE lease.task_id = OLD.id
+       AND lease.expires_at > unixepoch()
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'not-before dispatch lease is active');
+END;
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2597,6 +2747,29 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_not_before_dispatch_leases (
+            task_id TEXT PRIMARY KEY,
+            lease_hash TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_not_before_dispatch_leases_expiry
+            ON kanban_not_before_dispatch_leases(expires_at);
+        CREATE TRIGGER IF NOT EXISTS kanban_not_before_reject_leased_change
+        BEFORE UPDATE OF not_before ON tasks
+        WHEN OLD.not_before IS NOT NEW.not_before
+         AND EXISTS (
+             SELECT 1 FROM kanban_not_before_dispatch_leases AS lease
+             WHERE lease.task_id = OLD.id
+               AND lease.expires_at > unixepoch()
+         )
+        BEGIN
+            SELECT RAISE(ABORT, 'not-before dispatch lease is active');
+        END;
+        """
+    )
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -3152,6 +3325,38 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _effective_parent_not_before(
+    conn: sqlite3.Connection,
+    parents: tuple[str, ...],
+    requested: Optional[str],
+) -> Optional[str]:
+    """Return the latest release deadline across a task and its parents."""
+    effective = requested
+    if not parents:
+        return effective
+
+    placeholders = ",".join("?" * len(parents))
+    rows = conn.execute(
+        f"SELECT id, not_before FROM tasks WHERE id IN ({placeholders})",
+        parents,
+    ).fetchall()
+    found = {row["id"] for row in rows}
+    missing = [parent_id for parent_id in parents if parent_id not in found]
+    if missing:
+        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+
+    for row in rows:
+        parent_deadline = normalize_not_before(row["not_before"])
+        if parent_deadline is None:
+            continue
+        if (
+            effective is None
+            or _not_before_deadline(parent_deadline) > _not_before_deadline(effective)
+        ):
+            effective = parent_deadline
+    return effective
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3434,6 +3639,12 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # Resolve inherited release gates before choosing the initial
+                # status, so a parent deadline parks even an otherwise
+                # parent-gated child in ``scheduled``.
+                not_before = _effective_parent_not_before(
+                    conn, parents, not_before
+                )
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -5261,6 +5472,17 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Re-check inside the same write transaction as the terminal CAS. A
+        # second connection may install a gate after the initial preflight;
+        # that gate must win over completion and leave the task/run untouched.
+        if _not_before_blocks(
+            conn,
+            task_id,
+            operation="complete",
+            override=not_before_override,
+            now=now,
+        ):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6531,9 +6753,11 @@ def decompose_triage_task(
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
     _seen = 0
+    _topological_order: list[int] = []
     while _queue:
         _node = _queue.pop()
         _seen += 1
+        _topological_order.append(_node)
         for _nb in _adj[_node]:
             _in_deg[_nb] -= 1
             if _in_deg[_nb] == 0:
@@ -6552,7 +6776,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, not_before "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6567,6 +6791,31 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_not_before = normalize_not_before(root_row["not_before"])
+        child_not_befores: list[Optional[str]] = [None] * len(children)
+        for idx in _topological_order:
+            effective = normalize_not_before(children[idx].get("not_before"))
+            if (
+                root_not_before is not None
+                and (
+                    effective is None
+                    or _not_before_deadline(root_not_before)
+                    > _not_before_deadline(effective)
+                )
+            ):
+                effective = root_not_before
+            for parent_idx in children[idx].get("parents") or []:
+                parent_deadline = child_not_befores[parent_idx]
+                if (
+                    parent_deadline is not None
+                    and (
+                        effective is None
+                        or _not_before_deadline(parent_deadline)
+                        > _not_before_deadline(effective)
+                    )
+                ):
+                    effective = parent_deadline
+            child_not_befores[idx] = effective
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -6598,26 +6847,38 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_not_before = child_not_befores[idx]
+            child_status = (
+                "scheduled"
+                if not_before_pending(child_not_before, now=now)
+                else "todo"
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, not_before) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
                     now,
                     (author or "decomposer"),
+                    child_not_before,
                 ),
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    "not_before": child_not_before,
+                },
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -113,6 +114,58 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_persists_not_before_gate(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "scheduled dashboard task",
+            "assignee": "researcher",
+            "not_before": "2030-01-01T00:00:00Z",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["not_before"] == "2030-01-01T00:00:00Z"
+    assert task["status"] == "scheduled"
+
+
+def test_not_before_override_requires_verified_dashboard_owner(client, kanban_home):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "owner release",
+            "assignee": "worker",
+            "not_before": "2030-01-01T00:00:00Z",
+        },
+    ).json()["task"]
+
+    forged = client.patch(
+        f"/api/plugins/kanban/tasks/{created['id']}",
+        json={"status": "ready", "not_before_override_reason": "emergency"},
+    )
+    assert forged.status_code == 403
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def verified_owner(request, call_next):
+        request.state.session = SimpleNamespace(
+            user_id="alex",
+            provider="test-owner-auth",
+        )
+        return await call_next(request)
+
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    owner_client = TestClient(app)
+    released = owner_client.patch(
+        f"/api/plugins/kanban/tasks/{created['id']}",
+        json={"status": "ready", "not_before_override_reason": "emergency"},
+    )
+    assert released.status_code == 200, released.text
+    assert released.json()["task"]["not_before"] is None
+    assert released.json()["task"]["status"] == "ready"
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -706,5 +759,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

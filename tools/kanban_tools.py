@@ -1229,6 +1229,7 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    not_before = args.get("not_before")
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1330,6 +1331,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                not_before=not_before,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1960,6 +1962,15 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "not_before": {
+                "type": "string",
+                "description": (
+                    "Optional timezone-aware UTC instant. The task remains "
+                    "outside the dispatchable queue until this deadline; "
+                    "when parents have a later deadline, the latest parent "
+                    "deadline is inherited."
                 ),
             },
             "tenant": {

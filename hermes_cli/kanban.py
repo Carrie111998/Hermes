@@ -361,7 +361,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="ISO8601_UTC",
         help=(
             "Optional timezone-aware ISO8601 instant. Numeric offsets are "
-            "accepted and normalized to UTC; metadata only, not enforced."
+            "accepted and normalized to UTC; dispatch and lifecycle guards "
+            "enforce the release deadline."
         ),
     )
     p_create.add_argument("--created-by", default="user",
@@ -428,6 +429,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--synthesizer", required=True, help="Synthesizer/writer profile")
     p_swarm.add_argument("--tenant", default=None, help="Tenant namespace")
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_swarm.add_argument(
+        "--not-before",
+        default=None,
+        metavar="ISO8601_UTC",
+        help="Release deadline inherited by all workflow child tasks",
+    )
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
@@ -1570,6 +1577,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
+            not_before=getattr(args, "not_before", None),
             idempotency_key=getattr(args, "idempotency_key", None),
         )
     if getattr(args, "json", False):

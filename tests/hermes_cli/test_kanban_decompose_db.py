@@ -88,5 +88,43 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_decompose_propagates_root_and_sibling_deadlines(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 1_700_000_000.0)
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="gated root")
+        conn.execute(
+            "UPDATE tasks SET not_before = ? WHERE id = ?",
+            ("2030-01-01T00:00:00Z", tid),
+        )
+        conn.commit()
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "first child",
+                    "assignee": "worker",
+                    "parents": [],
+                    "not_before": "2029-01-01T00:00:00Z",
+                },
+                {
+                    "title": "later child",
+                    "assignee": "worker",
+                    "parents": [0],
+                    "not_before": "2032-01-01T00:00:00Z",
+                },
+            ],
+        )
+
+    assert child_ids is not None
+    with kb.connect() as conn:
+        first = kb.get_task(conn, child_ids[0])
+        later = kb.get_task(conn, child_ids[1])
+    assert first.not_before == "2030-01-01T00:00:00Z"
+    assert later.not_before == "2032-01-01T00:00:00Z"
+    assert first.status == "scheduled"
+    assert later.status == "scheduled"
+
 
 

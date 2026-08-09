@@ -38,13 +38,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -114,6 +115,38 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
             detail=f"board {normed!r} does not exist",
         )
     return normed
+
+
+def _verified_owner_from_request(request: Request) -> kanban_db.VerifiedKanbanOwner:
+    """Resolve owner identity only from the dashboard's verified auth seam."""
+    session = getattr(request.state, "session", None)
+    if session is not None:
+        identity = str(getattr(session, "user_id", "") or "").strip()
+        provider = str(getattr(session, "provider", "") or "").strip()
+        if identity and provider:
+            return kanban_db._verified_kanban_owner(
+                identity,
+                f"dashboard_session:{provider}",
+            )
+
+    # Loopback dashboard auth has no external user session, but the canonical
+    # dashboard session token is still required by the real web server. Bind
+    # that local authenticated control plane to the OS owner instead of a
+    # request-supplied identity. Bare plugin test apps intentionally fail closed.
+    try:
+        from hermes_cli import web_server
+
+        if web_server._has_valid_session_token(request):
+            return kanban_db._verified_kanban_owner(
+                f"local:{os.getuid()}",
+                "dashboard_session_token",
+            )
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=403,
+        detail="owner-authenticated control plane required for not-before override",
+    )
 
 
 def _conn(board: Optional[str] = None):
@@ -616,6 +649,9 @@ class CreateTaskBody(BaseModel):
     # Explicit project link; when omitted, create_task inherits the board's
     # scoped project (if any) so a project-scoped board anchors every task.
     project_id: Optional[str] = None
+    # Optional machine-enforced release deadline. Parent tasks with a later
+    # deadline are inherited by the kernel during creation.
+    not_before: Optional[str] = None
 
 
 @router.post("/tasks")
@@ -644,6 +680,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
             project_id=payload.project_id,
+            not_before=payload.not_before,
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
@@ -825,6 +862,9 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
+    # Supplying this field invokes the authenticated dashboard owner control
+    # plane; the client never supplies actor/authentication identity.
+    not_before_override_reason: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -852,13 +892,41 @@ class UpdateTaskBody(BaseModel):
 
 
 @router.patch("/tasks/{task_id}")
-def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
+def update_task(
+    request: Request,
+    task_id: str,
+    payload: UpdateTaskBody,
+    board: Optional[str] = Query(None),
+):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        not_before_override = None
+        if payload.not_before_override_reason is not None:
+            if payload.status is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="not-before override requires a status transition",
+                )
+            if payload.status not in {"ready", "done"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="not-before override only releases ready or done transitions",
+                )
+            owner = _verified_owner_from_request(request)
+            try:
+                not_before_override = kanban_db.mint_owner_not_before_override(
+                    conn,
+                    task_id,
+                    owner=owner,
+                    reason=payload.not_before_override_reason,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -881,6 +949,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     result=payload.result,
                     summary=payload.summary,
                     metadata=payload.metadata,
+                    not_before_override=not_before_override,
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
@@ -890,10 +959,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 # Re-open a blocked/scheduled task, or just an explicit status set.
                 current = kanban_db.get_task(conn, task_id)
                 if current and current.status in ("blocked", "scheduled"):
-                    ok = kanban_db.unblock_task(conn, task_id)
+                    ok = kanban_db.unblock_task(
+                        conn,
+                        task_id,
+                        not_before_override=not_before_override,
+                    )
                 else:
                     # Direct status write for drag-drop (todo -> ready etc).
-                    ok = _set_status_direct(conn, task_id, "ready")
+                    ok = _set_status_direct(
+                        conn,
+                        task_id,
+                        "ready",
+                        not_before_override=not_before_override,
+                    )
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
             elif s == "running":
@@ -1040,7 +1118,11 @@ def _parents_blocking_ready(
 
 
 def _set_status_direct(
-    conn: sqlite3.Connection, task_id: str, new_status: str,
+    conn: sqlite3.Connection,
+    task_id: str,
+    new_status: str,
+    *,
+    not_before_override: Optional[kanban_db.OwnerNotBeforeOverride] = None,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
     structured complete/block/unblock/archive verbs (e.g. todo<->ready,
@@ -1059,6 +1141,14 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+
+        if new_status in {"ready", "running"} and kanban_db._not_before_blocks(
+            conn,
+            task_id,
+            operation=f"dashboard_status:{new_status}",
+            override=not_before_override,
+        ):
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.

@@ -18,6 +18,7 @@ from pathlib import Path
 import logging
 import os
 import random
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -479,6 +480,120 @@ def _managed_values(
     )
 
 
+class _KanbanNotBeforeDispatchLease:
+    """Task-scoped authorization held across the provider callback."""
+
+    _LEASE_SECONDS = 300
+
+    def __init__(self, function_name: str):
+        self.function_name = function_name
+        self.task_id = (os.getenv("HERMES_KANBAN_TASK") or "").strip()
+        self.pinned_db = (os.getenv("HERMES_KANBAN_DB") or "").strip()
+        self.lease_hash = secrets.token_hex(32) if self.task_id and self.pinned_db else ""
+        self.conn = None
+        self.block: str | None = None
+
+    def acquire(self) -> "_KanbanNotBeforeDispatchLease":
+        if not self.task_id or not self.pinned_db:
+            return self
+        try:
+            from hermes_cli import kanban_db as kb
+
+            self.conn = kb.connect(db_path=Path(self.pinned_db))
+            now = int(time.time())
+            with kb.write_txn(self.conn):
+                task = kb.get_task(self.conn, self.task_id)
+                if task is None:
+                    raise RuntimeError("Kanban task is absent from the pinned board")
+                if task.not_before and kb.not_before_pending(task.not_before):
+                    if kb._not_before_blocks(
+                        self.conn,
+                        self.task_id,
+                        operation=f"side_effect_execution:{self.function_name}",
+                        now=now,
+                    ):
+                        self.block = (
+                            f"tool execution blocked for Kanban task {self.task_id}: "
+                            f"not-before deadline {task.not_before} has not elapsed"
+                        )
+                        return self
+                self.conn.execute(
+                    "DELETE FROM kanban_not_before_dispatch_leases "
+                    "WHERE task_id = ? AND expires_at <= ?",
+                    (self.task_id, now),
+                )
+                active = self.conn.execute(
+                    "SELECT 1 FROM kanban_not_before_dispatch_leases "
+                    "WHERE task_id = ?",
+                    (self.task_id,),
+                ).fetchone()
+                if active is not None:
+                    self.block = (
+                        f"tool execution blocked for Kanban task {self.task_id}: "
+                        "another dispatch lease is active"
+                    )
+                    return self
+                self.conn.execute(
+                    "INSERT INTO kanban_not_before_dispatch_leases "
+                    "(task_id, lease_hash, issued_at, expires_at) VALUES (?, ?, ?, ?)",
+                    (
+                        self.task_id,
+                        self.lease_hash,
+                        now,
+                        now + self._LEASE_SECONDS,
+                    ),
+                )
+        except Exception as exc:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self.conn = None
+            logger.error(
+                "Kanban not-before dispatch lease failed for task %s tool %s: %s",
+                self.task_id,
+                self.function_name,
+                exc,
+            )
+            self.block = (
+                f"tool execution blocked for Kanban task {self.task_id}: "
+                "not-before safety authorization could not be verified"
+            )
+        return self
+
+    def release(self) -> None:
+        if self.conn is None:
+            return
+        try:
+            from hermes_cli import kanban_db as kb
+
+            with kb.write_txn(self.conn):
+                self.conn.execute(
+                    "DELETE FROM kanban_not_before_dispatch_leases "
+                    "WHERE task_id = ? AND lease_hash = ?",
+                    (self.task_id, self.lease_hash),
+                )
+        except Exception as exc:
+            logger.error(
+                "Kanban not-before dispatch lease cleanup failed for task %s: %s",
+                self.task_id,
+                exc,
+            )
+        finally:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def _acquire_kanban_not_before_dispatch_lease(
+    function_name: str,
+) -> _KanbanNotBeforeDispatchLease:
+    return _KanbanNotBeforeDispatchLease(function_name).acquire()
+
+
 def _kanban_not_before_tool_block(function_name: str) -> str | None:
     """Fail closed before any worker tool/middleware can create side effects.
 
@@ -563,18 +678,18 @@ def _run_agent_tool_execution_middleware(
         "args": function_args,
         "middleware_trace": trace,
         "blocked": False,
+        "callback_invoked": False,
         "dispatched": False,
     }
     dispatch_lock = threading.Lock()
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
-            if state["dispatched"]:
+            if state["callback_invoked"]:
                 raise RuntimeError(
                     "Hermes tool execution callback invoked more than once"
                 )
-            state["dispatched"] = True
-            state["blocked"] = False
+            state["callback_invoked"] = True
             state["args"] = final_args
 
         def _begin() -> None:
@@ -659,13 +774,43 @@ def _run_agent_tool_execution_middleware(
             )
             return result
 
+        # The final authorization is a task-scoped lease, not merely a
+        # second read. It revalidates the current gate immediately before the
+        # callback and makes a concurrent gate update fail at the SQLite
+        # trigger while this provider dispatch is authorized.
+        dispatch_lease = _acquire_kanban_not_before_dispatch_lease(function_name)
+        if dispatch_lease.block is not None:
+            _advance_start_order()
+            state["blocked"] = True
+            result = json.dumps(
+                {"error": dispatch_lease.block}, ensure_ascii=False
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="blocked",
+                error_type="not_before",
+                error_message=dispatch_lease.block,
+                middleware_trace=list(state["middleware_trace"]),
+            )
+            dispatch_lease.release()
+            return result
+
         if function_name == "memory":
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
-        return execute(final_args)
+        try:
+            state["dispatched"] = True
+            _advance_start_order(_begin)
+            return execute(final_args)
+        finally:
+            dispatch_lease.release()
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(
