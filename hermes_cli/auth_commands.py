@@ -133,6 +133,14 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 def _format_exhausted_status(entry) -> str:
+    """Render the last-known failure for an exhausted pool entry.
+
+    Always reflects the *stored* error from the last real request — this
+    never re-probes the provider — so every line is tagged ``[cached]`` to
+    stop iterative debugging from mistaking a stale error for a fresh one
+    (#82154: a fix can look like it's "still failing" when what's shown is
+    actually the pre-fix error, replayed from the exhaustion cooldown).
+    """
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
     label, show_retry_window = _classify_exhausted_status(entry)
@@ -140,13 +148,13 @@ def _format_exhausted_status(entry) -> str:
     reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
     if not show_retry_window:
-        return f" {label}{reason_text}{code} (re-auth may be required)"
+        return f" {label}{reason_text}{code} [cached] (re-auth may be required)"
     exhausted_until = _exhausted_until(entry)
     if exhausted_until is None:
-        return f" {label}{reason_text}{code}"
+        return f" {label}{reason_text}{code} [cached]"
     remaining = max(0, int(math.ceil(exhausted_until - time.time())))
     if remaining <= 0:
-        return f" {label}{reason_text}{code} (ready to retry)"
+        return f" {label}{reason_text}{code} [cached] (ready to retry)"
     minutes, seconds = divmod(remaining, 60)
     hours, minutes = divmod(minutes, 60)
     days, hours = divmod(hours, 24)
@@ -158,7 +166,7 @@ def _format_exhausted_status(entry) -> str:
         wait = f"{minutes}m {seconds}s"
     else:
         wait = f"{seconds}s"
-    return f" {label}{reason_text}{code} ({wait} left)"
+    return f" {label}{reason_text}{code} [cached] ({wait} left)"
 
 
 def auth_add_command(args) -> None:
