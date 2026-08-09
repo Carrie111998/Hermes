@@ -3346,7 +3346,13 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # In a Feishu DM, root_id identifies the root of a quote/reply chain;
+        # promoting it to thread metadata hides the response from the main
+        # conversation. Group topics may use root_id as their routing context,
+        # so preserve the existing fallback outside p2p chats.
+        thread_id = getattr(message, "thread_id", None) or None
+        if not thread_id and chat_type != "p2p":
+            thread_id = getattr(message, "root_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)

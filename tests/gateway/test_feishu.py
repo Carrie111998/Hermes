@@ -950,6 +950,83 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.source.user_id_alt, "on_union")
         self.assertEqual(event.source.chat_name, "Feishu DM")
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_quoted_reply_root_id_is_not_treated_as_thread_id(self):
+        """A Feishu quote chain root is a reply anchor, not a topic thread."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import _reply_anchor_for_event
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="张三")
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            root_id="om_quoted_root",
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"follow up"}',
+            message_id="om_trigger",
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=sender_id,
+                chat_type="p2p",
+                message_id="om_trigger",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(event.reply_to_message_id, "om_quoted_root")
+        self.assertEqual(_reply_anchor_for_event(event), "om_trigger")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_group_topic_root_id_remains_routing_context(self):
+        """The DM fix must not remove root-based Feishu group topic routing."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._resolve_sender_name_from_api = AsyncMock(return_value="张三")
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Feishu Group", "type": "group"}
+        )
+        message = SimpleNamespace(
+            chat_id="oc_group",
+            thread_id=None,
+            root_id="om_topic_root",
+            parent_id=None,
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"topic follow up"}',
+            message_id="om_topic_message",
+        )
+        sender_id = SimpleNamespace(open_id="ou_user", user_id=None, union_id=None)
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_topic_message",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "om_topic_root")
+
 
     @patch.dict(
         os.environ,
