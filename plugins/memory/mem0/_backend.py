@@ -6,6 +6,52 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 
+def _patch_mem0_ollama_client(module_name: str, api_key: str) -> None:
+    """Make one mem0 ollama module construct AUTHENTICATED clients.
+
+    mem0's ``OllamaEmbedding``/``OllamaLLM`` build ``Client(host=...)`` with
+    no way to pass headers, and their ``__init__`` immediately calls
+    ``client.list()`` — so against a bearer-guarded endpoint (e.g. an
+    authenticated reverse-proxy front) ``Memory.from_config`` 401s before
+    any post-construction fix could run. The ``ollama`` client's only other
+    credential source is the process-wide ``OLLAMA_API_KEY`` env var, which
+    is the Ollama Cloud provider's variable — setting it hands this key to
+    every surface that reads it (the model picker's catalog probe calls
+    ollama.com with it). Neither is acceptable, so: both mem0 modules do
+    ``from ollama import Client`` at module level and resolve the name at
+    call time, and this replaces that one module attribute with a factory
+    that injects ``Authorization: Bearer <key>`` scoped to mem0 alone.
+
+    Idempotent (re-init re-patches from the preserved original, never wraps
+    a wrapper) and deliberately tolerant: mem0 is installed unpinned on
+    deployed agents, so if a future version moves the attribute this logs
+    once and returns — a guarded endpoint then fails with a loud 401 at
+    init rather than this raising something unrelated.
+    """
+    try:
+        import importlib
+
+        mod = importlib.import_module(module_name)
+        original = getattr(mod, "_hermes_unauthed_client", None) or mod.Client
+
+        def _authed_client(*args, **kwargs):
+            headers = dict(kwargs.pop("headers", None) or {})
+            if not any(k.lower() == "authorization" for k in headers):
+                headers["Authorization"] = f"Bearer {api_key}"
+            return original(*args, headers=headers, **kwargs)
+
+        mod._hermes_unauthed_client = original
+        mod.Client = _authed_client
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "could not scope the ollama bearer into %s (%s); an "
+            "authenticated endpoint will fail with 401 at memory init",
+            module_name, exc,
+        )
+
+
 class Mem0Backend(ABC):
     """Unified interface over Platform (MemoryClient) and OSS (Memory) backends."""
 
@@ -203,6 +249,21 @@ class OSSBackend(Mem0Backend):
             "embedder": _provider_block("embedder"),
             "version": "v1.1",
         }
+
+        # An ollama block carrying api_key means an AUTHENTICATED endpoint
+        # (a bearer-guarded front). mem0's classes ignore the field, so scope
+        # the bearer into their client construction — BEFORE from_config,
+        # whose __init__ probes the endpoint. See _patch_mem0_ollama_client.
+        for block_name, mem0_module in (
+            ("embedder", "mem0.embeddings.ollama"),
+            ("llm", "mem0.llms.ollama"),
+        ):
+            block = config.get(block_name, {})
+            provider = str(block.get("provider") or "").strip().lower()
+            block_key = str(block.get("config", {}).get("api_key") or "")
+            if provider == "ollama" and block_key:
+                _patch_mem0_ollama_client(mem0_module, block_key)
+
         self._memory = Memory.from_config(config)
 
     @staticmethod
