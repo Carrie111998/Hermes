@@ -140,6 +140,64 @@ class TestShouldExclude:
 
 class TestBackup:
 
+    def test_non_sqlite_db_asset_is_archived_as_regular_file(self, tmp_path, monkeypatch):
+        """An unrelated ``.db`` asset must not be opened as SQLite."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        asset = hermes_home / "workspaces" / "vendor" / "128B.db"
+        asset.parent.mkdir(parents=True)
+        payload = b"opaque chart data, not sqlite\n"
+        asset.write_bytes(payload)
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+
+        sqlite_sources = []
+        real_safe_copy = backup_mod._safe_copy_db
+
+        def _spy(src, dst):
+            sqlite_sources.append(src)
+            return real_safe_copy(src, dst)
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", _spy)
+        out_zip = tmp_path / "backup.zip"
+        backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert asset not in sqlite_sources
+        with zipfile.ZipFile(out_zip) as archive:
+            assert archive.read("workspaces/vendor/128B.db") == payload
+
+    def test_automatic_backup_archives_non_sqlite_db_asset(self, tmp_path, monkeypatch):
+        """The pre-update full backup follows the same content-based rule."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        asset = hermes_home / "workspaces" / "vendor" / "128B.db"
+        asset.parent.mkdir(parents=True)
+        payload = b"opaque chart data, not sqlite\n"
+        asset.write_bytes(payload)
+
+        import hermes_cli.backup as backup_mod
+
+        sqlite_sources = []
+        real_safe_copy = backup_mod._safe_copy_db
+
+        def _spy(src, dst):
+            sqlite_sources.append(src)
+            return real_safe_copy(src, dst)
+
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", _spy)
+        out_zip = tmp_path / "automatic.zip"
+        result = backup_mod._write_full_zip_backup(out_zip, hermes_home)
+
+        assert result == out_zip
+        assert asset not in sqlite_sources
+        with zipfile.ZipFile(out_zip) as archive:
+            assert archive.read("workspaces/vendor/128B.db") == payload
+
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
         """SQLite staging temp files must be created on the output zip's
@@ -1242,7 +1300,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 

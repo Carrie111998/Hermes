@@ -403,6 +403,26 @@ def is_zeroed_sqlite_file(
 
 _SQLITE_HEADER = b"SQLite format 3\0"
 
+
+def _should_snapshot_as_sqlite(path: Path) -> bool:
+    """Whether a ``.db`` file needs a WAL-safe SQLite snapshot.
+
+    ``.db`` is also used by unrelated applications for opaque data files.
+    Treating every such file as SQLite makes one incidental asset abort an
+    otherwise valid full backup.  A readable file is classified by SQLite's
+    magic header; when the lock-safe probe cannot read it, keep the previous
+    fail-closed behaviour and attempt a SQLite snapshot.
+    """
+    if path.suffix.lower() != ".db":
+        return False
+
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
+    if head is None:
+        return True
+    return head == _SQLITE_HEADER
+
 # Default ceiling above which ``PRAGMA integrity_check`` is skipped in favour
 # of the (O(1)) header + structural probe. ``integrity_check`` walks every
 # b-tree page in the file, so its cost scales with database size: on a 30 GB
@@ -699,7 +719,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
-                if abs_path.suffix == ".db":
+                if _should_snapshot_as_sqlite(abs_path):
                     # Stage the snapshot alongside the output zip so that the
                     # temp file lives on the same filesystem.  The system
                     # default (/tmp) may be a small tmpfs that cannot hold
@@ -1688,7 +1708,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
         ) as zf:
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
-                    if abs_path.suffix == ".db":
+                    if _should_snapshot_as_sqlite(abs_path):
                         # Stage the snapshot alongside the output zip so that the
                         # temp file lives on the same filesystem.  The system
                         # default (/tmp) may be a small tmpfs that cannot hold
