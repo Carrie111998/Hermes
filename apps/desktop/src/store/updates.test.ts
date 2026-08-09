@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus } from '@/global'
+import type { BackendUpdateCheckResponse } from '@/types/hermes'
 
 const storage = new Map<string, string>()
 
@@ -44,6 +45,7 @@ vi.mock('@/hermes', () => ({
 const {
   maybeNotifyUpdateAvailable,
   checkBackendUpdates,
+  $backendUpdateChecking,
   $backendUpdateStatus,
   applyBackendUpdate,
   $backendUpdateApply,
@@ -71,17 +73,42 @@ const status = (over: Partial<DesktopUpdateStatus> = {}): DesktopUpdateStatus =>
 
 const lastToast = () => notifySpy.mock.calls.at(-1)?.[0] as { onDismiss: () => void }
 
-const setRemote = (on: boolean) =>
+const setRemote = (on: boolean, baseUrl = 'http://box:9119', profile?: string) =>
   setConnection({
-    baseUrl: 'http://box:9119',
+    baseUrl,
     isFullscreen: false,
     mode: on ? 'remote' : 'local',
     nativeOverlayWidth: 0,
+    ...(profile ? { profile } : {}),
     token: 't',
-    wsUrl: 'ws://box:9119',
+    wsUrl: baseUrl.replace(/^http/, 'ws'),
     logs: [],
     windowButtonPosition: null
   })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+
+  const promise = new Promise<T>(next => {
+    resolve = next
+  })
+
+  return { promise, resolve }
+}
+
+const backendCheckResponse = (
+  current_version: string,
+  over: Partial<BackendUpdateCheckResponse> = {}
+): BackendUpdateCheckResponse => ({
+  install_method: 'git',
+  current_version,
+  behind: 0,
+  update_available: false,
+  can_apply: true,
+  update_command: 'hermes update',
+  message: null,
+  ...over
+})
 
 describe('maybeNotifyUpdateAvailable', () => {
   beforeEach(() => {
@@ -266,6 +293,24 @@ describe('checkBackendUpdates', () => {
     expect(result?.error).toBe('check-failed')
     expect(result?.behind).toBeUndefined()
     expect(result?.message).toMatch(/Couldn't reach the update source/)
+  })
+
+  it('treats a null behind count as a failed reachable check even without a backend message', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.16.0',
+      behind: null,
+      update_available: false,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: null
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.error).toBe('check-failed')
+    expect(result?.behind).toBeUndefined()
   })
 
   it('is a no-op in local mode (backend check only runs when remote)', async () => {
@@ -888,6 +933,7 @@ describe('startUpdatePoller', () => {
     storage.clear()
     checkMock.mockReset()
     onProgressMock.mockReset()
+    checkHermesUpdateSpy.mockReset()
     Object.keys(listeners).forEach(k => delete listeners[k])
     checkMock.mockResolvedValue({
       supported: true,
@@ -896,6 +942,9 @@ describe('startUpdatePoller', () => {
       fetchedAt: 0
     })
     $updateStatus.set(null)
+    $backendUpdateStatus.set(null)
+    $backendUpdateChecking.set(false)
+    setRemote(false)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { check: checkMock, onProgress: onProgressMock } },
       addEventListener: vi.fn((event: string, handler: Function) => {
@@ -945,5 +994,52 @@ describe('startUpdatePoller', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(checkMock).toHaveBeenCalled()
+  })
+
+  it('clears backend A state and rechecks when the connection profile switches to B', async () => {
+    const backendA = deferred<BackendUpdateCheckResponse>()
+    const backendB = deferred<BackendUpdateCheckResponse>()
+
+    checkHermesUpdateSpy.mockReturnValueOnce(backendA.promise).mockReturnValueOnce(backendB.promise)
+    startUpdatePoller()
+
+    setRemote(true, 'http://box:9119', 'alpha')
+    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(1)
+    backendA.resolve(backendCheckResponse('0.16.0'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect($backendUpdateStatus.get()?.currentVersion).toBe('0.16.0')
+
+    setRemote(true, 'http://box:9119', 'beta')
+
+    expect($backendUpdateStatus.get()).toBeNull()
+    expect($backendUpdateChecking.get()).toBe(true)
+    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(2)
+
+    backendB.resolve(backendCheckResponse('0.17.0'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect($backendUpdateStatus.get()?.currentVersion).toBe('0.17.0')
+  })
+
+  it('discards backend A response when it resolves after backend B is active', async () => {
+    const backendA = deferred<BackendUpdateCheckResponse>()
+    const backendB = deferred<BackendUpdateCheckResponse>()
+
+    checkHermesUpdateSpy.mockReturnValueOnce(backendA.promise).mockReturnValueOnce(backendB.promise)
+    startUpdatePoller()
+
+    setRemote(true, 'http://box-a:9119', 'alpha')
+    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(1)
+    setRemote(true, 'http://box-b:9119', 'alpha')
+    expect(checkHermesUpdateSpy).toHaveBeenCalledTimes(2)
+
+    backendB.resolve(backendCheckResponse('0.17.0'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect($backendUpdateStatus.get()?.currentVersion).toBe('0.17.0')
+
+    backendA.resolve(backendCheckResponse('0.16.0'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect($backendUpdateChecking.get()).toBe(false)
+    expect($backendUpdateStatus.get()?.currentVersion).toBe('0.17.0')
   })
 })

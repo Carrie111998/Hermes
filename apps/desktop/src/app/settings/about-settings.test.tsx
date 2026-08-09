@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus } from '@/global'
+import { I18nProvider } from '@/i18n'
 import { setConnection } from '@/store/session'
 import type * as UpdatesStore from '@/store/updates'
 import {
@@ -120,5 +121,32 @@ describe('AboutSettings update targets', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Update now' }))
     expect(actions.startUpdateFor).toHaveBeenCalledWith('client')
+  })
+
+  it('uses localized primary failure statuses instead of raw backend English', () => {
+    setMode('remote')
+    $updateStatus.set(status({ supported: false, message: 'This build cannot update itself.' }))
+    $backendUpdateStatus.set(
+      status({ error: 'check-failed', message: "Couldn't reach the update source — try again later." })
+    )
+
+    render(
+      <I18nProvider configClient={null} initialLocale="ja">
+        <AboutSettings />
+      </I18nProvider>
+    )
+
+    expect(
+      within(screen.getByRole('group', { name: 'クライアント' })).getByText(
+        'このビルドはアプリ内から更新できません。'
+      )
+    ).toBeTruthy()
+    expect(
+      within(screen.getByRole('group', { name: 'バックエンド' })).getByText(
+        '更新サーバーに接続できませんでした。'
+      )
+    ).toBeTruthy()
+    expect(screen.queryByText('This build cannot update itself.')).toBeNull()
+    expect(screen.queryByText("Couldn't reach the update source — try again later.")).toBeNull()
   })
 })

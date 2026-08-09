@@ -83,10 +83,10 @@ function UpdateCard({ a, apply, check, checking, label, releaseNotes, status, ta
   let statusTone: 'idle' | 'available' | 'error' = 'idle'
 
   if (!supported) {
-    statusLine = status?.message ?? a.cantUpdate
+    statusLine = a.cantUpdate
     statusTone = 'error'
   } else if (status?.error) {
-    statusLine = target === 'backend' ? (status.message ?? a.cantReach) : a.cantReach
+    statusLine = a.cantReach
     statusTone = 'error'
   } else if (applying) {
     statusLine = a.installing
