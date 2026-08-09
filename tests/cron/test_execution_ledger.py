@@ -397,3 +397,69 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_use_cron_store_routes_ledger_to_active_profile(monkeypatch, tmp_path):
+    """#82651: ledger reads/writes must follow use_cron_store(), not the
+    import-time home — an explicit store override wins even over a
+    re-pointed EXECUTIONS_FILE module constant."""
+    import cron.executions as executions
+    from cron.jobs import use_cron_store
+
+    # Simulate a ledger already frozen at an "import-time" home.
+    import_home = tmp_path / "import-home"
+    monkeypatch.setattr(
+        executions, "EXECUTIONS_FILE", import_home / "cron" / "executions.db"
+    )
+    profile_home = tmp_path / "profile-under-test"
+
+    with use_cron_store(profile_home):
+        record = executions.create_execution("ledger-profile-repro", source="direct")
+        listed = executions.list_executions(job_id="ledger-profile-repro")
+        assert [row["id"] for row in listed] == [record["id"]]
+
+    profile_db = profile_home / "cron" / "executions.db"
+    assert profile_db.exists()
+    assert not (import_home / "cron" / "executions.db").exists()
+
+
+def test_ledger_follows_store_switch_in_fresh_home_subprocess(tmp_path):
+    """#82651 E2E: with a fresh HERMES_HOME, a late use_cron_store() switch
+    must route the ledger to the profile home, not the import-time home."""
+    home = tmp_path / "home"
+    repo = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(repo)
+
+    script = """
+import json
+import os
+from pathlib import Path
+
+from cron.executions import create_execution, list_executions
+from cron.jobs import use_cron_store
+
+base_home = Path(os.environ["HERMES_HOME"]).resolve()
+profile_home = base_home / "profile-under-test"
+
+with use_cron_store(profile_home):
+    create_execution("ledger-profile-repro", source="direct")
+    rows = list_executions(job_id="ledger-profile-repro")
+
+print(json.dumps({
+    "base_db_exists": (base_home / "cron" / "executions.db").exists(),
+    "profile_db_exists": (profile_home / "cron" / "executions.db").exists(),
+    "count": len(rows),
+}))
+"""
+    run = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    result = json.loads(run.stdout.strip())
+    assert result == {"base_db_exists": False, "profile_db_exists": True, "count": 1}
