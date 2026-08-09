@@ -531,6 +531,8 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    persist_disabled: bool = False,
+    ephemeral: bool = False,
     requested_provider: str = None,
 ):
     """
@@ -1605,8 +1607,37 @@ def init_agent(
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
-    # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    # the user's real session and hijack the next live turn, and by both
+    # ephemeral entry points (`--no-session` one-shots and `/temp` sessions).
+    # Default False.
+    agent._persist_disabled = persist_disabled
+    # Ephemeral (user-facing "temporary chat"): implies persist_disabled and
+    # additionally blocks the write-side tools (memory/skill_manage/cronjob
+    # create) so a temporary chat cannot durably change the user's state.
+    # `_persist_disabled` alone is the weaker internal-fork contract, which
+    # deliberately still allows those tools.
+    agent.ephemeral = ephemeral
+    if ephemeral:
+        agent._persist_disabled = True
+        # Register THIS agent's session id with the state layer. The
+        # TUI/desktop registers its RPC handle at session.create, but every
+        # DB row is keyed by the AGENT's session id (the desktop passes
+        # session_key as session_id; the CLI uses the id minted above) — and
+        # the DB-layer refusals check exactly that id. With only the RPC
+        # handle registered, the first turn's token accounting created its
+        # foreign-key row for the agent id, and once that row existed each
+        # compression rotation published the full compacted transcript as
+        # its child (observed: 20260808_201210_9b2b46 and descendants).
+        # Released in AIAgent.close(); a missed release only wastes a set
+        # entry, since timestamped+random ids are never reused.
+        if agent.session_id:
+            from hermes_state import mark_session_ephemeral
+
+            mark_session_ephemeral(agent.session_id)
+    if agent._persist_disabled:
+        # An ephemeral/isolated agent must not leave a JSON snapshot either,
+        # even when sessions.write_json_snapshots is enabled above.
+        agent._session_json_enabled = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

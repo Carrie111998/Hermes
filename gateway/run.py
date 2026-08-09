@@ -702,6 +702,45 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+# Remind every Nth reply that the chat is temporary. Chat platforms have no
+# persistent badge (unlike the desktop's amber indicator and the CLI's
+# `temp >` prompt) and the flag deliberately survives gateway restarts, so
+# without a periodic nudge a user who forgets stays in "nothing is saved"
+# mode silently and indefinitely.
+_TEMP_REMINDER_EVERY = 10
+
+
+def _maybe_append_temp_reminder(runner, session_key: str, text: str) -> str:
+    """Append the temporary-chat reminder to *text* when the cadence hits.
+
+    Counter semantics (in-memory, keyed by session_key):
+      * ``/temp`` seeds the counter at 0, so the reply right after the
+        "started" banner is NOT reminded — two amber blocks making the same
+        point reads as a bug (same rationale as the desktop hero/badge
+        split). Reminders then fire on every ``_TEMP_REMINDER_EVERY``th
+        reply.
+      * A MISSING counter means this process has never replied to this
+        temporary chat — i.e. the gateway restarted mid-chat. That first
+        reply IS reminded: the user may have forgotten during the downtime
+        and no started-banner exists in this process's lifetime.
+    """
+    counts = getattr(runner, "_temp_reminder_turns", None)
+    if counts is None:
+        counts = {}
+        runner._temp_reminder_turns = counts
+    n = counts.get(session_key)
+    if n is None:
+        counts[session_key] = 0
+        remind = True
+    else:
+        n += 1
+        counts[session_key] = n
+        remind = (n % _TEMP_REMINDER_EVERY == 0)
+    if not remind:
+        return text
+    return f"{text}\n\n{t('gateway.temp.reminder')}"
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -4950,6 +4989,11 @@ class TurnRunner:
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
+                # /temp: this session leaves no durable trace. Read off the
+                # session entry so the flag survives agent-cache eviction and
+                # gateway restarts — a temporary chat must not silently become
+                # a saved one just because the agent was rebuilt.
+                ephemeral=self._runner._session_is_ephemeral(ctx.session_key),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
                 skip_context_files=skip_context_files,
@@ -5785,6 +5829,16 @@ class TurnRunner:
         # as `_on_session_title` before the run starts (see
         # _attach_session_title_callback), because the titler now fires from
         # inside the turn prologue rather than from here.
+
+        # Temporary chat: periodically restate that nothing is being saved.
+        # See _maybe_append_temp_reminder for the cadence contract.
+        if final_response and bool(getattr(agent, "ephemeral", False)):
+            try:
+                final_response = _maybe_append_temp_reminder(
+                    self._runner, ctx.session_key, final_response
+                )
+            except Exception:
+                logger.debug("temp reminder append failed", exc_info=True)
 
         return {
             "final_response": final_response,
@@ -14371,6 +14425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "start": self._busy_start_command,
                 "stop": self._busy_stop_command,
                 "new": self._busy_new_command,
+                "temp": self._busy_temp_command,
                 "queue": self._busy_queue_command,
                 "steer": self._busy_steer_command,
                 "egress": self._busy_egress_command,
@@ -14494,6 +14549,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Clean up the running agent entry so the reset handler
         # doesn't think an agent is still active.
         return await self._handle_reset_command(event)
+
+    async def _busy_temp_command(self, event: MessageEvent, quick_key: str, source):
+        # /temp must bypass the running-agent guard for the same reason /new
+        # does (#2170): queued as plain user text it would be replayed INTO
+        # the agent instead of toggling persistence. That failure mode is
+        # worse here than for /new — a user typing /temp mid-run believes
+        # they have gone private, and silently staying persistent is exactly
+        # the outcome this feature exists to prevent. Interrupt first, clear
+        # the pending queue, then dispatch the real handler.
+        await self._interrupt_and_clear_session(
+            quick_key,
+            source,
+            interrupt_reason=_INTERRUPT_REASON_RESET,
+            invalidation_reason="temp_command",
+        )
+        return await self._handle_temp_command(event)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # /queue <prompt> — queue without interrupting.
@@ -15427,6 +15498,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 execute=_do_reset,
             )
+
+        if canonical == "temp":
+            return await self._handle_temp_command(event)
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
@@ -23559,6 +23633,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Monotonic by design (#28686): incremented here, NEVER reset.
         persistent.run_generation = int(persistent.run_generation) + 1
         return persistent.run_generation
+
+    def _session_is_ephemeral(self, session_key: str) -> bool:
+        """True when this session is a /temp (temporary) chat.
+
+        Read from the session entry rather than cached on the agent, so the
+        answer survives agent-cache eviction, agent rebuilds, and gateway
+        restarts. Fails CLOSED-to-normal (returns False) only when the entry
+        is genuinely absent — /temp always writes the flag before the next
+        turn builds an agent, and both /temp and /temp off rotate the session
+        id, so a missing entry never corresponds to a live temporary chat.
+        """
+        try:
+            entry = self.session_store._entries.get(session_key)
+        except Exception:
+            return False
+        return bool(getattr(entry, "ephemeral", False)) if entry else False
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""

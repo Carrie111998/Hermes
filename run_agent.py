@@ -508,6 +508,8 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        persist_disabled: bool = False,
+        ephemeral: bool = False,
         requested_provider: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
@@ -595,6 +597,8 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            persist_disabled=persist_disabled,
+            ephemeral=ephemeral,
         )
 
     def _get_session_db_for_recall(self):
@@ -1817,6 +1821,18 @@ class AIAgent:
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
+        # A temporary (/temp, --no-session) conversation is not raw material
+        # for self-improvement: the review fork's entire output is durable
+        # state (MEMORY.md, the skill library) distilled from a conversation
+        # the user was promised is not written down. The fork's own
+        # _persist_disabled is the weaker contract — it only stops the fork
+        # saving a transcript and deliberately still allows memory/skill
+        # writes, which is exactly what must not happen here. The guard
+        # lives inside the spawn rather than at its call sites (automatic
+        # post-turn, CLI /refine, gateway /refine) so a missed caller cannot
+        # leak.
+        if getattr(self, "ephemeral", False):
+            return
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
@@ -2366,7 +2382,14 @@ class AIAgent:
         """
         if not self.save_trajectories:
             return
-        
+        # Persistence-isolated agents (/temp sessions, --no-session one-shots,
+        # background review forks) leave no trace even when the operator runs
+        # with trajectory capture on: a trajectory line is the full message
+        # history, which is exactly what a temporary chat promises not to
+        # write down.
+        if getattr(self, "_persist_disabled", False):
+            return
+
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
         _save_trajectory_to_file(trajectory, self.model, completed)
 
@@ -4120,17 +4143,24 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        # Persistence-isolated agents (background review fork, --no-session
+        # one-shots, /temp sessions) skip end-of-session memory extraction: a
+        # throwaway conversation is not signal worth committing to long-term
+        # memory. Provider teardown still runs so threads and DB handles are
+        # released.
+        persist_disabled = getattr(self, "_persist_disabled", False)
         if self._memory_manager:
-            try:
-                self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            if not persist_disabled:
+                try:
+                    self._memory_manager.on_session_end(messages or [])
+                except Exception as e:
+                    logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
-        if hasattr(self, "context_compressor") and self.context_compressor:
+        if not persist_disabled and hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
@@ -4144,6 +4174,12 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
+        # Ephemeral/isolated agents never commit memory — mirrors the
+        # extraction skip in shutdown_memory_provider(). This is the path a
+        # /temp session hits on /new, which is exactly when the temporary
+        # conversation would otherwise be extracted into durable memory.
+        if getattr(self, "_persist_disabled", False):
+            return
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -4199,6 +4235,12 @@ class AIAgent:
         backend must not block the user from seeing their response.
         """
         if interrupted:
+            return
+        # Persistence-isolated agents (background review fork, --no-session
+        # one-shots, /temp sessions) must not mirror the turn into external
+        # memory. This is the leak the tool-level guard cannot catch: sync_all
+        # runs automatically at turn end, with no tool call involved.
+        if getattr(self, "_persist_disabled", False):
             return
         if not (self._memory_manager and final_response and original_user_message):
             return
@@ -4305,6 +4347,18 @@ class AIAgent:
         independently guarded so a failure in one does not prevent the rest.
         """
         task_id = getattr(self, "session_id", None) or ""
+
+        # 0. Release the temporary-session registration for this agent's id —
+        # the counterpart of the mark in agent_init. Idempotent; a missed
+        # release only wastes a set entry (timestamped+random ids are never
+        # reused), but releasing keeps the registry's lifecycle exact.
+        if getattr(self, "ephemeral", False) and task_id:
+            try:
+                from hermes_state import unmark_session_ephemeral
+
+                unmark_session_ephemeral(task_id)
+            except Exception:
+                pass
 
         # 1. Kill background processes for this task
         try:

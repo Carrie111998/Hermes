@@ -601,6 +601,7 @@ def maybe_auto_title(
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
+    ephemeral: bool = False,
 ) -> None:
     """Title a session from its opening message: instant, then upgraded.
 
@@ -610,8 +611,21 @@ def maybe_auto_title(
 
     Only acts on the session's opening exchange, and only when the message
     carries real user intent (machine-authored compaction handoffs are skipped).
+
+    Never acts on an ``ephemeral`` session ("temporary chat"): a generated
+    title is *derived from the message content*, so titling one would write a
+    durable, human-readable summary of a conversation the user was promised
+    leaves no trace. The guard lives here rather than in the caller so a new
+    call site cannot leak silently.
     """
     if not session_db or not session_id or not user_message:
+        return
+
+    # Temporary chat: never derive a durable title from content the user was
+    # told is not retained. Checked before the history/config work below so it
+    # short-circuits regardless of how the caller was wired up.
+    if ephemeral:
+        logger.debug("Auto-title skipped: ephemeral (temporary) session")
         return
 
     # Count user messages to detect the opening turn. ``conversation_history``

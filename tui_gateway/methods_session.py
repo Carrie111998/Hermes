@@ -33,6 +33,11 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    # Private session ("New private session" in the desktop sidebar, /temp
+    # elsewhere). Set at creation and never toggled on a live session: the
+    # desktop opens a NEW session for private mode rather than converting the
+    # current one, so a conversation can't be half-persisted then go private.
+    ephemeral = is_truthy_value(params.get("ephemeral", False))
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -74,6 +79,25 @@ def _(rid, params: dict) -> dict:
     now = time.time()
     lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
 
+    # Register with the state layer BEFORE the session is reachable, so token /
+    # cost accounting (which inserts a row purely to satisfy a foreign key)
+    # cannot beat us to writing one. Registering after would leave a race where
+    # the first API call persists a row for a chat promised to leave no trace.
+    if ephemeral:
+        from hermes_state import mark_session_ephemeral
+
+        mark_session_ephemeral(sid)
+        # The RPC sid above is only the wire handle. Every DB row — and every
+        # DB-layer ephemeral refusal — is keyed by the session KEY, which is
+        # also the agent's session_id (_make_agent(session_id=session_key)).
+        # Register it here, BEFORE the session is reachable: the agent build
+        # registers the same id again (idempotent set add), but the build is
+        # asynchronous, and the whole point is that the first accounting
+        # write can never beat the registration. Registering only the sid
+        # left the key unprotected — token accounting then created its
+        # foreign-key row and compression chained full transcripts onto it.
+        mark_session_ephemeral(key)
+
     with _sessions_lock:
         _sessions[sid] = {
             "agent": None,
@@ -85,6 +109,7 @@ def _(rid, params: dict) -> dict:
             "cols": cols,
             "created_at": now,
             "edit_snapshots": {},
+            "ephemeral": ephemeral,
             "explicit_cwd": explicit_cwd,
             "history": history,
             "history_lock": threading.Lock(),
@@ -152,6 +177,12 @@ def _(rid, params: dict) -> dict:
                 "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
+                # The client builds its optimistic sidebar row from this
+                # response, before any session.info arrives. Without the flag
+                # here that row defaults to "not temporary" and a temporary
+                # chat shows up in Recents -- visible for the whole life of
+                # the session, since no later event rewrites the row.
+                "ephemeral": ephemeral,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
             },

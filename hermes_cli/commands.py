@@ -106,6 +106,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]",
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
+    CommandDef("temp", "Start a temporary chat — nothing is saved (toggle: /temp off)",
+               "Session", aliases=("temporary",), args_hint="[off|status]",
+               busy_policy="interrupt_then_dispatch", busy_handler="temp"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
@@ -646,6 +649,7 @@ _TELEGRAM_MENU_PRIORITY = (
     # Most-typed everyday commands first.
     "help",
     "new",
+    "temp",
     "stop",
     "status",
     "egress",
@@ -1277,7 +1281,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - platform: low-frequency diagnostic lookup; reached via /hermes platform
+#     on Slack. Demoted to free the native slot /temp now claims. /temp is a
+#     privacy control — a user reaching for it wants one keystroke, and a
+#     temporary chat that is awkward to start is one people skip — whereas
+#     /platform is an occasional "what am I talking to" check. Without this
+#     entry /temp tips the registry past the 50-cap and silently clamps
+#     /platform off anyway, just without the deliberate choice.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "platform"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

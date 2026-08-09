@@ -794,6 +794,14 @@ class SessionEntry:
     # (e.g. Slack thread-context watermarks). Survives gateway restarts via
     # the routing index; must stay small and JSON-serializable.
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Temporary ("/temp") chat: this session leaves no durable trace — no
+    # transcript rows, no JSON snapshot, no memory extraction, and write-side
+    # tools are blocked. Set by /temp, cleared by /temp off (both of which
+    # rotate the session id, so the flag never applies to a conversation that
+    # was already partly persisted). Persisted with the entry so a gateway
+    # restart cannot silently downgrade a temporary chat back to a saved one.
+    ephemeral: bool = False
     
     # Token tracking
     input_tokens: int = 0
@@ -869,6 +877,33 @@ class SessionEntry:
     model_override: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        if self.ephemeral:
+            # Temporary chat: persist only what routing and the
+            # restart-downgrade guard need. The full record would be the
+            # disk analogue of the session row the DB layer refuses for
+            # temporary sessions — display name, usage/cost totals,
+            # reset/resume introspection, session lineage (prev_session_id)
+            # and model override all profile a chat the user was told is not
+            # written down. Serialization is allowlist-shaped on purpose:
+            # a field added to the full record below stays OUT of the
+            # temporary record until someone deliberately adds it here.
+            result: Dict[str, Any] = {
+                "session_key": self.session_key,
+                "session_id": self.session_id,
+                "created_at": self.created_at.isoformat(),
+                "updated_at": self.updated_at.isoformat(),
+                "platform": self.platform.value if self.platform else None,
+                "chat_type": self.chat_type,
+                # Thread-context watermarks and similar routing state a live
+                # chat needs to keep delivering into the right thread.
+                "metadata": self.metadata,
+                "ephemeral": True,
+                "suspended": self.suspended,
+                "expiry_finalized": self.expiry_finalized,
+            }
+            if self.origin:
+                result["origin"] = self.origin.to_dict()
+            return result
         result = {
             "session_key": self.session_key,
             "session_id": self.session_id,
@@ -878,6 +913,7 @@ class SessionEntry:
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
             "metadata": self.metadata,
+            "ephemeral": self.ephemeral,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -979,6 +1015,7 @@ class SessionEntry:
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
             metadata=dict(data.get("metadata") or {}),
+            ephemeral=bool(data.get("ephemeral", False)),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
