@@ -722,8 +722,9 @@ class TestSpawnEnvSanitization:
 
         home = tmp_path / "home"
         home.mkdir()
-        (home / ".bash_profile").write_text(
-            "printf 'startup=%s\\n' \"${PAPERCLIP_API_KEY-missing}\"\n"
+        startup_file = home / ".bash_profile"
+        startup_file.write_text(
+            "printf 'startup-sourced\\n'\n"
             "export PAPERCLIP_API_KEY=stale-login-token\n"
             "export Paperclip_Api_Key=mixed-case-stale-login-token\n",
             encoding="utf-8",
@@ -737,7 +738,11 @@ class TestSpawnEnvSanitization:
 
         with patch.dict(
             os.environ,
-            {"PATH": os.environ.get("PATH", ""), "HOME": str(home)},
+            {
+                "PATH": os.environ.get("PATH", ""),
+                "HOME": str(home),
+                "BASH_ENV": str(startup_file),
+            },
             clear=True,
         ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch.object(
             registry, "_write_checkpoint"

@@ -1034,6 +1034,13 @@ class ProcessRegistry:
         # Do not run login/interactive startup files afterward: they could read
         # or overwrite the request credential before the user command starts.
         shell_flags = "-c" if runtime_env is not None else "-lic"
+        if runtime_env is not None:
+            # Non-interactive Bash and POSIX shells may still source a file from
+            # BASH_ENV/ENV. Remove aliases case-insensitively so managed runs do
+            # not regain a startup hook after switching away from ``-lic``.
+            for key in tuple(spawn_env):
+                if key.upper() in {"BASH_ENV", "ENV"}:
+                    spawn_env.pop(key, None)
         shell_command = f"set +m; {safe_command}"
 
         session = ProcessSession(
