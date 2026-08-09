@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -57,6 +58,19 @@ def _read_proc_field(pid: int, key: str) -> Optional[str]:
     return None
 
 
+def _summarize_cmdline_bytes(data: bytes) -> Optional[str]:
+    """Return executable identity without retaining any argument contents."""
+    parts = [part for part in data.split(b"\x00") if part]
+    if not parts:
+        return None
+    executable = Path(os.fsdecode(parts[0])).name or "(unknown)"
+    argument_count = len(parts) - 1
+    if argument_count == 0:
+        return executable
+    noun = "argument" if argument_count == 1 else "arguments"
+    return f"{executable} [{argument_count} {noun} redacted]"
+
+
 def _read_proc_cmdline(pid: int) -> Optional[str]:
     """Read /proc/<pid>/cmdline as a printable string.  Linux only; None elsewhere."""
     try:
@@ -64,10 +78,7 @@ def _read_proc_cmdline(pid: int) -> Optional[str]:
             data = fh.read()
     except (FileNotFoundError, PermissionError, OSError):
         return None
-    if not data:
-        return None
-    # cmdline uses NUL separators
-    return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    return _summarize_cmdline_bytes(data)
 
 
 def _proc_summary(pid: int) -> Dict[str, Any]:
@@ -96,12 +107,16 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
         summary["uid"] = uid.split()[0] if uid else uid
     cmdline = _read_proc_cmdline(pid)
     if cmdline:
-        # Truncate aggressively — these can be 4KB
-        summary["cmdline"] = cmdline[:300]
+        summary["cmdline"] = cmdline
     return summary
 
 
-def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
+def snapshot_shutdown_context(
+    received_signal: Any = None,
+    *,
+    planned_takeover: Optional[bool] = None,
+    planned_stop: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Fast (<10ms) snapshot of who/what is asking us to shut down.
 
     Captures:
@@ -130,6 +145,10 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
         "parent": _proc_summary(ppid),
         "self": _proc_summary(pid),
     }
+    if planned_takeover is not None:
+        ctx["planned_takeover"] = bool(planned_takeover)
+    if planned_stop is not None:
+        ctx["planned_stop"] = bool(planned_stop)
 
     # systemd context.  If we were started by a systemd unit, INVOCATION_ID
     # is set in our env.  ppid==1 (init) is also a strong signal that
@@ -172,26 +191,91 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
         if hermes_home_str:
             takeover_path = Path(hermes_home_str) / ".gateway-takeover.json"
             if takeover_path.exists():
-                try:
-                    raw = takeover_path.read_text(encoding="utf-8")
-                    ctx["takeover_marker"] = raw[:300]
-                    ctx["takeover_marker_for_self"] = (
-                        f'"target_pid": {pid}' in raw
-                        or f"'target_pid': {pid}" in raw
-                    )
-                except OSError:
-                    pass
+                ctx["takeover_marker_present"] = True
             planned_stop_path = Path(hermes_home_str) / ".gateway-planned-stop.json"
             if planned_stop_path.exists():
-                try:
-                    raw = planned_stop_path.read_text(encoding="utf-8")
-                    ctx["planned_stop_marker"] = raw[:300]
-                except OSError:
-                    pass
+                ctx["planned_stop_marker_present"] = True
     except Exception:  # noqa: BLE001 — never raise from a signal handler
         pass
 
     return ctx
+
+
+def _diagnostic_timeout_wrapper_source() -> str:
+    """Return the detached helper source with an anchor-owned process group."""
+    return """\
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import psutil
+from agent.redact import redact_sensitive_text
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+group_id = os.getpgrp()
+if group_id != os.getpid():
+    raise SystemExit("diagnostic wrapper is not its process-group leader")
+
+proc = subprocess.Popen(
+    ["/bin/bash", "-c", sys.argv[1]],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+)
+
+def group_members():
+    members = []
+    for candidate in psutil.process_iter(["pid"]):
+        if candidate.pid <= 1 or candidate.pid == os.getpid():
+            continue
+        try:
+            if os.getpgid(candidate.pid) == group_id:
+                members.append(candidate)
+        except (ProcessLookupError, PermissionError, psutil.NoSuchProcess):
+            continue
+    return members
+
+timed_out = False
+try:
+    output, _ = proc.communicate(timeout=float(sys.argv[2]))
+except subprocess.TimeoutExpired:
+    timed_out = True
+    output = b""
+
+members = group_members()
+if timed_out or members:
+    os.killpg(group_id, signal.SIGTERM)
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        members = [member for member in group_members() if member.is_running()]
+        if not members:
+            break
+        time.sleep(0.05)
+    for member in members:
+        try:
+            if member.is_running() and member.status() != psutil.STATUS_ZOMBIE:
+                member.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if members:
+        psutil.wait_procs(members, timeout=1.0)
+    try:
+        output, _ = proc.communicate(timeout=1.0)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.output or b""
+
+if output:
+    if isinstance(output, str):
+        output = output.encode("utf-8", errors="replace")
+    text = output.decode("utf-8", errors="replace")
+    redacted = redact_sensitive_text(
+        text,
+        force=True,
+        redact_url_credentials=True,
+    )
+    sys.stdout.write(redacted)
+"""
 
 
 def spawn_async_diagnostic(
@@ -226,25 +310,55 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
-    script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
-        "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
+    diagnostic_header = (
+        "printf '=== shutdown diagnostic @ %s ===\\n' "
+        '"$HERMES_DIAGNOSTIC_SIGNAL"; '
     )
+    if sys.platform == "darwin":
+        script = (
+            diagnostic_header
+            + "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- processes (top 60 by cpu) ---'; "
+            "ps -Ao pid=,ppid=,%cpu=,%mem=,state=,lstart=,comm= -r "
+            "2>/dev/null | head -60; "
+            "echo '--- gateway process ---'; "
+            f"ps -p {os.getpid()} -o pid=,ppid=,user=,state=,lstart=,comm= "
+            "2>/dev/null || true; "
+            "echo '--- load average ---'; "
+            "sysctl -n vm.loadavg 2>/dev/null || uptime 2>/dev/null || true; "
+            "echo '=== end ==='"
+        )
+    else:
+        script = (
+            diagnostic_header
+            + "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
+            "echo '--- processes (top 60 by cpu) ---'; "
+            "ps -eo pid=,ppid=,%cpu=,%mem=,stat=,lstart=,comm= "
+            "--sort=-pcpu 2>/dev/null | head -60; "
+            "echo '--- pstree of self ---'; "
+            f"pstree -pl {os.getpid()} 2>/dev/null | head -40 || true; "
+            "echo '--- /proc/loadavg ---'; "
+            "cat /proc/loadavg 2>/dev/null || true; "
+            "echo '=== end ==='"
+        )
+
+    # Enforce the timeout in a detached Python helper rather than relying on
+    # GNU ``timeout`` (not shipped by macOS).  The helper gives the shell its
+    # own process group so a wedged diagnostic command and its children are
+    # terminated together.
+    timeout_wrapper = _diagnostic_timeout_wrapper_source()
 
     try:
         # Open the log file in append mode and let the subprocess inherit.
         # We use os.O_APPEND so concurrent diagnostics from rapid signals
         # don't trample each other.
-        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        open_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(str(log_path), open_flags, 0o600)
+        os.fchmod(fd, 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
     except OSError:
         return None
 
@@ -254,13 +368,31 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        safe_signal_name = "".join(
+            char if char.isalnum() or char in "#_-" else "?"
+            for char in str(signal_name)[:32]
+        )
+        diagnostic_env = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "TZ": "UTC",
+            "HERMES_DIAGNOSTIC_SIGNAL": safe_signal_name,
+        }
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [
+                sys.executable,
+                "-c",
+                timeout_wrapper,
+                script,
+                f"{timeout_seconds:.3f}",
+            ],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            env=diagnostic_env,
         )
     except (FileNotFoundError, OSError):
         try:
@@ -289,12 +421,12 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
     load = ctx.get("loadavg_1m")
     load_str = f"{load:.2f}" if isinstance(load, (int, float)) else "?"
     extras: List[str] = []
-    if ctx.get("takeover_marker") is not None:
-        for_self = ctx.get("takeover_marker_for_self")
+    if ctx.get("takeover_marker_present"):
+        for_self = ctx.get("planned_takeover")
         extras.append(
             f"takeover_marker_present={'self' if for_self else 'other'}"
         )
-    if ctx.get("planned_stop_marker") is not None:
+    if ctx.get("planned_stop_marker_present"):
         extras.append("planned_stop_marker_present=yes")
     if ctx.get("tracer_pid"):
         extras.append(f"tracer_pid={ctx['tracer_pid']}")

@@ -83,4 +83,32 @@ class TestSessionLoadBoolCorruption:
         assert "valid_key" in store._entries
         assert "bad_string" not in store._entries
 
+    def test_retired_photon_origin_loads_as_inert_metadata(self, tmp_path):
+        """Historical routing survives, but cannot reconstruct an active adapter."""
+        retired_origin = {
+            "platform": "photon",
+            "chat_id": "historical-chat",
+            "chat_type": "dm",
+        }
+        retired_entry = {
+            "session_key": "agent:main:photon:dm:historical-chat",
+            "session_id": "20260101_140000_retired1",
+            "created_at": "2026-01-01T12:00:00",
+            "updated_at": "2026-01-01T12:30:00",
+            "origin": retired_origin,
+            "platform": "photon",
+        }
+        store = self._make_store(tmp_path, {"retired_key": retired_entry})
+
+        store._ensure_loaded()
+
+        entry = store._entries["retired_key"]
+        assert entry.origin is None
+        assert entry.platform is None
+        assert entry.retired_origin == retired_origin
+        assert entry.retired_platform == "photon"
+        persisted = entry.to_dict()
+        assert persisted["origin"] == retired_origin
+        assert persisted["platform"] == "photon"
+
 

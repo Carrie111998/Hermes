@@ -10761,12 +10761,11 @@ def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
 
     Bundled platform plugins are cheap-registered as *deferred* entries to
     avoid importing every gateway SDK during normal startup. A platform that
-    registers a top-level ``hermes <name>`` command (e.g. Photon ->
-    ``ctx.register_cli_command(name="photon", ...)``) only runs that side
-    effect when its module is imported. On the unknown-top-level-command slow
-    path, ``discover_plugins()`` records the deferred loader but does not
-    import it, so the CLI registration never happens and ``hermes photon``
-    fails with argparse ``invalid choice`` (issue #54678).
+    registers a top-level ``hermes <name>`` command only runs that side effect
+    when its module is imported. On the unknown-top-level-command slow path,
+    ``discover_plugins()`` records the deferred loader but does not import it,
+    so the CLI registration would otherwise fail with argparse ``invalid
+    choice`` (issue #54678).
 
     Resolving only the platform whose name matches the first positional token
     keeps normal startup cheap while making the targeted command available.

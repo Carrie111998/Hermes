@@ -303,6 +303,68 @@ class TestHelpers:
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
         assert mcp_serve._load_sessions_index() == {}
 
+    def test_load_sessions_index_prunes_retired_legacy_json(
+        self, sessions_dir, monkeypatch
+    ):
+        import mcp_serve
+
+        retired = "pho" + "ton"
+        supported_key = "agent:main:telegram:dm:123"
+        retired_key = f"agent:main:{retired}:dm:stale"
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps(
+                {
+                    supported_key: {
+                        "session_key": supported_key,
+                        "platform": "telegram",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    retired_key: {
+                        "session_key": retired_key,
+                        "platform": retired,
+                        "origin": {"platform": retired, "chat_id": "stale"},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index_from_db", lambda: {})
+
+        assert mcp_serve._load_sessions_index() == {
+            supported_key: {
+                "session_key": supported_key,
+                "platform": "telegram",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+        }
+
+    def test_load_sessions_index_prunes_retired_state_db_rows(self, monkeypatch):
+        import mcp_serve
+
+        retired = "pho" + "ton"
+        rows = {
+            "agent:main:telegram:dm:123": {
+                "session_key": "agent:main:telegram:dm:123",
+                "session_id": "supported",
+                "platform": "telegram",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            },
+            f"agent:main:{retired}:dm:stale": {
+                "session_key": f"agent:main:{retired}:dm:stale",
+                "session_id": "retired",
+                "platform": retired,
+                "origin": {"platform": retired, "chat_id": "stale"},
+            },
+        }
+        monkeypatch.setattr(
+            mcp_serve, "_load_sessions_index_from_db", lambda: dict(rows)
+        )
+
+        result = mcp_serve._load_sessions_index()
+
+        assert set(result) == {"agent:main:telegram:dm:123"}
+        assert result["agent:main:telegram:dm:123"]["platform"] == "telegram"
+
 
 class TestContentExtraction:
     def test_text(self):
@@ -811,6 +873,51 @@ class TestE2EMessagesSend:
 
 
 class TestE2EChannelsList:
+    def test_raw_directory_loader_prunes_retired_platform(self, tmp_path, monkeypatch):
+        import hermes_constants
+        import mcp_serve
+
+        retired = "pho" + "ton"
+        (tmp_path / "channel_directory.json").write_text(
+            json.dumps(
+                {
+                    "updated_at": "2026-05-07T12:00:00",
+                    "platforms": {
+                        retired: [{"id": "stale", "name": "stale", "type": "dm"}],
+                        "telegram": [{"id": "123456", "name": "Alice", "type": "dm"}],
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        directory = mcp_serve._load_channel_directory()
+
+        assert retired not in directory["platforms"]
+        assert directory["platforms"]["telegram"][0]["id"] == "123456"
+
+    def test_raw_directory_loader_wraps_supported_legacy_shape(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_constants
+        import mcp_serve
+
+        retired = "pho" + "ton"
+        telegram = [{"id": "123456", "name": "Alice", "type": "dm"}]
+        (tmp_path / "channel_directory.json").write_text(
+            json.dumps(
+                {
+                    retired: [{"id": "stale", "name": "stale", "type": "dm"}],
+                    "telegram": telegram,
+                }
+            )
+        )
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        directory = mcp_serve._load_channel_directory()
+
+        assert directory == {"platforms": {"telegram": telegram}}
+
     def test_channels_from_sessions(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
         result = _run_tool(server, "channels_list")

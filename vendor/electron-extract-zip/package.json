@@ -1,0 +1,23 @@
+{
+  "name": "@electron-internal/extract-zip",
+  "version": "1.0.5-hermes.1",
+  "description": "Hermes pure-JavaScript compatibility shim for Electron archive extraction",
+  "private": true,
+  "license": "MIT",
+  "main": "./index.cjs",
+  "exports": {
+    ".": {
+      "require": "./index.cjs",
+      "import": "./index.mjs"
+    }
+  },
+  "files": [
+    "index.cjs",
+    "index.mjs",
+    "LICENSE",
+    "README.md"
+  ],
+  "dependencies": {
+    "extract-zip": "2.0.1"
+  }
+}

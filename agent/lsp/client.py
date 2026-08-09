@@ -207,6 +207,7 @@ class LSPClient:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
 
         # Request/response correlation
         self._next_id: int = 0
@@ -275,9 +276,13 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except BaseException:
             self._state = "error"
-            await self._cleanup_process()
+            # Cancellation during initialize is the most dangerous failure
+            # path: the manager has not registered this client yet, so start()
+            # is the process's sole owner.  Run shielded teardown to completion
+            # before propagating CancelledError (or any other failure).
+            await self._await_process_cleanup()
             raise
 
     @staticmethod
@@ -457,6 +462,7 @@ class LSPClient:
         process if it doesn't exit cleanly.  Idempotent.
         """
         if self._stopping:
+            await self._await_process_cleanup()
             return
         self._stopping = True
         try:
@@ -471,7 +477,23 @@ class LSPClient:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._await_process_cleanup()
+
+    async def _await_process_cleanup(self) -> None:
+        """Run teardown to completion even when the outer shutdown is cancelled."""
+        task = self._cleanup_task
+        if task is None:
+            task = asyncio.create_task(self._cleanup_process())
+            self._cleanup_task = task
+        try:
+            # Manager timeout recovery cancels ``shutdown()`` after a bounded
+            # wait.  Shield the owned teardown task so that cancellation cannot
+            # orphan the process after the client has been removed from the
+            # manager's registry.
+            await asyncio.shield(task)
+        finally:
+            if task.done() and self._cleanup_task is task:
+                self._cleanup_task = None
 
     async def _cleanup_process(self) -> None:
         if self._reader_task is not None and not self._reader_task.done():
@@ -487,22 +509,38 @@ class LSPClient:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         proc = self._proc
-        self._proc = None
         if proc is None:
             return
-        if proc.returncode is None:
-            try:
-                proc.terminate()
+        cleanup_complete = False
+        try:
+            if proc.returncode is None:
+                # The LSP protocol's ``exit`` notification asks the server to
+                # terminate itself.  Give that normal exit one grace interval
+                # before signalling: asyncio may not have published returncode yet,
+                # and sending SIGTERM through a stale PID can hit an unrelated
+                # process if the OS has already reused it under heavy concurrency.
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
                     try:
-                        proc.kill()
-                        await proc.wait()
+                        proc.terminate()
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                        except asyncio.TimeoutError:
+                            try:
+                                proc.kill()
+                                await proc.wait()
+                            except ProcessLookupError:
+                                pass
                     except ProcessLookupError:
                         pass
-            except ProcessLookupError:
-                pass
+            cleanup_complete = True
+        finally:
+            # Keep the only process handle attached if an unexpected exception
+            # or direct caller cancellation interrupts teardown.  A later
+            # cleanup attempt can still finish it safely.
+            if cleanup_complete and self._proc is proc:
+                self._proc = None
 
     # ------------------------------------------------------------------
     # request / notification plumbing

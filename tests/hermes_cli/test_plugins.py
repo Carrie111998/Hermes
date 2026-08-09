@@ -44,6 +44,24 @@ def test_portable_skill_namespace_is_ascii_safe():
     assert is_valid_namespace(namespace)
 
 
+@pytest.mark.parametrize("source", ["user", "project", "entrypoint"])
+def test_plugin_context_rejects_retired_platform_for_every_plugin_source(source):
+    manager = PluginManager()
+    context = PluginContext(
+        PluginManifest(name=f"stale-{source}", source=source), manager
+    )
+
+    with pytest.raises(ValueError, match="retired"):
+        context.register_platform(
+            name="photon",
+            label="Photon",
+            adapter_factory=lambda config: MagicMock(),
+            check_fn=lambda: True,
+        )
+
+    assert "photon" not in manager._plugin_platform_names
+
+
 def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
                      manifest_extra: dict | None = None,
                      auto_enable: bool = True) -> Path:

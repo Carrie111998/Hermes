@@ -12,6 +12,9 @@ call is mocked — we never actually shell out during unit tests.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -97,6 +100,93 @@ class TestAllowlist:
         assert default.startswith("uv pip install ")
         # Same spec tail on both forms.
         assert venv.split(" -m pip install ", 1)[1] == default.split("uv pip install ", 1)[1]
+
+
+class TestDingTalkProjectInstallPolicy:
+    def test_missing_alibaba_distribution_is_not_active(self, monkeypatch):
+        from importlib import metadata
+
+        def missing_distribution(name):
+            raise metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(metadata, "distribution", missing_distribution)
+
+        assert ld._dingtalk_vendor_is_active() is False
+
+    def test_manual_commands_preserve_project_vendor_and_cryptography(self):
+        repo_root = Path(ld.__file__).resolve().parents[1]
+        vendor = str(repo_root / "vendor" / "alibabacloud-tea-openapi")
+
+        uv_command = ld.feature_install_command("platform.dingtalk")
+        pip_command = ld.feature_install_command("platform.dingtalk", venv_pip=True)
+
+        assert uv_command is not None and pip_command is not None
+        assert f"--project {repo_root}" in uv_command
+        assert vendor in uv_command and vendor in pip_command
+        assert "cryptography==50.0.0" in uv_command
+        assert "cryptography==50.0.0" in pip_command
+
+    def test_same_registry_version_is_missing_without_vendor_provenance(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(ld, "_is_satisfied", lambda spec: True)
+        monkeypatch.setattr(ld, "_dingtalk_vendor_is_active", lambda: False)
+
+        missing = ld.feature_missing("platform.dingtalk")
+
+        assert "alibabacloud-tea-openapi==0.4.5" in missing
+
+    def test_uv_install_uses_absolute_project_and_vendored_compatibility_package(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(ld, "_lazy_install_target", lambda: None)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "/fake/uv")
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+        result = ld._venv_pip_install(
+            ld.LAZY_DEPS["platform.dingtalk"], feature="platform.dingtalk"
+        )
+
+        repo_root = Path(ld.__file__).resolve().parents[1]
+        command = calls[0]
+        assert result.success
+        assert command[:3] == ["/fake/uv", "pip", "install"]
+        assert command[command.index("--project") + 1] == str(repo_root)
+        assert str(repo_root / "vendor" / "alibabacloud-tea-openapi") in command
+        assert "cryptography==50.0.0" in command
+
+    def test_pip_fallback_uses_vendored_package_and_fixed_cryptography(
+        self, tmp_path, monkeypatch
+    ):
+        calls = []
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(ld, "_lazy_install_target", lambda: None)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: None)
+        monkeypatch.setattr(ld.shutil, "which", lambda name: None)
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+        result = ld._venv_pip_install(
+            ld.LAZY_DEPS["platform.dingtalk"], feature="platform.dingtalk"
+        )
+
+        repo_root = Path(ld.__file__).resolve().parents[1]
+        install_command = next(command for command in calls if "install" in command)
+        assert result.success
+        assert install_command[:4] == [sys.executable, "-m", "pip", "install"]
+        assert str(repo_root / "vendor" / "alibabacloud-tea-openapi") in install_command
+        assert "cryptography==50.0.0" in install_command
 
 
 # ---------------------------------------------------------------------------

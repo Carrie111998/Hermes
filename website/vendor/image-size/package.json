@@ -1,0 +1,90 @@
+{
+  "name": "image-size",
+  "version": "2.0.3-hermes.1",
+  "description": "Hermes-vendored image-size 2.0.2 with bounded ICNS/HEIF/JXL parser progress",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./fromFile": {
+      "import": {
+        "types": "./dist/fromFile.d.ts",
+        "default": "./dist/fromFile.mjs"
+      },
+      "require": {
+        "types": "./dist/fromFile.d.ts",
+        "default": "./dist/fromFile.cjs"
+      }
+    },
+    "./types/*": {
+      "import": {
+        "types": "./dist/types/*.d.ts",
+        "default": "./dist/types/*.mjs"
+      },
+      "require": {
+        "types": "./dist/types/*.d.ts",
+        "default": "./dist/types/*.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "bin/image-size.js",
+    "LICENSE",
+    "Readme.md",
+    "SECURITY-PATCH.md"
+  ],
+  "engines": {
+    "node": ">=16.x"
+  },
+  "bin": "bin/image-size.js",
+  "keywords": [
+    "image",
+    "size",
+    "dimensions",
+    "resolution",
+    "width",
+    "height",
+    "avif",
+    "bmp",
+    "cur",
+    "gif",
+    "heic",
+    "heif",
+    "icns",
+    "ico",
+    "jpeg",
+    "jxl",
+    "png",
+    "psd",
+    "svg",
+    "tga",
+    "tiff",
+    "webp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/image-size/image-size.git"
+  },
+  "author": "netroy <aditya@netroy.in> (http://netroy.in/)",
+  "license": "MIT",
+  "private": true,
+  "hermesSecurityPatch": {
+    "base": "image-size@2.0.2",
+    "advisories": [
+      "GHSA-w3rx-r6r6-pgpr",
+      "GHSA-5p2g-fcmc-qvqq"
+    ],
+    "change": "Reject zero/non-advancing ICNS, HEIF, and JXL records to prevent infinite-loop denial of service."
+  }
+}

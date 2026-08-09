@@ -17,6 +17,78 @@ def _load_package_data():
     return tool["setuptools"]["package-data"]
 
 
+def test_cryptography_security_override_is_explicit():
+    """The CVE-fixed pin must use an audited Alibaba metadata patch."""
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject_path = repo_root / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+
+    assert "cryptography==50.0.0" in pyproject["project"]["dependencies"]
+    assert "alibabacloud-tea-openapi==0.4.5" in pyproject["project"]["optional-dependencies"]["dingtalk"]
+    uv = pyproject["tool"]["uv"]
+    assert "cryptography==50.0.0" in uv["override-dependencies"]
+    assert uv["exclude-newer-package"]["cryptography"] is False
+
+    source = uv["sources"]["alibabacloud-tea-openapi"]
+    vendor_dir = repo_root / source["path"]
+    setup_text = (vendor_dir / "setup.py").read_text(encoding="utf-8")
+    assert 'cryptography>=3.0.0, <51.0.0; python_version>=\'3.9\'' in setup_text
+    assert 'cryptography>=3.0.0, <49.0.0; python_version>=\'3.9\'' not in setup_text
+    assert (vendor_dir / "LICENSE").is_file()
+    assert (vendor_dir / "COMPATIBILITY-PATCH.md").is_file()
+    manifest = (vendor_dir / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "include LICENSE" in manifest
+    assert "include README.md" in manifest
+    assert "include COMPATIBILITY-PATCH.md" in manifest
+    assert '"share/doc/alibabacloud-tea-openapi"' in setup_text
+    for document in ("LICENSE", "README.md", "COMPATIBILITY-PATCH.md"):
+        assert f'"{document}"' in setup_text
+
+
+def test_alibaba_compatibility_notice_describes_direct_cryptography_use():
+    repo_root = Path(__file__).resolve().parents[1]
+    notice = (
+        repo_root / "vendor" / "alibabacloud-tea-openapi" / "COMPATIBILITY-PATCH.md"
+    ).read_text(encoding="utf-8")
+
+    assert "does not import `cryptography` directly" not in notice
+    assert "`rsa_sign` directly imports and uses `cryptography`" in notice
+
+
+def test_vendored_alibaba_rsa_sign_works_with_cryptography_50():
+    import cryptography
+    from alibabacloud_tea_openapi.utils import rsa_sign
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+    assert cryptography.__version__ == "50.0.0"
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    payload = b"hermes-dingtalk-cryptography-50"
+
+    signature = rsa_sign(payload, private_pem)
+
+    private_key.public_key().verify(
+        signature, payload, padding.PKCS1v15(), hashes.SHA256()
+    )
+
+
+def test_wake_tflite_runtime_is_limited_to_supported_macos_architecture():
+    """ai-edge-litert 2.1.6 only publishes macOS ARM64 wheels."""
+    wake_dependencies = _load_optional_dependencies()["wake"]
+    litert_specs = [spec for spec in wake_dependencies if spec.startswith("ai-edge-litert")]
+
+    assert litert_specs == [
+        "ai-edge-litert==2.1.6; platform_system == 'Darwin' and "
+        "platform_machine == 'arm64'"
+    ]
+
+
 def test_matrix_extra_not_in_all():
     """The [matrix] extra pulls `mautrix[encryption]` -> `python-olm`,
     which has Linux-only wheels and no native build path on Windows or

@@ -84,7 +84,10 @@ dependencies = [
   "urllib3>=2.7.0,<3",
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
-  "cryptography==48.0.1",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf; ==48.0.1 (not 49.x): msal and alibabacloud-tea-openapi cap <49, hindsight-api-slim needs >=48.0.1
+  # 50.0.0 fixes GHSA-g6cj-pr64-35w5, GHSA-jwv3-5hgf-82ww, and
+  # GHSA-m2h6-j472-rp4c. Alibaba's OpenAPI metadata still caps <49, so the
+  # audited compatibility override below is required until they relax it.
+  "cryptography==50.0.0",
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
@@ -209,7 +212,7 @@ wake = [
   # (dscripka/openWakeWord#336), so the wake word runs on tflite there.
   # Upstream declares tflite-runtime for Linux only; ai-edge-litert is the
   # macOS equivalent, bridged in tools/wake_word.py.
-  "ai-edge-litert==2.1.6; platform_system == 'Darwin'",
+  "ai-edge-litert==2.1.6; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 honcho = ["honcho-ai==2.2.0"]
 # Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
@@ -288,7 +291,12 @@ termux-all = [
   "hermes-agent[web]",
   "hermes-agent[pty]",
 ]
-dingtalk = ["dingtalk-stream==0.24.3", "alibabacloud-dingtalk==2.2.42", "qrcode==7.4.2"]
+dingtalk = [
+  "dingtalk-stream==0.24.3",
+  "alibabacloud-dingtalk==2.2.42",
+  "alibabacloud-tea-openapi==0.4.5",
+  "qrcode==7.4.2",
+]
 feishu = ["lark-oapi==1.6.8", "qrcode==7.4.2"]
 google = [
   # Required by the google-workspace skill (Gmail, Calendar, Drive, Contacts,
@@ -362,6 +370,10 @@ hermes-acp = "acp_adapter.entry:main"
 
 [tool.uv]
 override-dependencies = [
+  # alibabacloud-tea-openapi 0.4.5 caps cryptography <49 even though its
+  # OpenAPI signing path remains compatible with 50.0.0. Keep DingTalk while
+  # forcing the security-fixed release; remove when Alibaba relaxes the cap.
+  "cryptography==50.0.0",
   # discord.py's latest published version, 2.7.1, pins pynacl at <1.6. however, pynacl 1.5.0 has known vulnerabilities.
   # discord.py has updated pynacl to 1.6 on `main`, but has not yet published a patch release.
   # so, we force-override this to pynacl 1.6. here.
@@ -369,9 +381,13 @@ override-dependencies = [
   "pynacl>=1.6,<1.7",
 ]
 exclude-newer = "14 days"
-# h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
-# request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false }
+# Temporary security exceptions newer than the 14-day quarantine:
+# - h2 4.4.1 fixes CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg); remove after 2026-08-17.
+# - cryptography 50.0.0 fixes three retained advisories; remove after 2026-08-15.
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, cryptography = false }
+
+[tool.uv.sources]
+alibabacloud-tea-openapi = { path = "vendor/alibabacloud-tea-openapi" }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

@@ -164,7 +164,7 @@ plugins/platforms/                  # 插件打包的适配器（每个一个目
 ├── teams/adapter.py        # Microsoft Teams
 ├── irc/adapter.py          # IRC（作用域锁的标准示例）
 ├── homeassistant/adapter.py # Home Assistant 对话集成
-└── …                       # google_chat、ntfy、photon、raft、simplex 等
+└── …                       # google_chat、ntfy、raft、simplex 等
 
 gateway/platforms/                  # 核心 base 与旧的直接适配器
 ├── base.py              # BasePlatformAdapter — 所有平台的共享逻辑

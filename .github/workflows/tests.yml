@@ -131,6 +131,8 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
+          # Canonical release evidence must retain the first failure.
+          HERMES_TEST_FILE_RETRIES: "0"
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

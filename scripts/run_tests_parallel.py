@@ -42,15 +42,20 @@ Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+import psutil
 
 
 # Default test discovery roots.
@@ -100,6 +105,72 @@ _DEFAULT_FILE_RETRIES = 1
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+
+# Direct invocation must provide the same credential boundary as
+# ``scripts/run_tests.sh``.  Keep this explicit: wildcarding HERMES_* or
+# inheriting the ambient environment would let API keys reach arbitrary test
+# modules during collection, before conftest fixtures can scrub them.
+_CHILD_ENV_ALLOWLIST = {
+    "PATH",
+    "HOME",
+    # Native Windows location/runtime variables.
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    # Explicit test infrastructure and opt-in knobs.
+    "HERMES_TEST_IMAGE",
+    "HERMES_RUN_SLOW_PET_TESTS",
+    "HERMES_E2E_BROWSER",
+}
+
+
+def _build_pytest_env(pytest_temp_root: str) -> dict[str, str]:
+    """Build a deterministic, credential-free pytest child environment."""
+    env = {
+        name: os.environ[name]
+        for name in _CHILD_ENV_ALLOWLIST
+        if os.environ.get(name)
+    }
+    env.update(
+        {
+            "TZ": "UTC",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONHASHSEED": "0",
+            "PYTHONUTF8": "1",
+            "PYTEST_DEBUG_TEMPROOT": pytest_temp_root,
+            # Keep nested subprocess and tempfile users inside the same
+            # attempt-owned short root rather than ambient platform paths.
+            "TMPDIR": pytest_temp_root,
+            "TEMP": pytest_temp_root,
+            "TMP": pytest_temp_root,
+        }
+    )
+    # The live-system guard is the sole intentional pytest plugin injection.
+    # Derive it from its fixed file rather than trusting ambient import paths.
+    home = env.get("HOME") or env.get("USERPROFILE")
+    if home:
+        guard = Path(home) / ".hermes" / "pytest_live_guard.py"
+        if guard.is_file():
+            env["PYTHONPATH"] = str(guard.parent)
+            env["PYTEST_PLUGINS"] = "pytest_live_guard"
+    return env
+
+
+def _pytest_temp_base() -> str | None:
+    """Return a deliberately short base where the OS socket limit requires it."""
+    if sys.platform == "darwin":
+        # macOS sockaddr_un.sun_path is only 104 bytes. The normal
+        # /var/folders/... base leaves too little room for pytest's own nested
+        # names, while /private/tmp is the canonical writable short path.
+        return "/private/tmp"
+    return None
 
 
 def _split_pathspec(value: str) -> List[str]:
@@ -207,7 +278,294 @@ def _discover_files(roots: List[Path]) -> List[Path]:
     return sorted(out)
 
 
-def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
+_PROCESS_EXIT_GRACE = 0.5
+
+
+def _identity_alive(proc: psutil.Process) -> bool:
+    """Check a psutil identity without accepting a reused numeric PID."""
+    try:
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+        return False
+
+
+def _terminate_identities(processes: list[psutil.Process]) -> None:
+    """TERM then KILL only process identities that still match."""
+    unique: dict[tuple[int, float], psutil.Process] = {}
+    for process in processes:
+        try:
+            unique[(process.pid, process.create_time())] = process
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    alive = [process for process in unique.values() if _identity_alive(process)]
+    for process in alive:
+        try:
+            process.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=_PROCESS_EXIT_GRACE)
+    for process in alive:
+        if not _identity_alive(process):
+            continue
+        try:
+            process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
+            pass
+    if alive:
+        psutil.wait_procs(alive, timeout=_PROCESS_EXIT_GRACE)
+
+
+def _wait_without_reaping(pid: int, timeout: float) -> bool:
+    """Observe POSIX child exit while keeping its PID/PGID identity pinned."""
+    deadline = time.monotonic() + timeout
+    waitid = getattr(os, "waitid", None)
+    root = psutil.Process(pid)
+    while True:
+        if waitid is not None:
+            options = os.WEXITED | os.WNOHANG | os.WNOWAIT
+            try:
+                result = waitid(os.P_PID, pid, options)
+            except ChildProcessError:
+                # A concurrent global cleanup may already have reaped it.
+                return True
+            if result is not None and result.si_pid == pid:
+                return True
+        else:
+            try:
+                if root.status() == psutil.STATUS_ZOMBIE:
+                    return True
+            except psutil.NoSuchProcess:
+                # A concurrent global cleanup may already have reaped it.
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _owned_group_members(pgid: int, leader_pid: int) -> list[psutil.Process]:
+    """Return live non-leader identities in an anchor-pinned process group."""
+    members: list[psutil.Process] = []
+    for candidate in psutil.process_iter(["pid"]):
+        if candidate.pid <= 1 or candidate.pid == leader_pid:
+            continue
+        try:
+            if (
+                os.getpgid(candidate.pid) == pgid
+                and candidate.status() != psutil.STATUS_ZOMBIE
+            ):
+                members.append(candidate)
+        except (
+            ProcessLookupError,
+            PermissionError,
+            psutil.NoSuchProcess,
+            psutil.AccessDenied,
+        ):
+            continue
+    return members
+
+
+class _ProcessTreeLease:
+    """Identity-bound ownership of one pytest process and its descendants."""
+
+    def __init__(
+        self,
+        proc: "subprocess.Popen",
+        *,
+        pgid: int | None,
+        temp_root: str,
+    ) -> None:
+        self.proc = proc
+        self.pgid = pgid
+        self.temp_root = temp_root
+        self._tracked: dict[tuple[int, float], psutil.Process] = {}
+        self._tracked_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._cleaned = False
+        self._stop = threading.Event()
+        try:
+            self._root: psutil.Process | None = psutil.Process(proc.pid)
+            self._remember(self._root)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            self._root = None
+        self._snapshot_descendants()
+        self._monitor: threading.Thread | None = None
+        if sys.platform == "win32":
+            self._monitor = threading.Thread(
+                target=self._monitor_descendants,
+                name=f"pytest-tree-{proc.pid}",
+                daemon=True,
+            )
+            self._monitor.start()
+
+    def _remember(self, process: psutil.Process) -> None:
+        try:
+            key = (process.pid, process.create_time())
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return
+        with self._tracked_lock:
+            self._tracked[key] = process
+
+    def _snapshot_descendants(self) -> None:
+        root = self._root
+        if root is None or not _identity_alive(root):
+            return
+        try:
+            for child in root.children(recursive=True):
+                self._remember(child)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    def _monitor_descendants(self) -> None:
+        while not self._stop.wait(0.02):
+            self._snapshot_descendants()
+            if self.proc.poll() is not None:
+                self._snapshot_descendants()
+                return
+
+    def cleanup(self) -> None:
+        """Stop monitoring and terminate every still-matching identity once."""
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            if sys.platform != "win32":
+                self._cleanup_posix_group()
+                self._cleaned = True
+                return
+            self._snapshot_descendants()
+            self._stop.set()
+            if (
+                self._monitor is not None
+                and self._monitor is not threading.current_thread()
+            ):
+                self._monitor.join(timeout=0.2)
+            with self._tracked_lock:
+                tracked = list(self._tracked.values())
+            root = self._root
+            children = [p for p in tracked if root is None or p.pid != root.pid]
+            _terminate_identities([*children, *([root] if root is not None else [])])
+            self._cleaned = True
+
+    def _cleanup_posix_group(self) -> None:
+        pgid = self.pgid
+        if pgid is None or pgid != self.proc.pid or pgid == os.getpgrp():
+            raise RuntimeError("refusing to signal an unowned pytest process group")
+        try:
+            if os.getpgid(self.proc.pid) != pgid:
+                raise RuntimeError("pytest process-group identity changed")
+        except ProcessLookupError:
+            root_is_unreaped_zombie = False
+            if self._root is not None:
+                try:
+                    root_is_unreaped_zombie = (
+                        self._root.status() == psutil.STATUS_ZOMBIE
+                    )
+                except psutil.NoSuchProcess:
+                    pass
+            if not root_is_unreaped_zombie:
+                if self.proc.returncode is not None:
+                    return
+                raise RuntimeError("pytest group leader vanished before owned cleanup")
+
+        root_is_zombie = False
+        if self._root is not None:
+            try:
+                root_is_zombie = self._root.status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                pass
+        if root_is_zombie and not _owned_group_members(pgid, self.proc.pid):
+            self.proc.wait(timeout=_PROCESS_EXIT_GRACE)
+            return
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OSError) as exc:
+            raise RuntimeError(
+                f"failed to terminate owned pytest group: {exc!r}"
+            ) from exc
+
+        deadline = time.monotonic() + _PROCESS_EXIT_GRACE
+        members: list[psutil.Process] = []
+        while time.monotonic() < deadline:
+            members = _owned_group_members(pgid, self.proc.pid)
+            leader_running = self._root is not None and _identity_alive(self._root)
+            if not members and not leader_running:
+                break
+            time.sleep(0.02)
+        else:
+            members = _owned_group_members(pgid, self.proc.pid)
+            leader_running = self._root is not None and _identity_alive(self._root)
+            if members or leader_running:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except (PermissionError, OSError) as exc:
+                    raise RuntimeError("failed to kill stubborn pytest group") from exc
+
+        try:
+            self.proc.wait(timeout=_PROCESS_EXIT_GRACE)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("pytest group leader did not reap after cleanup") from exc
+
+
+_ACTIVE_LEASES: set[_ProcessTreeLease] = set()
+_ACTIVE_LEASES_LOCK = threading.Lock()
+_RUNNER_STOPPING = threading.Event()
+
+
+def _register_lease(lease: _ProcessTreeLease) -> None:
+    with _ACTIVE_LEASES_LOCK:
+        _ACTIVE_LEASES.add(lease)
+
+
+def _unregister_lease(lease: _ProcessTreeLease) -> None:
+    with _ACTIVE_LEASES_LOCK:
+        _ACTIVE_LEASES.discard(lease)
+
+
+def _cleanup_active_leases() -> None:
+    with _ACTIVE_LEASES_LOCK:
+        leases = list(_ACTIVE_LEASES)
+    for lease in leases:
+        lease.cleanup()
+
+
+atexit.register(_cleanup_active_leases)
+
+
+class _RunnerInterrupted(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.exit_code = 128 + signum
+
+
+def _install_cleanup_signal_handlers() -> dict[int, object]:
+    previous: dict[int, object] = {}
+
+    def _handle(signum: int, _frame: object) -> None:
+        _RUNNER_STOPPING.set()
+        _cleanup_active_leases()
+        raise _RunnerInterrupted(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle)
+    return previous
+
+
+def _restore_signal_handlers(previous: dict[int, object]) -> None:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)  # type: ignore[arg-type]
+
+
+def _kill_tree(
+    proc: "subprocess.Popen",
+    pgid: int | None = None,
+    *,
+    lease: _ProcessTreeLease | None = None,
+) -> None:
     """Kill the pytest subprocess and every descendant it spawned.
 
     A test run can spin up uvicorn servers, async runtimes, or other
@@ -234,35 +592,17 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
     primitives (process groups / taskkill) handle both cases correctly
     without an extra abstraction layer.
     """
-    if proc.pid is None:
+    del pgid  # A captured numeric PGID is not an identity after leader exit.
+    if lease is not None:
+        lease.cleanup()
         return
-
-    if sys.platform == "win32":
+    # Compatibility fallback for direct unit callers: only the still-live
+    # Popen leader is eligible. Never signal a captured process group here.
+    if proc.returncode is None:
         try:
-            
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-            )  # windows-footgun: ok
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            proc.kill()
+        except (ProcessLookupError, OSError):
             pass
-    else:
-        # POSIX: kill the captured pgid. Local-import signal so the
-        # SIGKILL attribute is never referenced on Windows.
-        if pgid is not None:
-            try:
-                import signal as _signal
-                os.killpg(pgid, _signal.SIGKILL)  # windows-footgun: ok
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-    # Belt-and-suspenders: ensure subprocess.communicate() sees the exit.
-    try:
-        proc.kill()
-    except (ProcessLookupError, OSError):
-        pass
 
 
 def _run_one_file(
@@ -304,11 +644,13 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
+    if _RUNNER_STOPPING.is_set():
+        return file, 130, "runner shutdown requested", {}, 0.0
     file, rc, output, summary, subproc_wall = _run_one_file_once(
         file, pytest_args, repo_root, file_timeout
     )
     attempt = 0
-    while rc != 0 and attempt < retries:
+    while rc != 0 and attempt < retries and not _RUNNER_STOPPING.is_set():
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
@@ -343,59 +685,78 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+
     subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    # Independent pytest processes must not share the default
+    # ``pytest-of-<user>/pytest-current`` symlink. Pytest's session cleanup
+    # performs an unguarded check-then-unlink on that symlink, so concurrent
+    # file processes can otherwise race and turn an all-green run red during
+    # teardown. A fresh namespace per attempt also isolates retries.
+    with tempfile.TemporaryDirectory(
+        # Keep this short: nested ``tmp_path`` values are used as AF_UNIX
+        # socket paths, whose macOS limit is only 104 bytes.
+        prefix="hp-",
+        dir=_pytest_temp_base(),
+        ignore_cleanup_errors=True,
+    ) as pytest_temp_root:
+        child_env = _build_pytest_env(pytest_temp_root)
 
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
+        with tempfile.TemporaryFile(mode="w+b", dir=pytest_temp_root) as captured:
+            # Spool output instead of using PIPE: a leaked descendant may inherit
+            # stdout, and communicate() would then wait for that descendant even
+            # after pytest itself exited.
+            proc = subprocess.Popen(
+                cmd,
+                cwd=repo_root,
+                stdout=captured,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                start_new_session=True,
+            )
 
-    try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
-        )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+            pgid: int | None = None
+            if sys.platform != "win32":
+                pgid = proc.pid
+                try:
+                    if os.getpgid(proc.pid) != pgid or pgid == os.getpgrp():
+                        raise RuntimeError("pytest did not enter its owned process group")
+                except BaseException:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    raise
 
-        output +=  "\n"
+            lease = _ProcessTreeLease(
+                proc,
+                pgid=pgid,
+                temp_root=pytest_temp_root,
+            )
+            _register_lease(lease)
+            timed_out = False
+            try:
+                if sys.platform == "win32":
+                    try:
+                        proc.wait(timeout=file_timeout)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                else:
+                    timed_out = not _wait_without_reaping(proc.pid, file_timeout)
+            finally:
+                try:
+                    lease.cleanup()
+                finally:
+                    _unregister_lease(lease)
+            rc = 124 if timed_out else int(proc.returncode or 0)
+
+            captured.flush()
+            captured.seek(0)
+            output = captured.read().decode("utf-8", errors="replace")
+            if timed_out:
+                output = (
+                    f"({file_timeout:.0f}s exceeded; process tree terminated)\n"
+                    f"{output}"
+                )
+            else:
+                output += "\n"
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a
@@ -1059,21 +1420,28 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures: List[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    _RUNNER_STOPPING.clear()
+    previous_handlers = _install_cleanup_signal_handlers()
+    try:
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures: List[Future] = []
+            for file in files:
+                t0 = time.monotonic()
+                fut = pool.submit(
+                    _run_one_file, file, pytest_passthrough, repo_root,
+                    args.file_timeout, args.file_retries,
+                )
+                fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
+                futures.append(fut)
+            # Block until everything's done. ThreadPoolExecutor.__exit__ waits
+            # for all submitted work, but doing it explicitly here makes the
+            # control flow obvious.
+            for fut in futures:
+                fut.result() if fut.exception() is None else None
+    except _RunnerInterrupted as interrupted:
+        return interrupted.exit_code
+    finally:
+        _restore_signal_handlers(previous_handlers)
 
     elapsed = time.monotonic() - started
     print()

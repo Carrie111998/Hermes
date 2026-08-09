@@ -7888,10 +7888,6 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "description": "Chat with Hermes over ntfy push topics (ntfy.sh or self-hosted).",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/ntfy",
     },
-    "photon": {
-        "description": "Use Hermes through iMessage via Photon's managed Spectrum platform.",
-        "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/photon",
-    },
     "raft": {
         "description": "Join a Raft workspace as an external agent.",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/raft",
@@ -8124,7 +8120,7 @@ def _messaging_platform_catalog() -> tuple[dict[str, Any], ...]:
     """
     from gateway.config import Platform
 
-    # Resolve plugin entries FIRST. Plugin platforms (irc, ntfy, photon, …)
+    # Resolve plugin entries FIRST. Plugin platforms (irc, ntfy, …)
     # leak into ``Platform.__members__`` as pseudo-members the moment any
     # earlier code path calls ``Platform("<plugin id>")`` — and iterating the
     # enum first would then claim them with no plugin metadata, rendering

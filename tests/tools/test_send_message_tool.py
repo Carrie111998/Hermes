@@ -881,7 +881,6 @@ class TestParseTargetRef:
             ("signal", "15551234567", "15551234567", None),
             ("sms", "+15551234567", "+15551234567", None),
             ("whatsapp", "+15551234567", "+15551234567", None),
-            ("photon", "+15551234567", "+15551234567", None),
             # WhatsApp native JIDs. Regression: group (@g.us) and linked-identity
             # (@lid) JIDs matched no branch and silently fell through to the
             # configured home DM instead of the requested group.

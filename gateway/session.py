@@ -9,6 +9,7 @@ Handles:
 """
 
 import asyncio
+import copy
 import hashlib
 import logging
 import os
@@ -90,6 +91,7 @@ from .config import (
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
 )
+from .retired_platforms import is_retired_platform_id
 from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
@@ -784,6 +786,11 @@ class SessionEntry:
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
+    # Raw historical metadata from a permanently retired adapter.  This is
+    # deliberately separate from ``origin`` so no active Platform or egress
+    # route can be reconstructed from it.
+    retired_origin: Optional[Dict[str, Any]] = None
+    retired_platform: Optional[str] = None
     
     # Display metadata
     display_name: Optional[str] = None
@@ -875,7 +882,7 @@ class SessionEntry:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "display_name": self.display_name,
-            "platform": self.platform.value if self.platform else None,
+            "platform": self.platform.value if self.platform else self.retired_platform,
             "chat_type": self.chat_type,
             "metadata": self.metadata,
             "input_tokens": self.input_tokens,
@@ -913,20 +920,31 @@ class SessionEntry:
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
+        elif self.retired_origin:
+            result["origin"] = copy.deepcopy(self.retired_origin)
         return result
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionEntry":
         origin = None
+        retired_origin = None
         if "origin" in data and isinstance(data["origin"], dict):
-            origin = SessionSource.from_dict(data["origin"])
+            origin_data = data["origin"]
+            if is_retired_platform_id(origin_data.get("platform")):
+                retired_origin = copy.deepcopy(origin_data)
+            else:
+                origin = SessionSource.from_dict(origin_data)
         
         platform = None
+        retired_platform = None
         if data.get("platform"):
-            try:
-                platform = Platform(data["platform"])
-            except ValueError as e:
-                logger.debug("Unknown platform value %r: %s", data["platform"], e)
+            if is_retired_platform_id(data["platform"]):
+                retired_platform = str(data["platform"]).strip().lower()
+            else:
+                try:
+                    platform = Platform(data["platform"])
+                except ValueError as e:
+                    logger.debug("Unknown platform value %r: %s", data["platform"], e)
 
         last_resume_marked_at = None
         _lrma = data.get("last_resume_marked_at")
@@ -975,6 +993,8 @@ class SessionEntry:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             origin=origin,
+            retired_origin=retired_origin,
+            retired_platform=retired_platform,
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),

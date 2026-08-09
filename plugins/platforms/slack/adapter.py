@@ -4792,7 +4792,7 @@ class SlackAdapter(BasePlatformAdapter):
         reactions as real responses.
 
         The synthesized text follows the cross-platform convention already
-        used by the Feishu and Photon adapters — ``reaction:added:<emoji>`` /
+        used by the Feishu adapter — ``reaction:added:<emoji>`` /
         ``reaction:removed:<emoji>`` — with common Slack reaction names
         translated to unicode emoji (👍, 👎, ✅, …) so agents and skills see
         the same shape on every platform. Because the synthesized event is
@@ -4933,8 +4933,8 @@ class SlackAdapter(BasePlatformAdapter):
             "thread_ts": thread_ts,
             # A reaction on the bot's own message (or an operator-allowlisted
             # trigger emoji) is definitionally addressed to the bot — skip
-            # the mention requirement the way Feishu/Photon reaction routing
-            # does. User authorization and allowed_channels still apply.
+            # the mention requirement the way Feishu reaction routing does.
+            # User authorization and allowed_channels still apply.
             "_hermes_force_process": True,
             # Surfaced for any downstream code that wants to know this was a
             # reaction rather than a typed message; not used by the default
@@ -8434,7 +8434,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Compile optional regex wake-word patterns for channel triggers.
 
         Parity with the other adapters (Telegram, DingTalk, Mattermost,
-        WhatsApp, BlueBubbles, Photon): when ``require_mention`` is on, a
+        WhatsApp, and BlueBubbles): when ``require_mention`` is on, a
         channel message matching one of these patterns triggers the bot even
         without a literal ``<@BOTUID>`` mention. Reads ``slack.mention_patterns``
         (a list or single string) or ``SLACK_MENTION_PATTERNS`` (a JSON list, or

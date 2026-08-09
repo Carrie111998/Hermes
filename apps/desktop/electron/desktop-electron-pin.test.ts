@@ -30,8 +30,10 @@ import path from 'node:path'
 import { test } from 'vitest'
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..')
+const ROOT_PKG = path.join(REPO_ROOT, 'package.json')
 const DESKTOP_PKG = path.join(REPO_ROOT, 'apps', 'desktop', 'package.json')
 const ROOT_LOCK = path.join(REPO_ROOT, 'package-lock.json')
+const EXTRACTOR_SHIM = path.join(REPO_ROOT, 'vendor', 'electron-extract-zip')
 
 // An exact semver: digits.digits.digits with an optional prerelease/build tag,
 // but NO range operators (^ ~ > < = * x || spaces || -range).
@@ -106,4 +108,32 @@ test('lockfile resolves the pinned electron', () => {
         'run `npm install --package-lock-only` so `npm ci` stays consistent.'
     )
   }
+})
+
+test('electron installation uses the repository pure-JavaScript extractor shim', () => {
+  const rootPkg = JSON.parse(fs.readFileSync(ROOT_PKG, 'utf-8'))
+  const shimSpec = rootPkg.devDependencies?.['@electron-internal/extract-zip']
+  assert.equal(shimSpec, 'file:vendor/electron-extract-zip')
+  assert.equal(
+    rootPkg.overrides?.electron?.['@electron-internal/extract-zip'],
+    '$@electron-internal/extract-zip'
+  )
+
+  const shimPkg = JSON.parse(
+    fs.readFileSync(path.join(EXTRACTOR_SHIM, 'package.json'), 'utf-8')
+  )
+
+  assert.equal(shimPkg.name, '@electron-internal/extract-zip')
+  assert.equal(shimPkg.dependencies?.['extract-zip'], '2.0.1')
+
+  const nativeBindings = fs
+    .readdirSync(EXTRACTOR_SHIM, { recursive: true })
+    .filter((entry) => String(entry).endsWith('.node'))
+
+  assert.deepEqual(nativeBindings, [], 'the Electron installer extractor must not ship native addons')
+
+  const lock = JSON.parse(fs.readFileSync(ROOT_LOCK, 'utf-8'))
+  const linkedExtractor = lock.packages?.['node_modules/@electron-internal/extract-zip']
+  assert.equal(linkedExtractor?.resolved, 'vendor/electron-extract-zip')
+  assert.equal(linkedExtractor?.link, true)
 })

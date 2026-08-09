@@ -313,6 +313,10 @@ class Platform(Enum):
             return None
         # Normalise to lowercase to avoid case mismatches in config
         value = value.strip().lower()
+        from gateway.retired_platforms import is_retired_platform_id
+
+        if is_retired_platform_id(value):
+            return None
         # Check cache first (another call may have created it already)
         if value in cls._value2member_map_:
             return cls._value2member_map_[value]

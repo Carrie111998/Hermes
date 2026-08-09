@@ -16,6 +16,8 @@ from typing import Any, Dict, List, Optional
 from hermes_cli.config import get_hermes_home
 from utils import atomic_json_write
 
+from .retired_platforms import is_retired_platform_id
+
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
@@ -47,6 +49,14 @@ def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
         return {}
 
 
+def _prune_retired_platforms(platforms: Dict[str, Any]) -> bool:
+    """Remove retired adapter namespaces from a channel-directory mapping."""
+    retired = [name for name in platforms if is_retired_platform_id(name)]
+    for name in retired:
+        platforms.pop(name, None)
+    return bool(retired)
+
+
 def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
     """Overlay friendly names onto directory entries by chat_id.
 
@@ -56,6 +66,8 @@ def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
     """
     aliases = _load_channel_aliases()
     for plat_name, id_map in aliases.items():
+        if is_retired_platform_id(plat_name):
+            continue
         if not isinstance(id_map, dict):
             continue
         entries = platforms.setdefault(plat_name, [])
@@ -150,6 +162,9 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     platforms: Dict[str, List[Dict[str, str]]] = {}
 
     for platform, adapter in adapters.items():
+        platform_name = getattr(platform, "value", str(platform))
+        if is_retired_platform_id(platform_name):
+            continue
         try:
             list_channels = getattr(adapter, "list_channels", None)
             if callable(list_channels):
@@ -189,7 +204,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             if (
-                entry.name not in _SKIP_SESSION_DISCOVERY
+                not is_retired_platform_id(entry.name)
+                and entry.name not in _SKIP_SESSION_DISCOVERY
                 and entry.name not in platforms
                 and entry.name in adapter_platform_names
             ):
@@ -199,6 +215,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     # Overlay user-maintained friendly names before persisting.
     _apply_channel_aliases(platforms)
+    _prune_retired_platforms(platforms)
 
     directory = {
         "updated_at": datetime.now().isoformat(),
@@ -528,13 +545,28 @@ def load_directory() -> Dict[str, Any]:
     if not DIRECTORY_PATH.exists():
         base = {"updated_at": None, "platforms": {}}
         _apply_channel_aliases(base["platforms"])
+        _prune_retired_platforms(base["platforms"])
         return base
     try:
         with open(DIRECTORY_PATH, encoding="utf-8") as f:
             data = json.load(f)
+        platforms = data.setdefault("platforms", {})
+        changed = False
+        if not isinstance(platforms, dict):
+            platforms = {}
+            data["platforms"] = platforms
+            changed = True
+        changed = _prune_retired_platforms(platforms) or changed
         # Re-apply aliases on read so friendly names take effect immediately,
-        # even between timed rebuilds and for brand-new alias entries.
-        _apply_channel_aliases(data.setdefault("platforms", {}))
+        # even between timed rebuilds and for brand-new alias entries. Prune a
+        # second time as defense in depth against stale retired alias files.
+        _apply_channel_aliases(platforms)
+        changed = _prune_retired_platforms(platforms) or changed
+        if changed:
+            try:
+                atomic_json_write(DIRECTORY_PATH, data)
+            except Exception as e:
+                logger.debug("Channel directory: failed to persist retirement migration: %s", e)
         return data
     except Exception:
         base = {"updated_at": None, "platforms": {}}

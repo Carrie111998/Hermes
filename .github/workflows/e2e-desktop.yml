@@ -52,6 +52,8 @@ jobs:
       - uses: ./.github/actions/retry
         with:
           command: npm ci
+        env:
+          electron_config_cache: ${{ runner.temp }}/hermes-electron-${{ github.run_id }}-${{ github.run_attempt }}
 
       # ── Python (for the hermes serve backend) ──────────────────────────
       - name: Install uv

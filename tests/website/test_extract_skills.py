@@ -132,3 +132,18 @@ def test_guess_category_empty_tags(mod):
 def test_guess_category_skips_first_junk_tag_for_later_known_tag(mod):
     # First tag is junk, second is curated — we should still find the curated one.
     assert mod._guess_category(["Some Brand", "security"]) == "security"
+
+
+def test_extract_policy_rejects_retired_platform_catalog_entry(mod):
+    assert mod.is_retired_platform_catalog_entry({
+        "identifier": "skills-sh/photon-hq/skills/spectrum",
+        "repo": "photon-hq/skills",
+    })
+
+
+def test_extract_policy_retains_photonics_skill(mod):
+    assert not mod.is_retired_platform_catalog_entry({
+        "identifier": "finance-photonics-cpo",
+        "description": "Co-packaged optics and photonics supply chains",
+        "tags": ["photonics-cpo"],
+    })
