@@ -94,29 +94,18 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
-| `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. Set to `observation,world,experience` to also include raw facts. The desktop settings panel exposes this tuning field. |
+| `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
-> **Default and benchmark caveat — `recall_types` remains `observation` only.**
+> **Behavior change — `recall_types` defaults to `observation` only.**
 >
-> Observations are Hindsight's consolidated knowledge layer: deduplicated,
-> evidence-grounded beliefs refined as new facts arrive. Keeping that as the
-> default preserves the existing plugin behavior and keeps automatic context
-> injection compact. The setting is now also available in the desktop provider
-> panel, so broad recall does not require hand-editing JSON.
+> Previously recall returned all three fact types. It now returns only observations.
 >
-> The independent [MemConflict comparison](https://engturtle.github.io/hermes-memconflict/report/)
-> reported Hindsight at `0.218` with observations-only and `0.281` in a separate
-> all-types diagnostic configuration. That comparison measured automatic session
-> ingestion/context injection; it is useful evidence for tuning, not proof that
-> all-types is universally better or a benchmark of Hermes' agentic tools.
+> Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
 >
-> To opt into broad recall, set `recall_types` to
-> `"observation,world,experience"` (string or JSON list) in
-> `~/.hermes/hindsight/config.json`, or use the desktop provider panel. The
-> setting applies to both auto-recall and the `hindsight_recall` tool.
+> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
 
 ### Retain
 

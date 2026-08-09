@@ -3,7 +3,6 @@
 from plugins.memory.config_schema import (
     KIND_SECRET,
     KIND_SELECT,
-    KIND_TEXT,
     get_provider_config_schema,
 )
 
@@ -23,7 +22,6 @@ def test_hindsight_is_declared():
         "llm_model",
         "bank_id",
         "recall_budget",
-        "recall_types",
     }
 
 
@@ -89,13 +87,3 @@ def test_api_key_is_a_secret_bound_to_env():
     assert api_key.kind == KIND_SECRET
     assert api_key.is_secret is True
     assert api_key.env_key == "HINDSIGHT_API_KEY"
-
-
-def test_recall_types_is_exposed_as_an_explicit_tuning_setting():
-    provider = get_provider_config_schema("hindsight")
-    assert provider is not None
-
-    recall_types = next(field for field in provider.fields if field.key == "recall_types")
-    assert recall_types.kind == KIND_TEXT
-    assert recall_types.default == "observation"
-    assert recall_types.inline is True

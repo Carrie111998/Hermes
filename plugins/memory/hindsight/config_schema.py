@@ -139,18 +139,5 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             ),
             inline=True,
         ),
-        ProviderField(
-            key="recall_types",
-            label="Recall types",
-            kind=KIND_TEXT,
-            default="observation",
-            description=(
-                "Comma-separated Hindsight fact types for automatic and tool recall. "
-                "Use observation,world,experience for broader evidence."
-            ),
-            placeholder="observation,world,experience",
-            group="Recall",
-            inline=True,
-        ),
     ),
 )
