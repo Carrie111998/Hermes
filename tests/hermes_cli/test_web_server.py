@@ -476,6 +476,84 @@ class TestWebServerEndpoints:
             "sidebar-stale"
         ]
 
+    def test_profiles_sidebar_scopes_every_slice_to_selected_profile(self):
+        from hermes_cli.profiles import create_profile
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        work_home = create_profile("work", no_alias=True, no_skills=True)
+
+        def seed(home, prefix):
+            db = SessionDB(db_path=Path(home) / "state.db")
+            try:
+                for suffix, source in (
+                    ("recent", "desktop"),
+                    ("cron", "cron"),
+                    ("message", "telegram"),
+                ):
+                    session_id = f"{prefix}-{suffix}"
+                    db.create_session(session_id, source=source)
+                    db.append_message(session_id, "user", "hello")
+            finally:
+                db.close()
+
+        seed(get_hermes_home(), "default")
+        seed(work_home, "work")
+
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=work"
+            "&recents_exclude=cron,telegram"
+            "&messaging_exclude=cron,desktop"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert [row["id"] for row in payload["recents"]["sessions"]] == [
+            "work-recent"
+        ]
+        assert [row["id"] for row in payload["cron"]["sessions"]] == [
+            "work-cron"
+        ]
+        assert [row["id"] for row in payload["messaging"]["sessions"]] == [
+            "work-message"
+        ]
+
+        default_payload = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=default"
+            "&recents_exclude=cron,telegram"
+            "&messaging_exclude=cron,desktop"
+        ).json()
+        assert [row["id"] for row in default_payload["recents"]["sessions"]] == [
+            "default-recent"
+        ]
+        assert [row["id"] for row in default_payload["cron"]["sessions"]] == [
+            "default-cron"
+        ]
+        assert [row["id"] for row in default_payload["messaging"]["sessions"]] == [
+            "default-message"
+        ]
+
+        all_payload = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all"
+            "&recents_exclude=cron,telegram"
+            "&messaging_exclude=cron,desktop"
+        ).json()
+        assert {row["id"] for row in all_payload["recents"]["sessions"]} == {
+            "default-recent",
+            "work-recent",
+        }
+        assert {row["id"] for row in all_payload["cron"]["sessions"]} == {
+            "default-cron",
+            "work-cron",
+        }
+        assert {row["id"] for row in all_payload["messaging"]["sessions"]} == {
+            "default-message",
+            "work-message",
+        }
+
     def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
         """A probe failure reconciliation can't cure must not retry forever.
 
