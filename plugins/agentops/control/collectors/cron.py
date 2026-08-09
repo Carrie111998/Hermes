@@ -61,7 +61,7 @@ class CronCollector:
             raise ValueError("duplicate cron assertion id")
         self.review_pack = review_pack if review_pack is not None else load_review_pack()
         self._caller_required_ids = configured
-        self.required_assertion_ids = configured | {"cron_business_assertion_fresh"}
+        self.required_assertion_ids = configured | self.review_pack.cron_mandatory_assertion_ids
         self.max_assertions = max_assertions
         self.max_bytes = max_bytes
         self.min_interval_seconds = min_interval_seconds

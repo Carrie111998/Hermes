@@ -71,10 +71,9 @@ def collect_all(
             _worker_slots += 1
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
         future = executor.submit(collector.collect, target, cursor)
+        slot_released = False
         try:
-            batch = future.result(timeout=deadline_seconds)
-            with _detached_lock:
-                _worker_slots = max(0, _worker_slots - 1)
+            batch = future.result(timeout=min(deadline_seconds, float(getattr(collector, "deadline_seconds", deadline_seconds))))
             if not isinstance(batch, CollectionBatch) or batch.target_id != target.target_id:
                 raise ValueError("invalid collection batch")
             unique_signals = tuple(signal for signal in batch.signals if signal.signal_id not in known_signal_ids)
@@ -90,6 +89,9 @@ def collect_all(
                     source_id=batch.source_id,
                     observation_id=batch.observation_id,
                 )
+            with _detached_lock:
+                _worker_slots = max(0, _worker_slots - 1)
+            slot_released = True
         except (FutureTimeout, TimeoutError):
             future.cancel()
             with _detached_lock:
@@ -102,8 +104,9 @@ def collect_all(
             future.add_done_callback(_release)
             batch = failed_batch(target, name, "collector_timeout", source_id=source_id, worker_detached=True)
         except Exception:
-            with _detached_lock:
-                _worker_slots = max(0, _worker_slots - 1)
+            if not slot_released:
+                with _detached_lock:
+                    _worker_slots = max(0, _worker_slots - 1)
             batch = failed_batch(target, name, "collector_failed", source_id=source_id)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)

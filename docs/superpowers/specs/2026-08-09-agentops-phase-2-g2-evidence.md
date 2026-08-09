@@ -37,6 +37,7 @@ not a G2 approval claim; independent Sol review remains required.
 | G2 second-round full-record gate | Every persisted string is redacted/rescanned; cron execution and mandatory assertion freshness/authority are fail-closed | `test_all_persisted_record_strings_are_redacted_and_occurrences_cursors_are_monotonic`, `test_cron_unknown_mandatory_and_stale_execution_are_unhealthy` |
 | G2 second-round delivery/order | Bridge claims in-flight events exactly once; cursor and occurrence updates are monotonic; timeout lifecycle is explicit | `test_bridge_concurrent_drain_claims_each_event_once`, `test_asset_binding_deadline_and_snapshot_deep_freeze` |
 | G2 release blockers | Complete sqlite object preflight, per-collection Cron reload, strict source cursor ordering, bootstrap identity/label binding, executable Review Pack factory, and bounded detached workers | `test_store_rejects_legacy_trigger_object_before_migration`, `test_cron_file_is_reparsed_and_duplicate_names_rejected`, `test_process_zero_match_and_launchd_label_mismatch_are_unhealthy`, `test_review_pack_factory_applies_runtime_target_and_budget` |
+| Final counterexamples | Manifest Cron mandatory IDs are authoritative; Cron factory defaults/attaches deadline; worker slots are atomically reserved; bootstrap fleet explicitly marks Process observation disabled until trusted fingerprints are registered | `test_cron_execution_json_max_age_is_enforced`, `test_cursor_truncate_reset_and_cross_source_independence`, `test_legacy_v1_secret_is_rejected_before_migration` |
 | P2 deep freeze/interpreter parity | Recursive immutable mappings detach snapshot/signal data; separate Python 3.14 environment contains dependencies | `test_asset_binding_deadline_and_snapshot_deep_freeze`; Python 3.14 command below |
 
 ## Fresh verification output
@@ -46,7 +47,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-114 passed in 3.53s
+116 passed in 3.57s
 ```
 
 ```bash
@@ -54,7 +55,7 @@ not a G2 approval claim; independent Sol review remains required.
 ```
 
 ```text
-114 passed in 6.26s
+116 passed in 6.33s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -66,7 +67,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.43s
+122 passed in 2.36s
 ```
 
 ```text
@@ -90,5 +91,8 @@ python 3.14 compileall: PASS
   continues. Phase 2 collectors contain no target-write primitive.
 - Git dirty state remains `unknown`; the collector only reads direct Git
   metadata and refuses to infer a clean worktree.
+- Bootstrap fleet ProcessCollector is explicitly disabled because no trusted
+  per-profile command fingerprint asset is available in Phase 2; coverage must
+  report this limitation rather than fabricate a binding.
 - G2 still requires independent security/architecture review. No conclusion in
   this document authorizes merge, push or Phase 3.
