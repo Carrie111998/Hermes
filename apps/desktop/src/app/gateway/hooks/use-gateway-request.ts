@@ -3,9 +3,10 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
+import { resolveConnectionMode, withConnectionMode } from '@/lib/connection-mode'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $gatewayState, setConnection } from '@/store/session'
+import { $connection, $gatewayState, setConnection } from '@/store/session'
 
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
@@ -104,12 +105,18 @@ export function useGatewayRequest() {
   }, [])
 
   const requestGateway = useCallback(
-    async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
+    async <T>(method: string, rawParams: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
       const gateway = gatewayRef.current
 
       if (!gateway) {
         throw new Error('Hermes gateway unavailable')
       }
+
+      // Announce the live connection mode on session/prompt RPCs (#82140).
+      // Read here, per request, so a connection or profile switch reaches the
+      // backend on the very next turn — $connection is kept in lockstep with
+      // the active profile by syncConnectionToActiveProfile.
+      const params = withConnectionMode(method, rawParams, resolveConnectionMode($connection.get()))
 
       try {
         return await gateway.request<T>(method, params, timeoutMs, signal)

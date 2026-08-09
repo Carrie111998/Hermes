@@ -1,6 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesConnection } from '@/global'
 import { dispatchPluginNativeNotification } from '@/store/native-notifications'
+import { $connection, setConnection } from '@/store/session'
 
 import { createPluginContext } from './plugin'
 
@@ -58,5 +60,62 @@ describe('createPluginContext.os', () => {
     } finally {
       delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
     }
+  })
+})
+
+describe('createPluginContext.connection', () => {
+  afterEach(() => {
+    setConnection(null)
+  })
+
+  const conn = (mode?: 'local' | 'remote') =>
+    ({ baseUrl: 'http://127.0.0.1:8787', mode, token: 'secret' }) as unknown as HermesConnection
+
+  it('reports the live mode without exposing the descriptor', () => {
+    setConnection(conn('remote'))
+    const ctx = createPluginContext('demo')
+
+    expect(ctx.connection.mode()).toBe('remote')
+    // The whole door is two functions — there is no descriptor to reach past.
+    expect(Object.keys(ctx.connection).sort()).toEqual(['mode', 'onModeChange'])
+  })
+
+  it('reports null before a connection resolves', () => {
+    expect(createPluginContext('demo').connection.mode()).toBeNull()
+  })
+
+  it('fires immediately and on every real transition', () => {
+    setConnection(conn('local'))
+    const seen: Array<'local' | 'remote' | null> = []
+    createPluginContext('demo').connection.onModeChange(mode => seen.push(mode))
+
+    setConnection(conn('remote'))
+    setConnection(null)
+
+    expect(seen).toEqual(['local', 'remote', null])
+  })
+
+  it('stays quiet when a descriptor refresh does not move the mode', () => {
+    setConnection(conn('remote'))
+    const listener = vi.fn()
+    createPluginContext('demo').connection.onModeChange(listener)
+
+    // A reconnect re-mints the descriptor (new token/wsUrl) on the same mode.
+    setConnection({ ...conn('remote'), token: 'rotated' } as unknown as HermesConnection)
+
+    expect(listener).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops listening when the plugin unloads, even if the disposer is ignored', () => {
+    setConnection(conn('local'))
+    const disposers: Array<() => void> = []
+    const listener = vi.fn()
+    createPluginContext('demo', dispose => disposers.push(dispose)).connection.onModeChange(listener)
+
+    disposers.forEach(dispose => dispose())
+    setConnection(conn('remote'))
+
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect($connection.get()?.mode).toBe('remote')
   })
 })

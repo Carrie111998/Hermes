@@ -523,7 +523,9 @@ export { Textarea } from '@/components/ui/textarea'
 export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 export type { GatewayEventListener } from '@/contrib/events'
 export type {
+  HermesConnectionMode,
   HermesPlugin,
+  PluginConnection,
   PluginContext,
   PluginContribution,
   PluginNativeNotificationInput,
