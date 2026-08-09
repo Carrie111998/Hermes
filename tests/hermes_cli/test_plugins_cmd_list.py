@@ -91,7 +91,7 @@ def test_cmd_list_plain_compact_output(monkeypatch, capsys):
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "enabled") for entry in entries],
     )
     plugins_cmd.cmd_list(_args(plain=True, no_bundled=True))
@@ -109,7 +109,7 @@ def test_cmd_list_json_preserves_name_and_adds_canonical_key(monkeypatch, capsys
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "enabled") for entry in entries],
     )
     plugins_cmd.cmd_list(_args(json=True))
@@ -126,7 +126,7 @@ def test_cmd_list_plain_disambiguates_duplicate_manifest_names(monkeypatch, caps
     ]
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "enabled") for entry in entries],
     )
     plugins_cmd.cmd_list(_args(plain=True))
@@ -136,7 +136,7 @@ def test_cmd_list_plain_disambiguates_duplicate_manifest_names(monkeypatch, caps
     assert "xai [video_gen/xai]" in out
 
 
-def test_cmd_list_uses_active_bundled_winner_over_inactive_user_copy(
+def test_cmd_list_keeps_inactive_user_override_actionable(
     monkeypatch,
     capsys,
 ):
@@ -172,8 +172,8 @@ def test_cmd_list_uses_active_bundled_winner_over_inactive_user_copy(
     plugins_cmd.cmd_list(_args(json=True))
 
     payload = json.loads(capsys.readouterr().out)
-    assert [(row["name"], row["source"]) for row in payload] == [
-        ("bundled-shared", "bundled")
+    assert [(row["name"], row["source"], row["status"]) for row in payload] == [
+        ("user-shared", "user", "not enabled")
     ]
 
 
@@ -201,6 +201,9 @@ def test_display_records_preserve_group_deny_and_list_uses_it(
         (candidates[1], "disabled")
     ]
     assert plugins_cmd._discover_plugin_display_entries() == [candidates[1]]
+    assert plugins_cmd._discover_plugin_management_records() == [
+        (candidates[1], "disabled")
+    ]
 
     plugins_cmd.cmd_list(_args(json=True))
     payload = json.loads(capsys.readouterr().out)
@@ -217,7 +220,7 @@ def test_display_records_preserve_group_deny_and_list_uses_it(
     assert json.loads(capsys.readouterr().out) == []
 
 
-def test_cmd_toggle_uses_enabled_winner_not_inactive_project_shadow(
+def test_cmd_toggle_keeps_inactive_project_override_actionable(
     monkeypatch,
 ):
     candidates = _PORTABLE_SHADOW_CANDIDATES
@@ -261,9 +264,9 @@ def test_cmd_toggle_uses_enabled_winner_not_inactive_project_shadow(
     plugins_cmd.cmd_toggle()
 
     assert captured["keys"] == ["shared"]
-    assert captured["selected"] == {0}
-    assert "portable-user" in captured["labels"][0]
-    assert "project-shadow" not in captured["labels"][0]
+    assert captured["selected"] == set()
+    assert "project-shadow" in captured["labels"][0]
+    assert "portable-user" not in captured["labels"][0]
 
 
 def test_composite_toggle_enable_clears_same_key_legacy_deny(monkeypatch):

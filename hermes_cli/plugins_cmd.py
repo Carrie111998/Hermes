@@ -1394,6 +1394,60 @@ def _discover_plugin_display_records(
     )
 
 
+def _select_plugin_management_entries(entries: list) -> list:
+    """Select the highest-precedence installed target for each key."""
+    management_by_key: dict[str, tuple] = {}
+    for entry in entries:
+        source = entry[3]
+        key = entry[5]
+        if key in management_by_key and source == "bundled":
+            continue
+        management_by_key[key] = entry
+    return list(management_by_key.values())
+
+
+def _select_plugin_management_records(
+    entries: list,
+    activation: PluginActivationState,
+) -> list:
+    """Keep the installed management target while reporting runtime truth."""
+    management_entries = _select_plugin_management_entries(entries)
+
+    runtime_by_key = {
+        entry[5]: (entry, status)
+        for entry, status in _select_plugin_display_records(entries, activation)
+    }
+    records = []
+    for entry in management_entries:
+        key = entry[5]
+        runtime_entry, group_status = runtime_by_key.get(
+            key,
+            (None, "not enabled"),
+        )
+        if group_status == "disabled":
+            status = "disabled"
+        elif group_status == "enabled" and entry == runtime_entry:
+            status = "enabled"
+        else:
+            status = "not enabled"
+        records.append((entry, status))
+    return records
+
+
+def _discover_plugin_management_records(
+    activation: PluginActivationState | None = None,
+) -> list:
+    """Return actionable installed rows with their effective runtime status."""
+    if activation is None:
+        from hermes_cli.config import load_plugin_activation_state
+
+        activation = load_plugin_activation_state()
+    return _select_plugin_management_records(
+        _discover_plugin_candidates(),
+        activation,
+    )
+
+
 def _discover_all_plugins() -> list:
     """Return side-effect-free metadata for every effective raw plugin.
 
@@ -1401,14 +1455,7 @@ def _discover_all_plugins() -> list:
     bundled first, then user, then project, then entry points. Later sources
     override earlier ones on key collision.
     """
-    seen: dict = {}
-    for entry in _discover_plugin_candidates():
-        source = entry[3]
-        key = entry[5]
-        if key in seen and source == "bundled":
-            continue
-        seen[key] = entry
-    return list(seen.values())
+    return _select_plugin_management_entries(_discover_plugin_candidates())
 
 
 def _discover_entrypoint_plugins() -> list[tuple[str, str, str, str]]:
@@ -1484,7 +1531,7 @@ def cmd_list(args: Any | None = None) -> None:
     from rich.table import Table
 
     console = Console()
-    records = _discover_plugin_display_records()
+    records = _discover_plugin_management_records()
     if not records:
         console.print("[dim]No plugins installed.[/dim]")
         console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
@@ -1728,7 +1775,7 @@ def cmd_toggle() -> None:
     console = Console()
 
     # -- General plugins discovery (bundled + user) --
-    records = _discover_plugin_display_records()
+    records = _discover_plugin_management_records()
     disabled_set = _get_disabled_set()
 
     # Track by CANONICAL KEY (``key``), not the manifest name. The loader

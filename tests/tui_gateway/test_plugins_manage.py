@@ -19,7 +19,7 @@ def _call(params):
 def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "enabled") for entry in _ENTRIES],
     )
     rows = _call({"action": "list"})["plugins"]
@@ -31,7 +31,7 @@ def test_plugins_manage_rows_add_key_without_replacing_name(monkeypatch):
 def test_plugins_manage_toggle_targets_key_and_returns_matching_row(monkeypatch):
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "enabled") for entry in _ENTRIES],
     )
     calls = []
@@ -72,7 +72,7 @@ def test_plugins_manage_preserves_resolved_group_deny(monkeypatch):
     )
     monkeypatch.setattr(
         plugins_cmd,
-        "_discover_plugin_display_records",
+        "_discover_plugin_management_records",
         lambda: [(entry, "disabled")],
     )
 

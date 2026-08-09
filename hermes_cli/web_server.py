@@ -16809,17 +16809,19 @@ def _discover_dashboard_runtime_entries() -> list:
 
 
 def _discover_dashboard_plugin_records() -> list:
-    """Discover display winners and resolved status in process-home scope."""
+    """Discover actionable installed rows and status in process-home scope."""
     from hermes_constants import (
         reset_hermes_home_override,
         set_hermes_home_override,
     )
     from hermes_cli.config import load_plugin_activation_state
-    from hermes_cli.plugins_cmd import _discover_plugin_display_records
+    from hermes_cli.plugins_cmd import _discover_plugin_management_records
 
     token = set_hermes_home_override(get_process_hermes_home())
     try:
-        return _discover_plugin_display_records(load_plugin_activation_state())
+        return _discover_plugin_management_records(
+            load_plugin_activation_state()
+        )
     finally:
         reset_hermes_home_override(token)
 

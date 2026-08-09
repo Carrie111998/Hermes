@@ -1811,14 +1811,14 @@ def _(rid, params: dict) -> dict:
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
-            _discover_plugin_display_records,
+            _discover_plugin_management_records,
             _is_portable_plugin_dir,
         )
 
         def _rows():
             out = []
             for entry, status in sorted(
-                _discover_plugin_display_records(),
+                _discover_plugin_management_records(),
                 key=lambda record: (
                     record[0][0],
                     record[0][5],
