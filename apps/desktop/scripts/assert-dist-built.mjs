@@ -11,7 +11,7 @@
 // inherits it. It fails loud and early instead of shipping a broken bundle.
 // See issues #39484 (renderer blank page) and #41327 / #39472 (dashboard 404).
 
-import { existsSync, statSync, readdirSync } from "fs"
+import { existsSync, statSync, readdirSync, readFileSync } from "fs"
 import { join, resolve } from "path"
 import { isMain } from "./utils.mjs"
 
@@ -33,12 +33,44 @@ export function checkDistBuilt(distDir) {
   // index.html alone isn't enough — vite emits hashed JS into dist/assets.
   // An index.html with no script bundle still blank-pages.
   const assetsDir = join(distDir, "assets")
-  const hasAssets =
-    existsSync(assetsDir) &&
-    statSync(assetsDir).isDirectory() &&
-    readdirSync(assetsDir).some(name => name.endsWith(".js"))
-  if (!hasAssets) {
+  let jsFiles = []
+  try {
+    if (existsSync(assetsDir) && statSync(assetsDir).isDirectory()) {
+      jsFiles = readdirSync(assetsDir).filter(name => name.endsWith(".js"))
+    }
+  } catch (err) {
+    return { ok: false, error: `failed reading assets directory at ${assetsDir}: ${err.message}` }
+  }
+
+  if (jsFiles.length === 0) {
     return { ok: false, error: `dist/assets has no built JS bundle (expected vite output under ${assetsDir})` }
+  }
+
+  // Packaging invariant: react-router must not be duplicated across multiple JS chunks (#82696).
+  // When react-router is split across chunks, non-entry chunks get an isolated Router context
+  // causing `useLocation()` to throw "may be used only in the context of a <Router> component".
+  const routerInvariant = "may be used only in the context of a"
+  const chunksWithRouter = jsFiles.filter(name => {
+    try {
+      const content = readFileSync(join(assetsDir, name), "utf8")
+      return content.includes(routerInvariant)
+    } catch {
+      return false
+    }
+  })
+
+  if (chunksWithRouter.length === 0) {
+    return {
+      ok: false,
+      error: `react-router context invariant not found in any JS chunk in dist/assets. Ensure the router invariant string is present in the built bundle (#82696)`
+    }
+  }
+
+  if (chunksWithRouter.length > 1) {
+    return {
+      ok: false,
+      error: `react-router context invariant emitted into ${chunksWithRouter.length} separate chunks (${chunksWithRouter.join(", ")}). Ensure react-router is in vendor-react and resolve.dedupe in vite.config.ts (#82696)`
+    }
   }
 
   return { ok: true }

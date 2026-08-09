@@ -18,7 +18,11 @@ test('checkDistBuilt passes when index.html + an assets JS bundle exist', () => 
   const { tempRoot, distDir } = makeDist(d => {
     fs.writeFileSync(path.join(d, 'index.html'), '<!doctype html><div id=root></div>', 'utf8')
     fs.mkdirSync(path.join(d, 'assets'))
-    fs.writeFileSync(path.join(d, 'assets', 'index-abc123.js'), 'console.log(1)', 'utf8')
+    fs.writeFileSync(
+      path.join(d, 'assets', 'index-abc123.js'),
+      'function useLocation(){ throw new Error("may be used only in the context of a <Router> component") }',
+      'utf8'
+    )
   })
   try {
     assert.deepEqual(checkDistBuilt(distDir), { ok: true })
@@ -82,3 +86,64 @@ test('checkDistBuilt fails when assets/ has no JS bundle', () => {
     fs.rmSync(tempRoot, { recursive: true, force: true })
   }
 })
+
+test('checkDistBuilt passes when react-router invariant is in exactly one JS bundle', () => {
+  const { tempRoot, distDir } = makeDist(d => {
+    fs.writeFileSync(path.join(d, 'index.html'), '<!doctype html><div id=root></div>', 'utf8')
+    fs.mkdirSync(path.join(d, 'assets'))
+    fs.writeFileSync(
+      path.join(d, 'assets', 'vendor-react-123.js'),
+      'function useLocation(){ throw new Error("may be used only in the context of a <Router> component") }',
+      'utf8'
+    )
+    fs.writeFileSync(path.join(d, 'assets', 'command-456.js'), 'console.log("command")', 'utf8')
+  })
+  try {
+    assert.deepEqual(checkDistBuilt(distDir), { ok: true })
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('checkDistBuilt fails when react-router invariant is emitted into multiple JS chunks', () => {
+  const { tempRoot, distDir } = makeDist(d => {
+    fs.writeFileSync(path.join(d, 'index.html'), '<!doctype html><div id=root></div>', 'utf8')
+    fs.mkdirSync(path.join(d, 'assets'))
+    fs.writeFileSync(
+      path.join(d, 'assets', 'index-123.js'),
+      'function useLocation(){ throw new Error("may be used only in the context of a <Router> component") }',
+      'utf8'
+    )
+    fs.writeFileSync(
+      path.join(d, 'assets', 'command-456.js'),
+      'function useLocation(){ throw new Error("may be used only in the context of a <Router> component") }',
+      'utf8'
+    )
+  })
+  try {
+    const result = checkDistBuilt(distDir)
+    assert.equal(result.ok, false)
+    assert.match(result.error, /react-router context invariant emitted into 2 separate chunks/)
+    assert.match(result.error, /command-456\.js/)
+    assert.match(result.error, /index-123\.js/)
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+test('checkDistBuilt fails when react-router context invariant is missing from JS bundles', () => {
+  const { tempRoot, distDir } = makeDist(d => {
+    fs.writeFileSync(path.join(d, 'index.html'), '<!doctype html><div id=root></div>', 'utf8')
+    fs.mkdirSync(path.join(d, 'assets'))
+    fs.writeFileSync(path.join(d, 'assets', 'index-abc123.js'), 'console.log(1)', 'utf8')
+  })
+  try {
+    const result = checkDistBuilt(distDir)
+    assert.equal(result.ok, false)
+    assert.match(result.error, /react-router context invariant not found in any JS chunk/)
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true })
+  }
+})
+
+
