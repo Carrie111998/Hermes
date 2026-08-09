@@ -206,6 +206,7 @@ jobs:
       # upload.
       - name: Build and package
         shell: bash
+        timeout-minutes: 60
         env:
           HERMES_BUNDLE_TAG: ${{ env.HERMES_PAYLOAD_TAG }}
           # macOS signing and notarization. Forks do not have the secrets.
