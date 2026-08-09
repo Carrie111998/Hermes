@@ -5911,8 +5911,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        chat_id = (body.get("chat_id") or "").strip()
-        message = (body.get("message") or "").strip()
+        raw_chat_id = body.get("chat_id")
+        raw_message = body.get("message")
+
+        if raw_chat_id is None or raw_message is None:
+            return web.json_response(
+                {"success": False, "error": "chat_id and message are required"},
+                status=400,
+            )
+        if not isinstance(raw_chat_id, str) or not isinstance(raw_message, str):
+            return web.json_response(
+                {"success": False, "error": "chat_id and message must be strings"},
+                status=400,
+            )
+
+        chat_id = raw_chat_id.strip()
+        message = raw_message.strip()
 
         if not chat_id or not message:
             return web.json_response(

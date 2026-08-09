@@ -135,6 +135,36 @@ class TestChatIdValidation:
         assert "required" in body["error"].lower()
 
     @pytest.mark.asyncio
+    async def test_non_string_chat_id_returns_400(self):
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/weixin/send",
+                json={"chat_id": 123, "message": "hi"},
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert "string" in body["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_non_string_message_returns_400(self):
+        adapter = _make_adapter()
+        app = _create_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/weixin/send",
+                json={"chat_id": "user@im.wechat", "message": ["a"]},
+            )
+            body = await resp.json()
+
+        assert resp.status == 400
+        assert "string" in body["error"].lower()
+
+    @pytest.mark.asyncio
     async def test_invalid_chat_id_format_no_at_suffix(self):
         adapter = _make_adapter()
         app = _create_app(adapter)
