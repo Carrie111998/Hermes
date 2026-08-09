@@ -7,7 +7,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
-import { closeHud } from '@/store/hud'
+import { $hudWindowContext, closeHud, startHudWindowContextTracking } from '@/store/hud'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { $busy, $messages } from '@/store/session'
 
@@ -180,6 +180,10 @@ export function HudShell() {
   const { t } = useI18n()
   const [recent, holdBand] = useRecentActivity()
   const held = useHudHeld()
+  const windowContext = useStore($hudWindowContext)
+  const windowContextLabel = [windowContext?.app, windowContext?.title].filter(Boolean).join(' — ')
+
+  useEffect(() => startHudWindowContextTracking(), [])
 
   // Clicking away to another APP is the most common way the HUD is let go of,
   // and it fires no focusout: the composer stays document.activeElement while
@@ -377,6 +381,12 @@ export function HudShell() {
       <div aria-hidden data-hud-glass />
 
       <WiredPane part="chatRoutes" />
+
+      {windowContextLabel ? (
+        <div aria-live="polite" data-hud-context role="status">
+          {windowContextLabel}
+        </div>
+      ) : null}
 
       {/* The way back — without it the only exits are ⌘⇧H and ⌘W, both
           invisible. Placed and revealed entirely from styles.css. */}

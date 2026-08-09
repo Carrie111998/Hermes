@@ -13,6 +13,26 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _hud_window_context(params: dict) -> dict | None:
+    """Validate the metadata-only HUD window identity at the client boundary."""
+    if params.get("surface") != "hud":
+        return None
+    raw = params.get("window_context")
+    if not isinstance(raw, dict):
+        return None
+
+    def clean(value, limit: int) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(value.split())[:limit]
+
+    context = {
+        "app": clean(raw.get("app"), 120),
+        "title": clean(raw.get("title"), 240),
+    }
+    return context if context["app"] or context["title"] else None
+
+
 def _pending_reaction_notes(session: dict) -> str:
     """Note block describing reactions the user added since the last turn, or "".
 
@@ -117,7 +137,10 @@ def _(rid, params: dict) -> dict:
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
+    from tui_gateway.methods_prompt import _hud_window_context
+
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    session["client_window_context"] = _hud_window_context(params)
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise

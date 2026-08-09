@@ -18,7 +18,7 @@ import {
   type ComposerAttachment,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
-import { $hudMode } from '@/store/hud'
+import { $hudMode, $hudWindowContext } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import {
@@ -615,15 +615,21 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
         rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
+        const hudMode = $hudMode.get()
+        const hudWindowContext = hudMode ? $hudWindowContext.get() : null
 
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
           ...(interrupted && { interrupted }),
           // Typed into the floating HUD, so the user is looking at another app
-          // rather than at Hermes. The gateway turns this into a per-turn hint
-          // to read the window underneath and work in it.
-          ...($hudMode.get() && { surface: 'hud' }),
+          // rather than at Hermes. Carry the live metadata-only app/title into
+          // this turn; the gateway keeps it out of persisted user text and the
+          // byte-stable system prompt.
+          ...(hudMode && {
+            surface: 'hud',
+            ...(hudWindowContext && { window_context: hudWindowContext })
+          }),
           // A queue drain is a "run after" message, never a live-turn
           // correction. The flag tells the gateway's busy path to hold it for
           // the next turn untouched — without it, losing the settle race

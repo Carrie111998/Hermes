@@ -1692,6 +1692,8 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
+        "client_surface": session.get("client_surface") or "",
+        "client_window_context": session.get("client_window_context"),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
@@ -7482,6 +7484,10 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
+    if session.get("client_surface"):
+        queued["client_surface"] = session["client_surface"]
+    if session.get("client_window_context") is not None:
+        queued["client_window_context"] = session["client_window_context"]
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7492,6 +7498,8 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        and existing.get("client_surface", "") == queued.get("client_surface", "")
+        and existing.get("client_window_context") == queued.get("client_window_context")
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -7640,6 +7648,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+        # Surface metadata belongs to the queued user turn, not to whichever
+        # window happened to submit most recently while it was waiting.
+        session["client_surface"] = queued.get("client_surface") or ""
+        session["client_window_context"] = queued.get("client_window_context")
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -9524,7 +9536,10 @@ def _hud_surface_note(session: dict) -> str:
         return ""
     from agent.prompt_builder import hud_surface_note
 
-    return hud_surface_note(getattr(session.get("agent"), "valid_tool_names", None))
+    return hud_surface_note(
+        getattr(session.get("agent"), "valid_tool_names", None),
+        session.get("client_window_context"),
+    )
 
 
 def _prepend_note(run_message: Any, note: str) -> Any:

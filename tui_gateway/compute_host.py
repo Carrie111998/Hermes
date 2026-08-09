@@ -528,6 +528,8 @@ class ComputeHost:
         session = server._sessions.get(sid)
         if session is not None:
             session["transport"] = self._transport
+            session["client_surface"] = str(frame.get("client_surface") or "")
+            session["client_window_context"] = frame.get("client_window_context")
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
             if frame.get("cwd"):
@@ -630,6 +632,8 @@ class ComputeHost:
             }
         session = server._sessions[sid]
         session["transport"] = self._transport
+        session["client_surface"] = str(frame.get("client_surface") or "")
+        session["client_window_context"] = frame.get("client_window_context")
         session["profile_home"] = profile_home or session.get("profile_home")
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])

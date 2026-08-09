@@ -8,7 +8,7 @@ import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
-import { $hudMode } from '@/store/hud'
+import { $hudMode, $hudWindowContext } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
 import {
   $busy,
@@ -331,11 +331,13 @@ describe('usePromptActions HUD surface', () => {
   afterEach(() => {
     cleanup()
     $hudMode.set(false)
+    $hudWindowContext.set(null)
     vi.restoreAllMocks()
   })
 
   async function submitFrom(window: 'app' | 'hud') {
     $hudMode.set(window === 'hud')
+    $hudWindowContext.set(window === 'hud' ? { app: 'Visual Studio Code', title: 'main.ts' } : null)
 
     const submitted: (Record<string, unknown> | undefined)[] = []
 
@@ -358,11 +360,15 @@ describe('usePromptActions HUD surface', () => {
   }
 
   it('tags a message typed into the HUD', async () => {
-    expect(await submitFrom('hud')).toMatchObject({ surface: 'hud' })
+    expect(await submitFrom('hud')).toMatchObject({
+      surface: 'hud',
+      window_context: { app: 'Visual Studio Code', title: 'main.ts' }
+    })
   })
 
   it('says nothing about the surface from the app window', async () => {
     expect(await submitFrom('app')).not.toHaveProperty('surface')
+    expect(await submitFrom('app')).not.toHaveProperty('window_context')
   })
 })
 
