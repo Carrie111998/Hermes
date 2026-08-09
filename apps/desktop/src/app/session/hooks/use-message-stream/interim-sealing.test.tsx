@@ -65,6 +65,24 @@ const complete = (text: string) =>
 const completePreviewed = (text: string) =>
   act(() => handleEvent!({ payload: { text, response_previewed: true }, session_id: SID, type: 'message.complete' }))
 
+const toolStart = (toolId = 'tool-1', name = 'terminal') =>
+  act(() =>
+    handleEvent!({
+      payload: { name, tool_id: toolId },
+      session_id: SID,
+      type: 'tool.start'
+    })
+  )
+
+const toolComplete = (toolId = 'tool-1', name = 'terminal') =>
+  act(() =>
+    handleEvent!({
+      payload: { name, tool_id: toolId },
+      session_id: SID,
+      type: 'tool.complete'
+    })
+  )
+
 function getState(): ClientSessionState {
   return sessionStates.get(SID) ?? createClientSessionState()
 }
@@ -200,6 +218,31 @@ describe('useMessageStream interim text sealing', () => {
 
     const texts = assistantMessages()
     expect(texts.filter(t => t === 'same reply')).toHaveLength(1)
+  })
+
+  it('settles identical final after real tool.start/tool.complete without double-bubble (JohnZhong #76191)', async () => {
+    await mountStream()
+    await start()
+
+    // Exact gateway sequence reported against main / older heads:
+    // message.start → message.interim → tool.start → tool.complete → message.complete
+    // The tool-reseed path must not mint a second assistant bubble for the same reply.
+    await interim('same reply')
+    await toolStart('tool-reseed-1', 'terminal')
+    await toolComplete('tool-reseed-1', 'terminal')
+    await complete('same reply')
+
+    const texts = assistantMessages()
+    expect(texts.filter(t => t === 'same reply')).toHaveLength(1)
+
+    const assistants = getState().messages.filter(m => m.role === 'assistant' && !m.hidden)
+    const reply = assistants.find(m => chatMessageText(m) === 'same reply')
+    expect(reply).toBeTruthy()
+    // Tool events should have attached a tool-call part on the settled row.
+    const partTypes = (reply?.parts ?? []).map(part => part.type)
+    expect(partTypes).toContain('tool-call')
+    expect(partTypes).toContain('text')
+    expect(reply?.interim).not.toBe(true)
   })
 
   it('settles a prefix-extended final onto a non-previewed interim (streamed + trailing delta)', async () => {
