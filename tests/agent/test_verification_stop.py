@@ -61,6 +61,27 @@ def test_verify_on_stop_env_can_enable(clear_verify_env):
     assert verify_on_stop_enabled({"agent": {}}) is True
 
 
+def test_verify_on_stop_auto_off_for_explicit_cron_platform(clear_verify_env):
+    # Cron is an unattended automation surface. Its job-owned state writes must
+    # not be mistaken for interactive coding edits when ambient context is absent.
+    assert verify_on_stop_enabled(
+        {"agent": {"verify_on_stop": "auto"}}, platform="cron"
+    ) is False
+
+
+def test_verify_on_stop_explicit_enable_wins_on_cron(clear_verify_env):
+    assert verify_on_stop_enabled(
+        {"agent": {"verify_on_stop": True}}, platform="cron"
+    ) is True
+
+
+def test_verify_on_stop_env_enable_wins_on_cron(clear_verify_env):
+    clear_verify_env.setenv("HERMES_VERIFY_ON_STOP", "1")
+    assert verify_on_stop_enabled(
+        {"agent": {"verify_on_stop": False}}, platform="cron"
+    ) is True
+
+
 
 
 

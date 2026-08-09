@@ -92,7 +92,11 @@ def _session_is_messaging_surface() -> bool:
         return False
 
 
-def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
+def verify_on_stop_enabled(
+    config: dict[str, Any] | None = None,
+    *,
+    platform: str | None = None,
+) -> bool:
     """Return whether edit -> verify-before-finish behavior is enabled.
 
     Precedence: an explicit ``HERMES_VERIFY_ON_STOP`` env var wins, then an
@@ -101,8 +105,10 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     coding surfaces (CLI, TUI, desktop) and programmatic callers, OFF for
     conversational messaging surfaces (Telegram, Discord, etc.) where the
     verification narrative would reach a human as chat noise. An explicit
-    bool forces the behavior in either direction. A missing or unrecognized
-    value falls back to the surface-aware ``"auto"`` default.
+    bool forces the behavior in either direction. In automatic mode, the
+    authoritative agent platform disables this interactive coding guard for
+    unattended cron turns. A missing or unrecognized value falls back to the
+    surface-aware ``"auto"`` default.
     """
     env = os.environ.get("HERMES_VERIFY_ON_STOP")
     if env is not None:
@@ -118,6 +124,10 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
     cfg_val = agent_cfg.get("verify_on_stop") if isinstance(agent_cfg, dict) else None
     if isinstance(cfg_val, bool):
         return cfg_val
+    auto_enabled = (
+        str(platform or "").strip().lower() != "cron"
+        and not _session_is_messaging_surface()
+    )
     if isinstance(cfg_val, str):
         token = cfg_val.strip().lower()
         if token in {"1", "true", "yes", "on"}:
@@ -125,9 +135,9 @@ def verify_on_stop_enabled(config: dict[str, Any] | None = None) -> bool:
         if token in {"0", "false", "no", "off"}:
             return False
         if token == "auto":
-            return not _session_is_messaging_surface()
+            return auto_enabled
     # Missing or unrecognized value -> surface-aware "auto" default.
-    return not _session_is_messaging_surface()
+    return auto_enabled
 
 
 def _candidate_cwds(paths: Iterable[str]) -> list[Path]:

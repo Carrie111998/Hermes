@@ -80,6 +80,39 @@ def test_verify_on_stop_preserves_composed_report_at_budget_limit(agent, monkeyp
     assert not result["messages"][1].get("_verification_stop_synthetic")
 
 
+def test_cron_auto_skips_verify_on_stop_when_ambient_context_is_absent(
+    agent, monkeypatch
+):
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"state.json"}
+        return _response("cron alert")
+
+    agent.platform = "cron"
+    agent._interruptible_api_call = model_call
+    monkeypatch.delenv("HERMES_VERIFY_ON_STOP", raising=False)
+
+    with (
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"agent": {"verify_on_stop": "auto"}},
+        ),
+        patch(
+            "agent.verification_stop._session_is_messaging_surface",
+            return_value=False,
+        ),
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            return_value="verify it",
+        ) as build_nudge,
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("inspect scheduled work")
+
+    assert result["final_response"] == "cron alert"
+    assert result["completed"] is True
+    build_nudge.assert_not_called()
+
+
 def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch):
     def model_call(_api_kwargs):
         agent._turn_file_mutation_paths = {"changed.py"}
