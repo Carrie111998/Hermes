@@ -4726,6 +4726,27 @@ def _launchd_fallback_to_detached(reason: str, *, exit_on_failure: bool = True) 
     return False
 
 
+def _launchd_log_redirection_xml(hermes_home: str, log_dir: Path) -> str:
+    """Return launchd stdout/stderr keys only when their targets are safe.
+
+    macOS may deny ``xpcproxy`` access to log files on an external volume,
+    preventing an otherwise valid LaunchAgent from starting. Hermes already
+    writes its application logs under ``HERMES_HOME/logs``, so launchd-level
+    redirection is optional for homes resolved beneath ``/Volumes``.
+    """
+    external_root = Path("/Volumes")
+    resolved_home = Path(hermes_home).resolve()
+    if resolved_home == external_root or external_root in resolved_home.parents:
+        return ""
+    return f"""
+    <key>StandardOutPath</key>
+    <string>{log_dir}/gateway.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/gateway.error.log</string>
+"""
+
+
 def generate_launchd_plist() -> str:
     # Stable cwd anchor — never the volatile source checkout. See
     # _stable_service_working_dir() for the rationale (same rot risk applies
@@ -4764,6 +4785,7 @@ def generate_launchd_plist() -> str:
         )
     ]
     prog_args_xml = "\n        ".join(prog_args)
+    log_redirection_xml = _launchd_log_redirection_xml(hermes_home, log_dir)
 
     # Persist the configured RLIMIT_NOFILE floor into the service definition
     # itself. launchd starts children with a soft limit of 256 by default;
@@ -4834,12 +4856,7 @@ def generate_launchd_plist() -> str:
     <key>ExitTimeOut</key>
     <integer>25</integer>
 {nofile_block}
-    <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
-    
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
-</dict>
+{log_redirection_xml}</dict>
 </plist>
 """
 

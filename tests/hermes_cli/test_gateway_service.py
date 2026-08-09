@@ -262,6 +262,19 @@ class TestGeneratedSystemdUnits:
 
         assert "SoftResourceLimits" not in plist
 
+    def test_launchd_plist_omits_log_redirection_for_external_volume_home(self, monkeypatch):
+        """External HERMES_HOME must not make xpcproxy open log files on /Volumes."""
+        external_home = Path("/Volumes/ExternalSSD/Hermes")
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: external_home)
+        monkeypatch.setattr(gateway_cli.Path, "mkdir", lambda self, *a, **k: None)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>StandardOutPath</key>" not in plist
+        assert "<key>StandardErrorPath</key>" not in plist
+        assert "<key>ThrottleInterval</key>" in plist
+        assert "<key>ExitTimeOut</key>" in plist
+
 
 
 class TestGatewayStopCleanup:
