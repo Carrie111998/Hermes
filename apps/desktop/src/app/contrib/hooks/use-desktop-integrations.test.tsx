@@ -2,6 +2,7 @@ import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { _resetLegacyDiscardForTests } from '@/store/session'
+import type * as WindowsStore from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { useDesktopIntegrations } from './use-desktop-integrations'
@@ -12,7 +13,7 @@ import { useDesktopIntegrations } from './use-desktop-integrations'
 const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
 
 vi.mock('@/store/windows', async importOriginal => {
-  const actual = await importOriginal<typeof import('@/store/windows')>()
+  const actual = await importOriginal<typeof WindowsStore>()
 
   return {
     ...actual,
