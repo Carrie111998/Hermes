@@ -3190,7 +3190,9 @@ def _characterize_codex(
         status["create"] = True
         status["used_registration_turn"] = result.used_registration_turn
         summary = source.find_native_thread(
-            native_id, source_kinds=("vscode", "appServer")
+            native_id,
+            source_kinds=("vscode", "appServer"),
+            state_db_only=True,
         )
         status["discover"] = summary is not None
         if summary is None:

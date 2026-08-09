@@ -3194,6 +3194,33 @@ def test_codex_exact_discovery_can_include_sidebar_and_app_server_threads() -> N
     ]
 
 
+def test_codex_exact_discovery_can_use_the_bounded_state_database() -> None:
+    client = FakeRequestClient({"thread/list": [_codex_inventory()]})
+    source = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    found = source.find_native_thread(
+        CODEX_ID,
+        source_kinds=("vscode", "appServer"),
+        state_db_only=True,
+    )
+
+    assert found is not None and found.native_id == CODEX_ID
+    assert client.calls == [
+        (
+            "thread/list",
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": True,
+                "sourceKinds": ["vscode", "appServer"],
+            },
+            30.0,
+        )
+    ]
+
+
 def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filter() -> (
     None
 ):
