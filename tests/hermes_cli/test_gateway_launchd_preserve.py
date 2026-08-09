@@ -53,12 +53,26 @@ def _customised(plist_text=GENERATED, *, limits=True, env=True):
     return plistlib.dumps(parsed).decode("utf-8")
 
 
+def _generated_with_resource_limits(plist_text=GENERATED, nfiles=10240):
+    """Simulate a template that owns Soft/HardResourceLimits (e.g. #80748)."""
+    parsed = plistlib.loads(plist_text.encode("utf-8"))
+    parsed["SoftResourceLimits"] = {"NumberOfFiles": nfiles}
+    parsed["HardResourceLimits"] = {"NumberOfFiles": nfiles}
+    return plistlib.dumps(parsed).decode("utf-8")
+
+
 class TestLaunchdPlistCustomisations:
     def test_generated_plist_reports_no_customisations(self):
-        assert gateway_cli.launchd_plist_customisations(GENERATED) == ({}, {})
+        # Pass generated= so ownership is evaluated against this fixture, not
+        # whatever the live template happens to emit on main.
+        assert gateway_cli.launchd_plist_customisations(
+            GENERATED, generated=GENERATED
+        ) == ({}, {})
 
     def test_detects_resource_limits_and_extra_env(self):
-        extra_top_level, extra_env = gateway_cli.launchd_plist_customisations(_customised())
+        extra_top_level, extra_env = gateway_cli.launchd_plist_customisations(
+            _customised(), generated=GENERATED
+        )
 
         assert set(extra_top_level) == {"SoftResourceLimits", "HardResourceLimits"}
         assert extra_top_level["SoftResourceLimits"] == {"NumberOfFiles": 4096}
@@ -73,9 +87,19 @@ class TestLaunchdPlistCustomisations:
         # A managed key the operator edited is still managed — regeneration is
         # supposed to update it. Only unrecognised keys are carried across.
         edited = GENERATED.replace("<key>KeepAlive</key>\n    <true/>", "<key>KeepAlive</key>\n    <false/>")
-        extra_top_level, _ = gateway_cli.launchd_plist_customisations(edited)
+        extra_top_level, _ = gateway_cli.launchd_plist_customisations(
+            edited, generated=GENERATED
+        )
 
         assert "KeepAlive" not in extra_top_level
+
+    def test_template_owned_resource_limits_are_not_operator_customisations(self):
+        # #80748 coexistence: once the template emits Soft/HardResourceLimits,
+        # a stock install of that template must not be reported as customised.
+        template = _generated_with_resource_limits()
+        assert gateway_cli.launchd_plist_customisations(
+            template, generated=template
+        ) == ({}, {})
 
 
 class TestMergeLaunchdCustomisations:
@@ -98,6 +122,35 @@ class TestMergeLaunchdCustomisations:
         parsed = plistlib.loads(merged.encode("utf-8"))
 
         assert parsed["EnvironmentVariables"]["PATH"] == "/usr/bin:/bin"
+
+    def test_template_owned_resource_limits_are_not_double_spliced(self):
+        # #80748 coexistence: when the template already emits Soft/HardResourceLimits,
+        # merging a stock installed copy of that template must be a pure noop —
+        # no second SoftResourceLimits block, no "stale forever" drift.
+        template = _generated_with_resource_limits()
+        merged = gateway_cli._merge_launchd_customisations(template, template)
+
+        assert merged == template
+        assert merged.count("<key>SoftResourceLimits</key>") == 1
+        assert merged.count("<key>HardResourceLimits</key>") == 1
+
+    def test_operator_limits_yield_to_template_when_template_owns_them(self):
+        # Once the template owns the limit keys, a hand-raised value is a
+        # managed-key edit (regeneration is supposed to reset it) — not an
+        # operator customisation to carry across. Extra env still survives.
+        template = _generated_with_resource_limits(nfiles=10240)
+        installed = _customised(template, limits=True, env=True)
+        # _customised() overwrites limits to 4096/8192; confirm that.
+        installed_parsed = plistlib.loads(installed.encode("utf-8"))
+        assert installed_parsed["SoftResourceLimits"] == {"NumberOfFiles": 4096}
+
+        merged = gateway_cli._merge_launchd_customisations(template, installed)
+        parsed = plistlib.loads(merged.encode("utf-8"))
+
+        assert parsed["SoftResourceLimits"] == {"NumberOfFiles": 10240}
+        assert parsed["HardResourceLimits"] == {"NumberOfFiles": 10240}
+        assert parsed["EnvironmentVariables"]["HERMES_MEMORY_DAEMON_IDLE_TIMEOUT"] == "900"
+        assert merged.count("<key>SoftResourceLimits</key>") == 1
 
     def test_merge_is_a_noop_without_customisations(self):
         # The overwhelmingly common case must stay byte-identical to the template.

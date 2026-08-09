@@ -4585,9 +4585,15 @@ def generate_launchd_plist() -> str:
 # generate_launchd_plist() emits a fixed template. Anything else an operator
 # put in the installed plist by hand — a raised SoftResourceLimits/NumberOfFiles,
 # an extra EnvironmentVariables entry — is not reproduced by the template, so a
-# plain overwrite silently reverts it (#82046). The keys below are the ones the
-# template owns; everything else in the installed plist is treated as an
-# operator customisation and carried across on every regeneration.
+# plain overwrite silently reverts it (#82046). Managed ownership is derived
+# from the *live* generated template (see `_managed_top_level_keys_from`), not
+# only this static fallback: if a sibling change (e.g. #80748) starts emitting
+# SoftResourceLimits/HardResourceLimits, those keys become managed the moment
+# the template owns them. A static-only allowlist would either (a) leave them
+# unmanaged and double-splice a second SoftResourceLimits block into the
+# regenerated plist, or (b) hard-code them as managed and wipe hand-raised
+# operator limits while the template still doesn't emit them. Deriving from
+# the generated body avoids both.
 _LAUNCHD_MANAGED_TOP_LEVEL_KEYS = frozenset(
     {
         "Label",
@@ -4626,29 +4632,84 @@ def _parse_plist_text(text: str) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def launchd_plist_customisations(text: str) -> tuple[dict, dict]:
+def _managed_top_level_keys_from(generated: str | None = None) -> frozenset:
+    """Top-level keys the current template owns.
+
+    Prefer the keys actually present in ``generated`` (or a fresh
+    ``generate_launchd_plist()`` call) so new template keys become managed
+    without a second allowlist edit. Union with the static fallback so a
+    partial stub in tests still treats the classic managed keys as managed
+    even when the stub omits them.
+    """
+    text = generated
+    if text is None:
+        try:
+            text = generate_launchd_plist()
+        except Exception:
+            return _LAUNCHD_MANAGED_TOP_LEVEL_KEYS
+    parsed = _parse_plist_text(text)
+    if not parsed:
+        return _LAUNCHD_MANAGED_TOP_LEVEL_KEYS
+    return frozenset(parsed.keys()) | _LAUNCHD_MANAGED_TOP_LEVEL_KEYS
+
+
+def _managed_env_keys_from(generated: str | None = None) -> frozenset:
+    """``EnvironmentVariables`` keys the current template owns.
+
+    Same live-template derivation as :func:`_managed_top_level_keys_from`, so
+    a future template env addition is not preserved-as-customisation and then
+    double-spliced on merge.
+    """
+    text = generated
+    if text is None:
+        try:
+            text = generate_launchd_plist()
+        except Exception:
+            return _LAUNCHD_MANAGED_ENV_KEYS
+    parsed = _parse_plist_text(text)
+    if not parsed:
+        return _LAUNCHD_MANAGED_ENV_KEYS
+    env = parsed.get("EnvironmentVariables")
+    if not isinstance(env, dict):
+        return _LAUNCHD_MANAGED_ENV_KEYS
+    return frozenset(env.keys()) | _LAUNCHD_MANAGED_ENV_KEYS
+
+
+def launchd_plist_customisations(
+    text: str,
+    *,
+    generated: str | None = None,
+) -> tuple[dict, dict]:
     """Return ``(extra_top_level, extra_env)`` operator additions in a plist.
 
-    ``extra_top_level`` holds keys the generated template never emits (e.g.
-    ``SoftResourceLimits``); ``extra_env`` holds ``EnvironmentVariables``
-    entries beyond PATH/VIRTUAL_ENV/HERMES_HOME. Both are empty for a plist
-    Hermes generated itself.
+    ``extra_top_level`` holds keys the generated template does not emit (e.g.
+    hand-raised ``SoftResourceLimits`` while the template still omits them);
+    ``extra_env`` holds ``EnvironmentVariables`` entries beyond the ones the
+    template owns. Both are empty for a plist Hermes generated itself.
+
+    Pass ``generated`` when the caller already has the template body (the
+    merge path) so managed ownership matches that exact body rather than a
+    second ``generate_launchd_plist()`` call that could differ under a
+    monkeypatch or path change.
     """
     parsed = _parse_plist_text(text)
     if not parsed:
         return {}, {}
 
+    managed_top = _managed_top_level_keys_from(generated)
+    managed_env = _managed_env_keys_from(generated)
+
     extra_top_level = {
         key: value
         for key, value in parsed.items()
-        if key not in _LAUNCHD_MANAGED_TOP_LEVEL_KEYS
+        if key not in managed_top
     }
     env = parsed.get("EnvironmentVariables")
     extra_env = (
         {
             key: value
             for key, value in env.items()
-            if key not in _LAUNCHD_MANAGED_ENV_KEYS
+            if key not in managed_env
         }
         if isinstance(env, dict)
         else {}
@@ -4708,11 +4769,16 @@ def _merge_launchd_customisations(generated: str, installed: str) -> str:
     """Splice operator customisations from ``installed`` into ``generated``.
 
     Managed keys always win — the whole point of regeneration is to update
-    them. Only keys the template does not emit are carried across. Returns
-    ``generated`` unchanged when there is nothing to preserve, so the common
-    case stays byte-identical to the template.
+    them. Only keys the template does not emit are carried across. Ownership
+    is derived from ``generated`` itself, so a template that already emits
+    SoftResourceLimits (e.g. after #80748) will not re-splice a second copy
+    from a stock installed plist. Returns ``generated`` unchanged when there
+    is nothing to preserve, so the common case stays byte-identical to the
+    template.
     """
-    extra_top_level, extra_env = launchd_plist_customisations(installed)
+    extra_top_level, extra_env = launchd_plist_customisations(
+        installed, generated=generated
+    )
     if not extra_top_level and not extra_env:
         return generated
 
