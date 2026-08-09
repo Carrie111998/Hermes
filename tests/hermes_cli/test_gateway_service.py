@@ -1,5 +1,6 @@
 """Tests for gateway service management helpers."""
 
+import math
 import os
 import plistlib
 import subprocess
@@ -57,6 +58,88 @@ class TestLaunchdExitTimeout:
         monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
 
         assert gateway_cli.launchd_plist_is_current() is False
+
+    @pytest.mark.parametrize(
+        ("source", "raw_timeout"),
+        [
+            ("env", "inf"),
+            ("env", "nan"),
+            ("env", "1e309"),
+            ("config", "inf"),
+            ("config", "nan"),
+            ("config", "1e309"),
+        ],
+    )
+    def test_exit_timeout_nonfinite_values_fall_back_to_default(
+        self, monkeypatch, source, raw_timeout
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+        if source == "env":
+            monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", raw_timeout)
+        else:
+            monkeypatch.setattr(
+                gateway_cli,
+                "read_raw_config",
+                lambda: {"agent": {"restart_drain_timeout": raw_timeout}},
+            )
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == max(
+            30, math.ceil(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30)
+        )
+
+    def test_exit_timeout_nonmapping_agent_config_falls_back_to_default(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {"agent": []})
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == max(
+            30, math.ceil(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30)
+        )
+
+    def test_drain_timeout_nonfinite_config_keeps_default_plist_current(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"agent": {"restart_drain_timeout": "1e309"}},
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is True
+
+    def test_exit_timeout_nonfinite_env_installs_with_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "nan")
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli, "_refuse_temp_home_service_write", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchctl_bootstrap", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_clear_launchd_unsupported_marker", lambda: None
+        )
+
+        gateway_cli.launchd_install(force=True)
+
+        plist = plistlib.loads(plist_path.read_bytes())
+        assert plist["ExitTimeOut"] == max(
+            30, math.ceil(DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT + 30)
+        )
 
 
 class TestUserSystemdPrivateSocketPreflight:

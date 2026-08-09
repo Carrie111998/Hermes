@@ -16,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -3290,6 +3291,8 @@ def _get_restart_drain_timeout() -> float:
     if not raw:
         cfg = read_raw_config()
         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(agent_cfg, Mapping):
+            agent_cfg = {}
         raw = str(
             agent_cfg.get(
                 "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
