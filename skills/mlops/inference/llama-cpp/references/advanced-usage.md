@@ -5,11 +5,13 @@
 ### Draft Model Approach
 
 ```bash
-# Use smaller model as draft for faster generation (no separate llama-speculative binary;
-# speculative decoding runs via the existing llama-cli / llama-server with --model-draft / -md)
+# Use a smaller draft model for faster generation.
+# `llama-speculative` is still built as an example, but the same effect is achieved
+# with the existing llama-cli / llama-server using -md / --model-draft + --spec-type.
 llama-cli \
     -m large-model-q4_k_m.gguf \
     -md draft-model-q4_k_m.gguf \
+    --spec-type draft-simple \
     -p "Write a story about AI" \
     -n 500 \
     --spec-draft-n-max 8  # number of draft tokens to propose before verification (default 3)

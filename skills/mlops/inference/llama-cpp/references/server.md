@@ -78,7 +78,7 @@ curl http://localhost:8080/v1/chat/completions \
 **Dockerfile**:
 ```dockerfile
 FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y git build-essential
+RUN apt-get update && apt-get install -y git build-essential cmake
 RUN git clone https://github.com/ggml-org/llama.cpp
 WORKDIR /llama.cpp
 RUN cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
