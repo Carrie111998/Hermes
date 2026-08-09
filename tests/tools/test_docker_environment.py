@@ -1277,6 +1277,65 @@ def test_credential_mount_skipped_when_source_is_directory(monkeypatch, tmp_path
     )
 
 
+def test_explicit_volume_takes_precedence_over_automatic_credential_mount(
+    monkeypatch, tmp_path, caplog,
+):
+    """An explicit writable credential bind must replace the automatic RO bind."""
+    token_path = tmp_path / "google_token.json"
+    token_path.write_text("{}")
+    other_path = tmp_path / "other.json"
+    other_path.write_text("{}")
+
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [
+            {
+                "host_path": str(token_path),
+                "container_path": "/root/.hermes/google_token.json",
+            },
+            {
+                "host_path": str(other_path),
+                "container_path": "/root/.hermes/other.json",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: [],
+    )
+
+    with caplog.at_level(logging.INFO):
+        _make_dummy_env(
+            volumes=[
+                f"{token_path}:/root/.hermes/google_token.json:rw",
+            ],
+        )
+
+    run_calls = [
+        c for c in calls
+        if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"
+    ]
+    assert run_calls, "docker run should have been called"
+    args = run_calls[0][0]
+    mounts = [args[idx + 1] for idx, value in enumerate(args[:-1]) if value == "-v"]
+    assert f"{token_path}:/root/.hermes/google_token.json:rw" in mounts
+    assert not any(
+        mount.endswith(":/root/.hermes/google_token.json:ro")
+        for mount in mounts
+    )
+    assert f"{other_path}:/root/.hermes/other.json:ro" in mounts
+    assert any(
+        "skipping automatic credential mount" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_credential_mount_skipped_when_source_missing(monkeypatch, tmp_path, caplog):
     """Credential mount should be skipped when source file no longer exists."""
     missing_path = tmp_path / "deleted_token.json"
