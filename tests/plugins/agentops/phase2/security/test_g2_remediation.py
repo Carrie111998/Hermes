@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import plistlib
+import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -513,7 +514,6 @@ def test_coverage_requires_process_health_evidence():
     from plugins.agentops.control.observer_models import TargetSnapshot
     registry = bootstrap_gateway_registry(); target = registry.get_target("hermes:profile:default:gateway")
     registry.record_target_snapshot(TargetSnapshot(target.target_id, datetime.now(timezone.utc), {"ok": True}))
-    registry.record_process_result(CollectionBatch(target.target_id, "processes", datetime.now(timezone.utc), (), CollectorHealth(False, "process_binding_no_match"), source_id="sha256:" + "e" * 64))
     assert registry.coverage_report().coverage_percent == 0
 
 
@@ -524,3 +524,14 @@ def test_phase2_memory_sink_has_no_persistence_surface():
     now = datetime.now(timezone.utc); source = "sha256:" + "f" * 64
     sink.commit_collection(CollectionBatch("hermes:profile:g2test:gateway", "memory", now, (), CollectorHealth(True), LogCursor(1, 1, source), source_id=source))
     assert sink.collection_run_count() == 1 and sink.get_cursor("hermes:profile:g2test:gateway", "memory", source).offset == 1
+
+
+def test_public_sqlite_writer_entrypoints_fail_closed_in_subprocess(tmp_path):
+    code = "from plugins.agentops.control.observer_store import ObserverStore, open_observer_store, ObserverStoreError; from pathlib import Path;\ntry: ObserverStore(None)\nexcept ObserverStoreError: pass\nelse: raise SystemExit(2)\ntry: open_observer_store(None)\nexcept ObserverStoreError: pass\nelse: raise SystemExit(3)"
+    env = {"PYTHONPATH": str(Path(__file__).resolve().parents[6])}
+    for value in (None, "1"):
+        child_env = dict(env)
+        if value is not None: child_env["AGENTOPS_ALLOW_SQLITE_TEST_ONLY"] = value
+        result = subprocess.run(["/Users/molly/Desktop/Hermes/venv/bin/python", "-c", code], env=child_env, capture_output=True, text=True)
+        assert result.returncode == 0
+    assert not list(tmp_path.glob("observer.db*"))
