@@ -105,3 +105,30 @@ test('one quit barrier waits for backend and SSH teardown before one retry', asy
   assert.equal(duplicateRuns, 0)
   assert.equal(retries, 1)
 })
+
+test('one quit barrier retains a removed pool start until it settles', async () => {
+  let releaseStart!: () => void
+  let retries = 0
+
+  const start = new Promise<void>(resolve => {
+    releaseStart = resolve
+  })
+
+  const barrier = createQuitTeardownBarrier()
+
+  barrier.track(start)
+
+  const teardown = barrier.start(async () => {
+    // The start was removed from its pool registry before this quit began.
+  }, () => {
+    retries += 1
+  })
+
+  await Promise.resolve()
+  assert.equal(barrier.pending, true)
+  assert.equal(retries, 0)
+
+  releaseStart()
+  await teardown
+  assert.equal(retries, 1)
+})

@@ -95,6 +95,7 @@ export function quitPromptFor(work: ActiveWork, quittingForHandoff: boolean): nu
 export function createQuitTeardownBarrier() {
   let teardown: Promise<void> | null = null
   let done = false
+  const tracked = new Set<Promise<unknown>>()
 
   return {
     get done() {
@@ -106,11 +107,24 @@ export function createQuitTeardownBarrier() {
     get started() {
       return teardown !== null
     },
+    get tracked() {
+      return [...tracked]
+    },
+    track<T>(branch: Promise<T>): Promise<T> {
+      tracked.add(branch)
+      void branch.then(
+        () => tracked.delete(branch),
+        () => tracked.delete(branch)
+      )
+
+      return branch
+    },
     start(run: () => Promise<void>, retryQuit: () => void): Promise<void> {
       if (!teardown) {
         teardown = Promise.resolve()
           .then(run)
-          .then(() => {
+          .then(async () => {
+            await Promise.allSettled([...tracked])
             done = true
             retryQuit()
           })

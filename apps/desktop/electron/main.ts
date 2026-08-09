@@ -8141,15 +8141,17 @@ async function ensureBackend(profile) {
     remoteBaseUrl: null
   }
 
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    if (backendPool.get(key) === entry) {
-      backendPool.delete(key)
-    }
+  entry.connectionPromise = quitTeardown.track(
+    spawnPoolBackend(key, entry).catch(error => {
+      if (backendPool.get(key) === entry) {
+        backendPool.delete(key)
+      }
 
-    stopBackendChild(entry.process)
-    void waitForBackendExit(entry.process).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
-    throw error
-  })
+      stopBackendChild(entry.process)
+      void waitForBackendExit(entry.process).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
+      throw error
+    })
+  )
   backendPool.set(key, entry)
   startPoolIdleReaper()
 
@@ -8514,7 +8516,7 @@ async function startHermes() {
   // a local failure latches to break install-restart loops.
   let attemptedRemote = primaryBackendIsRemote()
 
-  const connectionPromise = (async () => {
+  const connectionPromise = quitTeardown.track((async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
@@ -8793,6 +8795,7 @@ async function startHermes() {
     )
     throw error
   })
+  );
 
   backendConnectionState.setPromise(connectionAttempt, connectionPromise)
 
@@ -12563,6 +12566,7 @@ app.on('before-quit', event => {
 
   const primaryStart = backendConnectionState.getPromise()
   const poolEntries = [...backendPool.values()]
+  const pendingBackendStarts = quitTeardown.tracked
   const pendingBackendDrains = [...pendingBackendExits.values()]
   const pendingSshDrains = [...pendingSshTeardowns]
 
@@ -12574,7 +12578,10 @@ app.on('before-quit', event => {
     return child && child.exitCode === null && child.signalCode === null && processes.indexOf(child) === index
   })
 
-  const backendStarts = [primaryStart, ...poolEntries.map(entry => entry.connectionPromise)].filter(Boolean)
+  const backendStarts = [primaryStart, ...poolEntries.map(entry => entry.connectionPromise), ...pendingBackendStarts].filter(
+    (start, index, starts) => start && starts.indexOf(start) === index
+  )
+
   const sshScopes = [...sshConnections.keys()]
   const sshBootstraps = sshBootstrapCoordinator.promises()
 
@@ -12606,8 +12613,7 @@ app.on('before-quit', event => {
 
         const backendTeardown = Promise.allSettled([
           ...backendProcesses.map(child => waitForBackendExit(child)),
-          ...pendingBackendDrains,
-          ...backendStarts
+          ...pendingBackendDrains
         ])
 
         const sshTeardown = (async () => {
