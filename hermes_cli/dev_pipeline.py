@@ -563,11 +563,15 @@ def validate_repo_input(repo: str) -> tuple[bool, str | None]:
     if repo.startswith("http://") or repo.startswith("git@"):
         return False, "repo must be an absolute local path or https URL"
 
+    from pathlib import Path
+
+    path = Path(repo)
+    if not path.is_absolute():
+        return False, "local repo path must be absolute"
+
     if is_local_git_repo(repo):
         return True, None
 
-    from pathlib import Path
-
-    if not Path(repo).exists():
+    if not path.exists():
         return False, f"local repo path does not exist: {repo}"
     return False, f"local path is not a git repository: {repo}"
