@@ -409,6 +409,29 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _sandbox_reachable_image_dir() -> Path:
+    """Directory for materialized images the agent can actually open.
+
+    Under a non-local terminal backend the agent reads files inside the
+    sandbox, where the host ``$TMPDIR`` is not mounted. The Hermes image cache
+    is auto-mounted and is translated by ``to_agent_visible_cache_path``, so
+    images destined for a vision backend belong there.
+
+    Falls back to deriving the same path when the gateway package is not
+    importable (bare CLI runs).
+    """
+    try:
+        from gateway.platforms.base import get_image_cache_dir
+
+        return get_image_cache_dir()
+    except Exception:
+        from hermes_constants import get_hermes_dir
+
+        fallback = Path(get_hermes_dir()) / "cache" / "images"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -6630,19 +6653,25 @@ class AIAgent:
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
-        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
+        # Write into the Hermes image cache, NOT the host $TMPDIR. Under a
+        # non-local terminal backend (docker/ssh/modal/...) the vision resolver
+        # reads files *inside* the sandbox, where $TMPDIR is not mounted, so a
+        # temp file here makes every analysis fail with SourceNotFound. The
+        # image cache is auto-mounted and is exactly what
+        # ``to_agent_visible_cache_path`` already knows how to translate.
+        target_dir = _sandbox_reachable_image_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"inline_image_{uuid.uuid4().hex[:12]}{suffix}"
         try:
-            with tmp:
-                tmp.write(base64.b64decode(data))
+            path.write_bytes(base64.b64decode(data))
         except Exception:
-            # delete=False means a corrupt/unsupported data URL would otherwise
-            # leak a zero-byte temp file on every failed materialization.
+            # A corrupt/unsupported data URL would otherwise leave a zero-byte
+            # file behind on every failed materialization.
             try:
-                os.unlink(tmp.name)
+                path.unlink()
             except OSError:
                 pass
             raise
-        path = Path(tmp.name)
         return str(path), path
 
     def _describe_image_for_anthropic_fallback(self, image_url: str, role: str) -> str:

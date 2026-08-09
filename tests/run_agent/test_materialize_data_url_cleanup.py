@@ -1,16 +1,19 @@
-"""Regression test: temp file cleanup when materializing data URLs for vision.
+"""Regression test: file cleanup when materializing data URLs for vision.
 
-`_materialize_data_url_for_vision` creates a `NamedTemporaryFile(delete=False)`
-so the path can be handed to vision backends.  If `base64.b64decode` raises on
-a corrupt/unsupported data URL the temp file would otherwise persist forever
-on disk, leaking once per failed call.
+`_materialize_data_url_for_vision` writes the decoded image to a path that can
+be handed to vision backends.  If `base64.b64decode` raises on a corrupt or
+unsupported data URL, that file would otherwise persist forever on disk,
+leaking once per failed call.
+
+The destination is the sandbox-reachable image cache, not the host `$TMPDIR` —
+see tests/agent/test_image_materialization_reachable.py for why.  These tests
+patch that directory so the leak invariant is still checked where files
+actually land; patching `tempfile.tempdir` would silently assert nothing.
 """
 
 from __future__ import annotations
 
 import base64
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,26 +21,33 @@ import pytest
 from run_agent import AIAgent
 
 
-def _list_anthropic_tmpfiles(tmpdir: str) -> list[str]:
-    return [
-        name for name in os.listdir(tmpdir)
-        if name.startswith("anthropic_image_")
-    ]
+def _patch_image_dir(monkeypatch, target: Path) -> None:
+    import run_agent as ra
+
+    monkeypatch.setattr(ra, "_sandbox_reachable_image_dir", lambda: target)
 
 
-def test_b64decode_failure_does_not_leak_tempfile(monkeypatch, tmp_path):
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+def _list_materialized(directory: Path) -> list[str]:
+    if not directory.exists():
+        return []
+    return [p.name for p in directory.iterdir()]
+
+
+def test_b64decode_failure_does_not_leak_file(monkeypatch, tmp_path):
+    image_dir = tmp_path / "cache-images"
+    _patch_image_dir(monkeypatch, image_dir)
 
     bad_url = "data:image/png;base64,!!!not-valid-base64!!!"
     with pytest.raises(Exception):
         AIAgent._materialize_data_url_for_vision(bad_url)
 
-    leftovers = _list_anthropic_tmpfiles(str(tmp_path))
-    assert leftovers == [], f"leaked temp files after decode failure: {leftovers}"
+    leftovers = _list_materialized(image_dir)
+    assert leftovers == [], f"leaked files after decode failure: {leftovers}"
 
 
 def test_successful_decode_returns_path_to_existing_file(monkeypatch, tmp_path):
-    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    image_dir = tmp_path / "cache-images"
+    _patch_image_dir(monkeypatch, image_dir)
 
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16  # a few bytes is enough
     encoded = base64.b64encode(payload).decode("ascii")
@@ -47,6 +57,7 @@ def test_successful_decode_returns_path_to_existing_file(monkeypatch, tmp_path):
 
     assert isinstance(path_obj, Path)
     assert path_obj.exists()
+    assert path_obj.parent == image_dir
     assert path_obj.read_bytes() == payload
     assert path_str == str(path_obj)
     # Caller is responsible for cleanup; mimic that here so the test leaves
