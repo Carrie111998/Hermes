@@ -18,6 +18,7 @@ from plugins.agentops.control.redaction import RedactionError, contains_secret, 
 OBSERVER_SCHEMA_VERSION = 2
 OBSERVER_DATABASE_NAME = "observer.db"
 _STORE_KIND = "agentops-observer-store"
+_STORE_PATH_LOCK = threading.RLock()
 _LEGACY_TABLES = frozenset({"schema_migrations", "target_snapshots", "signals", "collector_cursors"})
 _CURRENT_TABLES = _LEGACY_TABLES | {
     "observer_metadata",
@@ -266,6 +267,7 @@ class ObserverStore:
             _create_empty_database(self.path)
             identity = _database_identity(self.path)
         try:
+          with _STORE_PATH_LOCK:
             if _database_identity(self.path) != identity:
                 raise ObserverStoreError("observer database identity changed")
             self._connection = sqlite3.connect(self.path, check_same_thread=False)
