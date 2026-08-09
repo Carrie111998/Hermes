@@ -213,6 +213,40 @@ def test_smart_mode_uses_native_guardian_without_a_second_prompt(verdict, allowe
     assert (result is None) is allowed
 
 
+def test_multiplex_write_approval_uses_owning_profile_mode(tmp_path, monkeypatch):
+    pool_home = tmp_path / "pool"
+    profile_home = tmp_path / "profile"
+    pool_home.mkdir()
+    profile_home.mkdir()
+    (pool_home / "config.yaml").write_text(
+        "approvals:\n  mode: smart\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "approvals:\n  mode: manual\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(pool_home))
+    state_key = (str(profile_home.resolve()), "pipedream")
+    mcp_tool._tool_read_only_hints[state_key] = {"send_email": False}
+
+    with patch("tools.approval._smart_approve") as smart, \
+         patch(
+             "tools.approval.request_elicitation_consent",
+             return_value="decline",
+         ) as consent:
+        blocked = mcp_tool._mcp_tool_approval_check(
+            "pipedream",
+            "send_email",
+            {"to": "owner@example.com"},
+            state_key,
+        )
+
+    smart.assert_not_called()
+    consent.assert_called_once()
+    assert "did not approve" in json.loads(blocked)["error"]
+
+
 def test_off_mode_and_session_yolo_bypass_write_approval():
     from tools import approval
 
