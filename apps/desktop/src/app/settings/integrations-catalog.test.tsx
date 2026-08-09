@@ -11,21 +11,29 @@ const activeProfile = atom('default')
 const activeSessionId = atom<string | null>('session-1')
 const gateway = atom<{ request: ReturnType<typeof vi.fn> } | null>(null)
 const getMcpCatalog = vi.fn()
+const getGoogleWorkspaceStatus = vi.fn()
+const startGoogleWorkspaceOAuth = vi.fn()
+const getGoogleWorkspaceOAuthFlow = vi.fn()
 const installMcpCatalogEntry = vi.fn()
 const setMcpServerEnabled = vi.fn()
+const completeDesktopOAuth = vi.fn()
 const completeMcpDesktopOAuth = vi.fn()
 const reloadMcp = vi.fn()
 
 vi.mock('@/hermes', () => ({
   authMcpServer: vi.fn(),
   getActionStatus: vi.fn(),
+  getGoogleWorkspaceOAuthFlow: () => getGoogleWorkspaceOAuthFlow(),
+  getGoogleWorkspaceStatus: () => getGoogleWorkspaceStatus(),
   getMcpCatalog: () => getMcpCatalog(),
   getMcpOAuthFlow: vi.fn(),
   installMcpCatalogEntry: (name: string, env: Record<string, string>) => installMcpCatalogEntry(name, env),
+  startGoogleWorkspaceOAuth: () => startGoogleWorkspaceOAuth(),
   setMcpServerEnabled: (name: string, enabled: boolean) => setMcpServerEnabled(name, enabled)
 }))
 
 vi.mock('@/lib/mcp-dashboard-oauth', () => ({
+  completeDesktopOAuth: (options: unknown) => completeDesktopOAuth(options),
   completeMcpDesktopOAuth: (options: unknown) => completeMcpDesktopOAuth(options)
 }))
 
@@ -86,9 +94,25 @@ beforeEach(() => {
   activeSessionId.set('session-1')
   gateway.set({ request: reloadMcp })
   getMcpCatalog.mockResolvedValue({ diagnostics: [], entries: [catalogEntry()] })
+  getGoogleWorkspaceStatus.mockResolvedValue({ configured: true, connected: false, scopes: [] })
+  startGoogleWorkspaceOAuth.mockResolvedValue({
+    authorization_url: 'https://accounts.google.com/o/oauth2/auth',
+    connected: false,
+    error: null,
+    flow_id: 'google-flow',
+    status: 'authorization_required'
+  })
+  getGoogleWorkspaceOAuthFlow.mockResolvedValue({
+    authorization_url: null,
+    connected: true,
+    error: null,
+    flow_id: 'google-flow',
+    status: 'approved'
+  })
   installMcpCatalogEntry.mockResolvedValue({ background: false, name: 'linear', ok: true })
   setMcpServerEnabled.mockResolvedValue({ ok: true })
   completeMcpDesktopOAuth.mockResolvedValue({ status: 'approved' })
+  completeDesktopOAuth.mockResolvedValue({ status: 'approved' })
   reloadMcp.mockResolvedValue({ ok: true })
 })
 
@@ -109,6 +133,17 @@ describe('IntegrationsCatalog', () => {
     await waitFor(() =>
       expect(reloadMcp).toHaveBeenCalledWith('reload.mcp', { confirm: true, session_id: 'session-1' })
     )
+  })
+
+  it('connects Google Workspace through the desktop OAuth flow', async () => {
+    getMcpCatalog.mockResolvedValue({ diagnostics: [], entries: [] })
+
+    await renderCatalog()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Connect Google Workspace' }))
+
+    await waitFor(() => expect(completeDesktopOAuth).toHaveBeenCalledOnce())
+    expect(startGoogleWorkspaceOAuth).not.toHaveBeenCalled()
   })
 
   it('treats an installed, enabled integration as ready without reinstalling it', async () => {

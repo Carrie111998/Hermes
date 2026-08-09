@@ -12190,6 +12190,16 @@ from hermes_cli.web_routers.mcp import (  # noqa: E402,F401 — legacy re-export
     install_mcp_catalog_entry,
 )
 
+from hermes_cli.web_routers import google_workspace as _google_workspace_routes  # noqa: E402
+
+app.include_router(_google_workspace_routes.router)
+from hermes_cli.web_routers.google_workspace import (  # noqa: E402,F401
+    google_workspace_oauth_callback,
+    google_workspace_oauth_status,
+    google_workspace_status,
+    start_google_workspace_oauth,
+)
+
 
 
 

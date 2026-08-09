@@ -338,6 +338,13 @@ export interface Translations {
       integrationsCredentialsDescription: string
       integrationsCredentialsRequired: string
       integrationsBrowserUnavailable: string
+      googleWorkspaceTitle: string
+      googleWorkspaceDescription: string
+      googleWorkspaceConnect: string
+      googleWorkspaceConnecting: string
+      googleWorkspaceConnected: string
+      googleWorkspaceSetupRequired: string
+      googleWorkspaceFailed: string
       integrationReady: (name: string) => string
       integrationReadyMessage: string
       integrationReadyNextLaunch: string

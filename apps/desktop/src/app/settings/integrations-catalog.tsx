@@ -9,16 +9,19 @@ import { Input } from '@/components/ui/input'
 import {
   authMcpServer,
   getActionStatus,
+  getGoogleWorkspaceOAuthFlow,
+  getGoogleWorkspaceStatus,
   getMcpCatalog,
   getMcpOAuthFlow,
   installMcpCatalogEntry,
   type McpCatalogEntry,
-  setMcpServerEnabled
+  setMcpServerEnabled,
+  startGoogleWorkspaceOAuth
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Wrench } from '@/lib/icons'
-import { completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
+import { completeDesktopOAuth, completeMcpDesktopOAuth } from '@/lib/mcp-dashboard-oauth'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -112,6 +115,7 @@ export function IntegrationsCatalog({
   const activeSessionId = useStore($activeSessionId)
   const gateway = useStore($gateway)
   const [installing, setInstalling] = useState<null | string>(null)
+  const [connectingGoogle, setConnectingGoogle] = useState(false)
   const [envDrafts, setEnvDrafts] = useState<Record<string, Record<string, string>>>({})
   const [envOpenFor, setEnvOpenFor] = useState<null | string>(null)
 
@@ -120,17 +124,34 @@ export function IntegrationsCatalog({
     queryFn: getMcpCatalog
   })
 
+  const googleWorkspaceQuery = useQuery({
+    queryKey: ['google-workspace-status', normalizeProfileKey(activeProfile)],
+    queryFn: getGoogleWorkspaceStatus
+  })
+
   const entries = [...(catalogQuery.data?.entries ?? [])]
     .filter(entry => matchesIntegrationCatalogQuery(entry, query))
     .filter(entry => (onlyInstalled ? entry.installed : !hideInstalled || !entry.installed))
     .sort((a, b) => Number(b.installed) - Number(a.installed) || prettyName(a.name).localeCompare(prettyName(b.name)))
 
-  const readyCount = entries.filter(entry => entry.installed && entry.enabled && entry.authenticated !== false).length
+  const googleConnected = googleWorkspaceQuery.data?.connected === true
+  const showGoogleWorkspace = onlyInstalled ? googleConnected : !hideInstalled || !googleConnected
+
+  const readyCount =
+    entries.filter(entry => entry.installed && entry.enabled && entry.authenticated !== false).length +
+    (showGoogleWorkspace && googleConnected ? 1 : 0)
+
   const sectionTitle = title ?? p.integrationsTitle
   const sectionDescription = description === undefined ? p.integrationsDescription : description
   const sectionMeta = meta === undefined ? p.integrationsCount(readyCount) : meta
 
-  if (hideWhenEmpty && !catalogQuery.isLoading && !catalogQuery.isError && entries.length === 0) {
+  if (
+    hideWhenEmpty &&
+    !catalogQuery.isLoading &&
+    !catalogQuery.isError &&
+    entries.length === 0 &&
+    !showGoogleWorkspace
+  ) {
     return null
   }
 
@@ -166,6 +187,35 @@ export function IntegrationsCatalog({
       status: getMcpOAuthFlow,
       openExternal: url => openExternal(url)
     })
+  }
+
+  const connectGoogleWorkspace = async () => {
+    const openExternal = window.hermesDesktop?.openExternal
+
+    if (!openExternal) {
+      throw new Error(p.integrationsBrowserUnavailable)
+    }
+
+    setConnectingGoogle(true)
+
+    try {
+      await completeDesktopOAuth({
+        openExternal: url => openExternal(url),
+        start: startGoogleWorkspaceOAuth,
+        status: getGoogleWorkspaceOAuthFlow
+      })
+      await googleWorkspaceQuery.refetch()
+      triggerHaptic('success')
+      notify({
+        kind: 'success',
+        title: p.googleWorkspaceTitle,
+        message: p.integrationReadyMessage
+      })
+    } catch (error) {
+      notifyError(error, p.googleWorkspaceFailed)
+    } finally {
+      setConnectingGoogle(false)
+    }
   }
 
   const waitForBackgroundInstall = async (entry: McpCatalogEntry, action: string) => {
@@ -243,6 +293,28 @@ export function IntegrationsCatalog({
     }
   }
 
+  const googleWorkspaceRow = showGoogleWorkspace ? (
+    <ListRow
+      action={
+        <Button
+          aria-label={`${googleConnected ? p.googleWorkspaceConnected : p.googleWorkspaceConnect} ${p.googleWorkspaceTitle}`}
+          disabled={googleConnected || connectingGoogle || googleWorkspaceQuery.isLoading}
+          onClick={() => void connectGoogleWorkspace()}
+          size="xs"
+          variant={googleConnected ? 'secondary' : 'default'}
+        >
+          {connectingGoogle
+            ? p.googleWorkspaceConnecting
+            : googleConnected
+              ? p.googleWorkspaceConnected
+              : p.googleWorkspaceConnect}
+        </Button>
+      }
+      description={p.googleWorkspaceDescription}
+      title={p.googleWorkspaceTitle}
+    />
+  ) : null
+
   return (
     <SettingsSection icon={Wrench} meta={sectionMeta ?? undefined} title={sectionTitle}>
       {sectionDescription && (
@@ -266,10 +338,14 @@ export function IntegrationsCatalog({
         </ErrorBanner>
       ) : entries.length === 0 ? (
         <SettingsGroup>
-          <ListRow description={emptyDescription ?? p.integrationsEmpty} title={sectionTitle} />
+          {googleWorkspaceRow}
+          {!showGoogleWorkspace && (
+            <ListRow description={emptyDescription ?? p.integrationsEmpty} title={sectionTitle} />
+          )}
         </SettingsGroup>
       ) : (
         <SettingsGroup>
+          {googleWorkspaceRow}
           {entries.map(entry => {
             const action = actionFor(entry)
             const busy = installing === entry.name

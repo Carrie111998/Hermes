@@ -386,6 +386,15 @@ export const en: Translations = {
       integrationsCredentialsDescription: 'Saved in this profile and reused automatically whenever Hermes starts.',
       integrationsCredentialsRequired: 'Fill in the required values before continuing.',
       integrationsBrowserUnavailable: 'Could not open the browser for sign-in.',
+      googleWorkspaceTitle: 'Google Workspace',
+      googleWorkspaceDescription:
+        'Connect Gmail, Drive, Calendar, Docs, Sheets, and Contacts once. Hermes reuses the secure profile connection automatically.',
+      googleWorkspaceConnect: 'Connect',
+      googleWorkspaceConnecting: 'Connecting...',
+      googleWorkspaceConnected: 'Connected',
+      googleWorkspaceSetupRequired:
+        'Set up the Google Desktop OAuth client with the Google Workspace skill before connecting.',
+      googleWorkspaceFailed: 'Could not connect Google Workspace.',
       integrationReady: name => `${name} is ready`,
       integrationReadyMessage: 'It starts in this chat now and automatically whenever you open Hermes.',
       integrationReadyNextLaunch: 'It will start automatically the next time Hermes opens.'

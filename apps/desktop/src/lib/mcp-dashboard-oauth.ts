@@ -7,10 +7,25 @@ export interface McpOAuthFlow {
   tools?: Array<{ name: string; description: string }>
 }
 
-interface CompleteOptions {
+export interface DesktopOAuthFlow {
+  flow_id: string
+  status: 'starting' | 'authorization_required' | 'approved' | 'error'
+  authorization_url: string | null
+  error: string | null
+}
+
+interface CompleteOptions<T extends DesktopOAuthFlow> {
   serverName: string
-  start: (name: string) => Promise<McpOAuthFlow>
-  status: (flowId: string) => Promise<McpOAuthFlow>
+  start: (name: string) => Promise<T>
+  status: (flowId: string) => Promise<T>
+  openExternal: (url: string) => Promise<void>
+  sleep?: (milliseconds: number) => Promise<void>
+  maxPollFailures?: number
+}
+
+interface DirectCompleteOptions<T extends DesktopOAuthFlow> {
+  start: () => Promise<T>
+  status: (flowId: string) => Promise<T>
   openExternal: (url: string) => Promise<void>
   sleep?: (milliseconds: number) => Promise<void>
   maxPollFailures?: number
@@ -18,15 +33,14 @@ interface CompleteOptions {
 
 const defaultSleep = (milliseconds: number) => new Promise<void>(resolve => window.setTimeout(resolve, milliseconds))
 
-export async function completeMcpDesktopOAuth({
-  serverName,
+export async function completeDesktopOAuth<T extends DesktopOAuthFlow>({
   start,
   status,
   openExternal,
   sleep = defaultSleep,
   maxPollFailures = 3
-}: CompleteOptions): Promise<McpOAuthFlow> {
-  const started = await start(serverName)
+}: DirectCompleteOptions<T>): Promise<T> {
+  const started = await start()
 
   if (started.status === 'error') {
     throw new Error(started.error || 'OAuth failed to start')
@@ -41,7 +55,7 @@ export async function completeMcpDesktopOAuth({
   let pollFailures = 0
 
   for (;;) {
-    let current: McpOAuthFlow
+    let current: T
 
     try {
       current = await status(started.flow_id)
@@ -68,4 +82,21 @@ export async function completeMcpDesktopOAuth({
 
     await sleep(1000)
   }
+}
+
+export async function completeMcpDesktopOAuth({
+  serverName,
+  start,
+  status,
+  openExternal,
+  sleep = defaultSleep,
+  maxPollFailures = 3
+}: CompleteOptions<McpOAuthFlow>): Promise<McpOAuthFlow> {
+  return completeDesktopOAuth({
+    maxPollFailures,
+    openExternal,
+    sleep,
+    start: () => start(serverName),
+    status
+  })
 }

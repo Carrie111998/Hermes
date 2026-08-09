@@ -1019,6 +1019,20 @@ export interface McpOAuthFlow {
   tools?: { name: string; description: string }[]
 }
 
+export interface GoogleWorkspaceStatus {
+  configured: boolean
+  connected: boolean
+  scopes: string[]
+}
+
+export interface GoogleWorkspaceOAuthFlow {
+  flow_id: string
+  status: 'authorization_required' | 'approved' | 'error'
+  authorization_url: string | null
+  error: string | null
+  connected: boolean
+}
+
 /** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
  *  for real) — well past the 15s default fetch timeout. */
 export function testMcpServer(name: string): Promise<McpTestResult> {
@@ -1056,6 +1070,30 @@ export function getMcpOAuthFlow(flowId: string): Promise<McpOAuthFlow> {
   return window.hermesDesktop.api<McpOAuthFlow>({
     ...profileScoped(),
     path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
+  })
+}
+
+export function getGoogleWorkspaceStatus(): Promise<GoogleWorkspaceStatus> {
+  return window.hermesDesktop.api<GoogleWorkspaceStatus>({
+    ...profileScoped(),
+    path: '/api/google-workspace/status'
+  })
+}
+
+export function startGoogleWorkspaceOAuth(): Promise<GoogleWorkspaceOAuthFlow> {
+  return window.hermesDesktop.api<GoogleWorkspaceOAuthFlow>({
+    ...profileScoped(),
+    path: '/api/google-workspace/oauth/start',
+    method: 'POST',
+    body: {},
+    timeoutMs: 60_000
+  })
+}
+
+export function getGoogleWorkspaceOAuthFlow(flowId: string): Promise<GoogleWorkspaceOAuthFlow> {
+  return window.hermesDesktop.api<GoogleWorkspaceOAuthFlow>({
+    ...profileScoped(),
+    path: `/api/google-workspace/oauth/flows/${encodeURIComponent(flowId)}`
   })
 }
 

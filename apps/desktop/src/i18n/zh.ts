@@ -344,6 +344,15 @@ export const zh: Translations = {
       plugins: '插件'
     },
     plugins: {
+      googleWorkspaceTitle: 'Google Workspace',
+      googleWorkspaceDescription:
+        'Connect Gmail, Drive, Calendar, Docs, Sheets, and Contacts once. Hermes reuses the secure profile connection automatically.',
+      googleWorkspaceConnect: 'Connect',
+      googleWorkspaceConnecting: 'Connecting...',
+      googleWorkspaceConnected: 'Connected',
+      googleWorkspaceSetupRequired:
+        'Set up the Google Desktop OAuth client with the Google Workspace skill before connecting.',
+      googleWorkspaceFailed: 'Could not connect Google Workspace.',
       title: '桌面插件',
       blurb:
         '加载到此应用中的界面扩展——随构建捆绑，或放入 desktop-plugins 文件夹（包括 Hermes 编写的插件）。禁用会即时卸载插件并在重启后保持。',
