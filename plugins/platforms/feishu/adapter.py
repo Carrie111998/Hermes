@@ -2773,6 +2773,21 @@ class FeishuAdapter(BasePlatformAdapter):
         normalized = str(open_id or "").strip()
         if not normalized:
             return False
+        # When FEISHU_ALLOW_ALL_USERS is enabled, skip admin-only gate for interactive card actions
+        # Use hermes' env loader (get_env_value_prefer_dotenv) to read from ~/.hermes/.env
+        try:
+            from hermes_cli.config import get_env_value_prefer_dotenv
+            feishu_allow = (get_env_value_prefer_dotenv("FEISHU_ALLOW_ALL_USERS") or "").strip().lower()
+            gateway_allow = (get_env_value_prefer_dotenv("GATEWAY_ALLOW_ALL_USERS") or "").strip().lower()
+        except Exception:
+            # Fallback to os.environ if hermes_cli.config is not available
+            feishu_allow = os.getenv("FEISHU_ALLOW_ALL_USERS", "").strip().lower()
+            gateway_allow = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").strip().lower()
+        
+        if feishu_allow in {"true", "1", "yes"}:
+            return True
+        if gateway_allow in {"true", "1", "yes"}:
+            return True
         allowed_ids = set(self._admins) | set(self._allowed_group_users)
         if not allowed_ids:
             return True
@@ -2793,7 +2808,9 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        # Bypass _allow_group_message for approval cards — card actions are always
+        # DM-based and should not be gated by group policy. Use admin check only.
+        if not self._is_interactive_operator_authorized(open_id):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
