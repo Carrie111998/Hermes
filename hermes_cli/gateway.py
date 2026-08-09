@@ -739,7 +739,11 @@ def _capture_gateway_argv(pid: int) -> list[str] | None:
     return argv
 
 
-def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | None:
+def _prepare_profile_gateway_update_restart(
+    profile: str,
+    pid: int,
+    wait_timeout: float = 120.0,
+) -> str | None:
     """Choose who relaunches a profile gateway after ``hermes update``.
 
     A gateway started with ``--external-supervisor`` must exit back to that
@@ -750,13 +754,38 @@ def _prepare_profile_gateway_update_restart(profile: str, pid: int) -> str | Non
     argv = _capture_gateway_argv(pid)
     if argv and "--external-supervisor" in argv:
         return "external-supervisor"
-    if launch_detached_profile_gateway_restart(profile, pid):
+    if launch_detached_profile_gateway_restart(
+        profile,
+        pid,
+        wait_timeout=wait_timeout,
+    ):
+        return "detached"
+    return None
+
+
+def _prepare_unmapped_gateway_update_restart(
+    pid: int,
+    wait_timeout: float = 120.0,
+) -> str | None:
+    """Prepare a safe relaunch for a manual gateway without profile mapping."""
+    run_argv = _capture_gateway_argv(pid)
+    if not run_argv:
+        return None
+    if "--external-supervisor" in run_argv:
+        return "external-supervisor"
+    if launch_detached_gateway_restart_by_cmdline(
+        pid,
+        run_argv,
+        wait_timeout=wait_timeout,
+    ):
         return "detached"
     return None
 
 
 def launch_detached_gateway_restart_by_cmdline(
-    old_pid: int, run_argv: list[str]
+    old_pid: int,
+    run_argv: list[str],
+    wait_timeout: float = 120.0,
 ) -> bool:
     """Relaunch a gateway by replaying its captured command line after exit.
 
@@ -768,20 +797,69 @@ def launch_detached_gateway_restart_by_cmdline(
     """
     if old_pid <= 0 or not run_argv:
         return False
-    return _spawn_gateway_restart_watcher(old_pid, list(run_argv))
+    return _spawn_gateway_restart_watcher(
+        old_pid,
+        list(run_argv),
+        wait_timeout=wait_timeout,
+    )
 
 
-def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
+def launch_detached_profile_gateway_restart(
+    profile: str,
+    old_pid: int,
+    wait_timeout: float = 120.0,
+) -> bool:
     """Relaunch a manually-run profile gateway after its current PID exits."""
     if old_pid <= 0:
         return False
-    return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile))
+    return _spawn_gateway_restart_watcher(
+        old_pid,
+        _gateway_run_args_for_profile(profile),
+        wait_timeout=wait_timeout,
+    )
 
 
-def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
-    """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits."""
+def launch_detached_systemd_restart_after_exit(
+    old_pid: int,
+    manage_cmd: list[str],
+    service_name: str,
+    wait_timeout: float = 120.0,
+) -> bool:
+    """Reset and start a systemd unit after its old gateway PID exits."""
+    if old_pid <= 0 or not manage_cmd or not service_name:
+        return False
+
+    restart_script = (
+        "import json, subprocess, sys\n"
+        "cmd = json.loads(sys.argv[1])\n"
+        "service = sys.argv[2]\n"
+        "subprocess.run(cmd + ['reset-failed', service], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)\n"
+        "subprocess.run(cmd + ['start', service], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)\n"
+    )
+    return _spawn_gateway_restart_watcher(
+        old_pid,
+        [
+            sys.executable,
+            "-c",
+            restart_script,
+            json.dumps(manage_cmd),
+            service_name,
+        ],
+        wait_timeout=wait_timeout,
+    )
+
+
+def _spawn_gateway_restart_watcher(
+    old_pid: int,
+    run_argv: list[str],
+    wait_timeout: float = 120.0,
+) -> bool:
+    """Spawn a detached watcher that runs a command after old PID exits."""
     if old_pid <= 0 or not run_argv:
         return False
+    wait_timeout = max(float(wait_timeout), 0.0)
 
     # The watcher is a tiny Python subprocess that polls the old PID and
     # respawns the gateway once it's gone.  Both legs of the chain need
@@ -852,14 +930,18 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         cmd = sys.argv[2:]
         _respawn_cwd = {respawn_cwd_literal}
         _respawn_env_overlay = {respawn_env_literal}
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + {wait_timeout!r}
+        from gateway.status import _pid_exists
+        exited = False
         while time.monotonic() < deadline:
             # ``os.kill(pid, 0)`` is not a no-op on Windows — use the
             # cross-platform existence check.
-            from gateway.status import _pid_exists
             if not _pid_exists(pid):
+                exited = True
                 break
             time.sleep(0.2)
+        if not exited:
+            sys.exit(1)
 
         # Platform-appropriate detach for the respawned gateway.  On POSIX
         # start_new_session=True maps to os.setsid; on Windows we need
@@ -899,6 +981,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     ).strip().format(
         respawn_cwd_literal=respawn_cwd_literal,
         respawn_env_literal=respawn_env_literal,
+        wait_timeout=wait_timeout,
     )
 
     watcher_argv = [
