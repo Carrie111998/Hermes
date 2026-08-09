@@ -233,8 +233,14 @@ def test_block_rejects_recoverable_engineering_obstacle(worker_env):
     from tools import kanban_tools as kt
 
     for reason in (
-        "pytest failed",
-        "CI failure",
+        "tests are failing",
+        "lint error",
+        "mypy errors",
+        "CI timed out",
+        "package installation failed",
+        "network error",
+        "tool unavailable",
+        "skill not found",
         "merge conflict",
         "missing package",
         "tool lookup failed",
@@ -244,6 +250,18 @@ def test_block_rejects_recoverable_engineering_obstacle(worker_env):
             d = json.loads(out)
             assert "error" in d
             assert "recoverable engineering obstacle" in d["error"]
+
+
+def test_block_recoverable_classification_is_specific(worker_env):
+    """Generic human-facing reasons and explicit genuine gates remain valid."""
+    from tools import kanban_tools as kt
+
+    for reason in (
+        "the owner is unavailable for a decision",
+        "external vendor approval is pending",
+        "required production permission is unavailable",
+    ):
+        assert kt._looks_recoverable_engineering_obstacle(reason) is False
 
 
 def test_block_preserves_genuine_capability_gate(worker_env):
