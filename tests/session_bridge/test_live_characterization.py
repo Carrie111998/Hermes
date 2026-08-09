@@ -247,7 +247,6 @@ def test_live_characterization_gate_survives_cli_config_composition_without_laun
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"session_bridge": {}})
     calls: list[str] = []
     loaded: list[BridgeConfig] = []
@@ -583,7 +582,7 @@ def test_cli_version_preserves_full_normalized_bounded_stdout(
 @_LIVE_ONLY
 @pytest.mark.timeout(600)
 def test_real_claude_and_codex_create_discover_read_and_resume() -> None:
-    report_path = run_live_characterization()
+    report_path = run_live_characterization(live_tests_enabled=True)
     report = json.loads(report_path.read_text(encoding="utf-8"))
 
     assert report_path.parent == (
