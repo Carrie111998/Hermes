@@ -14,6 +14,14 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from .sanitize import sanitize_metadata, sanitize_value
+from .embedding.base import EmbeddingModelIdentity
+from .embedding.vectors import (
+    FLOAT32_LE_DTYPE,
+    cosine_similarity,
+    l2_normalize,
+    pack_float32_le,
+    unpack_float32_le,
+)
 
 logger = logging.getLogger("hermes.plugins.semantic_graph")
 
@@ -617,6 +625,7 @@ class SemanticGraphStore:
                 if old_status in {"rejected", "superseded"} and new_status not in {"rejected", "superseded"}:
                     new_status = old_status
 
+                next_node_type = node.get("node_type", existing["node_type"])
                 next_subtype = node.get("subtype", existing["subtype"])
                 next_label = node.get("label", existing["label"])
                 next_normalized_label = node.get(
@@ -630,17 +639,18 @@ class SemanticGraphStore:
                     str(existing["summary"]),
                     str(existing["identity_key"]),
                 ) != (
-                    str(existing["node_type"]),
+                    str(next_node_type),
                     str(next_subtype),
                     str(next_label),
                     str(summary),
                     str(next_identity_key),
                 )
                 conn.execute(
-                    "UPDATE nodes SET subtype=?, label=?, normalized_label=?, summary=?, "
+                    "UPDATE nodes SET node_type=?, subtype=?, label=?, normalized_label=?, summary=?, "
                     "identity_key=?, status=?, authority=?, confidence=?, salience=?, "
                     "metadata_json=?, updated_at=? WHERE node_id=?",
                     (
+                        next_node_type,
                         next_subtype,
                         next_label,
                         next_normalized_label,
@@ -892,6 +902,103 @@ class SemanticGraphStore:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM nodes WHERE node_id=?", (node_id,)).fetchone()
             return dict(row) if row else None
+
+    def upsert_node_embedding(
+        self,
+        *,
+        node_id: str,
+        identity: EmbeddingModelIdentity,
+        vector: Any,
+        source_text_hash: str,
+    ) -> dict[str, Any]:
+        self.ensure_ready()
+        if not re.fullmatch(r"[0-9a-f]{64}", source_text_hash):
+            raise ValueError("source_text_hash must be a lowercase SHA-256 hex digest")
+        blob = pack_float32_le(vector, expected_dimensions=identity.dimensions)
+        now = _utcnow()
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM nodes WHERE node_id=?", (node_id,)).fetchone() is None:
+                raise KeyError(f"unknown node_id: {node_id}")
+            conn.execute(
+                """
+                INSERT INTO node_embeddings(
+                    node_id, namespace, provider, model, revision,
+                    serializer_version, dimensions, dtype, vector_blob,
+                    source_text_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id, namespace) DO UPDATE SET
+                    provider=excluded.provider, model=excluded.model,
+                    revision=excluded.revision, serializer_version=excluded.serializer_version,
+                    dimensions=excluded.dimensions, dtype=excluded.dtype,
+                    vector_blob=excluded.vector_blob, source_text_hash=excluded.source_text_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (node_id, identity.namespace, identity.provider, identity.model, identity.revision,
+                 identity.serializer_version, identity.dimensions, FLOAT32_LE_DTYPE, blob,
+                 source_text_hash, now, now),
+            )
+        return {"node_id": node_id, "namespace": identity.namespace,
+                "dimensions": identity.dimensions, "source_text_hash": source_text_hash}
+
+    def get_node_embedding(
+        self, *, node_id: str, namespace: str,
+        expected_source_text_hash: str | None = None,
+    ) -> Optional[dict[str, Any]]:
+        self.ensure_ready()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM node_embeddings WHERE node_id=? AND namespace=?",
+                (node_id, namespace),
+            ).fetchone()
+        if row is None or (expected_source_text_hash is not None
+                           and row["source_text_hash"] != expected_source_text_hash):
+            return None
+        result = dict(row)
+        result["vector"] = unpack_float32_le(
+            result.pop("vector_blob"), dimensions=int(result["dimensions"])
+        )
+        return result
+
+    def search_node_embeddings_exact(
+        self, *, namespace: str, query_vector: Any, top_k: int,
+        min_similarity: float = -1.0, node_ids: Any = None,
+        expected_source_hashes: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        if top_k <= 0:
+            return []
+        if not -1.0 <= min_similarity <= 1.0:
+            raise ValueError("min_similarity must be between -1 and 1")
+        query = l2_normalize(query_vector)
+        clauses = ["namespace = ?"]
+        params: list[Any] = [namespace]
+        if node_ids is not None:
+            ids = sorted(set(node_ids))
+            if not ids:
+                return []
+            clauses.append("node_id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT node_id, namespace, dimensions, vector_blob, source_text_hash "
+                "FROM node_embeddings WHERE " + " AND ".join(clauses) + " ORDER BY node_id",
+                params,
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            dimensions = int(row["dimensions"])
+            if dimensions != len(query):
+                continue
+            expected = expected_source_hashes.get(row["node_id"]) if expected_source_hashes else None
+            if expected is not None and row["source_text_hash"] != expected:
+                continue
+            vector = unpack_float32_le(row["vector_blob"], dimensions=dimensions)
+            score = cosine_similarity(query, vector)
+            if score >= min_similarity:
+                results.append({"node_id": row["node_id"], "namespace": row["namespace"],
+                                "similarity": score, "source_text_hash": row["source_text_hash"]})
+        results.sort(key=lambda item: (-float(item["similarity"]), str(item["node_id"])))
+        return results[:top_k]
 
     def get_edge(self, edge_id: str) -> Optional[dict[str, Any]]:
         self.ensure_ready()

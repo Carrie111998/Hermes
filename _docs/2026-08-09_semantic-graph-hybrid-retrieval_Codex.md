@@ -35,9 +35,12 @@ P0 Semantic Graph hardening is closed as an immutable baseline. Phase 2 starts f
 - Production backend: `LlamaCppEmbeddingBackend` only.
 - Server: operator-managed dedicated `llama-server` process with `--embedding`.
 - Endpoint: `POST /v1/embeddings` only; `/embedding` and `/embeddings` are not used.
-- Model: `Qwen/Qwen3-Embedding-0.6B-GGUF`; F16 is the primary baseline and Q8_0 is the later A/B comparison.
-- Dimensions: 1024 initially. Any 512-dimensional truncation is a later `truncate -> L2 normalize -> benchmark` decision, not an initial assumption.
-- Pooling: `last`; server-side normalization is expected with `--embd-normalize 2`; client-side defensive normalization belongs to Commit 5.
+- Model candidate: `Etherll/Qwen3-VL-Embedding-2B-Q8_0-GGUF:Q8_0`, served only through a dedicated llama-server; HF is distribution/reference only.
+- The model is treated as a separate 2B VL Q8_0 family; do not inherit the earlier Qwen3-Embedding-0.6B/1024-dimension assumption.
+- Dimensions are model/runtime metadata and must be confirmed from the live `/v1/embeddings` response or model metadata; vector code must not hard-code 1024.
+- The namespace must include model family, quantization, GGUF revision/hash, dimensions, and serializer version; F16 and Q8_0 live fixtures must never share a namespace.
+- Candidate server shape for a later live-validation commit: `./llama-server -hf Etherll/Qwen3-VL-Embedding-2B-Q8_0-GGUF:Q8_0 --embedding --pooling last --host 127.0.0.1 --port 8082`. Commit 5 does not start it.
+- Client-side finite/dimension/normalization validation belongs to Commit 5; Q8_0 quality comparison is a separate live fixture/namespace from any F16 baseline.
 - Query serialization uses the Qwen instruction form; document serialization uses only canonical node fields and no instruction.
 - Default deployment is loopback-only at `127.0.0.1:8082`, with `allow_remote: false`; no API key is persisted.
 - The plugin connects to the operator-managed server but does not auto-start it. Failure fails open to lexical retrieval with cooldown.
@@ -177,8 +180,30 @@ Implement the transactional SQLite embedding migration as the next isolated comm
 ## 変更履歴
 
 - 2026-08-09: Phase 2 start record created from merged `origin/main`.
-- 2026-08-09: llama-server-only production backend and 1024-dimensional Qwen3 policy locked.
+- 2026-08-09: llama-server-only production backend locked; model identity and dimensions remain parameterized after switching to Etherll Qwen3-VL Embedding 2B Q8_0.
 - 2026-08-09: Commit 3 serializer and source-hash verification recorded.
+
+## Commit 5 — exact embedding vector operations
+
+Commit 5 adds model-agnostic float32-le vector validation, stable packing/unpacking, L2 normalization, cosine/dot similarity, and low-level embedding persistence/exact scan APIs. The active model candidate is `Etherll/Qwen3-VL-Embedding-2B-Q8_0-GGUF:Q8_0`; no model download, llama-server startup, HF SDK runtime call, HTTP adapter, or retrieval integration is included.
+
+Changed files:
+- `plugins/semantic_graph/embedding/vectors.py`
+- `plugins/semantic_graph/embedding/__init__.py`
+- `plugins/semantic_graph/store.py`
+- `tests/plugins/test_semantic_graph_embedding_vectors.py`
+- `tests/plugins/test_semantic_graph_embedding_exact_search.py`
+
+Verification evidence:
+- Vector and exact-search tests: 65 passed, exit 0.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- Retrieval/runtime/config/serializer/dependencies remain outside the production change boundary.
+- No network calls or live embedding server calls performed.
+
+Residual risk:
+- Live model dimensions, pooling behavior, and Q8_0 quality remain unverified until the later llama-server live-validation commit.
 
 ## Commit 4 — transactional embedding store migration
 
@@ -210,7 +235,7 @@ Verification evidence:
 - No network calls or live embedding server calls performed.
 
 Residual risk:
-- Float32 packing, finite-value validation, normalization, cosine search, dense retrieval, RRF, and the llama-server adapter remain unimplemented.
+- Float32 packing, finite-value validation, normalization, cosine search, dense retrieval, RRF, and the llama-server adapter remain unimplemented. The selected Etherll Qwen3-VL model is not started in this commit.
 - Production readiness is not claimed.
 
 Next action:
