@@ -10180,10 +10180,21 @@ class TelegramAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
 
-    async def add_current_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
-        """React to the inbound message for the current turn."""
-        if not (chat_id and message_id and (emoji or "").strip()):
+    def _reaction_session_key(self, event: MessageEvent) -> Optional[str]:
+        """Resolve the durable session key for a live Telegram event."""
+        runner = getattr(self, "gateway_runner", None) or getattr(
+            getattr(self, "_message_handler", None), "__self__", None
+        )
+        resolve = getattr(runner, "_session_key_for_source", None)
+        key = resolve(event.source) if callable(resolve) else None
+        return str(key) if key else None
+
+    async def add_current_reaction(self, session_key: str, emoji: str) -> bool:
+        """React only to the ordinary inbound message driving this live turn."""
+        target = getattr(self, "_current_reaction_targets", {}).get(session_key)
+        if not target or not (emoji or "").strip():
             return False
+        chat_id, message_id = target
         success = await self._set_reaction(chat_id, str(message_id), emoji)
         if success and self._reactions_enabled():
             self.__dict__.setdefault("_intentional_reaction_targets", set()).add(
@@ -10231,10 +10242,16 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add the optional lifecycle status reaction."""
+        """Bind the current inbound target and add optional lifecycle status."""
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         meta = getattr(event, "metadata", None) or {}
+        session_key = self._reaction_session_key(event)
+        if session_key:
+            targets = self.__dict__.setdefault("_current_reaction_targets", {})
+            targets.pop(session_key, None)
+            if not meta.get("deferred_followup_event") and chat_id and message_id:
+                targets[session_key] = (str(chat_id), str(message_id))
         if not self._reactions_enabled() or meta.get("deferred_followup_event"):
             return
         if chat_id and message_id:
@@ -10254,6 +10271,9 @@ class TelegramAdapter(BasePlatformAdapter):
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
         """
+        session_key = self._reaction_session_key(event)
+        if session_key:
+            getattr(self, "_current_reaction_targets", {}).pop(session_key, None)
         meta = getattr(event, "metadata", None) or {}
         if meta.get("deferred_followup_event") or not self._reactions_enabled():
             return

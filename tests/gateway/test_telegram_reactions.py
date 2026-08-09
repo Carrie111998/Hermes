@@ -209,20 +209,42 @@ def _live_adapter(extra):
 async def test_lifecycle_off_intentional_survives_overwrite(monkeypatch):
     monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
     adapter = _make_adapter()
-    await adapter.on_processing_start(_make_event())
-    await adapter.on_processing_complete(_make_event(), ProcessingOutcome.SUCCESS)
-    adapter._bot.set_message_reaction.assert_not_awaited()
-    assert not hasattr(adapter, "add_reaction")
-    assert await adapter.add_current_reaction("123", "456", "❤️") is True
-    assert adapter._bot.set_message_reaction.await_args.kwargs["reaction"] == "❤"
-    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
-    adapter = _make_adapter()
+    adapter.gateway_runner = SimpleNamespace(_session_key_for_source=lambda source: "session")
     event = _make_event()
     await adapter.on_processing_start(event)
-    assert await adapter.add_current_reaction("123", "456", "❤️") is True
+    adapter._bot.set_message_reaction.assert_not_awaited()
+    assert adapter._current_reaction_targets == {"session": ("123", "456")}
+    assert not hasattr(adapter, "add_reaction")
+    assert await adapter.add_current_reaction("session", "❤️") is True
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    assert adapter._bot.set_message_reaction.await_args.kwargs["reaction"] == "❤"
+    assert adapter._bot.set_message_reaction.await_count == 1
+    assert adapter._current_reaction_targets == {}
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
+    adapter = _make_adapter()
+    adapter.gateway_runner = SimpleNamespace(_session_key_for_source=lambda source: "session")
+    event = _make_event()
+    await adapter.on_processing_start(event)
+    assert await adapter.add_current_reaction("session", "❤️") is True
     await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
     assert [c.kwargs["reaction"] for c in adapter._bot.set_message_reaction.await_args_list] == ["👀", "❤"]
     assert adapter._intentional_reaction_targets == set()
+
+
+@pytest.mark.asyncio
+async def test_intentional_reaction_never_uses_stale_session_origin(monkeypatch):
+    """A reset session's old origin id must never become the reaction target."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
+    adapter = _make_adapter()
+    adapter.gateway_runner = SimpleNamespace(_session_key_for_source=lambda source: "random")
+    event = _make_event(message_id="30999")
+
+    await adapter.on_processing_start(event)
+    assert await adapter.add_current_reaction("random", "👍") is True
+
+    adapter._bot.set_message_reaction.assert_awaited_once_with(
+        chat_id=123, message_id=30999, reaction="👍"
+    )
 
 
 @pytest.mark.parametrize(("enabled", "expected"), [(False, False), (True, True), ("yes", True), ("off", False)])

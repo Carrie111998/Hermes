@@ -31,16 +31,16 @@ def telegram_reaction_tool(emoji: str) -> str:
     if canonical is None:
         return tool_error("Telegram does not support that standard reaction emoji.")
     session_key = get_session_env("HERMES_SESSION_KEY", "")
-    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
-    if not (session_key and chat_id and message_id):
+    if not session_key:
         return tool_error("The current Telegram message context is unavailable.")
     try:
         from gateway.config import Platform
         from gateway.run import _gateway_runner_ref
         runner = _gateway_runner_ref()
-        source = runner._get_cached_session_source(session_key) if runner else None
-        if source is None or source.platform != Platform.TELEGRAM or str(source.chat_id) != str(chat_id):
+        if runner is None:
+            return tool_error("The Telegram gateway is not connected.")
+        source = runner._get_cached_session_source(session_key)
+        if source is None or source.platform != Platform.TELEGRAM:
             return tool_error("The current Telegram session is unavailable.")
         react = getattr(runner._adapter_for_source(source), "add_current_reaction", None)
         loop = getattr(runner, "_gateway_loop", None)
@@ -52,7 +52,7 @@ def telegram_reaction_tool(emoji: str) -> str:
                 return tool_error("Telegram reaction is unavailable on the gateway loop.")
         except RuntimeError:
             pass
-        coroutine = react(chat_id, message_id, canonical)
+        coroutine = react(session_key, canonical)
         try:
             future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         except Exception:

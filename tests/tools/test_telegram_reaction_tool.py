@@ -3,11 +3,10 @@ import asyncio, json, queue, subprocess, sys, threading
 from gateway.config import Platform
 from gateway.session import SessionSource
 
-def _call_on_gateway(monkeypatch, handler, emoji="❤️", message_id="900", chat_id="-100"):
+def _call_on_gateway(monkeypatch, handler, emoji="❤️"):
     from tools import telegram_reaction_tool as module
     values = {
         "HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_KEY": "secondary-session",
-        "HERMES_SESSION_CHAT_ID": chat_id, "HERMES_SESSION_MESSAGE_ID": message_id,
     }
     monkeypatch.setattr(module, "get_session_env", lambda n, d="": values.get(n, d))
     source = SessionSource(
@@ -36,14 +35,14 @@ def _call_on_gateway(monkeypatch, handler, emoji="❤️", message_id="900", cha
 def test_tool_target_canonical_fail_closed_scope_and_progress(monkeypatch):
     observed = {}
 
-    async def react(_a, chat_id, message_id, emoji):
-        observed.update(chat_id=chat_id, message_id=message_id, emoji=emoji,
+    async def react(_a, session_key, emoji):
+        observed.update(session_key=session_key, emoji=emoji,
                         loop=asyncio.get_running_loop(), thread=threading.get_ident())
         return True
 
     result, loop, thread, source = _call_on_gateway(monkeypatch, react)
     assert result == {"success": True}
-    assert observed == {"chat_id": "-100", "message_id": "900", "emoji": "❤",
+    assert observed == {"session_key": "secondary-session", "emoji": "❤",
                         "loop": loop, "thread": thread.ident}
     assert source.profile == "secondary"
 
@@ -51,10 +50,8 @@ def test_tool_target_canonical_fail_closed_scope_and_progress(monkeypatch):
         return False
 
     # Reaction turns / missing ordinary inbound → no outgoing reaction target.
-    assert _call_on_gateway(monkeypatch, fail, "👍", message_id="")[0] == {
+    assert _call_on_gateway(monkeypatch, fail, "👍")[0] == {
         "error": "The current Telegram message context is unavailable."}
-    assert _call_on_gateway(monkeypatch, fail, "👍", chat_id="-200")[0] == {
-        "error": "The current Telegram session is unavailable."}
 
     from tools import telegram_reaction_tool as module
     monkeypatch.setattr(module, "get_session_env",
