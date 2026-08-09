@@ -2999,6 +2999,10 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
     assert client.calls[1][1] == {"threadId": CODEX_ID, "name": "Mirror title"}
     assert client.calls[2][1] == {
         "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
         "sourceKinds": ["vscode", "appServer"],
     }
     assert client.calls[3][1] == {"threadId": CODEX_ID, "includeTurns": True}
@@ -3008,6 +3012,38 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
         used_registration_turn=False,
         verified_at=1234.5,
     )
+
+
+def test_codex_exact_placeholder_verification_uses_state_db_without_global_scan() -> None:
+    adapter, client = _codex_adapter({
+        "thread/start": [{"thread": {"id": CODEX_ID}}],
+        "thread/name/set": [{}],
+        "thread/list": [_codex_inventory()],
+        "thread/read": [_codex_signed_read()],
+    })
+
+    result = adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    assert result.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls] == [
+        "thread/start",
+        "thread/name/set",
+        "thread/list",
+        "thread/read",
+    ]
+    assert client.calls[2][1] == {
+        "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
+        "sourceKinds": ["vscode", "appServer"],
+    }
 
 
 def test_codex_visible_native_target_gets_one_authenticated_registration_turn() -> None:
@@ -3188,9 +3224,19 @@ def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filte
     ]
     assert client.calls[2][1] == {
         "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
         "sourceKinds": ["vscode", "appServer"],
     }
-    assert client.calls[3][1] == {"archived": False}
+    assert client.calls[3][1] == {
+        "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
+    }
     assert [method for method, _, _ in client.calls].count("thread/start") == 1
     assert [method for method, _, _ in client.calls].count("turn/start") == 0
 
