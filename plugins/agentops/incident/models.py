@@ -4,11 +4,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping
 import hashlib, json
+import re
 from types import MappingProxyType
 
 def _freeze(v):
     if isinstance(v, Mapping): return MappingProxyType({str(k): _freeze(x) for k,x in v.items()})
     if isinstance(v, (list, tuple)): return tuple(_freeze(x) for x in v)
+    return v
+
+def _redact(v):
+    if isinstance(v, Mapping): return {str(k): ("[REDACTED]" if re.search(r"password|token|secret|api[_-]?key", str(k), re.I) else _redact(x)) for k,x in v.items()}
+    if isinstance(v, (list, tuple)): return [_redact(x) for x in v]
+    if isinstance(v, str): return re.sub(r"(?i)(password|token|secret)\s*[:=]\s*[^,\s]+", r"\1=[REDACTED]", v)
     return v
 
 @dataclass(frozen=True)
@@ -23,7 +30,7 @@ class IncidentSignal:
     source_id: str = ""
     def __post_init__(self):
         if not self.signal_id: raise ValueError("signal_id required")
-        object.__setattr__(self, "payload", _freeze(self.payload))
+        object.__setattr__(self, "payload", _freeze(_redact(self.payload)))
 
 @dataclass
 class Incident:
@@ -53,3 +60,6 @@ class ReviewResult:
     rollback: tuple[str, ...] = ()
     confidence: float = 0.0
     evidence_ids: tuple[str, ...] = ()
+    def __post_init__(self):
+        if self.decision not in {"observe", "escalate"} or not 0 <= self.confidence <= 1: raise ValueError("invalid review proposal")
+        if self.actions and self.degraded: raise ValueError("degraded review cannot propose actions")
