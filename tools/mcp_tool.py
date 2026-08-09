@@ -5275,8 +5275,18 @@ def _connect_workspace_server(
         connected = _run_on_mcp_loop(_connect, timeout=wait_timeout)
         connected._breaker_key = scope_key
         with _lock:
-            stale = _workspace_servers.get(scope_key)
-            _workspace_servers[scope_key] = connected
+            # Full shutdown clears the in-flight ownership map before stopping
+            # the MCP loop.  The connect future can complete in the narrow
+            # window between that clear and loop teardown; publishing here
+            # would resurrect a dead scoped transport after shutdown.  Require
+            # the exact Event token we installed above to still own this key.
+            # Identity also prevents an old connect from clobbering a newer
+            # post-shutdown attempt for the same workspace (ABA race).
+            if _workspace_server_connecting.get(scope_key) is ready:
+                stale = _workspace_servers.get(scope_key)
+                _workspace_servers[scope_key] = connected
+            else:
+                connected = None
     except Exception as exc:
         logger.warning(
             "MCP server '%s': workspace-scoped connect failed for %s: %s",
@@ -5286,7 +5296,8 @@ def _connect_workspace_server(
         )
     finally:
         with _lock:
-            ready = _workspace_server_connecting.pop(scope_key, ready)
+            if _workspace_server_connecting.get(scope_key) is ready:
+                _workspace_server_connecting.pop(scope_key, None)
         ready.set()
 
     if stale is not None and stale is not connected:

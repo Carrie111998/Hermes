@@ -261,3 +261,60 @@ def test_probe_cleanup_keeps_loop_for_workspace_scoped_server():
             mcp_tool._workspace_servers.pop(scope_key, None)
             mcp_tool._workspace_server_connecting.pop(scope_key, None)
         mcp_tool._stop_mcp_loop()
+
+
+def test_shutdown_during_scoped_connect_does_not_republish_transport(monkeypatch):
+    import tools.mcp_tool as mcp_tool
+
+    name = "filesystem_shutdown_race"
+    root = "/projects/alpha"
+    template = {
+        "command": "filesystem-server",
+        "args": ["${workspaceFolder}"],
+    }
+    config = {
+        "command": "filesystem-server",
+        "args": [root],
+    }
+    connected = mcp_tool.MCPServerTask(name, publish_tools=False)
+    connected.session = MagicMock()
+    connected._config = config
+
+    async def fake_connect(server_name, resolved, *, publish_tools=True):
+        assert server_name == name
+        assert resolved == config
+        assert publish_tools is False
+        return connected
+
+    def connect_then_shutdown(coro_or_factory, timeout=30):
+        del timeout
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        result = asyncio.run(coro)
+        # Force shutdown after connection completes but before the caller can
+        # publish the transport into _workspace_servers.
+        mcp_tool.shutdown_mcp_servers()
+        return result
+
+    monkeypatch.setattr(mcp_tool, "_workspace_folder", lambda task_id=None: root)
+    monkeypatch.setattr(mcp_tool, "_connect_server", fake_connect)
+    monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", connect_then_shutdown)
+    monkeypatch.setattr(mcp_tool, "_stop_mcp_loop", lambda **kwargs: True)
+    scope_key = mcp_tool._workspace_scope_key(name, "session-alpha")
+    with mcp_tool._lock:
+        mcp_tool._workspace_server_configs[name] = template
+
+    try:
+        result = mcp_tool._connect_workspace_server(name, "session-alpha")
+
+        assert result is None
+        with mcp_tool._lock:
+            assert scope_key not in mcp_tool._workspace_servers
+            assert scope_key not in mcp_tool._workspace_server_connecting
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._workspace_server_configs.pop(name, None)
+            mcp_tool._workspace_servers.pop(scope_key, None)
+            ready = mcp_tool._workspace_server_connecting.pop(scope_key, None)
+        if ready is not None:
+            ready.set()
