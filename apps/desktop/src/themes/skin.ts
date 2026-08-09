@@ -145,8 +145,16 @@ export function skinToDesktopTheme(skin: HermesSkin): DesktopTheme | null {
   // Dual-mode: the base palette's authored background decides polarity (mirror
   // of the TUI's `skinIsLight`). The opposite mode is the base merged with the
   // matching hand-tuned overlay; the authored mode is the base itself.
+  //
+  // A chrome-only base (no `background`/`status_bar_bg`) must fall back to the
+  // SAME foreground-luminance bucket `buildPalette` uses, or the polarity seed
+  // disagrees with the palette it derives: light text ⇒ dark canvas ⇒ the
+  // light_colors overlay belongs in the light slot.
   const seededBg = pick(colors, ['background', 'status_bar_bg'], '#000000')
-  const baseDark = seededBg ? luminance(seededBg) < 0.4 : false
+  const foregroundSeed = pick(colors, ['ui_text', 'banner_text', 'status_bar_text'], seededBg ?? '#000000')
+  const baseDark = seededBg
+    ? luminance(seededBg) < 0.4
+    : (foregroundSeed ? luminance(foregroundSeed) > 0.5 : false)
 
   const lightSource = baseDark ? { ...colors, ...(skin.light_colors ?? {}) } : colors
   const darkSource = baseDark ? colors : { ...colors, ...(skin.dark_colors ?? {}) }

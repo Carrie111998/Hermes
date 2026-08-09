@@ -93,4 +93,21 @@ describe('skinToDesktopTheme', () => {
     expect(theme.colors).not.toBe(theme.darkColors)
     expect(theme.colors.input).toBe(normalizeHex('#ffffff'))
   })
+
+  it('buckets a chrome-only base by foreground luminance for polarity', () => {
+    // No background/status_bar_bg: light text must read as a dark-authored base,
+    // so the light_colors overlay lands in the light slot — the toggle works
+    // instead of rendering the same palette in both modes.
+    const theme = skinToDesktopTheme({
+      name: 'chrome',
+      colors: { ui_accent: '#ffcc00', banner_text: '#ffffff' },
+      light_colors: { background: '#fafafa', banner_text: '#111111', ui_accent: '#b8860b' }
+    })!
+
+    expect(theme.colors).not.toBe(theme.darkColors)
+    // Dark slot derives from the light-text chrome base (same bucket as buildPalette)…
+    expect(luminance(theme.darkColors!.background)).toBeLessThan(0.4)
+    // …and the light slot carries the overlay's canvas.
+    expect(luminance(theme.colors.background)).toBeGreaterThan(0.4)
+  })
 })
