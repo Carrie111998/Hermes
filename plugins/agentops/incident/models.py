@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Mapping
 import hashlib, json
 import re
+from plugins.agentops.control.redaction import redact_value, contains_secret
 from types import MappingProxyType
 
 def _freeze(v):
@@ -29,8 +30,13 @@ class IncidentSignal:
     severity: str = "warning"
     source_id: str = ""
     def __post_init__(self):
-        if not self.signal_id: raise ValueError("signal_id required")
-        object.__setattr__(self, "payload", _freeze(_redact(self.payload)))
+        if type(self.signal_id) is not str or not self.signal_id or type(self.target_id) is not str or not self.target_id:
+            raise ValueError("signal identity required")
+        if type(self.collector) is not str or type(self.signal_type) is not str or not isinstance(self.payload, Mapping):
+            raise ValueError("invalid signal schema")
+        safe = redact_value(self.payload)
+        if contains_secret(safe): raise ValueError("secret in incident evidence")
+        object.__setattr__(self, "payload", _freeze(safe))
 
 @dataclass
 class Incident:
@@ -61,6 +67,20 @@ class ReviewResult:
     confidence: float = 0.0
     evidence_ids: tuple[str, ...] = ()
     def __post_init__(self):
-        if self.decision not in {"observe", "escalate"} or self.risk not in {"low", "medium", "high", "critical", "unknown"} or not 0 <= self.confidence <= 1: raise ValueError("invalid review proposal")
-        if self.actions and self.degraded or (self.degraded and self.model_used): raise ValueError("degraded review cannot propose actions/model")
-        if not isinstance(self.model_used, bool) or not isinstance(self.degraded, bool) or not all(isinstance(x, str) for x in self.hypotheses + self.actions + self.verification + self.rollback + self.evidence_ids): raise ValueError("invalid review schema")
+        if not isinstance(self.incident_fingerprint, str) or not self.incident_fingerprint:
+            raise ValueError("invalid incident fingerprint")
+        if type(self.decision) is not str or self.decision not in {"observe", "escalate"}:
+            raise ValueError("invalid review decision")
+        if type(self.rationale) is not str:
+            raise ValueError("invalid review rationale")
+        if type(self.risk) is not str or self.risk not in {"low", "medium", "high", "critical", "unknown"}:
+            raise ValueError("invalid review risk")
+        if type(self.confidence) is not float or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("invalid review confidence")
+        if type(self.model_used) is not bool or type(self.degraded) is not bool:
+            raise ValueError("invalid review flags")
+        fields = (self.hypotheses, self.actions, self.verification, self.rollback, self.evidence_ids)
+        if any(type(items) is not tuple or any(type(item) is not str for item in items) for items in fields):
+            raise ValueError("invalid review fields")
+        if self.degraded and (self.model_used or self.actions):
+            raise ValueError("degraded review cannot propose actions/model")
