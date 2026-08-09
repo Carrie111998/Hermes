@@ -83,6 +83,11 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+# Staleness cap for restart replay: a pending completion older than this is
+# terminally dropped instead of re-run as a fresh full-context turn (see
+# restore_undelivered_completions). 48h keeps overnight/weekend results
+# deliverable while stopping weeks-old sessions from replaying after upgrades.
+_MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -352,20 +357,48 @@ def restore_undelivered_completions(target_queue) -> int:
     leave them queued for a consumer that can positively prove ownership,
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
+
+    Staleness cap: a pending completion older than
+    ``_MAX_COMPLETION_REPLAY_AGE_S`` is terminally dropped instead of
+    replayed. Replaying a weeks-old completion re-runs its parent session as
+    a full-context turn (a July session replayed in August burned a
+    102K-token context on the staging fleet) for a result nobody is waiting
+    on anymore; the payload stays queryable on the dropped row.
     """
     recover_abandoned_delegations()
+    now = time.time()
+    restored = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, event_json, completed_at, dispatched_at
+               FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        for delegation_id, payload, completed_at, dispatched_at in rows:
+            age_basis = completed_at or dispatched_at
+            if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              delivery_claim=NULL, delivery_claimed_at=NULL,
+                              updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (now, delegation_id),
+                )
+                logger.warning(
+                    "Async delegation %s: pending completion is %.1fh old "
+                    "(cap %.1fh); terminally dropping the replay (result "
+                    "remains queryable).",
+                    delegation_id, (now - age_basis) / 3600.0,
+                    _MAX_COMPLETION_REPLAY_AGE_S / 3600.0,
+                )
+                continue
             evt = json.loads(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
-    return len(rows)
+            restored += 1
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:

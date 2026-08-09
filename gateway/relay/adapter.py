@@ -487,6 +487,24 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - media localization must never break inbound
             logger.debug("relay inbound media localization failed", exc_info=True)
 
+    def prime_routing_cache(self, event) -> None:
+        """Warm the per-chat egress routing caches from a SYNTHETIC event.
+
+        The caches (_scope_by_chat/_dm_user_by_chat/...) are normally warmed
+        only by the inbound path (_on_inbound -> _capture_scope). A synthetic
+        completion turn injected right after a restart (durable
+        async-delegation replay) reaches handle_message with the caches COLD,
+        so every reply it produces egresses without metadata.scope_id /
+        metadata.user_id and is declined by the connector's fail-closed
+        tenant guard ("target not routed to an onboarded tenant" — staging
+        2026-08-09, defect #4). The synthetic event's session-store origin
+        already carries the discriminators; feed it through the same capture
+        used for real inbound. Never raises.
+        """
+        if event is None or getattr(event, "source", None) is None:
+            return
+        self._capture_scope(event)
+
     def _capture_scope(self, event) -> None:
         """Remember a chat_id's egress discriminator from an inbound event so our
         outbound (the agent's reply) can re-assert it for the connector's egress
