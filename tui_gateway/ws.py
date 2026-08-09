@@ -31,6 +31,7 @@ import socket
 import threading
 from typing import Any
 
+from hermes_cli.json_safety import dumps_utf8_safe
 from tui_gateway import server
 
 _log = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ class WSTransport:
         if self._closed:
             return False
 
-        line = json.dumps(obj, ensure_ascii=False)
+        line = dumps_utf8_safe(obj, ensure_ascii=False)
 
         try:
             on_loop = asyncio.get_running_loop() is self._loop
@@ -221,7 +222,7 @@ class WSTransport:
         with self._token_lock:
             batch = self._pending_tokens
             self._pending_tokens = []
-            batch.append(json.dumps(obj, ensure_ascii=False))
+            batch.append(dumps_utf8_safe(obj, ensure_ascii=False))
         await self._safe_send_many(batch)
         return not self._closed
 
