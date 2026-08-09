@@ -437,6 +437,33 @@ def test_gui_launches_even_when_desktop_entry_install_fails(tmp_path, monkeypatc
     assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
+def test_gui_build_only_does_not_register_linux_desktop_entry(tmp_path, monkeypatch):
+    """`hermes desktop --build-only` is the updater's headless rebuild step
+    (Desktop self-update → `hermes update` → `hermes desktop --build-only`).
+    It must never create or rewrite the launcher entry: the updater's
+    environment can differ from the desktop session's, so anything written
+    here risks persisting a broken `Exec=` into a launcher a real desktop
+    session later double-clicks.
+    """
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch, platform="linux")
+
+    monkeypatch.setattr("hermes_cli.linux_desktop_entry.is_supported", lambda: True)
+
+    registered: list[Path] = []
+    monkeypatch.setattr(
+        "hermes_cli.linux_desktop_entry.install_desktop_entry",
+        lambda project_root: registered.append(project_root) or (tmp_path / "hermes.desktop"),
+    )
+
+    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"):
+        cli_main.cmd_gui(_ns(build_only=True))
+
+    assert registered == []
+
+
 def test_gui_skips_desktop_entry_off_linux(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)

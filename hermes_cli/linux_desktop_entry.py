@@ -57,20 +57,65 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+def _is_env_python_source_wrapper(path: Path) -> bool:
+    """Whether ``path`` is a script that looks up ``python`` via ``PATH``.
+
+    A ``#!/usr/bin/env python3`` wrapper (e.g. a repo-root ``hermes``
+    launcher) resolves whatever interpreter is first on ``PATH`` at run
+    time. A desktop session's ``PATH`` can differ from wherever ``hermes
+    desktop`` was invoked from, so persisting this wrapper into ``Exec=``
+    risks a launcher that only works in one environment. An installed
+    console-script wrapper's shebang instead hardcodes its own venv
+    interpreter's absolute path, which has no such PATH dependency.
+
+    Requires the shebang's interpreter *basename* to be exactly ``env``
+    (not merely contain ``/env`` -- a real, hardcoded interpreter path
+    under a directory literally named ``envs`` must not match) and the
+    command it invokes to be a ``python*`` binary, tolerating ``env``'s
+    ``-S`` flag.
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return False
+    if not head.startswith(b"#!"):
+        return False
+    tokens = head.split(b"\n", 1)[0][2:].split()
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0].decode("utf-8", "replace")) != "env":
+        return False
+    args = tokens[1:]
+    if args[:1] == [b"-S"]:
+        args = args[1:]
+    if not args:
+        return False
+    command = os.path.basename(args[0].decode("utf-8", "replace"))
+    return command.startswith("python")
+
+
 def resolve_exec_command() -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
     Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
-    runs as a module with no launcher installed, use the current
+    runs as a module with no launcher installed, or the resolved binary is
+    a raw ``env python`` source wrapper unsafe to persist, use the current
     interpreter, also absolute.
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
     bin_path = resolve_hermes_bin()
-    if bin_path:
+    if bin_path and not _is_env_python_source_wrapper(Path(bin_path)):
         argv = [str(Path(bin_path).resolve()), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        # Absolute WITHOUT resolving a symlink: a venv's `bin/python` is
+        # typically a symlink to the base interpreter, and Python's venv
+        # detection keys off the invocation path (it looks for a
+        # `pyvenv.cfg` beside it), not the symlink target. Resolving it
+        # away would lose the venv's site-packages -- and hermes_cli with
+        # it -- the moment this Exec line runs from an unrelated cwd.
+        argv = [os.path.abspath(sys.executable), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
