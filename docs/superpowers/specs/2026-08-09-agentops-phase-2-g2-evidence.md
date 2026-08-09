@@ -6,10 +6,9 @@
 does not authorize a production rollout, lifecycle operation, Gateway,
 LaunchAgent or Cron change, LLM, Dashboard, R1-R4, merge or push.
 
-Sol's first G2 review returned `changes_requested`; the first remediation
-passed both P0 checks but the second review found additional counterexamples.
-This document is superseded again pending the second remediation commit. It is
-not a G2 approval claim.
+Sol's reviews returned `changes_requested`; this document records the final
+release-blocker remediation commit and its reproducible verification. It is
+not a G2 approval claim; independent Sol review remains required.
 
 ## Scope and protected assets
 
@@ -47,7 +46,7 @@ not a G2 approval claim.
 ```
 
 ```text
-111 passed in 3.41s
+114 passed in 3.53s
 ```
 
 ```bash
@@ -55,7 +54,7 @@ not a G2 approval claim.
 ```
 
 ```text
-111 passed in 6.29s
+114 passed in 6.26s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -67,7 +66,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.40s
+122 passed in 2.43s
 ```
 
 ```text
