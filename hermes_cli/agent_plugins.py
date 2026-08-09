@@ -558,14 +558,16 @@ def read_agent_plugin_manifest(plugin_root: Path) -> tuple[dict, tuple[AgentPlug
     return manifest, tuple(diagnostics)
 
 
-def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
+def has_enabled_agent_plugin_mcp(effective_config: Mapping[str, Any]) -> bool:
     """Compatibility wrapper for the shared PluginManager MCP probe.
 
     Directory scanning belongs to :mod:`hermes_cli.plugins` so startup gating
     and full plugin discovery cannot drift apart. Keep this import-compatible
-    entry point for callers that used the original helper.
+    entry point for callers that used the original helper. ``effective_config``
+    must come from the canonical config loader so environment expansion,
+    managed policy, and last-known-good behavior match runtime discovery.
     """
 
     from hermes_cli.plugins import has_enabled_agent_plugin_mcp as _probe
 
-    return _probe(raw_config)
+    return _probe(effective_config)

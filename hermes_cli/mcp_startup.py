@@ -14,15 +14,15 @@ _mcp_discovery_thread: Optional[threading.Thread] = None
 def _has_configured_mcp_servers() -> bool:
     """Cheap config probe so non-MCP users avoid importing the MCP stack."""
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import load_config_readonly
 
-        raw_config = read_raw_config() or {}
-        mcp_servers = raw_config.get("mcp_servers")
+        effective_config = load_config_readonly() or {}
+        mcp_servers = effective_config.get("mcp_servers")
         if isinstance(mcp_servers, dict) and len(mcp_servers) > 0:
             return True
         from hermes_cli.agent_plugins import has_enabled_agent_plugin_mcp
 
-        return has_enabled_agent_plugin_mcp(raw_config)
+        return has_enabled_agent_plugin_mcp(effective_config)
     except Exception:
         # Be conservative: if config probing fails, try discovery in the
         # background so startup still can't block.

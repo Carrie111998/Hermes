@@ -1580,19 +1580,23 @@ class PluginManager:
 
         return manifests
 
-    def has_enabled_portable_mcp(self, raw_config: Mapping[str, Any]) -> bool:
+    def has_enabled_portable_mcp(
+        self, effective_config: Mapping[str, Any]
+    ) -> bool:
         """Probe enabled portable MCP packages without loading plugins.
 
         The directory manifest collection is shared with full discovery, so
         native ``plugin.yaml`` precedence, source ordering, depth limits, and
         project-plugin gating cannot diverge between startup and runtime.
+        ``effective_config`` is the canonical loaded config snapshot used by
+        the startup gate, including environment expansion and managed policy.
         """
         if _env_enabled("HERMES_SAFE_MODE"):
             return False
 
         from hermes_cli.plugin_activation import PluginActivationState
 
-        activation = PluginActivationState.from_config(raw_config)
+        activation = PluginActivationState.from_config(effective_config)
         grouped: Dict[str, List[PluginManifest]] = {}
         for manifest in self._collect_directory_manifests():
             grouped.setdefault(manifest.key or manifest.name, []).append(manifest)
@@ -2303,13 +2307,13 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
-def has_enabled_agent_plugin_mcp(raw_config: Mapping[str, Any]) -> bool:
+def has_enabled_agent_plugin_mcp(effective_config: Mapping[str, Any]) -> bool:
     """Return whether config enables a portable package with MCP servers.
 
     A fresh manager performs manifest-only scanning, so this startup gate does
     not mutate the process-wide plugin registry or import native plugin code.
     """
-    return PluginManager().has_enabled_portable_mcp(raw_config)
+    return PluginManager().has_enabled_portable_mcp(effective_config)
 
 
 def discover_plugins(force: bool = False) -> None:

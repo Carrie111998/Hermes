@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from argparse import Namespace
 from contextlib import nullcontext
+import json
+from pathlib import Path
 import sys
 import threading
 import time
@@ -62,7 +64,9 @@ def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
         sys.modules,
         "hermes_cli.config",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
+            load_config_readonly=lambda: {
+                "mcp_servers": {"demo": {"transport": "stdio"}}
+            },
             load_config=lambda: {},
         ),
     )
@@ -119,7 +123,11 @@ def test_background_mcp_discovery_suppresses_interactive_oauth(monkeypatch):
         sys.modules,
         "hermes_cli.config",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"url": "https://mcp.example.test/mcp"}}},
+            load_config_readonly=lambda: {
+                "mcp_servers": {
+                    "demo": {"url": "https://mcp.example.test/mcp"}
+                }
+            },
         ),
     )
     monkeypatch.setitem(
@@ -150,7 +158,7 @@ def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        types.SimpleNamespace(read_raw_config=lambda: {}),
+        types.SimpleNamespace(load_config_readonly=lambda: {}),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -161,6 +169,54 @@ def test_portable_only_mcp_configuration_opens_startup_gate(monkeypatch):
     )
 
     assert mcp_startup._has_configured_mcp_servers() is True
+
+
+def test_portable_mcp_startup_gate_uses_effective_env_expansion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from hermes_cli.agent_plugins import MCP_SCHEMA_V1, PLUGIN_SCHEMA_V1
+    from hermes_cli.plugins import PluginManager
+
+    home = tmp_path / "home"
+    plugin = home / "plugins" / "portable.test"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.json").write_text(
+        json.dumps({"$schema": PLUGIN_SCHEMA_V1, "name": "portable.test"}),
+        encoding="utf-8",
+    )
+    (plugin / "mcp.json").write_text(
+        json.dumps(
+            {
+                "$schema": MCP_SCHEMA_V1,
+                "mcpServers": {
+                    "worker": {
+                        "type": "streamable-http",
+                        "url": "https://example.test/mcp",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - ${PORTABLE_ID}\n",
+        encoding="utf-8",
+    )
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
+    monkeypatch.setenv("PORTABLE_ID", "portable.test")
+
+    assert mcp_startup._has_configured_mcp_servers() is True
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    winner = manager._plugins["portable.test"]
+    assert winner.enabled is True
+    assert winner.manifest.name == "portable.test"
+    assert len(manager.get_portable_mcp_servers()) == 1
 
 
 
@@ -181,7 +237,9 @@ def _install_retry_stubs(monkeypatch, *, connected: bool, calls: dict):
         sys.modules,
         "hermes_cli.config",
         types.SimpleNamespace(
-            read_raw_config=lambda: {"mcp_servers": {"demo": {"transport": "stdio"}}},
+            load_config_readonly=lambda: {
+                "mcp_servers": {"demo": {"transport": "stdio"}}
+            },
         ),
     )
     monkeypatch.setitem(
