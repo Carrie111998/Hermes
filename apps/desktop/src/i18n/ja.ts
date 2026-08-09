@@ -2343,6 +2343,29 @@ export const ja = defineLocale({
       turnRunning: '実行中',
       contextUsage: 'コンテキスト使用状況',
       contextUsagePanel: {
+        accountName: suffix => `アカウント ${suffix}`,
+        accountEmpty: '設定済みのアカウントはありません',
+        accountError: 'アカウント使用量を読み込めませんでした',
+        accountLoading: 'アカウント使用量を読み込み中',
+        accountTitle: 'プロバイダーアカウント',
+        accountUnsupported: 'このバックエンドはアカウント使用量に対応していません',
+        callsAndTokens: (calls, tokens) => `${calls} 回 · ${tokens} トークン`,
+        health: {
+          cooldown: 'クールダウン中',
+          error: '確認が必要',
+          expired: '期限切れ',
+          ready: '利用可能',
+          unavailable: '利用不可'
+        },
+        localTitle: 'ローカルセッション',
+        localUnavailable: 'ローカルセッション分析は利用できません',
+        modelSummary: (provider, model) => `${provider} · ${model}`,
+        quota: {
+          error: 'プロバイダーの使用量取得に失敗しました',
+          unavailable: 'プロバイダーの使用量を取得できません',
+          unsupported: 'このプロバイダーはアカウント使用量を報告しません'
+        },
+        remaining: percent => `残り ${percent}%`,
         categories: {
           conversation: '会話',
           mcp: 'MCP',

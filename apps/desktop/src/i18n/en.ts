@@ -2533,6 +2533,29 @@ export const en: Translations = {
       turnRunning: 'Running',
       contextUsage: 'Context usage',
       contextUsagePanel: {
+        accountName: suffix => `Account ${suffix}`,
+        accountEmpty: 'No accounts are configured',
+        accountError: 'Account usage could not be loaded',
+        accountLoading: 'Loading account usage',
+        accountTitle: 'Provider Accounts',
+        accountUnsupported: 'Account usage is not supported by this backend',
+        callsAndTokens: (calls, tokens) => `${calls} calls · ${tokens} tokens`,
+        health: {
+          cooldown: 'Cooling down',
+          error: 'Needs attention',
+          expired: 'Expired',
+          ready: 'Ready',
+          unavailable: 'Unavailable'
+        },
+        localTitle: 'Local Session',
+        localUnavailable: 'No local session analytics are available',
+        modelSummary: (provider, model) => `${provider} · ${model}`,
+        quota: {
+          error: 'Provider usage request failed',
+          unavailable: 'Provider usage is unavailable',
+          unsupported: 'This provider does not report account usage'
+        },
+        remaining: percent => `${percent}% remaining`,
         categories: {
           conversation: 'Conversation',
           mcp: 'MCP',

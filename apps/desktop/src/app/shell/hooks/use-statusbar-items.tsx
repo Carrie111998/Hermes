@@ -535,6 +535,7 @@ export function useStatusbarItems({
           <ContextUsagePanel
             currentUsage={currentUsage}
             onUsageSnapshot={publishContextUsage}
+            profile={activeGatewayProfile}
             requestGateway={requestGateway}
             sessionId={activeSessionId}
           />
@@ -571,6 +572,7 @@ export function useStatusbarItems({
     ],
     [
       activeSessionId,
+      activeGatewayProfile,
       approvalModeItem,
       backendVersionItem,
       busy,

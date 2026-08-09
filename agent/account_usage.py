@@ -748,8 +748,10 @@ def redeem_codex_reset_credit(
     )
 
 
-def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
-    token = (resolve_anthropic_token() or "").strip()
+def _fetch_anthropic_account_usage(
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token = (api_key or resolve_anthropic_token() or "").strip()
     if not token:
         return None
     if not _is_oauth_token(token):
@@ -879,6 +881,32 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
         windows=tuple(windows),
         details=tuple(details),
     )
+
+
+ACCOUNT_USAGE_PROVIDERS = frozenset({"anthropic", "openai-codex", "openrouter"})
+
+
+def fetch_account_usage_for_credential(
+    provider: str,
+    *,
+    api_key: Optional[str],
+    base_url: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """Fetch usage for one exact credential without selecting from a pool.
+
+    Unlike :func:`fetch_account_usage`, provider errors intentionally propagate
+    so a structured consumer can distinguish an unavailable capability from a
+    failed provider request. The credential is accepted only as an argument and
+    is never copied into the returned snapshot.
+    """
+    normalized = str(provider or "").strip().lower()
+    if normalized == "openai-codex":
+        return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+    if normalized == "anthropic":
+        return _fetch_anthropic_account_usage(api_key=api_key)
+    if normalized == "openrouter":
+        return _fetch_openrouter_account_usage(base_url, api_key)
+    return None
 
 
 def fetch_account_usage(

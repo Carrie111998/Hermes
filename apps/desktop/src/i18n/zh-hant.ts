@@ -2266,6 +2266,29 @@ export const zhHant = defineLocale({
       turnRunning: '執行中',
       contextUsage: '上下文使用量',
       contextUsagePanel: {
+        accountName: suffix => `帳號 ${suffix}`,
+        accountEmpty: '尚未設定帳號',
+        accountError: '無法載入帳號用量',
+        accountLoading: '正在載入帳號用量',
+        accountTitle: '供應商帳號',
+        accountUnsupported: '目前後端不支援帳號用量',
+        callsAndTokens: (calls, tokens) => `${calls} 次呼叫 · ${tokens} tokens`,
+        health: {
+          cooldown: '冷卻中',
+          error: '需要處理',
+          expired: '已過期',
+          ready: '可用',
+          unavailable: '不可用'
+        },
+        localTitle: '本機工作階段',
+        localUnavailable: '沒有可用的本機工作階段分析',
+        modelSummary: (provider, model) => `${provider} · ${model}`,
+        quota: {
+          error: '供應商用量請求失敗',
+          unavailable: '供應商用量不可用',
+          unsupported: '此供應商不回報帳號用量'
+        },
+        remaining: percent => `剩餘 ${percent}%`,
         categories: {
           conversation: '對話',
           mcp: 'MCP',

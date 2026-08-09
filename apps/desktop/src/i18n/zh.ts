@@ -2713,6 +2713,29 @@ export const zh: Translations = {
       turnRunning: '运行中',
       contextUsage: '上下文用量',
       contextUsagePanel: {
+        accountName: suffix => `账号 ${suffix}`,
+        accountEmpty: '尚未配置账号',
+        accountError: '无法加载账号用量',
+        accountLoading: '正在加载账号用量',
+        accountTitle: '提供商账号',
+        accountUnsupported: '当前后端不支持账号用量',
+        callsAndTokens: (calls, tokens) => `${calls} 次调用 · ${tokens} tokens`,
+        health: {
+          cooldown: '冷却中',
+          error: '需要处理',
+          expired: '已过期',
+          ready: '可用',
+          unavailable: '不可用'
+        },
+        localTitle: '本地会话',
+        localUnavailable: '暂无本地会话分析',
+        modelSummary: (provider, model) => `${provider} · ${model}`,
+        quota: {
+          error: '提供商用量请求失败',
+          unavailable: '提供商用量不可用',
+          unsupported: '此提供商不报告账号用量'
+        },
+        remaining: percent => `剩余 ${percent}%`,
         categories: {
           conversation: '对话',
           mcp: 'MCP',

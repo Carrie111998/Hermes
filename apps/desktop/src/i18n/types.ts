@@ -2130,6 +2130,7 @@ export interface Translations {
       turnRunning: string
       contextUsage: string
       contextUsagePanel: {
+        accountName: (suffix: string) => string
         categories: {
           conversation: string
           mcp: string
@@ -2140,9 +2141,31 @@ export interface Translations {
           system_prompt: string
           tool_definitions: string
         }
+        accountEmpty: string
+        accountError: string
+        accountLoading: string
+        accountTitle: string
+        accountUnsupported: string
+        callsAndTokens: (calls: number, tokens: string) => string
         empty: string
+        health: {
+          cooldown: string
+          error: string
+          expired: string
+          ready: string
+          unavailable: string
+        }
+        localTitle: string
+        localUnavailable: string
         loading: string
+        modelSummary: (provider: string, model: string) => string
         percentFull: (percent: number) => string
+        quota: {
+          error: string
+          unavailable: string
+          unsupported: string
+        }
+        remaining: (percent: number) => string
         title: string
         tokenSummary: (used: string, max: string) => string
       }
