@@ -1079,6 +1079,68 @@ def _env_value(name: str) -> Optional[str]:
     return os.environ[name].strip() if name in os.environ else None
 
 
+# --- Profile-scoped .env resolution --------------------------------------------------
+#
+# When the desktop serve process runs multiple profiles in-process, the global
+# root .env is loaded into os.environ once at startup.  Per-profile .env files
+# are NOT reloaded — only a HERMES_HOME contextvar is set per session.  Any plugin
+# that reads os.environ directly picks up the root .env's credentials regardless
+# of the active profile.
+#
+# _profile_env_value() resolves OPENVIKING_* vars from the profile's own .env
+# file (via get_hermes_home(), which respects the contextvar) before falling
+# back to os.environ.  This is thread-safe (reads the file on each call, never
+# mutates os.environ) and backwards-compatible (falls back to os.environ when the
+# profile .env doesn't define a key).
+#
+# See: https://github.com/NousResearch/hermes-agent/issues/82117
+
+_PROFILE_ENV_KEYS = (
+    "OPENVIKING_ENDPOINT",
+    "OPENVIKING_API_KEY",
+    "OPENVIKING_ACCOUNT",
+    "OPENVIKING_USER",
+    "OPENVIKING_AGENT",
+)
+
+
+@lru_cache(maxsize=8)
+def _read_profile_env_cached(env_path: str, mtime: float) -> dict:
+    """Read .env values from ``env_path`` (cached by path+mtime so edits are
+    picked up without a process restart).  Returns only OPENVIKING_* keys."""
+    try:
+        from dotenv import dotenv_values
+
+        raw = dotenv_values(env_path)
+        return {k: (v.strip() if v else v) for k, v in raw.items() if k in _PROFILE_ENV_KEYS}
+    except Exception:
+        return {}
+
+
+def _profile_env_value(name: str) -> Optional[str]:
+    """Resolve an OPENVIKING_* env var from the profile's .env file, falling
+    back to os.environ.
+
+    Uses get_hermes_home() which follows the context-local override set by
+    set_hermes_home_override() — so in the serve process it resolves to the
+    active profile's home, and in a systemd gateway process it resolves to
+    that gateway's profile home (where os.environ already matches).
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        profile_home = get_hermes_home()
+        env_path = profile_home / ".env"
+        if env_path.is_file():
+            mtime = env_path.stat().st_mtime
+            values = _read_profile_env_cached(str(env_path), mtime)
+            if name in values and values[name]:
+                return values[name]
+    except Exception:
+        pass
+    return _env_value(name)
+
+
 def _first_nonempty(*values: Optional[str], default: str = "") -> str:
     for value in values:
         if value:
@@ -1093,11 +1155,11 @@ def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict
         ovcli_path = _resolve_ovcli_config_path(str(provider_config.get("ovcli_config_path") or ""))
         ovcli_values = _connection_values_from_ovcli(_load_ovcli_config(ovcli_path))
 
-    endpoint_env = _env_value("OPENVIKING_ENDPOINT")
-    api_key_env = _env_value("OPENVIKING_API_KEY")
-    account_env = _env_value("OPENVIKING_ACCOUNT")
-    user_env = _env_value("OPENVIKING_USER")
-    agent_env = _env_value("OPENVIKING_AGENT")
+    endpoint_env = _profile_env_value("OPENVIKING_ENDPOINT")
+    api_key_env = _profile_env_value("OPENVIKING_API_KEY")
+    account_env = _profile_env_value("OPENVIKING_ACCOUNT")
+    user_env = _profile_env_value("OPENVIKING_USER")
+    agent_env = _profile_env_value("OPENVIKING_AGENT")
 
     # Non-secret fields fall back to config.yaml (e.g. the Dashboard writes
     # ``memory.openviking.endpoint`` there) before the built-in default, so the
