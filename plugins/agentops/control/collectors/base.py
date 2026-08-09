@@ -1,8 +1,9 @@
-"""Protocol and failure isolation for read-only observer collectors."""
+"""Protocol, deadlines and failure isolation for read-only collectors."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Protocol
 
 from plugins.agentops.control.observer_models import (
@@ -16,34 +17,49 @@ from plugins.agentops.control.observer_models import (
 
 class Collector(Protocol):
     name: str
+    source_id: str
 
     def collect(self, target: Target, cursor: LogCursor | None = None) -> CollectionBatch: ...
 
 
-def failed_batch(target: Target, collector: str, reason: str) -> CollectionBatch:
-    """Return a non-echoing failure record rather than leaking collector input."""
+def failed_batch(target: Target, collector: str, reason: str, *, source_id: str = "") -> CollectionBatch:
+    """Return non-echoing bounded failure evidence, never an exception payload."""
     return CollectionBatch(
         target_id=target.target_id,
         collector=collector,
         collected_at=utc_now(),
         signals=(),
         health=CollectorHealth(healthy=False, reason=reason),
+        source_id=source_id,
     )
 
 
 def collect_all(
     target: Target,
     collectors: Iterable[Collector],
-    cursors: Mapping[str, LogCursor] | None = None,
+    cursors: Mapping[tuple[str, str], LogCursor] | Mapping[str, LogCursor] | None = None,
+    *,
+    deadline_seconds: float = 1.0,
 ) -> tuple[CollectionBatch, ...]:
-    """Contain a collector failure and suppress duplicate signal identities."""
+    """Apply a caller-visible deadline and keep every collector isolated.
+
+    A timed-out worker is never awaited at shutdown. It has no mutable control
+    surface; its caller receives a bounded unhealthy batch and the next
+    collector still runs.
+    """
+    if deadline_seconds <= 0:
+        raise ValueError("invalid collector deadline")
     batches: list[CollectionBatch] = []
     known_signal_ids: set[str] = set()
-    cursor_by_collector = {} if cursors is None else dict(cursors)
+    cursor_by_key = {} if cursors is None else dict(cursors)
     for collector in collectors:
         name = getattr(collector, "name", "unknown")
+        source_id = getattr(collector, "source_id", "")
+        cursor = cursor_by_key.get((name, source_id), cursor_by_key.get(name))
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
+        future = executor.submit(collector.collect, target, cursor)
         try:
-            batch = collector.collect(target, cursor_by_collector.get(name))
+            batch = future.result(timeout=deadline_seconds)
             if not isinstance(batch, CollectionBatch) or batch.target_id != target.target_id:
                 raise ValueError("invalid collection batch")
             unique_signals = tuple(signal for signal in batch.signals if signal.signal_id not in known_signal_ids)
@@ -56,10 +72,15 @@ def collect_all(
                     signals=unique_signals,
                     health=batch.health,
                     next_cursor=batch.next_cursor,
+                    source_id=batch.source_id,
+                    observation_id=batch.observation_id,
                 )
-        except TimeoutError:
-            batch = failed_batch(target, name, "collector_timeout")
+        except (FutureTimeout, TimeoutError):
+            future.cancel()
+            batch = failed_batch(target, name, "collector_timeout", source_id=source_id)
         except Exception:
-            batch = failed_batch(target, name, "collector_failed")
+            batch = failed_batch(target, name, "collector_failed", source_id=source_id)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
         batches.append(batch)
     return tuple(batches)

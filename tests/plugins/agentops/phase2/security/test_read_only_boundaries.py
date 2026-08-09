@@ -10,6 +10,14 @@ def test_phase_two_source_has_no_command_runner_or_target_control_primitives():
         assert forbidden not in source
 
 
+def test_target_sqlite_collector_has_no_sqlite_api_open_path():
+    source = Path("plugins/agentops/control/collectors/sqlite_health.py").read_text(encoding="utf-8")
+
+    assert "sqlite3" not in source
+    assert "integrity_check" not in source
+    assert '"integrity": "unknown"' in source
+
+
 def test_bridge_has_no_gateway_import_or_plugin_registration():
     tree = ast.parse(Path("plugins/agentops/bridge.py").read_text(encoding="utf-8"))
     imported_modules = [

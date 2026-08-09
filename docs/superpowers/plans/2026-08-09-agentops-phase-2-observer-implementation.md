@@ -35,8 +35,9 @@ target-specific SDK is introduced.
   worktree, SQLite target, or business data. Collectors use direct bounded
   file/API reads only; they never invoke a command interpreter.
 - AgentOps state writes are confined to a fixed `observer.db` underneath a
-  validated existing AgentOps state directory. Target SQLite files use a
-  read-only URI with `query_only=ON`; log/plist/Git reads reject symlinks.
+  validated existing AgentOps state directory. Target SQLite files are never
+  opened through SQLite: Phase 2 records regular-file metadata and
+  `integrity=unknown`; log/plist/Git reads reject symlinks.
 - Raw collector data is redacted before becoming a `Signal`, Bridge payload, or
   observer-store row. Redaction is applied once by the collector boundary and
   again by `commit_collection`; secret-like fields and token/cookie value
@@ -160,8 +161,9 @@ collect_all(target: Target, collectors: Iterable[Collector], cursors: Mapping[st
 - [x] Model Cron success as two facts: execution state and business assertion.
   A zero exit with a failing assertion must make the batch unhealthy and emit
   an unhealthy signal.
-- [x] Inspect target SQLite DB/WAL/SHM via read-only SQLite URI and file stats;
-  inspect Git `HEAD` and config by direct file reads. The Git collector reports
+- [x] Inspect target SQLite DB/WAL/SHM only through regular-file metadata and
+  report integrity as unknown; inspect Git `HEAD` and config by direct file
+  reads. The Git collector reports
   dirty state as `unknown` unless a read-only metadata callback explicitly
   supplies it, so it never asserts a false clean worktree.
 - [x] Test collector protocol, isolated failure, log duplicate suppression,
@@ -213,3 +215,69 @@ collect_all(target: Target, collectors: Iterable[Collector], cursors: Mapping[st
   or unavailable read-only inspection reports unhealthy/unknown evidence rather
   than a success inference.
 - [x] G2 approval remains outside this plan and requires independent review.
+
+## Sol G2 Remediation Addendum (2026-08-09)
+
+**Trigger:** Independent G2 review returned `changes_requested`. The earlier
+G2 evidence is superseded until every item below is implemented, negatively
+tested and independently re-reviewed. This addendum changes no authorization:
+Phase 2 remains an isolated read-only observer only.
+
+### Remediation scope and invariants
+
+- [x] **Target SQLite isolation.** Target DB/WAL/SHM are never opened through
+  SQLite while an external writer may be live. The collector records only
+  regular-file metadata and `integrity=unknown`; a test keeps a writer open
+  and proves every target file hash is unchanged.
+- [x] **End-to-end redaction.** JSON and quoted key/value log messages are
+  parsed before normalization, recursively redacted, then re-scanned at
+  collector and observer-store boundaries. Password/token/cookie canaries may
+  not appear in a persisted signal, snapshot, error or Bridge payload.
+- [x] **Lossless multi-source log cursors.** Cursors include a stable source
+  fingerprint as well as target and collector identity. Advancing a cursor is
+  limited to bytes actually converted into at most `max_lines` signals; signal
+  deduplication remains independent of source identity.
+- [x] **Collection-run evidence and Cron safety.** Persist every collection
+  run's observation ID, time, health and reason. Signal occurrence state tracks
+  first/last seen and count. Missing, stale or failing Cron assertions are
+  unhealthy even if exit code is zero.
+- [x] **Bridge immutability and concurrency.** The Bridge canonicalizes and
+  deep-copies event data, revalidates when enqueueing/draining, protects queue
+  operations with a lock and has capacity/injection race tests.
+- [x] **Git containment and standard worktree layouts.** Resolve refs only
+  under canonical git/common directories after every parent symlink check;
+  reject traversal. Support normal `.git` directories, gitdir files,
+  `commondir`, and packed refs by direct bounded reads.
+- [x] **Collector binding and budgets.** Targets own canonical approved asset
+  identities. Collectors reject unbound sources, impose wall-clock deadlines,
+  byte/item ceilings and rate limits, and report bounded failure evidence.
+- [x] **ObserverStore preflight.** Before any SQLite connection or WAL change,
+  verify AgentOps marker, ownership, modes, fixed path/inode constraints and
+  exact known schema/version/integrity. An unrelated existing database must be
+  byte-for-byte and journal-mode unchanged.
+- [x] **Review Pack completion.** Declare pack/version, target kinds, explicit
+  probes/budgets, assertion IDs/severity/mandatory states, input
+  classifications, production-read/dry-run/no-write behavior, failure runbook
+  and retention, with a strict manifest contract test.
+- [x] **Evidence and interpreter parity.** Replace invalidated G2 claims with
+  fresh results. Run Phase 1+2 and plugin regressions, security scans,
+  compileall and a Python 3.14 test environment with required dependencies
+  isolated from the main environment.
+
+### Additional files and tests
+
+| Area | Expected implementation/tests |
+|---|---|
+| Models/registry/cursors | source-aware `CursorKey`, immutable snapshots/assets; cursor loss tests |
+| Logs/redaction/store | JSON canary E2E, partial-line consumption, multi-log state, schema preflight and run-history tests |
+| Collectors | no-target-SQLite-open, live-WAL hashes, Git traversal/worktree/packed-ref, asset binding/deadline/budget tests |
+| Bridge | deep-copy, concurrent capacity and delivery revalidation tests |
+| Review pack/evidence | expanded manifest contract and corrected G2 matrix |
+
+### G2 re-review gate
+
+- [x] All remediation checkboxes have targeted negative tests.
+- [x] Fresh full verification is recorded without masking unavailable
+  interpreter dependencies.
+- [x] Worktree is clean after a remediation-only commit; no push, merge or
+  Phase 3 transition has occurred.

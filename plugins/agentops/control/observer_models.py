@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
@@ -16,11 +19,38 @@ from plugins.agentops.control.models import AuthorityMode
 
 _TARGET_ID = re.compile(r"^[a-z0-9][a-z0-9:._-]{2,199}$")
 _COLLECTOR_NAME = re.compile(r"^[a-z][a-z0-9_.-]{1,80}$")
+_OBSERVATION_ID = re.compile(r"^[a-f0-9-]{36}$")
+
+
+def _freeze_value(value: Any) -> Any:
+    """Recursively detach nested data from a caller before retaining it."""
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise ValueError("mapping keys must be strings")
+        return MappingProxyType({key: _freeze_value(child) for key, child in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(child) for child in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise ValueError("unsupported evidence value")
+
+
+def thaw_value(value: Any) -> Any:
+    """Create JSON-compatible detached values for a boundary crossing."""
+    if isinstance(value, Mapping):
+        return {key: thaw_value(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [thaw_value(child) for child in value]
+    return value
 
 
 def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Copy values before exposing a mapping from a frozen contract."""
-    return MappingProxyType(dict(value))
+    if not isinstance(value, Mapping):
+        raise ValueError("mapping required")
+    frozen = _freeze_value(value)
+    if not isinstance(frozen, Mapping):
+        raise ValueError("mapping required")
+    return frozen
 
 
 def _require_aware(value: datetime) -> datetime:
@@ -31,6 +61,29 @@ def _require_aware(value: datetime) -> datetime:
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def canonical_asset_path(value: str | Path) -> Path:
+    """Return a resolved asset identity before a collector binds a source."""
+    path = Path(value).expanduser()
+    return Path(os.path.abspath(os.fspath(path))).resolve(strict=False)
+
+
+def asset_source_id(value: str | Path) -> str:
+    canonical = os.fspath(canonical_asset_path(value)).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def target_allows_asset(target: "Target", value: str | Path) -> bool:
+    candidate = canonical_asset_path(value)
+    for observed in target.spec.observed_paths:
+        root = Path(observed)
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 class TargetKind(str, Enum):
@@ -50,11 +103,12 @@ class CursorResetReason(str, Enum):
     CONTINUE = "continue"
     ROTATED = "rotated"
     TRUNCATED = "truncated"
+    SOURCE_CHANGED = "source_changed"
 
 
 @dataclass(frozen=True)
 class TargetSpec:
-    """The allowed observation scope for one registered target."""
+    """The canonical assets that one target has authorized for observation."""
 
     target_id: str
     profile: str
@@ -71,14 +125,19 @@ class TargetSpec:
             raise ValueError("invalid target profile")
         if not isinstance(self.kind, TargetKind) or not isinstance(self.criticality, Criticality):
             raise ValueError("invalid target classification")
-        if not all(isinstance(path, str) and path for path in self.observed_paths):
-            raise ValueError("invalid observed path")
+        if not self.observed_paths or not all(isinstance(path, str) and path for path in self.observed_paths):
+            raise ValueError("target requires observed paths")
         if not isinstance(self.existing_writer, str) or not self.existing_writer.strip():
             raise ValueError("invalid existing writer")
         if not all(isinstance(key, str) and isinstance(value, str) for key, value in self.labels.items()):
             raise ValueError("invalid target labels")
-        object.__setattr__(self, "observed_paths", tuple(self.observed_paths))
+        canonical_paths = tuple(os.fspath(canonical_asset_path(path)) for path in self.observed_paths)
+        object.__setattr__(self, "observed_paths", canonical_paths)
         object.__setattr__(self, "labels", _freeze_mapping(self.labels))
+
+    @property
+    def asset_ids(self) -> tuple[str, ...]:
+        return tuple(asset_source_id(path) for path in self.observed_paths)
 
 
 @dataclass(frozen=True)
@@ -117,12 +176,15 @@ class TargetSnapshot:
 class LogCursor:
     inode: int
     offset: int
+    source_id: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.inode, int) or self.inode < 0:
             raise ValueError("invalid inode")
         if not isinstance(self.offset, int) or self.offset < 0:
             raise ValueError("invalid offset")
+        if not isinstance(self.source_id, str) or (self.source_id and not self.source_id.startswith("sha256:")):
+            raise ValueError("invalid cursor source")
 
 
 @dataclass(frozen=True)
@@ -191,7 +253,7 @@ class Signal:
             "collector": self.collector,
             "signal_type": self.signal_type,
             "observed_at": self.observed_at.isoformat(),
-            "payload": dict(self.payload),
+            "payload": thaw_value(self.payload),
             "severity": self.severity,
             "redaction_version": self.redaction_version,
         }
@@ -215,6 +277,8 @@ class CollectionBatch:
     signals: tuple[Signal, ...]
     health: CollectorHealth
     next_cursor: LogCursor | None = None
+    source_id: str = ""
+    observation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def __post_init__(self) -> None:
         if not isinstance(self.target_id, str) or not _TARGET_ID.fullmatch(self.target_id):
@@ -227,6 +291,12 @@ class CollectionBatch:
             raise ValueError("invalid collector health")
         if self.next_cursor is not None and not isinstance(self.next_cursor, LogCursor):
             raise ValueError("invalid batch cursor")
+        if not isinstance(self.source_id, str) or (self.source_id and not self.source_id.startswith("sha256:")):
+            raise ValueError("invalid source id")
+        if self.next_cursor is not None and self.source_id and self.next_cursor.source_id != self.source_id:
+            raise ValueError("cursor source does not match batch source")
+        if not isinstance(self.observation_id, str) or not _OBSERVATION_ID.fullmatch(self.observation_id):
+            raise ValueError("invalid observation id")
         object.__setattr__(self, "collected_at", _require_aware(self.collected_at))
         object.__setattr__(self, "signals", tuple(self.signals))
 
@@ -251,13 +321,38 @@ class BusinessAssertion:
     name: str
     passed: bool
     evidence: Mapping[str, Any] = field(default_factory=dict)
+    observed_at: datetime | None = None
+    max_age_seconds: int = 300
+    mandatory: bool = True
+    severity: str = "warning"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("invalid business assertion")
-        if not isinstance(self.passed, bool):
+        if not isinstance(self.passed, bool) or not isinstance(self.mandatory, bool):
             raise ValueError("invalid business assertion state")
+        if not isinstance(self.max_age_seconds, int) or self.max_age_seconds <= 0:
+            raise ValueError("invalid business assertion freshness")
+        if not isinstance(self.severity, str) or not self.severity:
+            raise ValueError("invalid assertion severity")
+        if self.observed_at is not None:
+            object.__setattr__(self, "observed_at", _require_aware(self.observed_at))
         object.__setattr__(self, "evidence", _freeze_mapping(self.evidence))
+
+
+@dataclass(frozen=True)
+class CronObservation:
+    """A detached read-only Cron status record, not an executable callback."""
+
+    execution: CronExecution
+    assertions: tuple[BusinessAssertion, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution, CronExecution) or not all(
+            isinstance(assertion, BusinessAssertion) for assertion in self.assertions
+        ):
+            raise ValueError("invalid cron observation")
+        object.__setattr__(self, "assertions", tuple(self.assertions))
 
 
 @dataclass(frozen=True)
@@ -270,12 +365,12 @@ class FleetCoverage:
 def stable_signal_id(
     *, target_id: str, collector: str, signal_type: str, payload: Mapping[str, Any]
 ) -> str:
-    """Create an opaque stable identity after the caller has redacted content."""
+    """Identity evidence without source path or observation time, for deduplication."""
     data = {
         "target_id": target_id,
         "collector": collector,
         "signal_type": signal_type,
-        "payload": dict(payload),
+        "payload": thaw_value(payload),
     }
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
