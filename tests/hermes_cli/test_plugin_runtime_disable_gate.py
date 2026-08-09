@@ -34,11 +34,15 @@ def _activation(*, enabled=(), disabled=(), safe_mode=False):
 @pytest.fixture(autouse=True)
 def _reset_plugin_cache():
     """Bust the plugin cache before and after each test."""
+    mounted_owners = dict(web_server._mounted_plugin_api_owners)
     web_server._dashboard_plugins_cache = None
     web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
     yield
     web_server._dashboard_plugins_cache = None
     web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
+    web_server._mounted_plugin_api_owners.update(mounted_owners)
 
 
 @pytest.fixture
@@ -160,11 +164,14 @@ class TestPluginApiRuntimeGate:
 
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
-        with patch.object(web_server, "_get_dashboard_plugins", return_value=[fake_plugin]), \
-             patch(
-                 "hermes_cli.config.load_plugin_activation_state",
-                 return_value=_activation(enabled={"hot"}, disabled={"hot"}),
-             ):
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"hot": fake_plugin},
+            clear=True,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=_activation(enabled={"hot"}, disabled={"hot"}),
+        ):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
         assert response.status_code == 404
@@ -223,6 +230,113 @@ class TestPluginApiRuntimeGate:
 
         assert response.status_code == 404
         call_next.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_middleware_gates_the_mounted_owner_after_winner_changes(
+        self,
+        tmp_path,
+    ):
+        """A new same-name winner cannot authorize the old mounted router."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        user_root = tmp_path / "user" / "shared-runtime"
+        bundled_root = tmp_path / "bundled" / "shared-runtime"
+        (user_root / "dashboard").mkdir(parents=True)
+        (bundled_root / "dashboard").mkdir(parents=True)
+
+        mounted_user = {
+            "name": "shared-api",
+            "source": "user",
+            "_dir": str(user_root / "dashboard"),
+            "_runtime_name": "shared-runtime",
+            "_runtime_key": "backend/shared-runtime",
+            "_runtime_source": "user",
+            "_runtime_kind": "backend",
+            "_runtime_managed": True,
+        }
+        current_bundled = {
+            **mounted_user,
+            "source": "bundled",
+            "_dir": str(bundled_root / "dashboard"),
+            "_runtime_source": "bundled",
+        }
+        runtime_entries = [
+            (
+                "shared-runtime",
+                "1.0.0",
+                "",
+                "bundled",
+                bundled_root,
+                "backend/shared-runtime",
+                "backend",
+            )
+        ]
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/shared-api/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {"token_authenticated": True},
+        })
+        call_next = AsyncMock(return_value=JSONResponse({"owner": "user"}))
+
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-api": mounted_user},
+            clear=True,
+        ), patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[current_bundled],
+        ), patch.object(
+            web_server,
+            "_discover_dashboard_runtime_entries",
+            return_value=runtime_entries,
+        ), patch(
+            "hermes_cli.config.load_plugin_activation_state",
+            return_value=_activation(enabled={"backend/shared-runtime"}),
+        ):
+            response = await web_server._plugin_api_runtime_gate(
+                request,
+                call_next,
+            )
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
+
+    def test_mount_skips_an_already_owned_public_namespace(self, tmp_path):
+        """A second same-name router cannot add differently gated subpaths."""
+        dashboard_dir = tmp_path / "second" / "dashboard"
+        dashboard_dir.mkdir(parents=True)
+        (dashboard_dir / "api.py").write_text("# import sentinel\n")
+        second_owner = {
+            "name": "shared-api",
+            "source": "user",
+            "_dir": str(dashboard_dir),
+            "_api_file": "api.py",
+        }
+
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-api": {"name": "shared-api", "source": "bundled"}},
+            clear=True,
+        ), patch.object(
+            web_server,
+            "_get_dashboard_plugins",
+            return_value=[second_owner],
+        ), patch.object(
+            web_server,
+            "_dashboard_plugin_is_active",
+            return_value=True,
+        ) as active, patch(
+            "importlib.util.spec_from_file_location",
+        ) as spec:
+            web_server._mount_plugin_api_routes()
+
+        active.assert_not_called()
+        spec.assert_not_called()
 
 
 class TestDashboardRouteNameCollision:
@@ -291,10 +405,10 @@ class TestDashboardRouteNameCollision:
         })
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
 
-        with patch.object(
-            web_server,
-            "_get_dashboard_plugins",
-            return_value=claimants,
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"shared-route": claimants[0]},
+            clear=True,
         ):
             response = await web_server._plugin_api_runtime_gate(request, call_next)
 
@@ -499,10 +613,10 @@ class TestProjectDashboardScopeInvalidation:
             "state": {"token_authenticated": True},
         })
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
-        with patch.object(
-            web_server,
-            "_get_dashboard_plugins",
-            return_value=[stale_plugin],
+        with patch.dict(
+            web_server._mounted_plugin_api_owners,
+            {"project-extension": stale_plugin},
+            clear=True,
         ), patch(
             "hermes_cli.config.load_plugin_activation_state",
             return_value=_activation(enabled={"project-extension"}),

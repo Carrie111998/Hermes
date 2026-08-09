@@ -93,6 +93,7 @@ def _install_example_plugin(_isolate_hermes_home):
     #      and start serving requests against a torn-down HERMES_HOME.
     app = web_server.app
     original_routes = list(app.router.routes)
+    original_mounted_owners = dict(web_server._mounted_plugin_api_owners)
 
     # Bust the module-level cache and re-discover so the example plugin
     # shows up in `_get_dashboard_plugins()`. `_mount_plugin_api_routes`
@@ -129,6 +130,8 @@ def _install_example_plugin(_isolate_hermes_home):
         # cache for the same reason.
         app.router.routes[:] = original_routes
         web_server._dashboard_plugins_cache = None
+        web_server._mounted_plugin_api_owners.clear()
+        web_server._mounted_plugin_api_owners.update(original_mounted_owners)
 
 
 # ---------------------------------------------------------------------------

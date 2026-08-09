@@ -48,11 +48,15 @@ def _reset_plugin_cache(monkeypatch):
     cache before *and* after each test so leakage between tests can't
     mask a regression — and so the production cache the import-time
     ``_mount_plugin_api_routes()`` populated doesn't bleed in."""
+    mounted_owners = dict(web_server._mounted_plugin_api_owners)
     web_server._dashboard_plugins_cache = None
     web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
     yield
     web_server._dashboard_plugins_cache = None
     web_server._dashboard_plugins_cache_fingerprint = None
+    web_server._mounted_plugin_api_owners.clear()
+    web_server._mounted_plugin_api_owners.update(mounted_owners)
 
 
 def _write_plugin_manifest(root: Path, name: str, manifest: dict) -> Path:

@@ -565,6 +565,12 @@ async def host_header_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# FastAPI routers stay mounted for the lifetime of the process.  Keep the
+# exact dashboard record whose router was mounted so request-time policy never
+# authorizes a different same-name winner discovered after a config refresh.
+_mounted_plugin_api_owners: dict[str, dict] = {}
+
+
 @app.middleware("http")
 async def _plugin_api_runtime_gate(request: Request, call_next):
     """Block requests to disabled plugin API routes at request time.
@@ -599,18 +605,10 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
             if len(parts) >= 4:
                 plugin_name = parts[3]
                 if plugin_name:
-                    # Determine plugin source.  Check the cached plugin list;
-                    # if not found, assume user plugin (safe default — blocks).
-                    plugins = _get_dashboard_plugins()
-                    plugin = next(
-                        (p for p in plugins if p.get("name") == plugin_name),
-                        None,
-                    )
-                    candidate = plugin or {
-                        "name": plugin_name,
-                        "source": "user",
-                    }
-                    if not _dashboard_plugin_is_active(candidate):
+                    mounted_owner = _mounted_plugin_api_owners.get(plugin_name)
+                    if mounted_owner is None or not _dashboard_plugin_is_active(
+                        mounted_owner
+                    ):
                         return JSONResponse(
                             status_code=404,
                             content={"detail": "Plugin not found"},
@@ -17827,6 +17825,12 @@ def _mount_plugin_api_routes():
         if not api_file_name:
             continue
         plugin_name = plugin.get("name", "")
+        if plugin_name in _mounted_plugin_api_owners:
+            _log.debug(
+                "Plugin %s: skipping API mount (namespace already mounted)",
+                plugin_name,
+            )
+            continue
         if not _dashboard_plugin_is_active(
             plugin,
             runtime_entries,
@@ -17887,6 +17891,10 @@ def _mount_plugin_api_routes():
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
             app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
+            # Route matching is first-wins.  Preserve the first successful
+            # mount for this public namespace even if a later manual rescan
+            # attempts to add another same-name router.
+            _mounted_plugin_api_owners[plugin_name] = dict(plugin)
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
