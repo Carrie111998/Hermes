@@ -135,6 +135,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -9205,15 +9206,11 @@ function hudUrl(sessionId, profile) {
   // adopts that backend instead of the primary — without it, a HUD opened on a
   // non-primary profile's conversation resolves the session id against the
   // wrong backend and falls back to the default profile's last session.
-  const profileKey = typeof profile === 'string' ? profile.trim() : ''
-  const query = `?win=hud${profileKey ? `&profile=${encodeURIComponent(profileKey)}` : ''}`
-  const route = sessionId ? `#/${encodeURIComponent(sessionId)}` : '#/'
-
-  if (DEV_SERVER) {
-    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/${query}${route}`
-  }
-
-  return `${pathToFileURL(resolveRendererIndex()).toString()}${query}${route}`
+  return buildHudWindowUrl(sessionId, {
+    devServer: DEV_SERVER,
+    profile,
+    rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+  })
 }
 
 // Tell every window whether the HUD is up, so a toggle in any of them reads
