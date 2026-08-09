@@ -14,6 +14,7 @@ import os
 import plistlib
 import re
 import stat
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -425,6 +426,9 @@ class ObservationRunbook:
         self._backlog_tail_reached = False
         self._state = "DRAINING"
         self._next_eligible_at = 0.0
+        self._next_observation_utc_day: date | None = None
+        self._missed_slot_days: set[date] = set()
+        self._lock = threading.RLock()
 
     def _reserve_event(self) -> None:
         if len(self._events) >= self.max_events:
@@ -461,11 +465,17 @@ class ObservationRunbook:
         return max(0.0, remaining)
 
     def drain_backlog(self, *, max_passes: int = 64) -> dict[str, Any]:
+        with self._lock:
+            return self._drain_backlog(max_passes=max_passes)
+
+    def _drain_backlog(self, *, max_passes: int = 64) -> dict[str, Any]:
         """Drain existing log backlog in bounded passes; it is not observation day 1."""
         if not isinstance(max_passes, int) or max_passes <= 0:
             raise ValueError("invalid backlog pass budget")
         if self._state != "DRAINING":
             raise ObservationBoundaryError("backlog drain is a one-shot stage")
+        if len(self._events) >= self.max_events:
+            raise ObservationBoundaryError("runbook event budget exceeded")
         if self._next_eligible_seconds() > 0:
             return self._metadata(stage="backlog_drain", status="safe_stop", passes=0, tail_reached=False, stop_reason="next_eligible_not_reached", next_eligible_seconds=math.ceil(self._next_eligible_seconds()), observation_day_counted=False)
         logs = next((collector for collector in self.loop.collectors if collector.name == "logs"), None)
@@ -515,12 +525,18 @@ class ObservationRunbook:
             raise ObservationBoundaryError("daily export verification required")
         current_summary = self.loop.ledger.daily_summary(day)
         current_terra = self.loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+        if day > utc_now().date():
+            raise ObservationBoundaryError("daily export cannot target a future UTC day")
+        if int(current_summary.get("run_count", 0)) <= 0:
+            raise ObservationBoundaryError("daily export cannot be empty")
         record_days = {
             _utc_day(datetime.fromisoformat(str(record["collected_at"])))
             for record in self.loop.ledger.batches()
         }
         if record_days and record_days != {day}:
             raise ObservationBoundaryError("daily export contains mixed UTC days")
+        if day in self._missed_slot_days:
+            raise ObservationBoundaryError("daily export has missing scheduled slots")
         if json.dumps(summary, sort_keys=True, separators=(",", ":")) != json.dumps(current_summary, sort_keys=True, separators=(",", ":")) or json.dumps(terra_input, sort_keys=True, separators=(",", ":")) != json.dumps(current_terra, sort_keys=True, separators=(",", ":")):
             raise ObservationBoundaryError("daily export does not match current ledger")
         envelope = {"summary": current_summary, "terra_input": current_terra}
@@ -530,9 +546,16 @@ class ObservationRunbook:
         return day, expected_receipt
 
     def rotate_after_daily_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self._rotate_after_daily_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
+
+    def _rotate_after_daily_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
         """Replace only the in-memory ledger after a verified UTC export."""
         if self._state != "OBSERVING":
             raise ObservationBoundaryError("daily rotation requires observing stage")
+        day = _utc_day(utc_day)
+        if self._next_observation_utc_day is None or day != self._next_observation_utc_day:
+            raise ObservationBoundaryError("daily export is out of sequence")
         self._reserve_event()
         day, receipt = self._verify_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
         if summary.get("day") != day.isoformat() or terra_input.get("summary", {}).get("day") != day.isoformat():
@@ -541,9 +564,14 @@ class ObservationRunbook:
             raise ObservationBoundaryError("daily export redaction gate failed")
         cursor_keys_before = tuple(sorted(self.loop._cursors))
         self.loop.ledger = ObservationLedger(max_runs=self.loop.ledger.max_runs, max_signals=self.loop.ledger.max_signals, max_bytes=self.loop.ledger.max_bytes)
-        return self._metadata(stage="daily_rotation", status="rotated", exported_utc_day=day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=True)
+        self._next_observation_utc_day = day + timedelta(days=1)
+        return self._metadata(stage="daily_rotation", status="rotated", exported_utc_day=day.isoformat(), next_observation_utc_day=self._next_observation_utc_day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=True)
 
     def finalize_backlog_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self._finalize_backlog_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
+
+    def _finalize_backlog_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
         if self._state != "READY" or not self._backlog_tail_reached:
             raise ObservationBoundaryError("backlog has not reached a verified tail")
         self._reserve_event()
@@ -551,10 +579,15 @@ class ObservationRunbook:
         cursor_keys_before = tuple(sorted(self.loop._cursors))
         self.loop.ledger = ObservationLedger(max_runs=self.loop.ledger.max_runs, max_signals=self.loop.ledger.max_signals, max_bytes=self.loop.ledger.max_bytes)
         next_day = day + timedelta(days=1)
+        self._next_observation_utc_day = next_day
         self._state = "OBSERVING"
         return self._metadata(stage="backlog_finalize", status="finalized", exported_utc_day=day.isoformat(), next_observation_utc_day=next_day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=False, day1_cleanup=True)
 
     def record_missed_slot(self, scheduled_at: datetime) -> dict[str, Any]:
+        with self._lock:
+            return self._record_missed_slot(scheduled_at)
+
+    def _record_missed_slot(self, scheduled_at: datetime) -> dict[str, Any]:
         if not isinstance(scheduled_at, datetime) or scheduled_at.tzinfo is None:
             raise ValueError("scheduled slot must be timezone-aware")
         scheduled_utc = scheduled_at.astimezone(timezone.utc)
@@ -563,11 +596,14 @@ class ObservationRunbook:
         slot_key = scheduled_utc.isoformat().replace("+00:00", "Z")
         if slot_key in self._slot_keys:
             raise ObservationBoundaryError("duplicate scheduled slot")
+        metadata = self._metadata(stage="scheduled_slot", status="missed", scheduled_at_utc=slot_key, catch_up=False, slot_satisfied=False, day_success_eligible=False, observation_day_counted=False)
         self._slot_keys.add(slot_key)
-        return self._metadata(stage="scheduled_slot", status="missed", scheduled_at_utc=slot_key, catch_up=False, slot_satisfied=False, day_success_eligible=False, observation_day_counted=False)
+        self._missed_slot_days.add(scheduled_utc.date())
+        return metadata
 
     def metadata(self) -> tuple[dict[str, Any], ...]:
-        return tuple(json.loads(json.dumps(item, sort_keys=True)) for item in self._events)
+        with self._lock:
+            return tuple(json.loads(json.dumps(item, sort_keys=True)) for item in self._events)
 
     @property
     def state(self) -> str:
