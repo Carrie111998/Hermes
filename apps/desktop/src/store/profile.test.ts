@@ -36,7 +36,7 @@ const {
 
 const { $connection } = await import('./session')
 const { invalidateProfileScopedQueries } = await import('@/lib/query-client')
-const { getProfiles } = await import('@/hermes')
+const { getProfiles, setApiRequestProfile } = await import('@/hermes')
 
 const profile = (name: string, isDefault = false): ProfileInfo => ({
   has_env: false,
@@ -57,6 +57,7 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
 const getConnection = vi.fn<
   (profile?: string | null, options?: { localOnly?: boolean; remoteOnly?: boolean }) => Promise<HermesConnection>
 >()
+
 const touchBackend = vi.fn(async () => ({ ok: true }))
 
 async function flushMicrotasks(count = 4): Promise<void> {
@@ -78,6 +79,7 @@ beforeEach(() => {
   $freshSessionRequest.set(0)
   vi.mocked(getProfiles).mockReset()
   vi.mocked(getProfiles).mockResolvedValue({ profiles: [] })
+  vi.mocked(setApiRequestProfile).mockClear()
   touchBackend.mockClear()
   vi.stubGlobal('window', { hermesDesktop: { getConnection, touchBackend } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
@@ -139,6 +141,7 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(getConnection).toHaveBeenCalledWith('default', { remoteOnly: true })
     expect($connection.get()?.mode).toBe('remote')
     expect($connection.get()?.profile).toBe('default')
+    expect(setApiRequestProfile).toHaveBeenLastCalledWith('default', { remoteOnly: true })
   })
 
   it('selects the local default instead of no-oping on a remote default with the same name', () => {

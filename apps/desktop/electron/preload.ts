@@ -4,7 +4,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: (profile, options) => ipcRenderer.invoke('hermes:connection', profile, options),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: (profile, options) => ipcRenderer.invoke('hermes:backend:touch', profile, options),
-  getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  getGatewayWsUrl: (profile, options) => ipcRenderer.invoke('hermes:gateway:ws-url', profile, options),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),

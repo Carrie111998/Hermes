@@ -71,12 +71,12 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
-  resolveRemoteBackendRail,
   resolveProfileBackendRoute,
+  resolveRemoteBackendRail,
   resolveTestWsUrl,
   savedProfileSsh,
-  touchBackendPoolEntries,
-  tokenPreview
+  tokenPreview,
+  touchBackendPoolEntries
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
@@ -6528,14 +6528,14 @@ async function mintGatewayWsTicket(baseUrl) {
 // calls this immediately before every gateway.connect() so each WS upgrade
 // carries a freshly-minted ticket. For local/token connections this just
 // reuses the static token (no minting needed).
-async function freshGatewayWsUrl(profile) {
+async function freshGatewayWsUrl(profile, options = {}) {
   // Mint for the requested profile's backend, NOT always the primary. The
   // renderer re-mints right before every gateway.connect(); when swapping to a
   // pooled profile we must return THAT backend's ws URL, otherwise the connect
   // silently lands back on the primary (default) backend and writes sessions to
   // the wrong profile's DB. A null/empty profile resolves to the primary, so
   // legacy callers and single-profile users are unchanged.
-  const connection = await ensureBackend(profile)
+  const connection = await ensureBackend(profile, options)
 
   if (connection.authMode === 'oauth') {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
@@ -10071,8 +10071,8 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile, options) => {
 
   return { ok: true }
 })
-ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => {
-  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:gateway:ws-url', async (_event, profile, options) => {
+  return gatewayWsUrlIpcResult(() => freshGatewayWsUrl(profile, options))
 })
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
@@ -10641,6 +10641,14 @@ ipcMain.handle('hermes:window:readBelow', async event => {
 //   PATCH  /api/sessions/{id}            → rename/archive on remote
 async function interceptSessionRequestForRemote(request) {
   if (typeof request?.path !== 'string') {
+    return undefined
+  }
+
+  // Explicit local-root traffic must stay on the local pool even while the
+  // window primary is global remote. The normal API route below already
+  // understands localOnly; bypass this legacy remote-profile shortcut so it
+  // cannot retarget the request before those options are evaluated.
+  if (request.localOnly === true) {
     return undefined
   }
 

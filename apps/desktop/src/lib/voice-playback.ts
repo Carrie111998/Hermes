@@ -1,6 +1,6 @@
 import { resolveGatewayWsUrl } from '@hermes/shared'
 
-import { getApiRequestProfile, speakText } from '@/hermes'
+import { getApiRequestProfile, getApiRequestTargetOptions, speakText } from '@/hermes'
 import {
   $voicePlayback,
   setVoicePlaybackState,
@@ -108,7 +108,10 @@ async function resolveSpeakStreamUrl(): Promise<null | string> {
     // ACTIVE profile's backend, then swap the gateway endpoint for the PCM
     // one — auth is shared across WS routes.
     const profile = getApiRequestProfile()
-    const wsUrl = await resolveGatewayWsUrl(desktop, await desktop.getConnection(profile))
+    const options = getApiRequestTargetOptions()
+    const targeted = options.localOnly || options.remoteOnly
+    const connection = targeted ? await desktop.getConnection(profile, options) : await desktop.getConnection(profile)
+    const wsUrl = await resolveGatewayWsUrl(desktop, connection, options)
     const url = new URL(wsUrl)
 
     if (!url.pathname.endsWith('/api/ws')) {

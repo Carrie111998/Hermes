@@ -20,8 +20,10 @@ import {
   listSessions,
   listSidebarSessions,
   resetSidebarBatchCapability,
+  saveHermesConfig,
   setApiRequestProfile,
   speakText,
+  STARTUP_REQUEST_TIMEOUT_MS,
   transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
@@ -415,6 +417,48 @@ describe('Hermes REST helpers', () => {
       path: '/api/audio/speak',
       profile: 'rhaegal',
       timeoutMs: AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS
+    })
+  })
+
+  it('carries an explicit local root target through representative REST reads and writes', async () => {
+    setApiRequestProfile('default', { localOnly: true })
+
+    await getHermesConfig()
+    await saveHermesConfig({ model: { default: 'synthetic/local-model' } })
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      localOnly: true,
+      path: '/api/config',
+      profile: 'default',
+      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      body: { config: { model: { default: 'synthetic/local-model' } } },
+      localOnly: true,
+      method: 'PUT',
+      path: '/api/config',
+      profile: 'default'
+    })
+  })
+
+  it('carries an explicit remote root target through representative REST reads and writes', async () => {
+    setApiRequestProfile('default', { remoteOnly: true })
+
+    await getHermesConfig()
+    await saveHermesConfig({ model: { default: 'synthetic/remote-model' } })
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      path: '/api/config',
+      profile: 'default',
+      remoteOnly: true,
+      timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      body: { config: { model: { default: 'synthetic/remote-model' } } },
+      method: 'PUT',
+      path: '/api/config',
+      profile: 'default',
+      remoteOnly: true
     })
   })
 

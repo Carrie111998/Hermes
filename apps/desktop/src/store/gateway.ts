@@ -326,7 +326,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
 
   const options = entry.localOnly ? { localOnly: true } : entry.remoteOnly ? { remoteOnly: true } : undefined
   const conn = await desktop.getConnection(entry.profile, options)
-  const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+  const wsUrl = await resolveGatewayWsUrl(desktop, conn, options)
   await entry.gateway.connect(wsUrl)
   void desktop.touchBackend?.(entry.profile, options).catch(() => undefined)
 }
@@ -449,8 +449,9 @@ export async function ensureGatewayForProfile(profile: string, options: GatewayP
 
     try {
       await openSecondary(entry)
-    } catch {
+    } catch (error) {
       scheduleReconnect(entry)
+      throw error
     }
   }
 
@@ -532,7 +533,10 @@ function disposeSecondary(entry: Secondary): void {
 // (profiles with a running / needs-input session). Bounds cost to live work.
 export function pruneSecondaryGateways(keep: Set<string>): void {
   for (const [key, entry] of [...g.secondaries]) {
-    if (key === g.activeKey || keep.has(key)) {
+    const pinnedRootTarget =
+      key === `${LOCAL_TARGET_PREFIX}default` || key === `${REMOTE_TARGET_PREFIX}default`
+
+    if (key === g.activeKey || keep.has(key) || pinnedRootTarget) {
       continue
     }
 

@@ -44,7 +44,6 @@ import {
 } from '@/lib/reorder'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $connection } from '@/store/session'
 import {
   $activeGatewayProfile,
   $profileColors,
@@ -65,6 +64,7 @@ import {
   sortByProfileOrder
 } from '@/store/profile'
 import { runExportProfileFlow, runImportProfileFlow } from '@/store/profile-share'
+import { $connection } from '@/store/session'
 import type { ProfileInfo } from '@/types/hermes'
 
 import { CreateProfileDialog } from '../../profiles/create-profile-dialog'
@@ -238,7 +238,7 @@ export function ProfileRail() {
       ?.getConnectionConfig?.()
       .then(config => {
         if (!cancelled) {
-          setHasSavedRemote(Boolean(config.remoteUrl.trim()))
+          setHasSavedRemote(Boolean(config.remoteUrl.trim() || config.sshHost.trim()))
         }
       })
       .catch(() => {

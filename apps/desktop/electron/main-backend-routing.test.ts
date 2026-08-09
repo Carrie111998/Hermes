@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -203,6 +204,36 @@ async function importMainForTest() {
   return (await import('./main')) as any
 }
 
+async function startJsonServer(label: string) {
+  const requests: Array<{ body: string; method: string; path: string }> = []
+
+  const server = http.createServer((request, response) => {
+    const chunks: Buffer[] = []
+
+    request.on('data', chunk => chunks.push(Buffer.from(chunk)))
+    request.on('end', () => {
+      requests.push({
+        body: Buffer.concat(chunks).toString('utf8'),
+        method: request.method || 'GET',
+        path: request.url || '/'
+      })
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ backend: label }))
+    })
+  })
+
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+
+  assert.ok(address && typeof address === 'object')
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve()))),
+    requests
+  }
+}
+
 test('hermes:backend:touch refreshes pooled explicit root rails through the main IPC handler', async () => {
   const main = await importMainForTest()
   const hooks = main.__backendRoutingTestHooks
@@ -285,4 +316,112 @@ test('main resolveRemoteBackend remoteOnly uses the saved global remote while th
     token: 'redacted-token',
     wsUrl: 'wss://remote.example.test/hermes/api/ws?token=redacted-token'
   })
+})
+
+test('hermes:api reads from the explicit remote root when the primary backend is local', async () => {
+  const main = await importMainForTest()
+  const hooks = main.__backendRoutingTestHooks
+  const local = await startJsonServer('local')
+  const remote = await startJsonServer('remote')
+
+  try {
+    fs.writeFileSync(
+      path.join(tempDir, 'connection.json'),
+      JSON.stringify({
+        mode: 'local',
+        remote: {
+          authMode: 'token',
+          mode: 'remote',
+          token: { encoding: 'plain', value: 'redacted-token' },
+          url: remote.baseUrl
+        },
+        profiles: {}
+      })
+    )
+    hooks.backendPool.clear()
+    hooks.backendPool.set('remote:default', {
+      connectionPromise: Promise.resolve({
+        authMode: 'token',
+        baseUrl: remote.baseUrl,
+        mode: 'remote',
+        profile: 'default',
+        token: 'redacted-token'
+      }),
+      lastActiveAt: 1
+    })
+    hooks.backendPool.set('local:default', {
+      connectionPromise: Promise.resolve({
+        authMode: 'token',
+        baseUrl: local.baseUrl,
+        mode: 'local',
+        profile: 'default',
+        token: 'redacted-token'
+      }),
+      lastActiveAt: 1
+    })
+
+    const handler = electronMock.handlers.get('hermes:api')
+    const response = await handler?.({}, { path: '/api/config', profile: 'default', remoteOnly: true })
+
+    assert.deepEqual(response, { backend: 'remote' })
+    assert.equal(remote.requests.length, 1)
+    assert.equal(local.requests.length, 0)
+  } finally {
+    hooks.backendPool.clear()
+    await Promise.all([local.close(), remote.close()])
+  }
+})
+
+test('hermes:api session writes stay on the explicit local root when the primary backend is remote', async () => {
+  const main = await importMainForTest()
+  const hooks = main.__backendRoutingTestHooks
+  const local = await startJsonServer('local')
+  const remote = await startJsonServer('remote')
+
+  try {
+    fs.writeFileSync(
+      path.join(tempDir, 'connection.json'),
+      JSON.stringify({
+        mode: 'remote',
+        remote: {
+          authMode: 'token',
+          mode: 'remote',
+          token: { encoding: 'plain', value: 'redacted-token' },
+          url: remote.baseUrl
+        },
+        profiles: {}
+      })
+    )
+    hooks.backendPool.clear()
+    hooks.backendPool.set('local:default', {
+      connectionPromise: Promise.resolve({
+        authMode: 'token',
+        baseUrl: local.baseUrl,
+        mode: 'local',
+        profile: 'default',
+        token: 'redacted-token'
+      }),
+      lastActiveAt: 1
+    })
+
+    const handler = electronMock.handlers.get('hermes:api')
+
+    const response = await handler?.(
+      {},
+      {
+        body: { title: 'Synthetic title' },
+        localOnly: true,
+        method: 'PATCH',
+        path: '/api/sessions/session-redacted',
+        profile: 'default'
+      }
+    )
+
+    assert.deepEqual(response, { backend: 'local' })
+    assert.equal(local.requests.length, 1)
+    assert.equal(remote.requests.length, 0)
+  } finally {
+    hooks.backendPool.clear()
+    await Promise.all([local.close(), remote.close()])
+  }
 })

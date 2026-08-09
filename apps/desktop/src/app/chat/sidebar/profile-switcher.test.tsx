@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
 import { MemoryRouter } from 'react-router'
@@ -235,6 +235,38 @@ describe('ProfileRail backend controls', () => {
 
     fireEvent.pointerOver(screen.getByRole('button', { name: 'Mac backend' }))
     expect(prewarmBackend).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a saved inactive SSH backend available while the local root is active', async () => {
+    getConnectionConfig.mockResolvedValue({
+      cloudOrg: '',
+      envOverride: false,
+      mode: 'local',
+      profile: null,
+      remoteAuthMode: 'token',
+      remoteOauthConnected: false,
+      remoteTokenPreview: 'set',
+      remoteTokenSet: true,
+      remoteUrl: '',
+      sshHost: 'saved-remote.example.test',
+      sshKeyPath: '/redacted/key',
+      sshPort: 2222,
+      sshRemoteHermesPath: '',
+      sshRemoteProfile: 'default',
+      sshUser: 'synthetic-user'
+    })
+
+    await renderRail()
+    await act(async () => {
+      await getConnectionConfig.mock.results.at(-1)?.value
+      await Promise.resolve()
+    })
+
+    const remoteButton = screen.getByRole('button', { name: 'Remote backend' })
+    expect(remoteButton.getAttribute('aria-disabled')).not.toBe('true')
+
+    fireEvent.click(remoteButton)
+    expect(selectBackend).toHaveBeenCalledWith('remote')
   })
 
   it('keeps the unavailable remote control focusable, blocked, and explained when no saved remote is available', async () => {

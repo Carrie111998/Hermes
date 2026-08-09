@@ -16,9 +16,8 @@ import { test } from 'vitest'
 
 import {
   AT_COOKIE_VARIANTS,
-  backendPoolTouchKeys,
-  touchBackendPoolEntries,
   authModeFromStatus,
+  backendPoolTouchKeys,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
   connectionScopeKey,
@@ -44,7 +43,8 @@ import {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  touchBackendPoolEntries
 } from './connection-config'
 
 // --- connectionScopeKey / normAuthMode ---

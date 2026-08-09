@@ -7,6 +7,14 @@ class FakeHermesGateway {
   readonly eventListeners = new Set<(event: { payload?: unknown; session_id?: string; type: string }) => void>()
 
   async connect(_url: string): Promise<void> {
+    const failure = connectFailures.shift()
+
+    if (failure) {
+      this.connectionState = 'error'
+      this.stateListeners.forEach(listener => listener('error'))
+      throw failure
+    }
+
     this.connectionState = 'open'
     this.stateListeners.forEach(listener => listener('open'))
   }
@@ -35,13 +43,16 @@ class FakeHermesGateway {
 }
 
 const constructedGateways: FakeHermesGateway[] = []
+const connectFailures: Error[] = []
 const setGatewayState = vi.fn()
 const markNativeNotifyBaseline = vi.fn()
 const resolveGatewayWsUrl = vi.fn(async () => 'ws://synthetic-gateway.test/ws')
+
 const getConnection = vi.fn(
   async (_profile?: string | null, _options?: { localOnly?: boolean; remoteOnly?: boolean }) =>
     ({ baseUrl: 'https://synthetic-gateway.test', mode: 'remote', profile: 'default' }) as never
 )
+
 const touchBackend = vi.fn(async () => ({ ok: true }))
 
 vi.mock('@hermes/shared', () => ({ resolveGatewayWsUrl }))
@@ -65,6 +76,7 @@ describe('gateway target-aware registry behavior', () => {
     markNativeNotifyBaseline.mockClear()
     resolveGatewayWsUrl.mockClear()
     constructedGateways.length = 0
+    connectFailures.length = 0
     vi.stubGlobal('window', { hermesDesktop: { getConnection, touchBackend } })
   })
 
@@ -74,6 +86,7 @@ describe('gateway target-aware registry behavior', () => {
     gateway.closeSecondaryGateways()
     gateway.setPrimaryGateway(null)
     gateway.setPrimaryBackendMode('local')
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.resetModules()
     vi.clearAllMocks()
@@ -140,6 +153,48 @@ describe('gateway target-aware registry behavior', () => {
     expect(reopened).not.toBe(primary)
   })
 
+  it('keeps the prior active gateway when descriptor acquisition fails and retries in the background', async () => {
+    vi.useFakeTimers()
+    const gateway = await import('./gateway')
+    const primary = new FakeHermesGateway()
+    const failure = new Error('synthetic descriptor failure')
+
+    primary.connectionState = 'open'
+    gateway.setPrimaryGateway(primary as never, 'default')
+    gateway.setPrimaryBackendMode('local')
+    await gateway.ensureGatewayForProfile('default')
+    getConnection.mockRejectedValueOnce(failure)
+
+    await expect(gateway.ensureGatewayForProfile('default', { remoteOnly: true })).rejects.toBe(failure)
+
+    expect(gateway.activeGateway()).toBe(primary)
+    expect(gateway.activeGatewayTargetOptions()).toEqual({})
+
+    await vi.advanceTimersByTimeAsync(1)
+
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    expect(constructedGateways[0]?.connectionState).toBe('open')
+    expect(gateway.activeGateway()).toBe(primary)
+    vi.useRealTimers()
+  })
+
+  it('keeps the prior active gateway when the target socket fails to open', async () => {
+    const gateway = await import('./gateway')
+    const primary = new FakeHermesGateway()
+    const failure = new Error('synthetic socket failure')
+
+    primary.connectionState = 'open'
+    gateway.setPrimaryGateway(primary as never, 'default')
+    gateway.setPrimaryBackendMode('local')
+    await gateway.ensureGatewayForProfile('default')
+    connectFailures.push(failure)
+
+    await expect(gateway.ensureGatewayForProfile('default', { remoteOnly: true })).rejects.toBe(failure)
+
+    expect(gateway.activeGateway()).toBe(primary)
+    expect(gateway.activeGatewayTargetOptions()).toEqual({})
+  })
+
   it('touches explicit local and remote root secondaries with their own target options', async () => {
     const gateway = await import('./gateway')
     const primary = new FakeHermesGateway()
@@ -172,7 +227,7 @@ describe('gateway target-aware registry behavior', () => {
     expect(gateway.sessionGatewayRetentionKey('writer', 'stored-redacted')).toBe('writer')
   })
 
-  it('prunes only the explicitly kept default-root target', async () => {
+  it('pins prewarmed and previously selected root targets across ordinary pruning', async () => {
     const gateway = await import('./gateway')
     const primary = new FakeHermesGateway()
 
@@ -180,13 +235,20 @@ describe('gateway target-aware registry behavior', () => {
     gateway.setPrimaryGateway(primary as never, 'writer')
     gateway.setPrimaryBackendMode('local')
 
-    await gateway.ensureGatewayForProfile('default', { localOnly: true })
+    await gateway.openGatewayForProfile('default', { localOnly: true })
     await gateway.ensureGatewayForProfile('default', { remoteOnly: true })
+    await gateway.openGatewayForProfile('ordinary-profile')
 
     touchBackend.mockClear()
-    gateway.pruneSecondaryGateways(new Set(['__remote__:default']))
+    gateway.pruneSecondaryGateways(new Set())
     gateway.touchSecondaryGateways()
 
-    expect(touchBackend.mock.calls).toEqual([['default', { remoteOnly: true }]])
+    expect(touchBackend.mock.calls).toEqual(
+      expect.arrayContaining([
+        ['default', { localOnly: true }],
+        ['default', { remoteOnly: true }]
+      ])
+    )
+    expect(touchBackend).not.toHaveBeenCalledWith('ordinary-profile', undefined)
   })
 })

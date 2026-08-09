@@ -15,8 +15,8 @@ import {
   $gateway,
   activeGatewayTargetOptions,
   ensureGatewayForProfile,
-  openGatewayForProfile,
-  type GatewayProfileOptions
+  type GatewayProfileOptions,
+  openGatewayForProfile
 } from '@/store/gateway'
 import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
@@ -110,12 +110,14 @@ function mergeProfileCatalogs(
 export async function refreshProfiles(): Promise<ProfileInfo[]> {
   const activeKey = normalizeProfileKey($activeGatewayProfile.get())
   const activeIsRemote = $connection.get()?.mode === 'remote'
+
   const activeProfilesRequest =
     activeKey === 'default'
       ? activeIsRemote
         ? getProfiles(null)
         : getProfiles('default', { localOnly: true })
       : getProfiles(activeKey)
+
   const [{ profiles: activeProfiles }, localResponse] = await Promise.all([
     activeProfilesRequest,
     getProfiles('default', { localOnly: true }).catch(() => ({ profiles: [] }))
@@ -251,8 +253,25 @@ export function requestFreshSession(): void {
 // previous profile so pages refetch against the right backend. Fires once
 // immediately (no real change → no invalidation), so single-profile users just
 // get "default" (→ the primary backend) with no extra fetches.
-let _lastRoutedProfile: string | null = null
+let _lastRoutedTarget: string | null = null
 let _profileRouteInitialized = false
+
+function publishApiRequestTarget(profile: string, options: GatewayProfileOptions, enabled = true): void {
+  const key = normalizeProfileKey(profile)
+  const target = `${key}:${options.localOnly ? 'local' : options.remoteOnly ? 'remote' : 'plain'}`
+
+  setApiRequestProfile(enabled ? key : null, enabled ? options : {})
+
+  if (_lastRoutedTarget !== null && _lastRoutedTarget !== target) {
+    // Profile-scoped settings + the unified session list are now stale.
+    // Narrowed so account/marketplace/onboarding caches don't refetch on
+    // every profile or backend-root switch.
+    invalidateProfileScopedQueries()
+    resetStarmapGraph()
+  }
+
+  _lastRoutedTarget = target
+}
 
 $activeGatewayProfile.subscribe(value => {
   const key = normalizeProfileKey(value)
@@ -260,18 +279,8 @@ $activeGatewayProfile.subscribe(value => {
   // Electron main process may have launched the primary backend under another
   // stored profile. Do not route early REST calls to an explicit default pool
   // until boot has adopted the main process's actual primary profile.
-  setApiRequestProfile(_profileRouteInitialized ? key : null)
+  publishApiRequestTarget(key, {}, _profileRouteInitialized)
   _profileRouteInitialized = true
-
-  if (_lastRoutedProfile !== null && _lastRoutedProfile !== key) {
-    // Profile-scoped settings + the unified session list are now stale.
-    // Narrowed so account/marketplace/onboarding caches don't refetch on
-    // every profile switch.
-    invalidateProfileScopedQueries()
-    resetStarmapGraph()
-  }
-
-  _lastRoutedProfile = key
 })
 
 // Target profile while a gateway swap is mid-flight (spawning/reconnecting that
@@ -409,6 +418,9 @@ export async function ensureGatewayProfile(
     const gateway = options.localOnly || options.remoteOnly ? ensureGatewayForProfile(target, options) : ensureGatewayForProfile(target)
     await gateway
     $activeGatewayProfile.set(target)
+    // A local-root ↔ remote-root switch keeps the same profile name, so the
+    // atom above may not notify. Publish the full target identity explicitly.
+    publishApiRequestTarget(target, options)
     // The active backend just changed; resync $connection so remote-aware
     // paths (image.attach_bytes vs image.attach, /api/fs/*, /api/media) follow.
     await syncConnectionToActiveProfile(target, options)
@@ -453,12 +465,14 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
   const options = profileTargetOptions(target)
+
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
   const switching =
     $showAllProfiles.get() ||
     target !== normalizeProfileKey($activeGatewayProfile.get()) ||
     Boolean(options.localOnly)
+
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
 

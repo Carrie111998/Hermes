@@ -682,6 +682,6 @@ export {
   resolveTestWsUrl,
   RT_COOKIE_VARIANTS,
   savedProfileSsh,
-  touchBackendPoolEntries,
-  tokenPreview
+  tokenPreview,
+  touchBackendPoolEntries
 }

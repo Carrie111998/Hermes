@@ -2,6 +2,8 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import type * as GatewayStore from '@/store/gateway'
+import type * as ProfileStore from '@/store/profile'
 import { $connection, $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
@@ -12,7 +14,7 @@ const { prewarmBackend, setPrimaryBackendMode } = vi.hoisted(() => ({
 }))
 
 vi.mock('@/store/profile', async importOriginal => {
-  const actual = await importOriginal<typeof import('@/store/profile')>()
+  const actual = await importOriginal<typeof ProfileStore>()
 
   prewarmBackend.mockImplementation(actual.prewarmBackend)
 
@@ -23,7 +25,7 @@ vi.mock('@/store/profile', async importOriginal => {
 })
 
 vi.mock('@/store/gateway', async importOriginal => {
-  const actual = await importOriginal<typeof import('@/store/gateway')>()
+  const actual = await importOriginal<typeof GatewayStore>()
 
   setPrimaryBackendMode.mockImplementation(actual.setPrimaryBackendMode)
 
@@ -386,6 +388,46 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     expect(setPrimaryBackendMode).toHaveBeenCalledWith('local')
+    expect(prewarmBackend).toHaveBeenCalledWith('remote')
+  })
+
+  it('prewarms a saved inactive SSH root when the local primary connects', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () =>
+      ({
+        authMode: 'token' as const,
+        baseUrl: 'http://127.0.0.1:9191',
+        mode: 'local' as const,
+        profile: 'default',
+        token: 't',
+        wsUrl: 'ws://127.0.0.1:9191/api/ws?token=t'
+      }) as never
+    )
+    desktop.getConnectionConfig = vi.fn(async () =>
+      ({
+        cloudOrg: '',
+        envOverride: false,
+        mode: 'local' as const,
+        profile: null,
+        remoteAuthMode: 'token' as const,
+        remoteOauthConnected: false,
+        remoteTokenPreview: 'set',
+        remoteTokenSet: true,
+        remoteUrl: '',
+        sshHost: 'saved-remote.example.test',
+        sshKeyPath: '/redacted/key',
+        sshPort: 2222,
+        sshRemoteHermesPath: '',
+        sshRemoteProfile: 'default',
+        sshUser: 'synthetic-user'
+      }) as never
+    )
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
     expect(prewarmBackend).toHaveBeenCalledWith('remote')
   })
 

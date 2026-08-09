@@ -245,16 +245,29 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // Electron main consumes request.profile to pick which backend *process* serves
 // the call; each pooled backend already has its own HERMES_HOME, so no backend
 // change is needed. Null → primary, so single-profile users are unaffected.
-let _apiProfile: null | string = null
-
-export function setApiRequestProfile(profile: null | string): void {
-  _apiProfile = profile || null
+export interface ApiRequestTargetOptions {
+  localOnly?: boolean
+  remoteOnly?: boolean
 }
 
-function profileScoped(profile?: null | string): { profile?: string } {
-  const selected = profile === undefined ? _apiProfile : profile
+let _apiProfile: null | string = null
+let _apiTargetOptions: ApiRequestTargetOptions = {}
 
-  return selected ? { profile: selected } : {}
+export function setApiRequestProfile(profile: null | string, options: ApiRequestTargetOptions = {}): void {
+  _apiProfile = profile || null
+  _apiTargetOptions = _apiProfile
+    ? {
+        ...(options.localOnly ? { localOnly: true } : {}),
+        ...(options.remoteOnly ? { remoteOnly: true } : {})
+      }
+    : {}
+}
+
+function profileScoped(profile?: null | string): ApiRequestTargetOptions & { profile?: string } {
+  const selected = profile === undefined ? _apiProfile : profile
+  const options = profile === undefined ? _apiTargetOptions : {}
+
+  return selected ? { profile: selected, ...options } : {}
 }
 
 /** Profile that profile-scoped REST/WS calls should target (null → primary).
@@ -262,6 +275,10 @@ function profileScoped(profile?: null | string): { profile?: string } {
  *  that build their own connection URLs and must stay on the same backend. */
 export function getApiRequestProfile(): null | string {
   return _apiProfile
+}
+
+export function getApiRequestTargetOptions(): ApiRequestTargetOptions {
+  return { ..._apiTargetOptions }
 }
 
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
@@ -325,7 +342,16 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
   let attempt = 0
 
   const connect = async () => {
-    const connection = await window.hermesDesktop.getConnection().catch(() => null)
+    const profile = getApiRequestProfile()
+    const options = getApiRequestTargetOptions()
+    const targeted = options.localOnly || options.remoteOnly
+
+    const connection = await (targeted
+      ? window.hermesDesktop.getConnection(profile, options)
+      : profile
+        ? window.hermesDesktop.getConnection(profile)
+        : window.hermesDesktop.getConnection()
+    ).catch(() => null)
 
     // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
     // stay on the polling fallback rather than half-working.

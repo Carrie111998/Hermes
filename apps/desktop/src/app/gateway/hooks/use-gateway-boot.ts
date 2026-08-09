@@ -15,11 +15,12 @@ import {
 } from '@/store/boot'
 import {
   $gateway,
+  activeGatewayTargetOptions,
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForProfile,
-  pruneSecondaryGateways,
   primaryGatewayRetentionKey,
+  pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
   sessionGatewayRetentionKey,
@@ -165,7 +166,10 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        const profile = $activeGatewayProfile.get()
+        const options = activeGatewayTargetOptions()
+        const targeted = options.localOnly || options.remoteOnly
+        const conn = targeted ? await desktop.getConnection(profile, options) : await desktop.getConnection(profile)
 
         if (cancelled) {
           return
@@ -180,7 +184,7 @@ export function useGatewayBoot({
         // explicit auth rejection asks for sign-in; transport failures stay in
         // this reconnect loop. For local/token gateways the URL carries a
         // long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn, options)
         await gateway.connect(wsUrl)
 
         if (cancelled) {
@@ -565,7 +569,7 @@ export function useGatewayBoot({
           void desktop
             .getConnectionConfig?.(connectionScope)
             .then(config => {
-              if (config.remoteUrl.trim()) {
+              if (config.remoteUrl.trim() || config.sshHost.trim()) {
                 bestEffortPrewarm('remote')
               }
             })

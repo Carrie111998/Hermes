@@ -34,7 +34,10 @@ declare global {
         profile?: string | null,
         options?: { localOnly?: boolean; remoteOnly?: boolean }
       ) => Promise<{ ok: boolean }>
-      getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
+      getGatewayWsUrl: (
+        profile?: null | string,
+        options?: { localOnly?: boolean; remoteOnly?: boolean }
+      ) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -795,6 +798,8 @@ export interface HermesApiRequest {
   path: string
   method?: string
   body?: unknown
+  localOnly?: boolean
+  remoteOnly?: boolean
   // Single-file multipart upload (FastAPI UploadFile endpoints). Mutually
   // exclusive with `body`; bytes transfer over IPC as a structured-clone
   // ArrayBuffer. Token-mode backends only.

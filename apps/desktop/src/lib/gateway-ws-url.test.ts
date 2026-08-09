@@ -16,6 +16,15 @@ describe('resolveGatewayWsUrl', () => {
       expect(getGatewayWsUrl).toHaveBeenCalledWith('remote-agent')
     })
 
+    it('forwards an explicit root target when refreshing a same-name backend', async () => {
+      const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?ticket=fresh')
+      const conn = { ...oauthConn, profile: 'default' }
+
+      await resolveGatewayWsUrl({ getGatewayWsUrl }, conn, { remoteOnly: true })
+
+      expect(getGatewayWsUrl).toHaveBeenCalledWith('default', { remoteOnly: true })
+    })
+
     it('uses the freshly minted URL', async () => {
       const getGatewayWsUrl = vi.fn().mockResolvedValue('ws://host/api/ws?ticket=fresh')
       await expect(resolveGatewayWsUrl({ getGatewayWsUrl }, oauthConn)).resolves.toBe('ws://host/api/ws?ticket=fresh')

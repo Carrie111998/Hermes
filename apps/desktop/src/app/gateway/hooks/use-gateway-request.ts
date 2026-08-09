@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
-import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
+import { $gateway, activeGatewayTargetOptions, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
@@ -73,7 +73,10 @@ export function useGatewayRequest() {
         // Reconnect to whichever profile the gateway is currently routed to (not
         // always the primary), so a sleep/wake reconnect keeps the user on the
         // profile they were chatting in.
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        const profile = $activeGatewayProfile.get()
+        const options = activeGatewayTargetOptions()
+        const targeted = options.localOnly || options.remoteOnly
+        const conn = targeted ? await desktop.getConnection(profile, options) : await desktop.getConnection(profile)
         connectionRef.current = conn
         setConnection(conn)
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
@@ -82,7 +85,7 @@ export function useGatewayRequest() {
         // auth rejection becomes a reauth error; transport failures remain
         // retryable. Stash only the former so requestGateway can show the
         // actionable "sign in again" message.
-        const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+        const wsUrl = await resolveGatewayWsUrl(desktop, conn, options)
         await existing.connect(wsUrl)
 
         return existing

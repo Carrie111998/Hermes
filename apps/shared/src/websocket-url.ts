@@ -12,7 +12,15 @@ export interface ResolveGatewayWsUrlDeps {
    * OAuth-gated gateways use single-use tickets, so callers should mint
    * immediately before opening the socket.
    */
-  getGatewayWsUrl?: (profile?: null | string) => Promise<GatewayWsUrlResult>
+  getGatewayWsUrl?: (
+    profile?: null | string,
+    options?: GatewayWsTargetOptions
+  ) => Promise<GatewayWsUrlResult>
+}
+
+export interface GatewayWsTargetOptions {
+  localOnly?: boolean
+  remoteOnly?: boolean
 }
 
 export type GatewayWsUrlResult =
@@ -36,9 +44,15 @@ export function isGatewayReauthRequired(error: unknown): error is GatewayReauthR
   )
 }
 
-export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: GatewayWsConnection): Promise<string> {
+export async function resolveGatewayWsUrl(
+  deps: ResolveGatewayWsUrlDeps,
+  conn: GatewayWsConnection,
+  options: GatewayWsTargetOptions = {}
+): Promise<string> {
   const mint = deps.getGatewayWsUrl
   const profile = conn.profile ?? null
+  const targeted = options.localOnly || options.remoteOnly
+  const mintFresh = () => (targeted ? mint?.(profile, options) : mint?.(profile))
 
   if (conn.authMode === 'oauth') {
     if (!mint) {
@@ -46,7 +60,11 @@ export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: G
     }
 
     try {
-      const result = await mint(profile)
+      const result = await mintFresh()
+
+      if (result === undefined) {
+        throw new Error('This Desktop build cannot refresh OAuth WebSocket tickets. Update Hermes Desktop and try again.')
+      }
 
       if (typeof result === 'string') {
         return result
@@ -79,7 +97,7 @@ export async function resolveGatewayWsUrl(deps: ResolveGatewayWsUrlDeps, conn: G
   }
 
   if (mint) {
-    const fresh = await mint(profile).catch(() => null)
+    const fresh = await mintFresh()?.catch(() => null)
 
     if (typeof fresh === 'string') {
       return fresh
