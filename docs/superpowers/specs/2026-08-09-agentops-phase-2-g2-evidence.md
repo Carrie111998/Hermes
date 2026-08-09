@@ -41,6 +41,7 @@ not a G2 approval claim; independent Sol review remains required.
 | Final P0 closure | Existing legacy DBs are refused before writable migration; DB/sidecar identity is rechecked immediately after connect and before PRAGMA/migration/WAL. Existing/new path-swap tests remain an explicit release gate and are not claimed as G2 approval | `test_store_rejects_legacy_trigger_object_before_migration`; connect-boundary swap coverage is pending independent review |
 | Final P1 coverage status | Five-profile Process coverage is **NOT MET / PAUSED**: no trusted LaunchAgent/deployment assets are available in this environment. Bootstrap performs bounded owner/label/ProgramArguments checks and marks unavailable profiles unmanaged; coverage is 0, not 100 | `test_bootstrap_coverage_reports_process_observer_unmanaged`; no G2/Phase3 authorization |
 | Approved G2 scope adjustment | G2 core denominator is only the default daily-production profile. feishu3/4/5/newbot remain registered but are explicitly `out_of_scope`/unmanaged and excluded from the core denominator; this does not claim fleet-wide 100% coverage | `test_bootstrap_coverage_reports_process_observer_unmanaged` plus scope assertions |
+| Default core binding | The fixed default LaunchAgent asset is parsed as plist or strict JSON `ProgramArguments`; exact expected command, owner, nlink and bounded size produce a fingerprint and `process_marker=default`. Core coverage is 100% only when this asset and snapshot are present; other profiles remain out of scope | `test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targets` |
 | P2 deep freeze/interpreter parity | Recursive immutable mappings detach snapshot/signal data; separate Python 3.14 environment contains dependencies | `test_asset_binding_deadline_and_snapshot_deep_freeze`; Python 3.14 command below |
 
 ## Fresh verification output
@@ -70,7 +71,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.55s
+122 passed in 2.69s
 ```
 
 ```text
@@ -94,10 +95,9 @@ python 3.14 compileall: PASS
   continues. Phase 2 collectors contain no target-write primitive.
 - Git dirty state remains `unknown`; the collector only reads direct Git
   metadata and refuses to infer a clean worktree.
-- Bootstrap fleet ProcessCollector is explicitly disabled because no trusted
-  per-profile command fingerprint asset is available in Phase 2; registry
-  performs a bounded LaunchAgent plist attempt and coverage reports profiles
-  still unmanaged rather than fabricating a binding.
+- Bootstrap parses the trusted default deployment asset in plist/strict JSON
+  form; any owner, link-count, size, command, symlink or parse mismatch fails
+  closed. The four non-core profiles remain explicitly out of scope.
 - Existing legacy observer databases are refused rather than auto-migrated;
   safe migration requires a future fd-bound SQLite handle implementation.
 - G2 still requires independent security/architecture review. No conclusion in

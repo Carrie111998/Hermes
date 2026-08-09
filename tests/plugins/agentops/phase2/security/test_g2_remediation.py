@@ -470,7 +470,8 @@ def test_cron_factory_has_safe_defaults_and_deadline():
 def test_bootstrap_coverage_reports_process_observer_unmanaged():
     from plugins.agentops.control.registry import bootstrap_gateway_registry
     coverage = bootstrap_gateway_registry().coverage_report()
-    assert "processes" in coverage.unmanaged_collectors
+    assert coverage.registered_targets == 1
+    assert len(coverage.out_of_scope_targets) == 4
 
 
 def test_factory_rejects_cron_budget_expansion():
