@@ -1,4 +1,5 @@
 import { ThreadPrimitive, useAuiEvent, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import {
   type ComponentProps,
   type CSSProperties,
@@ -18,6 +19,7 @@ import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
 import { cn } from '@/lib/utils'
+import { $chatLayout } from '@/store/chat-layout'
 import {
   $threadScrolledUp,
   onScrollToBottomRequest,
@@ -237,6 +239,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   loadingIndicator,
   sessionKey
 }) => {
+  const chatLayout = useStore($chatLayout)
+
   // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
   // changes only when messages are added/removed/swapped — it keys the error
   // boundaries and the row identity. The WEIGHT one (parts + character cost)
@@ -644,6 +648,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         ) : (
           <div
             className={cn('mx-auto flex w-full max-w-(--composer-width) min-w-0 flex-col px-6', threadContentTopPad)}
+            data-chat-layout={chatLayout}
             data-slot="aui_thread-content"
             ref={contentRef as React.RefCallback<HTMLDivElement>}
           >
