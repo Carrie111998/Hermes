@@ -496,3 +496,134 @@ The server was stopped after verification and port `8084` was confirmed free of 
 ### Recommended next action
 
 Commit and push this independent probe/profile change, verify PR CI, then run the real-vector 90-query A/B before considering any production adapter work.
+
+## Isolated real-vector BGE-M3 90-query A/B — 2026-08-10
+
+### Scope and boundary
+
+The benchmark was executed against a fresh temporary SQLite database with `--live` and a local `llama-server` endpoint on `127.0.0.1:8084`. It did not call production hybrid retrieval and did not modify `plugins/semantic_graph/runtime.py`, `plugins/semantic_graph/config.py`, a production adapter, the default retrieval path, or the production database.
+
+The two variants reused the existing 90-query fixture and evaluation contract:
+
+```text
+top_k: 8
+min_confidence: 0.60
+lexical_candidates: 30
+dense_candidates: 30
+rrf_k: 60
+```
+
+Document embeddings were backfilled separately from query retrieval. The BGE-M3 query serializer was raw text without a Qwen instruction. Canonical document text used only the existing semantic fields (`node_type`, `subtype`, `label`, `summary`, `identity_key`). Dense candidates were restricted to run-A nodes with `status in {asserted, accepted}` and `confidence >= 0.60`; stale protection used recomputed `expected_source_hashes`.
+
+### Commit-bound metadata
+
+```text
+control_code_revision:
+  0c89ef566343dbed810cedff81c9ac405febf0da
+
+benchmark_code_revision:
+  78c67713d78be97092f630580e3ee02e38726b78
+
+control:
+  KGESH/nsfw-bge-m3
+  BGE-M3 fine-tune
+  revision e22b93e36704360fc712c8894de59a66cdb1638e
+  dimensions 1024
+  serializer bge_m3_control
+
+retrieval:
+  top_k 8
+  lexical_candidates 30
+  dense_candidates 30
+  rrf_k 60
+
+document_backfill:
+  41 documents
+  duration 1211.487 ms
+```
+
+### Final measured comparison
+
+| Metric | A lexical | B lexical + BGE-M3 dense + RRF | Delta |
+|---|---:|---:|---:|
+| Exact identifier Recall@8 | 0.9500 | 1.0000 | +0.0500 |
+| Exact identifier MRR@8 | 0.6213 | 0.8750 | +0.2537 |
+| English paraphrase Recall@8 | 0.0000 | 0.0000 | +0.0000 |
+| English paraphrase MRR@8 | 0.0000 | 0.0000 | +0.0000 |
+| Japanese paraphrase Recall@8 | 0.9500 | 1.0000 | +0.0500 |
+| Japanese paraphrase MRR@8 | 0.4546 | 0.8350 | +0.3804 |
+| Japanese → English Recall@8 | 1.0000 | 1.0000 | +0.0000 |
+| Japanese → English MRR@8 | 0.6700 | 1.0000 | +0.3300 |
+| Correction/history Recall@8 | 1.0000 | 1.0000 | +0.0000 |
+| Correction/history MRR@8 | 0.9500 | 1.0000 | +0.0500 |
+| Overall Recall@8 | 0.6444 | 0.6667 | +0.0222 |
+| Overall MRR@8 | 0.4191 | 0.6022 | +0.1831 |
+
+Negative behavior was unchanged: `negative_false_recall_rate=1.0` and `negative_no_result_precision=0.0` for both variants. This fixture records candidate return behavior for negative queries; it is not evidence of context injection. Maximum rendered context was 1481 characters for B versus 1480 for A.
+
+### Latency
+
+```text
+A lexical:
+  lexical p50/p95: 4.008 / 5.470 ms
+  end-to-end p50/p95: 3.637 / 4.560 ms
+
+B hybrid:
+  query embedding p50/p95: 12.739 / 25.402 ms
+  lexical p50/p95: 4.008 / 5.470 ms
+  dense scan p50/p95: 60.013 / 78.806 ms
+  RRF p50/p95: 0.159 / 0.216 ms
+  end-to-end p50/p95: 85.098 / 105.670 ms
+```
+
+The backfill duration is excluded from per-query retrieval latency.
+
+### Safety and gate result
+
+```text
+rejected_or_superseded_leak_count:
+  A 0 / B 0
+
+cross_run_leak_count:
+  A 6 / B 0
+
+secret_recall_count:
+  A 0 / B 0
+
+state_mutation_count:
+  A 0 / B 0
+
+Japanese→English no-regression:
+  PASS (B Recall@8 = 1.00)
+
+leak_free gate:
+  PASS for B
+```
+
+The lexical cross-run count is an observed baseline-fixture diagnostic: lexical-only candidate output contains six run-B decoy occurrences. The hybrid variant applies the same safe run-A boundary to both lexical and dense inputs and records zero cross-run leaks. This does not alter Production retrieval; it is isolated benchmark behavior.
+
+The first live run before the safety-boundary correction was discarded as non-final evidence because its lexical side retained out-of-scope candidates. The final run above was executed after the correction at benchmark commit `78c67713d78be97092f630580e3ee02e38726b78`.
+
+### Verification and disposition
+
+```text
+targeted benchmark/retrieval tests:
+  16 passed
+
+ruff:
+  PASS
+
+Python compile:
+  PASS
+
+git diff --check:
+  PASS
+working tree:
+  clean
+HEAD and origin feature branch:
+  78c67713d78be97092f630580e3ee02e38726b78
+server:
+  stopped after run; 8084 has no listening socket
+```
+
+The result satisfies the initial benchmark gates for exact identifier, Japanese paraphrase, Japanese→English no-regression, correction/history, and hybrid leak/mutation safety. English paraphrase did not improve (`0.00`), so this is not evidence that `nsfw-bge-m3` is a useful general English memory-retrieval model. It remains a pipeline Control and isolated benchmark result only. Production adapter creation, production enablement, default-path changes, Draft promotion, Phase 3 Associative Adapter work, and `main` merge remain blocked pending separate review and explicit approval.
