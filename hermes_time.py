@@ -144,14 +144,18 @@ def format_display_timestamp(
 
     This helper is display-only: it returns an unadorned label and never
     mutates message content or protocol payloads. ``value`` may be a datetime
-    or Unix epoch seconds; omitting it uses the Hermes clock. Callers own the
-    surrounding UI decoration (brackets, dim styling, separators).
+    or Unix epoch seconds. Omitting it uses the current instant from the Hermes
+    clock, rendered in the surface-local timezone unless ``tz`` is supplied.
+    Callers own the surrounding UI decoration (brackets, dim styling, separators).
     """
     if not enabled:
         return ""
 
     if value is None:
-        dt = now()
+        # Display labels follow the human-facing surface's local timezone.
+        # now() may honor the agent's configured timezone, so normalize
+        # it just as the epoch path below does before formatting.
+        dt = now().astimezone()
     elif isinstance(value, datetime):
         dt = value
     elif isinstance(value, (int, float)):

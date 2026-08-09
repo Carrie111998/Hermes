@@ -41,3 +41,21 @@ def test_format_display_timestamp_converts_epoch_in_requested_timezone():
     )
 
     assert rendered == "2026-08-08 21:04:05 CEST"
+
+
+def test_format_display_timestamp_normalizes_clock_to_surface_timezone(monkeypatch):
+    class ConfiguredClockDatetime(datetime):
+        def astimezone(self, tz=None):
+            if tz is None:
+                return datetime(2026, 8, 8, 15, 4, 5, tzinfo=ZoneInfo("America/New_York"))
+            return super().astimezone(tz)
+
+    configured_now = ConfiguredClockDatetime(2026, 8, 8, 19, 4, 5, tzinfo=timezone.utc)
+    monkeypatch.setattr(hermes_time, "now", lambda: configured_now)
+
+    rendered = hermes_time.format_display_timestamp(
+        enabled=True,
+        format_string="%Y-%m-%d %H:%M:%S %Z",
+    )
+
+    assert rendered == "2026-08-08 15:04:05 EDT"
