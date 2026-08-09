@@ -167,6 +167,14 @@ class TestResumeRoundTrip:
 
         kwargs = _make_agent_with_override(override, monkeypatch, LEGACY_LIST_CONFIG)
 
+        # The rebuild must recover the entry identity from the stored
+        # base_url — restoring these assertions (they were dropped when the
+        # #81789 change landed, leaving an empty test body; #44022/#47714
+        # guard). `requested_provider="custom"` is in the exclusion set, so
+        # the base_url heal path is what must carry the recovery.
+        assert kwargs["base_url"] == MIMO_URL
+        assert kwargs["api_key"] == MIMO_KEY
+
 
 # --- Issue #81789: two providers sharing one base_url, different api_keys ----
 
