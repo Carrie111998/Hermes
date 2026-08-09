@@ -198,7 +198,7 @@ function showError(node, copy) {
   node.focus?.({ preventScroll: true });
 }
 
-function marketSelector(selected = [], { max = 0 } = {}) {
+function marketSelector(selected = [], { max = 0, onChange } = {}) {
   const values = new Set(selected.filter(Boolean));
   const picker = select([
     { value: '', label: 'Choose a country' },
@@ -230,6 +230,9 @@ function marketSelector(selected = [], { max = 0 } = {}) {
         }, '×'))));
     note.textContent = max ? `${values.size} of ${max} markets selected` : '';
     add.disabled = !picker.value || values.has(picker.value) || Boolean(max && values.size >= max);
+    // Every add and remove funnels through render(), so notifying here means
+    // no future mutation path can forget to tell the map.
+    onChange?.([...values]);
   }
 
   picker.addEventListener('change', render);
@@ -574,7 +577,7 @@ export async function mount(root, ctx) {
       el('span', {}, item.description)),
     el('span', { class: 'ifz-setup-row-summary' },
       summary || (done ? 'Saved' : 'Needs your input'),
-      el('small', {}, done ? 'Ready' : 'Required')),
+      done ? null : el('small', {}, 'Required')),
     el('span', { class: 'ifz-setup-row-chevron', 'aria-hidden': 'true' }, icon('arrowRight', 16))));
 
     if (open) {
@@ -1039,14 +1042,25 @@ export async function mount(root, ctx) {
   }
 
   function marketsEditor() {
-    const targets = marketSelector(targetMarkets(), { max: 5 });
-    const noResearch = marketSelector(blockedMarkets('research'));
-    const noOutreach = marketSelector(blockedMarkets('outreach'));
     const mapHost = el('div', {
       class: 'ifz-setup-map ifz-minimap',
-      'aria-label': `Target markets: ${targetMarkets().map(countryName).join(', ') || 'none selected'}`,
+      role: 'img',
     });
-    renderMiniMap(mapHost, {}, targetMarkets());
+    // The map used to be painted once from saved state, so adding a country
+    // did nothing until you pressed Save: the picker and the map disagreed
+    // for the whole time you were choosing. It now follows the selection.
+    // renderMiniMap is async, but it awaits a cached SVG clone before it
+    // touches the container, so two rapid calls resume in the order they were
+    // made and the newest selection commits last. No sequencing guard needed.
+    function paintMap(codes) {
+      mapHost.setAttribute('aria-label', codes.length
+        ? `Target markets: ${codes.map(countryName).join(', ')}`
+        : 'No target markets selected');
+      renderMiniMap(mapHost, {}, codes);
+    }
+    const targets = marketSelector(targetMarkets(), { max: 5, onChange: paintMap });
+    const noResearch = marketSelector(blockedMarkets('research'));
+    const noOutreach = marketSelector(blockedMarkets('outreach'));
     const save = button('Save markets and continue', { kind: 'primary', icon: 'check' });
     const error = errorLine();
 
@@ -1223,7 +1237,7 @@ export async function mount(root, ctx) {
       el('span', {}, description)),
     el('span', { class: 'ifz-setup-row-summary' },
       summary,
-      el('small', {}, ready ? 'Added' : 'Optional')),
+      ready ? null : el('small', {}, 'Optional')),
     el('span', { class: 'ifz-setup-row-chevron', 'aria-hidden': 'true' }, icon('arrowRight', 16))));
     if (open && editor) {
       row.append(el('div', {

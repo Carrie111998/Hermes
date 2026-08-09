@@ -47,7 +47,6 @@ body {
 /* approvals + review */
 .ifz-email-body,
 .ifz-review-email-body,
-.ifz-review-help,
 .ifz-review-delivery-note,
 .ifz-review-pause-banner,
 .ifz-review-block,
@@ -55,7 +54,7 @@ body {
 .ifz-review-qa,
 .ifz-review-context section p,
 /* today */
-.ifz-today-hero p,
+.ifz-today-briefing,
 .ifz-today-empty p,
 .ifz-today-activity p,
 .ifz-today-action > p,
@@ -134,10 +133,19 @@ h1, h2, h3, h4, p { margin: 0; }
 /* The page shell only takes focus programmatically on route change; no ring for that. */
 .ifz-page:focus-visible { outline: none; }
 
-/* Scrollbars */
-* { scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
-*::-webkit-scrollbar { width: 8px; height: 8px; }
-*::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 0; }
+/* Scrollbars. The thumb was --surface-3 on a --surface panel, which is a 1.1:1
+   step and effectively invisible: a scrollable region looked like a clipped
+   one. --border-strong is still quiet but actually legible, and in a flat
+   shadowless UI the scrollbar is the only affordance saying "there is more". */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 0;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--muted); background-clip: content-box; }
 *::-webkit-scrollbar-track { background: transparent; }
 
 /* ---------- App frame ---------- */
@@ -1531,42 +1539,6 @@ h1, h2, h3, h4, p { margin: 0; }
   display: none;
 }
 /* Fill the stage — slice crops ocean margins so land dominates */
-.ifz-map-svghost {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.ifz-map-svghost svg {
-  width: 100%;
-  height: 100%;
-  display: block;
-}
-.ifz-map-svghost .country {
-  fill: var(--map-land);
-  stroke: none;
-  cursor: pointer;
-  transition: fill 0.15s ease, stroke 0.15s ease, filter 0.15s ease;
-  outline: none;
-}
-.ifz-map-svghost .country:hover,
-.ifz-map-svghost .country:focus-visible { fill: var(--map-land-hover); }
-.ifz-map-svghost .country:focus-visible {
-  fill: var(--map-land-hover);
-}
-.ifz-map-svghost .country.recommended {
-  stroke: none;
-}
-.ifz-map-svghost .country.selected {
-  fill: var(--map-selected);
-  stroke: none;
-}
-.ifz-map-svghost .country.selected:hover,
-.ifz-map-svghost .country.selected:focus-visible { fill: var(--map-selected-hover); }
-.ifz-map-svghost .country.active {
-  fill: var(--map-selected-hover);
-}
 
 .ifz-map-hint {
   position: absolute;
@@ -1986,9 +1958,19 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-btn.ghost:hover:not(:disabled) {
   background: var(--surface-2);
 }
+/* The rarest action on the screen should not be the second loudest. No fill
+   and no resting border: colour alone marks it. The outline and tint appear
+   on hover, once the user has actually aimed at it. A pastel slab read as
+   decorative, and a full-width red outline outweighed its importance. */
 .ifz-btn.danger {
-  background: var(--error-soft);
+  background: transparent;
+  border: 1px solid transparent;
   color: var(--error);
+}
+.ifz-btn.danger:hover:not(:disabled),
+.ifz-btn.danger:focus-visible {
+  background: var(--error-soft);
+  border-color: var(--error);
 }
 .ifz-iconbtn {
   background: var(--surface-2);
@@ -2171,10 +2153,6 @@ h1, h2, h3, h4, p { margin: 0; }
   border-radius: var(--radius-xl);
   box-shadow: none;
 }
-.ifz-map-svghost .country,
-.ifz-minimap .country {
-  stroke: none !important;
-}
 .ifz-runlog {
   background: var(--surface-2);
   color: var(--text);
@@ -2194,19 +2172,33 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 
 /* ---------- Approvals: focused email review queue ---------- */
+/* One scroll on this page: the page itself.
+   The card used to be a fixed-height window with its own inner scroll, which
+   forced an 800px email through a 400px porthole and put the most important
+   content on the screen behind a gesture. It now takes its natural height and
+   the page scrolls, with the head, the context column and the action bar
+   pinned so nothing you need constantly leaves the viewport. */
+/* No vertical padding on the scroll container.
+   Sticky offsets resolve against the scrollport's PADDING box, not the
+   viewport edge. Padding here pushed the sticky head down by the same amount
+   and left a gap above it where the subject line showed through, and held the
+   action bar up off the bottom with a strip of email visible underneath. Both
+   read as the pinned bars failing. The spacing moves inside, where it scrolls
+   with the content instead of fighting the sticky offsets. */
 .ifz-page--approvals {
-  padding-top: var(--space-5);
+  padding-top: 0;
+  padding-bottom: 0;
+  scroll-padding-top: 64px;
+  scroll-padding-bottom: 96px;
 }
 .ifz-review-page {
   width: min(100%, 1240px);
   margin: 0 auto;
+  padding-top: var(--space-5);
 }
-.ifz-review-help {
-  margin: calc(var(--space-4) * -1) 0 var(--space-4);
-  color: var(--muted);
-  font-size: var(--fs-sm);
-  line-height: 1.5;
-}
+/* Available to a screen reader, absent for everyone else. Was hand-rolled on
+   .ifz-review-live; now one utility both it and the shortcut hint share. */
+.ifz-sr-only,
 .ifz-review-live {
   position: absolute;
   width: 1px;
@@ -2241,10 +2233,9 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-review-card {
   display: flex;
   flex-direction: column;
-  height: calc(100dvh - 220px);
-  min-height: 560px;
-  max-height: 820px;
-  overflow: hidden;
+  /* Natural height. overflow must stay visible or the sticky head, context
+     column and action bar inside it are clipped and stop sticking. */
+  overflow: visible;
   background: var(--surface);
   border-radius: var(--radius-lg);
   box-shadow: none;
@@ -2253,14 +2244,21 @@ h1, h2, h3, h4, p { margin: 0; }
   outline: 2px solid var(--apple-blue);
   outline-offset: 3px;
 }
+/* Pinned: position and Previous/Next stay reachable while the email scrolls
+   past. --review-head is the offset the context column parks below. */
 .ifz-review-card-head {
+  --review-head: 64px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  min-height: 76px;
-  padding: 16px 22px;
+  min-height: var(--review-head);
+  padding: var(--space-3) 22px;
   background: var(--surface);
+  border-bottom: 1px solid var(--border);
 }
 .ifz-review-card-head > div:first-child {
   display: flex;
@@ -2281,21 +2279,6 @@ h1, h2, h3, h4, p { margin: 0; }
   min-width: var(--touch-min);
   min-height: var(--touch-min);
   padding: 8px 12px;
-}
-.ifz-review-progress {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding-right: var(--space-2);
-}
-.ifz-review-progress span {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--surface-3);
-}
-.ifz-review-progress span.done {
-  background: var(--text-strong);
 }
 .ifz-review-block {
   padding: 13px 22px;
@@ -2347,10 +2330,8 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-review-layout {
   display: grid;
   grid-template-columns: minmax(0, 3fr) minmax(18rem, 2fr);
+  /* Rows size to content now; nothing here scrolls on its own. */
   align-items: stretch;
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow: hidden;
 }
 .ifz-review-email,
 .ifz-review-context {
@@ -2362,6 +2343,13 @@ h1, h2, h3, h4, p { margin: 0; }
   flex-direction: column;
   padding: clamp(22px, 3vw, 38px);
   background: var(--surface);
+}
+/* emailCopy() wraps the subject and body. Nothing to relay now that heights
+   are natural, but it stays a flex column so the two children keep their
+   order and spacing predictable. */
+.ifz-review-copy {
+  display: flex;
+  flex-direction: column;
 }
 .ifz-review-recipient {
   display: grid;
@@ -2397,12 +2385,11 @@ h1, h2, h3, h4, p { margin: 0; }
   text-wrap: balance;
 }
 .ifz-review-email-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  max-height: none;
+  /* Full height, no inner scroll. Capped at a readable measure: the column is
+     ~818px, which ran to roughly 95 characters a line. This is text someone is
+     proofreading before it goes out under their name. */
+  max-width: 68ch;
   padding-top: var(--space-5);
-  overflow-y: auto;
-  overscroll-behavior: contain;
   color: var(--text);
   font-size: var(--fs-md);
   line-height: 1.75;
@@ -2418,14 +2405,24 @@ h1, h2, h3, h4, p { margin: 0; }
   font-size: var(--fs-xs);
   line-height: 1.5;
 }
+/* Pinned beside the email rather than scrolling with it. "Why this company"
+   is the thing you check against the paragraph you are reading, so it has to
+   stay in view; parking it below the sticky head keeps the two from
+   overlapping. align-self: start stops the grid stretching it to full row
+   height, which would defeat position: sticky. */
 .ifz-review-context {
+  position: sticky;
+  top: 64px;
+  align-self: start;
+  max-height: calc(100dvh - 200px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: var(--space-6);
   padding: clamp(22px, 3vw, 34px);
-  overflow-y: auto;
-  overscroll-behavior: contain;
   background: var(--surface-2);
+  border-left: 1px solid var(--border);
 }
 .ifz-review-company h2 {
   color: var(--text-strong);
@@ -2464,7 +2461,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-review-actions {
   position: sticky;
   bottom: 0;
-  z-index: 2;
+  z-index: 4;
   display: flex;
   align-items: flex-end;
   justify-content: space-between;
@@ -2472,7 +2469,14 @@ h1, h2, h3, h4, p { margin: 0; }
   gap: var(--space-4);
   padding: 18px 22px calc(18px + env(safe-area-inset-bottom));
   background: var(--surface-3);
-  box-shadow: inset 0 1px var(--surface-2);
+  /* A real top edge. As a pinned bar with content sliding under it, an inset
+     highlight was not enough to separate the two. */
+  border-top: 1px solid var(--border-strong);
+}
+/* Room for the last line of the email to clear the pinned bar. Without it the
+   closing signature can never be read in full. */
+.ifz-review-layout {
+  padding-bottom: var(--space-8);
 }
 /* The bar is --surface-3, and so is the global .ifz-btn:hover. Without this the
    secondary actions lose their silhouette the moment you point at them. */
@@ -2481,12 +2485,6 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 .ifz-review-actions .ifz-btn:disabled:hover {
   background: var(--surface-2);
-}
-.ifz-review-primary-action,
-.ifz-review-secondary-actions > div {
-  display: flex;
-  align-items: center;
-  gap: 7px;
 }
 .ifz-review-primary-action .ifz-btn {
   min-height: 48px;
@@ -2499,25 +2497,10 @@ h1, h2, h3, h4, p { margin: 0; }
   flex-wrap: wrap;
   gap: var(--space-2);
 }
-.ifz-review-actions kbd {
-  min-width: 22px;
-  padding: 2px 6px;
-  color: var(--muted);
-  background: var(--surface-2);
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.5;
-  text-align: center;
-}
 .ifz-review-editor {
   display: flex;
   flex-direction: column;
-  flex: 1 1 auto;
-  min-height: 0;
   gap: var(--space-2);
-  overflow-y: auto;
-  overscroll-behavior: contain;
 }
 .ifz-review-editor .ifz-label:not(:first-child) {
   margin-top: var(--space-3);
@@ -2526,9 +2509,13 @@ h1, h2, h3, h4, p { margin: 0; }
   font-size: var(--fs-lg);
   font-weight: 650;
 }
+/* Sized by autoGrow() in _components.js, so it never scrolls on its own.
+   overflow hidden rather than auto: with the height tracking scrollHeight a
+   scrollbar would only ever appear for one frame mid-keystroke. */
 .ifz-review-body-input {
-  min-height: 360px;
-  resize: vertical;
+  min-height: 240px;
+  resize: none;
+  overflow-y: hidden;
   line-height: 1.7;
 }
 .ifz-review-edit-actions {
@@ -2548,40 +2535,31 @@ h1, h2, h3, h4, p { margin: 0; }
   outline-offset: 3px;
 }
 
+/* Stacked. Most of what this block used to do was undo the old inner-scroll
+   model, which no longer exists; only the structural changes remain. */
 @media (max-width: 900px) {
   .ifz-review-layout {
     grid-template-columns: 1fr;
-    grid-template-rows: max-content max-content;
-    align-content: start;
-    overflow-y: auto;
-    overscroll-behavior: contain;
   }
   .ifz-review-email {
     display: block;
   }
-  .ifz-review-editor {
-    overflow: visible;
-  }
   .ifz-review-email-body {
-    min-height: 0;
-    max-height: none;
-    overflow: visible;
+    /* Full width once the context column is below rather than beside it. */
+    max-width: none;
   }
   .ifz-review-context {
-    gap: var(--space-5);
+    /* Nothing to pin against when the columns are stacked. */
+    position: static;
+    max-height: none;
     overflow: visible;
-  }
-  .ifz-review-actions {
-    bottom: 0;
+    gap: var(--space-5);
+    border-left: 0;
+    border-top: 1px solid var(--border);
   }
 }
 
 @media (max-width: 640px) {
-  .ifz-review-card {
-    height: calc(100dvh - 252px);
-    min-height: 560px;
-    max-height: 720px;
-  }
   .ifz-review-card-head {
     align-items: center;
     flex-direction: row;
@@ -2592,10 +2570,6 @@ h1, h2, h3, h4, p { margin: 0; }
     width: auto;
     min-width: 0;
     margin-left: auto;
-  }
-  .ifz-review-progress {
-    margin-right: 0;
-    padding-right: 0;
   }
   .ifz-review-card-nav .ifz-btn {
     font-size: 0;
@@ -2627,7 +2601,8 @@ h1, h2, h3, h4, p { margin: 0; }
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
-  .ifz-review-secondary-actions > div,
+  /* The per-button wrapper div is gone; the key badge lives inside the
+     button now, so the buttons are the direct grid children. */
   .ifz-review-secondary-actions .ifz-btn {
     width: 100%;
   }
@@ -2641,9 +2616,6 @@ h1, h2, h3, h4, p { margin: 0; }
   }
   .ifz-review-secondary-actions > .ifz-btn {
     grid-column: auto;
-  }
-  .ifz-review-actions kbd {
-    display: none;
   }
   .ifz-review-empty {
     padding: var(--space-5);
@@ -2796,8 +2768,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-research-filters .ifz-btn { text-transform: capitalize; }
 .ifz-research-ledger { border-top: 3px solid var(--text-strong); }
 .ifz-research-ledger .ifz-table th { font-size: 10px; letter-spacing: .1em; }
-.ifz-research-ledger .ifz-table tbody tr { border-left: 3px solid transparent; }
-.ifz-research-ledger .ifz-table tbody tr:hover { border-left-color: var(--accent); }
+.ifz-research-ledger .ifz-table tbody tr:hover { background: var(--accent-softer); }
 
 .ifz-research-editor {
   display: grid;
@@ -2828,7 +2799,6 @@ h1, h2, h3, h4, p { margin: 0; }
   text-align: left;
   border-radius: 0;
   border: 0;
-  border-left: 2px solid transparent;
   background: transparent;
   color: var(--muted);
 }
@@ -2874,7 +2844,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-research-errors {
   margin-bottom: var(--space-5);
   padding: 15px 18px;
-  border-left: 3px solid var(--error);
+  border: 1px solid var(--error);
   background: var(--error-soft);
   color: var(--text-strong);
 }
@@ -2912,7 +2882,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-gate-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20px; }
 .ifz-gate { display: flex; gap: 10px; align-items: center; min-height: 44px; border-bottom: 1px solid var(--border); color: var(--text-strong); }
 .ifz-gate input, .ifz-research-toggle-line input { accent-color: var(--accent); width: 17px; height: 17px; }
-.ifz-policy-lock { margin-top: 16px; padding: 12px 14px; border-left: 2px solid var(--warning); background: var(--warning-soft); color: var(--text); font-size: var(--fs-sm); }
+.ifz-policy-lock { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--warning); background: var(--warning-soft); color: var(--text); font-size: var(--fs-sm); }
 .ifz-research-inline-head { display: flex; align-items: start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); }
 .ifz-research-inline-head p { margin: 5px 0 0; }
 .ifz-weight-control { display: flex; align-items: center; gap: var(--space-3); }
@@ -2937,7 +2907,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-estimate-panel > div span { color: var(--muted); font-size: var(--fs-sm); }
 .ifz-estimate-panel > div strong { font: 650 28px/1 var(--font-display); color: var(--text-strong); letter-spacing: -.03em; }
 .ifz-estimate-panel > p, .ifz-estimate-panel > .ifz-hint { grid-column: 1 / -1; margin: 0; padding: 12px 18px; background: var(--surface-2); }
-.ifz-estimate-panel.unavailable { display: block; padding: 22px; border-left: 3px solid var(--warning); background: var(--warning-soft); }
+.ifz-estimate-panel.unavailable { display: block; padding: 22px; border: 1px solid var(--warning); background: var(--warning-soft); }
 .ifz-estimate-panel.unavailable p { padding: 0; margin: 7px 0; background: transparent; }
 .ifz-review-list { display: grid; grid-template-columns: minmax(110px, .42fr) 1fr; gap: 0; margin: 0; }
 .ifz-review-list dt, .ifz-review-list dd { margin: 0; padding: 11px 0; border-bottom: 1px solid var(--border); }
@@ -2953,7 +2923,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-funnel-bar span { display: block; height: 100%; background: var(--accent); transition: width .5s cubic-bezier(.2,.8,.2,1); }
 .ifz-research-config { max-height: 620px; overflow: auto; margin: 0; padding: 18px; background: var(--text-strong); color: var(--surface); font: 12px/1.65 var(--font-mono); }
 .ifz-research-claims { display: flex; flex-direction: column; gap: var(--space-4); }
-.ifz-claim-card { border-left: 3px solid var(--accent); }
+.ifz-claim-card { border: 1px solid var(--accent); }
 .ifz-claim-card .ifz-card-head { align-items: flex-start; }
 .ifz-confidence-mark { font: 600 10px/1.2 var(--font-mono); color: var(--muted); }
 .ifz-claim-value { margin-bottom: var(--space-4); font: 650 26px/1.1 var(--font-display); letter-spacing: -.025em; color: var(--text-strong); }
@@ -3011,33 +2981,63 @@ h1, h2, h3, h4, p { margin: 0; }
   letter-spacing: var(--track-label);
   text-transform: uppercase;
 }
+/* The hero carries the news, the counters and the one action. It replaces the
+   old greeting + summary paragraph + separate "Needs you" band, which between
+   them printed the waiting count three times and the workspace counters twice.
+
+   The rule is ink, not blue. A blue rule here was a third element saying
+   "needs you" alongside the caret and the Review button, which breaks the
+   house One Voice Rule; the caret says it better because it blinks. Ink at
+   3px also matches the rule on the action panel opposite. */
 .ifz-today-hero {
-  max-width: 850px;
-  padding: var(--space-4) 0 var(--space-6);
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-6);
+  flex-wrap: wrap;
+  padding: var(--space-4) 0 var(--space-5);
+  border-top: 3px solid var(--text-strong);
+}
+.ifz-today-hero-main { min-width: 0; max-width: 720px; }
+.ifz-today-hero-main .ifz-caret { display: flex; margin-bottom: var(--space-3); }
+.ifz-today-hero-act {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+/* Mono, tabular, one line: the register the operator reads all day. Inherits
+   the mono default now that the prose allowlist no longer claims every <p>
+   in this header. */
+.ifz-today-counters {
+  margin-top: var(--space-4);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
 }
 /* House display treatment: Satoshi 500, tight tracking, sub-1.0 leading.
    Big type needs less weight — 680 was fighting the tracking. */
+/* House display treatment: Satoshi 500, tight tracking, sub-1.0 leading.
+   Capped lower than the old 68px: this headline now states a fact rather than
+   greeting anyone, and it no longer needs to fill a third of the viewport. */
 .ifz-today-hero h1,
 .ifz-today-empty h1 {
   margin: 0;
   color: var(--text-strong);
-  font: 500 clamp(40px, 6vw, 68px)/.96 var(--font-display);
+  font: 500 clamp(30px, 3.6vw, 46px)/1 var(--font-display);
   letter-spacing: var(--track-display);
   text-wrap: balance;
 }
-.ifz-today-hero p,
+.ifz-today-briefing,
 .ifz-today-empty p {
-  max-width: 720px;
-  margin-top: 22px;
-  color: var(--text);
-  font-size: clamp(18px, 2.1vw, 24px);
-  line-height: 1.45;
-  letter-spacing: -.018em;
+  max-width: 68ch;
+  margin-top: var(--space-3);
+  color: var(--muted);
+  font-size: var(--fs-md);
+  line-height: 1.5;
   text-wrap: pretty;
 }
 .ifz-today-warning,
-.ifz-today-review,
-.ifz-today-clear,
 .ifz-today-work {
   display: flex;
   align-items: center;
@@ -3056,33 +3056,6 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 /* The one band on the page that needs a human gets the blue rule. Blue means
    the machine is waiting on you — the same thing the caret inside it says. */
-.ifz-today-review {
-  justify-content: space-between;
-  min-height: 92px;
-  padding: 18px 20px 18px 24px;
-  background: var(--surface);
-  border-top: 3px solid var(--accent);
-}
-/* Block-level so it stacks above the sentence and its margin actually
-   applies — an inline-flex box would sit on the same line. */
-.ifz-today-review .ifz-caret {
-  display: flex;
-  margin-bottom: 7px;
-}
-.ifz-today-review strong {
-  display: block;
-  color: var(--text-strong);
-  font-size: clamp(17px, 2vw, 21px);
-  letter-spacing: -.015em;
-}
-.ifz-today-clear {
-  min-height: 48px;
-  padding: 12px 15px;
-  background: var(--surface);
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-weight: 500;
-}
 .ifz-today-work {
   min-height: 52px;
   padding: 14px 16px;
@@ -3101,12 +3074,15 @@ h1, h2, h3, h4, p { margin: 0; }
   background: var(--error-soft);
   color: var(--error);
 }
+/* Tightened from clamp(20px,3vw,36px): with the hero's own bottom padding and
+   the .ifz-today > * + * margin, the old value opened a ~120px band of nothing
+   between the counters and the activity feed. */
 .ifz-today-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.18fr) minmax(320px, .82fr);
-  gap: clamp(28px, 5vw, 64px);
+  gap: clamp(28px, 4vw, 56px);
   align-items: start;
-  padding-top: clamp(20px, 3vw, 36px);
+  padding-top: var(--space-4);
 }
 .ifz-today-activity-section {
   min-width: 0;
@@ -3168,11 +3144,6 @@ h1, h2, h3, h4, p { margin: 0; }
   max-height: 174px;
   margin: 20px -8px 16px;
   overflow: hidden;
-  opacity: .92;
-}
-.ifz-today-map svg {
-  transform: scale(1.18);
-  transform-origin: 50% 45%;
 }
 .ifz-today-action-control {
   display: flex;
@@ -3203,40 +3174,28 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-today-action-buttons .ifz-btn {
   flex: 1 1 auto;
 }
+/* Now nested under the activity feed rather than spanning the page, so it
+   stacks instead of running a two-column label/value split across full width.
+   No bottom border: the activity list above already closes each row. */
 .ifz-today-next {
-  display: grid;
-  grid-template-columns: minmax(90px, .22fr) minmax(0, 1fr);
-  gap: var(--space-5);
-  padding: 22px 0;
-  border-top: 1px solid var(--border-strong);
-  border-bottom: 1px solid var(--border-strong);
+  padding: var(--space-5) 0 0;
+  margin-top: var(--space-2);
 }
 .ifz-today-next .ifz-today-kicker {
-  margin: 4px 0 0;
+  margin: 0 0 var(--space-2);
 }
 .ifz-today-next p {
   max-width: 70ch;
   color: var(--text-strong);
   font-size: var(--fs-md);
 }
-/* A run that failed or was stopped keeps its recovery action in the same column
-   as the sentence it belongs to. */
+/* A run that failed or was stopped keeps its recovery action directly under
+   the sentence it belongs to. `grid-column` is gone with the two-column grid. */
 .ifz-today-next > .ifz-btn {
-  grid-column: 2;
-  justify-self: start;
-  margin-top: var(--space-1);
+  margin-top: var(--space-3);
 }
 .ifz-today-next.needs-attention p {
   color: var(--warning);
-}
-.ifz-today-summary {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: var(--space-4);
-  color: var(--muted);
-  font: 500 12px/1.4 var(--font-mono);
-  font-variant-numeric: tabular-nums;
 }
 .ifz-today-empty {
   max-width: 790px;
@@ -3432,14 +3391,15 @@ h1, h2, h3, h4, p { margin: 0; }
     padding-bottom: var(--space-4);
   }
   .ifz-today-warning,
-  .ifz-today-review {
+  .ifz-today-hero {
     align-items: flex-start;
     flex-direction: column;
   }
   .ifz-today-warning .ifz-btn,
-  .ifz-today-review .ifz-btn {
+  .ifz-today-hero-act .ifz-btn {
     width: 100%;
   }
+  .ifz-today-hero-act { width: 100%; }
   .ifz-today-grid {
     gap: var(--space-6);
   }
@@ -3453,40 +3413,8 @@ h1, h2, h3, h4, p { margin: 0; }
   .ifz-today-next > .ifz-btn {
     grid-column: 1;
   }
-  .ifz-today-summary {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .ifz-today-summary .ifz-btn {
-    width: 100%;
-  }
-  .ifz-ask-trigger kbd {
-    display: none;
-  }
-  .ifz-ask-overlay {
-    align-items: flex-end;
-    padding: 0;
-  }
-  .ifz-ask-panel {
-    max-height: 92dvh;
-  }
-  .ifz-ask-head,
-  .ifz-ask-feed {
-    padding-left: 18px;
-    padding-right: 18px;
-  }
-  .ifz-ask-suggestions {
-    padding-left: 18px;
-    padding-right: 18px;
-  }
-  .ifz-ask-form {
-    grid-template-columns: 1fr;
-    padding: 14px 18px 18px;
-  }
-  .ifz-ask-form .ifz-btn {
-    width: 100%;
-  }
 }
+
 @media (max-width: 480px) {
   .ifz-ask-trigger {
     width: 38px;
@@ -4456,16 +4384,19 @@ h1, h2, h3, h4, p { margin: 0; }
   margin-bottom: 0;
 }
 
+/* Page-title scale, not display scale. "Setup" at 54px sat directly above
+   "Setup is ready." and the two large headings competed; the nav already
+   says which page this is, so the status line is the one carrying news. */
 .ifz-setup .ifz-page-title {
-  font-size: clamp(38px, 4.5vw, 54px);
-  line-height: 1;
-  letter-spacing: -.052em;
+  font-size: var(--fs-2xl);
+  line-height: 1.05;
+  letter-spacing: var(--track-title);
 }
 
 .ifz-setup .ifz-page-sub {
   max-width: 62ch;
-  margin-top: 12px;
-  font-size: clamp(16px, 1.7vw, 19px);
+  margin-top: 6px;
+  font-size: var(--fs-md);
   line-height: 1.5;
   text-wrap: pretty;
 }
@@ -4650,10 +4581,14 @@ h1, h2, h3, h4, p { margin: 0; }
   font: 650 13px/1 var(--font-mono);
 }
 
+/* Ink, not green. A completed setup row is the normal resting state, not an
+   achievement, and green is reserved in this system for mail that actually
+   went out. Eight filled green squares made the quietest information on the
+   page the loudest thing on it. */
 .ifz-setup-row.is-done .ifz-setup-row-mark {
-  border-color: var(--success);
-  background: var(--success);
-  color: #fff;
+  border-color: var(--text-strong);
+  background: var(--text-strong);
+  color: var(--bg);
 }
 
 .ifz-setup-row-title,
@@ -4690,10 +4625,6 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-setup-row-summary small {
   color: var(--faint);
   font: 590 11px/1.25 var(--font-mono);
-}
-
-.ifz-setup-row.is-done .ifz-setup-row-summary small {
-  color: var(--success);
 }
 
 .ifz-setup-row-chevron {
@@ -4858,18 +4789,18 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 
 .ifz-setup-form-error {
-  border-left: 3px solid var(--error);
+  border: 1px solid var(--error);
   background: var(--error-soft);
   color: var(--error);
 }
 
 .ifz-setup-offline {
-  border-left: 3px solid var(--warning);
+  border: 1px solid var(--warning);
   background: var(--warning-soft);
 }
 
 .ifz-setup-work {
-  border-left: 3px solid var(--info);
+  border: 1px solid var(--info);
   background: var(--info-soft);
 }
 
@@ -4970,9 +4901,14 @@ h1, h2, h3, h4, p { margin: 0; }
   column-gap: clamp(30px, 5vw, 68px);
 }
 
+/* Span the band, do not hide in column two. The left column is a label
+   gutter, and these bands have no label to put in it, so pushing content
+   right left ~290px of nothing beside every row on the page. Only
+   .ifz-setup-status still uses the gutter, because it actually has a
+   kicker to sit there. */
 .ifz-setup-band-body > :only-child,
 .ifz-setup-brain .ifz-setup-band-body > * {
-  grid-column: 2;
+  grid-column: 1 / -1;
 }
 
 .ifz-setup-capability-list,
@@ -5011,10 +4947,13 @@ h1, h2, h3, h4, p { margin: 0; }
   transform: none;
 }
 
+/* Same reasoning as the essentials rows: ink, not green. This is the second
+   of the two rules that painted the marks, which is why the optional section
+   stayed green after the first was changed. */
 .ifz-setup-capability-row.is-done .ifz-setup-row-mark {
-  border-color: var(--success);
-  background: var(--success);
-  color: #fff;
+  border-color: var(--text-strong);
+  background: var(--text-strong);
+  color: var(--bg);
 }
 
 .ifz-setup-gap-row {
@@ -5254,7 +5193,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .ifz-setup-inline-note {
   margin-bottom: var(--space-4);
   padding: 12px 14px;
-  border-left: 3px solid var(--success);
+  border: 1px solid var(--success);
   background: var(--success-soft);
   color: var(--text-strong);
   line-height: 1.5;

@@ -14,12 +14,9 @@ import { createCaret } from '../caret.js';
 const MAX_EMAILS_PER_SEARCH = 6;
 const TERMINAL_OK = new Set(['completed', 'succeeded']);
 
-function greeting() {
-  const hour = new Date().getHours();
-  if (hour < 12) return 'Good morning.';
-  if (hour < 18) return 'Good afternoon.';
-  return 'Good evening.';
-}
+/* No greeting(). A time-of-day salutation was this page's largest typographic
+   element and carried no information; it also contradicts the house voice rule
+   that the machine reports rather than converses. */
 
 function plural(count, singular, pluralForm = `${singular}s`) {
   return `${fmt.num(count)} ${count === 1 ? singular : pluralForm}`;
@@ -114,29 +111,16 @@ function digestBriefing(digest, waiting) {
   return `Today I plan to look${scope} for new buyers.${needs}`;
 }
 
-function currentPicture(summary, waiting) {
-  const sales = summary?.sales || {};
-  const buyers = Number(sales.leads_found) || 0;
-  const replies = Number(sales.replies) || 0;
-  const sent = Number(sales.emails_sent) || 0;
-  const parts = [];
-  if (buyers) parts.push(`${plural(buyers, 'buyer')} ${buyers === 1 ? 'is' : 'are'} in your workspace`);
-  if (sent) parts.push(`${plural(sent, 'email')} ${sent === 1 ? 'has' : 'have'} been sent`);
-  if (replies) parts.push(`${plural(replies, 'reply', 'replies')} ${replies === 1 ? 'has' : 'have'} come back`);
+/* No currentPicture(). It restated leads_found / emails_sent / replies in
+   prose, which is the same three counters the hero's mono strip prints. Four
+   lines of text for data that reads better as one line of tabular figures. */
 
-  const base = parts.length
-    ? `Here is the current picture: ${listPhrase(parts)}.`
-    : "There isn't any buyer activity to summarize yet.";
-  if (!waiting) return base;
-  return `${base} ${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for your review.`;
-}
-
-function latestActivityHeading(activities) {
-  const latest = activities[0]?.at;
-  if (!latest) return 'Latest recorded activity';
-  const value = typeof latest === 'number' && latest < 100000000000 ? latest * 1000 : latest;
-  const age = Date.now() - new Date(value).getTime();
-  return age <= 36 * 60 * 60 * 1000 ? 'Since yesterday' : 'Latest recorded activity';
+/* One stable heading. It used to swap between "Since yesterday" and "Latest
+   recorded activity" across a 36-hour boundary, so a section header silently
+   changed its width and its meaning between two visits. Each row already
+   carries its own timestamp; the heading does not need to date the set. */
+function latestActivityHeading() {
+  return 'Recent activity';
 }
 
 function workCapability(health) {
@@ -430,8 +414,11 @@ export async function mount(root, ctx) {
 
   function actionControl(countries) {
     const canRun = workCapability(health);
+    // Secondary, not primary. Review owns the one blue on this screen (house
+    // One Voice Rule); a second blue slab here also rendered pale when
+    // disabled, which read as broken rather than unavailable.
     const action = button(work.busy ? 'Working on it…' : 'Find buyers and write to them', {
-      kind: 'primary',
+      kind: '',
       icon: work.busy ? null : 'search',
       disabled: work.busy || !canRun,
       onClick: startTodayWork,
@@ -510,23 +497,14 @@ export async function mount(root, ctx) {
           }))
       : null;
 
-    const reviewPrompt = waiting
-      // The blinking caret marks the one place on this page where the machine
-      // has stopped and cannot continue without a person.
-      ? el('section', { class: 'ifz-today-review' },
-          el('div', {},
-            createCaret({ state: 'waiting', label: 'Needs you' }).el,
-            el('strong', {}, `${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for you.`)),
-          button('Review', {
-            kind: 'primary',
-            icon: 'arrowRight',
-            onClick: () => ctx.navigate('/app/approvals'),
-          }))
-      // An empty queue is an idle state, not an achievement — so it reads
-      // neutral. Green is reserved for mail that actually went out.
-      : el('section', { class: 'ifz-today-clear' },
-          createCaret({ state: 'idle', label: 'Clear' }).el,
-          el('span', {}, 'No emails are waiting for review.'));
+    // The headline IS the news. There is no greeting and no restated summary:
+    // `currentPicture()` read the same three counters the footer strip already
+    // prints, and the waiting count appeared three times on one screen (here,
+    // in a separate "Needs you" band, and in the nav badge). The band is gone;
+    // its caret and its action moved up here.
+    const headline = waiting
+      ? `${plural(waiting, 'email')} ${waiting === 1 ? 'is' : 'are'} waiting for you.`
+      : 'Nothing is waiting for you.';
 
     const workNotice = work.sentence
       ? el('div', {
@@ -545,8 +523,10 @@ export async function mount(root, ctx) {
         el('span', {}, work.sentence))
       : null;
 
+    // Six, not three. The aside beside this column is much taller, and at three
+    // entries the grid left ~400px of dead space in the middle of the page.
     const activityList = activities.length
-      ? el('div', { class: 'ifz-today-activity-list' }, activities.slice(0, 3).map(activity =>
+      ? el('div', { class: 'ifz-today-activity-list' }, activities.slice(0, 6).map(activity =>
           el('article', { class: 'ifz-today-activity' },
             el('span', { class: 'ifz-today-activity-mark', 'aria-hidden': 'true' }),
             el('div', {},
@@ -560,18 +540,55 @@ export async function mount(root, ctx) {
       Number(sales.emails_sent) > 0 ? plural(Number(sales.emails_sent), 'sent email') : null,
     ].filter(Boolean).join(' · ');
 
+    // The overnight digest is real news and survives. The workspace summary it
+    // used to fall back to did not: those counters are the strip below.
+    const briefing = digest ? digestBriefing(digest, waiting) : null;
+
     host.replaceChildren(...[
       mailboxWarning,
       el('header', { class: 'ifz-today-hero' },
-        el('span', { class: 'ifz-today-kicker' }, 'Today'),
-        el('h1', {}, greeting()),
-        el('p', {}, digestBriefing(digest, waiting) || currentPicture(summary, waiting))),
-      reviewPrompt,
+        el('div', { class: 'ifz-today-hero-main' },
+          createCaret({ state: waiting ? 'waiting' : 'idle', label: 'Today' }).el,
+          el('h1', {}, headline),
+          // Explicit class, not a bare <p>. The prose allowlist used to claim
+          // every paragraph in this header, which dragged the counters strip
+          // below into Inter with proportional figures.
+          briefing ? el('p', { class: 'ifz-today-briefing' }, briefing) : null,
+          el('p', { class: 'ifz-today-counters' }, summaryLine || 'No buyer activity recorded yet.')),
+        el('div', { class: 'ifz-today-hero-act' },
+          waiting
+            ? button('Review', {
+                kind: 'primary',
+                icon: 'arrowRight',
+                onClick: () => ctx.navigate('/app/approvals'),
+              })
+            : null,
+          button('See the numbers', {
+            kind: 'ghost',
+            icon: 'arrowRight',
+            onClick: () => ctx.navigate('/app/analytics'),
+          }))),
       workNotice,
       el('div', { class: 'ifz-today-grid' },
+        // "Next" sits under the activity feed, not in a full-width row below
+        // the grid. What the agent will do belongs with what it just did, and
+        // the aside opposite is structurally taller than any realistic
+        // activity list, so the left column needs the content.
         el('section', { class: 'ifz-today-activity-section' },
-          el('span', { class: 'ifz-today-kicker' }, latestActivityHeading(activities)),
-          activityList),
+          el('span', { class: 'ifz-today-kicker' }, latestActivityHeading()),
+          activityList,
+          el('section', { class: `ifz-today-next${outcome.retry ? ' needs-attention' : ''}` },
+            el('span', { class: 'ifz-today-kicker' }, outcome.live ? 'Happening now' : 'Next'),
+            el('p', { role: outcome.retry ? 'status' : null }, nextSentence),
+            // A run that failed or was stopped stays visible after a reload,
+            // with the one action that resolves it.
+            outcome.retry
+              ? button('Try again', {
+                  icon: 'refresh',
+                  disabled: work.busy || !workCapability(health),
+                  onClick: startTodayWork,
+                })
+              : null)),
         el('aside', { class: 'ifz-today-action' },
           el('span', { class: 'ifz-today-kicker' }, 'Start the next search'),
           el('h2', {}, 'Find buyers and write to them'),
@@ -586,25 +603,8 @@ export async function mount(root, ctx) {
                 onClick: () => ctx.navigate('/app/setup?section=markets'),
               }),
           countries.length ? mapHost : null)),
-      el('section', { class: `ifz-today-next${outcome.retry ? ' needs-attention' : ''}` },
-        el('span', { class: 'ifz-today-kicker' }, outcome.live ? 'Happening now' : 'Next'),
-        el('p', { role: outcome.retry ? 'status' : null }, nextSentence),
-        // A run that failed or was stopped stays visible after a reload, with the
-        // one action that resolves it.
-        outcome.retry
-          ? button('Try again', {
-              icon: 'refresh',
-              disabled: work.busy || !workCapability(health),
-              onClick: startTodayWork,
-            })
-          : null),
-      el('footer', { class: 'ifz-today-summary' },
-        el('span', {}, summaryLine),
-        button('See the numbers', {
-          kind: 'ghost',
-          icon: 'arrowRight',
-          onClick: () => ctx.navigate('/app/analytics'),
-        })),
+      // No footer strip. Those counters and this link now sit in the hero,
+      // where they are read instead of scrolled past.
     ].filter(Boolean));
   }
 

@@ -193,7 +193,31 @@ def _mount_webui(app: FastAPI, webui_dir: Path, settings: Settings) -> None:
     mimetypes.add_type("font/woff2", ".woff2")
     mimetypes.add_type("font/woff", ".woff")
 
-    app.mount("/", StaticFiles(directory=str(webui_dir)), name="webui")
+    class RevalidatingStatic(StaticFiles):
+        """Serve the SPA with must-revalidate on code, long cache on fonts.
+
+        The dashboard is unbundled ES modules with stable filenames, so there
+        is no content hash to bust a cache with. Browsers cache modules
+        aggressively and heuristically, which means an edited .js can keep
+        serving from disk cache through several reloads: the page renders a
+        mix of old and new code and the change looks like it silently failed.
+
+        `no-cache` does not mean "do not cache" — it means "revalidate before
+        reuse". StaticFiles already emits ETag and Last-Modified, so this
+        costs a 304 per file and guarantees freshness. Fonts are exempt: their
+        names never change meaning and they are the largest payload here.
+        """
+
+        def file_response(self, *args, **kwargs):  # type: ignore[override]
+            response = super().file_response(*args, **kwargs)
+            path = str(getattr(response, "path", ""))
+            if path.endswith((".woff2", ".woff")):
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+            else:
+                response.headers["Cache-Control"] = "no-cache"
+            return response
+
+    app.mount("/", RevalidatingStatic(directory=str(webui_dir)), name="webui")
 
 
 def app_factory() -> FastAPI:

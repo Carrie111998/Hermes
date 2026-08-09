@@ -79,8 +79,11 @@
   --sidebar-warn: #D9A441;
 
   /* ---- map ---- */
-  --map-land: #E6E6E8;
-  --map-land-hover: #D2D2D6;
+  /* Must never equal a surface token: the map panels sit on --surface-2,
+     and land at #E6E6E8 was byte-identical to it, so the whole world was
+     invisible and only selected countries showed. */
+  --map-land: #C9C9CC;
+  --map-land-hover: #A2A2A7;
   --map-border: #FFFFFF;
   --map-selected: #2563FF;
   --map-selected-hover: #2145A0;
@@ -223,8 +226,8 @@
   --sidebar-badge-bg: #2563FF;
   --sidebar-badge-text: #FFFFFF;
 
-  --map-land: #1C1C1E;
-  --map-land-hover: #2C2C2F;
+  --map-land: #3A3A3E;
+  --map-land-hover: #4C4C52;
   --map-border: #0A0A0A;
   --map-selected: #2563FF;
   --map-selected-hover: #5B85FF;

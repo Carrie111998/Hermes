@@ -28,22 +28,19 @@ function qaFailures(message) {
 }
 
 function actionButton(label, {
-  key: _key, kind = '', icon, onClick, disabled = false, title,
+  kind = '', icon, onClick, disabled = false, title,
 } = {}) {
   return button(label, { kind, icon, onClick, disabled, title });
 }
 
-function reviewProgress(position, total) {
-  const visible = Math.min(total, 12);
-  return el('div', {
-    class: 'ifz-review-progress',
-    'aria-hidden': 'true',
-  }, Array.from({ length: visible }, (_, idx) =>
-    el('span', {
-      class: idx < position ? 'done' : '',
-      'aria-hidden': 'true',
-    })));
-}
+/* No progress indicator. It began as six dots, which restated the "N of M"
+   beside them; I replaced it with a bar, which restated the same thing in a
+   shape that read as a divider. The numerals were always complete on their
+   own. Two iterations on a redundant element is one more than it deserved.
+
+   No keyboard shortcuts either. A/E/S and the arrows are gone: they only
+   duplicated visible controls, and a bare letter key that fires an
+   irreversible send is a hazard on a screen where the user is mid-read. */
 
 function recipientDetails(message, contact) {
   const to = message.to || message.content?.to || contact?.email || 'No email address on file';
@@ -56,6 +53,20 @@ function recipientDetails(message, contact) {
       contact?.name && to ? el('span', {}, to) : null),
     el('dt', {}, 'CC'),
     el('dd', {}, cc.length ? cc.join(', ') : 'No one'));
+}
+
+/* Grows the textarea to its content so edit mode has one scroll (the page)
+   rather than two. A textarea that scrolls inside a scrolling page means the
+   same gesture moves different things depending on where the pointer sits.
+   The rAF runs after render attaches the node, when scrollHeight is real. */
+function autoGrow(node) {
+  const fit = () => {
+    node.style.height = 'auto';
+    node.style.height = `${node.scrollHeight}px`;
+  };
+  node.addEventListener('input', fit);
+  requestAnimationFrame(fit);
+  return node;
 }
 
 function emailEditor(message, handlers) {
@@ -79,6 +90,7 @@ function emailEditor(message, handlers) {
     'aria-describedby': handlers.validationField === 'body' ? `${bodyId}-error` : null,
   });
   body.classList.add('ifz-review-body-input');
+  autoGrow(body);
   return el('div', { class: 'ifz-review-editor' },
     el('label', { class: 'ifz-label', for: subjectId }, 'Subject'),
     subject,
@@ -98,7 +110,6 @@ function emailEditor(message, handlers) {
       actionButton(handlers.busy ? 'Saving…' : 'Save and approve', {
         kind: 'primary',
         icon: 'check',
-        key: 'A',
         disabled: handlers.busy,
         onClick: () => handlers.onSaveEdit?.({
           subject: subject.value.trim(),
@@ -183,29 +194,22 @@ function reviewActions(message, handlers) {
 
   const primary = qaFailed
     ? actionButton(handlers.busy ? 'Rewriting…' : 'Rewrite', {
-        kind: 'primary', icon: 'refresh', key: 'A',
+        kind: 'primary', icon: 'refresh',
         onClick: handlers.onRegenerate, disabled: handlers.busy,
       })
     : actionButton(handlers.busy ? 'Working…' : (handlers.primaryLabel || 'Approve'), {
-        kind: 'primary', icon: handlers.primaryIcon || 'check', key: 'A',
+        kind: 'primary', icon: handlers.primaryIcon || 'check',
         onClick: handlers.onPrimary, disabled: handlers.busy || handlers.blocked,
       });
 
   return el('footer', { class: 'ifz-review-actions' },
-    el('div', { class: 'ifz-review-primary-action' },
-      primary,
-      el('kbd', {}, 'A')),
+    el('div', { class: 'ifz-review-primary-action' }, primary),
     el('div', { class: 'ifz-review-secondary-actions' },
-      el('div', {},
-        actionButton(qaFailed ? 'Edit myself' : 'Edit', {
-          icon: 'edit', key: 'E', onClick: handlers.onEdit, disabled: handlers.busy,
-        }),
-        el('kbd', {}, 'E')),
-      el('div', {},
-        actionButton('Skip for now', {
-          key: 'S', onClick: handlers.onSkip, disabled: handlers.busy,
-        }),
-        el('kbd', {}, 'S')),
+      actionButton(qaFailed ? 'Edit myself' : 'Edit', {
+        icon: 'edit', onClick: handlers.onEdit, disabled: handlers.busy,
+      }),
+      actionButton('Skip for now', { onClick: handlers.onSkip, disabled: handlers.busy,
+      }),
       actionButton(handlers.contact ? 'Never contact this person' : 'Never contact this company', {
         kind: 'danger', icon: 'ban', onClick: handlers.onNeverContact, disabled: handlers.busy,
       })));
@@ -226,23 +230,21 @@ export function reviewCard(message, handlers = {}) {
     tabindex: '0',
     dataset: { messageId: message.id },
     'aria-label': `Review email ${position} of ${total}`,
-    'aria-keyshortcuts': 'A E S ArrowLeft ArrowRight Escape',
   },
     el('header', { class: 'ifz-review-card-head' },
       el('div', {},
         el('span', { class: 'ifz-overline' }, qaFailed ? 'Quality check' : 'Email review'),
         el('strong', {}, `${position} of ${total}`)),
       el('div', { class: 'ifz-review-card-nav' },
-        reviewProgress(position, total),
         actionButton('Previous', {
           kind: 'ghost', icon: 'arrowLeft', onClick: handlers.onPrevious,
           disabled: handlers.busy || position <= 1,
-          title: 'Previous email (Left arrow)',
+          title: 'Previous email',
         }),
         actionButton('Next', {
           kind: 'ghost', icon: 'arrowRight', onClick: handlers.onNext,
           disabled: handlers.busy || position >= total,
-          title: 'Next email (Right arrow)',
+          title: 'Next email',
         }))),
     handlers.blockedReason
       ? el('div', { class: 'ifz-review-block' }, handlers.blockedReason)

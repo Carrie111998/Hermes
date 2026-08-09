@@ -80,6 +80,58 @@ def test_static_assets_resolve_from_relative_hrefs():
         assert res.status_code == 200, path
 
 
+def test_stylesheets_have_balanced_braces():
+    # There is no build step or CSS linter here, so a dropped closing brace is
+    # silent: the browser swallows every following rule into the unclosed
+    # block. An unclosed @media in particular scopes the whole rest of the
+    # file to that breakpoint, and pages styled below it render unstyled at
+    # every other width, which looks like a data bug rather than a CSS one.
+    css_dir = Path(__file__).resolve().parents[2] / "server" / "webui" / "css"
+    sheets = sorted(css_dir.glob("*.css"))
+    assert sheets, "no stylesheets found"
+    for sheet in sheets:
+        source = re.sub(r"/\*.*?\*/", "", sheet.read_text(encoding="utf-8"), flags=re.S)
+        depth = source.count("{") - source.count("}")
+        assert depth == 0, f"{sheet.name} has {depth:+d} unclosed block(s)"
+
+
+def test_map_land_is_distinct_from_every_surface():
+    # The map panels sit on surface tokens, so landmasses painted the same
+    # value as their container are invisible: only selected countries render
+    # and the map looks broken rather than unstyled. This was a real defect in
+    # both themes (--map-land equalled --surface-2 exactly).
+    tokens = (
+        Path(__file__).resolve().parents[2] / "server" / "webui" / "css" / "tokens.css"
+    ).read_text(encoding="utf-8")
+    light, _, dark = tokens.partition(":root.dark")
+
+    def value(source: str, name: str) -> str:
+        found = re.search(rf"--{name}:\s*(#[0-9A-Fa-f]{{6}})", source)
+        assert found, f"--{name} not found"
+        return found.group(1).upper()
+
+    for label, source in (("light", light), ("dark", dark)):
+        land = value(source, "map-land")
+        for surface in ("bg", "surface", "surface-2", "surface-3"):
+            assert land != value(source, surface), (
+                f"{label}: --map-land equals --{surface} ({land}); the map will be invisible"
+            )
+
+
+def test_spa_code_revalidates_while_fonts_stay_immutable():
+    # Unbundled ES modules with stable filenames have no content hash to bust
+    # a cache with, so browsers can keep serving an edited .js from disk cache
+    # across reloads and the page runs a mix of old and new code.
+    _, client = make_client()
+    for path in ("/js/main.js", "/js/pages/_components.js", "/css/app.css"):
+        res = client.get(path)
+        assert res.status_code == 200, path
+        assert res.headers["cache-control"] == "no-cache", path
+
+    res = client.get("/fonts/inter-latin.woff2")
+    assert "immutable" in res.headers["cache-control"]
+
+
 def test_self_hosted_fonts_serve_with_the_woff2_media_type():
     # CSP is font-src 'self', so the faces must be local. They also have to go
     # out as font/woff2 — stdlib mimetypes has no woff2 entry on Windows, and

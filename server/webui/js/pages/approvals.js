@@ -180,14 +180,12 @@ export async function mount(root, ctx) {
     const header = pageHead({
       title: 'Emails waiting for you',
       status: caret.el,
-      sub: message
-        ? 'Review one at a time. The main button always says whether it will save a draft or send.'
-        : 'Your review queue, without campaign setup or delivery logs.',
+      // No subtitle while reviewing. "The main button always says whether it
+      // will save a draft or send" described a button that already says
+      // exactly that ("Approve — saves a draft in your mailbox"). The card is
+      // height-constrained, so every line here is taken from the email body.
+      sub: message ? null : 'Your review queue, without campaign setup or delivery logs.',
     });
-    const help = el('p', {
-      class: 'ifz-review-help',
-      id: 'ifz-review-help',
-    }, 'Shortcuts work while the review card is focused: A uses the main action, E edits, S skips for now, and the arrow keys move.');
     const live = el('p', {
       class: 'ifz-review-live',
       role: 'status',
@@ -312,8 +310,7 @@ export async function mount(root, ctx) {
       onNext: () => move(1),
       onEvidence: lead ? () => openLeadEvidence(lead) : null,
     });
-    card.setAttribute('aria-describedby', 'ifz-review-help');
-    host.replaceChildren(...[header, help, live, pauseBanner, card].filter(Boolean));
+    host.replaceChildren(...[header, live, pauseBanner, card].filter(Boolean));
     if (previousId && previousId === message.id) {
       const body = host.querySelector('.ifz-review-email-body');
       if (body) body.scrollTop = previousBodyScroll;
@@ -582,64 +579,11 @@ export async function mount(root, ctx) {
     }
   }
 
-  function onKeydown(event) {
-    if (event.repeat || event.isComposing || event.ctrlKey || event.metaKey || event.altKey) return;
-    if (!event.target.closest?.('.ifz-review-card')) return;
-
-    if (event.key === 'Escape' && editing) {
-      event.preventDefault();
-      editing = false;
-      feedback = null;
-      validationField = null;
-      announcement = 'Editing cancelled.';
-      render({ focus: 'edit' });
-      return;
-    }
-    if (busy) return;
-
-    const textEntry = event.target.closest?.('input, textarea, select, [contenteditable="true"]');
-    if (textEntry) return;
-
-    const key = event.key.toLowerCase();
-    if (editing) {
-      if (key === 'a') {
-        event.preventDefault();
-        host.querySelector('.ifz-review-edit-actions .ifz-btn.primary')?.click();
-      }
-      return;
-    }
-
-    if (key === 'a') {
-      event.preventDefault();
-      const message = queue[currentIndex];
-      if (message?.status === 'qa_failed') regenerate(message);
-      else if (!mailboxConnected && message?.status === 'approved') {
-        ctx.navigate('/app/setup?section=sending');
-      } else if (message) approveAndDeliver(message);
-    } else if (key === 'e') {
-      event.preventDefault();
-      editing = true;
-      feedback = null;
-      validationField = null;
-      render({ focus: 'editor' });
-    } else if (key === 's') {
-      event.preventDefault();
-      skipCurrent();
-    } else if (event.key === 'ArrowLeft') {
-      if (event.target.closest?.('button, a')) return;
-      event.preventDefault();
-      move(-1);
-    } else if (event.key === 'ArrowRight') {
-      if (event.target.closest?.('button, a')) return;
-      event.preventDefault();
-      move(1);
-    } else if (event.key === 'Escape') {
-      event.preventDefault();
-      ctx.navigate('/app/today');
-    }
-  }
-
-  host.addEventListener('keydown', onKeydown);
+  /* No keyboard shortcuts. A/E/S and the arrow keys were removed along with
+     the badges that advertised them: they duplicated visible controls, and a
+     single unmodified letter key firing an irreversible send is a hazard in a
+     surface where the user is often mid-read. Escape still leaves edit mode
+     by the browser's own handling of the Cancel button. */
   rebuildQueue(ctx.query.message || null);
   announcement = queue.length
     ? `${queue.length} email${queue.length === 1 ? '' : 's'} waiting for review.`
@@ -648,7 +592,6 @@ export async function mount(root, ctx) {
 
   return () => {
     disposed = true;
-    host.removeEventListener('keydown', onKeydown);
     root.classList.remove('ifz-page--approvals');
   };
 }
