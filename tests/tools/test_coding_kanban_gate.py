@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from tools.registry import ToolRegistry
-from tools.coding_kanban_gate import coding_tool_gate_refusal, is_coding_intent
+from tools.coding_kanban_gate import (
+    _verification_tool_allowed,
+    coding_tool_gate_refusal,
+    is_coding_intent,
+    task_capability_preflight,
+)
 
 
 def _registry(calls: list[str], *names: str) -> ToolRegistry:
@@ -24,6 +30,17 @@ def _registry(calls: list[str], *names: str) -> ToolRegistry:
 
 def _payload(result):
     return json.loads(result)
+
+
+def test_legacy_task_without_capability_metadata_remains_dispatchable():
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": {}})()
+    assert task_capability_preflight(task) is None
+
+
+@pytest.mark.parametrize("metadata", [{"capability": ""}, {"capability": "bogus"}])
+def test_explicit_malformed_capability_metadata_fails_closed(metadata):
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": metadata})()
+    assert task_capability_preflight(task)
 
 
 def _declare_profile(tmp_path, name: str) -> None:
@@ -824,6 +841,28 @@ def test_review_lane_worker_can_run_terminal_via_review_identity_metadata(monkey
     assert calls == ["terminal"]
 
 
+def test_verification_capability_cannot_be_bypassed_by_review_lane_heuristic(monkeypatch, tmp_path):
+    _claim_review_lane_task(
+        monkeypatch,
+        tmp_path,
+        title="Review PR #99 authorization boundaries",
+        metadata={"canonical": True, "capability": "verification", "lane": "VERIFICATION"},
+    )
+    calls: list[str] = []
+    registry = _registry(calls, "write_file")
+
+    result = _payload(registry.dispatch(
+        "write_file",
+        {"path": str(tmp_path / "changed.py"), "content": "print(1)"},
+        session_id="review-worker",
+        user_message="Inspect the PR",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert "verification workers are read-only" in result["error"]
+    assert calls == []
+
+
 @pytest.mark.parametrize(
     ("name", "args"),
     [
@@ -1188,3 +1227,51 @@ def test_kill_switch_unset_preserves_existing_behavior(monkeypatch, tmp_path):
     assert result["status"] == "ready"
     assert result["assignee"] == "dev"
     assert calls == []
+
+
+def _capability_task(assignee="orion", capability="verification", lane="VERIFICATION", **metadata):
+    return SimpleNamespace(
+        assignee=assignee,
+        status="ready",
+        metadata={"canonical": True, "capability": capability, "lane": lane, **metadata},
+    )
+
+
+def test_orion_verification_contract_allows_read_only_tools():
+    assert task_capability_preflight(_capability_task()) is None
+    assert _verification_tool_allowed("terminal", {"command": "git status --short"}) == (True, "")
+    assert _verification_tool_allowed("execute_code", {"code": "print(2 + 2)"}) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("write_file", {"path": "src/x.py", "content": "x"}),
+        ("patch", {"path": "src/x.py"}),
+        ("terminal", {"command": "git commit -am change"}),
+        ("execute_code", {"code": "open('x', 'w').write('x')"}),
+    ],
+)
+def test_orion_verification_contract_denies_writes(tool_name, args):
+    allowed, reason = _verification_tool_allowed(tool_name, args)
+    assert allowed is False
+    assert reason
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        (_capability_task(capability=None), "missing task capability"),
+        (_capability_task(capability="bogus"), "unsupported task capability"),
+        (_capability_task(assignee="dev", capability="verification"), "requires assignee orion"),
+    ],
+)
+def test_malformed_capability_metadata_is_rejected_before_spawn(task, expected):
+    reason = task_capability_preflight(task)
+    assert reason is not None
+    assert expected in reason
+
+
+def test_native_review_contract_remains_separate_from_verification():
+    assert task_capability_preflight(_capability_task(capability="review", lane="REVIEW")) is None
+    assert task_capability_preflight(_capability_task(assignee="dev", capability="implementation", lane="DEV")) is None
