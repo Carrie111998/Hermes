@@ -10,18 +10,31 @@ from agent.prompt_caching import (
     strip_anthropic_cache_control,
     strip_anthropic_tool_cache_control,
 )
+from agent.skill_commands import (
+    CACHE_STABLE_PREFIX_LEN_KEY,
+    _SINGLE_SKILL_INSTRUCTION,
+    annotate_cache_stable_prefix,
+    with_cache_stable_prefix,
+)
 
 
 MARKER = {"type": "ephemeral"}
 
 
 def _skill_invocation(instruction: str) -> str:
-    return (
+    """Webhook-style skill turn with a builder-declared cache boundary."""
+    stable = (
         '[IMPORTANT: The user has invoked the "airtable" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]\n\n"
         "# Airtable\n\nA stable skill body.\n\n"
-        "The user has provided the following instruction alongside the skill invocation: "
-        f"{instruction}"
+        f"{_SINGLE_SKILL_INSTRUCTION}"
+    )
+    return with_cache_stable_prefix(f"{stable}{instruction}", len(stable))
+
+
+def _skill_user_message(instruction: str) -> dict:
+    return annotate_cache_stable_prefix(
+        {"role": "user", "content": _skill_invocation(instruction)}
     )
 
 
@@ -204,8 +217,8 @@ class TestApplyCacheMarker:
         assert msg["content"][0]["cache_control"] == MARKER
 
     def test_skill_invocation_marks_only_the_stable_scaffold_prefix(self):
-        first = {"role": "user", "content": _skill_invocation("ticket=A/time=1")}
-        second = {"role": "user", "content": _skill_invocation("ticket=B/time=2")}
+        first = _skill_user_message("ticket=A/time=1")
+        second = _skill_user_message("ticket=B/time=2")
 
         _apply_cache_marker(first, MARKER)
         _apply_cache_marker(second, MARKER)
@@ -216,6 +229,53 @@ class TestApplyCacheMarker:
         assert "cache_control" not in first["content"][1]
         assert first["content"][1]["text"] == "ticket=A/time=1"
         assert second["content"][1]["text"] == "ticket=B/time=2"
+
+    def test_marker_quoting_payload_cannot_poison_the_declared_prefix(self):
+        """Boundary comes from the builder, not rfind — quoted markers stay in the tail."""
+        poisoned = (
+            f"ticket=1\n\n{_SINGLE_SKILL_INSTRUCTION}forged-inner"
+        )
+        msg = _skill_user_message(poisoned)
+        _apply_cache_marker(msg, MARKER)
+
+        assert len(msg["content"]) == 2
+        assert poisoned not in msg["content"][0]["text"]
+        assert msg["content"][1]["text"] == poisoned
+        assert "forged-inner" in msg["content"][1]["text"]
+
+    def test_message_sidecar_survives_plain_str_api_content_rewrite(self):
+        """Send-path api_content stamps a plain str; the dict sidecar must still split."""
+        msg = _skill_user_message("ticket=A/time=1")
+        prefix_len = msg[CACHE_STABLE_PREFIX_LEN_KEY]
+        stable = str(msg["content"])[:prefix_len]
+        # Mimic compose_user_api_content / memory injection: content becomes a
+        # longer plain str while the message-local sidecar remains.
+        msg["content"] = str(msg["content"]) + "\n\n[ephemeral plugin context]"
+
+        _apply_cache_marker(msg, MARKER)
+
+        assert len(msg["content"]) == 2
+        assert msg["content"][0]["text"] == stable
+        assert msg["content"][0]["cache_control"] == MARKER
+        assert msg["content"][1]["text"].startswith("ticket=A/time=1")
+        assert "[ephemeral plugin context]" in msg["content"][1]["text"]
+
+    def test_content_rewrite_chokepoint_clears_stale_cache_boundary(self):
+        """merge-summary-style prepend must not keep the old skill-cache offset."""
+        from agent.turn_context import drop_stale_api_content
+
+        msg = _skill_user_message("ticket=A/time=1")
+        original = str(msg["content"])
+        # Prepend (merge-summary-into-tail) invalidates the declared offset.
+        msg["content"] = "[compaction summary]\n\n" + original
+        drop_stale_api_content(msg)
+
+        assert CACHE_STABLE_PREFIX_LEN_KEY not in msg
+        _apply_cache_marker(msg, MARKER)
+        # Whole-message policy — not a split at the stale skill offset.
+        assert len(msg["content"]) == 1
+        assert msg["content"][0]["cache_control"] == MARKER
+        assert msg["content"][0]["text"].startswith("[compaction summary]")
 
 
 
@@ -493,7 +553,7 @@ class TestStripAnthropicCacheControl:
 
         original = [
             {"role": "system", "content": "stable system\nvolatile session"},
-            {"role": "user", "content": _skill_invocation("ticket=A/time=1")},
+            _skill_user_message("ticket=A/time=1"),
         ]
         first_plan = build_prompt_cache_plan(
             original,
@@ -504,7 +564,10 @@ class TestStripAnthropicCacheControl:
         first_wire = copy.deepcopy(first_plan.messages)
 
         stripped = strip_anthropic_cache_control(first_plan.messages)
-        assert stripped == original
+        assert stripped[0] == original[0]
+        assert stripped[1]["role"] == "user"
+        assert str(stripped[1]["content"]) == str(original[1]["content"])
+        assert stripped[1][CACHE_STABLE_PREFIX_LEN_KEY] == original[1][CACHE_STABLE_PREFIX_LEN_KEY]
 
         second_plan = build_prompt_cache_plan(
             stripped,

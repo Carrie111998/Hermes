@@ -14,7 +14,11 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from agent.skill_commands import split_skill_message_for_cache
+from agent.skill_commands import (
+    CACHE_STABLE_PREFIX_LEN_KEY,
+    annotate_cache_stable_prefix,
+    with_cache_stable_prefix,
+)
 
 
 @dataclass(frozen=True)
@@ -61,16 +65,18 @@ def _apply_cache_marker(msg: dict, cache_marker: dict, native_anthropic: bool = 
 
     if isinstance(content, str):
         if role == "user":
-            skill_parts = split_skill_message_for_cache(content)
-            if skill_parts is not None:
-                stable_prefix, volatile_suffix = skill_parts
+            # Builder-declared boundary (#81867): prefer the message-local
+            # sidecar, fall back to a ``_CacheBoundedStr`` content attribute.
+            annotate_cache_stable_prefix(msg)
+            prefix_len = msg.get(CACHE_STABLE_PREFIX_LEN_KEY)
+            if isinstance(prefix_len, int) and 0 < prefix_len < len(content):
                 msg["content"] = [
                     {
                         "type": "text",
-                        "text": stable_prefix,
+                        "text": content[:prefix_len],
                         "cache_control": cache_marker,
                     },
-                    {"type": "text", "text": volatile_suffix},
+                    {"type": "text", "text": content[prefix_len:]},
                 ]
                 return
         msg["content"] = [
@@ -190,8 +196,9 @@ def strip_anthropic_cache_control(
     Flattening back to a plain string is restricted to the exact shapes
     :func:`apply_anthropic_cache_control` produces from string content —
     a single ``{"type": "text"}`` part, the two-part ``[static, volatile]``
-    system split, or a recognized two-part skill invocation split — so the
-    ``""``-join is provably byte-exact. Organic
+    system split, or the two-part builder-declared skill split (identified
+    by the message-local ``_cache_stable_prefix_len`` sidecar matching the
+    first part's length) — so the ``""``-join is provably byte-exact. Organic
     multi-part text (merged user turns, imported transcripts) and parts
     carrying extra keys (``citations`` etc.) keep their structure; only
     per-part markers are removed. Marker removal is copy-on-write on the
@@ -210,9 +217,11 @@ def strip_anthropic_cache_control(
         content = msg.get("content")
         if not isinstance(content, list):
             continue
+        declared_len = msg.get(CACHE_STABLE_PREFIX_LEN_KEY)
         skill_split_shape = (
             msg.get("role") == "user"
             and len(content) == 2
+            and isinstance(declared_len, int)
             and all(
                 isinstance(part, dict)
                 and part.get("type", "text") == "text"
@@ -221,10 +230,7 @@ def strip_anthropic_cache_control(
             )
             and "cache_control" in content[0]
             and "cache_control" not in content[1]
-            and split_skill_message_for_cache(
-                content[0]["text"] + content[1]["text"]
-            )
-            == (content[0]["text"], content[1]["text"])
+            and len(content[0]["text"]) == declared_len
         )
         if any(isinstance(part, dict) and "cache_control" in part for part in content):
             content = [
@@ -246,7 +252,15 @@ def strip_anthropic_cache_control(
             or skill_split_shape
         )
         if decoration_shape:
-            msg["content"] = "".join(part["text"] for part in content)
+            # Flatten back to a plain string for the next decorator, but keep
+            # the builder-declared boundary sidecar so a mid-turn failover
+            # redecorate (#72626) can recreate the same split.
+            flat = "".join(part["text"] for part in content)
+            if skill_split_shape:
+                msg["content"] = with_cache_stable_prefix(flat, declared_len)
+                msg[CACHE_STABLE_PREFIX_LEN_KEY] = declared_len
+            else:
+                msg["content"] = flat
     return api_messages
 
 

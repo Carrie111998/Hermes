@@ -53,10 +53,6 @@ _RUNTIME_NOTE = "\n\n[Runtime note:"
 _BUNDLE_MARKER = " skill bundle,"
 _BUNDLE_USER_INSTRUCTION = "\nUser instruction: "
 _BUNDLE_FIRST_SKILL_BLOCK = "\n\n[Loaded as part of the "
-_CRON_SKIPPED_SKILLS_PREFIX = (
-    "[IMPORTANT: The following skill(s) were listed for this job but could not be found "
-)
-_CRON_EXECUTION_PREFIX = "[IMPORTANT: You are running as a scheduled cron job. "
 
 # The skill name sits in the first quoted span of the activation note, for both
 # the single-skill and the bundle header ("work" / "/clean /work").
@@ -72,6 +68,90 @@ SKILL_SCAFFOLD_SQL_LIKE = _SKILL_INVOCATION_PREFIX + "%"
 # the joint (a bundle instruction cut off by the head window); callers cut the
 # description there rather than show the skill body on the far side.
 SKILL_EXCERPT_JOINT = "\x1e"
+
+# Message-local sidecar (#81867): builders declare the exact stable/volatile
+# byte boundary at construction time. The cache planner reads this key (or the
+# matching attribute on a ``_CacheBoundedStr`` content value) to mark only the
+# scaffold. Underscore-prefixed so transports strip it before the provider
+# wire — same convention as other Hermes-internal message sidecars.
+CACHE_STABLE_PREFIX_LEN_KEY = "_cache_stable_prefix_len"
+
+
+class _CacheBoundedStr(str):
+    """str subclass carrying a builder-declared Anthropic cache boundary.
+
+    Plain ``str`` is a deepcopy atomic, but subclasses go through
+    ``__newobj__`` — so ``__getnewargs__`` must round-trip the boundary.
+    Structural send-path clones share immutable string leaves and therefore
+    keep the same object. JSON / SessionDB serialization collapses to a plain
+    ``str``, after which the message falls back to whole-block caching —
+    never worse than main.
+    """
+
+    __slots__ = (CACHE_STABLE_PREFIX_LEN_KEY,)
+
+    def __new__(cls, value: str, cache_stable_prefix_len: int):
+        obj = str.__new__(cls, value)
+        object.__setattr__(obj, CACHE_STABLE_PREFIX_LEN_KEY, cache_stable_prefix_len)
+        return obj
+
+    def __getnewargs__(self):
+        return (str.__str__(self), getattr(self, CACHE_STABLE_PREFIX_LEN_KEY))
+
+
+def get_cache_stable_prefix_len(content: Any) -> Optional[int]:
+    """Return a builder-declared stable-prefix length, or ``None``."""
+    length = getattr(content, CACHE_STABLE_PREFIX_LEN_KEY, None)
+    if isinstance(length, int) and length > 0:
+        return length
+    return None
+
+
+def with_cache_stable_prefix(content: str, prefix_len: Optional[int]) -> str:
+    """Attach a proper-prefix cache boundary to ``content`` when valid."""
+    if (
+        isinstance(content, str)
+        and isinstance(prefix_len, int)
+        and 0 < prefix_len < len(content)
+    ):
+        return _CacheBoundedStr(content, prefix_len)
+    return content
+
+
+def annotate_cache_stable_prefix(message: dict, prefix_len: Optional[int] = None) -> dict:
+    """Lift a builder-declared boundary onto a message dict (in place).
+
+    Resolution order for the boundary length:
+    1. Explicit ``prefix_len`` argument
+    2. ``_CacheBoundedStr`` attribute on ``content``
+    3. Existing message-local ``_cache_stable_prefix_len`` sidecar
+
+    (3) matters on the send path: memory/plugin injection may replace
+    ``content`` with a longer plain ``str`` via ``api_content`` while leaving
+    the dict key intact. Dropping a still-valid sidecar there would silently
+    revert to whole-block caching (#81867).
+
+    Invalid / missing boundaries leave the message unmarked so the ordinary
+    one-block cache policy applies.
+    """
+    if not isinstance(message, dict):
+        return message
+    content = message.get("content")
+    if prefix_len is None:
+        prefix_len = get_cache_stable_prefix_len(content)
+    if prefix_len is None:
+        existing = message.get(CACHE_STABLE_PREFIX_LEN_KEY)
+        if isinstance(existing, int):
+            prefix_len = existing
+    if (
+        isinstance(content, str)
+        and isinstance(prefix_len, int)
+        and 0 < prefix_len < len(content)
+    ):
+        message[CACHE_STABLE_PREFIX_LEN_KEY] = prefix_len
+    else:
+        message.pop(CACHE_STABLE_PREFIX_LEN_KEY, None)
+    return message
 
 
 def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
@@ -99,68 +179,6 @@ def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
         return _extract_single_skill_user_instruction(content)
 
     return None
-
-
-def split_skill_message_for_cache(content: Any) -> Optional[tuple[str, str]]:
-    """Split stable single-skill scaffolding from its volatile invocation tail.
-
-    The returned boundary is used only while decorating an outgoing provider
-    request. The canonical conversation message remains a string, preserving
-    persistence, transcript rendering, and memory-provider behavior.
-
-    Cron's one-or-more-skill prompt uses the same activation and instruction
-    markers as the slash-skill builder, so it gets the same boundary without
-    changing its canonical text. Ordinary bundle messages are excluded because
-    their user instruction precedes the loaded skill blocks; cron's bundle
-    wrapper is the exception because it appends its own instruction after all
-    stable blocks.
-    """
-    if not isinstance(content, str):
-        return None
-
-    activation_index = content.find(_SKILL_INVOCATION_PREFIX)
-    starts_with_single_skill = activation_index == 0
-    starts_with_cron_skip_notice = (
-        content.startswith(_CRON_SKIPPED_SKILLS_PREFIX)
-        and activation_index > 0
-    )
-    if not starts_with_single_skill and not starts_with_cron_skip_notice:
-        return None
-
-    activation_end = content.find("\n\n", activation_index)
-    if activation_end < 0:
-        activation_end = len(content)
-    activation_note = content[activation_index:activation_end]
-    is_single_skill_scaffold = _SINGLE_SKILL_MARKER in activation_note
-    is_bundle_scaffold = _BUNDLE_MARKER in activation_note
-
-    instruction_boundary = f"\n\n{_SINGLE_SKILL_INSTRUCTION}"
-    boundary_index = content.rfind(instruction_boundary)
-    if boundary_index >= 0:
-        split_index = boundary_index + len(instruction_boundary)
-        suffix = content[split_index:]
-        # A normal bundle keeps its instruction before the skill blocks and
-        # must retain the ordinary one-block cache policy. Cron is the one
-        # bundle caller that appends a second, outer instruction after all
-        # stable blocks; its suffix always begins with the execution hint.
-        if not is_single_skill_scaffold and not (
-            is_bundle_scaffold
-            and 0 <= content.rfind(_BUNDLE_FIRST_SKILL_BLOCK) < boundary_index
-            and suffix.startswith(_CRON_EXECUTION_PREFIX)
-        ):
-            return None
-    else:
-        if not is_single_skill_scaffold:
-            return None
-        boundary_index = content.rfind(_RUNTIME_NOTE)
-        if boundary_index < 0:
-            return None
-        split_index = boundary_index + len(_RUNTIME_NOTE)
-
-    prefix, suffix = content[:split_index], content[split_index:]
-    if not prefix or not suffix:
-        return None
-    return prefix, suffix
 
 
 def describe_skill_invocation(content: Any, separator: str = " — ") -> Optional[str]:
@@ -426,15 +444,23 @@ def _build_skill_message(
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
 
+    stable_prefix = None
     if user_instruction:
         parts.append("")
-        parts.append(f"The user has provided the following instruction alongside the skill invocation: {user_instruction}")
+        # Everything through the static instruction prose is a stable scaffold;
+        # the caller-supplied instruction (webhook payload, ticket IDs,
+        # timestamps) and any runtime note ride in the volatile tail (#81867).
+        stable_prefix = "\n".join(parts) + "\n" + _SINGLE_SKILL_INSTRUCTION
+        parts.append(f"{_SINGLE_SKILL_INSTRUCTION}{user_instruction}")
 
     if runtime_note:
         parts.append("")
         parts.append(f"[Runtime note: {runtime_note}]")
 
-    return "\n".join(parts)
+    message = "\n".join(parts)
+    if stable_prefix is not None:
+        return with_cache_stable_prefix(message, len(stable_prefix))
+    return message
 
 
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:

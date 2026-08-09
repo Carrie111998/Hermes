@@ -109,15 +109,31 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
 
 
 def drop_stale_api_content(msg: Dict[str, Any]) -> None:
-    """Drop the ``api_content`` sidecar from a message whose content was rewritten.
+    """Drop request-local sidecars from a message whose content was rewritten.
 
     Called from every content-rewrite path (historical image strip,
     merge-summary-into-tail, consecutive-user repair merge, stale-confirmation
-    redaction). Replaying the pre-rewrite sidecar would resend exactly what
-    the rewrite removed, so it must be dropped — the cost is one cache
-    boundary miss, never wrong content.
+    redaction). Replaying the pre-rewrite ``api_content`` sidecar would
+    resend exactly what the rewrite removed, so it must be dropped — the
+    cost is one cache boundary miss, never wrong content.
+
+    The builder-declared skill-cache boundary (#81867) is cleared for the
+    same reason: a prepend/replace rewrite invalidates the old offset, and
+    keeping ``_cache_stable_prefix_len`` would place ``cache_control`` on
+    the wrong cut. Falls back to whole-message caching.
     """
+    from agent.skill_commands import (
+        CACHE_STABLE_PREFIX_LEN_KEY,
+        get_cache_stable_prefix_len,
+    )
+
     msg.pop("api_content", None)
+    msg.pop(CACHE_STABLE_PREFIX_LEN_KEY, None)
+    content = msg.get("content")
+    # Collapse ``_CacheBoundedStr`` so a stale attribute cannot re-annotate
+    # after the dict sidecar was cleared.
+    if get_cache_stable_prefix_len(content) is not None:
+        msg["content"] = str(content)
 
 
 def extract_api_content_sidecar(msg: Mapping[str, Any]) -> Optional[str]:
@@ -439,9 +455,20 @@ def build_turn_context(
     except Exception:
         logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
 
-    # Sanitize surrogate characters from user input.
+    # Sanitize surrogate characters from user input. Preserve a builder-declared
+    # cache boundary (#81867) across the rewrite — ``sanitize_surrogates`` returns
+    # a plain ``str`` when it replaces lone surrogates.
+    from agent.skill_commands import (
+        annotate_cache_stable_prefix,
+        get_cache_stable_prefix_len,
+        with_cache_stable_prefix,
+    )
+
+    _user_cache_boundary = get_cache_stable_prefix_len(user_message)
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
+        if _user_cache_boundary is not None:
+            user_message = with_cache_stable_prefix(user_message, _user_cache_boundary)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
@@ -541,6 +568,10 @@ def build_turn_context(
         user_msg = {"role": "user", "content": user_message}
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+
+    # Lift the builder-declared cache boundary onto the message dict so it
+    # survives later content rewrites (sanitize, api_content stamp, etc.).
+    annotate_cache_stable_prefix(user_msg)
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():

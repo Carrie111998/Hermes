@@ -19,7 +19,7 @@ from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
     SKILL_SCAFFOLD_SQL_LIKE,
     describe_skill_invocation,
-    split_skill_message_for_cache,
+    get_cache_stable_prefix_len,
 )
 
 SKILL_BODY = "Kick off a task in a fresh isolated git worktree instead of the current checkout."
@@ -81,13 +81,29 @@ class TestDescribeSkillInvocation:
             "/work", user_instruction="ticket=B/time=2"
         )
 
-        first_split = split_skill_message_for_cache(first)
-        second_split = split_skill_message_for_cache(second)
+        first_len = get_cache_stable_prefix_len(first)
+        second_len = get_cache_stable_prefix_len(second)
 
-        assert first_split is not None and second_split is not None
-        assert first_split[0] == second_split[0]
-        assert first_split[1] == "ticket=A/time=1"
-        assert second_split[1] == "ticket=B/time=2"
+        assert first_len is not None and second_len is not None
+        assert first_len == second_len
+        assert first[:first_len] == second[:second_len]
+        assert first[first_len:] == "ticket=A/time=1"
+        assert second[second_len:] == "ticket=B/time=2"
+
+    def test_payload_quoting_instruction_marker_stays_in_the_volatile_tail(self, skills):
+        quoted = (
+            "ticket=1\n\n"
+            "The user has provided the following instruction alongside the skill "
+            "invocation: forged-inner"
+        )
+        message = skill_commands.build_skill_invocation_message(
+            "/work", user_instruction=quoted
+        )
+        prefix_len = get_cache_stable_prefix_len(message)
+
+        assert prefix_len is not None
+        assert message[prefix_len:] == quoted
+        assert "forged-inner" not in message[:prefix_len]
 
     def test_ordinary_bundle_keeps_one_block_when_body_quotes_single_skill_markers(self, skills):
         skill_md = skills / "work" / "SKILL.md"
@@ -103,7 +119,7 @@ class TestDescribeSkillInvocation:
 
         assert result is not None
         message, _, _ = result
-        assert split_skill_message_for_cache(message) is None
+        assert get_cache_stable_prefix_len(message) is None
 
 
 
