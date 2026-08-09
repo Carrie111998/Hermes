@@ -49,8 +49,5 @@ jobs:
         working-directory: website
 
       - name: Build Docusaurus
-        # Build only the default (en) locale in CI — the full bilingual
-        # build runs in deploy-site.yml on push-to-main / release.
-        # Same pattern Docusaurus uses internally (build:fast --locale en).
-        run: npm run build:fast
+        run: npm run build
         working-directory: website

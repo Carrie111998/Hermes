@@ -16,7 +16,6 @@ import { GeneratedImage } from '@/components/chat/generated-image-result'
 import { SCAFFOLD_LABEL_CLASS, SCAFFOLD_META_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
 import { useI18n } from '@/i18n'
 import { generatedImageFromResult } from '@/lib/generated-images'
-import { separateGluedReasoningBlocks } from '@/lib/reasoning-blocks'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 
@@ -250,7 +249,7 @@ const ReasoningTextPart: ReasoningMessagePartComponent = () => {
       containerProps={{ 'data-slot': 'aui_reasoning-text' } as ComponentProps<'div'>}
       disableArtifacts
       isRunning={status.type === 'running' || messageRunning}
-      text={separateGluedReasoningBlocks(text.trimStart())}
+      text={text.trimStart()}
     />
   )
 }

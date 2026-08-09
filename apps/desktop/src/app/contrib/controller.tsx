@@ -2,7 +2,6 @@ import { useStore } from '@nanostores/react'
 import { atom, computed } from 'nanostores'
 import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } from 'react'
 
-import { SessionDraftTitle } from '@/app/chat/session-draft-title'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
 import { type StatusbarItem } from '@/app/shell/statusbar-controls'
@@ -37,7 +36,7 @@ import { Slot } from '@/contrib/react/slot'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
-import { NEW_SESSION_TITLE, sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
+import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { Download, FileText, LayoutDashboard, PanelBottom, Terminal, Upload, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { setYoloEnabled } from '@/lib/yolo-session'
@@ -59,7 +58,6 @@ import { $reviewOpen, closeReview, openReview, REVIEW_PANE_ID } from '@/store/re
 import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
-import { isHudWindow } from '@/store/windows'
 
 import type { SessionDragPayload } from '../chat/composer/inline-refs'
 import { watchPreviewTiles } from '../chat/preview-tile'
@@ -71,7 +69,6 @@ import {
   watchSessionTiles,
   WorkspaceTabMenu
 } from '../chat/session-tile'
-import { HudShell } from '../hud/hud-shell'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
@@ -160,7 +157,7 @@ registry.registerMany([
     id: 'workspace',
     area: 'panes',
     // Live-retitled to the loaded session by syncWorkspaceTitle below.
-    title: NEW_SESSION_TITLE,
+    title: 'New session',
     data: {
       placement: 'main',
       minWidth: '22vw',
@@ -431,19 +428,12 @@ const syncWorkspaceTitle = () => {
   registry.register({
     id: 'workspace',
     area: 'panes',
-    // The placeholder, not the draft's live name — `tabTitle` below renders
-    // that. Keeping it here would re-register the pane on every keystroke.
-    title: stored ? storedSessionTitle(stored) : NEW_SESSION_TITLE,
+    title: stored ? storedSessionTitle(stored) : 'New session',
     data: {
       // The tab's status dot — the SAME primitive the sidebar row and session
-      // tiles render, so the main tab never disagrees with its sidebar row. A
-      // fresh draft has no session to key by, which IS its status: the dot
-      // resolves to `draft` and marks the tab rather than leaving a hole.
-      tabLead: () => <SessionStatusDot session={stored} storedSessionId={selected} />,
-      // A draft's name lives in its composer, not in any session row, so the
-      // label subscribes to it directly — typing renames the tab without
-      // re-registering the pane.
-      tabTitle: stored ? undefined : () => <SessionDraftTitle scope={selected} />,
+      // tiles render, so the main tab never disagrees with its sidebar row. No
+      // dot on a fresh draft (no session yet).
+      tabLead: selected ? () => <SessionStatusDot session={stored} storedSessionId={selected} /> : undefined,
       // Pages aren't tab-able: the main zone's bar stands down while one shows.
       headerVeto: $workspaceIsPage.get(),
       placement: 'main',
@@ -697,18 +687,6 @@ function TitlebarSlot({ area, className, style }: TitlebarSlotProps) {
 export function ContribController() {
   const sidebarOpen = useStore($sidebarOpen)
   const statusbarVisible = useStore($statusbarVisible)
-
-  // HUD mode is the SAME app with its frame removed: the wiring (gateway,
-  // sessions, streams, submit) mounts identically, and only the shell around
-  // the chat surface differs. Branching here rather than at the window entry
-  // is what keeps the HUD's composer the real composer.
-  if (isHudWindow()) {
-    return (
-      <ContribWiring>
-        <HudShell />
-      </ContribWiring>
-    )
-  }
 
   return (
     <SidebarProvider

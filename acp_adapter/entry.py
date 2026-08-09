@@ -80,11 +80,9 @@ class _BenignProbeMethodFilter(logging.Filter):
 
 def _setup_logging() -> None:
     """Route all logging to stderr so stdout stays clean for ACP stdio."""
-    from agent.redact import RedactingFormatter
-
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(
-        RedactingFormatter(
+        logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

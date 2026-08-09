@@ -2,7 +2,6 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
-import { isElementInHiddenPane, PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { markRightPanePerf } from '@/debug/right-pane-events'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
@@ -51,7 +50,6 @@ interface PersistentTerminalProps {
 }
 
 interface Rect {
-  hidden: boolean
   top: number
   left: number
   width: number
@@ -59,7 +57,7 @@ interface Rect {
 }
 
 const sameRect = (a: Rect | null, b: Rect) =>
-  !!a && a.hidden === b.hidden && a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height
+  !!a && a.top === b.top && a.left === b.left && a.width === b.width && a.height === b.height
 
 export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalProps) {
   const slot = useStore($slot)
@@ -114,16 +112,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
       // full pixel footprint, so half-pixel rects can't leak page bg through.
       const top = Math.floor(r.top)
       const left = Math.floor(r.left)
-
-      // Inactive keep-alive panes deliberately retain the same rect as the
-      // foreground pane, so visibility must be sampled independently.
-      const next: Rect = {
-        hidden: isElementInHiddenPane(slot),
-        top,
-        left,
-        width: Math.ceil(r.right) - left,
-        height: Math.ceil(r.bottom) - top
-      }
+      const next: Rect = { top, left, width: Math.ceil(r.right) - left, height: Math.ceil(r.bottom) - top }
 
       if (!sameRect(prev, next)) {
         prev = next
@@ -193,7 +182,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
     for (let node: HTMLElement | null = slot; node; node = node.parentElement) {
       positionObserver?.observe(node, {
-        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state', PANE_HIDDEN_ATTR],
+        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
         attributes: true,
         childList: true,
         subtree: false
@@ -229,7 +218,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     }
   }, [slot])
 
-  const visible = Boolean(rect && !rect.hidden && rect.width > 0 && rect.height > 0)
+  const visible = Boolean(rect && rect.width > 0 && rect.height > 0)
 
   const style: CSSProperties = {
     position: 'fixed',
@@ -240,10 +229,6 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     display: 'flex',
     flexDirection: 'column',
     visibility: visible ? 'visible' : 'hidden',
-    // Electron may keep xterm's WebGL canvas visually composited after an
-    // ancestor becomes visibility:hidden. Opacity clears that compositor layer
-    // while preserving the mounted DOM, terminal dimensions, and live PTY.
-    opacity: visible ? 1 : 0,
     pointerEvents: visible ? 'auto' : 'none',
     zIndex: 4,
     // Match the live skin surface so the header strip (transparent) and body

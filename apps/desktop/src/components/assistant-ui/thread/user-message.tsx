@@ -348,6 +348,7 @@ export const UserMessage: FC<{
 
                         notifyThreadEditOpen()
                       }}
+                      title={copy.editMessage}
                       type="button"
                     >
                       {bubbleContent}

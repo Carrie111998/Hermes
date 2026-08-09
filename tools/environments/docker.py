@@ -18,11 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from tools.environments.base import (
-    BaseEnvironment,
-    EnvironmentConnectionError,
-    _popen_bash,
-)
+from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -782,13 +778,9 @@ def _ensure_docker_available() -> None:
             "or known install locations. Install Docker Desktop and ensure the "
             "CLI is available."
         )
-        raise EnvironmentConnectionError(
+        raise RuntimeError(
             "Docker executable not found in PATH or known install locations. "
-            "Install Docker and ensure the 'docker' command is available.",
-            retry_hint=(
-                "Install Docker (or fix PATH) and retry, or switch "
-                "terminal.backend to 'local'."
-            ),
+            "Install Docker and ensure the 'docker' command is available."
         )
 
     try:
@@ -806,9 +798,8 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise EnvironmentConnectionError(
-            "Docker executable could not be executed. Check your Docker installation.",
-            retry_hint="Repair the Docker installation and retry.",
+        raise RuntimeError(
+            "Docker executable could not be executed. Check your Docker installation."
         )
     except subprocess.TimeoutExpired:
         logger.error(
@@ -817,12 +808,8 @@ def _ensure_docker_available() -> None:
             docker_exe,
             exc_info=True,
         )
-        raise EnvironmentConnectionError(
-            "Docker daemon is not responding. Ensure Docker is running and try again.",
-            retry_hint=(
-                "Start the Docker daemon (e.g. `systemctl start docker` or "
-                "launch Docker Desktop), then retry the same command."
-            ),
+        raise RuntimeError(
+            "Docker daemon is not responding. Ensure Docker is running and try again."
         )
     except Exception:
         logger.error(
@@ -839,13 +826,9 @@ def _ensure_docker_available() -> None:
                 result.returncode,
                 result.stderr.strip(),
             )
-            raise EnvironmentConnectionError(
+            raise RuntimeError(
                 "Docker command is available but 'docker version' failed. "
-                "Check your Docker installation.",
-                retry_hint=(
-                    "The Docker daemon may be down or the current user lacks "
-                    "permission (docker group). Fix and retry."
-                ),
+                "Check your Docker installation."
             )
 
 

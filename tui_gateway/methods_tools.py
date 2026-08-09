@@ -710,19 +710,15 @@ def _(rid, params: dict) -> dict:
         if not history:
             return _err(rid, 4018, "no previous user message to retry")
         # Walk backwards to the last *real* user turn. Timeline bookkeeping
-        # rows (display_kind set) and compaction handoffs are durable
-        # role=user but must not count as user-originated asks — same
-        # predicate as CLI resume/count and the prompt.submit ordinal fix.
-        # Without this, /retry re-sends opaque markers (model_switch /
-        # async_delegation_complete / auto_continue / CONTEXT COMPACTION
-        # handoffs) and truncates only the marker instead of the failed
-        # exchange (#80622).
-        from agent.context_compressor import is_user_originated_turn
-
+        # rows (display_kind set) are durable role=user but no client counts
+        # them as user turns — same predicate as CLI resume/count and the
+        # prompt.submit ordinal fix. Without this, /retry re-sends opaque
+        # markers (model_switch / async_delegation_complete / auto_continue)
+        # and truncates only the marker instead of the failed exchange.
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if is_user_originated_turn(msg):
+            if msg.get("role") == "user" and not msg.get("display_kind"):
                 last_user_idx = i
                 break
         if last_user_idx is None:
@@ -1298,17 +1294,12 @@ def _(rid, params: dict) -> dict:
                 removed = 0
                 with session["history_lock"]:
                     history = session.get("history", [])
-                    # Truncate from the last *real* user turn. Same predicate
-                    # as list_recent_user_messages / /undo / /retry —
-                    # is_user_originated_turn also excludes compaction
-                    # handoffs (durable role=user, sometimes without
-                    # display_kind on legacy sessions; #80622).
-                    from agent.context_compressor import is_user_originated_turn
-
+                    # Truncate from the last *real* user turn (no display_kind).
+                    # Same predicate as list_recent_user_messages / /undo / /retry.
                     last_user_idx = None
                     for i in range(len(history) - 1, -1, -1):
                         msg = history[i]
-                        if is_user_originated_turn(msg):
+                        if msg.get("role") == "user" and not msg.get("display_kind"):
                             last_user_idx = i
                             break
                     if last_user_idx is not None:
@@ -1803,19 +1794,17 @@ def _(rid, params: dict) -> dict:
     agree on what's installed and what's enabled.
 
     Actions:
-      - ``list``   → {"plugins": [{name, key, version, description, source,
-                       status, portable}], "user_count": N, "bundled_count": M}
-      - ``toggle`` → flip ``key`` (or ``name``) based on ``enable`` (bool).
-                       Returns the refreshed row plus {"ok", "unchanged"}.
+      - ``list``   → {"plugins": [{name, version, description, source,
+                       status}], "user_count": N, "bundled_count": M}
+      - ``toggle`` → flip ``name`` based on ``enable`` (bool). Returns the
+                       refreshed row plus {"ok", "unchanged"}.
     """
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
-            _bundled_default_on,
             _discover_all_plugins,
             _get_disabled_set,
             _get_enabled_set,
-            _is_portable_plugin_dir,
             _plugin_status,
         )
 
@@ -1826,31 +1815,13 @@ def _(rid, params: dict) -> dict:
             for name, version, desc, source, _dir, key in sorted(
                 _discover_all_plugins()
             ):
-                status = _plugin_status(name, enabled, disabled, key=key)
-                # Bundled backends/platforms/providers are active without an
-                # explicit enable (they "just work" — plugins.py). Reporting
-                # them "not enabled" reads as OFF in clients when they are in
-                # fact running; surface the truthful default instead.
-                if (
-                    status == "not enabled"
-                    and source == "bundled"
-                    and _bundled_default_on(_dir)
-                ):
-                    status = "enabled"
                 out.append(
                     {
                         "name": name,
-                        # Canonical registry key (e.g. ``image_gen/fal``). Names
-                        # can collide across category dirs — both fal backends
-                        # are named "fal" — so toggles must address the key.
-                        "key": key,
                         "version": str(version or ""),
                         "description": desc or "",
                         "source": source,
-                        "status": status,
-                        # Agent Plugins v1 package (plugin.json — the portable
-                        # skills/MCP format) vs a native Hermes plugin.
-                        "portable": _is_portable_plugin_dir(_dir),
+                        "status": _plugin_status(name, enabled, disabled, key=key),
                     }
                 )
             return out
@@ -1870,24 +1841,20 @@ def _(rid, params: dict) -> dict:
         if action == "toggle":
             from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
 
-            # Prefer the canonical key — bare names are ambiguous when two
-            # category plugins share one (image_gen/fal vs video_gen/fal).
-            ident = (params.get("key") or params.get("name") or "").strip()
-            if not ident:
-                return _err(rid, 4019, "plugins.toggle requires a 'key' or 'name'")
+            name = (params.get("name") or "").strip()
+            if not name:
+                return _err(rid, 4019, "plugins.toggle requires a 'name'")
             enable = bool(params.get("enable"))
-            result = dashboard_set_agent_plugin_enabled(ident, enabled=enable)
+            result = dashboard_set_agent_plugin_enabled(name, enabled=enable)
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "toggle failed")
-            row = next(
-                (r for r in _rows() if ident in (r["key"], r["name"])), None
-            )
+            row = next((r for r in _rows() if r["name"] == name), None)
             return _ok(
                 rid,
                 {
                     "ok": True,
                     "unchanged": bool(result.get("unchanged")),
-                    "name": ident,
+                    "name": name,
                     "plugin": row,
                 },
             )

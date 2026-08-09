@@ -124,11 +124,7 @@ class TestFalRouting:
         capture: dict = {}
         self._patch_submit(monkeypatch, image_tool, capture)
 
-        # Routing test — disable the (default-on) upscale pass so the captured
-        # endpoint is the generation submit, not the upscaler.
-        raw = image_tool.image_generate_tool(
-            prompt="a cat", aspect_ratio="square", upscale=False,
-        )
+        raw = image_tool.image_generate_tool(prompt="a cat", aspect_ratio="square")
         out = json.loads(raw)
         assert out["success"] is True
         assert out["modality"] == "text"

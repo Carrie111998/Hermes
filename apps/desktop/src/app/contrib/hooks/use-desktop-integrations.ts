@@ -14,7 +14,7 @@ import {
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
-import { isHudWindow, isSecondaryWindow } from '@/store/windows'
+import { isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
@@ -82,7 +82,7 @@ export function useDesktopIntegrations({
   // This ref is a one-time lifecycle latch, not a mirror of reactive atom state.
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
-    if (!profileReady || isHudWindow()) {
+    if (!profileReady) {
       return
     }
 

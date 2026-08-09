@@ -385,10 +385,7 @@ export const api = {
   },
   getSessionMessages: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionMessagesResponse>(
-      appendProfileParam(
-        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest`,
-        profile,
-      ),
+      appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/messages`, profile),
     ),
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(
@@ -2007,12 +2004,6 @@ export interface SessionMessage {
 export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessage[];
-  pagination?: {
-    limit: number;
-    offset: number;
-    order: "latest" | "oldest";
-    returned: number;
-  };
 }
 
 export interface LogsResponse {

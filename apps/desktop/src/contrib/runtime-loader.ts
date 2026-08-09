@@ -139,7 +139,6 @@ export async function loadRuntimePlugin(
     const record = {
       id: plugin.id,
       name: plugin.name ?? plugin.id,
-      description: plugin.description,
       kind: options.kind ?? 'disk',
       file: options.file
     }

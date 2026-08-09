@@ -5,7 +5,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
-import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
 import {
   Dialog,
@@ -74,13 +73,7 @@ import {
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, initialBlueprintValues } from './blueprints'
-import {
-  cronEditorUpdates,
-  jobIsScriptOnly,
-  parseCronDeliveryTargets,
-  toggleCronDeliveryTarget,
-  validateCronEditor
-} from './cron-job-model'
+import { cronEditorUpdates, jobIsScriptOnly, validateCronEditor } from './cron-job-model'
 import { jobState, jobTitle, STATE_DOT } from './job-state'
 
 const DEFAULT_DELIVER = 'local'
@@ -785,11 +778,10 @@ function deliverTargetLabel(target: CronDeliveryTarget, c: Translations['cron'])
   return target.id !== 'local' && !target.home_target_set ? `${base} — ${c.deliverNeedsHomeChannel}` : base
 }
 
-// The delivery-target checkbox group, shared by the manual cron editor and the
-// blueprint form. The scheduler accepts comma-separated targets, so users can
-// keep results local while also sending them to connected platforms. Preserve
-// selected targets missing from discovery so editing never drops a saved route.
-export function DeliverCheckboxes({
+// The delivery-target dropdown, shared by the manual cron editor and the
+// blueprint form so both offer exactly the connected platforms (never a
+// hardcoded list). While the targets load, keep the current value selectable.
+function DeliverSelect({
   c,
   id,
   onChange,
@@ -802,39 +794,21 @@ export function DeliverCheckboxes({
   targets: CronDeliveryTarget[]
   value: string
 }) {
-  const selected = parseCronDeliveryTargets(value)
-  const knownIds = new Set(targets.map(target => target.id))
-
-  const options = [
-    ...targets,
-    ...selected
-      .filter(target => !knownIds.has(target))
-      .map(target => ({ home_env_var: null, home_target_set: true, id: target, name: target }))
-  ]
+  const options = targets.length > 0 ? targets : [{ home_env_var: null, home_target_set: true, id: value, name: value }]
 
   return (
-    <div
-      aria-labelledby={`${id}-label`}
-      className="grid gap-2 rounded-md border border-input px-3 py-2.5"
-      id={id}
-      role="group"
-    >
-      {options.map((target, index) => {
-        const checked = selected.includes(target.id)
-        const checkboxId = `${id}-${index}`
-
-        return (
-          <label className="flex items-center gap-2 text-sm" htmlFor={checkboxId} key={target.id}>
-            <Checkbox
-              checked={checked}
-              id={checkboxId}
-              onCheckedChange={next => onChange(toggleCronDeliveryTarget(value, target.id, next === true))}
-            />
-            <span>{deliverTargetLabel(target, c)}</span>
-          </label>
-        )
-      })}
-    </div>
+    <Select onValueChange={onChange} value={value}>
+      <SelectTrigger className="h-9 rounded-md" id={id}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map(target => (
+          <SelectItem key={target.id} value={target.id}>
+            {deliverTargetLabel(target, c)}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 
@@ -1067,7 +1041,7 @@ function CronEditorDialog({
                     // Use the shared, backend-sourced delivery targets (same as the
                     // manual editor) rather than the blueprint's static field.options,
                     // so both dialogs offer exactly the connected platforms.
-                    <DeliverCheckboxes
+                    <DeliverSelect
                       c={c}
                       id={fieldId}
                       onChange={next => setSlotValues(prev => ({ ...prev, [field.name]: next }))}
@@ -1148,7 +1122,7 @@ function CronEditorDialog({
               </Field>
 
               <Field htmlFor="cron-deliver" label={c.deliverLabel}>
-                <DeliverCheckboxes
+                <DeliverSelect
                   c={c}
                   id="cron-deliver"
                   onChange={setDeliver}

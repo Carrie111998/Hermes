@@ -29,7 +29,6 @@ import {
   $sessions,
   $yoloActive,
   resolveComposerSessionKey,
-  setActiveSessionId,
   setCurrentUsage,
   setModelPickerOpen,
   setSessionPickerOpen,
@@ -63,8 +62,7 @@ import {
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
-  type SubmitTextOptions,
-  withSessionNotFoundResume
+  type SubmitTextOptions
 } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
@@ -501,8 +499,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          const { render: renderSlashOutput, sessionId: initialSessionId, storedSessionId } = resolved
-          let sessionId = initialSessionId
+          const { render: renderSlashOutput, sessionId, storedSessionId } = resolved
           const focusTopic = ctx.arg.trim()
           const noticeId = `session-compress:${sessionId}`
 
@@ -521,40 +518,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           })
 
           try {
-            // Same stale-runtime recovery as prompt.submit: after sleep/wake a
-            // dead id 404s session.compress while plain chat still works, so
-            // /compress reported "session not found" on a healthy session.
-            // NOT alsoTimeout — compress is legitimately LLM-slow and a
-            // timeout here must not be retried as a dead session.
-            const { result, sessionId: liveSessionId } = await withSessionNotFoundResume(
-              sessionId,
-              storedSessionId,
-              liveId =>
-                requestGateway<SessionCompressResponse>(
-                  'session.compress',
-                  {
-                    session_id: liveId,
-                    ...(focusTopic ? { focus_topic: focusTopic } : {})
-                  },
-                  SESSION_COMPRESS_TIMEOUT_MS
-                ),
+            const result = await requestGateway<SessionCompressResponse>(
+              'session.compress',
               {
-                requestGateway,
-                onRecovered: recoveredId => {
-                  // Move the in-flight claim onto the live id so the coalesce
-                  // guard releases the right key in `finally`.
-                  compressInFlightRef.current.delete(sessionId)
-                  compressInFlightRef.current.add(recoveredId)
-
-                  if (activeSessionIdRef.current === initialSessionId) {
-                    activeSessionIdRef.current = recoveredId
-                    setActiveSessionId(recoveredId)
-                  }
-                }
-              }
+                session_id: sessionId,
+                ...(focusTopic ? { focus_topic: focusTopic } : {})
+              },
+              SESSION_COMPRESS_TIMEOUT_MS
             )
-
-            sessionId = liveSessionId
 
             // Replace the transcript with the post-compress history so the
             // summarized bubbles actually disappear. `messages` is the same

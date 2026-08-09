@@ -3,9 +3,8 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
+import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
@@ -46,8 +45,7 @@ vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   deleteSession: vi.fn(),
   getSession: vi.fn(),
-  getAllSessionMessages: vi.fn(),
-  getLatestSessionMessages: vi.fn(),
+  getSessionMessages: vi.fn(),
   listAllProfileSessions: vi.fn(),
   setApiRequestProfile: vi.fn(),
   setSessionArchived: vi.fn()
@@ -434,30 +432,6 @@ describe('startFreshSessionDraft', () => {
     expect($currentCwd.get()).toBe('')
     expect($newChatWorkspaceTarget.get()).toBeNull()
   })
-
-  it('fronts the workspace without closing a terminal that is merely behind a tab', async () => {
-    // Regression: a persisted terminal takeover kept the terminal fronted
-    // after New Session / ⌘N. The fix is to reveal the workspace — NOT to
-    // clear the takeover atom. That atom is the terminal's open/closed state
-    // in every layout: clearing it here closed a terminal sitting in its own
-    // zone (Default / Terminal deck / Quad), and persisted a `false` that left
-    // the Focus tab unable to mount its workspace after a restart. Behind a
-    // tab the terminal is hidden, not closed.
-    const navigate = vi.fn()
-    const requestGateway = vi.fn(async () => ({}) as never)
-    let handle: HarnessHandle | null = null
-
-    setTerminalTakeover(true)
-    expect($terminalTakeover.get()).toBe(true)
-
-    render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
-    await waitFor(() => expect(handle).not.toBeNull())
-
-    act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
-
-    expect(revealTreePane).toHaveBeenCalledWith('workspace')
-    expect($terminalTakeover.get()).toBe(true)
-  })
 })
 
 describe('createBackendSessionForSend profile routing', () => {
@@ -678,7 +652,7 @@ describe('resumeSession failure recovery', () => {
     })
 
     // ...and the REST transcript fallback also rejects (backend unreachable).
-    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('network down'))
+    vi.mocked(getSessionMessages).mockRejectedValue(new Error('network down'))
 
     await runResume(requestGateway)
 
@@ -698,7 +672,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [
         { content: 'hello', role: 'user', timestamp: 1 },
         { content: 'hi there', role: 'assistant', timestamp: 2 }
@@ -740,7 +714,7 @@ describe('resumeSession failure recovery', () => {
       { content: 'earlier answer', role: 'assistant', timestamp: 2 }
     ]
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.resume') {
@@ -773,7 +747,7 @@ describe('resumeSession failure recovery', () => {
       { content: 'earlier answer', role: 'assistant', timestamp: 2 }
     ]
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.resume') {
@@ -826,7 +800,7 @@ describe('resumeSession failure recovery', () => {
       { content: 'answer after compression', role: 'assistant', timestamp: 4 }
     ]
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: parentMessages,
       session_id: 'stored-1'
     } as never)
@@ -874,7 +848,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockRejectedValue(new Error('network down'))
+    vi.mocked(getSessionMessages).mockRejectedValue(new Error('network down'))
 
     // resumeSession must resolve (swallow the fallback failure), not reject.
     await expect(runResume(requestGateway)).resolves.toBeUndefined()
@@ -892,7 +866,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
 
     await runResume(requestGateway)
 
@@ -916,7 +890,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
 
     await runResume(requestGateway)
 
@@ -936,7 +910,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-1' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-1' } as never)
 
     await runResume(requestGateway)
 
@@ -963,7 +937,6 @@ describe('resumeSession failure recovery', () => {
             interimBoundaryPending: false,
             interrupted: false,
             messages: [],
-            adoptedRunningTurn: false,
             model: '',
             needsInput: false,
             pendingBranchGroup: null,
@@ -992,7 +965,7 @@ describe('resumeSession failure recovery', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'existing text', role: 'user', timestamp: 1 }],
       session_id: 'stored-1'
     } as never)
@@ -1073,7 +1046,7 @@ describe('branchStoredSession desktop source tagging', () => {
     // Parent is the currently-open (primary) chat.
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
     setSelectedStoredSessionId('stored-parent')
-    vi.mocked(getAllSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
     } as never)
@@ -1112,7 +1085,7 @@ describe('branchStoredSession desktop source tagging', () => {
     })
 
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
-    vi.mocked(getAllSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
     } as never)
@@ -1186,7 +1159,7 @@ describe('branchStoredSession desktop source tagging', () => {
   it('resolves and swaps to the parent profile when the branched session is not cached', async () => {
     setSessions([])
     vi.mocked(getSession).mockResolvedValue(storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' }))
-    vi.mocked(getAllSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
     } as never)
@@ -1212,7 +1185,7 @@ describe('branchStoredSession desktop source tagging', () => {
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
     expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
-    expect(getAllSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
+    expect(getSessionMessages).toHaveBeenCalledWith('stored-parent', 'work')
     // The create itself must carry the owning profile: in app-global remote
     // mode the soft gateway swap alone is not enough — an omitted profile
     // lands the branch on the launch (default) profile's state.db.
@@ -1223,7 +1196,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
   it('creates the branch on the cached parent session profile', async () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1, profile: 'work' })])
-    vi.mocked(getAllSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
     } as never)
@@ -1252,7 +1225,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
   it('omits profile for a profile-less parent so single-profile users are unchanged', async () => {
     setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
-    vi.mocked(getAllSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
       session_id: 'stored-parent'
     } as never)
@@ -1308,7 +1281,7 @@ describe('resumeSession drops a redundant tile when the session loads into main'
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
 
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} />)
@@ -1333,7 +1306,7 @@ describe('resumeSession drops a redundant tile when the session loads into main'
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
 
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(<ResumeHarness onReady={r => (resume = r)} requestGateway={requestGateway} />)
@@ -1384,7 +1357,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [] } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [] } as never)
 
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(
@@ -1437,7 +1410,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       return {} as never
     })
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
 
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(
@@ -1457,7 +1430,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     const methods = requestGateway.mock.calls.map(([method]) => method)
     expect(methods).toContain('session.activate')
     expect(methods).not.toContain('session.resume')
-    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
+    expect(getSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
     expect(requestGateway).toHaveBeenCalledWith(
       'session.activate',
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
@@ -1494,7 +1467,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       { content: 'It is a photo.', role: 'assistant', timestamp: 2 }
     ]
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: persistedMessages,
       session_id: 'stored-A'
     } as never)
@@ -1531,7 +1504,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
     await resume!('stored-A', true)
 
     expect(requestGateway.mock.calls.map(([method]) => method)).toContain('session.activate')
-    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
+    expect(getSessionMessages).toHaveBeenCalledWith('stored-A', undefined)
     expect(resumedState?.messages[0]?.attachmentRefs).toEqual(['@image:/tmp/photo.png'])
   })
 
@@ -1568,7 +1541,7 @@ describe('resumeSession warm-cache mapping integrity', () => {
       { content: 'answer saved after compression', role: 'assistant', timestamp: 4 }
     ]
 
-    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+    vi.mocked(getSessionMessages).mockResolvedValue({
       messages: persistedMessages,
       session_id: 'stored-A'
     } as never)

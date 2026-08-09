@@ -400,11 +400,6 @@ _CACHE_DIRS: list[tuple[str, str]] = [
     # reach uploads inside sandbox containers (#69575). No legacy alias exists,
     # so both tuple slots are ``images``.
     ("images", "images"),
-    # Desktop non-image file attachments (tui_gateway ``file.attach`` staging)
-    # land in the flat top-level ``attachments/`` dir. Mount it so the agent's
-    # file tools can read dropped binaries (zip/pdf/...) from inside sandbox
-    # containers instead of dangling host paths (#76577).
-    ("attachments", "attachments"),
 ]
 
 
@@ -422,25 +417,13 @@ def get_cache_directory_mounts(
     mounts: List[Dict[str, str]] = []
     for new_subpath, old_name in _CACHE_DIRS:
         host_dir = get_hermes_dir(new_subpath, old_name)
-        if not host_dir.is_dir():
-            # Create missing staging dirs instead of skipping them: Docker
-            # snapshots this mount list at container CREATION, so a dir that
-            # appears later (first desktop attachment, first clipboard image)
-            # would dangle for the whole life of a persistent container
-            # (#76577). An empty bind-mounted dir costs nothing; a missing
-            # mount costs the feature. get_hermes_dir() already resolved
-            # new-vs-legacy layout, so creating its answer cannot shadow a
-            # populated legacy dir.
-            try:
-                host_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                continue  # unwritable home (tests, RO mounts) — skip as before
-        # Always map to the *new* container layout regardless of host layout.
-        container_path = f"{container_base.rstrip('/')}/{new_subpath}"
-        mounts.append({
-            "host_path": str(host_dir),
-            "container_path": container_path,
-        })
+        if host_dir.is_dir():
+            # Always map to the *new* container layout regardless of host layout.
+            container_path = f"{container_base.rstrip('/')}/{new_subpath}"
+            mounts.append({
+                "host_path": str(host_dir),
+                "container_path": container_path,
+            })
     return mounts
 
 
@@ -500,33 +483,14 @@ def to_agent_visible_cache_path(
 
     Returns the input unchanged if it is not under any auto-mounted cache
     directory, or if the active terminal backend does not require path
-    translation (local).
-
-    Per-backend base (mirrors ``_agent_cache_base_for_env`` in
-    tools/image_generation_tool.py, the proven heuristics for where each
-    backend's Hermes cache lands):
-
-    * docker / modal — bind-mounted (docker) or per-file-synced (modal) at
-      ``/root/.hermes`` (the *container_base* default).
-    * ssh / daytona / vercel_sandbox — file-synced under the remote user's
-      home; ``~/.hermes`` is shell-expanded by the remote shell, so tool
-      commands resolve it regardless of the actual remote home. Previously
-      these backends synced the bytes but still rendered the dangling host
-      path (#76577 gap).
-    * singularity — NOT translated: Apptainer auto-binds the host home, so
-      the host path is directly readable and translation would dangle
-      (cache dirs are not remapped into that sandbox).
-
-    Backend is identified by TERMINAL_ENV (same env var
-    tools/terminal_tool.py reads in _get_environment_config).
+    translation (only Docker for now).
     """
-    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
-    if backend in ("docker", "modal"):
-        pass  # /root/.hermes default
-    elif backend in ("ssh", "daytona", "vercel_sandbox"):
-        container_base = "~/.hermes"
-    else:
-        return host_path  # local, singularity, unknown: host path is correct
+    # Only Docker backend requires translation at this time.  Other backends
+    # (Modal, Daytona, Vercel) use different mount semantics and will be
+    # addressed separately if needed.  Backend is identified by TERMINAL_ENV
+    # (same env var tools/terminal_tool.py reads in _get_environment_config).
+    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+        return host_path
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)
     return mapped if mapped is not None else host_path

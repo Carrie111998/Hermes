@@ -1561,24 +1561,11 @@ def _model_flow_named_custom(config, provider_info):
         fetch_kwargs = {"timeout": 8.0}
         if api_mode:
             fetch_kwargs["api_mode"] = api_mode
-        live_models = fetch_api_models(api_key, base_url, **fetch_kwargs)
+        models = fetch_api_models(api_key, base_url, **fetch_kwargs)
         # If the probe came back empty but the operator configured an explicit
         # list, fall back to it rather than forcing manual entry.
-        models = live_models or configured_models
-        # Persist the live catalog back to the custom_providers entry so that
-        # no-probe surfaces (dashboard, desktop, ACP) show the full model list
-        # instead of collapsing to the single ``model:`` default. Mirrors the
-        # picker path in model_switch.py::_save_discovered_models_to_config; a
-        # failed save is non-fatal.
-        if live_models:
-            try:
-                from hermes_cli.model_switch import (
-                    _save_discovered_models_to_config,
-                )
-
-                _save_discovered_models_to_config(base_url, live_models)
-            except Exception:
-                pass
+        if not models and configured_models:
+            models = configured_models
 
     if models:
         default_idx = 0

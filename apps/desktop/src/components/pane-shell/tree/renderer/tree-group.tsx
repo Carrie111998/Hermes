@@ -50,7 +50,6 @@ import {
   closeTreeTabsToRight,
   collapseTreePane,
   isCollapsePane,
-  isMainStripPane,
   isSessionStripPane,
   noteActiveTreeGroup,
   reloadTreePane,
@@ -313,9 +312,6 @@ export function TreeGroup({
   // leaving the tree.
   const closeableTab = (paneId: string) => !paneChrome(paneFor(paneId)).uncloseable || panesWithCloser.has(paneId)
 
-  // A pane's own live label when it has one, else its registered string.
-  const tabLabel = (paneId: string) => paneChrome(paneFor(paneId)).tabTitle?.() ?? paneFor(paneId)?.title ?? paneId
-
   // Collapse/restore a tool panel (or plain minimize elsewhere) — the header
   // chevron + tap gesture, routed so ⌃`/the titlebar toggle stay truthful.
   const toggleCollapse = () => (node.minimized ? restoreTreePane(activeId) : collapseTreePane(activeId))
@@ -382,6 +378,7 @@ export function TreeGroup({
             >
               {shown.map(paneId => {
                 const closeable = closeableTab(paneId)
+                const title = paneFor(paneId)?.title ?? paneId
 
                 return (
                   <PaneTab
@@ -399,7 +396,7 @@ export function TreeGroup({
                     side={railSide}
                     vertical
                   >
-                    <PaneTabLabel>{tabLabel(paneId)}</PaneTabLabel>
+                    <PaneTabLabel>{title}</PaneTabLabel>
                   </PaneTab>
                 )
               })}
@@ -550,7 +547,7 @@ export function TreeGroup({
                   {chrome.tabLead ? (
                     <span className="ml-2 -mr-1 flex shrink-0 items-center">{chrome.tabLead()}</span>
                   ) : null}
-                  <PaneTabLabel>{tabLabel(paneId)}</PaneTabLabel>
+                  <PaneTabLabel>{title}</PaneTabLabel>
                 </PaneTab>
               )
 
@@ -771,19 +768,10 @@ function ZoneDropOverlay({ node }: { node: GroupNode }) {
   }
 
   // A session drag (sidebar row) reuses this exact overlay — over ANY zone
-  // that hosts a MAIN tile (stack into its tabs / split its edges); only a
-  // CHAT zone's center is a link-to-chat (the composer overlay owns that
-  // visual). Standing side chrome — the sidebar, files, terminal — hosts no
-  // main tile, so a session can't land there: those zones stay DARK rather
-  // than painting an idle outline the drop would only refuse. Same test
-  // `tileZoneHost` (session-drag.ts) resolves the drop with, so what lights
-  // up and what commits cannot disagree.
+  // now (stack into its tabs / split its edges); only a CHAT zone's center is
+  // a link-to-chat (the composer overlay owns that visual).
   const sessionDrag = dragging === SESSION_TILE_DRAG
   const chatZone = node.panes.some(isSessionStripPane)
-
-  if (sessionDrag && !chatZone && !node.panes.some(isMainStripPane)) {
-    return null
-  }
 
   const isDragSource = node.panes.includes(dragging)
 

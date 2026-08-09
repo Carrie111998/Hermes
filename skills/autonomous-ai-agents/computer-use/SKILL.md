@@ -1,9 +1,12 @@
 ---
 name: computer-use
-description: "Drive the desktop in the background without stealing focus."
+description: |
+  Drive the user's desktop in the background — clicking, typing,
+  scrolling, dragging — without stealing the cursor, keyboard focus,
+  or switching virtual desktops / Spaces. Cross-platform: macOS,
+  Windows, Linux. Works with any tool-capable model. Load this skill
+  whenever the `computer_use` tool is available.
 version: 2.0.0
-author: Francesco Bonacci (f-trycua), Hermes Agent
-license: MIT
 platforms: [macos, windows, linux]
 metadata:
   hermes:

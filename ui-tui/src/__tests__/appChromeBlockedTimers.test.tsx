@@ -165,7 +165,6 @@ const layoutProps: AppLayoutProps = {
     goodVibesTick: 0,
     lastTurnEndedAt: T0 - 5_000,
     sessionStartedAt: T0 - 60_000,
-    sessionTitle: '',
     showStickyPrompt: false,
     statusColor: DEFAULT_THEME.color.ok,
     stickyPrompt: '',

@@ -209,13 +209,9 @@ def _(rid, params: dict) -> dict:
             {"value": norm if norm in INDICATOR_STYLES else DEFAULT_INDICATOR_STYLE},
         )
     if key == "personality":
-        # Report the EFFECTIVE personality via the single owner — a stale or
-        # unknown name in config must not display as active.
-        from hermes_cli.personality import active_personality_name
-
         return _ok(
             rid,
-            {"value": active_personality_name(_load_cfg()) or "none"},
+            {"value": (_load_cfg().get("display") or {}).get("personality") or "none"},
         )
     if key == "reasoning":
         cfg = _load_cfg()

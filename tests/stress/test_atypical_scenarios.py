@@ -705,7 +705,7 @@ def _idempotency_race_worker(hermes_home: str, key: str, result_file: str,
         )
     finally:
         conn.close()
-    with open(result_file, "w", encoding="utf-8") as f:
+    with open(result_file, "w") as f:
         f.write(tid)
 
 
@@ -731,16 +731,12 @@ def _(home, kb):
         p.start()
     time.sleep(0.1)  # let them hit the spin
     # Fire the gun
-    with open(barrier, "w", encoding="utf-8") as f:
+    with open(barrier, "w") as f:
         f.write("go")
     for p in procs:
         p.join(timeout=10)
 
-    tids = [
-        Path(r).read_text(encoding="utf-8").strip()
-        for r in results
-        if os.path.exists(r)
-    ]
+    tids = [open(r).read().strip() for r in results if os.path.exists(r)]
     assert len(tids) == 2, f"only {len(tids)} workers finished"
     assert tids[0] == tids[1], (
         f"idempotency key race produced two different tasks: {tids}"

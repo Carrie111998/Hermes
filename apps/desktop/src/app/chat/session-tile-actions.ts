@@ -157,20 +157,12 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       sessionId: string,
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
-    ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
+    ): Promise<ComposerAttachment[]> => {
       const remote = $connection.get()?.mode === 'remote'
-      let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
-      // A tile owns its own runtime binding, so a recovery here rebinds the
-      // tile's ref rather than the foreground session's.
-      const onSessionRecovered = (recoveredId: string) => {
-        liveSessionId = recoveredId
-        runtimeIdRef.current = recoveredId
-      }
-
       for (const attachment of attachments) {
-        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
+        if (!attachment.path || attachment.attachedSessionId === sessionId) {
           synced.push(attachment)
 
           continue
@@ -181,9 +173,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
             backendCwd: readState()?.cwd,
             remote,
             requestGateway,
-            sessionId: liveSessionId,
-            storedSessionId: storedIdRef.current,
-            onSessionRecovered
+            sessionId
           })
 
           if (options.updateComposerAttachments ?? true) {
@@ -198,7 +188,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         synced.push(attachment)
       }
 
-      return { attachments: synced, sessionId: liveSessionId }
+      return synced
     },
     [requestGateway, scope.attachments]
   )
@@ -367,12 +357,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
   // the primary chat so the two can't diverge.
   const submitRewind = useCallback(
     (text: string, truncateOrdinal: number | undefined, interruptFirst: boolean) =>
-      runRewindSubmit(requestGateway, runtimeIdRef.current, text, truncateOrdinal, interruptFirst, {
-        storedSessionId: storedIdRef.current,
-        onSessionRecovered: recoveredId => {
-          runtimeIdRef.current = recoveredId
-        }
-      }),
+      runRewindSubmit(requestGateway, runtimeIdRef.current, text, truncateOrdinal, interruptFirst),
     [requestGateway]
   )
 

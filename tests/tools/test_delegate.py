@@ -618,11 +618,7 @@ class TestSubagentCostRollup(unittest.TestCase):
             ]
             result = json.loads(
                 delegate_task(
-                    tasks=[
-                        {"goal": "Investigate module A"},
-                        {"goal": "Investigate module B"},
-                        {"goal": "Investigate module C"},
-                    ],
+                    tasks=[{"goal": "A"}, {"goal": "B"}, {"goal": "C"}],
                     parent_agent=parent,
                 )
             )
@@ -1599,10 +1595,7 @@ class TestOrchestratorEndToEnd(unittest.TestCase):
                 def _orchestrator_run(user_message=None, task_id=None, stream_callback=None):
                     # Re-entrant: orchestrator spawns two leaves
                     delegate_task(
-                        tasks=[
-                            {"goal": "Do leaf work stream A"},
-                            {"goal": "Do leaf work stream B"},
-                        ],
+                        tasks=[{"goal": "leaf-A"}, {"goal": "leaf-B"}],
                         parent_agent=m,
                     )
                     return {

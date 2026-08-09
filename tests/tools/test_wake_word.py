@@ -437,22 +437,10 @@ class _LoudStream(_FakeStream):
 
 def test_detector_opens_configured_input_device_and_reports_backend(monkeypatch):
     opened = []
-    reads = []
-    processed = []
-
-    class _NativeRateStream(_LoudStream):
-        def read(self, n):
-            reads.append(n)
-            return super().read(n)
-
-    class _RecordingEngine(_FakeEngine):
-        def process(self, frame):
-            processed.append(frame)
-            return False
 
     def _stream(**kwargs):
         opened.append(kwargs)
-        return _NativeRateStream(**kwargs)
+        return _LoudStream(**kwargs)
 
     fake_sd = types.SimpleNamespace(
         InputStream=_stream,
@@ -464,25 +452,16 @@ def test_detector_opens_configured_input_device_and_reports_backend(monkeypatch)
         },
         query_hostapis=lambda index: {"name": "Windows WASAPI"},
     )
-    np = pytest.importorskip("numpy")
-    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, np))
+    monkeypatch.setattr(ww, "_import_audio", lambda: (fake_sd, None))
 
     det = ww.WakeWordDetector(
-        _RecordingEngine(fire=False),
+        _FakeEngine(fire=False),
         lambda: None,
         input_device="Microphone Array",
     )
     det.start()
     try:
         assert opened[0]["device"] == "Microphone Array"
-        assert opened[0]["samplerate"] == 48000
-        assert opened[0]["blocksize"] == 12
-        deadline = time.monotonic() + 2.0
-        while not processed and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert reads[0] == 12
-        assert len(processed[0]) == 4
-        assert processed[0].tolist() == [500] * 4
         assert det.input_device_details == {
             "selector": "Microphone Array",
             "name": "Microphone Array",

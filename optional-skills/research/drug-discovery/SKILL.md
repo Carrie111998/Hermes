@@ -1,6 +1,12 @@
 ---
 name: drug-discovery
-description: "Drug discovery: ChEMBL search, drug-likeness, interactions."
+description: >
+  Pharmaceutical research assistant for drug discovery workflows. Search
+  bioactive compounds on ChEMBL, calculate drug-likeness (Lipinski Ro5, QED,
+  TPSA, synthetic accessibility), look up drug-drug interactions via
+  OpenFDA, interpret ADMET profiles, and assist with lead optimization.
+  Use for medicinal chemistry questions, molecule property analysis, clinical
+  pharmacology, and open-science drug research.
 platforms: [linux, macos, windows]
 version: 1.0.0
 author: bennytimz

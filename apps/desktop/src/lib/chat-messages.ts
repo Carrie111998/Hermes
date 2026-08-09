@@ -61,7 +61,6 @@ export type GatewayEventPayload = {
   running?: boolean
   cwd?: string
   branch?: string
-  terminal_backend?: string
   credential_warning?: string
   install_warning?: string
   personality?: string

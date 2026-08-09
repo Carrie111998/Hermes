@@ -1,12 +1,12 @@
 ---
-title: "Torchtitan — Pretrain LLMs at scale with PyTorch 4D parallelism"
-sidebar_label: "Torchtitan"
+title: "Distributed Llm Pretraining Torchtitan — Pretrain LLMs at scale with PyTorch 4D parallelism"
+sidebar_label: "Distributed Llm Pretraining Torchtitan"
 description: "Pretrain LLMs at scale with PyTorch 4D parallelism"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
-# Torchtitan
+# Distributed Llm Pretraining Torchtitan
 
 Pretrain LLMs at scale with PyTorch 4D parallelism.
 

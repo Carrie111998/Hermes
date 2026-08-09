@@ -233,18 +233,6 @@ class GitFileBody(BaseModel):
     file: Optional[str] = None
 
 
-class GitPrListBody(BaseModel):
-    path: str
-    branches: List[str] = []
-    # PRs a session recovered from its transcript, which we know by number
-    # rather than by the branch it came from.
-    numbers: List[int] = []
-
-
-class SessionPrScanBody(BaseModel):
-    ids: List[str] = []
-
-
 class GitCommitBody(BaseModel):
     path: str
     message: str
