@@ -486,3 +486,20 @@ def test_default_deployment_asset_parser_rejects_malformed_and_wrong_arguments()
     assert _parse_deployment_asset(("[" + ",".join('"'+item+'"' for item in expected) + "]").encode(), "ai.hermes.gateway") == expected
     for raw in (b"not-json", b"\xff\xfe", b'{"ProgramArguments": [1]}'):
         with pytest.raises(ValueError): _parse_deployment_asset(raw, "ai.hermes.gateway")
+
+
+def test_default_process_binding_accepts_exact_command_without_string_markers():
+    from plugins.agentops.control.registry import bootstrap_gateway_registry
+    import os
+    target = bootstrap_gateway_registry().get_target("hermes:profile:default:gateway")
+    if target.spec.labels.get("process_observation") != "enabled":
+        pytest.skip("default deployment asset unavailable")
+    class P:
+        pid = 42
+        def name(self): return "python"
+        def cmdline(self): return ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+        def uids(self):
+            class U: real = os.getuid()
+            return U()
+    batch = ProcessCollector(name_contains="python", process_iter=lambda: [P()]).collect(target)
+    assert batch.health.healthy and len(batch.signals) == 1

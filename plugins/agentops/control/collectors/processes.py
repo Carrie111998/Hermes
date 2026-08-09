@@ -84,7 +84,7 @@ class ProcessCollector:
                         continue
                     command = [str(part) for part in process.cmdline()]
                     fingerprint = self._command_fingerprint(process)
-                    if profile_marker not in command and f"--profile={profile_marker}" not in command:
+                    if labels.get("process_marker_optional") != "true" and profile_marker not in command and f"--profile={profile_marker}" not in command:
                         continue
                     if service_label not in command and labels.get("process_command_label_optional") != "true":
                         continue
