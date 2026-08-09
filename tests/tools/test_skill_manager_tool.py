@@ -1179,3 +1179,134 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+
+# ---------------------------------------------------------------------------
+# restore_skill shared publication guard glue (#79723 absorption)
+# ---------------------------------------------------------------------------
+
+
+def _make_archived_skill(tmp_path: Path, name: str = "restore-probe"):
+    hermes_home = tmp_path / ".hermes"
+    skills_root = hermes_home / "skills"
+    archive = skills_root / ".archive"
+    src = archive / name
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "SKILL.md").write_text(_skill_content(name), encoding="utf-8")
+    return hermes_home, skills_root, src, skills_root / name
+
+
+class TestRestoreSkillPublicationGuard:
+    def test_restore_skill_uses_shared_publication_guard_new_only(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        from pathlib import Path as _Path
+        from tools import skill_publish_guard as _spg
+        from tools import skill_usage as su
+
+        hermes_home, _skills_root, src, dest = _make_archived_skill(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(su, "is_hub_installed", lambda _name: False)
+        monkeypatch.setattr(su, "is_bundled", lambda _name: False)
+
+        events = []
+        inside = {"guard": False}
+        original_rename = _Path.rename
+
+        @contextmanager
+        def guard(name, *, target, replacement_policy):
+            events.append(("guard_called", name, target, replacement_policy))
+            inside["guard"] = True
+            events.append(("guard_enter", src.exists(), dest.exists()))
+            try:
+                yield
+            finally:
+                events.append(("guard_exit", src.exists(), dest.exists()))
+                inside["guard"] = False
+
+        def recording_rename(self, target):
+            if self == src and target == dest:
+                events.append(("rename", inside["guard"]))
+            return original_rename(self, target)
+
+        def recording_remove(name):
+            events.append(("remove_suppressed_name", name, inside["guard"]))
+
+        def recording_set_state(name, state):
+            events.append(("set_state", name, state, inside["guard"]))
+
+        monkeypatch.setattr(_spg, "live_skill_publish_guard", guard)
+        monkeypatch.setattr(_Path, "rename", recording_rename)
+        monkeypatch.setattr(su, "remove_suppressed_name", recording_remove)
+        monkeypatch.setattr(su, "set_state", recording_set_state)
+
+        ok, message = su.restore_skill("restore-probe")
+
+        assert ok is True
+        assert message == f"restored to {dest}"
+        assert dest.exists()
+        assert ("guard_called", "restore-probe", dest, "new_only") in events
+        assert ("rename", True) in events
+        assert ("remove_suppressed_name", "restore-probe", True) in events
+        assert ("set_state", "restore-probe", su.STATE_ACTIVE, True) in events
+        assert events.index(("guard_enter", True, False)) < events.index(("rename", True))
+        assert events.index(("rename", True)) < events.index(("remove_suppressed_name", "restore-probe", True))
+        assert events.index(("remove_suppressed_name", "restore-probe", True)) < events.index(("set_state", "restore-probe", su.STATE_ACTIVE, True))
+        assert events.index(("set_state", "restore-probe", su.STATE_ACTIVE, True)) < events.index(("guard_exit", False, True))
+
+    def test_restore_skill_lock_acquire_failure_preserves_archive_and_returns_false(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        from tools import skill_publish_guard as _spg
+        from tools import skill_usage as su
+
+        hermes_home, _skills_root, src, dest = _make_archived_skill(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(su, "is_hub_installed", lambda _name: False)
+        monkeypatch.setattr(su, "is_bundled", lambda _name: False)
+
+        @contextmanager
+        def acquire_failure(*args, **kwargs):
+            raise _spg.SkillMutationLockAcquireFailure(
+                canonical_skill_path=dest,
+                lock_path=tmp_path / "lock",
+                platform="posix",
+                lock_failure_stage=_spg.LOCK_FAILURE_STAGE_CONTENTION,
+                safe_to_retry=True,
+            )
+            yield
+
+        monkeypatch.setattr(_spg, "live_skill_publish_guard", acquire_failure)
+
+        ok, message = su.restore_skill("restore-probe")
+
+        assert ok is False
+        assert "restore could not acquire the publication lock" in message
+        assert src.exists()
+        assert not dest.exists()
+
+    def test_restore_skill_lock_release_failure_propagates(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        from tools import skill_publish_guard as _spg
+        from tools import skill_usage as su
+
+        hermes_home, _skills_root, _src, dest = _make_archived_skill(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(su, "is_hub_installed", lambda _name: False)
+        monkeypatch.setattr(su, "is_bundled", lambda _name: False)
+        monkeypatch.setattr(su, "remove_suppressed_name", lambda _name: None)
+        monkeypatch.setattr(su, "set_state", lambda _name, _state: None)
+
+        @contextmanager
+        def release_failure(*args, **kwargs):
+            yield
+            raise _spg.SkillMutationLockReleaseFailure(
+                canonical_skill_path=dest,
+                lock_path=tmp_path / "lock",
+                platform="posix",
+                release_error=RuntimeError("release failed"),
+                live_mutation_committed=True,
+            )
+
+        monkeypatch.setattr(_spg, "live_skill_publish_guard", release_failure)
+
+        with pytest.raises(_spg.SkillMutationLockReleaseFailure):
+            su.restore_skill("restore-probe")

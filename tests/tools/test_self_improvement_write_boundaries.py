@@ -721,3 +721,57 @@ class TestPhase2TypedContext:
                 )
                 # The guard's policy chain still consults the typed
                 # ContextVar in Phase 2 — exercised in F-2 and F-7.
+
+
+    # ------------------------------------------------------------------
+    # F-18 — no decision in legacy caller denies (1 outcome)
+    # ------------------------------------------------------------------
+    def test_no_decision_in_legacy_caller_denies(self, monkeypatch):
+        # F-18 — unbound typed ContextVar -> DENY_FALLBACK_DECISION.
+        from agent.self_improvement_decision_context import (
+            get_self_improvement_decision,
+            DENY_FALLBACK_DECISION,
+        )
+
+        monkeypatch.delenv("HERMES_DISABLE_SELF_IMPROVEMENT", raising=False)
+        monkeypatch.delenv("HERMES_READ_ONLY_SESSION", raising=False)
+        seen = get_self_improvement_decision()
+        assert seen is DENY_FALLBACK_DECISION
+        assert getattr(seen, "allow", True) is False
+
+    # ------------------------------------------------------------------
+    # F-20 — trusted dispatcher origin remains ALLOW (1 outcome)
+    # ------------------------------------------------------------------
+    def test_trusted_dispatcher_origin_preserves_allow_decision(self, monkeypatch):
+        # F-20 trusted_dispatcher — foreground_user_explicit + ALLOW Decision
+        # + NORMAL SessionWritePolicy leaves the effective Decision as ALLOW.
+        from agent.self_improvement_decision_context import (
+            self_improvement_decision_scope,
+            get_self_improvement_decision,
+        )
+        from agent.self_improvement_policy import ALLOW, Decision as _Dec
+        from agent.session_write_policy import (
+            SessionWritePolicy,
+            session_write_policy_scope,
+        )
+        from tools.skill_provenance import (
+            set_current_write_origin,
+            reset_current_write_origin,
+        )
+
+        monkeypatch.delenv("HERMES_DISABLE_SELF_IMPROVEMENT", raising=False)
+        monkeypatch.delenv("HERMES_READ_ONLY_SESSION", raising=False)
+        token = set_current_write_origin("foreground_user_explicit")
+        try:
+            with self_improvement_decision_scope(
+                _Dec(result=ALLOW, reason="f20_trusted")
+            ):
+                with session_write_policy_scope(
+                    SessionWritePolicy.normal(
+                        session_id="f20", origin="foreground_user_explicit"
+                    )
+                ):
+                    seen = get_self_improvement_decision()
+                    assert getattr(seen, "allow", False) is True
+        finally:
+            reset_current_write_origin(token)
