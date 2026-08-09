@@ -1,22 +1,104 @@
-schema_version: 1
-name: runtime_core
-description: Read-only runtime evidence pack for Hermes Gateway fleet review.
+schema_version: 2
+pack:
+  id: runtime_core
+  version: 1.0.0
+  description: Read-only runtime evidence pack for Hermes Gateway fleet review.
 authority_mode: observe_only
-execution: disabled
+execution:
+  production_read: true
+  dry_run: true
+  no_write: true
+  action_execution: disabled
+target_kinds:
+  - gateway
+  - cron
+  - repository
+  - sqlite
 inputs:
+  classification: operational_metadata
+  redaction_policy_version: 2
+  retention_days: 14
   collectors:
-    - logs
-    - processes
-    - launchd
-    - cron
-    - sqlite_health
-    - git_state
-  redaction_policy_version: 1
+    - id: logs
+      source_binding: target.observed_paths
+      max_bytes: 65536
+      max_items: 200
+      deadline_seconds: 1
+      rate_limit_seconds: 15
+    - id: processes
+      source_binding: target.labels.service_label
+      max_items: 256
+      deadline_seconds: 1
+      rate_limit_seconds: 15
+    - id: launchd
+      source_binding: target.observed_paths
+      max_bytes: 1048576
+      deadline_seconds: 1
+      rate_limit_seconds: 60
+    - id: cron
+      source_binding: target.observed_paths
+      max_items: 32
+      deadline_seconds: 1
+      rate_limit_seconds: 60
+    - id: sqlite_health
+      source_binding: target.observed_paths
+      max_items: 3
+      deadline_seconds: 1
+      rate_limit_seconds: 60
+    - id: git_state
+      source_binding: target.observed_paths
+      max_bytes: 1048576
+      deadline_seconds: 1
+      rate_limit_seconds: 60
+probes:
+  - id: gateway_log_tail
+    collector: logs
+    severity: warning
+    mandatory: true
+  - id: gateway_process_presence
+    collector: processes
+    severity: warning
+    mandatory: true
+  - id: service_configuration_fingerprint
+    collector: launchd
+    severity: warning
+    mandatory: false
+  - id: cron_business_health
+    collector: cron
+    severity: critical
+    mandatory: true
+  - id: sqlite_metadata_only
+    collector: sqlite_health
+    severity: warning
+    mandatory: false
+  - id: git_metadata
+    collector: git_state
+    severity: warning
+    mandatory: false
+assertions:
+  - id: cron_execution_completed
+    severity: warning
+    mandatory: true
+  - id: cron_business_assertion_fresh
+    severity: critical
+    mandatory: true
+  - id: evidence_redacted
+    severity: critical
+    mandatory: true
 evidence:
   required_fields:
+    - observation_id
     - target_id
     - collected_at
     - collector
+    - source_id
     - signal_id
     - redaction_version
+failure_runbook:
+  id: manual_observe_only_triage
+  mode: manual_only
+  steps:
+    - preserve_redacted_evidence
+    - notify_owner
+    - do_not_change_target
 actions: []

@@ -3,7 +3,20 @@ from pathlib import Path
 from plugins.agentops.control.collectors.base import collect_all
 from plugins.agentops.control.collectors.logs import LogCollector
 from plugins.agentops.control.observer_models import CursorResetReason
-from plugins.agentops.control.registry import bootstrap_gateway_registry
+from plugins.agentops.control.observer_models import Criticality, Target, TargetKind, TargetSpec
+
+
+def _target(path):
+    return Target(
+        TargetSpec(
+            target_id="hermes:profile:test:gateway",
+            profile="test",
+            kind=TargetKind.GATEWAY,
+            criticality=Criticality.NONCRITICAL,
+            observed_paths=(str(path),),
+            labels={"service_label": "ai.hermes.gateway-test"},
+        )
+    )
 
 
 def _reason(batch):
@@ -11,8 +24,8 @@ def _reason(batch):
 
 
 def test_log_cursor_recovers_after_rotation_and_truncation(tmp_path):
-    target = bootstrap_gateway_registry().list_targets()[0]
     path = tmp_path / "gateway.log"
+    target = _target(tmp_path)
     path.write_text("2026-08-09T00:00:00Z initial failure\n", encoding="utf-8")
     collector = LogCollector("logs", path)
 
@@ -31,9 +44,9 @@ def test_log_cursor_recovers_after_rotation_and_truncation(tmp_path):
 
 
 def test_same_log_error_from_two_files_is_a_single_signal_in_fan_out(tmp_path):
-    target = bootstrap_gateway_registry().list_targets()[0]
     first = tmp_path / "gateway.log"
     second = tmp_path / "errors.log"
+    target = _target(tmp_path)
     first.write_text("2026-08-09T00:00:00Z pid=100 boom\n", encoding="utf-8")
     second.write_text("2026-08-09T01:00:00Z pid=200 boom\n", encoding="utf-8")
 

@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from plugins.agentops.control.observer_models import RawSignal, Signal, stable_signal_id
+from plugins.agentops.control.observer_models import RawSignal, Signal, stable_signal_id, thaw_value
 
 
-_SENSITIVE_KEY = re.compile(r"(?:api[_-]?key|token|cookie|password|secret|authorization|credential|session)", re.I)
+_SENSITIVE_NAME = r"(?:api[_-]?key|token|cookie|password|secret|authorization|credential|session)"
+_SENSITIVE_KEY = re.compile(_SENSITIVE_NAME, re.I)
 _SENSITIVE_VALUE = re.compile(
-    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._-]{8,}\b|"
-    r"\bgh[pousr]_[A-Za-z0-9]{8,}\b|"
-    r"(?:api[_-]?key|token|cookie|session|secret|authorization)\s*[=:]\s*[^\s;]{4,})",
+    r"(?:\bsk-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[A-Za-z0-9._-]{8,}\b|\bgh[pousr]_[A-Za-z0-9]{8,})",
+    re.I,
+)
+_SENSITIVE_ASSIGNMENT = re.compile(
+    rf"(?P<prefix>(?:(?:\"|')?{_SENSITIVE_NAME}(?:\"|')?)\s*[:=]\s*)"
+    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^\s,;}]+)",
     re.I,
 )
 _REDACTED = "[REDACTED]"
@@ -25,7 +30,7 @@ class RedactionError(ValueError):
 
 @dataclass(frozen=True)
 class RedactionPolicy:
-    version: int = 1
+    version: int = 2
     replacement: str = _REDACTED
 
     def __post_init__(self) -> None:
@@ -41,10 +46,12 @@ DEFAULT_POLICY = RedactionPolicy()
 def redact_text(value: str, policy: RedactionPolicy = DEFAULT_POLICY) -> str:
     if not isinstance(value, str):
         raise RedactionError("invalid text value")
-    return _SENSITIVE_VALUE.sub(policy.replacement, value)
+    value = _SENSITIVE_VALUE.sub(policy.replacement, value)
+    return _SENSITIVE_ASSIGNMENT.sub(lambda match: match.group("prefix") + policy.replacement, value)
 
 
 def redact_value(value: Any, policy: RedactionPolicy = DEFAULT_POLICY) -> Any:
+    """Recursively remove secret fields and values from JSON-compatible data."""
     if isinstance(value, str):
         return redact_text(value, policy)
     if isinstance(value, Mapping):
@@ -65,9 +72,24 @@ def redact_value(value: Any, policy: RedactionPolicy = DEFAULT_POLICY) -> Any:
     return policy.replacement
 
 
+def redact_log_line(line: str, policy: RedactionPolicy = DEFAULT_POLICY) -> dict[str, Any]:
+    """Prefer a recursively redacted JSON record, otherwise return safe text."""
+    if not isinstance(line, str):
+        raise RedactionError("invalid log line")
+    try:
+        decoded = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return {"message": redact_text(line, policy)}
+    if isinstance(decoded, (Mapping, list, tuple)):
+        return {"record": redact_value(decoded, policy)}
+    return {"message": redact_text(line, policy)}
+
+
 def contains_secret(value: Any) -> bool:
     if isinstance(value, str):
-        return bool(_SENSITIVE_VALUE.search(value))
+        assignment = _SENSITIVE_ASSIGNMENT.search(value)
+        assignment_has_secret = assignment is not None and assignment.group("value").strip("\"'") != _REDACTED
+        return bool(_SENSITIVE_VALUE.search(value) or assignment_has_secret)
     if isinstance(value, Mapping):
         return any(
             (not isinstance(key, str)) or _SENSITIVE_KEY.search(key) is not None or contains_secret(child)
@@ -81,7 +103,7 @@ def contains_secret(value: Any) -> bool:
 def redact_signal(signal: RawSignal, policy: RedactionPolicy = DEFAULT_POLICY) -> Signal:
     if not isinstance(signal, RawSignal):
         raise RedactionError("invalid raw signal")
-    payload = redact_value(signal.payload, policy)
+    payload = redact_value(thaw_value(signal.payload), policy)
     if contains_secret(payload):
         raise RedactionError("redaction gate failed")
     return Signal(
