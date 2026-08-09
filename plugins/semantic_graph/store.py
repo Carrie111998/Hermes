@@ -17,7 +17,10 @@ from .sanitize import sanitize_metadata, sanitize_value
 
 logger = logging.getLogger("hermes.plugins.semantic_graph")
 
-SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
+GRAPH_SCHEMA_VERSION = 1
+# Backwards-compatible alias retained for existing importers.
+SCHEMA_VERSION = DB_SCHEMA_VERSION
 
 DDL_CORE = """
 CREATE TABLE IF NOT EXISTS graph_runs (
@@ -211,6 +214,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
 );
 """
 
+MIGRATION_V2_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS node_embeddings (
+        node_id TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        revision TEXT NOT NULL DEFAULT '',
+        serializer_version INTEGER NOT NULL CHECK(serializer_version > 0),
+        dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+        dtype TEXT NOT NULL DEFAULT 'float32-le' CHECK(dtype = 'float32-le'),
+        vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
+        source_text_hash TEXT NOT NULL CHECK(length(source_text_hash) = 64),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(node_id, namespace),
+        FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_node_embeddings_namespace
+        ON node_embeddings(namespace)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_node_embeddings_source_hash
+        ON node_embeddings(namespace, source_text_hash)
+    """,
+)
+
+_NODE_EMBEDDING_COLUMNS = {
+    "node_id", "namespace", "provider", "model", "revision",
+    "serializer_version", "dimensions", "dtype", "vector_blob",
+    "source_text_hash", "created_at", "updated_at",
+}
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -289,21 +327,106 @@ class SemanticGraphStore:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                "semantic-graph database schema "
+                f"{version} is newer than supported schema {DB_SCHEMA_VERSION}"
+            )
+
         if version < 1:
-            conn.executescript(DDL_CORE)
-            try:
-                conn.executescript(DDL_FTS)
-                self.fts_enabled = True
-            except sqlite3.Error as exc:
-                logger.warning("semantic-graph: FTS5 unavailable, LIKE fallback: %s", exc)
-                self.fts_enabled = False
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        else:
-            # Detect whether FTS tables exist.
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
-            ).fetchone()
-            self.fts_enabled = row is not None
+            self._create_schema_v1(conn)
+            version = 1
+        if version < 2:
+            self._apply_migration(
+                conn,
+                target_version=2,
+                statements=MIGRATION_V2_STATEMENTS,
+            )
+
+        self._detect_fts(conn)
+
+    def _create_schema_v1(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(DDL_CORE)
+        try:
+            conn.executescript(DDL_FTS)
+        except sqlite3.Error as exc:
+            logger.warning("semantic-graph: FTS5 unavailable, LIKE fallback: %s", exc)
+        conn.execute("PRAGMA user_version = 1")
+
+    def _apply_migration(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        target_version: int,
+        statements: tuple[str, ...],
+    ) -> None:
+        if conn.in_transaction:
+            raise RuntimeError("schema migration must start outside an active transaction")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                conn.execute(statement)
+            self._validate_node_embeddings_schema(conn)
+            conn.execute(f"PRAGMA user_version = {int(target_version)}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _validate_node_embeddings_schema(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(node_embeddings)").fetchall()
+        actual = {str(row["name"]) for row in rows}
+        if actual != _NODE_EMBEDDING_COLUMNS:
+            missing = sorted(_NODE_EMBEDDING_COLUMNS - actual)
+            extra = sorted(actual - _NODE_EMBEDDING_COLUMNS)
+            raise RuntimeError(
+                "invalid node_embeddings schema: "
+                f"missing={missing}, extra={extra}"
+            )
+
+        primary_key = sorted(
+            (int(row["pk"]), str(row["name"]))
+            for row in rows
+            if int(row["pk"])
+        )
+        if primary_key != [(1, "node_id"), (2, "namespace")]:
+            raise RuntimeError(
+                "invalid node_embeddings schema: "
+                "must have PRIMARY KEY(node_id, namespace)"
+            )
+
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='node_embeddings'"
+        ).fetchone()
+        table_sql = str(sql_row["sql"] or "").lower() if sql_row else ""
+        required_constraints = (
+            "check(serializer_version > 0)",
+            "check(dimensions > 0)",
+            "check(dtype = 'float32-le')",
+            "check(length(vector_blob) = dimensions * 4)",
+            "check(length(source_text_hash) = 64)",
+        )
+        if any(constraint not in table_sql for constraint in required_constraints):
+            raise RuntimeError("invalid node_embeddings constraints")
+
+        fk_rows = conn.execute("PRAGMA foreign_key_list(node_embeddings)").fetchall()
+        has_node_fk = any(
+            str(row["table"]) == "nodes"
+            and str(row["from"]) == "node_id"
+            and str(row["to"]) == "node_id"
+            and str(row["on_delete"]).upper() == "CASCADE"
+            for row in fk_rows
+        )
+        if not has_node_fk:
+            raise RuntimeError(
+                "node_embeddings must reference nodes(node_id) with ON DELETE CASCADE"
+            )
+
+    def _detect_fts(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+        ).fetchone()
+        self.fts_enabled = row is not None
 
     def get_status_counts(self) -> dict[str, Any]:
         self.ensure_ready()
@@ -311,8 +434,10 @@ class SemanticGraphStore:
             def _c(table: str) -> int:
                 return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
+            db_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             return {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": db_version,
+                "graph_schema_version": GRAPH_SCHEMA_VERSION,
                 "fts_enabled": self.fts_enabled,
                 "runs": _c("graph_runs"),
                 "nodes": _c("nodes"),
@@ -361,7 +486,7 @@ class SemanticGraphStore:
                     turn_id,
                     model,
                     platform,
-                    SCHEMA_VERSION,
+                    GRAPH_SCHEMA_VERSION,
                     now,
                     _dumps(metadata or {}),
                 ),
@@ -455,7 +580,7 @@ class SemanticGraphStore:
         node["metadata"] = sanitize_metadata(node.get("metadata") or {})
         node_id = node["node_id"]
         now = _utcnow()
-        with self._connect() as conn:
+        with self.transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM nodes WHERE node_id = ?", (node_id,)
             ).fetchone()
@@ -491,16 +616,36 @@ class SemanticGraphStore:
                     new_status = old_status
                 if old_status in {"rejected", "superseded"} and new_status not in {"rejected", "superseded"}:
                     new_status = old_status
+
+                next_subtype = node.get("subtype", existing["subtype"])
+                next_label = node.get("label", existing["label"])
+                next_normalized_label = node.get(
+                    "normalized_label", existing["normalized_label"]
+                )
+                next_identity_key = node.get("identity_key", existing["identity_key"])
+                semantic_changed = (
+                    str(existing["node_type"]),
+                    str(existing["subtype"]),
+                    str(existing["label"]),
+                    str(existing["summary"]),
+                    str(existing["identity_key"]),
+                ) != (
+                    str(existing["node_type"]),
+                    str(next_subtype),
+                    str(next_label),
+                    str(summary),
+                    str(next_identity_key),
+                )
                 conn.execute(
                     "UPDATE nodes SET subtype=?, label=?, normalized_label=?, summary=?, "
                     "identity_key=?, status=?, authority=?, confidence=?, salience=?, "
                     "metadata_json=?, updated_at=? WHERE node_id=?",
                     (
-                        node.get("subtype", existing["subtype"]),
-                        node.get("label", existing["label"]),
-                        node.get("normalized_label", existing["normalized_label"]),
+                        next_subtype,
+                        next_label,
+                        next_normalized_label,
                         summary,
-                        node.get("identity_key", existing["identity_key"]),
+                        next_identity_key,
                         new_status,
                         new_authority,
                         conf,
@@ -514,7 +659,12 @@ class SemanticGraphStore:
                     conn.execute("DELETE FROM nodes_fts WHERE node_id = ?", (node_id,))
                     conn.execute(
                         "INSERT INTO nodes_fts(node_id, label, summary) VALUES (?,?,?)",
-                        (node_id, node.get("label", existing["label"]), summary),
+                        (node_id, next_label, summary),
+                    )
+                if semantic_changed:
+                    conn.execute(
+                        "DELETE FROM node_embeddings WHERE node_id = ?",
+                        (node_id,),
                     )
                 return {"node_id": node_id, "updated": True}
             conn.execute(

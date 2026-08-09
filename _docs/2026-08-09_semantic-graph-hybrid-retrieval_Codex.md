@@ -179,3 +179,43 @@ Implement the transactional SQLite embedding migration as the next isolated comm
 - 2026-08-09: Phase 2 start record created from merged `origin/main`.
 - 2026-08-09: llama-server-only production backend and 1024-dimensional Qwen3 policy locked.
 - 2026-08-09: Commit 3 serializer and source-hash verification recorded.
+
+## Commit 4 — transactional embedding store migration
+
+Commit 4 upgrades the SQLite database schema from v1 to v2 while preserving existing graph data. It adds only the `node_embeddings` table, migration validation/rollback, schema-version separation, and stale-embedding invalidation during node updates.
+
+Changed files:
+- `plugins/semantic_graph/store.py`
+- `tests/plugins/test_semantic_graph_embedding_store.py`
+
+Design decisions:
+- `DB_SCHEMA_VERSION = 2`, `GRAPH_SCHEMA_VERSION = 1`, and compatibility alias `SCHEMA_VERSION = DB_SCHEMA_VERSION`.
+- `graph_runs.schema_version` stores the graph format version (`1`), not the SQLite database version.
+- `get_status_counts()` reports the live `PRAGMA user_version` and `graph_schema_version` separately.
+- v2 DDL is executed one statement at a time inside explicit `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`; `executescript()` is not used for v2.
+- The schema is validated before `PRAGMA user_version` advances: exact column set and `nodes(node_id)` foreign key with `ON DELETE CASCADE`.
+- `node_embeddings` is keyed by `(node_id, namespace)` and fixes the initial dtype to `float32-le`; vector packing/normalization remain Commit 5 responsibilities.
+- Existing v1 nodes, runs, artifacts, and graph data are preserved. Future database versions fail closed.
+- `upsert_node()` now participates in the existing thread-local transaction model. Semantic changes to `node_type`, `subtype`, `label`, final merged `summary`, or `identity_key` delete all stale embeddings for that node. Status/authority/confidence/salience/metadata-only changes retain embeddings.
+- No embedding save API, vector math, retrieval integration, config, HTTP, CLI, or dependency was added.
+
+Verification evidence:
+- RED: canonical runner collection failed before implementation because `DB_SCHEMA_VERSION` and v2 migration symbols did not exist (exit 1).
+- Migration tests: 14 passed, exit 0.
+- Combined regression: 6 files / 61 tests passed, exit 0.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- Production boundary: only `store.py`, the new migration test, and this implementation log changed.
+- No network calls or live embedding server calls performed.
+
+Residual risk:
+- Float32 packing, finite-value validation, normalization, cosine search, dense retrieval, RRF, and the llama-server adapter remain unimplemented.
+- Production readiness is not claimed.
+
+Next action:
+- Add Commit 5 vector packing/unpacking, finite validation, L2 normalization, and exact cosine tests without changing retrieval integration.
+
+## 変更履歴
+
+- 2026-08-09: Commit 4 transactional migration and invalidation verification recorded.
