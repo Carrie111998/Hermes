@@ -396,6 +396,81 @@ def test_cached_profile_switch_does_not_repeat_refresh_hooks(
     ]
 
 
+def test_profile_env_metadata_is_monotonic_across_cached_scopes(
+    tmp_path,
+    monkeypatch,
+):
+    home_a = tmp_path / "profile-a-env"
+    home_b = tmp_path / "profile-b-env"
+    for home, provider, env_var in (
+        (home_a, "profile-a-provider", "PROFILE_A_ONLY_API_KEY"),
+        (home_b, "profile-b-provider", "PROFILE_B_ONLY_API_KEY"),
+    ):
+        home.mkdir()
+        _write_user_provider(
+            home,
+            provider,
+            base_url=f"https://{provider}.example/v1",
+            env_var=env_var,
+        )
+        _write_activation(home, enabled=(f"model-providers/{provider}",))
+
+    import providers
+    from hermes_cli import config
+
+    for home in (home_a, home_b, home_a):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        providers.get_provider_catalog_snapshot()
+
+    assert {
+        "PROFILE_A_ONLY_API_KEY",
+        "PROFILE_B_ONLY_API_KEY",
+    }.issubset(config.OPTIONAL_ENV_VARS)
+
+
+def test_profile_env_metadata_concurrent_observation_keeps_union(tmp_path):
+    home_c = tmp_path / "profile-c-env"
+    home_d = tmp_path / "profile-d-env"
+    for home, provider, env_var in (
+        (home_c, "profile-c-provider", "PROFILE_C_ONLY_API_KEY"),
+        (home_d, "profile-d-provider", "PROFILE_D_ONLY_API_KEY"),
+    ):
+        home.mkdir()
+        _write_user_provider(
+            home,
+            provider,
+            base_url=f"https://{provider}.example/v1",
+            env_var=env_var,
+        )
+        _write_activation(home, enabled=(f"model-providers/{provider}",))
+
+    import providers
+    from hermes_cli import config
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    def discover(home):
+        token = set_hermes_home_override(home)
+        try:
+            return providers.get_provider_catalog_snapshot().scope_identity
+        finally:
+            reset_hermes_home_override(token)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scopes = list(executor.map(discover, (home_c, home_d)))
+
+    assert set(scopes) == {
+        (str(home_c.resolve()), ""),
+        (str(home_d.resolve()), ""),
+    }
+    assert {
+        "PROFILE_C_ONLY_API_KEY",
+        "PROFILE_D_ONLY_API_KEY",
+    }.issubset(config.OPTIONAL_ENV_VARS)
+
+
 def test_inactive_external_manifest_cannot_suppress_static_provider(
     tmp_path,
     monkeypatch,
@@ -478,7 +553,10 @@ def test_disabling_provider_refreshes_all_derived_surfaces(
         for entry in models.CANONICAL_PROVIDERS
     )
     assert "refresh-provider" not in models._KNOWN_PROVIDER_NAMES
-    assert "REFRESH_PROVIDER_API_KEY" not in config.OPTIONAL_ENV_VARS
+    # OPTIONAL_ENV_VARS is a process-wide compatibility inventory. Routing and
+    # picker surfaces drop the disabled provider, while observed metadata stays
+    # available without being overwritten by another profile's refresh.
+    assert "REFRESH_PROVIDER_API_KEY" in config.OPTIONAL_ENV_VARS
     assert (
         "REFRESH_PROVIDER_API_KEY"
         in auth.get_observed_provider_security_env_names()

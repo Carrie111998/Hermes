@@ -5397,31 +5397,31 @@ def config_command(args):
 # ── Profile-driven env var injection ─────────────────────────────────────────
 # Any provider registered in providers/ with auth_type="api_key" automatically
 # gets its env_vars exposed in OPTIONAL_ENV_VARS without editing this file.
-# Runs once at import time.
+# Entries are retained once observed so cached/concurrent profile switches
+# cannot overwrite this process-global compatibility inventory.
 
-_profile_env_vars_injected = False
-_profile_env_var_names: set[str] = set()
+_profile_env_vars_lock = threading.RLock()
 
 
 def _inject_profile_env_vars() -> None:
-    """Populate OPTIONAL_ENV_VARS from provider profiles not already listed.
-
-    Called once at module load time. Idempotent — repeated calls are no-ops.
-    """
-    global _profile_env_vars_injected
-    if _profile_env_vars_injected:
-        return
-    _profile_env_vars_injected = True
+    """Monotonically add metadata from provider profiles observed in-process."""
     try:
         from providers import list_providers
-        for _pp in list_providers():
+
+        profiles = tuple(list_providers())
+    except Exception:
+        return
+
+    with _profile_env_vars_lock:
+        additions: Dict[str, Dict[str, Any]] = {}
+        for _pp in profiles:
             if _pp.auth_type not in {"api_key",}:
                 continue
             for _var in _pp.env_vars:
-                if _var in OPTIONAL_ENV_VARS:
+                if _var in OPTIONAL_ENV_VARS or _var in additions:
                     continue
                 _is_key = not _var.endswith("_BASE_URL") and not _var.endswith("_URL")
-                OPTIONAL_ENV_VARS[_var] = {
+                additions[_var] = {
                     "description": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL override'}",
                     "prompt": f"{_pp.display_name or _pp.name} {'API key' if _is_key else 'base URL (leave empty for default)'}",
                     "url": _pp.signup_url or None,
@@ -5429,18 +5429,11 @@ def _inject_profile_env_vars() -> None:
                     "category": "provider",
                     "advanced": True,
                 }
-                _profile_env_var_names.add(_var)
-    except Exception:
-        pass
+        OPTIONAL_ENV_VARS.update(additions)
 
 
 def _refresh_profile_env_vars() -> None:
-    """Rebuild provider-plugin environment metadata after activation changes."""
-    global _profile_env_vars_injected
-    for name in _profile_env_var_names:
-        OPTIONAL_ENV_VARS.pop(name, None)
-    _profile_env_var_names.clear()
-    _profile_env_vars_injected = False
+    """Observe provider metadata after a new catalog becomes active."""
     _inject_profile_env_vars()
 
 
