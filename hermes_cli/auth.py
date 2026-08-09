@@ -63,7 +63,13 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import (
+    atomic_replace,
+    atomic_yaml_write,
+    base_url_host_matches,
+    env_float,
+    is_truthy_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2396,8 +2402,23 @@ def resolve_provider(
             msg += " Check 'hermes model' for available providers, or run 'hermes doctor' to diagnose config issues."
         raise AuthError(msg, code="invalid_provider")
 
-    # Explicit one-off CLI creds always mean openrouter/custom
-    if explicit_api_key or explicit_base_url:
+    # Explicit one-off CLI creds always mean openrouter/custom. Classify an
+    # explicit endpoint before applying the plugin gate: non-OpenRouter hosts
+    # are generic OpenAI-compatible endpoints even though this legacy resolver
+    # keeps returning ``openrouter`` for downstream compatibility.
+    if explicit_base_url:
+        endpoint_provider = (
+            "openrouter"
+            if base_url_host_matches(explicit_base_url, "openrouter.ai")
+            else "custom"
+        )
+        if not _provider_plugin_is_active(endpoint_provider):
+            raise AuthError(
+                f"Provider '{endpoint_provider}' is disabled by plugin configuration.",
+                code="invalid_provider",
+            )
+        return "openrouter"
+    if explicit_api_key:
         return resolve_provider("openrouter")
 
     # Provider precedence for the auto-path (#29285): explicit user intent must
