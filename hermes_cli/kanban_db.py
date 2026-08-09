@@ -7982,6 +7982,12 @@ DEFAULT_LOG_BACKUP_COUNT = 1
 # and call kanban_block/kanban_complete before max_runtime_seconds kills it.
 KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS = 30
 
+# A worker that timed itself out may still be unwinding after releasing its
+# task lease. Remote PIDs and local PIDs without a start-time fingerprint
+# cannot be safely signalled, so quarantine their retry briefly instead of
+# either risking an immediate concurrent writer or stranding the task forever.
+TERMINAL_TIMEOUT_UNVERIFIED_GUARD_SECONDS = 300
+
 # ---------------------------------------------------------------------------
 # Respawn guard constants
 # ---------------------------------------------------------------------------
@@ -8464,13 +8470,14 @@ def _terminate_terminal_timeout_worker_before_respawn(
 
     Returns a respawn-guard reason when the original worker cannot be proven
     gone. Host-local workers are fingerprinted and terminated before retry;
-    remote claimers fail closed because their PID cannot be interpreted from
-    this host's process namespace. A dead worker, a recycled host-local PID,
-    or a timeout run produced by the dispatcher's max-runtime path falls
-    through to the normal claim path.
+    remote claimers and unverifiable local PIDs fail closed during a bounded
+    quarantine because they cannot be safely signalled. A dead worker, a
+    recycled host-local PID, an expired quarantine, or a timeout run produced
+    by the dispatcher's max-runtime path falls through to the normal claim
+    path.
     """
     row = conn.execute(
-        "SELECT outcome, metadata FROM task_runs "
+        "SELECT outcome, metadata, ended_at FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -8498,22 +8505,30 @@ def _terminate_terminal_timeout_worker_before_respawn(
     if not claimer:
         return None
 
+    quarantine_expired = (
+        int(time.time()) - int(row["ended_at"])
+        >= TERMINAL_TIMEOUT_UNVERIFIED_GUARD_SECONDS
+    )
+
     # Claim locks are host-qualified (``host:pid``). A numeric PID from a
     # different host has no meaning in this process namespace: probing it could
     # mistake an unrelated local process for the timed-out remote worker, while
     # allowing the retry could create the same concurrent-writer race remotely.
-    # Keep the task ready and let the originating host prove/terminate its own
-    # worker before any claimant starts a replacement.
+    # Keep the task ready long enough for the originating host to finish
+    # unwinding. After the bounded quarantine, availability wins: a host that
+    # never returns must not strand the task forever.
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     if not str(claimer).startswith(host_prefix):
-        return "timed_out_worker_remote_unverified"
+        if not quarantine_expired:
+            return "timed_out_worker_remote_unverified"
+        return None
 
     expected_started_at = identity.get("process_started_at")
     if expected_started_at is None:
         # Without the start fingerprint, a live numeric PID may already have
         # been recycled. Fail closed instead of signalling an unproven process
         # or starting a concurrent retry beside the original worker.
-        if _pid_alive(pid):
+        if _pid_alive(pid) and not quarantine_expired:
             return "timed_out_worker_identity_unverified"
         return None
 
@@ -8521,7 +8536,7 @@ def _terminate_terminal_timeout_worker_before_respawn(
     if current_started_at is None:
         # A missing current fingerprint normally means the original PID is
         # already gone. If it still appears alive, keep the retry gated.
-        if _pid_alive(pid):
+        if _pid_alive(pid) and not quarantine_expired:
             return "timed_out_worker_identity_unverified"
         return None
     if int(current_started_at) != int(expected_started_at):

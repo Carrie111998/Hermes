@@ -361,3 +361,68 @@ def test_remote_timeout_worker_fails_closed_at_claim_boundary(
         assert task.claim_lock is None
     finally:
         conn.close()
+
+
+def test_remote_timeout_worker_guard_expires(kanban_home, monkeypatch):
+    """An offline worker host must not strand a ready task forever."""
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="stale remote timeout")
+        assert kb.claim_task(conn, task_id, claimer="remote-host:claim") is not None
+        kb._set_worker_pid(conn, task_id, 424242)
+        monkeypatch.setattr(kb, "_worker_process_start_time", lambda _pid: 100)
+        kb._record_task_failure(
+            conn,
+            task_id,
+            error="Iteration budget exhausted (90/90)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at - ? WHERE task_id = ?",
+            (kb.TERMINAL_TIMEOUT_UNVERIFIED_GUARD_SECONDS + 1, task_id),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        signals = []
+        monkeypatch.setattr(kb.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+
+        retry = kb.claim_task(conn, task_id)
+
+        assert retry is not None
+        assert signals == []
+    finally:
+        conn.close()
+
+
+def test_local_unverifiable_timeout_worker_guard_expires(kanban_home, monkeypatch):
+    """A missing local PID fingerprint also uses the bounded quarantine."""
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="stale unverifiable timeout")
+        assert kb.claim_task(conn, task_id) is not None
+        kb._set_worker_pid(conn, task_id, 424242)
+        monkeypatch.setattr(kb, "_worker_process_start_time", lambda _pid: None)
+        kb._record_task_failure(
+            conn,
+            task_id,
+            error="Iteration budget exhausted (90/90)",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+        )
+        conn.execute(
+            "UPDATE task_runs SET ended_at = ended_at - ? WHERE task_id = ?",
+            (kb.TERMINAL_TIMEOUT_UNVERIFIED_GUARD_SECONDS + 1, task_id),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+
+        retry = kb.claim_task(conn, task_id)
+
+        assert retry is not None
+    finally:
+        conn.close()
