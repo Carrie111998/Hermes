@@ -22643,8 +22643,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "terminal"
         if not parent.get("ended_at"):
             return "deliver"
-        if parent.get("end_reason") != "compression":
-            return "terminal"
+        end_reason = str(parent.get("end_reason") or "")
+        if end_reason != "compression":
+            # An ended parent is only unreachable when the USER closed the
+            # thread of work (explicit boundary: /new -> session_reset,
+            # user_exit, session_switch). Idle/timeout ends are the norm on
+            # scale-to-zero relay deployments — the platform chat remains
+            # routable, and the #55578 resolver retargets the completion to
+            # the chat's current session. Dropping those loses finished work
+            # (staging incident 2026-08-09: completed delegation batch never
+            # delivered because the parent had idle-ended).
+            _user_boundaries = ("session_reset", "user_exit", "session_switch")
+            if end_reason in _user_boundaries:
+                return "terminal"
+            return "deliver"
         try:
             tip_session_id = await session_db.get_compression_tip(parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:
