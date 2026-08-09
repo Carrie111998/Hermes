@@ -1904,27 +1904,69 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
 
 
 class _ThreadReadConnection:
-    """Close a SessionDB reader when its owning thread exits."""
+    """Thread-local owner for one SessionDB reader connection."""
 
     def __init__(self, db, conn: sqlite3.Connection):
         self._db_ref = weakref.ref(db)
         self.conn: Optional[sqlite3.Connection] = conn
+        self._closing = False
+        self._orphan_closing = False
 
     def close(self) -> None:
-        conn, self.conn = self.conn, None
-        if conn is None:
-            return
         db = self._db_ref()
         if db is not None:
-            with db._read_conns_lock:
-                db._read_conns.discard(conn)
-        try:
-            conn.close()
-        except Exception:
-            pass
+            db._close_read_holder(self)
+            return
+        _close_orphaned_read_holder(self)
 
     def __del__(self):
         self.close()
+
+
+# A holder normally lives in its SessionDB's reader registry.  Its finalizer
+# can instead run after SessionDB has been reclaimed, though, so a failed close
+# cannot be retained only on the finalizing holder itself.  Keep that narrow
+# exceptional path process-owned until a later deterministic retry succeeds.
+_orphaned_read_conn_holders: "set[_ThreadReadConnection]" = set()
+_orphaned_read_conn_holders_lock = threading.Lock()
+
+
+def _close_orphaned_read_holder(holder: _ThreadReadConnection) -> bool:
+    """Close an owner whose SessionDB is gone, retaining failures for retry."""
+    with _orphaned_read_conn_holders_lock:
+        conn = holder.conn
+        if conn is None:
+            _orphaned_read_conn_holders.discard(holder)
+            return False
+        if holder._orphan_closing:
+            return False
+        holder._orphan_closing = True
+    try:
+        conn.close()
+    except Exception:
+        logger.warning("orphaned state.db read connection close failed", exc_info=True)
+        with _orphaned_read_conn_holders_lock:
+            holder._orphan_closing = False
+            if holder.conn is conn:
+                _orphaned_read_conn_holders.add(holder)
+        return False
+    with _orphaned_read_conn_holders_lock:
+        if holder.conn is conn:
+            holder.conn = None
+        holder._orphan_closing = False
+        _orphaned_read_conn_holders.discard(holder)
+    return True
+
+
+def _retry_orphaned_read_connection_closes() -> None:
+    """Make one bounded retry pass over failed orphaned reader closes."""
+    with _orphaned_read_conn_holders_lock:
+        holders = tuple(_orphaned_read_conn_holders)
+    for holder in holders:
+        _close_orphaned_read_holder(holder)
+
+
+atexit.register(_retry_orphaned_read_connection_closes)
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -2237,6 +2279,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return data
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
+        # Every SessionDB lifecycle boundary makes one safe, bounded pass over
+        # failed finalizer closes whose original owner has already gone away.
+        _retry_orphaned_read_connection_closes()
         self.db_path = db_path or _default_db_path()
         # Fail hard (before any connection/pragma/mkdir) if a pytest-context
         # process resolved the developer's production state.db — see the
@@ -2254,10 +2299,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # when their thread exits; close() drains readers still owned by live
         # threads.
         self._read_conns: "set[sqlite3.Connection]" = set()
+        # Connection-to-holder map gives SessionDB.close() the same close owner
+        # used by thread-local teardown without making holders point back to us.
+        self._read_conn_holders: "weakref.WeakValueDictionary[sqlite3.Connection, _ThreadReadConnection]" = weakref.WeakValueDictionary()
+        # A failed close needs a strong retry owner after its worker exits.
+        self._failed_read_conn_holders: "dict[sqlite3.Connection, _ThreadReadConnection]" = {}
         self._read_conns_lock = threading.Lock()
-        # Set when close() begins.  _get_read_conn checks this under the
-        # lock so a reader that finishes opening after the drain finds the
-        # shutdown in progress and closes its own connection immediately.
+        # A dedicated reader lease gate keeps close() out of SQLite while any
+        # read context still owns a cursor/statement. It must remain distinct
+        # from self._lock: WAL readers intentionally do not serialize behind
+        # writers, and close() waits without holding a lock readers need to
+        # release their lease.
+        self._read_lease_cond = threading.Condition(threading.Lock())
+        self._active_read_leases = 0
+        # Each thread owns its own nested lease depth in _read_local. close()
+        # rejects a caller with a non-zero depth before it marks shutdown
+        # terminal, because that caller cannot release its own lease while
+        # blocked waiting for the global count to drain.
+        # Set when close() begins, under _read_lease_cond. _read_ctx() then
+        # atomically either rejects terminal state or acquires its lease.
         self._read_conns_closed = False
         self._wal_active = False
         self._write_count = 0
@@ -2488,6 +2548,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Read-path split ──
 
+    def _close_read_holder(self, holder: _ThreadReadConnection) -> bool:
+        """Claim and close *holder* once; retain failed closes for retry."""
+        with self._read_conns_lock:
+            conn = holder.conn
+            if conn is None or holder._closing:
+                return False
+            holder._closing = True
+            self._read_conns.discard(conn)
+            self._read_conn_holders.pop(conn, None)
+        try:
+            conn.close()
+        except Exception:
+            logger.warning("state.db read connection close failed", exc_info=True)
+            with self._read_conns_lock:
+                holder._closing = False
+                if holder.conn is conn:
+                    self._read_conns.add(conn)
+                    self._read_conn_holders[conn] = holder
+                    self._failed_read_conn_holders[conn] = holder
+            return False
+        with self._read_conns_lock:
+            self._failed_read_conn_holders.pop(conn, None)
+            if holder.conn is conn:
+                holder.conn = None
+            holder._closing = False
+        return True
+
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
 
@@ -2497,18 +2584,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reader can hit SQLITE_BUSY storms during writes, so we keep the
         legacy locked single-connection path there.
 
+        Each reader remains owned and normally used by its creating thread,
+        but ``check_same_thread=False`` lets SessionDB.close() close an idle
+        live worker's reader during synchronized shutdown. Without it SQLite
+        rejects that close with ProgrammingError and strands the descriptor.
+        Holder claiming serializes competing teardown closes; callers must
+        still stop using SessionDB before closing it.
+
         Fresh read transactions begin per statement (autocommit), so each
         query observes everything committed so far — read-your-writes holds
         for the flush-then-search patterns in a turn.
         """
         if not self._wal_active or self.read_only:
             return None
+        with self._read_lease_cond:
+            if self._read_conns_closed:
+                return None
         holder = getattr(self._read_local, "read_conn", None)
         conn = holder.conn if holder is not None else None
         if conn is not None:
             return conn
         if getattr(self._read_local, "failed", False):
             return None
+        conn = None
+        holder = None
+        registered = False
         try:
             conn = _connect_tracked_db(
                 f"file:{self.db_path}?mode=ro",
@@ -2516,6 +2616,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 uri=True,
                 timeout=5.0,
                 isolation_level=None,
+                check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
             apply_database_pragmas(conn, db_label="state.db")
@@ -2527,10 +2628,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 load_fts5_cjk_extension(conn)
             holder = _ThreadReadConnection(self, conn)
             self._read_local.read_conn = holder
-            with self._read_conns_lock:
+            # Keep the terminal check and registration ordered behind the same
+            # lease gate as close(): a direct _get_read_conn() caller cannot
+            # register a new holder after shutdown has begun.
+            with self._read_lease_cond:
                 closed = self._read_conns_closed
                 if not closed:
-                    self._read_conns.add(conn)
+                    with self._read_conns_lock:
+                        self._read_conns.add(conn)
+                        self._read_conn_holders[conn] = holder
+                        registered = True
             if closed:
                 # close() already drained — don't register; close immediately
                 # so no tracked fd leaks.
@@ -2538,6 +2645,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._read_local.failed = True
                 return None
         except sqlite3.Error:
+            if conn is not None and not registered:
+                # Setup ran after the tracked connect but before this reader
+                # gained a registered owner. Close it explicitly: the tracked
+                # connection's C-level finalizer does not call close(), so
+                # merely losing this local reference leaves its live count up.
+                if holder is not None and holder.conn is conn:
+                    holder.close()
+                else:
+                    try:
+                        conn.close()
+                    except Exception:
+                        logger.warning(
+                            "state.db unregistered read connection close failed",
+                            exc_info=True,
+                        )
             # Mark this thread failed so we don't retry the open on every
             # query; the locked writer connection still serves reads.
             self._read_local.failed = True
@@ -2555,12 +2677,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Non-WAL or read-conn failure: the shared writer connection under
         self._lock, byte-for-byte the legacy behavior.
         """
-        conn = self._get_read_conn()
-        if conn is not None:
-            yield conn
-            return
-        with self._lock:
-            yield self._conn
+        with self._read_lease_cond:
+            if self._read_conns_closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+            self._active_read_leases += 1
+            self._read_local.read_lease_depth = (
+                getattr(self._read_local, "read_lease_depth", 0) + 1
+            )
+        try:
+            conn = self._get_read_conn()
+            if conn is not None:
+                yield conn
+                return
+            with self._lock:
+                yield self._conn
+        finally:
+            with self._read_lease_cond:
+                self._active_read_leases -= 1
+                self._read_local.read_lease_depth -= 1
+                if self._active_read_leases == 0:
+                    self._read_lease_cond.notify_all()
 
     # ── Core write helper ──
 
@@ -3057,11 +3193,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def close(self):
         """Close the database connection.
 
+        Calling this from a thread currently inside :meth:`_read_ctx` raises
+        ``RuntimeError`` without beginning shutdown: a synchronous close cannot
+        wait for its caller's own read lease to drain. Another thread may close
+        normally while readers drain.
+
         Drains queued token deltas first (the background writer needs the
         connection). Writable connections then attempt a TRUNCATE WAL
         checkpoint so exiting writer processes help shrink the WAL file.
         Read-only connections never request a checkpoint.
         """
+        # A close boundary retries failures retained by orphaned worker
+        # finalizers; this is intentionally before this instance becomes terminal.
+        _retry_orphaned_read_connection_closes()
+        # Terminal state and the lease count share one condition: readers that
+        # won the race acquired a lease and must finish before any connection
+        # close, while later readers fail before they can obtain a connection.
+        # Do not hold self._lock or _read_conns_lock while waiting: a fallback
+        # reader may need self._lock and every reader needs this condition to
+        # release its lease.
+        with self._read_lease_cond:
+            if getattr(self._read_local, "read_lease_depth", 0):
+                raise RuntimeError(
+                    "Cannot close SessionDB while the current thread holds a read lease."
+                )
+            self._read_conns_closed = True
+            while self._active_read_leases:
+                self._read_lease_cond.wait()
         self._stop_token_writer()
         # The atexit hook holds a strong reference to this instance (bound
         # method); without unregistering, every closed SessionDB stays
@@ -3070,18 +3228,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # no-op when the writer never started.
         atexit.unregister(self._drain_token_queue_at_exit)
         # Close all read-only connections across all live threads. Thread-
-        # local owners close completed threads' readers themselves; the set
-        # lets shutdown drain the remaining live readers. Setting the closed
-        # flag under the lock prevents a reader from registering after drain.
+        # local owners close completed threads' readers themselves; after the
+        # lease drain the set lets shutdown claim the remaining idle holders.
         with self._read_conns_lock:
-            self._read_conns_closed = True
-            read_conns = list(self._read_conns)
-            self._read_conns.clear()
-        for conn in read_conns:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            read_holders = list(self._read_conn_holders.values())
+            for holder in self._failed_read_conn_holders.values():
+                if holder not in read_holders:
+                    read_holders.append(holder)
+        for holder in read_holders:
+            holder.close()
         self._read_local.read_conn = None
         with self._lock:
             if self._conn:
