@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import contextvars
 from pathlib import Path
 
 import pytest
@@ -31,14 +32,41 @@ BAD_SKILL_MD = SKILL_MD + "\nBLOCK\n"
 
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
+    from agent.self_improvement_decision_context import (
+        bind_self_improvement_decision,
+        reset_self_improvement_decision,
+    )
+    from agent.self_improvement_policy import Decision as _Decision
+
     home = tmp_path / "home"
     hermes = tmp_path / "hermes"
     home.mkdir()
     hermes.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(hermes))
-    monkeypatch.delenv("HERMES_READ_ONLY_SESSION", raising=False)
-    monkeypatch.delenv("HERMES_DISABLE_SELF_IMPROVEMENT", raising=False)
+    monkeypatch.setenv("HERMES_READ_ONLY_SESSION", "0")
+    monkeypatch.setenv("HERMES_DISABLE_SELF_IMPROVEMENT", "0")
+    token = bind_self_improvement_decision(
+        _Decision(result="ALLOW", reason="test skill mutation opt-in")
+    )
+    original_thread_init = threading.Thread.__init__
+
+    def _context_propagating_thread_init(self, *args, **kwargs):
+        target = kwargs.get("target")
+        if target is not None:
+            ctx = contextvars.copy_context()
+
+            def _wrapped_target(*target_args, **target_kwargs):
+                return ctx.run(target, *target_args, **target_kwargs)
+
+            kwargs["target"] = _wrapped_target
+        return original_thread_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(threading.Thread, "__init__", _context_propagating_thread_init)
+    try:
+        yield
+    finally:
+        reset_self_improvement_decision(token)
 
 
 def _allowlist(session_id, root, *operations):

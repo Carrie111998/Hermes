@@ -1,5 +1,6 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
+import hashlib
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,6 +19,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _final_skill_mutation_denial,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -31,9 +33,25 @@ from agent.skill_utils import (
 def _skill_dir(tmp_path):
     """Patch both SKILLS_DIR and get_all_skills_dirs so _find_skill searches
     only the temp directory — not the real ~/.hermes/skills/."""
-    with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
-         patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
-        yield
+    from agent.self_improvement_decision_context import (
+        bind_self_improvement_decision,
+        reset_self_improvement_decision,
+    )
+    from agent.self_improvement_policy import Decision as _Decision
+
+    token = bind_self_improvement_decision(
+        _Decision(result="ALLOW", reason="test skill mutation opt-in")
+    )
+    try:
+        with patch.dict("os.environ", {
+                "HERMES_DISABLE_SELF_IMPROVEMENT": "0",
+                "HERMES_READ_ONLY_SESSION": "0",
+             }), \
+             patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]):
+            yield
+    finally:
+        reset_self_improvement_decision(token)
 
 
 @pytest.fixture
@@ -576,6 +594,275 @@ class TestSkillManageDispatcher:
         bump_patch.assert_not_called()
 
 
+class TestFinalSkillMutationRevalidation:
+    @staticmethod
+    def _deny_decision(reason="final deny"):
+        from agent.self_improvement_policy import Decision as _Decision
+
+        return _Decision(result="DENY_UNKNOWN_OPERATION", reason=reason)
+
+    def test_initial_allow_then_final_deny_blocks_patch_and_preserves_bytes(self, tmp_path, monkeypatch):
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before = target.read_bytes()
+            monkeypatch.setattr(
+                "agent.self_improvement_decision_context.get_self_improvement_decision",
+                lambda: self._deny_decision("stale ALLOW invalidated before sink"),
+            )
+            result = _patch_skill("my-skill", "Do the thing.", "Do the unsafe thing.")
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_UNKNOWN_OPERATION"
+        assert target.read_bytes() == before
+
+    def test_missing_final_decision_blocks_create_without_partial_tree(self, tmp_path, monkeypatch):
+        with _skill_dir(tmp_path):
+            monkeypatch.setattr(
+                "agent.self_improvement_decision_context.get_self_improvement_decision",
+                lambda: self._deny_decision("missing typed context; fail-closed DENY"),
+            )
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False, result
+        assert not (tmp_path / "my-skill").exists()
+
+    def test_final_session_policy_exception_blocks_edit_and_preserves_bytes(self, tmp_path, monkeypatch):
+        import agent.session_write_policy as swp
+
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before = target.read_bytes()
+            monkeypatch.setattr(
+                swp,
+                "evaluate_session_write_policy",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+            )
+            result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "policy_evaluation_failed"
+        assert target.read_bytes() == before
+
+    def test_readonly_session_blocks_write_file_at_sink(self, tmp_path):
+        from agent.session_write_policy import SessionWritePolicy, session_write_policy_scope
+
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            policy = SessionWritePolicy.deny_all("readonly-test")
+            with session_write_policy_scope(policy):
+                result = _write_file("my-skill", "references/new.md", "new")
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "deny_all"
+        assert not (tmp_path / "my-skill" / "references" / "new.md").exists()
+
+    def test_env_disabled_at_sink_blocks_stale_allow_and_preserves_bytes(self, tmp_path, monkeypatch):
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before = target.read_bytes()
+            monkeypatch.setenv("HERMES_DISABLE_SELF_IMPROVEMENT", "1")
+            result = _patch_skill("my-skill", "Do the thing.", "Do the unsafe thing.")
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_ENV_DISABLED"
+        assert target.read_bytes() == before
+
+    def test_background_review_stale_allow_final_deny_preserves_target(self, tmp_path, monkeypatch):
+        from tools.skill_manager_tool import mark_background_review_skill_read
+        from tools.skill_provenance import BACKGROUND_REVIEW, reset_current_write_origin, set_current_write_origin
+
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before = target.read_bytes()
+            token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
+                mark_background_review_skill_read(target)
+                monkeypatch.setattr("tools.skill_manager_tool._background_review_write_guard", lambda *_a, **_kw: None)
+                monkeypatch.setattr(
+                    "agent.self_improvement_decision_context.get_self_improvement_decision",
+                    lambda: self._deny_decision("background_review stale ALLOW invalidated"),
+                )
+                result = _patch_skill("my-skill", "Do the thing.", "Do the unsafe thing.")
+            finally:
+                reset_current_write_origin(token)
+
+        assert result["success"] is False, result
+        assert target.read_bytes() == before
+
+    def test_delete_and_remove_file_final_deny_preserve_targets(self, tmp_path, monkeypatch):
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            assert _write_file("my-skill", "references/old.md", "old")["success"] is True
+            skill_md = tmp_path / "my-skill" / "SKILL.md"
+            support = tmp_path / "my-skill" / "references" / "old.md"
+            before_skill = skill_md.read_bytes()
+            before_support = support.read_bytes()
+            monkeypatch.setattr(
+                "agent.self_improvement_decision_context.get_self_improvement_decision",
+                lambda: self._deny_decision("final destructive op deny"),
+            )
+            delete_result = _delete_skill("my-skill")
+            remove_result = _remove_file("my-skill", "references/old.md")
+
+        assert delete_result["success"] is False, delete_result
+        assert remove_result["success"] is False, remove_result
+        assert skill_md.read_bytes() == before_skill
+        assert support.read_bytes() == before_support
+
+    def test_direct_final_helper_without_context_denies(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "agent.self_improvement_decision_context.get_self_improvement_decision",
+            lambda: self._deny_decision("direct helper untrusted caller"),
+        )
+        result = _final_skill_mutation_denial(
+            "write_file", tmp_path / "skill" / "references" / "x.md", origin="unit"
+        )
+
+        assert result is not None
+        assert result["success"] is False
+        assert result["operation_kind"] == "skill_write_file"
+
+    @staticmethod
+    def _tree_artifacts(root: Path) -> set[str]:
+        names = set()
+        try:
+            paths = list(root.rglob("*"))
+        except FileNotFoundError:
+            paths = []
+        for path in paths:
+            try:
+                name = path.name
+                if (
+                    name.startswith(".hermes-staging-")
+                    or name.startswith(".hermes-skill-staging-")
+                    or ".publish." in name
+                    or ".tmp." in name
+                ):
+                    names.add(str(path.relative_to(root)))
+            except FileNotFoundError:
+                pass
+        return names
+
+    @staticmethod
+    def _sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _revoke_during_scan(self, monkeypatch, calls, staging_paths):
+        real_final = _final_skill_mutation_denial
+        import tools.skill_manager_tool as smt
+        real_create_staging = smt._create_private_staging
+
+        def recording_final(action, target_path, *, origin):
+            result = real_final(action, target_path, origin=origin)
+            calls.append((origin, result is None, None if result is None else result.get("policy_reason")))
+            return result
+
+        def revoke_scan(_staged_skill_dir):
+            monkeypatch.setenv("HERMES_DISABLE_SELF_IMPROVEMENT", "1")
+            return None
+
+        def recording_create_staging(skills_root):
+            handle = real_create_staging(skills_root)
+            staging_paths.append(Path(handle.path))
+            return handle
+
+        monkeypatch.setattr(
+            "tools.skill_manager_tool._final_skill_mutation_denial",
+            recording_final,
+        )
+        monkeypatch.setattr(
+            "tools.skill_manager_tool._security_scan_skill_fail_closed",
+            revoke_scan,
+        )
+        monkeypatch.setattr(
+            "tools.skill_manager_tool._create_private_staging",
+            recording_create_staging,
+        )
+
+    def _assert_early_allow_late_deny(self, calls):
+        assert any(allowed for _origin, allowed, _reason in calls), calls
+        assert any(reason == "DENY_ENV_DISABLED" for _origin, _allowed, reason in calls), calls
+
+    def _assert_staging_cleaned(self, staging_paths):
+        assert staging_paths
+        for staging_path in staging_paths:
+            assert not staging_path.exists()
+            assert not staging_path.parent.exists()
+
+    def test_create_late_revocation_after_staging_blocks_publish_and_cleans_artifacts(self, tmp_path, monkeypatch):
+        calls = []
+        staging_paths = []
+        with _skill_dir(tmp_path):
+            self._revoke_during_scan(monkeypatch, calls, staging_paths)
+            target = tmp_path / "my-skill"
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_ENV_DISABLED"
+        assert not target.exists()
+        self._assert_staging_cleaned(staging_paths)
+        self._assert_early_allow_late_deny(calls)
+
+    def test_edit_late_revocation_after_scan_preserves_target_and_avoids_publish(self, tmp_path, monkeypatch):
+        calls = []
+        staging_paths = []
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before_sha = self._sha(target)
+            self._revoke_during_scan(monkeypatch, calls, staging_paths)
+            with patch("tools.skill_manager_tool.atomic_replace") as atomic_replace:
+                result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_ENV_DISABLED"
+        assert self._sha(target) == before_sha
+        self._assert_staging_cleaned(staging_paths)
+        atomic_replace.assert_not_called()
+        self._assert_early_allow_late_deny(calls)
+
+    def test_patch_late_revocation_after_scan_preserves_target_and_avoids_publish(self, tmp_path, monkeypatch):
+        calls = []
+        staging_paths = []
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            target = tmp_path / "my-skill" / "SKILL.md"
+            before_sha = self._sha(target)
+            self._revoke_during_scan(monkeypatch, calls, staging_paths)
+            with patch("tools.skill_manager_tool.atomic_replace") as atomic_replace:
+                result = _patch_skill("my-skill", "Do the thing.", "Do the safer thing.")
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_ENV_DISABLED"
+        assert self._sha(target) == before_sha
+        self._assert_staging_cleaned(staging_paths)
+        atomic_replace.assert_not_called()
+        self._assert_early_allow_late_deny(calls)
+
+    def test_write_file_late_revocation_after_scan_preserves_target_and_avoids_publish(self, tmp_path, monkeypatch):
+        calls = []
+        staging_paths = []
+        with _skill_dir(tmp_path):
+            assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"] is True
+            assert _write_file("my-skill", "references/api.md", "before")["success"] is True
+            target = tmp_path / "my-skill" / "references" / "api.md"
+            before_sha = self._sha(target)
+            self._revoke_during_scan(monkeypatch, calls, staging_paths)
+            with patch("tools.skill_manager_tool.atomic_replace") as atomic_replace:
+                result = _write_file("my-skill", "references/api.md", "after")
+
+        assert result["success"] is False, result
+        assert result["policy_reason"] == "DENY_ENV_DISABLED"
+        assert self._sha(target) == before_sha
+        self._assert_staging_cleaned(staging_paths)
+        atomic_replace.assert_not_called()
+        self._assert_early_allow_late_deny(calls)
+
+
     def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path, allow_decision):
         from tools.skill_provenance import (
             BACKGROUND_REVIEW,
@@ -671,10 +958,26 @@ class TestSecurityScanGate:
 def _two_roots(local_dir: Path, external_dir: Path):
     """Patch the skill manager so local SKILLS_DIR = local_dir and
     get_all_skills_dirs() returns [local_dir, external_dir] in order."""
-    with patch("tools.skill_manager_tool.SKILLS_DIR", local_dir), \
-         patch("agent.skill_utils.get_all_skills_dirs",
-               return_value=[local_dir, external_dir]):
-        yield
+    from agent.self_improvement_decision_context import (
+        bind_self_improvement_decision,
+        reset_self_improvement_decision,
+    )
+    from agent.self_improvement_policy import Decision as _Decision
+
+    token = bind_self_improvement_decision(
+        _Decision(result="ALLOW", reason="test skill mutation opt-in")
+    )
+    try:
+        with patch.dict("os.environ", {
+                "HERMES_DISABLE_SELF_IMPROVEMENT": "0",
+                "HERMES_READ_ONLY_SESSION": "0",
+             }), \
+             patch("tools.skill_manager_tool.SKILLS_DIR", local_dir), \
+             patch("agent.skill_utils.get_all_skills_dirs",
+                   return_value=[local_dir, external_dir]):
+            yield
+    finally:
+        reset_self_improvement_decision(token)
 
 
 def _write_external_skill(external_dir: Path, name: str = "ext-skill") -> Path:
@@ -1092,12 +1395,28 @@ def _curator_pass(tmp_path, *, monkeypatch):
     skills_root = hermes_home / "skills"
     skills_root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    with patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
-         patch("tools.skills_tool.SKILLS_DIR", skills_root), \
-         patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]), \
-         patch("tools.skill_usage._is_curator_managed_record", return_value=True), \
-         patch("tools.skill_provenance.is_background_review", return_value=True):
-        yield skills_root
+    from agent.self_improvement_decision_context import (
+        bind_self_improvement_decision,
+        reset_self_improvement_decision,
+    )
+    from agent.self_improvement_policy import Decision as _Decision
+
+    token = bind_self_improvement_decision(
+        _Decision(result="ALLOW", reason="test curator mutation opt-in")
+    )
+    try:
+        with patch.dict("os.environ", {
+                "HERMES_DISABLE_SELF_IMPROVEMENT": "0",
+                "HERMES_READ_ONLY_SESSION": "0",
+             }), \
+             patch("tools.skill_manager_tool.SKILLS_DIR", skills_root), \
+             patch("tools.skills_tool.SKILLS_DIR", skills_root), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_root]), \
+             patch("tools.skill_usage._is_curator_managed_record", return_value=True), \
+             patch("tools.skill_provenance.is_background_review", return_value=True):
+            yield skills_root
+    finally:
+        reset_self_improvement_decision(token)
 
 
 def _skill_content(name: str) -> str:

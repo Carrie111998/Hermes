@@ -1123,6 +1123,8 @@ def _policy_blocks_background_review_spawn(agent: Any) -> Optional[str]:
         decision = getattr(agent, "_self_improvement_decision", None)
         if decision is None:
             return "missing_self_improvement_decision"
+        if not all(hasattr(decision, attr) for attr in ("allow", "result", "reason")):
+            return "invalid_self_improvement_decision"
         if not decision.allow:
             return decision.reason or "decision_denies_spawn"
     except Exception:
@@ -1130,6 +1132,26 @@ def _policy_blocks_background_review_spawn(agent: Any) -> Optional[str]:
         # spawn a reviewer we cannot gate.
         logger.exception("self_improvement_decision lookup raised; defaulting to DENY")
         return "decision-lookup-raised"
+
+    try:
+        from agent.session_write_policy import (
+            SessionWritePolicy,
+            SessionWritePolicyMode,
+        )
+
+        policy = getattr(agent, "session_write_policy", None)
+        if not isinstance(policy, SessionWritePolicy):
+            return "missing_session_write_policy"
+        if policy.mode is SessionWritePolicyMode.DENY_ALL:
+            return "session_write_policy_deny_all"
+        if policy.is_protected:
+            return "session_write_policy_protected"
+    except Exception:
+        logger.exception(
+            "session_write_policy lookup raised; defaulting to DENY"
+        )
+        return "session_write_policy_lookup_raised"
+
     return None
 
 

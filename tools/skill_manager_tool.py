@@ -1363,6 +1363,19 @@ def _cleanup_private_staging(staging: Any) -> Optional[Tuple[Path, str]]:
             "failed to clean up staging %s: %s", staging_path, exc, exc_info=True
         )
         return (staging_path, str(exc))
+    scratch_parent = staging_path.parent
+    if scratch_parent.name.startswith(".hermes-staging-"):
+        try:
+            if not any(scratch_parent.iterdir()):
+                scratch_parent.rmdir()
+        except OSError as exc:
+            logger.error(
+                "failed to clean up staging parent %s: %s",
+                scratch_parent,
+                exc,
+                exc_info=True,
+            )
+            return (scratch_parent, str(exc))
     return None
 
 
@@ -1647,6 +1660,83 @@ def _skill_policy_denial(action: str, target_path: Path, *, origin: str = "skill
                 "target": str(target_path or ""),
             }
     return None
+
+
+def _final_skill_mutation_denial(
+    action: str,
+    target_path: Path,
+    *,
+    origin: str,
+) -> Optional[Dict[str, Any]]:
+    """Fail-closed last-mile authorization for skill-manager mutations.
+
+    A stale public-tool ALLOW, a caller that skips ``skill_manage()``, or a
+    background-review fork that crosses into a protected/read-only state must
+    not reach a persistent skill mutation. Re-check the canonical typed
+    self-improvement decision and session write policy immediately before the
+    mutation surface; any missing/invalid decision is DENY by construction.
+    """
+    operation_kind = _SKILL_ACTION_OPERATION_KIND.get(action, action)
+    try:
+        from agent.self_improvement_decision_context import get_self_improvement_decision
+
+        decision = get_self_improvement_decision()
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "Self-improvement authorization lookup failed; mutation denied",
+            "policy_reason": "self_improvement_policy_evaluation_failed",
+            "operation_kind": operation_kind,
+            "target": str(target_path or ""),
+            "policy_error": f"{type(exc).__name__}: {exc}",
+        }
+    if not getattr(decision, "allow", False):
+        return {
+            "success": False,
+            "error": (
+                "Self-improvement authorization denied skill mutation: "
+                f"{getattr(decision, 'reason', '')}"
+            ),
+            "policy_reason": getattr(decision, "result", "self_improvement_denied"),
+            "operation_kind": operation_kind,
+            "target": str(target_path or ""),
+        }
+    try:
+        from agent.self_improvement_policy import evaluate as _evaluate_self_improvement_policy
+
+        live_decision = _evaluate_self_improvement_policy(
+            environment_disabled=os.environ.get("HERMES_DISABLE_SELF_IMPROVEMENT", ""),
+            session_read_only=os.environ.get("HERMES_READ_ONLY_SESSION", ""),
+            operation_kind=operation_kind,
+            origin=origin,
+            target_path=str(target_path or ""),
+            explicit_opt_in=True,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "Self-improvement authorization re-evaluation failed; mutation denied",
+            "policy_reason": "self_improvement_policy_evaluation_failed",
+            "operation_kind": operation_kind,
+            "target": str(target_path or ""),
+            "policy_error": f"{type(exc).__name__}: {exc}",
+        }
+    if not getattr(live_decision, "allow", False):
+        return {
+            "success": False,
+            "error": (
+                "Self-improvement authorization denied skill mutation: "
+                f"{getattr(live_decision, 'reason', '')}"
+            ),
+            "policy_reason": getattr(live_decision, "result", "self_improvement_denied"),
+            "operation_kind": operation_kind,
+            "target": str(target_path or ""),
+        }
+    return _skill_policy_denial(action, target_path, origin=origin)
+
+
+class _SkillMutationAborted(Exception):
+    """Internal control flow after a structured mutation denial is assigned."""
 
 
 def _rollback_failed_payload(
@@ -2798,7 +2888,7 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
         "skill_patch": "patch",
         "skill_write_file": "write_file",
     }.get(operation_kind, "write_file")
-    denial = _skill_policy_denial(action, file_path, origin="skill_manager_atomic_write")
+    denial = _final_skill_mutation_denial(action, file_path, origin="skill_manager_atomic_write")
     if denial is not None:
         raise PermissionError(denial["error"])
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2810,6 +2900,11 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
     try:
         with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
+        denial = _final_skill_mutation_denial(
+            action, file_path, origin="skill_manager_atomic_replace"
+        )
+        if denial is not None:
+            raise PermissionError(denial["error"])
         atomic_replace(temp_path, file_path)
     except Exception:
         # Clean up temp file on error
@@ -2942,7 +3037,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                     if guard:
                         _primary = guard
                     else:
-                        denial = _skill_policy_denial("create", skill_dir, origin="skill_manager_create")
+                        denial = _final_skill_mutation_denial("create", skill_dir, origin="skill_manager_create")
                         if denial is not None:
                             _primary = denial
                         else:
@@ -3008,6 +3103,12 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                                             }
                                         else:
                                             # Build the live parent chain under the skills root.
+                                            denial = _final_skill_mutation_denial(
+                                                "create", skill_dir, origin="skill_manager_create_live_parent"
+                                            )
+                                            if denial is not None:
+                                                _primary = denial
+                                                raise _SkillMutationAborted
                                             created_parent_identities: list[tuple[Path, tuple[int, int, int]]] = []
                                             if not os.path.lexists(skills_root):
                                                 skills_root.mkdir(parents=True, exist_ok=True)
@@ -3022,6 +3123,18 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                                                     created_parent_identities.append((directory, _lstat_identity(directory)))
 
                                             # Publish the live skill directory.
+                                            denial = _final_skill_mutation_denial(
+                                                "create", skill_dir, origin="skill_manager_create_live_dir"
+                                            )
+                                            if denial is not None:
+                                                try:
+                                                    for directory, identity in reversed(created_parent_identities):
+                                                        _ensure_directory_identity(directory, identity)
+                                                        directory.rmdir()
+                                                except OSError:
+                                                    logger.debug("cleanup of own parent chain failed", exc_info=True)
+                                                _primary = denial
+                                                raise _SkillMutationAborted
                                             try:
                                                 skill_dir.mkdir(exist_ok=False)
                                             except FileExistsError:
@@ -3044,6 +3157,18 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                                                 # directory.  Use O_CREAT | O_EXCL | O_NOFOLLOW so a symlink
                                                 # appearing at the live target fails the publish instead of
                                                 # following it.
+                                                denial = _final_skill_mutation_denial(
+                                                    "create", skill_md, origin="skill_manager_create_publish"
+                                                )
+                                                if denial is not None:
+                                                    _publish_failure_cleanup(
+                                                        skill_dir=skill_dir,
+                                                        skill_dir_identity=skill_dir_identity,
+                                                        created_parent_identities=created_parent_identities,
+                                                        skills_root=skills_root,
+                                                    )
+                                                    _primary = denial
+                                                    raise _SkillMutationAborted
                                                 try:
                                                     publish_fd = os.open(
                                                         str(skill_md),
@@ -3109,6 +3234,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
                                                         # Successful publish.
                                                         _live_committed = True
                                                         _primary = None  # will build success below
+    except _SkillMutationAborted:
+        pass
     except _spg.SkillMutationLockAcquireFailure as _acq_exc:
         _lock_acquire_exc = _acq_exc
     except _spg.SkillMutationLockReleaseFailure as _rel_exc:
@@ -3296,7 +3423,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
                 if guard:
                     _primary = guard
                 else:
-                    denial = _skill_policy_denial("edit", skill_md, origin="skill_manager_edit")
+                    denial = _final_skill_mutation_denial("edit", skill_md, origin="skill_manager_edit")
                     if denial is not None:
                         _primary = denial
                     else:
@@ -3369,6 +3496,12 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
                                     }
                                 else:
                                     # Publish: temp + atomic_replace into the live parent.
+                                    denial = _final_skill_mutation_denial(
+                                        "edit", skill_md, origin="skill_manager_edit_publish_temp"
+                                    )
+                                    if denial is not None:
+                                        _primary = denial
+                                        raise _SkillMutationAborted
                                     fd, temp_path = tempfile.mkstemp(
                                         dir=str(skill_md.parent),
                                         prefix=f".{skill_md.name}.publish.",
@@ -3378,7 +3511,19 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
                                         with os.fdopen(fd, "wb") as f:
                                             f.write(candidate_bytes)
                                         os.chmod(temp_path, stat.S_IMODE(original_mode))
+                                        denial = _final_skill_mutation_denial(
+                                            "edit", skill_md, origin="skill_manager_edit_atomic_replace"
+                                        )
+                                        if denial is not None:
+                                            _primary = denial
+                                            try:
+                                                os.unlink(temp_path)
+                                            except OSError:
+                                                logger.error("failed to remove denied publish temp %s", temp_path, exc_info=True)
+                                            raise _SkillMutationAborted
                                         atomic_replace(temp_path, skill_md)
+                                    except _SkillMutationAborted:
+                                        raise
                                     except Exception:
                                         try:
                                             os.unlink(temp_path)
@@ -3410,6 +3555,8 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
                                         else:
                                             _live_committed = True
                                             _primary = None
+    except _SkillMutationAborted:
+        pass
     except _SkillMutationLockAcquireFailure:
         import sys as _sys
         _exc_info = _sys.exc_info()[1]
@@ -3551,7 +3698,7 @@ def _patch_skill(
                 if guard:
                     _primary = guard
                 else:
-                    denial = _skill_policy_denial("patch", target, origin="skill_manager_patch")
+                    denial = _final_skill_mutation_denial("patch", target, origin="skill_manager_patch")
                     if denial is not None:
                         _primary = denial
                     else:
@@ -3726,6 +3873,11 @@ def _apply_and_publish_patch(
             "rollback_failure_kind": "concurrent_modification",
             "target": str(canonical_skill_dir),
         }
+    denial = _final_skill_mutation_denial(
+        "patch", target, origin="skill_manager_patch_publish_temp"
+    )
+    if denial is not None:
+        return denial
     fd, temp_path = tempfile.mkstemp(
         dir=str(target.parent),
         prefix=f".{target.name}.publish.",
@@ -3735,6 +3887,15 @@ def _apply_and_publish_patch(
         with os.fdopen(fd, "wb") as f:
             f.write(candidate_bytes)
         os.chmod(temp_path, stat.S_IMODE(original_mode))
+        denial = _final_skill_mutation_denial(
+            "patch", target, origin="skill_manager_patch_atomic_replace"
+        )
+        if denial is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                logger.error("failed to remove denied publish temp %s", temp_path, exc_info=True)
+            return denial
         atomic_replace(temp_path, target)
     except Exception:
         try:
@@ -4061,7 +4222,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                             "target": str(canonical_skill_dir),
                             "lock_path": str(refusal_lock_path),
                         }
-                    denial = _skill_policy_denial(
+                    denial = _final_skill_mutation_denial(
                         "delete", re_skill_dir, origin="skill_manager_archive"
                     )
                     if denial is not None:
@@ -4266,7 +4427,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
                 guard = _background_review_write_guard(name, re_skill_dir, "delete")
                 if guard:
                     return guard
-                denial = _skill_policy_denial("delete", re_skill_dir, origin="skill_manager_delete")
+                denial = _final_skill_mutation_denial("delete", re_skill_dir, origin="skill_manager_delete")
                 if denial is not None:
                     return denial
                 # Final pre-delete identity check (immediately before rmtree).
@@ -4444,6 +4605,11 @@ def _publish_write_file(
     callers cannot overwrite each other's outcomes.
     """
     if not target_existed:
+        denial = _final_skill_mutation_denial(
+            "write_file", target, origin="skill_manager_write_file_live_parent"
+        )
+        if denial is not None:
+            return denial
         skill_root_resolved = existing["path"].resolve(strict=False)
         parent_chain: list[Path] = []
         parent = target.parent
@@ -4467,6 +4633,22 @@ def _publish_write_file(
                     "rollback_failure_kind": "concurrent_modification",
                     "target": str(target),
                 }
+        denial = _final_skill_mutation_denial(
+            "write_file", target, origin="skill_manager_write_file_publish"
+        )
+        if denial is not None:
+            for directory, identity in reversed(created_parent_identities):
+                try:
+                    _ensure_directory_identity(directory, identity)
+                    if directory.exists() and not any(directory.iterdir()):
+                        directory.rmdir()
+                except OSError:
+                    logger.debug(
+                        "publish-denial cleanup of parent %s failed",
+                        directory,
+                        exc_info=True,
+                    )
+            return denial
         try:
             publish_fd = os.open(
                 str(target),
@@ -4516,6 +4698,11 @@ def _publish_write_file(
                 rollback_failure_kind="physical_failure",
             )
     else:
+        denial = _final_skill_mutation_denial(
+            "write_file", target, origin="skill_manager_write_file_publish_temp"
+        )
+        if denial is not None:
+            return denial
         fd, temp_path = tempfile.mkstemp(
             dir=str(target.parent),
             prefix=f".{target.name}.publish.",
@@ -4525,6 +4712,15 @@ def _publish_write_file(
             with os.fdopen(fd, "wb") as f:
                 f.write(candidate_bytes)
             os.chmod(temp_path, stat.S_IMODE(original_mode))
+            denial = _final_skill_mutation_denial(
+                "write_file", target, origin="skill_manager_write_file_atomic_replace"
+            )
+            if denial is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    logger.error("failed to remove denied publish temp %s", temp_path, exc_info=True)
+                return denial
             atomic_replace(temp_path, target)
         except Exception:
             try:
@@ -4604,7 +4800,7 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
     assert target is not None
-    denial = _skill_policy_denial("write_file", target, origin="skill_manager_write_file")
+    denial = _final_skill_mutation_denial("write_file", target, origin="skill_manager_write_file")
     if denial is not None:
         return denial
     if target.exists():
@@ -4640,6 +4836,13 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
                         original_stat.st_ino,
                         stat.S_IFMT(original_stat.st_mode),
                     )
+
+                denial = _final_skill_mutation_denial(
+                    "write_file", target, origin="skill_manager_write_file_staging"
+                )
+                if denial is not None:
+                    _primary = denial
+                    raise _SkillMutationAborted
 
                 # Build staging copy of the live skill.
                 staging = _create_private_staging(skills_root)
@@ -4738,6 +4941,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
                             )
                             if _primary is None:
                                 _live_committed = True
+    except _SkillMutationAborted:
+        pass
     except _SkillMutationLockAcquireFailure:
         import sys as _sys
         _exc_info = _sys.exc_info()[1]
@@ -4892,7 +5097,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
                 guard = _background_review_write_guard(name, re_skill_dir, "remove_file")
                 if guard:
                     return guard
-                denial = _skill_policy_denial(
+                denial = _final_skill_mutation_denial(
                     "remove_file", re_target, origin="skill_manager_remove_file"
                 )
                 if denial is not None:
@@ -5301,7 +5506,7 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
                 # Clean up empty subdirectories
                 parent = re_target.parent
                 if parent != re_skill_dir and parent.exists() and not any(parent.iterdir()):
-                    denial = _skill_policy_denial("remove_file", parent, origin="skill_manager_remove_empty_parent")
+                    denial = _final_skill_mutation_denial("remove_file", parent, origin="skill_manager_remove_empty_parent")
                     if denial is not None:
                         return denial
                     parent.rmdir()
