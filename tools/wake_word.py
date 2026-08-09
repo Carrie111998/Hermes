@@ -115,10 +115,15 @@ def _is_macos_arm64() -> bool:
 def _is_macos_intel() -> bool:
     """True on macOS running on an Intel (x86_64) CPU.
 
-    The openWakeWord ONNX stack pins ``onnxruntime==1.27.0``, which ships no
-    x86_64 macOS wheel, so the lazy install fails outright on Intel Macs
-    (#81560). The tflite backend (``ai-edge-litert``) has macOS wheels for
-    both arches, so it is the only installable openWakeWord backend there.
+    The default openWakeWord stack pins ``onnxruntime==1.27.0``, which ships
+    no x86_64 macOS wheel, so the lazy install fails outright on Intel Macs
+    (#81560). Neither is the tflite route viable: ``ai-edge-litert==2.1.6``
+    publishes arm64-only macOS wheels (no x86_64, no sdist). The [wake]
+    extra therefore pins ``onnxruntime==1.23.2`` — the last release with a
+    Darwin x86_64 wheel — via platform marker, and this platform gates the
+    engine to the ``wake.openwakeword.slim`` feature, which omits
+    onnxruntime so lazy-deps' version match cannot fail against the
+    marker-pinned 1.23.2 install (#81560, #81577).
     """
     import platform
 
@@ -160,10 +165,6 @@ def resolve_inference_framework(cfg: Dict[str, Any]) -> str:
       phrase cross threshold (upstream #336). Existing macOS users who pinned
       ``onnx`` before the tflite fix landed would otherwise keep a wake word
       that arms but never fires.
-    - explicit ``onnx`` on macOS ARM64: the embedding model never fires
-      (upstream #336). Existing macOS users who pinned ``onnx`` before the
-      tflite fix landed would otherwise keep a wake word that arms but
-      never fires.
 
     Coerce that case to tflite (with a one-time warning) instead of
     silently shipping a dead ear. macOS Intel is left to the platform
@@ -585,6 +586,29 @@ class _OpenWakeWordEngine(_Engine):
             lazy_deps.ensure("wake.openwakeword.slim", prompt=False)
         else:
             lazy_deps.ensure("wake.openwakeword", prompt=False)
+
+        # slim omits onnxruntime, which the [wake] extra provides at the
+        # platform-correct version (1.23.2 on Intel macOS, 1.27.0 elsewhere).
+        # A bare openwakeword install (e.g. ``pip install openwakeword``)
+        # leaves the runtime missing; openwakeword's own import then raises a
+        # bare ModuleNotFoundError. Surface the real fix instead (#81560,
+        # #81577).
+        try:
+            import onnxruntime  # noqa: F401
+        except ImportError:
+            if _is_macos_intel():
+                # The default feature hard-pins onnxruntime==1.27.0, which has
+                # no x86_64 macOS wheel — only the [wake] extra's marker pin
+                # (1.23.2) is correct here, so point at the wizard, not pip.
+                hint = "Run `hermes tools` (Voice section) to install it."
+            else:
+                hint = "Run `hermes tools` (Voice section) to install it, or manually: " + (
+                    lazy_deps.feature_install_command("wake.openwakeword") or ""
+                )
+            raise ImportError(
+                "The wake word needs onnxruntime (openWakeWord's inference "
+                f"runtime), which is not installed. {hint}"
+            ) from None
 
         import openwakeword
         from openwakeword.model import Model

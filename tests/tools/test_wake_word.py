@@ -211,6 +211,12 @@ def _install_fake_openwakeword(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
+    # The engine's onnxruntime preflight (slim / missing-runtime guard) must
+    # not depend on the test venv's installed packages; the runtime is faked
+    # here and the missing-runtime path is exercised by its own test.
+    monkeypatch.setitem(
+        sys.modules, "onnxruntime", types.SimpleNamespace(__name__="onnxruntime")
+    )
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     return calls
 
@@ -325,6 +331,39 @@ def test_intel_macos_engine_ensures_slim_stack(monkeypatch):
     assert "wake.openwakeword.slim" in ensured
     assert "wake.openwakeword" not in ensured
     assert "wake.openwakeword.tflite" not in ensured
+
+
+def test_intel_macos_engine_reports_missing_onnxruntime(monkeypatch):
+    # The slim feature omits onnxruntime — it expects the [wake] extra's
+    # marker pin (1.23.2 on Intel macOS) to provide the runtime. A user who
+    # manually pip-installed only the slim stack (no [wake] extra) would
+    # otherwise hit openwakeword's bare ModuleNotFoundError at engine
+    # construction. The engine must surface an actionable hint instead of the
+    # raw "No module named 'onnxruntime'".
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("No module named 'onnxruntime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: None
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    with pytest.raises(ImportError) as err:
+        ww._OpenWakeWordEngine(
+            {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+        )
+    msg = str(err.value)
+    assert "onnxruntime" in msg
+    assert "hermes tools" in msg
+    assert "No module named 'onnxruntime'" not in msg
 
 
 def test_non_intel_macos_engine_ensures_default_stack(monkeypatch):
