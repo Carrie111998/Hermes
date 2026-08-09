@@ -22532,11 +22532,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        # Alias-aware resolution (relay-plane): a relay-fronted gateway
+        # registers ONE adapter under Platform.RELAY fronting N logical
+        # platforms, so a literal ``p.value == platform_name`` scan misses
+        # "slack" and silently drops the completion as "no gateway route"
+        # (staging incident 2026-08-09, second occurrence). Resolve through
+        # the shared transport resolver — native adapter wins; relay is
+        # eligible only when it advertises fronting the logical platform.
         adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        try:
+            _platform_enum = Platform(platform_name)
+        except (ValueError, KeyError):
+            _platform_enum = None
+        if _platform_enum is not None:
+            try:
+                _transport = resolve_delivery_transport(
+                    _platform_enum, self.config, self.adapters,
+                )
+            except Exception:
+                _transport = None
+            if _transport is not None:
+                adapter = _transport.adapter
+        if adapter is None:
+            # Legacy literal scan — still correct for native adapters, and
+            # keeps minimal runner stubs (tests) and exotic platform strings
+            # working when the resolver can't run.
+            for p, a in self.adapters.items():
+                if p.value == platform_name:
+                    adapter = a
+                    break
         if not adapter:
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
