@@ -2734,8 +2734,9 @@ def run_live_characterization(
     codex_executable: str = "codex",
     cwd: Path | None = None,
     provenance_secret: bytes | None = None,
+    live_tests_enabled: bool = False,
 ) -> Path:
-    if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
+    if not live_tests_enabled:
         raise RuntimeError("live_characterization_not_enabled")
     claude_command = resolve_cli_executable(claude_executable)
     codex_command = resolve_cli_executable(codex_executable)
@@ -3190,7 +3191,9 @@ def _characterize_codex(
         status["create"] = True
         status["used_registration_turn"] = result.used_registration_turn
         summary = source.find_native_thread(
-            native_id, source_kinds=("vscode", "appServer")
+            native_id,
+            source_kinds=("vscode", "appServer"),
+            state_db_only=True,
         )
         status["discover"] = summary is not None
         if summary is None:

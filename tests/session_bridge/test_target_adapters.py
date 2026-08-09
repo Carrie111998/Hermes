@@ -2999,6 +2999,10 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
     assert client.calls[1][1] == {"threadId": CODEX_ID, "name": "Mirror title"}
     assert client.calls[2][1] == {
         "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
         "sourceKinds": ["vscode", "appServer"],
     }
     assert client.calls[3][1] == {"threadId": CODEX_ID, "includeTurns": True}
@@ -3008,6 +3012,38 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
         used_registration_turn=False,
         verified_at=1234.5,
     )
+
+
+def test_codex_exact_placeholder_verification_uses_state_db_without_global_scan() -> None:
+    adapter, client = _codex_adapter({
+        "thread/start": [{"thread": {"id": CODEX_ID}}],
+        "thread/name/set": [{}],
+        "thread/list": [_codex_inventory()],
+        "thread/read": [_codex_signed_read()],
+    })
+
+    result = adapter.create_placeholder(
+        title="Mirror title",
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+        policy_generation=1,
+    )
+
+    assert result.native_id == CODEX_ID
+    assert [method for method, _, _ in client.calls] == [
+        "thread/start",
+        "thread/name/set",
+        "thread/list",
+        "thread/read",
+    ]
+    assert client.calls[2][1] == {
+        "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
+        "sourceKinds": ["vscode", "appServer"],
+    }
 
 
 def test_codex_visible_native_target_gets_one_authenticated_registration_turn() -> None:
@@ -3158,6 +3194,33 @@ def test_codex_exact_discovery_can_include_sidebar_and_app_server_threads() -> N
     ]
 
 
+def test_codex_exact_discovery_can_use_the_bounded_state_database() -> None:
+    client = FakeRequestClient({"thread/list": [_codex_inventory()]})
+    source = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    found = source.find_native_thread(
+        CODEX_ID,
+        source_kinds=("vscode", "appServer"),
+        state_db_only=True,
+    )
+
+    assert found is not None and found.native_id == CODEX_ID
+    assert client.calls == [
+        (
+            "thread/list",
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "useStateDbOnly": True,
+                "sourceKinds": ["vscode", "appServer"],
+            },
+            30.0,
+        )
+    ]
+
+
 def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filter() -> (
     None
 ):
@@ -3188,9 +3251,19 @@ def test_codex_source_kinds_enum_drift_retries_read_only_inventory_without_filte
     ]
     assert client.calls[2][1] == {
         "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
         "sourceKinds": ["vscode", "appServer"],
     }
-    assert client.calls[3][1] == {"archived": False}
+    assert client.calls[3][1] == {
+        "archived": False,
+        "limit": 100,
+        "sortKey": "updated_at",
+        "sortDirection": "desc",
+        "useStateDbOnly": True,
+    }
     assert [method for method, _, _ in client.calls].count("thread/start") == 1
     assert [method for method, _, _ in client.calls].count("turn/start") == 0
 
@@ -5197,7 +5270,6 @@ def test_characterization_report_preserves_only_sanitized_claude_failure_metrics
     def fail_claude(*args: Any, **kwargs: Any) -> None:
         raise failure
 
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: value
     )
@@ -5215,6 +5287,7 @@ def test_characterization_report_preserves_only_sanitized_claude_failure_metrics
             codex_executable="fake-codex",
             cwd=tmp_path,
             provenance_secret=SECRET,
+            live_tests_enabled=True,
         )
 
     report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
@@ -5246,7 +5319,6 @@ def test_live_characterization_preserves_direct_runtime_argv_prefixes(
     version_calls: list[list[str]] = []
     characterized: dict[str, Any] = {}
 
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module,
         "resolve_cli_executable",
@@ -5279,6 +5351,7 @@ def test_live_characterization_preserves_direct_runtime_argv_prefixes(
         claude_projects_root=tmp_path / "projects",
         cwd=tmp_path,
         provenance_secret=SECRET,
+        live_tests_enabled=True,
     )
 
     assert version_calls == [
@@ -5298,7 +5371,6 @@ def test_live_characterization_guard_blocks_then_binds_exact_codex_id(
     native_id = "019f8621-4d36-7fe0-9419-319ee7ec09dd"
     observations: list[str] = []
 
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: (value,)
     )
@@ -5343,6 +5415,7 @@ def test_live_characterization_guard_blocks_then_binds_exact_codex_id(
         claude_projects_root=tmp_path / "projects",
         cwd=tmp_path,
         provenance_secret=SECRET,
+        live_tests_enabled=True,
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -5360,7 +5433,6 @@ def test_live_characterization_crash_before_codex_id_remains_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     report_root = tmp_path / "reports"
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: (value,)
     )
@@ -5380,6 +5452,7 @@ def test_live_characterization_crash_before_codex_id_remains_blocking(
             claude_projects_root=tmp_path / "projects",
             cwd=tmp_path,
             provenance_secret=SECRET,
+            live_tests_enabled=True,
         )
 
     with pytest.raises(
@@ -5396,7 +5469,6 @@ def test_live_characterization_rejects_tampered_active_codex_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     report_root = tmp_path / "reports"
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: (value,)
     )
@@ -5415,6 +5487,7 @@ def test_live_characterization_rejects_tampered_active_codex_guard(
             claude_projects_root=tmp_path / "projects",
             cwd=tmp_path,
             provenance_secret=SECRET,
+            live_tests_enabled=True,
         )
     [guard] = (report_root / ".codex-origin-guards").glob("*.json")
     guard.write_bytes(guard.read_bytes() + b"tampered")
@@ -5433,7 +5506,6 @@ def test_live_characterization_ambiguous_no_id_keeps_blocking_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     report_root = tmp_path / "reports"
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: (value,)
     )
@@ -5455,6 +5527,7 @@ def test_live_characterization_ambiguous_no_id_keeps_blocking_guard(
             claude_projects_root=tmp_path / "projects",
             cwd=tmp_path,
             provenance_secret=SECRET,
+            live_tests_enabled=True,
         )
 
     report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
@@ -5474,7 +5547,6 @@ def test_live_characterization_success_without_id_is_failed_and_blocking(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     report_root = tmp_path / "reports"
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module, "resolve_cli_executable", lambda value: (value,)
     )
@@ -5492,6 +5564,7 @@ def test_live_characterization_success_without_id_is_failed_and_blocking(
             claude_projects_root=tmp_path / "projects",
             cwd=tmp_path,
             provenance_secret=SECRET,
+            live_tests_enabled=True,
         )
 
     report = json.loads(raised.value.report_path.read_text(encoding="utf-8"))
@@ -5631,7 +5704,6 @@ def test_live_characterization_aborts_before_sessions_when_cli_preflight_fails(
         version_calls.append(list(args))
         return "1.2.3" if "claude.exe" in args[0] else None
 
-    monkeypatch.setenv("HERMES_SESSION_BRIDGE_LIVE_TESTS", "1")
     monkeypatch.setattr(
         characterize_module,
         "resolve_cli_executable",
@@ -5654,6 +5726,7 @@ def test_live_characterization_aborts_before_sessions_when_cli_preflight_fails(
             report_root=tmp_path / "reports",
             claude_projects_root=tmp_path / "projects",
             cwd=tmp_path,
+            live_tests_enabled=True,
         )
 
     assert version_calls == [
