@@ -13331,7 +13331,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # async httpx transports until they hit EMFILE on macOS's default
             # RLIMIT_NOFILE=256.  See #14210.
             try:
-                from agent.auxiliary_client import shutdown_cached_clients
+                from agent.auxiliary_client import (
+                    close_cached_async_clients_for_loop,
+                    shutdown_cached_clients,
+                )
+
+                # This coroutine still owns the gateway loop, so close its
+                # transports here rather than trying to hand work back to the
+                # loop synchronously after it has stopped.
+                await close_cached_async_clients_for_loop()
                 shutdown_cached_clients()
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
