@@ -204,6 +204,7 @@ export const en: Translations = {
     openStarmap: 'Open memory graph',
     enterHud: 'HUD mode',
     exitHud: 'Exit HUD mode',
+    dragHud: 'Drag HUD',
     layoutEditor: 'Layout editor',
     layoutEditorTitle: 'Layout editor — ⌘-click resets the layout'
   },

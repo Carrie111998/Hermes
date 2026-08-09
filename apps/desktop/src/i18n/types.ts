@@ -246,6 +246,7 @@ export interface Translations {
     openStarmap: string
     enterHud: string
     exitHud: string
+    dragHud: string
     layoutEditor: string
     layoutEditorTitle: string
   }

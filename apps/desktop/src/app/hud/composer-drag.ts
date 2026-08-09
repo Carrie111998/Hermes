@@ -1,4 +1,11 @@
-import { type PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from 'react'
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState
+} from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
 
@@ -7,6 +14,7 @@ import { triggerHaptic } from '@/lib/haptics'
 const LONG_PRESS_MS = 140
 /** Slop before the hold is read as a text selection instead of a grab. */
 const MOVE_TOLERANCE = 8
+const KEYBOARD_MOVE_STEP = 12
 
 interface PressState {
   armed: boolean
@@ -18,8 +26,23 @@ interface PressState {
   target: HTMLElement
 }
 
+function arm(state: PressState, setGrabbing: (grabbing: boolean) => void) {
+  state.armed = true
+  setGrabbing(true)
+  triggerHaptic('selection')
+
+  // Capture so the moves keep arriving once the cursor outruns the bar,
+  // and drop the caret so the drag isn't also extending a selection.
+  state.target.setPointerCapture(state.pointerId)
+
+  if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.blur()
+  }
+}
+
 /**
- * HUD-only: press and hold the composer, then drag to move the window.
+ * HUD-only: drag the visible composer grip immediately, or press and hold
+ * anywhere else on the composer before dragging to move the window.
  *
  * The only way to move the HUD. An `-webkit-app-region: drag` handle is the
  * obvious alternative and cannot work here: the window manager takes a drag
@@ -58,6 +81,11 @@ export function useHudComposerDrag(enabled: boolean) {
         return
       }
 
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current)
+        timerRef.current = null
+      }
+
       const target = event.currentTarget
 
       stateRef.current = {
@@ -70,8 +98,16 @@ export function useHudComposerDrag(enabled: boolean) {
         target
       }
 
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current)
+      // The grip is deliberately a normal renderer hit target, rather than an
+      // app-region drag handle: click-through needs these pointer events to
+      // keep the HUD solid under the cursor. Starting there is an explicit move
+      // gesture, so capture immediately instead of making an ordinary drag lose
+      // to the long-press slop.
+      if (event.target instanceof Element && event.target.closest('[data-hud-drag-grip]')) {
+        event.preventDefault()
+        arm(stateRef.current, setGrabbing)
+
+        return
       }
 
       timerRef.current = window.setTimeout(() => {
@@ -81,18 +117,37 @@ export function useHudComposerDrag(enabled: boolean) {
           return
         }
 
-        state.armed = true
-        setGrabbing(true)
-        triggerHaptic('selection')
-
-        // Capture so the moves keep arriving once the cursor outruns the bar,
-        // and drop the caret so the drag isn't also extending a selection.
-        state.target.setPointerCapture(state.pointerId)
-
-        if (document.activeElement instanceof HTMLElement) {
-          document.activeElement.blur()
-        }
+        arm(state, setGrabbing)
       }, LONG_PRESS_MS)
+    },
+    [enabled]
+  )
+
+  const onGripKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLElement>) => {
+      if (!enabled) {
+        return
+      }
+
+      const step = event.shiftKey ? KEYBOARD_MOVE_STEP * 4 : KEYBOARD_MOVE_STEP
+
+      const delta =
+        event.key === 'ArrowLeft'
+          ? { x: -step, y: 0 }
+          : event.key === 'ArrowRight'
+            ? { x: step, y: 0 }
+            : event.key === 'ArrowUp'
+              ? { x: 0, y: -step }
+              : event.key === 'ArrowDown'
+                ? { x: 0, y: step }
+                : null
+
+      if (!delta) {
+        return
+      }
+
+      event.preventDefault()
+      window.hermesDesktop?.hud?.moveBy?.(delta)
     },
     [enabled]
   )
@@ -159,5 +214,5 @@ export function useHudComposerDrag(enabled: boolean) {
 
   useEffect(() => reset, [reset])
 
-  return { grabbing, onPointerDown }
+  return { grabbing, onGripKeyDown, onPointerDown }
 }

@@ -5,6 +5,8 @@ import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, u
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
 import { composerFill, composerFloatingStrip, composerSurfaceGlass } from '@/components/chat/composer-dock'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
+import { Tip } from '@/components/ui/tooltip'
 import { Slot as ContribSlot } from '@/contrib/react/slot'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
@@ -103,7 +105,12 @@ export function ChatBar({
   onTranscribeAudio
 }: ChatBarProps) {
   const hudMode = useStore($hudMode)
-  const { grabbing: hudGrabbing, onPointerDown: onHudDragPointerDown } = useHudComposerDrag(hudMode)
+
+  const {
+    grabbing: hudGrabbing,
+    onGripKeyDown: onHudDragGripKeyDown,
+    onPointerDown: onHudDragPointerDown
+  } = useHudComposerDrag(hudMode)
 
   // Typed stop phrase during an active voice conversation ends it — same
   // semantics as SAYING "stop" (voice-stop-word.ts) or clicking the pill's
@@ -1257,6 +1264,20 @@ export function ChatBar({
                     )}
                   >
                     <div className="flex translate-y-[3px] items-start gap-(--composer-control-gap) self-start [grid-area:menu]">
+                      {hudMode && (
+                        <Tip label={t.titlebar.dragHud}>
+                          <button
+                            aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight"
+                            aria-label={t.titlebar.dragHud}
+                            className="flex size-6 shrink-0 touch-none cursor-grab appearance-none items-center justify-center rounded-md border-0 bg-transparent p-0 text-(--ui-text-tertiary) opacity-70 hover:bg-(--chrome-action-hover) hover:text-(--ui-text-secondary) hover:opacity-100 active:cursor-grabbing"
+                            data-hud-drag-grip
+                            onKeyDown={onHudDragGripKeyDown}
+                            type="button"
+                          >
+                            <Codicon name="gripper" />
+                          </button>
+                        </Tip>
+                      )}
                       {contextMenu}
                       <ContribSlot area={COMPOSER_AREAS.leading} />
                     </div>
