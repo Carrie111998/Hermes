@@ -1457,6 +1457,12 @@ def status(deep: bool = False) -> None:
         print("  hermes gateway install")
 
 
+def _launch_detached_gateway() -> None:
+    """Launch the gateway through the canonical detached Windows path."""
+    pid = _spawn_detached()
+    _report_gateway_start(f"direct spawn (PID {pid})")
+
+
 def start() -> None:
     """Start the gateway using the canonical detached Windows launch path."""
     _assert_windows()
@@ -1486,8 +1492,7 @@ def start() -> None:
     # Manual starts use the same console-less direct spawn path as restart()
     # and install --start-now. Scheduled Task / Startup entries are only login
     # persistence mechanisms.
-    pid = _spawn_detached()
-    _report_gateway_start(f"direct spawn (PID {pid})")
+    _launch_detached_gateway()
 
 
 def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
@@ -1653,10 +1658,9 @@ def restart() -> None:
     """Stop the gateway then start it again.
 
     Waits for the old gateway to be authoritatively gone before relaunching --
-    otherwise ``start()``'s "already running" guard sees the still-draining old
-    process and no-ops, and when that process later exits nothing replaces it (a
-    silent outage). Fails loudly if the process can't be cleared or the relaunch
-    doesn't produce a running gateway.
+    otherwise the replacement process could fail to bind the listening port or
+    race the old process's shutdown. Fails loudly if the process can't be cleared
+    or the relaunch doesn't produce a running gateway.
     """
     _assert_windows()
 
@@ -1673,7 +1677,7 @@ def restart() -> None:
 
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
-    start()
+    _launch_detached_gateway()
 
     if not _wait_for_gateway_ready(timeout_s=15.0):
         raise RuntimeError(

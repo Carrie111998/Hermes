@@ -555,6 +555,76 @@ def test_start_noops_when_gateway_already_running(monkeypatch, capsys):
     assert "27128" in out
 
 
+def test_restart_relaunches_manual_gateway_without_persistence(monkeypatch):
+    """Restarting a manual gateway must not create Windows login persistence."""
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_absent",
+        lambda **kwargs: calls.append(("wait_absent", kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        gateway_windows.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda: calls.append("spawn") or 12345,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_report_gateway_start",
+        lambda via: calls.append(("report_start", via)),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_ready",
+        lambda **kwargs: calls.append(("wait_ready", kwargs)) or [12345],
+    )
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "start",
+        lambda: pytest.fail("restart must launch directly, not call start()"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "install",
+        lambda *args, **kwargs: pytest.fail("restart must not install persistence"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "is_task_registered",
+        lambda: pytest.fail("restart must not query the Scheduled Task"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "is_startup_entry_installed",
+        lambda: pytest.fail("restart must not query the Startup folder"),
+    )
+    monkeypatch.setattr(
+        setup,
+        "prompt_yes_no",
+        lambda *args, **kwargs: pytest.fail("restart must not prompt for install"),
+    )
+
+    gateway_windows.restart()
+
+    assert calls == [
+        "stop",
+        ("wait_absent", {"timeout_s": 30.0}),
+        ("sleep", 1.0),
+        "spawn",
+        ("report_start", "direct spawn (PID 12345)"),
+        ("wait_ready", {"timeout_s": 15.0}),
+    ]
+
+
 def test_install_startup_fallback_does_not_spawn_when_gateway_already_running(monkeypatch, tmp_path, capsys):
     """Repeated Windows fallback installs should not spawn duplicate gateways."""
     script_path, calls = _arrange_startup_fallback(monkeypatch, tmp_path, [24476])
