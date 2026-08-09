@@ -49,6 +49,7 @@ class Incident:
     state: str = "open"
     notification_count: int = 0
     last_notified_at: datetime | None = None
+    suppressed_until: datetime | None = None
     evidence: list[IncidentSignal] = field(default_factory=list)
     history: list[str] = field(default_factory=list)
 

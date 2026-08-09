@@ -13,7 +13,7 @@ class IncidentOpsService:
     def ingest(self, signal: IncidentSignal): return self.correlator.ingest(signal)
     def merge(self, target, source): return self.correlator.merge(target, source)
     def split(self, incident, signal_ids): return self.correlator.split(incident, signal_ids)
-    def suppress(self, fingerprint): return self.correlator.suppress(fingerprint)
+    def suppress(self, fingerprint, until=None): return self.correlator.suppress(fingerprint, until=until)
     def review(self, incident) -> ReviewResult: return self.reviewer.review(incident)
     def notify(self, incident, now: datetime) -> bool: return self.notifier.allow(incident, now)
     def digest(self, period: str, generated_at: datetime): return digest(list(self.correlator.all_incidents()), period=period, generated_at=generated_at)

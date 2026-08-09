@@ -42,6 +42,20 @@ def test_fingerprint_drops_volatile_ids_and_normalizes_uuid():
     base = {"message_id": "one", "session_id": "a", "task_id": "x", "run_id": "r", "request_id": "q", "error": "down", "trace": "550e8400-e29b-41d4-a716-446655440000"}
     changed = {**base, "message_id": "two", "session_id": "b", "task_id": "y", "run_id": "s", "request_id": "z", "trace": "123e4567-e89b-12d3-a456-426614174000"}
     assert incident_fingerprint("x", base, collector="logs") == incident_fingerprint("x", changed, collector="logs")
+    assert incident_fingerprint("x", {"error": "failed 550e8400-e29b-41d4-a716-446655440000"}) == incident_fingerprint("x", {"error": "failed 123e4567-e89b-12d3-a456-426614174000"})
+
+
+def test_signal_and_split_budgets_fail_closed():
+    now = datetime.now(timezone.utc)
+    service = IncidentOpsService(max_history=1, max_incidents=1)
+    service.ingest(sig(now, "one"))
+    with pytest.raises(RuntimeError, match="signal id budget"):
+        service.ingest(sig(now + timedelta(seconds=1), "two"))
+    roomy = IncidentOpsService(max_history=10, max_incidents=1)
+    incident = roomy.ingest(sig(now, "one"))
+    roomy.ingest(sig(now + timedelta(seconds=1), "two"))
+    with pytest.raises(RuntimeError, match="incident budget"):
+        roomy.split(incident, {incident.evidence[0].signal_id})
 
 
 def test_split_merge_suppress_keep_public_history_and_rebind_seen():
@@ -55,9 +69,21 @@ def test_split_merge_suppress_keep_public_history_and_rebind_seen():
     service.correlator.merge(second, child)
     assert child not in service.correlator.incidents()
     assert service.ingest(child.evidence[0]) is second
-    suppressed = service.correlator.suppress(second.fingerprint)
+    suppressed = service.correlator.suppress(second.fingerprint, until=now + timedelta(hours=1))
     assert suppressed.state == "suppressed" and any("suppressed" in item for item in suppressed.history)
-    assert len(service.digest("daily", now)["incidents"]) >= 2
+    reopened = service.ingest(sig(now + timedelta(hours=2), "b", payload={"command_fingerprint": "sha256:" + "a" * 64, "state": "failed"}))
+    assert reopened is suppressed and reopened.state == "reopened"
+    assert len(service.digest("daily", now)["incidents"]) == 1
+
+
+def test_merge_marks_source_and_excludes_it_from_digest():
+    now = datetime.now(timezone.utc)
+    service = IncidentOpsService()
+    target = service.ingest(sig(now, "a"))
+    source = service.ingest(sig(now, "b", payload={"command_fingerprint": "sha256:" + "c" * 64, "state": "failed"}))
+    service.merge(target, source)
+    assert source.state == "merged"
+    assert source.fingerprint not in {item["fingerprint"] for item in service.digest("daily", now)["incidents"]}
 
 
 def test_dashboard_auth_expiry_and_direct_reads_fail_closed():
@@ -72,6 +98,8 @@ def test_dashboard_auth_expiry_and_direct_reads_fail_closed():
         dash.manifest()
     with pytest.raises(PermissionError):
         dash.incidents()
+    with pytest.raises(ValueError):
+        ReadOnlyDashboard([incident], token_hash=hashlib.sha256(b"short").hexdigest(), issued_at=now, expiry=now + timedelta(days=365))
 
 
 def test_review_schema_rejects_unsafe_types_and_degraded_actions():
