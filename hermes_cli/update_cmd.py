@@ -889,6 +889,7 @@ def _update_via_zip(args):
             f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
         )
     _m()._record_bytecode_fingerprint()
+    _m()._refresh_bootstrap_cache_scripts(branch)
 
     # Reinstall Python dependencies. Prefer .[all], but if one optional extra
     # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -3101,17 +3102,33 @@ def _orphaned_desktop_backend_pids(
     - its supervising parent is demonstrably gone: the parent PID no longer
       exists, or the PID was reused (parent created *after* the child).
 
-    A backend whose parent is alive (the Desktop is still open) disqualifies
-    the whole set — the guard must keep refusing exactly as before. Returns
-    ``None`` in that case, or when any holder is not a backend, or when
-    psutil is unavailable (can't prove orphanhood → refuse). Never raises.
+    Tree-aware: the scanner can return an orphaned backend AND one of its
+    managed-runtime descendants (the ``.hermes-runtime`` interpreter child)
+    in the same holder set. That descendant has a live parent — the orphaned
+    backend itself — and isn't a ``serve`` cmdline, so per-process rules
+    would refuse a set that is entirely safe to reap. Holders that sit
+    inside an accepted orphan root's tree are therefore folded into that
+    root (only roots are returned; ``taskkill /T`` reaps the descendants).
+
+    Any other live-parent backend (the Desktop is still open), non-backend
+    holder outside an orphan tree, or unprovable case disqualifies the whole
+    set — the guard must keep refusing exactly as before. Returns ``None``
+    in that case, or when psutil is unavailable (can't prove orphanhood →
+    refuse). Never raises.
     """
     try:
         import psutil  # type: ignore
     except Exception:
         return None
 
-    pids: list[int] = []
+    def _is_backend(argv_low: str) -> bool:
+        return "hermes_cli.main" in argv_low and (
+            " serve" in argv_low or " dashboard" in argv_low
+        )
+
+    # Pass 1: find orphaned backend ROOTS among the holders.
+    roots: list[int] = []
+    remaining: list[tuple[int, str]] = []  # (pid, argv_low) still to justify
     for pid, _name, cmdline in matches:
         argv = cmdline
         try:
@@ -3123,10 +3140,9 @@ def _orphaned_desktop_backend_pids(
         except Exception:
             pass
         low = argv.lower()
-        if "hermes_cli.main" not in low or not (
-            " serve" in low or " dashboard" in low
-        ):
-            return None
+        if not _is_backend(low):
+            remaining.append((int(pid), low))
+            continue
         try:
             proc = psutil.Process(int(pid))
             ppid = proc.ppid()
@@ -3135,13 +3151,36 @@ def _orphaned_desktop_backend_pids(
                 # PID-reuse check: a "parent" created after its child is a
                 # recycled PID, not the real (dead) supervisor.
                 if parent.create_time() <= proc.create_time():
-                    return None
+                    # Live parent — NOT a root. But it may still be a
+                    # descendant of an orphan root: the venv python.exe is
+                    # a trampoline that re-execs the uv-managed interpreter
+                    # with the SAME backend argv, so the worker half of the
+                    # two-process chain lands here. Defer to pass 2 instead
+                    # of refusing outright.
+                    remaining.append((int(pid), low))
+                    continue
         except psutil.NoSuchProcess:
             pass  # parent gone → orphan
         except Exception:
             return None
-        pids.append(int(pid))
-    return pids
+        roots.append(int(pid))
+
+    # Pass 2: every non-backend holder must be a descendant of an accepted
+    # orphan root — then it dies with the root's tree reap. Anything else
+    # (operator REPL, stray script) keeps the refusal.
+    root_set = set(roots)
+    for pid, _low in remaining:
+        if not root_set:
+            return None
+        try:
+            ancestors = {int(a.pid) for a in psutil.Process(pid).parents()}
+        except psutil.NoSuchProcess:
+            continue  # exited already
+        except Exception:
+            return None
+        if not (ancestors & root_set):
+            return None
+    return roots
 
 
 def _stop_process_trees(pids: list[int]) -> None:
@@ -3435,6 +3474,84 @@ def _refresh_windows_gateway_launchers() -> None:
         print("  ✓ Refreshed Windows gateway launcher scripts")
     except Exception as exc:
         logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
+
+def _refresh_bootstrap_cache_scripts(branch: str = "main") -> None:
+    """Sync the installer's bootstrap-cache scripts from the fresh checkout.
+
+    The Desktop GUI updater (``hermes-setup.exe``) executes
+    ``$HERMES_HOME/bootstrap-cache/install-<ref>.ps1`` (or ``.sh``) for its
+    repair/bootstrap stages. Installer binaries built before the #67193
+    cache-refresh fix (June 2026 and earlier) NEVER re-download a cached
+    branch-ref script — ``install-main.ps1`` cached at install time is
+    reused forever, executing months-stale code with long-fixed bugs (the
+    2026-08-09 incident: a June 4 cached script's venv stage lacked the
+    #81327 process-tree sweep and died on ``Access denied``). The binary
+    has no self-update path, so the poisoned cache outlives every
+    ``hermes update``.
+
+    Overwriting the cached script for *branch* with the freshly pulled
+    ``scripts/install.ps1`` / ``scripts/install.sh`` on every update turns
+    the stale binary's unconditional reuse into a feature: it "reuses" a
+    file this function keeps permanently current. Post-#67193 installers
+    re-download on each run anyway, so for them this is a harmless
+    pre-seed of the same bytes.
+
+    Scope guards, mirroring ``install_script.rs``:
+
+    - Only the cache key for the update-target *branch* is rewritten
+      (``sanitize_ref``: non ``[A-Za-z0-9._-]`` chars become ``_``, so
+      ``bb/gui`` → ``install-bb_gui.ps1``). Sibling mutable refs cache
+      DIFFERENT branches' scripts — updating main must not clobber
+      ``install-bb_gui.ps1`` with main's script.
+    - Commit-SHA pins are immutable by design and never touched. The
+      installer's ``is_valid_commit()`` accepts **7–40** hex chars, so an
+      abbreviated pin like ``install-4ce1994.ps1`` is just as immutable as
+      a full 40-hex one; the sanitized *branch* is additionally required
+      to not itself look like a commit pin (defense in depth against a
+      caller passing a SHA as the branch).
+
+    The .ps1 copy gets a UTF-8 BOM to match the installer's cache format
+    (#67193 encoding fix). Best-effort: a failed refresh must never fail
+    the update.
+    """
+    try:
+        import re as _re
+
+        cache_dir = Path(_m().get_hermes_home()) / "bootstrap-cache"
+        if not cache_dir.is_dir():
+            return
+        # Mirror install_script.rs::sanitize_ref().
+        safe_ref = _re.sub(r"[^A-Za-z0-9._-]", "_", str(branch or "main"))
+        # Mirror install_script.rs::is_valid_commit(): 7-40 hex chars is an
+        # immutable commit pin — abbreviated SHAs included. Never rewrite.
+        if _re.fullmatch(r"[0-9a-fA-F]{7,40}", safe_ref):
+            return
+        refreshed = []
+        for kind, src_name in (("ps1", "install.ps1"), ("sh", "install.sh")):
+            src = _m().PROJECT_ROOT / "scripts" / src_name
+            if not src.is_file():
+                continue
+            cached = cache_dir / f"install-{safe_ref}.{kind}"
+            if not cached.is_file():
+                continue  # this ref was never bootstrap-cached — nothing to heal
+            data = src.read_bytes()
+            if kind == "ps1" and not data.startswith(b"\xef\xbb\xbf"):
+                # Match the installer's cache format: PowerShell needs the
+                # UTF-8 BOM or localized/em-dash text mis-decodes (#67193).
+                data = b"\xef\xbb\xbf" + data
+            if cached.read_bytes() == data:
+                continue  # already current
+            tmp = cached.with_suffix(cached.suffix + ".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, cached)
+            refreshed.append(cached.name)
+        if refreshed:
+            print(
+                "  ✓ Refreshed installer bootstrap-cache script(s): "
+                + ", ".join(sorted(refreshed))
+            )
+    except Exception as exc:
+        logger.debug("Could not refresh bootstrap-cache scripts after update: %s", exc)
 
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
@@ -4188,6 +4305,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
         _m()._record_bytecode_fingerprint()
+        _m()._refresh_bootstrap_cache_scripts(branch)
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
@@ -4277,6 +4395,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
         _m()._record_bytecode_fingerprint()
+        _m()._refresh_bootstrap_cache_scripts(branch)
         _m()._reload_updated_runtime_modules()
 
         # Upgrade pip before lazy refreshes — stale pip can fail source builds
