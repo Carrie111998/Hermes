@@ -125,6 +125,52 @@ class TestOneShotActionApproval:
             "context": None,
         }
 
+    def test_cli_path_offers_only_once_or_decline(self, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        observed = {}
+
+        def prompt(*args, **kwargs):
+            observed.update(kwargs)
+            return "session"
+
+        monkeypatch.setattr(approval_module, "prompt_dangerous_approval", prompt)
+        assert request_action_approval(
+            "Grant access", "Exact plan", timeout_seconds=17,
+        ) == {"decision": "decline", "context": None}
+        assert observed["allow_permanent"] is False
+        assert observed["allow_session"] is False
+        assert observed["timeout_seconds"] == 17
+
+    def test_gateway_honors_action_specific_timeout(self, monkeypatch):
+        session_key = "action-specific-timeout"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        approval_module._gateway_queues.clear()
+        approval_module._gateway_notify_cbs.clear()
+        approval_module.register_gateway_notify(session_key, lambda data: None)
+        started = time.monotonic()
+        try:
+            result = request_action_approval(
+                "Grant access", "Exact plan", timeout_seconds=0.02,
+            )
+        finally:
+            approval_module.unregister_gateway_notify(session_key)
+        assert result == {"decision": "timeout", "context": None}
+        assert time.monotonic() - started < 0.5
+
+    def test_raw_prompt_rejects_session_when_session_is_disabled(self, monkeypatch, capsys):
+        monkeypatch.setattr("builtins.input", lambda _prompt="": "session")
+        assert prompt_dangerous_approval(
+            "grant exact access",
+            "one-shot action",
+            timeout_seconds=1,
+            allow_permanent=False,
+            allow_session=False,
+        ) == "deny"
+        rendered = capsys.readouterr().out.lower()
+        assert "[s]ession" not in rendered
+
 
 class TestSmartApproval:
     def test_smart_approval_uses_call_llm(self):

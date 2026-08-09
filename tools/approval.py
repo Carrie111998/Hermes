@@ -2737,13 +2737,17 @@ def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
                               approval_callback=None,
-                              *, smart_denied: bool = False) -> str:
+                              *, smart_denied: bool = False,
+                              allow_session: bool = True) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
 
     Args:
         allow_permanent: When False, hide the [a]lways option (used when
             tirith warnings are present, since broad permanent allowlisting
             is inappropriate for content-level security findings).
+        allow_session: When False, offer only one-operation approval or denial.
+            This is the action-approval contract; it must never imply a wider
+            session grant.
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
         approval_callback: Optional callback registered by the CLI for
@@ -2772,6 +2776,7 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_permanent,
             approval_callback,
             smart_denied=smart_denied,
+            allow_session=allow_session,
         )
 
 
@@ -2779,7 +2784,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                                      timeout_seconds: int,
                                      allow_permanent: bool = True,
                                      approval_callback=None,
-                                     *, smart_denied: bool = False) -> str:
+                                     *, smart_denied: bool = False,
+                                     allow_session: bool = True) -> str:
     # Redact secrets before any user-visible rendering. The original
     # `command` is still what executes after approval; only the displayed
     # copy is scrubbed. Reuses the same redaction module used for memory
@@ -2791,6 +2797,8 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
     if approval_callback is not None:
         try:
             callback_kwargs = {"allow_permanent": allow_permanent}
+            if not allow_session:
+                callback_kwargs["allow_session"] = False
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
             return approval_callback(
@@ -2837,7 +2845,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
             print(f"  {t('approval.dangerous_header', description=display_description)}")
             print(f"      {display_command}")
             print()
-            if smart_denied:
+            if smart_denied or not allow_session:
                 print(t("approval.choose_smart_deny"))
             elif allow_permanent:
                 print(t("approval.choose_long"))
@@ -2850,7 +2858,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
 
             def get_input():
                 try:
-                    if smart_denied:
+                    if smart_denied or not allow_session:
                         prompt = t("approval.prompt_smart_deny")
                     else:
                         prompt = t("approval.prompt_long") if allow_permanent else t("approval.prompt_short")
@@ -2870,7 +2878,7 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                 return "timeout"
 
             choice = result["choice"]
-            if smart_denied:
+            if smart_denied or not allow_session:
                 choice_map = {
                     **{
                         value: "once"
@@ -3629,7 +3637,8 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway",
+                            timeout_seconds: int | None = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3695,7 +3704,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
+    timeout = _get_approval_timeout() if timeout_seconds is None else timeout_seconds
 
     try:
         from tools.environments.base import touch_activity_if_due
@@ -4574,7 +4583,11 @@ def request_action_approval(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
             logger.error("Action approval gateway dispatch failed: %s", exc, exc_info=True)
@@ -4594,6 +4607,7 @@ def request_action_approval(
             clean_title,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            allow_session=False,
         )
     except Exception as exc:
         logger.error("Action approval CLI prompt failed: %s", exc, exc_info=True)
@@ -4601,7 +4615,7 @@ def request_action_approval(
     if choice == "timeout":
         return {"decision": "timeout", "context": None}
     return {
-        "decision": "approve" if choice in ("once", "session", "always") else "decline",
+        "decision": "approve" if choice == "once" else "decline",
         "context": None,
     }
 
