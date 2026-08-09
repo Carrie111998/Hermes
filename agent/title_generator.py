@@ -144,6 +144,41 @@ _MACHINE_PREFIXES = (
     "[System: The active model for this chat has changed to ",
 )
 
+# Image-attachment envelopes that gateway/CLI image enrichment prepends to
+# the user's message. They embed the vision model's reading of the image —
+# which can be a misclassification (an IME candidate popup described as a
+# browser search bar) or text copied from the screenshot (a previous
+# session's title). Titling from them names the session after the vision
+# model's guess, not after what the user actually asked. Two call sites
+# produce slightly different wording, so the matcher keys on the shared
+# ``[The user attached an image`` prefix and consumes the bracketed block
+# plus any trailing ``[hint]`` line, rather than hardcoding one phrase:
+#   tui_gateway/server.py:  "[The user attached an image:\n<desc>]\n[hint]"
+#   cli.py:                 "[The user attached an image. Here's what it
+#                            contains:\n<desc>]\n[hint]"
+# Failure variants ("...but analysis failed.") are matched by the same rule.
+_IMAGE_ENVELOPE_RE = re.compile(
+    r"\[\s*The user attached an image[^\]]*\]"
+    r"(?:\s*\[[^\]]*\])?",
+    re.DOTALL,
+)
+
+def _strip_image_envelope(text: str) -> str:
+    """Remove leading image-attachment envelopes prepended by enrichment.
+
+    Only consumes envelopes at the very start of the message (that is where
+    ``_enrich_with_attached_images`` and the CLI enrichment put them), so a
+    user who literally types ``[The user attached an image ...]`` mid-sentence
+    keeps their text. Repeated blocks (multiple images) are all removed.
+    """
+    stripped = (text or "").lstrip()
+    while True:
+        m = _IMAGE_ENVELOPE_RE.match(stripped)
+        if not m:
+            break
+        stripped = stripped[m.end():].lstrip()
+    return stripped
+
 
 def _title_language() -> str:
     """Return configured title language, or empty string to match the user."""
@@ -219,6 +254,11 @@ def _summarize_user_message(user_message: str) -> str:
     after the user's request. Reuse the canonical scaffolding parser so the
     model sees ``/work — fix the title leak`` instead, then strip any control
     wrappers left around it.
+
+    Image-attachment envelopes (vision descriptions prepended by
+    ``_enrich_with_attached_images`` and the CLI image enrichment) are removed
+    first, so a screenshot that the vision model misreads — or whose visible
+    text it echoes — never becomes the session title (#82339).
     """
     if not user_message:
         return ""
@@ -230,7 +270,7 @@ def _summarize_user_message(user_message: str) -> str:
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
     text = described if described is not None else user_message
-    return strip_control_wrappers(text)
+    return strip_control_wrappers(_strip_image_envelope(text))
 
 
 def is_titleable_user_message(user_message: str) -> bool:

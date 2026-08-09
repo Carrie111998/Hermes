@@ -9,6 +9,7 @@ from agent.title_generator import (
     auto_title_session,
     maybe_auto_title,
     _title_language,
+    _strip_image_envelope,
 )
 from hermes_state import SessionDB
 
@@ -372,6 +373,94 @@ class TestMaybeAutoTitle:
 
 
 
+
+
+class TestImageEnvelopeStripping:
+    """#82339: titling must never be poisoned by the vision description that
+    gateway/CLI image enrichment prepends to the user's message."""
+
+    def test_strips_tui_gateway_envelope(self):
+        msg = (
+            "[The user attached an image:\n"
+            "A close-up view of a browser's search or address bar with a list "
+            "of autocomplete suggestions.\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "小狼毫输入法候选词排序问题"
+        )
+        assert _strip_image_envelope(msg) == "小狼毫输入法候选词排序问题"
+
+    def test_strips_cli_envelope(self):
+        msg = (
+            "[The user attached an image. Here's what it contains:\n"
+            "The desktop app interface showing a sidebar with a session titled "
+            "'修复搜索自动补全下拉'.\n"
+            "]\n"
+            "[If you need a closer look, use vision_analyze with image_url: /tmp/x.png]\n"
+            "Rime 候选词排序问题"
+        )
+        assert _strip_image_envelope(msg) == "Rime 候选词排序问题"
+
+    def test_strips_analysis_failed_variants(self):
+        tui_fail = (
+            "[The user attached an image but analysis failed.]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "What is this?"
+        )
+        assert _strip_image_envelope(tui_fail) == "What is this?"
+        cli_fail = (
+            "[The user attached an image but it couldn't be analyzed. You can "
+            "try examining it with vision_analyze using image_url: /tmp/x.png]\n"
+            "What is this?"
+        )
+        assert _strip_image_envelope(cli_fail) == "What is this?"
+
+    def test_strips_multiple_images(self):
+        msg = (
+            "[The user attached an image:\nfirst screenshot\n]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/a.png]\n\n"
+            "[The user attached an image:\nsecond screenshot\n]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/b.png]\n\n"
+            "Fix the login flow"
+        )
+        assert _strip_image_envelope(msg) == "Fix the login flow"
+
+    def test_keeps_user_text_that_mentions_images_mid_sentence(self):
+        # A user who literally types about an image (not an enrichment envelope
+        # at the start of the message) must keep their text.
+        msg = "I took a screenshot of [The user attached an image bug] earlier"
+        assert _strip_image_envelope(msg) == msg
+
+    def test_keeps_image_ref_directive(self):
+        # The persisted @image:<path> form is not descriptive and must survive.
+        msg = "@image:/tmp/x.png 修复输入法候选词排序"
+        assert _strip_image_envelope(msg) == msg
+
+    def test_derive_title_not_poisoned_by_envelope(self):
+        from agent.title_generator import derive_title
+
+        enriched = (
+            "[The user attached an image:\n"
+            "A close-up view of a browser's search bar.\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "小狼毫输入法候选词排序问题"
+        )
+        assert derive_title(enriched) == "小狼毫输入法候选词排序问题"
+        assert derive_title("小狼毫输入法候选词排序问题") == "小狼毫输入法候选词排序问题"
+
+    def test_is_titleable_user_message_true_with_envelope(self):
+        # The enriched message still carries user intent underneath the
+        # envelope: it must remain titleable (the envelope alone is not the
+        # reason to skip titling).
+        from agent.title_generator import is_titleable_user_message
+
+        enriched = (
+            "[The user attached an image:\nsome description\n]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "小狼毫输入法候选词排序问题"
+        )
+        assert is_titleable_user_message(enriched) is True
 
 
 class TestAutoTitleDuplicateHandling:
