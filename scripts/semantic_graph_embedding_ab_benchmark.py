@@ -246,8 +246,10 @@ def run_variant(
             )
             latencies["dense_scan_ms"].append((time.perf_counter() - dense_started) * 1000)
             rrf_started = time.perf_counter()
+            eligible_ids = {row["node_id"] for row in eligible}
+            lexical_safe = [row for row in lexical if row["node_id"] in eligible_ids]
             fused = reciprocal_rank_fusion(
-                lexical_ids=[row["node_id"] for row in lexical],
+                lexical_ids=[row["node_id"] for row in lexical_safe],
                 dense_ids=[row["node_id"] for row in dense_rows],
                 k=RRF_K,
                 dense_similarities={row["node_id"]: row["similarity"] for row in dense_rows},
