@@ -5,13 +5,14 @@
 ### Draft Model Approach
 
 ```bash
-# Use smaller model as draft for faster generation
-./llama-speculative \
+# Use smaller model as draft for faster generation (no separate llama-speculative binary;
+# speculative decoding runs via the existing llama-cli / llama-server with --model-draft / -md)
+llama-cli \
     -m large-model-q4_k_m.gguf \
     -md draft-model-q4_k_m.gguf \
     -p "Write a story about AI" \
     -n 500 \
-    --draft 8  # Draft tokens before verification
+    --spec-draft-n-max 8  # number of draft tokens to propose before verification (default 3)
 ```
 
 ### Self-Speculative Decoding
@@ -483,16 +484,17 @@ llm = Llama(
 ### Build with All Optimizations
 
 ```bash
-# Clean build with all CPU optimizations
-make clean
-LLAMA_OPENBLAS=1 LLAMA_BLAS_VENDOR=OpenBLAS make -j
+# Clean build with all CPU optimizations (CMake; the old Makefile build is deprecated upstream)
+cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 
-# With CUDA and cuBLAS
-make clean
-GGML_CUDA=1 LLAMA_CUBLAS=1 make -j
+# With CUDA
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 
-# With specific CUDA architecture
-GGML_CUDA=1 CUDA_DOCKER_ARCH=sm_86 make -j
+# With specific CUDA architecture (numeric compute capability, e.g. 86 = sm_86)
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 ```
 
 ### CMake Build

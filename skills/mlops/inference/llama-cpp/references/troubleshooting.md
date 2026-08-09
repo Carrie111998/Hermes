@@ -24,7 +24,8 @@ sudo apt install nvidia-cuda-toolkit
 # Or set CUDA path
 export CUDA_PATH=/usr/local/cuda
 export PATH=$CUDA_PATH/bin:$PATH
-make GGML_CUDA=1
+cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 ```
 
 ### Python Bindings Issues
@@ -359,9 +360,9 @@ response = client.chat.completions.create(
 
 **Fix**:
 ```bash
-# Rebuild with Metal
-make clean
-make GGML_METAL=1
+# Rebuild with Metal (CMake; Makefile build is deprecated upstream)
+cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 
 # Python bindings
 CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python --force-reinstall
