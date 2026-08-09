@@ -11,7 +11,7 @@ export type EmbedRenderer = 'frame' | 'tweet'
 interface EmbedLayout {
   /** Frame aspect ratio (width / height). For video/maps. */
   aspectRatio?: number
-  /** Fixed pixel height for non-ratio embeds (Instagram, Pinterest, Spotify). */
+  /** Fixed outer pixel height for non-ratio embeds (Instagram, Pinterest, Spotify). */
   height?: number
   /** Max rendered width in px; falls back to the conversation column. */
   maxWidth?: number
@@ -35,7 +35,7 @@ export interface FrameEmbed extends BaseEmbed {
   renderer: 'frame'
 }
 
-/** Twitter/X ships no iframe URL — only a widget script (see social-embed.tsx). */
+/** Twitter/X has no fixed iframe URL, so it renders as a safe explicit link card. */
 export interface TweetEmbed extends BaseEmbed {
   renderer: 'tweet'
   tweetId: string

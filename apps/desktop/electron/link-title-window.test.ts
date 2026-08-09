@@ -10,13 +10,16 @@ import {
 } from './link-title-window'
 
 function makeFakeBrowserWindow() {
-  const calls = { audioMuted: [] }
+  const calls = { audioMuted: [], windowOpenHandlers: [] }
 
   const FakeBrowserWindow = function (options) {
     this.options = options
     this.webContents = {
       setAudioMuted(value) {
         calls.audioMuted.push(value)
+      },
+      setWindowOpenHandler(handler) {
+        calls.windowOpenHandlers.push(handler)
       }
     }
   }
@@ -47,10 +50,20 @@ test('createLinkTitleWindow mutes audio so historical links never autoplay sound
   assert.deepEqual(calls.audioMuted, [true])
 })
 
+test('createLinkTitleWindow denies popup creation from fetched pages', () => {
+  const { FakeBrowserWindow, calls } = makeFakeBrowserWindow()
+
+  createLinkTitleWindow(FakeBrowserWindow, { id: 'link-titles' })
+
+  assert.equal(calls.windowOpenHandlers.length, 1)
+  assert.deepEqual(calls.windowOpenHandlers[0]({ url: 'https://attacker.example/popup' }), { action: 'deny' })
+})
+
 test('createLinkTitleWindow still returns the window if muting throws', () => {
   const ThrowingBrowserWindow = function (options) {
     this.options = options
     this.webContents = {
+      setWindowOpenHandler() {},
       setAudioMuted() {
         throw new Error('webContents unavailable')
       }

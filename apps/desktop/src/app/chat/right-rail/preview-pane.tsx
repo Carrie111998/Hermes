@@ -168,6 +168,16 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const previewLabel =
     target.label && target.label.replace(/\/$/, '') !== currentLabel.replace(/\/$/, '') ? target.label : currentLabel
 
+  const openHeaderTarget = useCallback(() => {
+    // Remote HTML must keep the original target so openPreviewTargetInBrowser
+    // can stage its validated data URL. Ordinary previews, however, may have
+    // navigated within the local webview; open exactly the URL currently shown
+    // instead of falling back to the stale tab target.
+    const browserTarget = isRemoteHtmlTarget ? target : { ...target, url: currentUrl }
+
+    void openPreviewTargetInBrowser(browserTarget).catch(error => notifyError(error, t.preview.unavailable))
+  }, [currentUrl, isRemoteHtmlTarget, t.preview.unavailable, target])
+
   const restartingServer =
     previewServerRestart?.status === 'running' &&
     (previewServerRestart.url === target.url || previewServerRestart.url === currentUrl)
@@ -659,20 +669,24 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           <div className="pointer-events-none flex min-h-(--titlebar-height) items-center gap-1.5 border-b border-border/60 bg-background px-2 py-1">
             <div className="min-w-0 flex-1">
               <Tip label={copy.openTarget(currentUrl)}>
-                <a
-                  className="pointer-events-auto inline max-w-full truncate text-left text-xs font-medium text-foreground underline-offset-4 decoration-current/20 transition-colors hover:text-primary hover:underline"
-                  href={isRemoteHtmlTarget ? undefined : currentUrl}
-                  onClick={event => {
-                    if (isRemoteHtmlTarget) {
-                      event.preventDefault()
-                      void openPreviewTargetInBrowser(target).catch(error => notifyError(error, t.preview.unavailable))
+                <button
+                  className="pointer-events-auto inline max-w-full truncate border-0 bg-transparent p-0 text-left text-xs font-medium text-foreground underline-offset-4 decoration-current/20 transition-colors hover:text-primary hover:underline"
+                  onAuxClick={event => {
+                    if (event.button !== 1) {
+                      return
                     }
+
+                    event.preventDefault()
+                    openHeaderTarget()
                   }}
-                  rel="noreferrer"
-                  target={isRemoteHtmlTarget ? undefined : '_blank'}
+                  onClick={event => {
+                    event.preventDefault()
+                    openHeaderTarget()
+                  }}
+                  type="button"
                 >
                   {previewLabel || copy.fallbackTitle}
-                </a>
+                </button>
               </Tip>
             </div>
           </div>

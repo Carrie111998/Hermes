@@ -5,6 +5,7 @@ import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
+import { openExternalLink } from '@/lib/external-link'
 import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
@@ -156,9 +157,17 @@ export function AboutSettings() {
             <Button asChild className="ml-auto" size="sm" variant="text">
               <a
                 href={RELEASE_NOTES_URL}
+                onAuxClick={event => {
+                  if (event.button !== 1) {
+                    return
+                  }
+
+                  event.preventDefault()
+                  openExternalLink(RELEASE_NOTES_URL)
+                }}
                 onClick={event => {
                   event.preventDefault()
-                  void window.hermesDesktop?.openExternal?.(RELEASE_NOTES_URL)
+                  openExternalLink(RELEASE_NOTES_URL)
                 }}
                 rel="noreferrer"
                 target="_blank"

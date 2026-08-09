@@ -144,11 +144,98 @@ describe('PreviewPane console state', () => {
     })
 
     expect(rendered.container.querySelector('iframe')).toBeNull()
-    const sourceLink = rendered.container.querySelector('a')
+    const sourceButton = rendered.container.querySelector('button')
 
-    expect(sourceLink?.getAttribute('href')).toBeNull()
-    expect(sourceLink?.getAttribute('target')).toBeNull()
-    expect(fireEvent.click(sourceLink!)).toBe(false)
+    expect(sourceButton?.getAttribute('type')).toBe('button')
+    sourceButton?.focus()
+    expect(document.activeElement).toBe(sourceButton)
+    expect(fireEvent.click(sourceButton!)).toBe(false)
+  })
+
+  it('opens the current localhost preview through the desktop bridge', async () => {
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    window.hermesDesktop = { openPreviewInBrowser } as never
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const button = rendered.container.querySelector('button')
+
+    expect(button?.getAttribute('type')).toBe('button')
+    button?.focus()
+    expect(document.activeElement).toBe(button)
+    expect(fireEvent.click(button!)).toBe(false)
+    await waitFor(() => expect(openPreviewInBrowser).toHaveBeenCalledWith('http://localhost:5174'))
+  })
+
+  it('opens a local file through the desktop bridge and handles middle-click', async () => {
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    const readFileText = vi.fn(async () => ({ path: '/tmp/report.txt', text: 'report' }))
+    window.hermesDesktop = { openPreviewInBrowser, readFileText } as never
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{
+            kind: 'file',
+            label: 'report.txt',
+            path: '/tmp/report.txt',
+            previewKind: 'text',
+            source: '/tmp/report.txt',
+            url: 'file:///tmp/report.txt'
+          }}
+        />
+      )
+    })
+
+    const button = rendered.container.querySelector('button')
+
+    expect(button?.getAttribute('type')).toBe('button')
+    expect(fireEvent(button!, new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 }))).toBe(false)
+    await waitFor(() => expect(openPreviewInBrowser).toHaveBeenCalledWith('file:///tmp/report.txt'))
+  })
+
+  it('opens the navigated preview URL rather than the original target', async () => {
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    window.hermesDesktop = { openPreviewInBrowser } as never
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview')
+    const button = rendered.container.querySelector('button')
+
+    expect(webview).not.toBeNull()
+    act(() => {
+      webview?.dispatchEvent(Object.assign(new Event('did-navigate'), { url: 'http://localhost:5174/dashboard' }))
+    })
+
+    expect(button?.getAttribute('type')).toBe('button')
+    expect(fireEvent.click(button!)).toBe(false)
+    await waitFor(() => expect(openPreviewInBrowser).toHaveBeenCalledWith('http://localhost:5174/dashboard'))
   })
 
   it('renders PDF targets in an embedded viewer', async () => {

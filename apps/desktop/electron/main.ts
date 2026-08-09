@@ -218,7 +218,13 @@ import {
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
+import {
+  enforcePreviewWebviewPolicy,
+  installPreviewWebviewNavigationGuard,
+  isAllowedPreviewWebviewUrl
+} from './webview-guard'
 import { readWindowBelow } from './window-below'
+import { installWindowOpenDenyGuard } from './window-open-guard'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -5010,6 +5016,39 @@ async function previewFileTarget(rawTarget, baseDir) {
   }
 }
 
+/**
+ * The normal preview policy accepts local files with an empty URL host. On
+ * Windows, pathToFileURL intentionally emits `file://server/share/...` for a
+ * validated UNC file. Keep that compatibility path narrow: the URL must be
+ * a Windows UNC shape, resolve through the existing IPC path normalizer, name
+ * an existing regular file, and round-trip byte-for-byte through Node's
+ * canonical pathToFileURL helper. This prevents arbitrary file authorities
+ * from becoming an attachment policy just because they have a hostname.
+ */
+function isValidatedPreviewWebviewUrl(rawUrl) {
+  const exactRawUrl = String(rawUrl || '')
+
+  if (isAllowedPreviewWebviewUrl(exactRawUrl)) {
+    return true
+  }
+
+  if (!IS_WINDOWS || !isAllowedPreviewWebviewUrl(exactRawUrl, { allowWindowsUnc: true })) {
+    return false
+  }
+
+  try {
+    new URL(exactRawUrl)
+    const resolved = resolveRequestedPathForIpc(exactRawUrl, { purpose: 'Preview webview' })
+
+    // Compare with the exact source URL Electron will load. URL's
+    // serializer can normalize spelling (for example, escaping or casing),
+    // which must not turn a non-canonical UNC request into an allowed one.
+    return fileExists(resolved) && pathToFileURL(resolved).toString() === exactRawUrl
+  } catch {
+    return false
+  }
+}
+
 function previewUrlTarget(rawTarget) {
   const raw = String(rawTarget || '').trim()
   const url = new URL(raw)
@@ -8829,10 +8868,21 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   }
 
   installContextMenu(win)
-  win.webContents.setWindowOpenHandler(details => {
-    openExternalUrl(details.url)
-
-    return { action: 'deny' }
+  // Popup requests are untrusted renderer content. Denying them must not also
+  // dispatch the requested URL to the OS; explicit app links use the validated
+  // Desktop bridge and the preview header uses openPreviewInBrowser instead.
+  installWindowOpenDenyGuard(win.webContents)
+  win.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    enforcePreviewWebviewPolicy(event, webPreferences, params, isValidatedPreviewWebviewUrl)
+  })
+  // `<webview>` guests have their own WebContents and do not inherit the
+  // BrowserWindow's handler. Preview pages are arbitrary remote content, so
+  // deny their popup requests at the guest boundary as well. Users can use the
+  // preview header's explicit "open in browser" action when they want the
+  // current page outside Hermes.
+  win.webContents.on('did-attach-webview', (_event, guestContents) => {
+    installWindowOpenDenyGuard(guestContents)
+    installPreviewWebviewNavigationGuard(guestContents, isValidatedPreviewWebviewUrl)
   })
   win.webContents.on('will-navigate', (event, url) => {
     if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {

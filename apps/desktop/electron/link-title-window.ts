@@ -3,6 +3,8 @@
 // in an offscreen window and read its title. That window loads arbitrary
 // user-linked pages, so it must never emit sound or trigger real downloads.
 
+import { installWindowOpenDenyGuard } from './window-open-guard'
+
 export function linkTitleWindowOptions(partitionSession) {
   return {
     show: false,
@@ -31,6 +33,12 @@ export function linkTitleWindowOptions(partitionSession) {
 // audio every time a session containing such links is re-rendered. See #49505.
 export function createLinkTitleWindow(BrowserWindow, partitionSession) {
   const window = new BrowserWindow(linkTitleWindowOptions(partitionSession))
+
+  // The title fetcher loads arbitrary remote pages in a hidden, sandboxed
+  // window. Keep their renderer-level `window.open()` requests from creating a
+  // native BrowserWindow; the visible app's explicit external-link bridge is
+  // the only supported path for opening a URL.
+  installWindowOpenDenyGuard(window.webContents)
 
   try {
     window.webContents.setAudioMuted(true)

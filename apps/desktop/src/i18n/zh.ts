@@ -2950,6 +2950,10 @@ export const zh: Translations = {
       sendEdited: '发送编辑后的消息',
       attachingFile: '正在附加…'
     },
+    embeds: {
+      openPostOn: label => `在 ${label} 上打开此帖子`,
+      openPost: label => `打开 ${label} 帖子`
+    },
     approval: {
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送审批响应',

@@ -12,6 +12,7 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import { saveMemoryProviderConfig } from '@/hermes'
+import { openExternalLink } from '@/lib/external-link'
 import { ExternalLink, Loader2, Save, SlidersHorizontal } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -102,9 +103,17 @@ export function ProviderConfigModal({
             <a
               className="inline-flex w-fit items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-accent-secondary) underline-offset-4 transition-colors hover:underline"
               href={config.docs_url}
+              onAuxClick={event => {
+                if (event.button !== 1) {
+                  return
+                }
+
+                event.preventDefault()
+                openExternalLink(config.docs_url!)
+              }}
               onClick={event => {
                 event.preventDefault()
-                void window.hermesDesktop?.openExternal?.(config.docs_url)
+                openExternalLink(config.docs_url!)
               }}
               rel="noreferrer"
               target="_blank"

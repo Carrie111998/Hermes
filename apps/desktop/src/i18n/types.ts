@@ -2365,6 +2365,10 @@ export interface Translations {
       sendEdited: string
       attachingFile: string
     }
+    embeds: {
+      openPostOn: (label: string) => string
+      openPost: (label: string) => string
+    }
     approval: {
       gatewayDisconnected: string
       sendFailed: string

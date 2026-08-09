@@ -12,6 +12,7 @@ import {
   submitOAuthCode,
   validateProviderCredential
 } from '@/hermes'
+import { openExternalLinkWithFallback } from '@/lib/external-link'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { evaluateRuntimeReadiness, type RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { notify, notifyError } from '@/store/notifications'
@@ -557,24 +558,11 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
   return false
 }
 
-// Open a sign-in URL via the desktop bridge, falling back to window.open
-// when the bridge isn't present (e.g. the web dashboard / dev preview) so
-// the flow never silently stalls in a waiting state. Mirrors the pattern in
-// apps/desktop/src/app/artifacts/index.tsx.
+// Open a sign-in URL through the explicit Desktop bridge/browser contract. A
+// bridge rejection is allowed to reach startProviderOAuth's error state;
+// window.open is reserved for the non-Electron browser/dev-preview case.
 async function openSignInUrl(url: string) {
-  if (window.hermesDesktop?.openExternal) {
-    try {
-      await window.hermesDesktop.openExternal(url)
-
-      return
-    } catch {
-      // Bridge present but failed (no OS handler, user denied, etc.). Fall
-      // through to window.open so the sign-in URL still opens and the flow
-      // doesn't strand a pending OAuth session in a waiting state.
-    }
-  }
-
-  window.open(url, '_blank', 'noopener,noreferrer')
+  await openExternalLinkWithFallback(url)
 }
 
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {

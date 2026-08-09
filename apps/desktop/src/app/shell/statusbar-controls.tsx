@@ -15,6 +15,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Tip, TipKeybindLabel, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { ContribRender } from '@/contrib/react/boundary'
 import { useI18n } from '@/i18n'
+import { openExternalLink } from '@/lib/external-link'
 import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
 import { cn } from '@/lib/utils'
 import { $statusbarHiddenIds, setStatusbarItemVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
@@ -278,6 +279,18 @@ const StatusbarItemView = memo(function StatusbarItemView({
                       <a
                         className="inline-flex w-full items-center gap-2"
                         href={menuItem.href}
+                        onAuxClick={event => {
+                          if (event.button !== 1) {
+                            return
+                          }
+
+                          event.preventDefault()
+                          openExternalLink(menuItem.href!)
+                        }}
+                        onClick={event => {
+                          event.preventDefault()
+                          openExternalLink(menuItem.href!)
+                        }}
                         rel="noreferrer"
                         target="_blank"
                       >
@@ -312,10 +325,39 @@ const StatusbarItemView = memo(function StatusbarItemView({
     )
   }
 
-  if (item.href || item.variant === 'link') {
+  if (item.href) {
     return (
       <Tip label={tooltipLabel}>
-        <a className={cn(STATUSBAR_ACTION_CLASS, item.className)} href={item.href} rel="noreferrer" target="_blank">
+        <a
+          aria-disabled={item.disabled || undefined}
+          className={cn(STATUSBAR_ACTION_CLASS, item.className)}
+          href={item.href}
+          onAuxClick={event => {
+            if (event.button !== 1) {
+              return
+            }
+
+            event.preventDefault()
+
+            if (item.disabled) {
+              return
+            }
+
+            openExternalLink(item.href!)
+          }}
+          onClick={event => {
+            event.preventDefault()
+
+            if (item.disabled) {
+              return
+            }
+
+            openExternalLink(item.href!)
+          }}
+          rel="noreferrer"
+          tabIndex={item.disabled ? -1 : undefined}
+          target="_blank"
+        >
           {content}
         </a>
       </Tip>

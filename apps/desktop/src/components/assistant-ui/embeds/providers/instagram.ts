@@ -14,7 +14,9 @@ export const instagram: EmbedMatcher = url => {
 
   return {
     embedUrl: `https://www.instagram.com/${type}/${code}/embed`,
-    // Placeholder height for content-visibility; embed.js self-sizes in-document.
+    // Fixed outer height for the official Instagram iframe; the frame renderer
+    // keeps longer posts reachable with internal scrolling. No in-document
+    // widget script is loaded into the privileged Desktop renderer.
     height: 450,
     id: `instagram:${code}`,
     label: 'Instagram',

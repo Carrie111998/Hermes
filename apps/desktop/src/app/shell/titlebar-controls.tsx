@@ -8,6 +8,7 @@ import { resetLayoutTree } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { openExternalLink } from '@/lib/external-link'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { $hapticsMuted, toggleHapticsMuted } from '@/store/haptics'
@@ -301,6 +302,18 @@ function TitlebarToolButton({ navigate, tool }: { navigate: ReturnType<typeof us
           <a
             aria-label={tool.label}
             href={tool.href}
+            onAuxClick={event => {
+              if (event.button !== 1) {
+                return
+              }
+
+              event.preventDefault()
+              openExternalLink(tool.href!)
+            }}
+            onClick={event => {
+              event.preventDefault()
+              openExternalLink(tool.href!)
+            }}
             onPointerDown={event => event.stopPropagation()}
             rel="noreferrer"
             target="_blank"

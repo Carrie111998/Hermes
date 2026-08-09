@@ -133,6 +133,17 @@ describe('remote HTML previews', () => {
     expect(localPreviewTarget('//srv/share/report #1?.html')?.url).toBe('file:////srv/share/report%20%231%3F.html')
   })
 
+  it('round-trips Windows UNC file URLs without dropping the server authority', () => {
+    const target = localPreviewTarget('file://server/share/report.html')
+
+    expect(target?.path).toBe('\\\\server\\share\\report.html')
+    expect(target?.url).toBe('file://server/share/report.html')
+  })
+
+  it('keeps the localhost file URL alias on the local path contract', () => {
+    expect(localPreviewTarget('file://localhost/tmp/report.html')?.path).toBe('/tmp/report.html')
+  })
+
   it('opens ordinary targets without staging them', async () => {
     const openPreviewInBrowser = vi.fn(async () => undefined)
     const saveImageBuffer = vi.fn()

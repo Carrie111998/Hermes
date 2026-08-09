@@ -15,7 +15,7 @@ import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
 import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { detectArtifact } from '@/lib/artifact-detect'
-import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
+import { ExternalLink, normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
@@ -105,9 +105,33 @@ function useOpenMediaFile(path: string) {
     if (window.hermesDesktop && isRemoteGateway()) {
       setOpenFailed(false)
       void downloadGatewayMediaFile(path).catch(() => setOpenFailed(true))
-    } else {
-      openExternalLink(mediaExternalUrl(path))
+
+      return
     }
+
+    const href = mediaExternalUrl(path)
+
+    // Local media is an explicit file-preview action, not a general external
+    // link. Keep it on the main-process file opener, which validates the
+    // requested file path; the shared external-link helper intentionally
+    // rejects file: URLs before either a bridge or browser navigation.
+    if (/^file:/i.test(href)) {
+      const openFile = window.hermesDesktop?.openPreviewInBrowser ?? window.hermesDesktop?.openExternal
+
+      if (!openFile) {
+        setOpenFailed(true)
+
+        return
+      }
+
+      setOpenFailed(false)
+      void openFile(href).catch(() => setOpenFailed(true))
+
+      return
+    }
+
+    setOpenFailed(false)
+    openExternalLink(href)
   }
 
   return { open, openFailed }
@@ -272,15 +296,9 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 
   if (!target || !/^https?:\/\//i.test(target)) {
     return (
-      <a
-        className={cn('ref wrap-anywhere', className)}
-        href={href}
-        rel="noopener noreferrer"
-        target="_blank"
-        {...props}
-      >
+      <ExternalLink className={cn('wrap-anywhere', className)} href={target || ''} {...props}>
         {children}
-      </a>
+      </ExternalLink>
     )
   }
 

@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $connection } from '@/store/session'
@@ -77,5 +77,37 @@ describe('MarkdownImage media routing', () => {
 
     expect(container.querySelector('video')).toBeNull()
     expect(container.querySelector('audio')).toBeNull()
+  })
+
+  it('opens local media through the validated preview bridge', async () => {
+    const openPreviewInBrowser = vi.fn(async () => undefined)
+    const originalDesktop = window.hermesDesktop
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { openPreviewInBrowser }
+    })
+
+    try {
+      const { container } = render(<MarkdownImage alt="note" src="file:///tmp/note.mp3" />)
+
+      const audio = await waitFor(() => {
+        const element = container.querySelector('audio')
+
+        expect(element).not.toBeNull()
+
+        return element as HTMLAudioElement
+      })
+
+      fireEvent.error(audio)
+      fireEvent.click(await screen.findByRole('button', { name: 'Open audio file' }))
+
+      expect(openPreviewInBrowser).toHaveBeenCalledWith('file:///tmp/note.mp3')
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: originalDesktop
+      })
+    }
   })
 })

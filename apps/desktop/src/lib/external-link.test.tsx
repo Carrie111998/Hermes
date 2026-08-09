@@ -8,6 +8,8 @@ import {
   hostPathLabel,
   isTitleFetchable,
   LinkifiedText,
+  openExternalLink,
+  openExternalLinkWithFallback,
   PrettyLink,
   urlSlugTitleLabel
 } from './external-link'
@@ -110,6 +112,119 @@ describe('external link helpers', () => {
 
     fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
     expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
+  })
+
+  it('opens intercepted links in a browser preview without the desktop bridge', () => {
+    const popup = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    delete desktopWindow.hermesDesktop
+
+    render(<ExternalLink href="mailto:hello@example.com">Email link</ExternalLink>)
+
+    fireEvent.click(screen.getByRole('link', { name: 'Email link' }))
+
+    expect(popup).toHaveBeenCalledWith('mailto:hello@example.com', '_blank', 'noopener,noreferrer')
+  })
+
+  it('does not bypass a present but incomplete desktop bridge', () => {
+    const popup = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    desktopWindow.hermesDesktop = {} as Window['hermesDesktop']
+
+    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
+
+    fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
+
+    expect(popup).not.toHaveBeenCalled()
+  })
+
+  it('routes middle-clicks through the bridge while preserving right-click menus', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+
+    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
+
+    const link = screen.getByRole('link', { name: 'Example link' })
+    const middleClick = new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })
+    expect(link.dispatchEvent(middleClick)).toBe(false)
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
+
+    openExternal.mockClear()
+    const rightClick = new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 2 })
+    expect(link.dispatchEvent(rightClick)).toBe(true)
+    expect(openExternal).not.toHaveBeenCalled()
+  })
+
+  it('uses a browser popup only without the desktop bridge and surfaces bridge failures', async () => {
+    const popup = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    delete desktopWindow.hermesDesktop
+
+    await openExternalLinkWithFallback('https://example.com/sign-in')
+    expect(popup).toHaveBeenCalledWith('https://example.com/sign-in', '_blank', 'noopener,noreferrer')
+
+    const bridgeError = new Error('OS opener unavailable')
+    installDesktopBridge({ openExternal: vi.fn().mockRejectedValue(bridgeError) })
+
+    await expect(openExternalLinkWithFallback('https://example.com/sign-in')).rejects.toBe(bridgeError)
+    expect(popup).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not treat a null browser popup result as a navigation failure', async () => {
+    const popup = vi.spyOn(window, 'open').mockReturnValue(null)
+    delete desktopWindow.hermesDesktop
+
+    await expect(openExternalLinkWithFallback('https://example.com/sign-in')).resolves.toBeUndefined()
+    expect(popup).toHaveBeenCalledWith('https://example.com/sign-in', '_blank', 'noopener,noreferrer')
+  })
+
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,<script>alert(1)</script>',
+    'file:///tmp/demo.html',
+    'spotify:track:123',
+    '/relative/path',
+    'not a URL',
+    'https:///missing-host'
+  ])('rejects unsafe external schemes before bridge or browser navigation: %s', async href => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    const popup = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+
+    openExternalLink(href)
+    await expect(openExternalLinkWithFallback(href)).rejects.toThrow('Unsupported external URL')
+
+    expect(openExternal).not.toHaveBeenCalled()
+    expect(popup).not.toHaveBeenCalled()
+  })
+
+  it('rejects unsafe external schemes in browser fallback mode', async () => {
+    const popup = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    delete desktopWindow.hermesDesktop
+
+    openExternalLink('javascript:alert(1)')
+    await expect(openExternalLinkWithFallback('file:///tmp/demo.html')).rejects.toThrow('Unsupported external URL')
+
+    expect(popup).not.toHaveBeenCalled()
+  })
+
+  it('preserves supported external schemes after normalization', async () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+
+    openExternalLink('example.com/docs')
+    await openExternalLinkWithFallback('mailto:hello@example.com')
+
+    expect(openExternal).toHaveBeenNthCalledWith(1, 'https://example.com/docs')
+    expect(openExternal).toHaveBeenNthCalledWith(2, 'mailto:hello@example.com')
+  })
+
+  it('returns without a browser fallback when window is unavailable', async () => {
+    delete desktopWindow.hermesDesktop
+    vi.stubGlobal('window', undefined)
+
+    try {
+      await expect(openExternalLinkWithFallback('https://example.com/sign-in')).resolves.toBeUndefined()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('hides the trailing external-link icon by default', () => {

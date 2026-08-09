@@ -193,7 +193,14 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
 
   if (/^file:\/\//i.test(raw)) {
     try {
-      path = decodeURIComponent(new URL(raw).pathname)
+      const parsed = new URL(raw)
+      const decodedPath = decodeURIComponent(parsed.pathname)
+
+      // URL.pathname drops the authority from Windows UNC file URLs. Keep it
+      // as a Windows path so the canonical pathToFileUrl helper round-trips
+      // `\\server\share\file` back to `file://server/share/file`.
+      const uncHost = parsed.hostname && parsed.hostname.toLowerCase() !== 'localhost' ? parsed.hostname : ''
+      path = uncHost ? `\\\\${uncHost}${decodedPath.replace(/\//g, '\\')}` : decodedPath
     } catch {
       path = raw.replace(/^file:\/\//i, '')
     }

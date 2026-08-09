@@ -18,6 +18,7 @@ import {
   startOAuthLogin
 } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { openExternalLinkWithFallback } from '@/lib/external-link'
 import { Check, Loader2, Save, Terminal } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { upsertDesktopActionTask } from '@/store/activity'
@@ -625,16 +626,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
       }
 
       const url = start.verification_url
-
-      if (window.hermesDesktop?.openExternal) {
-        try {
-          await window.hermesDesktop.openExternal(url)
-        } catch {
-          window.open(url, '_blank', 'noopener,noreferrer')
-        }
-      } else {
-        window.open(url, '_blank', 'noopener,noreferrer')
-      }
+      await openExternalLinkWithFallback(url)
 
       // Poll until the device-code session resolves (~5s cadence, bounded).
       for (let attempt = 0; attempt < 120 && mountedRef.current; attempt += 1) {

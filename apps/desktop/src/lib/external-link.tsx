@@ -22,6 +22,7 @@ const EXPLICIT_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"'`]+[^\s<>"'`.,;:!?)]/gi
 const DOMAIN_RE = /^(?:www\.)?[a-z0-9](?:[a-z0-9-]*\.)+[a-z]{2,}(?::\d+)?(?:[/?#][^\s]*)?$/i
 const SKIP_PROTO_RE = /^(?:file|data|mailto|javascript|blob|chrome|about|hermes):/i
 const LOCAL_HOST_RE = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?$/i
+const EXTERNAL_NAVIGATION_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
 
 const ERROR_TITLE_RE =
   /\b(?:access denied|attention required|captcha|error|forbidden|just a moment|not found|request blocked|too many requests)\b/i
@@ -195,10 +196,107 @@ export function useLinkTitle(url?: null | string): string {
   return title
 }
 
-export function openExternalLink(href: string): void {
-  if (href) {
-    void window.hermesDesktop?.openExternal?.(href)
+function normalizeAllowedExternalUrl(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null
   }
+
+  const normalized = normalizeExternalUrl(value)
+
+  if (!normalized) {
+    return null
+  }
+
+  let parsed: URL
+
+  try {
+    parsed = new URL(normalized)
+  } catch {
+    return null
+  }
+
+  if (!EXTERNAL_NAVIGATION_PROTOCOLS.has(parsed.protocol)) {
+    return null
+  }
+
+  // URL accepts some malformed authority forms by treating the first path
+  // segment as a host. Require an explicit authority and a real host for
+  // network URLs before handing them to either the Desktop bridge or the
+  // browser fallback.
+  if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+    if (!/^https?:\/\/(?=[^/?#\s])/i.test(normalized) || !parsed.hostname) {
+      return null
+    }
+  }
+
+  // A bare `mailto:` has no destination and is not a useful external action.
+  if (parsed.protocol === 'mailto:' && !parsed.pathname) {
+    return null
+  }
+
+  return normalized
+}
+
+export function openExternalLink(href: string): void {
+  const normalizedHref = normalizeAllowedExternalUrl(href)
+
+  if (!normalizedHref || typeof window === 'undefined') {
+    return
+  }
+
+  // In Electron the Desktop bridge owns external navigation. Browser/dev
+  // previews have no bridge, so callers that already cancelled an anchor
+  // event must still get the normal popup behavior instead of silently doing
+  // nothing. Keep a present-but-incomplete bridge fail-closed; it is an
+  // application integration failure, not permission to bypass the bridge.
+  if (window.hermesDesktop) {
+    if (window.hermesDesktop.openExternal) {
+      void window.hermesDesktop.openExternal(normalizedHref)
+    }
+
+    return
+  }
+
+  window.open(normalizedHref, '_blank', 'noopener,noreferrer')
+}
+
+/**
+ * Open an OAuth or other user-requested URL in the current runtime.
+ *
+ * Electron's common window-open policy is deny-only, so a failed Desktop
+ * bridge must not fall through to window.open() inside the app. A missing
+ * bridge is the explicit browser/dev-preview contract where window.open is
+ * still the appropriate fallback; a present bridge that rejects is surfaced
+ * to the caller so it can show recovery UI instead of silently stalling.
+ */
+export async function openExternalLinkWithFallback(href: string): Promise<void> {
+  if (typeof window === 'undefined') {
+    return
+  }
+
+  const normalizedHref = normalizeAllowedExternalUrl(href)
+
+  if (!normalizedHref) {
+    throw new Error('Unsupported external URL')
+  }
+
+  const bridge = window.hermesDesktop
+
+  if (bridge) {
+    if (!bridge.openExternal) {
+      throw new Error('Desktop external-link bridge is unavailable')
+    }
+
+    await bridge.openExternal(normalizedHref)
+
+    return
+  }
+
+  // Browsers may return null even after starting a successful navigation
+  // (notably with `noopener`), so the return value is not a reliable failure
+  // signal. Keep this operation best-effort and let the browser own popup
+  // policy and user-activation behavior.
+  window.open(normalizedHref, '_blank', 'noopener,noreferrer')
 }
 
 interface ExternalLinkProps extends Omit<ComponentProps<'a'>, 'href' | 'target'> {
@@ -232,6 +330,7 @@ export function ExternalLink({
   className,
   href,
   onClick,
+  onAuxClick,
   showExternalIcon = false,
   ...rest
 }: ExternalLinkProps) {
@@ -241,6 +340,17 @@ export function ExternalLink({
     <a
       className={cn('ref', className)}
       href={target}
+      onAuxClick={event => {
+        onAuxClick?.(event)
+
+        if (event.button !== 1 || event.defaultPrevented) {
+          return
+        }
+
+        event.stopPropagation()
+        event.preventDefault()
+        openExternalLink(target)
+      }}
       onClick={event => {
         event.stopPropagation()
         onClick?.(event)

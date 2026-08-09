@@ -2,6 +2,7 @@
 
 import { type CSSProperties, useMemo } from 'react'
 
+import { EXTERNAL_FRAME_SANDBOX } from './embed-security'
 import type { FrameEmbed } from './providers/types'
 import { useIsDark } from './use-is-dark'
 
@@ -37,6 +38,8 @@ export default function SpotifyEmbedRenderer({ descriptor }: { descriptor: Frame
       allow={ALLOW}
       className="block w-full border-0 bg-transparent"
       loading="lazy"
+      referrerPolicy="strict-origin-when-cross-origin"
+      sandbox={EXTERNAL_FRAME_SANDBOX}
       src={src}
       style={style}
       title="Spotify embed"

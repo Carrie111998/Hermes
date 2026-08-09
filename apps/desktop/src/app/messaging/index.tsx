@@ -650,6 +650,14 @@ function PlatformDetail({
             <Button asChild size="sm" variant="textStrong">
               <a
                 href={platform.docs_url}
+                onAuxClick={event => {
+                  if (event.button !== 1) {
+                    return
+                  }
+
+                  event.preventDefault()
+                  openExternalLink(platform.docs_url!)
+                }}
                 onClick={event => {
                   // Route through the validated external opener instead of
                   // letting Electron resolve the anchor. A packaged build's
@@ -853,7 +861,23 @@ function MessagingField({
           {field.url && (
             <Tip label={m.openDocs}>
               <Button asChild className="size-8 shrink-0" variant="ghost">
-                <a href={field.url} rel="noreferrer" target="_blank">
+                <a
+                  href={field.url}
+                  onAuxClick={event => {
+                    if (event.button !== 1) {
+                      return
+                    }
+
+                    event.preventDefault()
+                    openExternalLink(field.url!)
+                  }}
+                  onClick={event => {
+                    event.preventDefault()
+                    openExternalLink(field.url!)
+                  }}
+                  rel="noreferrer"
+                  target="_blank"
+                >
                   <ExternalLink className="size-3.5" />
                 </a>
               </Button>

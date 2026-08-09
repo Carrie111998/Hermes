@@ -24,10 +24,19 @@ beforeAll(() => {
   HTMLElement.prototype.scrollIntoView ??= () => undefined
 })
 
+const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
+const initialHermesDesktop = desktopWindow.hermesDesktop
+
 afterEach(() => {
   cleanup()
   $statusbarHiddenIds.set([...STATUSBAR_HIDDEN_BY_DEFAULT])
   $statusbarVisible.set(true)
+
+  if (initialHermesDesktop) {
+    desktopWindow.hermesDesktop = initialHermesDesktop
+  } else {
+    delete desktopWindow.hermesDesktop
+  }
 })
 
 const item = (id: string, label: string, extra: Partial<StatusbarItem> = {}): StatusbarItem => ({
@@ -55,6 +64,31 @@ function openContextMenu(target: HTMLElement) {
 }
 
 describe('statusbar item visibility', () => {
+  it('keeps disabled direct links inert and out of the tab order', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    desktopWindow.hermesDesktop = { openExternal } as unknown as Window['hermesDesktop']
+
+    const statusbar = bar([
+      item('docs', 'Docs', {
+        disabled: true,
+        href: 'https://example.com/docs'
+      })
+    ])
+    const link = within(statusbar).getByRole('link', { name: 'Docs' })
+
+    expect(link.getAttribute('aria-disabled')).toBe('true')
+    expect(link.getAttribute('tabindex')).toBe('-1')
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+    const middleClick = new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })
+    const rightClick = new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 2 })
+
+    expect(link.dispatchEvent(click)).toBe(false)
+    expect(link.dispatchEvent(middleClick)).toBe(false)
+    expect(link.dispatchEvent(rightClick)).toBe(true)
+    expect(openExternal).not.toHaveBeenCalled()
+  })
+
   it('hides the route/toggle items out of the box and keeps status items', () => {
     bar([
       item('cron', 'Cron'),

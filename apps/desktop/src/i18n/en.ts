@@ -2777,6 +2777,10 @@ export const en: Translations = {
       sendEdited: 'Send edited message',
       attachingFile: 'Attaching…'
     },
+    embeds: {
+      openPostOn: label => `Open this post on ${label}`,
+      openPost: label => `Open ${label} post`
+    },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send approval response',
