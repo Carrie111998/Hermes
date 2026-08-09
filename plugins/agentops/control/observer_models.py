@@ -370,6 +370,7 @@ class FleetCoverage:
     snapshotted_targets: int
     coverage_percent: int
     unmanaged_collectors: tuple[str, ...] = ()
+    out_of_scope_targets: tuple[str, ...] = ()
 
 
 def stable_signal_id(

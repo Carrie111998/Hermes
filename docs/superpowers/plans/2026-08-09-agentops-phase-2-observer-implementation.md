@@ -332,6 +332,11 @@ below are implemented and independently re-reviewed.
 - [x] timed-out worker lifecycle, inspected-item budget, concurrent Bridge
   drain, out-of-order signal/cursor and manifest loader contract tests
 
+### Approved G2 scope adjustment
+
+- [x] Core denominator/exit condition is limited to the default daily-production profile.
+- [x] feishu3/feishu4/feishu5/newbot remain registered but are explicitly `out_of_scope` and unmanaged for this G2.
+
 ## Sol G2 Release Blocker Addendum 3 (2026-08-09)
 
 - [x] Complete `sqlite_master` object preflight rejects triggers/views/unknown objects.
