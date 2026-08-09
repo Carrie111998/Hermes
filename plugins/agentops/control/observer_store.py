@@ -139,6 +139,21 @@ def _validate_schema_shape(connection: sqlite3.Connection, version: int) -> None
         for row in connection.execute(f"PRAGMA index_list({table})"):
             if int(row[2]) and str(row[3]) != "pk":
                 raise ObserverStoreError("observer database indexes incompatible")
+    objects = [(str(row[0]), str(row[1])) for row in connection.execute(
+        "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+    )]
+    expected_objects = [("table", table) for table in sorted(tables)]
+    if objects != expected_objects:
+        raise ObserverStoreError("observer database sqlite_master objects incompatible")
+    all_objects = connection.execute("SELECT type,name FROM sqlite_master").fetchall()
+    allowed_auto = {f"sqlite_autoindex_{table}_" for table in tables}
+    for kind, name in all_objects:
+        if str(kind) == "index" and str(name).startswith("sqlite_autoindex_"):
+            if not any(str(name).startswith(prefix) for prefix in allowed_auto):
+                raise ObserverStoreError("observer database unknown index")
+        elif str(kind) not in {"table", "index"} or str(name).startswith("sqlite_"):
+            if str(name) not in {table for _, table in expected_objects}:
+                raise ObserverStoreError("observer database unknown object")
 
 
 def _preflight_existing_database(path: Path) -> int:
@@ -339,6 +354,8 @@ class ObserverStore:
         """Persist a collection run, recurring signals and source cursor atomically."""
         if not isinstance(batch, CollectionBatch):
             raise ObserverStoreError("invalid collection batch")
+        if batch.next_cursor is not None and not batch.source_id:
+            raise ObserverStoreError("cursor source is required")
         try:
             safe_signals = self._safe_signals(batch)
         except RedactionError as exc:
@@ -404,6 +421,14 @@ class ObserverStore:
                         (batch.observation_id, signal.signal_id),
                     )
                 if batch.next_cursor is not None:
+                    latest = self._connection.execute(
+                        "SELECT MAX(collected_at) FROM collection_runs WHERE target_id=? AND collector=? AND observation_id<>?",
+                        (batch.target_id, batch.collector, batch.observation_id),
+                    ).fetchone()[0]
+                    cursor_is_newer = latest is None or batch.collected_at.isoformat() >= str(latest)
+                    if not cursor_is_newer:
+                        self._connection.commit()
+                        return
                     self._connection.execute(
                         """
                         INSERT INTO source_cursors(target_id, collector, source_id, inode, offset)

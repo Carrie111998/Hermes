@@ -110,11 +110,12 @@ class ProcessCollector:
                     continue
         except Exception:
             return failed_batch(target, self.name, "process_observation_failed", source_id=self.source_id)
+        health = CollectorHealth(healthy=bool(signals), reason=None if signals else "process_binding_no_match")
         return CollectionBatch(
             target_id=target.target_id,
             collector=self.name,
             collected_at=observed_at,
             signals=tuple(signals),
-            health=CollectorHealth(healthy=True),
+            health=health,
             source_id=self.source_id,
         )

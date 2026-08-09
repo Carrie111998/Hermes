@@ -30,7 +30,8 @@ def _batch():
         collected_at=signal.observed_at,
         signals=(signal,),
         health=CollectorHealth(healthy=True),
-        next_cursor=LogCursor(inode=99, offset=12),
+        next_cursor=LogCursor(inode=99, offset=12, source_id="sha256:" + "9" * 64),
+        source_id="sha256:" + "9" * 64,
     )
 
 
@@ -43,7 +44,7 @@ def test_observer_store_is_fixed_inside_agentops_state_and_commits_cursor_with_b
         assert observer_database_path(config) == store.path
         assert store.journal_mode() == "wal"
         assert store.signal_count() == 1
-        assert store.get_cursor("hermes:profile:default:gateway", "test.collector") == LogCursor(99, 12)
+        assert store.get_cursor("hermes:profile:default:gateway", "test.collector", "sha256:" + "9" * 64) == LogCursor(99, 12, "sha256:" + "9" * 64)
     finally:
         store.close()
 

@@ -5,6 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Protocol
+import threading
+
+
+_DETACHED_LIMIT = 4
+_detached_lock = threading.Lock()
+_detached_workers = 0
 
 from plugins.agentops.control.observer_models import (
     CollectionBatch,
@@ -56,6 +62,11 @@ def collect_all(
         name = getattr(collector, "name", "unknown")
         source_id = getattr(collector, "source_id", "")
         cursor = cursor_by_key.get((name, source_id), cursor_by_key.get(name))
+        global _detached_workers
+        with _detached_lock:
+            if _detached_workers >= _DETACHED_LIMIT:
+                batches.append(failed_batch(target, name, "collector_timeout_worker_budget", source_id=source_id, worker_detached=True))
+                continue
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
         future = executor.submit(collector.collect, target, cursor)
         try:
@@ -77,8 +88,13 @@ def collect_all(
                 )
         except (FutureTimeout, TimeoutError):
             future.cancel()
-            # Python threads cannot be force-killed safely.  Surface the detached
-            # worker explicitly so readiness never treats this as a clean timeout.
+            with _detached_lock:
+                _detached_workers += 1
+            def _release(_future):
+                global _detached_workers
+                with _detached_lock:
+                    _detached_workers = max(0, _detached_workers - 1)
+            future.add_done_callback(_release)
             batch = failed_batch(target, name, "collector_timeout", source_id=source_id, worker_detached=True)
         except Exception:
             batch = failed_batch(target, name, "collector_failed", source_id=source_id)

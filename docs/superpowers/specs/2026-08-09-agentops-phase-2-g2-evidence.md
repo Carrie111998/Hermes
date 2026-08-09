@@ -37,6 +37,7 @@ not a G2 approval claim.
 | P1-7 manifest semantics | Versioned pack declares target kinds, bounded probes, assertions, classification, retention, no-write production-read/dry-run and manual failure runbook | `test_review_pack_manifest.py`, `test_manifest_loader_executes_entry_capability_and_budget_validation` |
 | G2 second-round full-record gate | Every persisted string is redacted/rescanned; cron execution and mandatory assertion freshness/authority are fail-closed | `test_all_persisted_record_strings_are_redacted_and_occurrences_cursors_are_monotonic`, `test_cron_unknown_mandatory_and_stale_execution_are_unhealthy` |
 | G2 second-round delivery/order | Bridge claims in-flight events exactly once; cursor and occurrence updates are monotonic; timeout lifecycle is explicit | `test_bridge_concurrent_drain_claims_each_event_once`, `test_asset_binding_deadline_and_snapshot_deep_freeze` |
+| G2 release blockers | Complete sqlite object preflight, per-collection Cron reload, strict source cursor ordering, bootstrap identity/label binding, executable Review Pack factory, and bounded detached workers | `test_store_rejects_legacy_trigger_object_before_migration`, `test_cron_file_is_reparsed_and_duplicate_names_rejected`, `test_process_zero_match_and_launchd_label_mismatch_are_unhealthy`, `test_review_pack_factory_applies_runtime_target_and_budget` |
 | P2 deep freeze/interpreter parity | Recursive immutable mappings detach snapshot/signal data; separate Python 3.14 environment contains dependencies | `test_asset_binding_deadline_and_snapshot_deep_freeze`; Python 3.14 command below |
 
 ## Fresh verification output
@@ -46,7 +47,7 @@ not a G2 approval claim.
 ```
 
 ```text
-107 passed in 3.47s
+111 passed in 3.41s
 ```
 
 ```bash
@@ -54,7 +55,7 @@ not a G2 approval claim.
 ```
 
 ```text
-107 passed in 6.24s
+111 passed in 6.29s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -66,7 +67,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.54s
+122 passed in 2.40s
 ```
 
 ```text

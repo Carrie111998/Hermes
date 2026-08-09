@@ -60,6 +60,9 @@ class LaunchdCollector:
             return failed_batch(target, self.name, "plist_unavailable", source_id=self.source_id)
         if not isinstance(data, dict) or not isinstance(data.get("Label"), str):
             return failed_batch(target, self.name, "plist_invalid", source_id=self.source_id)
+        expected_label = target.spec.labels.get("service_label")
+        if expected_label and data["Label"] != expected_label:
+            return failed_batch(target, self.name, "plist_label_mismatch", source_id=self.source_id)
         command_fields = {
             "Program": data.get("Program"),
             "ProgramArguments": data.get("ProgramArguments"),

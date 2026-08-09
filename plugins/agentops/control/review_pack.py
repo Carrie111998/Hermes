@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ class ReviewPack:
     assertions: dict[str, AssertionSpec]
     target_kinds: tuple[str, ...]
     retention_days: int
+    probes: tuple[str, ...]
 
     @property
     def mandatory_assertion_ids(self) -> frozenset[str]:
@@ -113,4 +115,40 @@ def load_review_pack(path: Path | None = None) -> ReviewPack:
         assertions[assertion.id] = assertion
     if not assertions:
         raise ManifestValidationError("manifest assertions missing")
-    return ReviewPack(str(pack["id"]), str(pack["version"]), "observe_only", collectors, assertions, kinds, retention)
+    probes = data.get("probes", ())
+    if not probes or any(not item.get("id") or item.get("collector") not in collectors for item in probes):
+        raise ManifestValidationError("manifest probes incomplete")
+    if data.get("actions") != []:
+        raise ManifestValidationError("manifest actions must be empty")
+    required_fields = set(data.get("evidence", {}).get("required_fields", ()))
+    if not {"observation_id", "target_id", "collected_at", "collector", "source_id", "signal_id", "redaction_version"}.issubset(required_fields):
+        raise ManifestValidationError("manifest evidence fields incomplete")
+    for item in inputs.get("collectors", ()):
+        if not item.get("source_binding"):
+            raise ManifestValidationError("collector source binding missing")
+    cron_assertions = {"cron_execution_completed", "cron_business_assertion_fresh"}
+    if not cron_assertions.issubset(assertions):
+        raise ManifestValidationError("cron assertion authority incomplete")
+    return ReviewPack(str(pack["id"]), str(pack["version"]), "observe_only", collectors, assertions, kinds, retention, tuple(str(item["id"]) for item in probes))
+
+
+def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: ReviewPack | None = None, **kwargs: Any) -> Any:
+    """Instantiate a collector only after applying the pack's runtime limits."""
+    active = pack or load_review_pack()
+    spec = active.validate_collector(collector_id, target_kind)
+    module, symbol = spec.entry.split(":", 1)
+    cls = getattr(importlib.import_module(module), symbol)
+    runtime = dict(kwargs)
+    for name, value in (("max_bytes", spec.max_bytes), ("max_items", spec.max_items), ("min_interval_seconds", spec.rate_limit_seconds)):
+        if name in runtime and name in {"max_bytes", "max_items"} and int(runtime[name]) > int(value):
+            raise ManifestValidationError("runtime collector budget exceeds pack")
+        runtime.setdefault(name, value)
+    runtime.pop("target_kind", None)
+    try:
+        accepted = inspect.signature(cls).parameters
+        runtime = {key: value for key, value in runtime.items() if key in accepted}
+        return cls(**runtime)
+    except TypeError:
+        # Most constructors take their asset as the first positional argument;
+        # callers must still supply it, while pack budgets remain enforced.
+        raise ManifestValidationError("collector factory arguments invalid")
