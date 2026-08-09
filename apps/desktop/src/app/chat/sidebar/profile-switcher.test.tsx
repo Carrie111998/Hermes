@@ -214,6 +214,16 @@ describe('ProfileRail backend controls', () => {
     expect(screen.getByRole('button', { name: 'Remote backend' }).getAttribute('aria-pressed')).toBe('true')
   })
 
+  it('does not mark Mac active before connection mode is known', async () => {
+    $connection.set(null)
+
+    await renderRail()
+    await flushEffects()
+
+    expect(screen.getByRole('button', { name: 'Mac backend' }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: 'Remote backend' }).getAttribute('aria-pressed')).toBe('false')
+  })
+
   it('prewarms the inactive backend on pointer hover', async () => {
     $connection.set(localConnection())
 
@@ -227,7 +237,7 @@ describe('ProfileRail backend controls', () => {
     expect(prewarmBackend).toHaveBeenCalledTimes(1)
   })
 
-  it('disables the remote control and explains why when no saved remote is available', async () => {
+  it('keeps the unavailable remote control focusable, blocked, and explained when no saved remote is available', async () => {
     getConnectionConfig.mockResolvedValue({
       cloudOrg: '',
       envOverride: false,
@@ -250,7 +260,14 @@ describe('ProfileRail backend controls', () => {
     await flushEffects()
 
     const remoteButton = screen.getByRole('button', { name: 'Remote backend' })
-    expect((remoteButton as HTMLButtonElement).disabled).toBe(true)
+    expect((remoteButton as HTMLButtonElement).disabled).toBe(false)
+    expect(remoteButton.getAttribute('aria-disabled')).toBe('true')
+
+    remoteButton.focus()
+    expect(document.activeElement).toBe(remoteButton)
+
+    fireEvent.click(remoteButton)
+    expect(selectBackend).not.toHaveBeenCalled()
 
     const trigger = remoteButton.closest('[data-slot="tooltip-trigger"]')
     expect(trigger).toBeTruthy()

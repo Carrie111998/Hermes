@@ -283,7 +283,7 @@ export function ProfileRail() {
         />
       )}
 
-      <BackendPill active={connection?.mode !== 'remote'} icon={Monitor} label={p.backendLocal} target="local" />
+      <BackendPill active={connection?.mode === 'local'} icon={Monitor} label={p.backendLocal} target="local" />
       <BackendPill
         active={connection?.mode === 'remote'}
         disabled={!remoteAvailable}
@@ -598,25 +598,32 @@ function BackendPill({ active, disabled = false, disabledLabel, icon: Icon, labe
 
   return (
     <Tip delayDuration={0} label={tipLabel}>
-      <span className="inline-flex shrink-0">
-        <Button
-          aria-label={label}
-          aria-pressed={active}
-          className={cn(
-            'gap-1.5 bg-transparent px-2 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground',
-            active && 'bg-(--ui-control-active-background) text-foreground'
-          )}
-          disabled={disabled}
-          onClick={() => selectBackend(target)}
-          onPointerEnter={() => !disabled && !active && prewarmBackend(target)}
-          size="xs"
-          type="button"
-          variant="ghost"
-        >
-          <Icon className="size-3.5" />
-          <span>{label}</span>
-        </Button>
-      </span>
+      <Button
+        aria-disabled={disabled || undefined}
+        aria-label={label}
+        aria-pressed={active}
+        className={cn(
+          'gap-1.5 bg-transparent px-2 text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground aria-disabled:cursor-default aria-disabled:opacity-50',
+          active && 'bg-(--ui-control-active-background) text-foreground',
+          disabled && 'hover:bg-transparent hover:text-(--ui-text-tertiary)'
+        )}
+        onClick={event => {
+          if (disabled) {
+            event.preventDefault()
+
+            return
+          }
+
+          selectBackend(target)
+        }}
+        onPointerEnter={() => !disabled && !active && prewarmBackend(target)}
+        size="xs"
+        type="button"
+        variant="ghost"
+      >
+        <Icon className="size-3.5" />
+        <span>{label}</span>
+      </Button>
     </Tip>
   )
 }
