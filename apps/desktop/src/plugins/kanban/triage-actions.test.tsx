@@ -59,6 +59,11 @@ describe('TriageActions', () => {
 
     expect(await screen.findByText('Specified — retitled: Concrete task')).not.toBeNull()
     expect(onRefresh).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Specify' }))
+
+    expect(onSpecify).toHaveBeenCalledTimes(1)
+    expect((screen.getByRole('button', { name: 'Specify' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   it('shows a backend failure reason without refreshing', async () => {

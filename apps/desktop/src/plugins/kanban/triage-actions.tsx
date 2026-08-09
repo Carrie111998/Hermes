@@ -32,6 +32,7 @@ function errorText(error: unknown, fallback: string): string {
 }
 
 export function TriageActions({ labels, onDecompose, onRefresh, onSpecify, status }: TriageActionsProps) {
+  const [completed, setCompleted] = useState(false)
   const [pending, setPending] = useState<null | Action>(null)
   const [feedback, setFeedback] = useState<Feedback>(null)
 
@@ -40,7 +41,7 @@ export function TriageActions({ labels, onDecompose, onRefresh, onSpecify, statu
   }
 
   const run = async (action: Action) => {
-    if (pending) {
+    if (completed || pending) {
       return
     }
 
@@ -71,6 +72,7 @@ export function TriageActions({ labels, onDecompose, onRefresh, onSpecify, statu
         message = decomposed.fanout ? labels.decomposed(decomposed.child_ids.length) : labels.decomposedSingle
       }
 
+      setCompleted(true)
       setFeedback({ kind: 'success', message })
       onRefresh()
     } catch (error) {
@@ -91,7 +93,7 @@ export function TriageActions({ labels, onDecompose, onRefresh, onSpecify, statu
       <div className="flex flex-wrap gap-2">
         <Button
           aria-label={pending === 'specify' ? labels.specifying : labels.specify}
-          disabled={pending !== null}
+          disabled={completed || pending !== null}
           onClick={() => void run('specify')}
           size="sm"
           variant="secondary"
@@ -100,7 +102,7 @@ export function TriageActions({ labels, onDecompose, onRefresh, onSpecify, statu
         </Button>
         <Button
           aria-label={pending === 'decompose' ? labels.decomposing : labels.decompose}
-          disabled={pending !== null}
+          disabled={completed || pending !== null}
           onClick={() => void run('decompose')}
           size="sm"
           variant="secondary"
