@@ -1512,19 +1512,33 @@ class SimplexAdapter(BasePlatformAdapter):
         contact whose display name is not literally its numeric id
         (verified against simplex-chat v7.0.0.11: ``@3 hi`` →
         ``chatCmdError/contactNotFound``). :meth:`send` has since moved to
-        the structured form on main, so both paths now address by id; this
-        helper remains as the approval flow's self-contained send path and
-        the home of the display-name fallback below. A user who taps ✅
+        the structured form on main — unconditionally, which the daemon
+        rejects for display-name-addressed chats (see the fallback branch
+        below). This helper is therefore the approval flow's self-contained
+        send path for BOTH cases: structured for numeric refs, bare for
+        name-addressed chats. A user who taps ✅
         and sees no reply reads the tap
         as broken, so the approval flow must not depend on that branch.
 
         Chats with no numeric ``ChatRef`` — DMs addressed by display name —
-        fall back to :meth:`send`, which is the form that addresses them
-        correctly.
+        get the bare chat-command form composed inline below, because the
+        daemon rejects the structured form for them and :meth:`send` now
+        emits the structured form unconditionally.
         """
         chat_ref = self._chat_ref(chat_id)
         if not chat_ref:
-            return await self.send(chat_id, text, metadata=metadata)
+            # Display-name-addressed chat. The daemon REJECTS the structured
+            # form for these (``/_send @<name> json …`` → ``commandError:
+            # Failed reading: empty`` — verified live against v7.0.0.11,
+            # 2026-08-09), and :meth:`send` now composes the structured form
+            # unconditionally, so delegating there would lose the message
+            # outright. The bare chat-command form is the one the daemon
+            # accepts for name-addressed chats; its known limitation (the
+            # display-name lookup) is strictly better than a guaranteed
+            # rejection. Approval-flow messages must reach the chat, so the
+            # bare form is deliberate here.
+            await self._send_fire_and_forget(f"@{chat_id} {text}")
+            return SendResult(success=True)
         composed = json.dumps([{"msgContent": {"type": "text", "text": text}}])
         await self._send_fire_and_forget(f"/_send {chat_ref} json {composed}")
         return SendResult(success=True)

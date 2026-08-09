@@ -674,9 +674,15 @@ async def test_exec_approval_text_only_when_chat_id_is_a_display_name():
     assert result.success is True
     assert sent == []  # never touched /_send or /_reaction
     frame = json.loads(adapter._ws.send.call_args[0][0])
-    # send() moved to the structured form on main — display-name chats are
-    # addressed as ``/_send @<name> json [...]`` now, not bare ``@name text``.
-    assert frame["cmd"].startswith("/_send @alice json ")
+    # Deliberately the BARE form. The daemon rejects the structured
+    # ``/_send @<name> json …`` for display-name-addressed chats
+    # (``commandError: Failed reading: empty``, verified live against
+    # v7.0.0.11 on 2026-08-09), so the approval flow composes the bare
+    # chat command itself rather than delegating to ``send()``, whose
+    # unconditional structured form would lose the message outright.
+    # This assertion is the guard: if it starts failing, the fallback
+    # lane regressed to a form the daemon refuses.
+    assert frame["cmd"].startswith("@alice ")
     assert "tap a reaction" not in frame["cmd"]
     assert "/approve" in frame["cmd"]
 
