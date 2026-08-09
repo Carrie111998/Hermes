@@ -21,8 +21,10 @@ def make_audit(action: str = "event.append"):
     )
 
 
-def test_audit_chain_verifies_and_detects_tampering(tmp_path):
-    store = open_store(tmp_path / "state.db")
+def test_audit_chain_verifies_and_detects_tampering(write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
+    store = open_store(load_agentops_config(write_config()))
     store.append_audit(make_audit("event.append"))
     store.append_audit(make_audit("event.replayed"))
 
@@ -35,8 +37,10 @@ def test_audit_chain_verifies_and_detects_tampering(tmp_path):
     assert store.verify_audit_chain() is False
 
 
-def test_secret_audit_metadata_is_rejected_before_persistence(tmp_path):
-    store = open_store(tmp_path / "state.db")
+def test_secret_audit_metadata_is_rejected_before_persistence(write_config):
+    from plugins.agentops.control.config import load_agentops_config
+
+    store = open_store(load_agentops_config(write_config()))
     with pytest.raises(AuditValidationError):
         store.append_audit(
             AuditEvent.create(

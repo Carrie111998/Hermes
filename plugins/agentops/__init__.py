@@ -6,7 +6,7 @@ tools, lifecycle hooks, collectors, or any path that could affect a target.
 
 from __future__ import annotations
 
-from plugins.agentops.cli import agentops_command, register_cli
+from plugins.agentops.cli import agentops_main_command, register_cli
 
 
 def register(ctx) -> None:
@@ -15,6 +15,6 @@ def register(ctx) -> None:
         name="agentops",
         help="Observe-only AgentOps control-plane diagnostics",
         setup_fn=register_cli,
-        handler_fn=agentops_command,
+        handler_fn=agentops_main_command,
         description="Run the local observe-only AgentOps daemon or diagnostics.",
     )

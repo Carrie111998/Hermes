@@ -3,23 +3,26 @@
 | 字段 | 内容 |
 |---|---|
 | 范围 | Phase 1 control-plane foundation |
-| 状态 | 实施设计；本文件不安装服务、不执行迁移、不修改任何现有运行面 |
+| 状态 | Phase 1 实现已在隔离 worktree 完成，等待 G1 审阅；未安装服务、未执行生产迁移、未修改任何现有运行面 |
 | 默认状态目录 | `~/.hermes/agentops/`，仅在 Owner 显式启动 daemon 后创建 |
 | 默认权限 | `observe_only` |
 
 ## 1. Phase 1 可写边界
 
-在本阶段，控制面只可在显式配置的 AgentOps state directory 内创建下列文件：`state.db`、SQLite WAL/SHM、`event-spool/`、`event-spool/quarantine/`、短期备份文件和 UDS socket。它不得写入 Hermes 的 session `state.db`、Cron jobs、配置、日志、Gateway、LaunchAgent、代码仓库或业务数据。
+在本阶段，控制面只可在显式配置的专属 AgentOps state directory 内创建下列文件：`state.db`、SQLite WAL/SHM、`event-spool/`、`event-spool/quarantine/`、`backups/`、lock 和 UDS socket。该目录必须 canonicalize 后仍位于自身根中、由当前用户拥有、标记为 `.agentops-state`，且不是 symlink、Git worktree、Hermes 根状态目录或既有非-AgentOps 目录。`state.db`、spool 与 socket 必须分别是该根中的受控布局；否则 daemon 不启动 UDS，也不会打开 SQLite/WAL。
+
+它不得写入 Hermes 的 session `state.db`、Cron jobs、配置、日志、Gateway、LaunchAgent、代码仓库或业务数据。配置/路径安全失败是 **fail closed**：不会以“degraded UDS”方式接触外部 socket 或不受控数据库。
 
 插件 import 和 `agentops doctor` 均不得创建状态目录、数据库、socket 或后台线程。只有人工显式运行 `hermes agentops daemon --config <path>`（并在插件已被手动启用）才允许创建 AgentOps 自身状态。
 
 ## 2. 数据库迁移与备份
 
-1. Store 以 `schema_migrations` 的单调整型版本确认数据库版本。
-2. 新数据库从空状态创建 schema v1，并启用 WAL、foreign keys 和 `busy_timeout`。
-3. 将来升级已有数据库前，Store 使用 SQLite backup API 在同一 AgentOps 受控目录生成时间戳备份，完成校验后才运行迁移事务。
-4. 发现未知的未来 schema、损坏数据库或迁移异常时，daemon 不尝试修复或降级；它在 health 中记录安全启动原因，保持 `observe_only`。
-5. Phase 1 不承诺 downgrade migration。回滚采用停止对应 daemon、验证备份、恢复 AgentOps `state.db`，然后以旧二进制重新启动。恢复动作只可针对配置中的 AgentOps SQLite 路径，不能引用 Hermes 现有 `state.db`。
+1. Store 以 `schema_migrations(singleton=1, version)` 的单调版本确认数据库版本；缺失、重复、未来版本或迁移缺口都会拒绝。
+2. 新数据库从空状态创建 schema v1，并启用 WAL、foreign keys 和 `busy_timeout`。已有数据库先用只读连接完成 `integrity_check`、schema/version 和 audit-chain 预检，成功后才可切换 WAL。
+3. 审计 head sequence/hash 作为 metadata 与 audit entry 在同一 SQLite transaction 中更新；检验首序号、连续性、行数、尾 hash 与 metadata 必须全部一致。
+4. 备份仅可写入受控 `backups/`。恢复先在受控临时副本上做只读完整性/schema/version/audit 预检；成功后才原子替换。替换前会保留 pre-restore snapshot，重开失败必须以该快照回滚。
+5. 发现未知的未来 schema、损坏数据库、审计异常或迁移异常时，daemon 不尝试修复 Target；它以 `observe_only` degraded health 记录安全原因，或在路径安全失败时不启动。
+6. Phase 1 不承诺 downgrade migration。恢复动作只可针对配置中的 AgentOps SQLite 路径，不能引用 Hermes 现有 `state.db`。
 
 ## 3. Event spool 恢复
 
@@ -28,13 +31,13 @@ Event 先由 Producer 写入 AgentOps 自身 spool；文件名为 event ID，使
 1. 用 schema-v1 与 secret gate 验证事件。
 2. 通过 `event_id` 向 SQLite 幂等 append。
 3. 成功或重复后删除 spool 文件。
-4. 未知 schema、损坏 JSON 或无效事件进入 quarantine；若原始内容包含 Secret，只保存哈希和理由的脱敏 metadata，不保留原文。
+4. 未知 schema、损坏 JSON、非法 UTF-8 或无效事件进入 metadata-only quarantine；一律只保存内容 hash、大小、理由和 redacted 标志，绝不保留原始字节。
 
-spool 只提供本地崩溃恢复，不能触发 Target 行为。spool 超过配置预算时拒绝新事件并将控制面标为 degraded/observe-only，不丢失静默地转为写修复。
+spool 只提供本地崩溃恢复，不能触发 Target 行为。spool 与 quarantine 分别受容量预算限制；超限时拒绝新事件或显式记录脱敏 drop，并将控制面标为 degraded/observe-only，不会静默转为写修复。
 
 ## 4. daemon 启动、停止和未来 launchd
 
-Phase 1 仅允许测试或人工前台 daemon。没有 plist、没有 `launchctl bootstrap`、没有自动启动。
+Phase 1 仅允许测试或人工前台 daemon。没有 plist、没有 `launchctl bootstrap`、没有自动启动。daemon 必须持有独立进程锁；已有 socket 会先探测 health，存活实例拒绝第二实例，只有当前用户、受控目录且无监听的 stale UDS 才可由持锁实例清理。目录必须回读为 `0700`、socket 必须回读为 `0600`，任一 chmod/owner/symlink 检查失败均不启动 API。
 
 未来（不在本阶段）的 launchd 设计为：
 

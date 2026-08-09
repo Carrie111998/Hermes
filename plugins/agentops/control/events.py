@@ -45,7 +45,10 @@ def canonical_hash(value: Any) -> str:
 
 
 def _validate_json(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, bool)):
+    if value is None or isinstance(value, (int, bool)):
+        return value
+    if isinstance(value, str):
+        validate_string_value(value, required=False)
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -56,7 +59,9 @@ def _validate_json(value: Any) -> Any:
         for key, child in value.items():
             if not isinstance(key, str):
                 raise EventValidationError("event validation failed")
-            if _SECRET_KEY.search(key):
+            try:
+                validate_string_value(key, required=True)
+            except ValueError as exc:
                 raise EventValidationError("event validation failed")
             output[key] = _validate_json(child)
         return output
@@ -73,8 +78,20 @@ def contains_secret(value: Any) -> bool:
     return bool(_SECRET_VALUE.search(encoded))
 
 
-def contains_secret_blob(value: str) -> bool:
-    return bool(_SECRET_VALUE.search(value) or _SECRET_KEY.search(value))
+def validate_string_value(value: Any, *, required: bool) -> None:
+    """Reject secret-looking and non-text values without reflecting them."""
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise EventValidationError("event validation failed")
+    if _SECRET_KEY.search(value) or _SECRET_VALUE.search(value):
+        raise EventValidationError("event validation failed")
+
+
+def contains_secret_blob(value: bytes) -> bool:
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return bool(_SECRET_VALUE.search(decoded) or _SECRET_KEY.search(decoded))
 
 
 def validate_event_fields(
@@ -92,15 +109,22 @@ def validate_event_fields(
     if schema_version != 1 or not isinstance(redaction_version, int) or redaction_version < 1:
         raise EventValidationError("event validation failed")
     for value in (event_id, event_type, producer, target_id):
-        if not isinstance(value, str) or not _SAFE_ID.fullmatch(value):
+        try:
+            validate_string_value(value, required=True)
+        except ValueError as exc:
+            raise EventValidationError("event validation failed") from exc
+        if not _SAFE_ID.fullmatch(value):
             raise EventValidationError("event validation failed")
-    if correlation_id is not None and (not isinstance(correlation_id, str) or not _SAFE_ID.fullmatch(correlation_id)):
-        raise EventValidationError("event validation failed")
+    if correlation_id is not None:
+        try:
+            validate_string_value(correlation_id, required=True)
+        except ValueError as exc:
+            raise EventValidationError("event validation failed") from exc
+        if not _SAFE_ID.fullmatch(correlation_id):
+            raise EventValidationError("event validation failed")
     if not isinstance(occurred_at, datetime) or occurred_at.tzinfo is None:
         raise EventValidationError("event validation failed")
     _validate_json(payload)
-    if contains_secret(payload):
-        raise EventValidationError("event validation failed")
 
 
 class EventSpool:
@@ -114,11 +138,8 @@ class EventSpool:
     def _ensure_directories(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.root, 0o700)
-            os.chmod(self.quarantine_dir, 0o700)
-        except OSError:
-            pass
+        os.chmod(self.root, 0o700)
+        os.chmod(self.quarantine_dir, 0o700)
 
     def pending_paths(self) -> list[Path]:
         if not self.root.exists():
@@ -131,6 +152,25 @@ class EventSpool:
     def _size_bytes(self) -> int:
         return sum(path.stat().st_size for path in self.pending_paths())
 
+    def quarantine_size_bytes(self) -> int:
+        if not self.quarantine_dir.exists():
+            return 0
+        return sum(path.stat().st_size for path in self.quarantine_dir.glob("*.json") if path.is_file())
+
+    def total_size_bytes(self) -> int:
+        return self._size_bytes() + self.quarantine_size_bytes()
+
+    def healthy(self) -> bool:
+        return self.total_size_bytes() <= self.max_bytes and self.quarantine_size_bytes() <= self.max_bytes // 4
+
+    @staticmethod
+    def _fsync_parent(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def write(self, event: EventEnvelope) -> Path:
         payload = canonical_json(event.to_dict()).encode("utf-8")
         self._ensure_directories()
@@ -139,7 +179,7 @@ class EventSpool:
             if destination.read_bytes() == payload:
                 return destination
             raise EventValidationError("event validation failed")
-        if self._size_bytes() + len(payload) > self.max_bytes:
+        if self.total_size_bytes() + len(payload) > self.max_bytes:
             raise SpoolCapacityError("event spool capacity reached")
         temporary = self.root / f".{event.event_id}.tmp"
         try:
@@ -148,46 +188,60 @@ class EventSpool:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
+            self._fsync_parent(self.root)
             return destination
         finally:
             if temporary.exists():
                 temporary.unlink(missing_ok=True)
 
-    def _quarantine(self, path: Path, raw: str, reason: str) -> None:
+    def _quarantine(self, path: Path, raw: bytes, reason: str) -> bool:
         self._ensure_directories()
         destination = self.quarantine_dir / path.name
-        if contains_secret_blob(raw):
-            content = canonical_json(
-                {
-                    "reason": reason,
-                    "content_hash": "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                    "redacted": True,
-                }
-            )
-            temporary = self.quarantine_dir / f".{path.name}.tmp"
-            temporary.write_text(content, encoding="utf-8")
-            os.replace(temporary, destination)
+        content = canonical_json(
+            {
+                "reason": reason,
+                "content_hash": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+                "redacted": True,
+            }
+        ).encode("utf-8")
+        if self.quarantine_size_bytes() + len(content) > self.max_bytes // 4:
             path.unlink(missing_ok=True)
-            return
-        os.replace(path, destination)
+            self._fsync_parent(self.root)
+            return False
+        temporary = self.quarantine_dir / f".{path.name}.tmp"
+        with temporary.open("xb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        path.unlink(missing_ok=True)
+        self._fsync_parent(self.quarantine_dir)
+        self._fsync_parent(self.root)
+        return True
 
     def replay(self, store: EventStore) -> SpoolReplayResult:
-        appended = duplicates = quarantined = 0
+        appended = duplicates = quarantined = dropped = 0
         for path in self.pending_paths():
+            raw: bytes = b""
             try:
-                raw = path.read_text(encoding="utf-8")
-                event = EventEnvelope.from_dict(json.loads(raw))
+                raw = path.read_bytes()
+                decoded = raw.decode("utf-8")
+                event = EventEnvelope.from_dict(json.loads(decoded))
                 result = store.append_event(event)
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, EventValidationError, TypeError, AttributeError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, EventValidationError, TypeError, AttributeError, RuntimeError):
                 try:
-                    self._quarantine(path, locals().get("raw", ""), "event_invalid")
-                    quarantined += 1
+                    if self._quarantine(path, raw, "event_invalid"):
+                        quarantined += 1
+                    else:
+                        dropped += 1
                 except OSError:
                     pass
                 continue
             path.unlink(missing_ok=True)
+            self._fsync_parent(self.root)
             if result.inserted:
                 appended += 1
             else:
                 duplicates += 1
-        return SpoolReplayResult(appended=appended, duplicates=duplicates, quarantined=quarantined)
+        return SpoolReplayResult(appended=appended, duplicates=duplicates, quarantined=quarantined, dropped=dropped)

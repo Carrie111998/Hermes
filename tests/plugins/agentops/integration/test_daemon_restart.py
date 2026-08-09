@@ -30,7 +30,7 @@ def test_migration_failure_serves_safe_observe_only_health(tmp_path, monkeypatch
 
     config_path = write_config()
 
-    def fail_open_store(_path):
+    def fail_open_store(_config):
         raise StoreMigrationError("synthetic migration failure")
 
     monkeypatch.setattr(daemon, "open_store", fail_open_store)
@@ -47,7 +47,7 @@ def test_migration_failure_serves_safe_observe_only_health(tmp_path, monkeypatch
 def test_invalid_audit_chain_serves_safe_observe_only_health(tmp_path, write_config):
     config_path = write_config()
     config = load_agentops_config(config_path)
-    store = open_store(config.sqlite_path)
+    store = open_store(config)
     store.append_audit(
         AuditEvent.create(
             actor_type="system",

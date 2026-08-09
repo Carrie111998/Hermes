@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from plugins.agentops.control.config import load_agentops_config
 from plugins.agentops.control.models import AuthorityMode
 
@@ -43,5 +45,6 @@ def test_socket_outside_agentops_state_directory_is_rejected(tmp_path):
 
     config = load_agentops_config(path)
 
-    assert config.socket_path == config.state_dir / "agentops.sock"
-    assert "unsafe_socket_path" in config.safe_start_reasons
+    assert config.socket_path == Path("/private/tmp/not-agentops.sock")
+    assert "socket_outside_state_dir" in config.safe_start_reasons
+    assert config.state_dir_safe is False

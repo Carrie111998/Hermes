@@ -36,19 +36,21 @@ def write_config(tmp_path):
 
     def _write_config(*, state_dir=None, extra: str = ""):
         if state_dir is None:
-            state_dir = Path(tempfile.mkdtemp(prefix="agentops-", dir="/tmp"))
-            created_state_dirs.append(state_dir)
+            parent = Path(tempfile.mkdtemp(prefix="agentops-parent-", dir="/private/tmp"))
+            state_dir = parent / "state"
+            created_state_dirs.append(parent)
         path = tmp_path / "agentops.yaml"
-        socket_path = state_dir / "agentops.sock"
         path.write_text(
             "\n".join(
                 [
                     "schema_version: 1",
                     "control_plane:",
-                    f"  socket_path: {socket_path}",
+                    "  socket_path: agentops.sock",
                     "  event_spool_max_mb: 1",
                     "storage:",
-                    f"  sqlite_path: {state_dir / 'state.db'}",
+                    f"  state_dir: {state_dir}",
+                    "  sqlite_path: state.db",
+                    "  spool_dir: event-spool",
                     "safety:",
                     "  default_authority: observe_only",
                     "  global_write_enabled: false",
@@ -58,6 +60,9 @@ def write_config(tmp_path):
             ),
             encoding="utf-8",
         )
+        from plugins.agentops.control.config import initialize_state_dir, load_agentops_config
+
+        initialize_state_dir(load_agentops_config(path))
         return path
 
     yield _write_config

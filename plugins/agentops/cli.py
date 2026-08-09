@@ -28,12 +28,26 @@ def doctor_report(config_path: Path) -> dict[str, Any]:
     config = load_agentops_config(Path(config_path))
     inspection = inspect_store(config.sqlite_path)
     daemon_health: dict[str, Any] | None = None
-    if config.socket_path.exists():
+    if config.state_dir_safe and config.socket_path.exists():
         try:
             daemon_health = request_health(config.socket_path)
         except (OSError, RuntimeError, ValueError):
             daemon_health = {"available": False}
-    status = "ok" if inspection.exists and inspection.audit_chain_valid is True and daemon_health else "degraded"
+    daemon_ready = bool(
+        daemon_health
+        and daemon_health.get("ready") is True
+        and daemon_health.get("store_available") is True
+        and daemon_health.get("audit_chain_valid") is True
+        and daemon_health.get("spool_healthy") is True
+        and not daemon_health.get("safe_start_reasons")
+    )
+    status = "ok" if (
+        not config.safe_start_reasons
+        and inspection.exists
+        and inspection.integrity_ok is True
+        and inspection.audit_chain_valid is True
+        and daemon_ready
+    ) else "degraded"
     return {
         "status": status,
         "authority_mode": "observe_only",
@@ -45,6 +59,8 @@ def doctor_report(config_path: Path) -> dict[str, Any]:
             "schema_version": inspection.schema_version,
             "audit_chain_valid": inspection.audit_chain_valid,
             "event_count": inspection.event_count,
+            "integrity_ok": inspection.integrity_ok,
+            "error": inspection.error,
         },
         "daemon": daemon_health,
     }
@@ -69,3 +85,10 @@ def agentops_command(args: argparse.Namespace) -> int:
             return 0
     print("usage: hermes agentops {daemon,doctor}")
     return 2
+
+
+def agentops_main_command(args: argparse.Namespace) -> None:
+    """Preserve meaningful exit status even on Hermes CLI versions ignoring returns."""
+    code = agentops_command(args)
+    if code:
+        raise SystemExit(code)
