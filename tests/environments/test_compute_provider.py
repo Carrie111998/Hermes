@@ -300,7 +300,7 @@ def test_modal_transport_backend_captures_through_native_cua_window_state() -> N
     ]
     backend = _TransportComputerBackend(transport)
 
-    capture = backend.capture()
+    capture = backend.capture(app="chromium")
 
     assert [call.args[0] for call in transport.call_tool.call_args_list] == [
         "list_windows", "get_window_state",
@@ -320,23 +320,75 @@ def test_modal_transport_backend_captures_through_native_cua_window_state() -> N
 
 def test_modal_transport_backend_capture_falls_back_to_the_desktop_screenshot() -> None:
     transport = Mock()
-    transport.call_tool.side_effect = [
-        {"structuredContent": {"windows": []}},
-        {
-            "content": [{"type": "image", "data": "DESKTOPPNG", "mimeType": "image/png"}],
-            "structuredContent": {"screenshot_width": 1024, "screenshot_height": 768},
-        },
-    ]
+    transport.call_tool.return_value = {
+        "content": [{"type": "image", "data": "DESKTOPPNG", "mimeType": "image/png"}],
+        "structuredContent": {"screenshot_width": 1024, "screenshot_height": 768},
+    }
     backend = _TransportComputerBackend(transport)
 
     capture = backend.capture()
 
     assert [call.args[0] for call in transport.call_tool.call_args_list] == [
-        "list_windows", "get_desktop_state",
+        "get_desktop_state",
     ]
     assert (capture.width, capture.height) == (1024, 768)
     assert capture.png_b64 == "DESKTOPPNG"
     assert capture.elements == []
+
+
+def test_modal_transport_backend_desktop_capture_drives_desktop_scoped_actions() -> None:
+    def respond(tool, arguments):
+        if tool == "get_desktop_state":
+            return {
+                "content": [{"type": "image", "data": "DESKTOPPNG", "mimeType": "image/png"}],
+                "structuredContent": {"screenshot_width": 1280, "screenshot_height": 800},
+            }
+        if tool == "list_windows":
+            return _hn_window_listing()
+        return {"structuredContent": {"ok": True}}
+
+    transport = Mock()
+    transport.call_tool.side_effect = respond
+    backend = _TransportComputerBackend(transport)
+
+    backend.capture()
+    backend.click(x=10, y=20)
+    backend.type_text("Microsoft Edge")
+    backend.key("ctrl+l")
+    backend.key("Return")
+    backend.scroll(direction="down", amount=2)
+    backend.drag(from_xy=(1, 2), to_xy=(3, 4))
+
+    calls = transport.call_tool.call_args_list
+    assert calls[0].args == ("get_desktop_state", {})
+    assert calls[1].args == ("click", {"scope": "desktop", "button": "left", "x": 10.0, "y": 20.0})
+    assert calls[2].args == ("type_text", {"scope": "desktop", "text": "Microsoft Edge"})
+    assert calls[3].args == ("hotkey", {"scope": "desktop", "keys": ["ctrl", "l"]})
+    assert calls[4].args == ("press_key", {"scope": "desktop", "key": "Return"})
+    assert calls[5].args == ("scroll", {"scope": "desktop", "direction": "down", "amount": 2})
+    assert calls[6].args == ("drag", {
+        "scope": "desktop", "from_x": 1.0, "from_y": 2.0, "to_x": 3.0, "to_y": 4.0,
+    })
+
+
+def test_modal_transport_backend_ignores_driver_overlay_as_window_target() -> None:
+    transport = Mock()
+    transport.call_tool.side_effect = [
+        {"structuredContent": {"windows": [
+            {"app_name": "cua-driver.exe", "title": "Cua.AgentCursorOverlay.default",
+             "pid": 4184, "window_id": 196822, "is_on_screen": True},
+            {"app_name": "explorer.exe", "title": "Program Manager",
+             "pid": 5380, "window_id": 65822, "is_on_screen": True},
+        ]}},
+        {"structuredContent": {"ok": True}},
+    ]
+    backend = _TransportComputerBackend(transport)
+
+    backend.click(element=1)
+
+    assert transport.call_tool.call_args_list[1].args == ("click", {
+        "pid": 5380, "window_id": 65822, "button": "left", "element_index": 1,
+    })
 
 
 def test_modal_transport_backend_capture_waits_for_an_expected_window() -> None:

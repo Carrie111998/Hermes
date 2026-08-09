@@ -43,6 +43,7 @@ class _TransportComputerBackend(ComputerUseBackend):
         # (pid, window_id) the driver's window-scoped input tools require.
         # Primed by capture()/focus_app(), lazily resolved otherwise.
         self._window_target: Optional[Tuple[int, int]] = None
+        self._desktop_target = False
 
     def start(self) -> None:
         self.transport.start()
@@ -65,7 +66,9 @@ class _TransportComputerBackend(ComputerUseBackend):
             raise ValueError("capture targeting requires both pid and window_id")
 
         expects_window = app is not None or pid is not None
-        attempts = _WINDOW_WAIT_ATTEMPTS if expects_window else 1
+        if not expects_window:
+            return self._capture_desktop(mode=mode, app=app)
+        attempts = _WINDOW_WAIT_ATTEMPTS
         target = None
         for attempt in range(attempts):
             if attempt:
@@ -82,6 +85,7 @@ class _TransportComputerBackend(ComputerUseBackend):
         if target_pid is None or target_window_id is None:
             raise RuntimeError("CUA list_windows returned a target without pid/window_id")
         self._window_target = (target_pid, target_window_id)
+        self._desktop_target = False
 
         result = self.transport.call_tool(
             "get_window_state", {"pid": target_pid, "window_id": target_window_id},
@@ -114,6 +118,8 @@ class _TransportComputerBackend(ComputerUseBackend):
         Reporting the real (possibly empty) screen beats the 0x0 result this
         used to return, which read as a dead desktop.
         """
+        self._window_target = None
+        self._desktop_target = True
         result = self.transport.call_tool("get_desktop_state", {})
         data = _result_data(result)
         png_b64, image_mime_type = _image_from_result(result, data)
@@ -154,9 +160,12 @@ class _TransportComputerBackend(ComputerUseBackend):
         return self._window_target
 
     def _targeted_arguments(self, delivery_mode: Optional[str],
-                            bring_to_front: bool) -> Dict[str, Any]:
-        pid, window_id = self._action_target()
-        arguments: Dict[str, Any] = {"pid": pid, "window_id": window_id}
+                            bring_to_front: bool, *, allow_desktop: bool = False) -> Dict[str, Any]:
+        if allow_desktop and self._desktop_target:
+            arguments: Dict[str, Any] = {"scope": "desktop"}
+        else:
+            pid, window_id = self._action_target()
+            arguments = {"pid": pid, "window_id": window_id}
         if delivery_mode:
             arguments["delivery_mode"] = delivery_mode
         elif bring_to_front:
@@ -170,7 +179,9 @@ class _TransportComputerBackend(ComputerUseBackend):
               modifiers: Optional[List[str]] = None, delivery_mode: Optional[str] = None,
               bring_to_front: bool = False) -> ActionResult:
         del modifiers  # the driver's click has no modifier field
-        arguments = self._targeted_arguments(delivery_mode, bring_to_front)
+        arguments = self._targeted_arguments(
+            delivery_mode, bring_to_front, allow_desktop=element is None,
+        )
         arguments["button"] = button or "left"
         if int(click_count or 1) != 1:
             arguments["count"] = int(click_count)
@@ -190,7 +201,9 @@ class _TransportComputerBackend(ComputerUseBackend):
         del from_element, to_element  # AT-SPI elements carry no bounds to drag between
         if not from_xy or not to_xy:
             raise ValueError("drag on the Modal desktop requires from/to coordinates")
-        arguments = self._targeted_arguments(delivery_mode, bring_to_front)
+        arguments = self._targeted_arguments(
+            delivery_mode, bring_to_front, allow_desktop=True,
+        )
         arguments.update({
             "from_x": float(from_xy[0]), "from_y": float(from_xy[1]),
             "to_x": float(to_xy[0]), "to_y": float(to_xy[1]),
@@ -206,7 +219,9 @@ class _TransportComputerBackend(ComputerUseBackend):
                modifiers: Optional[List[str]] = None, delivery_mode: Optional[str] = None,
                bring_to_front: bool = False) -> ActionResult:
         del modifiers  # the driver's scroll has no modifier field
-        arguments = self._targeted_arguments(delivery_mode, bring_to_front)
+        arguments = self._targeted_arguments(
+            delivery_mode, bring_to_front, allow_desktop=element is None,
+        )
         arguments["direction"] = direction
         arguments["amount"] = max(1, min(50, int(amount or 3)))
         if element is not None:
@@ -218,7 +233,9 @@ class _TransportComputerBackend(ComputerUseBackend):
 
     def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
                   bring_to_front: bool = False) -> ActionResult:
-        arguments = self._targeted_arguments(delivery_mode, bring_to_front)
+        arguments = self._targeted_arguments(
+            delivery_mode, bring_to_front, allow_desktop=True,
+        )
         arguments["text"] = text
         return self._invoke("type_text", arguments)
 
@@ -227,7 +244,9 @@ class _TransportComputerBackend(ComputerUseBackend):
         # Hermes sends one string ("ctrl+l", "Return"); the driver splits the
         # surface into hotkey (combo array, min 2) and press_key (single key).
         parts = [part.strip() for part in str(keys).split("+") if part.strip()]
-        arguments = self._targeted_arguments(delivery_mode, bring_to_front)
+        arguments = self._targeted_arguments(
+            delivery_mode, bring_to_front, allow_desktop=True,
+        )
         if len(parts) >= 2:
             arguments["keys"] = parts
             return self._invoke("hotkey", arguments)
@@ -254,6 +273,7 @@ class _TransportComputerBackend(ComputerUseBackend):
         if target_pid is None or target_window_id is None:
             raise RuntimeError(f"no window found for app {app!r}")
         self._window_target = (target_pid, target_window_id)
+        self._desktop_target = False
         return self._invoke("bring_to_front", {"pid": target_pid, "window_id": target_window_id})
 
     def launch_app(
@@ -348,7 +368,14 @@ def _capture_target(
             window for window in candidates
             if needle in str(window.get("app_name", window.get("app", ""))).casefold()
         ]
+    else:
+        candidates = [window for window in candidates if not _is_driver_overlay(window)]
     return candidates[0] if candidates else None
+
+
+def _is_driver_overlay(window: Mapping[str, Any]) -> bool:
+    title = str(window.get("title", "")).casefold()
+    return "cua.agentcursoroverlay" in title
 
 
 def _image_from_result(
