@@ -162,7 +162,9 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     entry = json.loads((home / "skills" / ".hub" / "lock.json").read_text())["installed"]["demo-bundle"]
     assert entry["scan_provenance"]["source_url"] == url
     assert entry["scan_provenance"]["fresh"] is True
-    assert "Scan provenance: fresh" in sink.getvalue()
+    output = sink.getvalue()
+    assert "Scan provenance: fresh" in output
+    assert "Raw SKILL.md URLs cannot enumerate sibling files" in output
 
 
 def test_bundled_optional_source_still_includes_support_files(tmp_path, monkeypatch):
