@@ -464,3 +464,60 @@ def test_start_new_attempt_clears_stale_candidate(kanban_home_fixture):
     assert st.get("unit_name") is None
     assert st.get("unit_started") is False
     assert st.get("spawn_pending") is True
+
+
+def test_resolve_reconcile_candidate_head_equals_base_is_not_candidate():
+    state = {
+        "phase": ex.PHASE_RUNNING,
+        "unit_started": True,
+        "base_commit": "abc123",
+        "repo_path": "/tmp/repo",
+    }
+    with patch.object(ex, "git_head_sha", return_value="abc123"):
+        candidate, unit_started = ex.resolve_reconcile_candidate(state)
+    assert candidate is None
+    assert unit_started is True
+
+
+def test_reconcile_head_equals_base_retries_not_verify():
+    state = {
+        "phase": ex.PHASE_RUNNING,
+        "unit_started": True,
+        "base_commit": "abc123",
+        "repo_path": "/tmp/repo",
+    }
+    with patch.object(ex, "git_head_sha", return_value="abc123"):
+        candidate, unit_started = ex.resolve_reconcile_candidate(state)
+    decision = ex.reconcile_task_state(
+        state,
+        unit_active=False,
+        pid_match=False,
+        candidate_commit=candidate,
+        unit_started=unit_started,
+        attempts_used=1,
+        max_attempts=2,
+    )
+    assert decision.action == "retry"
+    assert decision.phase == ex.PHASE_RUNNING
+
+
+def test_reconcile_head_equals_base_blocks_when_attempts_exhausted():
+    state = {
+        "phase": ex.PHASE_RUNNING,
+        "unit_started": True,
+        "base_commit": "abc123",
+        "repo_path": "/tmp/repo",
+    }
+    with patch.object(ex, "git_head_sha", return_value="abc123"):
+        candidate, unit_started = ex.resolve_reconcile_candidate(state)
+    decision = ex.reconcile_task_state(
+        state,
+        unit_active=False,
+        pid_match=False,
+        candidate_commit=candidate,
+        unit_started=unit_started,
+        attempts_used=2,
+        max_attempts=2,
+    )
+    assert decision.action == "block"
+    assert decision.reason == "executor_restarted"

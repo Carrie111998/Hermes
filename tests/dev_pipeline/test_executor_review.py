@@ -74,11 +74,14 @@ def test_kimi_grok_invocations_mocked_at_subprocess_boundary(kanban_home, tmp_pa
     kimi_mock = MagicMock(return_value=type("P", (), {"stdout": verdict, "stderr": ""})())
     grok_mock = MagicMock(return_value=type("P", (), {"stdout": verdict, "stderr": ""})())
 
-    with patch.object(ex, "unified_diff", return_value="diff"):
-        with patch.object(ex, "hermes_chat_review", kimi_mock):
-            with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
-                with patch.object(ex, "run_subprocess", grok_mock):
-                    executor._phase_reviewing(conn, task_id, run.id, meta, ex.pipeline_state(meta))
+    with patch.object(ex, "git_head_sha", return_value=None):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(ex, "hermes_chat_review", kimi_mock):
+                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                    with patch.object(ex, "run_subprocess", grok_mock):
+                        executor._phase_reviewing(
+                            conn, task_id, run.id, meta, ex.pipeline_state(meta)
+                        )
 
     kimi_mock.assert_called_once()
     grok_mock.assert_called_once()

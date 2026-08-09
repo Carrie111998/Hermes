@@ -329,15 +329,21 @@ def resolve_reconcile_candidate(state: Mapping[str, Any]) -> tuple[Optional[str]
     unit_started = bool(state.get("unit_started"))
     phase = state.get("phase")
     candidate = state.get("candidate_commit")
+    base = state.get("base_commit")
     if phase == PHASE_RUNNING and not unit_started:
         return None, False
     repo_path = state.get("repo_path")
     if unit_started and repo_path:
         head = git_head_sha(Path(str(repo_path)))
-        if head:
+        if head and base and head == base:
+            return None, True
+        if head and (not base or head != base):
             return head, True
     if candidate and unit_started:
-        return str(candidate), True
+        cand = str(candidate)
+        if base and cand == base:
+            return None, True
+        return cand, True
     return None, unit_started
 
 
@@ -2025,7 +2031,8 @@ class DevExecutor:
         logs_root = Path(str(st.get("logs_root") or ""))
         logs_root.mkdir(parents=True, exist_ok=True)
         base = str(st.get("base_commit") or "")
-        candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
+        head = git_head_sha(repo_dir)
+        candidate = str(head or st.get("candidate_commit") or "")
         full_diff = unified_diff(repo_dir, base, candidate)
         if self._scan_and_quarantine_diff(full_diff, logs_root):
             block_dev_task(
@@ -2145,7 +2152,8 @@ class DevExecutor:
         logs_root.mkdir(parents=True, exist_ok=True)
         branch = str(st.get("dev_branch") or f"hermes-dev/{task_id}")
         base = str(st.get("base_commit") or "")
-        candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
+        head = git_head_sha(repo_dir)
+        candidate = str(head or st.get("candidate_commit") or "")
         diff = unified_diff(repo_dir, base, candidate)
         task = kb.get_task(conn, task_id)
         body = parse_task_body(task.body if task else None)
