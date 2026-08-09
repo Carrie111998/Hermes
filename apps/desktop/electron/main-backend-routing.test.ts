@@ -228,6 +228,32 @@ test('hermes:backend:touch refreshes pooled explicit root rails through the main
   assert.equal(hooks.backendPool.get('writer')?.lastActiveAt, 4)
 })
 
+test('hermes:backend:touch keeps explicit root rail touches isolated through the main IPC handler', async () => {
+  const main = await importMainForTest()
+  const hooks = main.__backendRoutingTestHooks
+
+  assert.ok(hooks, 'main.ts must expose its backend routing test hooks')
+
+  hooks.backendPool.clear()
+  hooks.backendPool.set('default', { lastActiveAt: 1 })
+  hooks.backendPool.set('local:default', { lastActiveAt: 2 })
+  hooks.backendPool.set('remote:default', { lastActiveAt: 3 })
+  hooks.backendPool.set('writer', { lastActiveAt: 4 })
+
+  const handler = electronMock.handlers.get('hermes:backend:touch')
+
+  assert.equal(typeof handler, 'function')
+  assert.deepEqual(await handler?.({}, 'default', { remoteOnly: true }), { ok: true })
+
+  const touchedAt = hooks.backendPool.get('remote:default')?.lastActiveAt
+
+  assert.ok(touchedAt > 4)
+  assert.equal(hooks.backendPool.get('default')?.lastActiveAt, 1)
+  assert.equal(hooks.backendPool.get('local:default')?.lastActiveAt, 2)
+  assert.equal(hooks.backendPool.get('remote:default')?.lastActiveAt, touchedAt)
+  assert.equal(hooks.backendPool.get('writer')?.lastActiveAt, 4)
+})
+
 test('main resolveRemoteBackend remoteOnly uses the saved global remote while the primary mode is local', async () => {
   const main = await importMainForTest()
   const hooks = main.__backendRoutingTestHooks

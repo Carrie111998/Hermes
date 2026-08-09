@@ -8212,13 +8212,17 @@ async function ensureBackend(profile, options = {}) {
 // renderer calls this when it opens a profile's chat WS and periodically while
 // streaming, since the main process can't see the direct renderer↔backend WS.
 function touchPoolBackend(profile, options) {
-  const key = backendPoolTargetKey(profile, options)
-  const entry = backendPool.get(key)
+  const targeted = Boolean(options) && (Reflect.get(options, 'localOnly') === true || Reflect.get(options, 'remoteOnly') === true)
 
-  if (entry) {
-    entry.lastActiveAt = Date.now()
+  if (targeted) {
+    const key = backendPoolTargetKey(profile, options)
+    const entry = backendPool.get(key)
 
-    return
+    if (entry) {
+      entry.lastActiveAt = Date.now()
+
+      return
+    }
   }
 
   touchBackendPoolEntries(backendPool, profile, Date.now())
