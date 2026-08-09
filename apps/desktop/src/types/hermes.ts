@@ -449,6 +449,7 @@ export interface PaginatedSessions {
 export interface RpcEvent<T = unknown> {
   payload?: T
   profile?: string
+  targetKey?: string
   session_id?: string
   type: string
 }

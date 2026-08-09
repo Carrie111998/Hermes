@@ -21,6 +21,7 @@ import {
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
+  sessionGatewayRetentionKey,
   setPrimaryBackendMode,
   setPrimaryGateway,
   touchSecondaryGateways
@@ -428,7 +429,7 @@ export function useGatewayBoot({
     const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
+      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile, targetKey: sourceProfile })
     )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
@@ -464,7 +465,7 @@ export function useGatewayBoot({
 
       for (const session of $sessions.get()) {
         if (live.has(session.id)) {
-          keep.add(normalizeProfileKey(session.profile))
+          keep.add(sessionGatewayRetentionKey(session.profile, session.id))
         }
       }
 

@@ -5,6 +5,7 @@ import { HermesGateway } from '@/hermes'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setGatewayState } from '@/store/session'
+import type { RpcEvent } from '@/types/hermes'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
 // Concurrent sessions across profiles need concurrent sockets: the renderer's
@@ -95,7 +96,7 @@ function resolvedTargetKey(
 const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionState === 'open'
 
 interface RegistryConfig {
-  onEvent: (event: GatewayEvent) => void
+  onEvent: (event: RpcEvent) => void
 }
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
@@ -134,6 +135,8 @@ interface GatewayRegistryState {
   activeKey: string
   activeProfile: string
   activeTargetMode: GatewayTargetMode
+  runtimeTargetKeys: Map<string, string>
+  storedTargetKeys: Map<string, string>
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
 }
@@ -149,6 +152,8 @@ function createRegistryState(): GatewayRegistryState {
     activeKey: 'default',
     activeProfile: 'default',
     activeTargetMode: 'plain',
+    runtimeTargetKeys: new Map<string, string>(),
+    storedTargetKeys: new Map<string, string>(),
     secondaries: new Map<string, Secondary>(),
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
@@ -194,7 +199,7 @@ export function configureGatewayRegistry(cfg: RegistryConfig): void {
  * registry is configured.
  */
 export function emitLocalGatewayEvent(event: GatewayEvent): void {
-  g.config?.onEvent(event)
+  g.config?.onEvent(event as RpcEvent)
 }
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
@@ -206,6 +211,38 @@ export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'defa
 export function setPrimaryBackendMode(mode: BackendMode): void {
   g.primaryBackendMode = mode
   syncActiveTarget()
+}
+
+export function activeGatewayTargetOptions(): GatewayProfileOptions {
+  return targetOptions(g.activeTargetMode)
+}
+
+export function rememberGatewayRuntimeTarget(runtimeSessionId: string, key: string): void {
+  if (!runtimeSessionId) {
+    return
+  }
+
+  g.runtimeTargetKeys.set(runtimeSessionId, key)
+}
+
+export function bindStoredSessionGatewayTarget(runtimeSessionId: string, storedSessionId: null | string | undefined): void {
+  const storedId = storedSessionId?.trim()
+
+  if (!storedId) {
+    return
+  }
+
+  g.storedTargetKeys.set(storedId, g.runtimeTargetKeys.get(runtimeSessionId) ?? g.activeKey)
+}
+
+export function sessionGatewayRetentionKey(profile: null | string | undefined, storedSessionId: null | string | undefined): string {
+  const key = normKey(profile)
+
+  if (key !== 'default') {
+    return key
+  }
+
+  return storedSessionId?.trim() ? (g.storedTargetKeys.get(storedSessionId.trim()) ?? key) : key
 }
 
 export function isActivePrimary(): boolean {
@@ -333,7 +370,7 @@ function createSecondary(key: string, profile: string, mode: GatewayTargetMode =
     wantOpen: true
   }
 
-  entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
+  entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile, targetKey: key }))
   entry.offState = gateway.onState(state => {
     reportGatewayState(key, state)
 
@@ -481,7 +518,7 @@ function disposeSecondary(entry: Secondary): void {
 // (profiles with a running / needs-input session). Bounds cost to live work.
 export function pruneSecondaryGateways(keep: Set<string>): void {
   for (const [key, entry] of [...g.secondaries]) {
-    if (key === g.activeKey || keep.has(key) || keep.has(entry.profile)) {
+    if (key === g.activeKey || keep.has(key)) {
       continue
     }
 

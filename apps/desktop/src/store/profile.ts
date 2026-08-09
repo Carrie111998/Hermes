@@ -11,7 +11,13 @@ import {
   storedStringArray,
   storedStringRecord
 } from '@/lib/storage'
-import { $gateway, ensureGatewayForProfile, openGatewayForProfile, type GatewayProfileOptions } from '@/store/gateway'
+import {
+  $gateway,
+  activeGatewayTargetOptions,
+  ensureGatewayForProfile,
+  openGatewayForProfile,
+  type GatewayProfileOptions
+} from '@/store/gateway'
 import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
@@ -511,5 +517,8 @@ export function touchActiveGatewayBackend(): void {
   // Always ping: the main process no-ops for non-pool (primary) backends, so we
   // don't need to know which profile is primary from here.
   const target = normalizeProfileKey($activeGatewayProfile.get())
-  void window.hermesDesktop?.touchBackend?.(target).catch(() => undefined)
+  const options = activeGatewayTargetOptions()
+  void window.hermesDesktop
+    ?.touchBackend?.(target, options.localOnly || options.remoteOnly ? options : undefined)
+    .catch(() => undefined)
 }

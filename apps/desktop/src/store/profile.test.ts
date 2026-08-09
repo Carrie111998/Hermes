@@ -8,10 +8,11 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const activeGatewayTargetOptions = vi.fn(() => ({}))
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForProfile, openGatewayForProfile }))
+vi.mock('@/store/gateway', () => ({ $gateway, activeGatewayTargetOptions, ensureGatewayForProfile, openGatewayForProfile }))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
@@ -19,7 +20,15 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/lib/query-client', () => ({ invalidateProfileScopedQueries: vi.fn() }))
 vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
-const { $activeGatewayProfile, $profiles, ensureGatewayProfile, prewarmProfileBackend, refreshProfiles, selectProfile } =
+const {
+  $activeGatewayProfile,
+  $profiles,
+  ensureGatewayProfile,
+  prewarmProfileBackend,
+  refreshProfiles,
+  selectProfile,
+  touchActiveGatewayBackend
+} =
   await import('./profile')
 
 const { $connection } = await import('./session')
@@ -45,18 +54,22 @@ const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
 const getConnection = vi.fn<
   (profile?: string | null, options?: { localOnly?: boolean; remoteOnly?: boolean }) => Promise<HermesConnection>
 >()
+const touchBackend = vi.fn(async () => ({ ok: true }))
 
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
   openGatewayForProfile.mockClear()
+  activeGatewayTargetOptions.mockReset()
+  activeGatewayTargetOptions.mockReturnValue({})
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
   vi.mocked(getProfiles).mockReset()
   vi.mocked(getProfiles).mockResolvedValue({ profiles: [] })
-  vi.stubGlobal('window', { hermesDesktop: { getConnection } })
+  touchBackend.mockClear()
+  vi.stubGlobal('window', { hermesDesktop: { getConnection, touchBackend } })
   vi.mocked(invalidateProfileScopedQueries).mockClear()
   resetStarmapGraph.mockClear()
 })
@@ -199,6 +212,18 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     openGatewayForProfile.mockRejectedValueOnce(new Error('spawn failed'))
 
     expect(() => prewarmProfileBackend('warm-failing')).not.toThrow()
+  })
+})
+
+describe('touchActiveGatewayBackend', () => {
+  it('passes the explicit remote root target through the desktop touch API', async () => {
+    $activeGatewayProfile.set('default')
+    activeGatewayTargetOptions.mockReturnValue({ remoteOnly: true })
+
+    touchActiveGatewayBackend()
+    await Promise.resolve()
+
+    expect(touchBackend).toHaveBeenCalledWith('default', { remoteOnly: true })
   })
 })
 

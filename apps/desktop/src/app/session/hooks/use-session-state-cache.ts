@@ -6,6 +6,7 @@ import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { bindStoredSessionGatewayTarget } from '@/store/gateway'
 import {
   $activeSessionId,
   $busy,
@@ -296,10 +297,12 @@ export function useSessionStateCache({
       // storedSessionId rotated); the caller gets its return value from the
       // cache, so stale reads don't regress.
       if (next === previous) {
+        bindStoredSessionGatewayTarget(sessionId, storedSessionId ?? previous.storedSessionId)
         return previous
       }
 
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
+      bindStoredSessionGatewayTarget(sessionId, next.storedSessionId)
       // Crash-survivable turn progress: journal the running turn's visible
       // tail (throttled localStorage write; cleared the moment the turn
       // settles) so a renderer/app death mid-turn can be recovered on resume.
