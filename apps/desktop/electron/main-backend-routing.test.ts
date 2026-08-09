@@ -70,6 +70,7 @@ const electronMock = vi.hoisted(() => {
         commandLine: {
           appendSwitch: vi.fn()
         },
+        disableHardwareAcceleration: vi.fn(),
         exit: vi.fn(),
         getAppPath: vi.fn(() => path.resolve(__dirname, '..')),
         getLocale: vi.fn(() => 'en-US'),
