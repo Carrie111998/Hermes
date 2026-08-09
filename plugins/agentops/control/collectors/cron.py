@@ -56,10 +56,12 @@ class CronCollector:
         self._source_loader = None
         self.source_path = Path(source_path)
         self.source_id = asset_source_id(self.source_path)
-        self.required_assertion_ids = frozenset(required_assertion_ids)
-        if len(self.required_assertion_ids) != len(required_assertion_ids):
+        configured = frozenset(required_assertion_ids)
+        if len(configured) != len(required_assertion_ids):
             raise ValueError("duplicate cron assertion id")
         self.review_pack = review_pack if review_pack is not None else load_review_pack()
+        self._caller_required_ids = configured
+        self.required_assertion_ids = configured | {"cron_business_assertion_fresh"}
         self.max_assertions = max_assertions
         self.max_bytes = max_bytes
         self.min_interval_seconds = min_interval_seconds
@@ -100,6 +102,7 @@ class CronCollector:
                 observed_at=datetime.fromisoformat(execution_data["observed_at"].replace("Z", "+00:00")),
                 exit_code=execution_data.get("exit_code"),
                 completed=execution_data["completed"],
+                max_age_seconds=execution_data.get("max_age_seconds", 300),
             )
             assertions = tuple(
                 BusinessAssertion(
@@ -282,7 +285,7 @@ class CronCollector:
         elif not execution_fresh:
             reason = "cron_execution_stale"
         elif failures:
-            reason = "cron_assertions_missing" if not self.required_assertion_ids else "cron_business_assertions_unhealthy"
+            reason = "cron_assertions_missing" if not self._caller_required_ids else "cron_business_assertions_unhealthy"
         return CollectionBatch(
             target_id=target.target_id,
             collector=self.name,

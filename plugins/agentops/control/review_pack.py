@@ -142,6 +142,8 @@ def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: R
     for name, value in (("max_bytes", spec.max_bytes), ("max_items", spec.max_items), ("min_interval_seconds", spec.rate_limit_seconds)):
         if name in runtime and name in {"max_bytes", "max_items"} and int(runtime[name]) > int(value):
             raise ManifestValidationError("runtime collector budget exceeds pack")
+        if name == "min_interval_seconds" and name in runtime and float(runtime[name]) < spec.rate_limit_seconds:
+            raise ManifestValidationError("runtime collector rate below pack")
         runtime.setdefault(name, value)
     runtime.pop("target_kind", None)
     try:

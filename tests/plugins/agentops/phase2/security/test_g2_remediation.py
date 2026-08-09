@@ -425,3 +425,29 @@ def test_process_zero_match_and_launchd_label_mismatch_are_unhealthy(tmp_path):
 def test_review_pack_factory_applies_runtime_target_and_budget(tmp_path):
     pack = load_review_pack()
     with pytest.raises(ManifestValidationError): build_collector("logs", target_kind=TargetKind.CRON, pack=pack, name="logs", path=tmp_path/"x", max_bytes=pack.collectors["logs"].max_bytes+1)
+
+
+def test_legacy_v1_secret_is_rejected_before_migration(write_config):
+    config = load_agentops_config(write_config()); path = config.state_dir / "observer.db"; db = sqlite3.connect(path)
+    db.executescript('''CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES (1); CREATE TABLE target_snapshots(target_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, facts_json TEXT NOT NULL, collector_version TEXT NOT NULL); CREATE TABLE signals(signal_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, collector TEXT NOT NULL, signal_type TEXT NOT NULL, observed_at TEXT NOT NULL, severity TEXT NOT NULL, redaction_version INTEGER NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE collector_cursors(target_id TEXT NOT NULL, collector TEXT NOT NULL, inode INTEGER NOT NULL, offset INTEGER NOT NULL, PRIMARY KEY(target_id,collector)); INSERT INTO signals VALUES ('sha256:x','hermes:profile:x:gateway','c','t','2026-01-01T00:00:00+00:00','warning',1,'{"password":"hunter2"}');''')
+    db.commit(); db.close(); path.chmod(0o600)
+    with pytest.raises(ObserverStoreError): open_observer_store(config)
+
+
+def test_cursor_truncate_reset_and_cross_source_independence(tmp_path, write_config):
+    target = _target(tmp_path); now = datetime.now(timezone.utc); store = open_observer_store(load_agentops_config(write_config()))
+    try:
+        def batch(source, offset, at):
+            return CollectionBatch(target.target_id, "logs", at, (), CollectorHealth(True), LogCursor(7, offset, source), source_id=source)
+        a = "sha256:"+"a"*64; b = "sha256:"+"b"*64
+        store.commit_collection(batch(a, 10, now)); store.commit_collection(batch(b, 15, now + timedelta(seconds=1))); store.commit_collection(batch(a, 4, now + timedelta(seconds=2)))
+        assert store.get_cursor(target.target_id, "logs", a).offset == 4
+        assert store.get_cursor(target.target_id, "logs", b).offset == 15
+    finally: store.close()
+
+
+def test_cron_execution_json_max_age_is_enforced(tmp_path):
+    source = tmp_path / "cron.json"; old = (datetime.now(timezone.utc)-timedelta(seconds=30)).isoformat()
+    source.write_text('{"execution":{"job_id":"j","observed_at":"'+old+'","exit_code":0,"completed":true,"max_age_seconds":1},"assertions":[]}')
+    batch = CronCollector.from_json_file(source, required_assertion_ids=("cron_business_assertion_fresh",)).collect(_target(tmp_path))
+    assert batch.health.reason == "cron_execution_stale"

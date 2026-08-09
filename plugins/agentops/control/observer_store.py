@@ -156,6 +156,22 @@ def _validate_schema_shape(connection: sqlite3.Connection, version: int) -> None
                 raise ObserverStoreError("observer database unknown object")
 
 
+def _scan_database_secrets(connection: sqlite3.Connection) -> None:
+    for table in _table_names(connection):
+        columns = [str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")]
+        for row in connection.execute(f"SELECT {','.join(columns)} FROM {table}"):
+            for value in row:
+                if not isinstance(value, str):
+                    continue
+                candidate = value
+                try:
+                    candidate = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+                if contains_secret(candidate):
+                    raise ObserverStoreError("legacy database contains secret material")
+
+
 def _preflight_existing_database(path: Path) -> int:
     """Read schema/integrity before any writable SQLite connection or WAL change."""
     try:
@@ -171,6 +187,7 @@ def _preflight_existing_database(path: Path) -> int:
             version = versions[-1] if versions else 0
             if version == 1 and versions == [1] and tables == _LEGACY_TABLES:
                 _validate_schema_shape(connection, version)
+                _scan_database_secrets(connection)
                 return version
             if version != OBSERVER_SCHEMA_VERSION or versions != [1, 2] or tables != _CURRENT_TABLES:
                 raise ObserverStoreError("unmanaged observer database")
@@ -393,6 +410,7 @@ class ObserverStore:
                             severity=excluded.severity,
                             redaction_version=excluded.redaction_version,
                             payload_json=excluded.payload_json
+                        WHERE excluded.observed_at >= signals.observed_at
                         """,
                         (
                             _safe_text(signal.signal_id, "signal_id"),
@@ -422,11 +440,22 @@ class ObserverStore:
                     )
                 if batch.next_cursor is not None:
                     latest = self._connection.execute(
-                        "SELECT MAX(collected_at) FROM collection_runs WHERE target_id=? AND collector=? AND observation_id<>?",
-                        (batch.target_id, batch.collector, batch.observation_id),
+                        "SELECT MAX(collected_at) FROM collection_runs WHERE target_id=? AND collector=? AND source_id=? AND observation_id<>?",
+                        (batch.target_id, batch.collector, batch.source_id, batch.observation_id),
                     ).fetchone()[0]
                     cursor_is_newer = latest is None or batch.collected_at.isoformat() >= str(latest)
+                    existing_cursor = self._connection.execute(
+                        "SELECT inode, offset FROM source_cursors WHERE target_id=? AND collector=? AND source_id=?",
+                        (batch.target_id, batch.collector, batch.source_id),
+                    ).fetchone()
                     if not cursor_is_newer:
+                        self._connection.commit()
+                        return
+                    if existing_cursor is not None and int(existing_cursor[0]) == batch.next_cursor.inode and batch.next_cursor.offset < int(existing_cursor[1]):
+                        self._connection.execute(
+                            "UPDATE source_cursors SET offset=? WHERE target_id=? AND collector=? AND source_id=?",
+                            (batch.next_cursor.offset, batch.target_id, batch.collector, batch.source_id),
+                        )
                         self._connection.commit()
                         return
                     self._connection.execute(

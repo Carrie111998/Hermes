@@ -11,6 +11,7 @@ import threading
 _DETACHED_LIMIT = 4
 _detached_lock = threading.Lock()
 _detached_workers = 0
+_worker_slots = 0
 
 from plugins.agentops.control.observer_models import (
     CollectionBatch,
@@ -62,15 +63,18 @@ def collect_all(
         name = getattr(collector, "name", "unknown")
         source_id = getattr(collector, "source_id", "")
         cursor = cursor_by_key.get((name, source_id), cursor_by_key.get(name))
-        global _detached_workers
+        global _detached_workers, _worker_slots
         with _detached_lock:
-            if _detached_workers >= _DETACHED_LIMIT:
+            if _worker_slots >= _DETACHED_LIMIT:
                 batches.append(failed_batch(target, name, "collector_timeout_worker_budget", source_id=source_id, worker_detached=True))
                 continue
+            _worker_slots += 1
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agentops-observer")
         future = executor.submit(collector.collect, target, cursor)
         try:
             batch = future.result(timeout=deadline_seconds)
+            with _detached_lock:
+                _worker_slots = max(0, _worker_slots - 1)
             if not isinstance(batch, CollectionBatch) or batch.target_id != target.target_id:
                 raise ValueError("invalid collection batch")
             unique_signals = tuple(signal for signal in batch.signals if signal.signal_id not in known_signal_ids)
@@ -91,12 +95,15 @@ def collect_all(
             with _detached_lock:
                 _detached_workers += 1
             def _release(_future):
-                global _detached_workers
+                global _detached_workers, _worker_slots
                 with _detached_lock:
                     _detached_workers = max(0, _detached_workers - 1)
+                    _worker_slots = max(0, _worker_slots - 1)
             future.add_done_callback(_release)
             batch = failed_batch(target, name, "collector_timeout", source_id=source_id, worker_detached=True)
         except Exception:
+            with _detached_lock:
+                _worker_slots = max(0, _worker_slots - 1)
             batch = failed_batch(target, name, "collector_failed", source_id=source_id)
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
