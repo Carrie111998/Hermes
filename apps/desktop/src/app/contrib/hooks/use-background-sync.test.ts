@@ -1,5 +1,8 @@
+import { act, render } from '@testing-library/react'
+import { createElement } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { HermesConnection } from '@/global'
 import {
   $attentionSessionIds,
   $stalledSessionIds,
@@ -7,8 +10,42 @@ import {
   clearAllSessionStates,
   SESSION_WATCHDOG_TIMEOUT_MS
 } from '@/store/session-states'
+import { $connection } from '@/store/session'
 
-import { rehydrateLiveSessionStatuses } from './use-background-sync'
+import { rehydrateLiveSessionStatuses, useBackgroundSync } from './use-background-sync'
+
+function connection(mode: HermesConnection['mode']): HermesConnection {
+  return {
+    baseUrl: mode === 'remote' ? 'https://remote.example' : '',
+    isFullscreen: false,
+    logs: [],
+    mode,
+    nativeOverlayWidth: 0,
+    profile: 'default',
+    token: '',
+    windowButtonPosition: null,
+    wsUrl: ''
+  }
+}
+
+function BackgroundSyncHarness({ refreshSessions }: { refreshSessions: () => void }) {
+  useBackgroundSync({
+    activeGatewayProfile: 'default',
+    activeIsMessaging: false,
+    activeSessionId: null,
+    freshDraftReady: true,
+    gatewayState: 'open',
+    refreshActiveMessagingTranscript: () => undefined,
+    refreshCronJobs: () => undefined,
+    refreshCurrentModel: () => undefined,
+    refreshHermesConfig: () => undefined,
+    refreshMessagingSessions: () => undefined,
+    refreshSessions,
+    requestGateway: async <T>() => ({ sessions: [] }) as T
+  })
+
+  return null
+}
 
 describe('rehydrateLiveSessionStatuses', () => {
   beforeEach(() => {
@@ -71,5 +108,23 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($workingSessionIds.get()).toEqual([])
     expect($attentionSessionIds.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])
+  })
+})
+
+describe('useBackgroundSync', () => {
+  it('refreshes the sidebar when the active backend mode changes', async () => {
+    const refreshSessions = vi.fn()
+
+    $connection.set(connection('local'))
+    const view = render(createElement(BackgroundSyncHarness, { refreshSessions }))
+
+    expect(refreshSessions).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      $connection.set(connection('remote'))
+    })
+
+    expect(refreshSessions).toHaveBeenCalledTimes(2)
+    view.unmount()
   })
 })

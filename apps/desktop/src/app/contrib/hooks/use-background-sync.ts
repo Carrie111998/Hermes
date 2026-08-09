@@ -5,7 +5,7 @@ import { createClientSessionState } from '@/lib/chat-runtime'
 import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
-import { $activeSessionId, $currentCwd, setCurrentCwd } from '@/store/session'
+import { $activeSessionId, $connection, $currentCwd, setCurrentCwd } from '@/store/session'
 import {
   $sessionStates,
   publishSessionState,
@@ -239,6 +239,7 @@ export function useBackgroundSync({
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
   const sessionsChangeTick = useStore($sessionsChangeTick)
+  const backendMode = useStore($connection)?.mode ?? null
 
   useEffect(() => {
     if (gatewayState !== 'open') {
@@ -264,7 +265,7 @@ export function useBackgroundSync({
         })
         .catch(() => undefined)
     }
-  }, [gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
+  }, [backendMode, gatewayState, refreshCurrentModel, refreshSessions, requestGateway])
 
   // A reconnect loses renderer-only working/attention atoms while the backend
   // keeps the actual turns alive. Re-seed from the gateway's in-memory session
