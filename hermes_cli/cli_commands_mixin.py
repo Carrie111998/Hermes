@@ -1263,6 +1263,9 @@ class CLICommandsMixin:
                         "tool_calls": msg.get("tool_calls"),
                         "tool_call_id": msg.get("tool_call_id"),
                         "reasoning": msg.get("reasoning"),
+                        "reasoning_details": msg.get("reasoning_details"),
+                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
+                        "codex_message_items": msg.get("codex_message_items"),
                         # Keep the api_content sidecar so the branch's first turn
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.
@@ -1340,21 +1343,34 @@ class CLICommandsMixin:
             personality_name = parts[1].strip().lower()
             
             if personality_name in {"none", "default", "neutral"}:
-                self.system_prompt = ""
+                # Persist the selection only. Never clear agent.system_prompt —
+                # that field is the user-owned manual overlay.
+                saved = save_config_value("display.personality", "")
+                try:
+                    from hermes_cli.config import cfg_get, read_raw_config, _prompt_text
+
+                    self.system_prompt = _prompt_text(
+                        cfg_get(read_raw_config(), "agent", "system_prompt", default="")
+                    )
+                except Exception:
+                    self.system_prompt = ""
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                if saved:
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
                     print("(^_^) Personality cleared (session only)")
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                personality_prompt = self._resolve_personality_prompt(
+                    self.personalities[personality_name]
+                )
+                self.system_prompt = personality_prompt
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                if save_config_value("display.personality", personality_name):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
-                print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
+                print(f"  \"{personality_prompt[:60]}{'...' if len(personality_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
                 print(f"  Available: none, {', '.join(self.personalities.keys())}")
@@ -1944,9 +1960,17 @@ class CLICommandsMixin:
         print(out)
 
     def _save_write_approval(self, subsystem: str, enabled: bool):
-        """Persist <subsystem>.write_approval to config (for /memory|/skills approval)."""
+        """Persist <subsystem>.write_approval to config (for /memory|/skills approval).
+
+        Raises on a failed write so ``_set_approval`` reports the failure
+        instead of confirming a gate change that never reached config.yaml.
+        ``save_config_value`` signals failure with ``False`` (it logs and
+        returns), unlike the gateway's ``set_mode_fn`` which raises from
+        ``atomic_config_write``.
+        """
         from cli import save_config_value
-        save_config_value(f"{subsystem}.write_approval", bool(enabled))
+        if not save_config_value(f"{subsystem}.write_approval", bool(enabled)):
+            raise RuntimeError("could not write config.yaml (see errors.log)")
 
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -2992,7 +3016,7 @@ class CLICommandsMixin:
 
         self._focus_view_enabled = bool(target)
         self._focus_hidden_lines = 0
-        save_config_value(FOCUS_CONFIG_KEY, bool(target))
+        persisted = save_config_value(FOCUS_CONFIG_KEY, bool(target))
 
         state = (
             f"{_Colors.GREEN}enabled{_Colors.RESET}" if target
@@ -3005,6 +3029,11 @@ class CLICommandsMixin:
                 message = message.replace(word, state, 1)
                 break
         _cprint(f"  {message}")
+        if not persisted:
+            _cprint(
+                "  Failed to save focus setting to config.yaml "
+                "(active this session only)"
+            )
 
     def _set_tool_progress_mode(self, mode: str) -> None:
         """Set the live tool-progress mode on both the CLI and the agent.
@@ -3222,31 +3251,42 @@ class CLICommandsMixin:
             self.show_reasoning = True
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
+            saved = save_config_value("display.show_reasoning", True)
+            _cprint(f"  {_ACCENT}✓ Reasoning display: ON{' (saved)' if saved else ''}{_RST}")
+            if not saved:
+                _cprint(f"  {_DIM}  Failed to save to config.yaml — this session only.{_RST}")
             _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
             return
         if arg in {"hide", "off"}:
             self.show_reasoning = False
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}")
+            saved = save_config_value("display.show_reasoning", False)
+            _cprint(f"  {_ACCENT}✓ Reasoning display: OFF{' (saved)' if saved else ''}{_RST}")
+            if not saved:
+                _cprint(f"  {_DIM}  Failed to save to config.yaml — this session only.{_RST}")
             return
 
         # Full / clamped recap toggle
         if arg in {"full", "all"}:
             self.reasoning_full = True
-            save_config_value("display.reasoning_full", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL (saved){_RST}")
+            saved = save_config_value("display.reasoning_full", True)
+            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL{' (saved)' if saved else ''}{_RST}")
+            if not saved:
+                _cprint(f"  {_DIM}  Failed to save to config.yaml — this session only.{_RST}")
             _cprint(f"  {_DIM}  The post-response recap box will print complete thinking.{_RST}")
             if not self.show_reasoning:
                 _cprint(f"  {_DIM}  Note: reasoning display is OFF — run /reasoning show to see it.{_RST}")
             return
         if arg in {"clamp", "collapse", "short"}:
             self.reasoning_full = False
-            save_config_value("display.reasoning_full", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved){_RST}")
+            saved = save_config_value("display.reasoning_full", False)
+            _cprint(
+                f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines"
+                f"{' (saved)' if saved else ''}{_RST}"
+            )
+            if not saved:
+                _cprint(f"  {_DIM}  Failed to save to config.yaml — this session only.{_RST}")
             return
 
         # Effort level change
