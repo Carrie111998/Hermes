@@ -86,6 +86,32 @@ class TestIsCodingContext:
                 config=cfg,
             ) is False
 
+    def test_nested_cwd_denied_sibling_blocks_git_root_scan(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "src"
+        denied = root / "private"
+        nested.mkdir(parents=True)
+        denied.mkdir()
+        cfg = {"agent": {"coding_context": "auto"}}
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(denied / "**")],
+            ),
+            patch("agent.coding_context._marker_root", return_value=None),
+            patch("agent.coding_context._git_root", return_value=root),
+            patch(
+                "agent.coding_context._has_code_files",
+                side_effect=AssertionError("denied ancestor root was scanned"),
+            ),
+        ):
+            assert cc.is_coding_context(
+                platform="cli",
+                cwd=nested,
+                config=cfg,
+            ) is False
+
 
 
     def test_auto_bare_git_repo_without_code_stays_general(self, tmp_path):
@@ -159,6 +185,26 @@ class TestWorkspaceBlock:
             ),
         ):
             assert cc.build_coding_workspace_block(tmp_path) == ""
+
+    def test_nested_cwd_denied_sibling_blocks_workspace_git_probe(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "src"
+        denied = root / "private"
+        nested.mkdir(parents=True)
+        denied.mkdir()
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(denied / "**")],
+            ),
+            patch("agent.coding_context._git_root", return_value=root),
+            patch(
+                "agent.coding_context._git",
+                side_effect=AssertionError("denied ancestor root reached git probe"),
+            ),
+        ):
+            assert cc.build_coding_workspace_block(nested) == ""
 
     def test_reports_branch_and_clean_status(self, tmp_path):
         _git_init(tmp_path)
@@ -234,6 +280,26 @@ class TestProjectFacts:
         assert facts["verifyCommands"]
         for cmd in facts["verifyCommands"]:
             assert cmd in verify_line
+
+    def test_nested_cwd_denied_sibling_blocks_project_facts(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "src"
+        denied = root / "private"
+        nested.mkdir(parents=True)
+        denied.mkdir()
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(denied / "**")],
+            ),
+            patch("agent.coding_context._git_root", return_value=root),
+            patch(
+                "agent.coding_context.detect_project_facts",
+                side_effect=AssertionError("denied ancestor root facts were read"),
+            ),
+        ):
+            assert cc.project_facts_for(nested) is None
 
 
 

@@ -618,18 +618,20 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
 def _permissions_deny_patterns_for_task(
     patterns: list[str],
     task_id: str = "default",
-) -> list[str]:
-    """Return raw rules plus task-cwd-anchored variants of relative rules.
+) -> list[tuple[str, str]]:
+    """Pair task-resolved match variants with their configured source rules.
 
     Keeping both identities means ``secret/**`` blocks both the raw relative
     spelling and an equivalent absolute argument under the active workspace.
     Resolution follows the backend's path dialect and never dereferences a
-    remote path on the host.
+    remote path on the host. The second tuple item remains the configured rule
+    so user-facing errors never expose a synthetic anchored variant as policy.
     """
-    variants: list[str] = []
+    variants: list[tuple[str, str]] = []
     for pattern in patterns:
-        if pattern not in variants:
-            variants.append(pattern)
+        raw_pair = (pattern, pattern)
+        if raw_pair not in variants:
+            variants.append(raw_pair)
         expanded = _expand_tilde(pattern)
         is_absolute = (
             os.path.isabs(expanded)
@@ -640,8 +642,9 @@ def _permissions_deny_patterns_for_task(
         if is_absolute:
             continue
         anchored = str(_resolve_path_for_task(expanded, task_id))
-        if anchored not in variants:
-            variants.append(anchored)
+        anchored_pair = (anchored, pattern)
+        if anchored_pair not in variants:
+            variants.append(anchored_pair)
     return variants
 
 
@@ -675,10 +678,11 @@ def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str
             permissions_deny_paths,
         )
 
-        patterns = _permissions_deny_patterns_for_task(
+        pattern_variants = _permissions_deny_patterns_for_task(
             permissions_deny_paths(),
             task_id,
         )
+        patterns = [variant for variant, _source in pattern_variants]
         local_backend = _terminal_env_type_for_task(task_id) == "local"
         match = None
         for candidate in candidates:
@@ -688,6 +692,14 @@ def _check_permissions_deny_path(filepath: str, task_id: str = "default") -> str
                 canonicalize=local_backend,
             )
             if match is not None:
+                from agent.deny_policy import DenyMatch
+
+                source_pattern = next(
+                    source_pattern
+                    for variant, source_pattern in pattern_variants
+                    if variant == match.pattern
+                )
+                match = DenyMatch(pattern=source_pattern, source=match.source)
                 break
     except Exception:
         logger.warning("permissions.deny.paths check failed closed for %s", filepath, exc_info=True)
@@ -717,10 +729,11 @@ def _check_permissions_deny_search_root(filepath: str, task_id: str = "default")
             permissions_deny_paths,
         )
 
-        patterns = _permissions_deny_patterns_for_task(
+        pattern_variants = _permissions_deny_patterns_for_task(
             permissions_deny_paths(),
             task_id,
         )
+        patterns = [variant for variant, _source in pattern_variants]
         local_backend = _terminal_env_type_for_task(task_id) == "local"
         root_probe = resolved
         if root_probe is None and (
@@ -744,6 +757,14 @@ def _check_permissions_deny_search_root(filepath: str, task_id: str = "default")
                 canonicalize=local_backend,
             )
             if match is not None:
+                from agent.deny_policy import DenyMatch
+
+                source_pattern = next(
+                    source_pattern
+                    for variant, source_pattern in pattern_variants
+                    if variant == match.pattern
+                )
+                match = DenyMatch(pattern=source_pattern, source=match.source)
                 break
     except Exception:
         logger.warning(

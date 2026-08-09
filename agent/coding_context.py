@@ -486,11 +486,16 @@ def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
         return GENERAL_PROFILE.name
     # A recognized project root (manifest / AGENTS.md / .cursorrules) is a code
     # workspace on its own — cheap stat checks, no scan.
-    if _marker_root(cwd) is not None:
+    marker_root = _marker_root(cwd)
+    if marker_root is not None:
+        if _is_denied_workspace_root(marker_root, base_path=cwd):
+            return GENERAL_PROFILE.name
         return CODING_PROFILE.name
     git_root = _git_root(cwd)
     if git_root is not None and git_root == _home():
         git_root = None  # dotfiles repo at $HOME — not a code workspace
+    if git_root is not None and _is_denied_workspace_root(git_root, base_path=cwd):
+        return GENERAL_PROFILE.name
     # A bare git repo only counts when it actually holds code, so `git init` on a
     # notes/writing/research folder stays in the general posture.
     if git_root is not None and _has_code_files(git_root):
@@ -886,6 +891,8 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
     root = _git_root(resolved) or _marker_root(resolved)
     if root is None:
         return None
+    if _is_denied_workspace_root(root, base_path=resolved):
+        return None
 
     f = detect_project_facts(root)
     return {
@@ -910,6 +917,8 @@ def build_coding_workspace_block(cwd: Optional[str | Path] = None) -> str:
     git_root = _git_root(resolved)
     root = git_root or _marker_root(resolved)
     if root is None:
+        return ""
+    if _is_denied_workspace_root(root, base_path=resolved):
         return ""
 
     lines = ["Workspace (snapshot at session start — re-check with `git` before acting on it):"]

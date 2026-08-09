@@ -266,6 +266,34 @@ class TestPermissionsDenyFileTools:
 
         assert error is not None
         assert "permissions.deny.paths" in error
+        assert "matches the user-defined deny rule 'secret/**'" in error
+
+    def test_search_root_reports_configured_relative_rule(self, monkeypatch):
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        def resolve_for_task(value, task_id):
+            if value == "secret/**":
+                return Path("C:/workspace/secret/**")
+            return Path(value)
+
+        with (
+            patch(
+                "tools.file_tools._resolve_path_for_task",
+                side_effect=resolve_for_task,
+            ),
+            patch(
+                "tools.file_tools._terminal_env_type_for_task",
+                return_value="local",
+            ),
+            patch("tools.file_tools.os.path.isfile", return_value=False),
+        ):
+            error = file_tools._check_permissions_deny_search_root(
+                "C:/workspace",
+                task_id="task",
+            )
+
+        assert error is not None
+        assert "matches the user-defined deny rule 'secret/**'" in error
 
     def test_read_file_denied_before_file_ops(self, monkeypatch, tmp_path):
         secret = tmp_path / "secret.txt"
@@ -365,6 +393,25 @@ class TestPermissionsDenyFileTools:
 
         assert "error" in result
         assert "permissions.deny.paths" in result["error"]
+        mock_get.assert_not_called()
+        assert not resolved.exists()
+
+    def test_absolute_write_reports_configured_relative_rule(self, monkeypatch, tmp_path):
+        resolved = tmp_path / "secret" / "file.txt"
+        _install_permissions_config(monkeypatch, paths=["secret/**"])
+
+        with (
+            patch("tools.file_tools._resolve_path_for_task", return_value=resolved),
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.write_file_tool(
+                str(resolved),
+                "new data",
+                task_id="deny-write-reporting",
+            ))
+
+        assert "error" in result
+        assert "matches the user-defined deny rule 'secret/**'" in result["error"]
         mock_get.assert_not_called()
         assert not resolved.exists()
 
