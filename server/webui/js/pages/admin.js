@@ -2,7 +2,7 @@
 
 import {
   el, card, button, pageHead, statCard, dataTable, badge, emptyState, toast,
-  input, select, field, modal, setBusy, kv, fmt, hbarList,
+  input, select, field, modal, setBusy, setFieldError, passwordField, kv, fmt, hbarList,
 } from '../ui.js';
 import { call } from '../api.js';
 import { db, emit } from '../mocks/db.js';
@@ -113,7 +113,9 @@ export async function mountCompanyDetail(root, ctx) {
 }
 
 export async function mountUsers(root, ctx) {
-  const res = await call('admin.users.list');
+  // Companies are loaded alongside the users so the table can name each user's
+  // workspace instead of falling back to "Platform".
+  const [res] = await Promise.all([call('admin.users.list'), call('admin.companies.list')]);
   withAdmin(root, ctx, 'Users', 'Admin-provisioned users; customers cannot invite users in MVP.', '/admin/users',
     card({ flush: true, body: usersTable(res.items, ctx) }),
     [button('Create user', { kind: 'primary', icon: 'plus', onClick: () => openUserModal(null, () => ctx.navigate('/admin/users')) })]);
@@ -311,7 +313,7 @@ function usersTable(rows, ctx) {
       { key: 'last', label: 'Last login', render: u => u.last_login_at ? fmt.ago(u.last_login_at) : '-' },
       { key: 'actions', label: '', width: '160px', render: u => el('div', { class: 'ifz-row' },
         button('Edit', { size: 'sm', icon: 'edit', onClick: () => openUserModal(u, () => ctx.navigate('/admin/users')) }),
-        button('Reset', { size: 'sm', onClick: async () => { const res = await call('admin.users.resetPassword', { params: { userId: u.id } }); toast(res.message, 'success'); } })) },
+        button('Reset', { size: 'sm', onClick: () => openResetPasswordModal(u) })) },
     ],
     rows,
   });
@@ -343,47 +345,170 @@ function dataSourcesTable(rows) {
   });
 }
 
+/* The backend stores exactly two roles (schemas.UserCreate/UserPatch are
+   Literal["admin", "customer"]); anything else is a 422. */
+const USER_ROLES = [
+  { value: 'customer', label: 'Customer' },
+  { value: 'admin', label: 'Administrator' },
+];
+const COMPANY_PLANS = ['trial', 'pilot', 'demo', 'enterprise'];
+const MIN_PASSWORD_LENGTH = 10; // schemas.UserCreate / schemas.ResetPassword
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 function openCompanyModal(company, afterSave) {
   const name = input({ value: company?.name || '' });
   const legal = input({ value: company?.legal_name || '' });
-  const website = input({ value: company?.website || '' });
-  const plan = select(['trial', 'pilot', 'demo', 'enterprise'], { value: company?.plan || 'trial' });
+  const website = input({ value: company?.website || '', type: 'url', placeholder: 'https://' });
+  const plan = select(COMPANY_PLANS, { value: company?.plan || 'trial' });
   const save = button(company ? 'Save company' : 'Create company', { kind: 'primary', icon: 'check' });
   const m = modal({
     title: company ? 'Edit company' : 'Create company',
-    body: el('div', {}, field('Name', name), field('Legal name', legal), field('Website', website), field('Plan', plan)),
+    body: el('div', {},
+      field('Name', name, { required: true }),
+      field('Legal name', legal, { hint: 'Defaults to the company name.' }),
+      field('Website', website),
+      field('Plan', plan)),
     actions: [button('Cancel', { onClick: () => m.close() }), save],
   });
   save.addEventListener('click', async () => {
-    setBusy(save, true, 'Saving...');
-    const body = { name: name.value, legal_name: legal.value || name.value, website: website.value, plan: plan.value };
-    if (company) await call('admin.companies.update', { params: { companyId: company.id }, body });
-    else await call('admin.companies.create', { body });
-    toast('Company saved', 'success');
-    m.close();
-    afterSave();
+    if (!name.value.trim()) {
+      setFieldError(name, 'Enter a company name');
+      name.focus();
+      return;
+    }
+    setFieldError(name, null);
+    setBusy(save, true, 'Saving…');
+    // website/plan are not company columns; adaptRequest packs them into `data`,
+    // which CompanyCreate/CompanyPatch accept and adminCompany() flattens back.
+    const body = {
+      name: name.value.trim(),
+      legal_name: legal.value.trim() || name.value.trim(),
+      website: website.value.trim(),
+      plan: plan.value,
+    };
+    try {
+      if (company) await call('admin.companies.update', { params: { companyId: company.id }, body });
+      else await call('admin.companies.create', { body });
+      m.close();
+      toast('Company saved', 'success');
+      afterSave();
+    } catch (error) {
+      setBusy(save, false);
+      toast(error.message || 'Company could not be saved', 'error');
+    }
   });
 }
 
-function openUserModal(user, afterSave) {
+/* Company options come from the admin list route, which real-state.js mirrors
+   into db.admin.companies. Without a fetch the select (and the users table's
+   company column) would only ever offer "Platform". */
+async function companyOptions() {
+  if (!db.admin.companies.length) await call('admin.companies.list').catch(() => null);
+  return [
+    { value: '', label: 'Platform' },
+    ...db.admin.companies.map(c => ({ value: c.id, label: c.name })),
+  ];
+}
+
+async function openUserModal(user, afterSave) {
+  const options = await companyOptions();
   const name = input({ value: user?.name || '' });
   const email = input({ value: user?.email || '', type: 'email' });
-  const role = select(['admin', 'support', 'owner', 'sales'], { value: user?.role || 'owner' });
-  const company = select([{ value: '', label: 'Platform' }, ...db.admin.companies.map(c => ({ value: c.id, label: c.name }))], { value: user?.company_id || '' });
+  const role = select(USER_ROLES, { value: user?.role === 'admin' ? 'admin' : 'customer' });
+  const company = select(options, { value: user?.company_id || '' });
+  // Created users authenticate with this password: the backend hashes it (or
+  // provisions the Supabase account with it), and a user created without one
+  // has no usable credential at all.
+  const { wrap: passwordWrap, input: password } = passwordField({
+    autocomplete: 'new-password', placeholder: '••••••••',
+  });
   const save = button(user ? 'Save user' : 'Create user', { kind: 'primary', icon: 'check' });
   const m = modal({
     title: user ? 'Edit user' : 'Create user',
-    body: el('div', {}, field('Name', name), field('Email', email), field('Role', role), field('Company', company)),
+    body: el('div', {},
+      field('Name', name),
+      field('Email', email, { required: true }),
+      field('Role', role),
+      field('Company', company, { hint: 'Customers must belong to a company.' }),
+      user ? null : field('Temporary password', passwordWrap, {
+        required: true,
+        hint: `At least ${MIN_PASSWORD_LENGTH} characters. Share it with the user out of band.`,
+      })),
     actions: [button('Cancel', { onClick: () => m.close() }), save],
   });
   save.addEventListener('click', async () => {
-    setBusy(save, true, 'Saving...');
-    const body = { name: name.value, email: email.value, role: role.value, company_id: company.value || null };
-    if (user) await call('admin.users.update', { params: { userId: user.id }, body });
-    else await call('admin.users.create', { body });
-    toast('User saved', 'success');
-    m.close();
-    afterSave();
+    let ok = true;
+    if (!EMAIL_PATTERN.test(email.value.trim())) {
+      setFieldError(email, 'Enter a valid email address');
+      ok = false;
+    } else setFieldError(email, null);
+    if (role.value === 'customer' && !company.value) {
+      setFieldError(company, 'Customer users need a company');
+      ok = false;
+    } else setFieldError(company, null);
+    if (!user && password.value.length < MIN_PASSWORD_LENGTH) {
+      setFieldError(password, `Use at least ${MIN_PASSWORD_LENGTH} characters`);
+      ok = false;
+    } else setFieldError(password, null);
+    if (!ok) {
+      m.box.querySelector('.is-invalid')?.focus();
+      return;
+    }
+    setBusy(save, true, 'Saving…');
+    // `name` is not a users column; adaptRequest moves it into `data`.
+    const body = {
+      name: name.value.trim(),
+      email: email.value.trim(),
+      role: role.value,
+      company_id: company.value || null,
+    };
+    try {
+      if (user) await call('admin.users.update', { params: { userId: user.id }, body });
+      else await call('admin.users.create', { body: { ...body, password: password.value } });
+      m.close();
+      toast('User saved', 'success');
+      afterSave();
+    } catch (error) {
+      setBusy(save, false);
+      toast(error.message || 'User could not be saved', 'error');
+    }
+  });
+}
+
+function openResetPasswordModal(user) {
+  const { wrap: passwordWrap, input: password } = passwordField({
+    autocomplete: 'new-password', placeholder: '••••••••',
+  });
+  const save = button('Set password', { kind: 'primary', icon: 'check' });
+  const m = modal({
+    title: `Reset password — ${user.name || user.email}`,
+    body: field('New password', passwordWrap, {
+      required: true,
+      hint: `At least ${MIN_PASSWORD_LENGTH} characters. Share it with the user out of band.`,
+    }),
+    actions: [button('Cancel', { onClick: () => m.close() }), save],
+  });
+  save.addEventListener('click', async () => {
+    if (password.value.length < MIN_PASSWORD_LENGTH) {
+      setFieldError(password, `Use at least ${MIN_PASSWORD_LENGTH} characters`);
+      password.focus();
+      return;
+    }
+    setFieldError(password, null);
+    setBusy(save, true, 'Saving…');
+    try {
+      // The route requires the new password and answers 204, so there is no
+      // response message to echo — the confirmation is written here.
+      await call('admin.users.resetPassword', {
+        params: { userId: user.id },
+        body: { password: password.value },
+      });
+      m.close();
+      toast(`Password updated for ${user.email}`, 'success');
+    } catch (error) {
+      setBusy(save, false);
+      toast(error.message || 'Password reset failed', 'error');
+    }
   });
 }
 

@@ -1,28 +1,9 @@
 /* Login page — full-screen, outside the app shell. */
 
-import { el, field, input, button, setBusy, toast, passwordField, modal } from '../ui.js';
+import { el, field, input, button, setBusy, setFieldError, toast, passwordField, modal } from '../ui.js';
 import { call, config } from '../api.js';
 import { setSession } from '../session.js';
 import { logoNode, destroyShell } from '../shell.js';
-
-function setFieldError(inputNode, message) {
-  const fieldEl = inputNode.closest('.ifz-field');
-  if (!fieldEl) return;
-  let err = fieldEl.querySelector('.ifz-field-error');
-  if (!message) {
-    inputNode.classList.remove('is-invalid');
-    inputNode.removeAttribute('aria-invalid');
-    if (err) err.remove();
-    return;
-  }
-  inputNode.classList.add('is-invalid');
-  inputNode.setAttribute('aria-invalid', 'true');
-  if (!err) {
-    err = el('div', { class: 'ifz-field-error', role: 'alert' });
-    fieldEl.append(err);
-  }
-  err.textContent = message;
-}
 
 export function mount(root, ctx) {
   destroyShell(); // returning from a logged-in session — rebuild shell next time

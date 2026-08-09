@@ -1,23 +1,30 @@
 name: Interfaze API
 
 # CI for the Sales Agent MVP in server/ — the one part of the tree the main
-# ci.yml pipeline never exercised on its own. Three things are checked:
+# ci.yml pipeline never exercised on its own. Three jobs:
 #
-#   1. the service installs from pyproject with the extras it actually needs
-#      (`[web]` + `[interfaze]`, plus `[dev]` for pytest),
-#   2. `pytest tests/server` passes,
-#   3. the packaged `interfaze-api` console script boots and /health answers —
-#      including `agent_runs_enabled`, which is only true when the `hermes`
-#      CLI landed on PATH (server/agent_service.py shells out to it).
+#   `interfaze-api` (source install)
+#     1. the service installs from uv.lock with the extras it actually needs
+#        (`[web]` + `[interfaze]`, plus `[dev]` for pytest),
+#     2. `pytest tests/server` passes,
+#     3. the `interfaze-api` console script boots and /health answers —
+#        including `agent_runs_enabled`, which is only true when the `hermes`
+#        CLI landed on PATH (server/agent_service.py shells out to it).
 #
-# Deliberately a single fast job, no matrix. The heavier repo-wide suite is
-# sliced across a matrix in tests.yml; duplicating that here buys nothing.
+#   `packaging` (wheel + sdist)
+#     builds both distributions and installs each into a *clean* venv with no
+#     repo checkout on sys.path, then boots the console script from there.
+#     This is what catches "works from the source tree, ImportError once
+#     packaged" — a missing entry in [tool.setuptools.packages.find] or
+#     package-data shows up here and nowhere else.
 #
-# NOTE: this installs from pyproject.toml, NOT `uv sync --locked`. uv.lock's
-# `interfaze` extra is currently missing ddgs / scrapling / markdownify, so a
-# locked install would either fail or silently omit the web-research stack.
-# Once uv.lock is regenerated this can move to `uv sync --locked --extra web
-# --extra interfaze --extra dev`.
+#   `docker` (image build + boot)
+#     builds Dockerfile.interfaze-api for real, runs the container, and waits
+#     on the same /health assertions. Previously only hadolint ran, so a
+#     Dockerfile that lints clean but cannot build or boot merged green.
+#
+# Installs use `uv sync --locked`, which fails on a stale uv.lock rather than
+# resolving something different from what the image ships.
 
 on:
   push:
@@ -26,16 +33,24 @@ on:
       - "server/**"
       - "tests/server/**"
       - "pyproject.toml"
+      - "uv.lock"
+      - "MANIFEST.in"
       - "Dockerfile.interfaze-api"
       - "docker-compose.interfaze.yml"
+      - "scripts/ci/interfaze_*.sh"
+      - "skills/sales/lead-research/references/**"
       - ".github/workflows/interfaze-api.yml"
   pull_request:
     paths:
       - "server/**"
       - "tests/server/**"
       - "pyproject.toml"
+      - "uv.lock"
+      - "MANIFEST.in"
       - "Dockerfile.interfaze-api"
       - "docker-compose.interfaze.yml"
+      - "scripts/ci/interfaze_*.sh"
+      - "skills/sales/lead-research/references/**"
       - ".github/workflows/interfaze-api.yml"
   workflow_dispatch:
   workflow_call:
@@ -71,15 +86,18 @@ jobs:
           enable-cache: true
           cache-dependency-glob: |
             pyproject.toml
+            uv.lock
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         run: uv python install "${PYTHON_VERSION}"
 
+      # `--locked` fails on a stale uv.lock instead of quietly resolving a
+      # different dependency set than Dockerfile.interfaze-api ships.
       - name: Install interfaze-api and its extras
         run: |
           set -euo pipefail
-          uv venv --python "${PYTHON_VERSION}"
-          uv pip install --python .venv/bin/python ".[web,interfaze,dev]"
+          uv sync --locked --python "${PYTHON_VERSION}" \
+            --extra web --extra interfaze --extra dev
 
       - name: Verify console scripts are on PATH
         run: |
@@ -94,12 +112,22 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/server -q
 
-      - name: Run WebUI OAuth popup tests
+      # Test files are listed one by one: `node --test <dir>` only picks up
+      # `test-*` / `*.test.*` names, which would silently skip these.
+      - name: Run WebUI browser tests
         run: |
           set -euo pipefail
           node --test tests/server/webui/test_oauth_popup.mjs
+          node --test tests/server/webui/test_admin_provisioning.mjs
           node --input-type=module --check < server/webui/js/oauth-popup.js
-          node --input-type=module --check < server/webui/js/pages/integrations.js
+          # pages/integrations.js was folded into pages/setup.js by 608f0f0b8;
+          # the stale path made this whole step fail under `set -e`.
+          node --input-type=module --check < server/webui/js/pages/setup.js
+          node --input-type=module --check < server/webui/js/pages/admin.js
+          node --input-type=module --check < server/webui/js/pages/login.js
+          node --input-type=module --check < server/webui/js/adapters.js
+          node --input-type=module --check < server/webui/js/real-state.js
+          node --input-type=module --check < server/webui/js/ui.js
           node --input-type=module --check < server/webui/js/api.js
 
       - name: Boot smoke test (interfaze-api + /health)
@@ -121,49 +149,83 @@ jobs:
           interfaze-api --host 0.0.0.0 --port 8000 > "${RUNNER_TEMP}/api.log" 2>&1 &
           api_pid=$!
 
-          ready=""
-          for _ in $(seq 1 60); do
-            if curl -fsS --max-time 3 http://127.0.0.1:8000/health -o "${RUNNER_TEMP}/health.json"; then
-              ready=1
-              break
-            fi
-            if ! kill -0 "${api_pid}" 2>/dev/null; then
-              echo "::error::interfaze-api exited before /health became reachable"
-              cat "${RUNNER_TEMP}/api.log"
-              exit 1
-            fi
-            sleep 1
-          done
-
-          if [ -z "${ready}" ]; then
-            echo "::error::/health did not respond within 60s"
+          if ! SMOKE_PID="${api_pid}" scripts/ci/interfaze_api_smoke.sh http://127.0.0.1:8000 60; then
             cat "${RUNNER_TEMP}/api.log"
             kill "${api_pid}" 2>/dev/null || true
             exit 1
           fi
 
-          python - "${RUNNER_TEMP}/health.json" <<'PY'
-          import json
-          import sys
-
-          with open(sys.argv[1], encoding="utf-8") as handle:
-              payload = json.load(handle)
-          print("GET /health ->", json.dumps(payload, sort_keys=True))
-
-          assert payload["status"] == "ok", payload
-          assert payload["service"] == "interfaze-agent", payload
-          assert payload["api_version"] == "v1", payload
-          # False here means the `hermes` CLI is missing from PATH, which is the
-          # exact regression that would ship a container where every agent run
-          # fails at Popen time.
-          assert payload["agent_runs_enabled"] is True, payload
-          PY
-
-          # The API must serve the dashboard SPA and the OpenAPI schema too.
-          curl -fsS --max-time 5 http://127.0.0.1:8000/openapi.json -o /dev/null
-
           kill "${api_pid}" 2>/dev/null || true
           wait "${api_pid}" 2>/dev/null || true
+
+      - name: Minimize uv cache
+        if: always()
+        run: uv cache prune --ci
+
+  packaging:
+    name: Wheel + sdist install (clean env)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHON_VERSION: "3.13"
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        run: uv python install "${PYTHON_VERSION}"
+
+      # `uv build` produces both distributions. The sdist is built first and
+      # the wheel is then built *from that sdist*, so a file missing from
+      # MANIFEST.in fails here rather than in a downstream packager's build.
+      - name: Build wheel and sdist
+        run: |
+          set -euo pipefail
+          uv build --out-dir "${RUNNER_TEMP}/dist"
+          ls -la "${RUNNER_TEMP}/dist"
+
+      # Both installs run from ${RUNNER_TEMP}, NOT the checkout. With the repo
+      # root on sys.path a packaged install can import `server`/`tools` from the
+      # source tree and pass even when the distribution omits them entirely.
+      - name: Install and smoke-test the wheel in a clean venv
+        run: |
+          set -euo pipefail
+          scripts/ci/interfaze_packaging_check.sh \
+            "$(ls "${RUNNER_TEMP}"/dist/*.whl)" \
+            "${RUNNER_TEMP}/venv-wheel" \
+            8001
+
+      - name: Install and smoke-test the sdist in a clean venv
+        run: |
+          set -euo pipefail
+          scripts/ci/interfaze_packaging_check.sh \
+            "$(ls "${RUNNER_TEMP}"/dist/*.tar.gz)" \
+            "${RUNNER_TEMP}/venv-sdist" \
+            8002
+
+      - name: Minimize uv cache
+        if: always()
+        run: uv cache prune --ci
+
+  docker:
+    name: Docker build + boot
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Lint Dockerfile.interfaze-api (hadolint)
         uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
@@ -175,6 +237,67 @@ jobs:
       - name: Validate docker-compose.interfaze.yml
         run: docker compose -f docker-compose.interfaze.yml config --quiet
 
-      - name: Minimize uv cache
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      # load: true puts the image in the local daemon so the boot step below can
+      # actually run it. Build cache is scoped per-ref with a main fallback so
+      # PRs don't pay the full ~10 min cold build every push.
+      - name: Build interfaze-api image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile.interfaze-api
+          tags: interfaze-api:ci
+          load: true
+          push: false
+          cache-from: type=gha,scope=interfaze-api
+          cache-to: type=gha,scope=interfaze-api,mode=max
+
+      - name: Boot the container and smoke-test /health
+        run: |
+          set -euo pipefail
+
+          # Mirrors docker-compose.interfaze.yml: named volume for /data, the
+          # two bootstrap-admin vars, and a generated credential key. No real
+          # provider keys — the smoke test must never reach an upstream API.
+          docker run -d --name interfaze-api-ci \
+            -p 8000:8000 \
+            -e INTERFAZE_CREDENTIAL_KEY="$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')" \
+            -e INTERFAZE_BOOTSTRAP_ADMIN_EMAIL="ci-admin@interfaze.invalid" \
+            -e INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD="ci-smoke-test-password" \
+            -e INTERFAZE_PUBLIC_BASE_URL="http://127.0.0.1:8000" \
+            -e OPENROUTER_API_KEY="" \
+            -e OPENAI_API_KEY="" \
+            -e ANTHROPIC_API_KEY="" \
+            interfaze-api:ci
+
+          # The image's own HEALTHCHECK allows a 40s start period; give the
+          # first boot (skills sync + uvicorn import graph) room beyond that.
+          if ! scripts/ci/interfaze_api_smoke.sh http://127.0.0.1:8000 120; then
+            echo "::group::container logs"
+            docker logs interfaze-api-ci || true
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # The declared HEALTHCHECK has to pass too — a container that answers
+          # curl from the host but reports `unhealthy` will be restart-looped by
+          # any orchestrator that honours it.
+          health=""
+          for _ in $(seq 1 30); do
+            health="$(docker inspect -f '{{.State.Health.Status}}' interfaze-api-ci)"
+            [ "${health}" = "healthy" ] && break
+            [ "${health}" = "unhealthy" ] && { echo "::error::container HEALTHCHECK reported unhealthy"; break; }
+            sleep 2
+          done
+          echo "container health: ${health}"
+          [ "${health}" = "healthy" ]
+
+      - name: Container logs
         if: always()
-        run: uv cache prune --ci
+        run: docker logs interfaze-api-ci || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f interfaze-api-ci || true

@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import os
+import sysconfig
 from pathlib import Path
 
 import yaml
@@ -11,7 +13,54 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 ROOT = Path(__file__).resolve().parents[2]
-REFERENCE_DIR = ROOT / "skills" / "sales" / "lead-research" / "references"
+
+# Sentinel: the file registry.build_registry() needs. Probing for it rather
+# than for the directory means a partially-populated candidate can't win.
+_CATALOG_FILENAME = "provider-catalog.yaml"
+
+
+def _resolve_reference_dir() -> Path:
+    """Locate the lead-research reference data across install layouts.
+
+    `parents[2]` is the repo root in a checkout but site-packages in an
+    installed build, and there is no `skills/` tree there. This is not a lazy
+    failure to shrug at: registry.py reads provider-catalog.yaml at import
+    time and build_registry() runs inside create_app(), so an unresolved path
+    means the API will not boot at all.
+
+    Order:
+        1. ``HERMES_BUNDLED_SKILLS`` — the container copies the full skills
+           tree to /opt/interfaze/skills and points this at it.
+        2. The source checkout. Ahead of the packaged copy on purpose: in a
+           dev tree with an editable install both exist, and the checkout is
+           the one being edited (test_foundation.py asserts the generated
+           sectors.md/.csv match the .yaml — reading a stale installed copy
+           there produces a baffling failure).
+        3. Wheel data-files (`<data>/interfaze-reference/lead-research`), the
+           only candidate that exists for a plain `pip install`.
+
+    Falls back to the checkout path so the FileNotFoundError names something
+    recognisable rather than a sysconfig directory nobody expects.
+    """
+    checkout = ROOT / "skills" / "sales" / "lead-research" / "references"
+
+    candidates: list[Path] = []
+    override = os.getenv("HERMES_BUNDLED_SKILLS", "").strip()
+    if override:
+        candidates.append(Path(override) / "sales" / "lead-research" / "references")
+    candidates.append(checkout)
+    for scheme in ("data", "purelib", "platlib"):
+        raw = sysconfig.get_path(scheme)
+        if raw:
+            candidates.append(Path(raw) / "interfaze-reference" / "lead-research")
+
+    for candidate in candidates:
+        if (candidate / _CATALOG_FILENAME).is_file():
+            return candidate
+    return checkout
+
+
+REFERENCE_DIR = _resolve_reference_dir()
 SECTOR_YAML = REFERENCE_DIR / "sectors.yaml"
 SECTOR_MD = REFERENCE_DIR / "sectors.md"
 SECTOR_CSV = REFERENCE_DIR / "sectors.csv"

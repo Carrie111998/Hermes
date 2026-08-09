@@ -346,6 +346,27 @@ locales = ["locales/*.yaml"]
 # entry; tests/test_packaging_metadata.py enforces an entry per optional-mcps/<name>.
 "optional-mcps/linear" = ["optional-mcps/linear/manifest.yaml"]
 "optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
+# The lead-research reference data (sector taxonomy, provider catalog, feature
+# playbooks). Unlike the rest of skills/ — which is agent-facing instruction
+# text the container mounts from /opt/interfaze/skills — these files are read
+# by server/lead_research at import time, and build_registry() runs inside
+# create_app(). A wheel without them cannot start the API at all, not merely
+# degrade the skill, so they have to travel in the distribution. MANIFEST.in's
+# `graft skills` already covers the sdist; this covers the wheel.
+#
+# Target is `interfaze-reference/`, deliberately NOT `skills/`. Installing to
+# `<data>/skills` would make hermes_constants._get_packaged_data_dir("skills")
+# start resolving for every wheel install, so tools/skills_sync.py would sync
+# this five-file subtree into $HERMES_HOME/skills as if it were the whole
+# bundled catalog. Its own namespace keeps that resolution untouched;
+# server/lead_research/sectors.py knows where to look.
+"interfaze-reference/lead-research" = [
+  "skills/sales/lead-research/references/provider-catalog.yaml",
+  "skills/sales/lead-research/references/feature-playbooks.yaml",
+  "skills/sales/lead-research/references/sectors.yaml",
+  "skills/sales/lead-research/references/sectors.md",
+  "skills/sales/lead-research/references/sectors.csv",
+]
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
