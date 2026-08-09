@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import os
+import plistlib
+import stat
+from pathlib import Path
 from typing import Iterable
 
 from plugins.agentops.control.observer_models import (
@@ -78,18 +83,33 @@ _PROFILE_TARGETS: tuple[tuple[str, str, str, Criticality, str], ...] = (
 
 def bootstrap_gateway_registry() -> FleetRegistry:
     """Return the fixed five-profile inventory recorded during Phase 0."""
-    specs = (
-        TargetSpec(
+    def spec_for(profile, label, logs_path, criticality, label_profile):
+        plist = Path(f"~/Library/LaunchAgents/{label}.plist").expanduser()
+        labels = {"service_label": label, "profile": label_profile}
+        try:
+            meta = plist.lstat()
+            if stat.S_ISREG(meta.st_mode) and not stat.S_ISLNK(meta.st_mode) and meta.st_uid == os.getuid() and meta.st_nlink == 1 and meta.st_size <= 1024 * 1024:
+                data = plistlib.loads(plist.read_bytes())
+                args = data.get("ProgramArguments")
+                if data.get("Label") == label and isinstance(args, list) and all(isinstance(x, str) for x in args):
+                    digest = hashlib.sha256("\x00".join(args).encode()).hexdigest()
+                    labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled")
+                else:
+                    labels["process_observation"] = "disabled"
+            else:
+                labels["process_observation"] = "disabled"
+        except (OSError, plistlib.InvalidFileException, ValueError, TypeError):
+            labels["process_observation"] = "disabled"
+        return TargetSpec(
             target_id=f"hermes:profile:{profile}:gateway",
             profile=profile,
             kind=TargetKind.GATEWAY,
             criticality=criticality,
             observed_paths=(logs_path, f"~/Library/LaunchAgents/{label}.plist"),
-            labels={"service_label": label, "profile": label_profile, "process_observation": "disabled"},
+            labels=labels,
             existing_writer="launchd+hermes_gateway_watchdog",
         )
-        for profile, label, logs_path, criticality, label_profile in _PROFILE_TARGETS
-    )
+    specs = tuple(spec_for(*item) for item in _PROFILE_TARGETS)
     return FleetRegistry(specs)
 
 
