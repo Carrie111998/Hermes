@@ -135,6 +135,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -168,7 +169,6 @@ import {
   revalidatePooledRemoteBackends,
   revalidateRemoteConnection
 } from './remote-liveness'
-import { buildHudWindowUrl } from './hud-url'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
