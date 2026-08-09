@@ -374,6 +374,9 @@ function profileRemoteOverride(config, profile) {
 }
 
 export interface ProfileRouteOptions {
+  /** Profile name on a separately-scoped backend when it differs from the
+   * desktop's local routing label (managed SSH `remoteProfile`). */
+  backendProfile?: null | string
   globalRemote?: boolean
   primaryProfile?: null | string
   profileRemoteOverride?: boolean
@@ -428,16 +431,16 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
 }
 
 /**
- * Add renderer-side `request.profile` to a REST path when the route says the
- * serving backend is not already scoped to that profile.
+ * Reconcile the renderer's desktop-facing profile label with the backend's
+ * profile namespace, then add `request.profile` when a shared backend needs it.
+ *
+ * A managed SSH override can deliberately map local `mara` to remote `default`.
+ * Endpoint-level filters (cron list / blueprint instantiate) arrive as an
+ * explicit `?profile=mara`; translate only that self-scope. Cross-profile
+ * selectors such as `all` or another concrete profile retain their meaning.
  */
 function pathWithGlobalRemoteProfile(path, profile, opts: ProfileRouteOptions = {}) {
   const scopedProfile = connectionScopeKey(profile)
-
-  if (!resolveProfileBackendRoute(profile, opts).scopePath) {
-    return path
-  }
-
   const rawPath = String(path || '')
 
   if (!rawPath) {
@@ -449,6 +452,19 @@ function pathWithGlobalRemoteProfile(path, profile, opts: ProfileRouteOptions = 
   try {
     parsed = new URL(rawPath, 'http://hermes.local')
   } catch {
+    return path
+  }
+
+  const backendProfile = connectionScopeKey(opts.backendProfile)
+  const explicitProfile = connectionScopeKey(parsed.searchParams.get('profile'))
+
+  if (backendProfile && backendProfile !== scopedProfile && explicitProfile === scopedProfile) {
+    parsed.searchParams.set('profile', backendProfile)
+
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`
+  }
+
+  if (!resolveProfileBackendRoute(profile, opts).scopePath) {
     return path
   }
 
