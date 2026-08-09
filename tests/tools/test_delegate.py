@@ -1860,11 +1860,17 @@ class TestMaxConcurrentChildrenParsing(unittest.TestCase):
         )
 
     def test_non_integer_numeric_string_falls_back_to_default(self):
-        # '8.5' cannot be parsed by int() -> ValueError branch -> default.
+        # '8.5' (a STRING) cannot be parsed by int() -> ValueError branch ->
+        # default. Distinct from a real float value (next test).
         self.assertEqual(
             self._call({"max_concurrent_children": "8.5"}),
             _DEFAULT_MAX_CONCURRENT_CHILDREN,
         )
+
+    def test_float_value_truncates_not_falls_back(self):
+        # REAL float 8.5 (e.g. YAML numeric) -> int(8.5) == 8, no exception,
+        # no fallback. Trust-review gap: pin the truncation behavior.
+        self.assertEqual(self._call({"max_concurrent_children": 8.5}), 8)
 
     def test_zero_config_clamped_to_one(self):
         self.assertEqual(self._call({"max_concurrent_children": 0}), 1)
@@ -1906,6 +1912,19 @@ class TestMaxConcurrentChildrenEnvVar(unittest.TestCase):
 
     def test_env_negative_clamped_to_one(self):
         self.assertEqual(self._call_with_env("-3"), 1)
+
+    def test_config_wins_over_env_precedence(self):
+        # Trust-review gap: env is consulted ONLY when the config value is
+        # absent (delegate_tool.py:597-618). With config present, env must
+        # NOT override — config value 4 beats env 7.
+        with (
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"max_concurrent_children": 4},
+            ),
+            patch.dict(os.environ, {"DELEGATION_MAX_CONCURRENT_CHILDREN": "7"}, clear=True),
+        ):
+            self.assertEqual(_get_max_concurrent_children(), 4)
 
     def test_unset_env_uses_default(self):
         self.assertEqual(
