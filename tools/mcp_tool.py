@@ -4783,6 +4783,16 @@ def _try_acquire_mcp_discovery_lock() -> Any:
 # normal server shutdown.
 _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 
+# Server names whose in-flight ``call_tool`` was cancelled by the fail-fast
+# watchdog in ``_watch_stdio_subprocess`` (i.e. the stdio subprocess died
+# mid-call, not a user interrupt).  ``_call`` consults this under ``_lock``
+# when it surfaces ``asyncio.CancelledError``: if the watchdog fired, the
+# cancellation is remapped to ``MCPStdioSubprocessDeadError`` so the sync
+# handler's ``except Exception`` path can reach
+# ``_handle_subprocess_dead_and_retry``; otherwise it is a genuine user
+# cancellation and propagates unchanged (#81995).
+_watchdog_fired_servers: Set[str] = set()
+
 # PIDs that survived their session context exit (SDK teardown failed to
 # terminate them).  These are detected in _run_stdio's finally block and
 # can be cleaned up asynchronously by _kill_orphaned_mcp_children().
@@ -4870,6 +4880,12 @@ async def _watch_stdio_subprocess(
                 # in-flight call_tool future so the SDK's recv loop is
                 # unwound, then signal the failure to the caller.
                 if not call_task.done():
+                    # Record that THIS cancellation was watchdog-driven so
+                    # ``_call`` can remap the surfaced CancelledError to
+                    # ``MCPStdioSubprocessDeadError`` instead of letting a
+                    # bare BaseException escape the handler (#81995).
+                    with _lock:
+                        _watchdog_fired_servers.add(server_name)
                     call_task.cancel()
                 raise MCPStdioSubprocessDeadError(
                     f"MCP stdio subprocess for server '{server_name}' died "
@@ -5597,6 +5613,27 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                     try:
                         result = await call_task
+                    except asyncio.CancelledError:
+                        # The watchdog cancelled ``call_task`` because the
+                        # stdio subprocess died mid-call (#81995): remap the
+                        # surfaced CancelledError (a BaseException, which the
+                        # sync handler's ``except Exception`` cannot see) to
+                        # ``MCPStdioSubprocessDeadError`` so the handler's
+                        # reconnect-and-retry path actually runs. A genuine
+                        # user cancellation (``_run_on_mcp_loop`` interrupt
+                        # or timeout) leaves the flag unset and re-raises
+                        # unchanged.
+                        with _lock:
+                            watchdog_fired = server_name in _watchdog_fired_servers
+                            if watchdog_fired:
+                                _watchdog_fired_servers.discard(server_name)
+                        if watchdog_fired:
+                            raise MCPStdioSubprocessDeadError(
+                                f"MCP stdio subprocess for server "
+                                f"'{server_name}' died during an in-flight "
+                                f"tool call; failing fast (#81995)."
+                            ) from None
+                        raise
                     finally:
                         # Always cancel the watchdog so it doesn't outlive
                         # the call (and so its ``asyncio.wait`` releases).

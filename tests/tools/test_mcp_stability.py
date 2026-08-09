@@ -1,6 +1,7 @@
 """Tests for MCP stability fixes — event loop handler, PID tracking, shutdown robustness."""
 
 import asyncio
+import json
 import os
 import signal
 from unittest.mock import patch, MagicMock
@@ -922,3 +923,142 @@ class TestStdioSubprocessDeadFailFast:
                     call_task.cancel()
 
         asyncio.run(_run())
+
+    def test_watchdog_cancel_reaches_retry_handler(self):
+        """Watchdog-triggered CancelledError is remapped so the retry chain runs.
+
+        The watchdog in ``_watch_stdio_subprocess`` cancels the in-flight
+        ``call_tool`` future, which surfaces as ``asyncio.CancelledError`` at
+        ``await call_task`` in ``_call()``. CancelledError is a BaseException,
+        so the sync handler's ``except Exception`` never saw it and
+        ``_handle_subprocess_dead_and_retry`` was unreachable dead code.
+        ``_call()`` must remap the watchdog-driven cancellation to
+        ``MCPStdioSubprocessDeadError`` so the reconnect-and-retry path
+        actually executes (#81995).
+        """
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        import tools.mcp_tool as mcp_mod
+
+        server_name = "retry-chain-srv"
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_connecting.clear()
+            mcp_mod._stdio_pids.clear()
+            mcp_mod._watchdog_fired_servers.clear()
+            mcp_mod._server_error_counts.clear()
+            mcp_mod._server_breaker_opened_at.clear()
+            mcp_mod._server_trust_levels.clear()
+
+        # Fake server: session.call_tool hangs on the FIRST call (until the
+        # watchdog cancels it) and succeeds on the retry.
+        srv = MagicMock()
+        srv._rpc_lock = asyncio.Lock()
+        srv._reconnect_event = asyncio.Event()
+        srv._reconnect_event.set()
+
+        def _fake_call_tool(*args, **kwargs):
+            if _fake_call_tool.calls == 0:
+                _fake_call_tool.calls += 1
+                return asyncio.sleep(60)  # hangs until cancelled
+            _fake_call_tool.calls += 1
+            ok = SimpleNamespace(
+                isError=False,
+                structuredContent=None,
+                content=[SimpleNamespace(type="text", text="recovered")],
+            )
+            return asyncio.sleep(0.001, result=ok)
+
+        _fake_call_tool.calls = 0
+        srv.session.call_tool = MagicMock(side_effect=_fake_call_tool)
+
+        dead_pid = 999999994
+        with mcp_mod._lock:
+            mcp_mod._servers[server_name] = srv
+            mcp_mod._stdio_pids[dead_pid] = server_name
+
+        try:
+            mcp_mod._ensure_mcp_loop()
+            handler = mcp_mod._make_tool_handler(server_name, "do-thing", 5.0)
+            with patch.object(
+                mcp_mod, "_signal_reconnect_and_wait", return_value=True,
+            ) as mock_reconnect:
+                result = handler({"arg": 1})
+
+            # The retry path ran: reconnect signalled once, the call was
+            # retried on the fresh session, and the retried result surfaced.
+            assert result == '{"result": "recovered"}'
+            assert mock_reconnect.call_count == 1
+            assert mock_reconnect.call_args[0][0] == server_name
+            assert _fake_call_tool.calls == 2
+            # The remap flag was consumed, not left dangling.
+            with mcp_mod._lock:
+                assert server_name not in mcp_mod._watchdog_fired_servers
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_connecting.clear()
+                mcp_mod._stdio_pids.clear()
+                mcp_mod._watchdog_fired_servers.clear()
+                mcp_mod._server_error_counts.clear()
+                mcp_mod._server_breaker_opened_at.clear()
+                mcp_mod._server_trust_levels.clear()
+            mcp_mod._stop_mcp_loop()
+
+    def test_non_watchdog_cancellation_not_remapped(self):
+        """A genuine CancelledError is not remapped to a subprocess-dead retry.
+
+        User interrupts and loop teardown cancel the call for reasons
+        unrelated to the stdio subprocess. Those must NOT trigger the
+        watchdog's reconnect-and-retry chain (``_watchdog_fired_servers``
+        stays empty), and the call must fall through to the generic error
+        path instead of retrying against a healthy server (#81995).
+        """
+        import asyncio
+        from unittest.mock import MagicMock
+        import tools.mcp_tool as mcp_mod
+
+        server_name = "retry-chain-cancel-srv"
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._server_connecting.clear()
+            mcp_mod._stdio_pids.clear()
+            mcp_mod._watchdog_fired_servers.clear()
+            mcp_mod._server_error_counts.clear()
+            mcp_mod._server_breaker_opened_at.clear()
+            mcp_mod._server_trust_levels.clear()
+
+        srv = MagicMock()
+        srv._rpc_lock = asyncio.Lock()
+        srv.session.call_tool = MagicMock(
+            side_effect=asyncio.CancelledError("user interrupt")
+        )
+        with mcp_mod._lock:
+            mcp_mod._servers[server_name] = srv
+
+        try:
+            mcp_mod._ensure_mcp_loop()
+            handler = mcp_mod._make_tool_handler(server_name, "do-thing", 5.0)
+            with patch.object(
+                mcp_mod, "_signal_reconnect_and_wait", return_value=True,
+            ) as mock_reconnect:
+                result = handler({"arg": 1})
+
+            # Generic error path — no reconnect/retry was attempted for a
+            # cancellation that the watchdog did not originate.
+            assert mock_reconnect.call_count == 0
+            parsed = json.loads(result)
+            assert "error" in parsed
+            with mcp_mod._lock:
+                assert server_name not in mcp_mod._watchdog_fired_servers
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+                mcp_mod._server_connecting.clear()
+                mcp_mod._stdio_pids.clear()
+                mcp_mod._watchdog_fired_servers.clear()
+                mcp_mod._server_error_counts.clear()
+                mcp_mod._server_breaker_opened_at.clear()
+                mcp_mod._server_trust_levels.clear()
+            mcp_mod._stop_mcp_loop()
