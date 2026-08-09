@@ -1788,6 +1788,8 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier as _normalize_whatsapp_identifier,
 )
 
+from gateway.nats_collab_listener import run_nats_collab_listener
+
 
 logger = logging.getLogger(__name__)
 
@@ -7518,6 +7520,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is ignored via its instantiation epoch; only a current-epoch marker
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
+
+        # Start background NATS collaboration listener - subscribes to
+        # collab.done on the shared NATS bus and injects synthetic Slack
+        # events when xiaozhi (Claude on ser6) finishes her turn, reusing
+        # the existing Slack session (same model, prompt, context).
+        asyncio.create_task(run_nats_collab_listener(self))
 
         logger.info("Press Ctrl+C to stop")
         
