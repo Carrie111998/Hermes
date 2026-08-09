@@ -971,6 +971,13 @@ class SlackAdapter(BasePlatformAdapter):
         # user never clicks would otherwise leak its entry forever. Keys may
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
+        # Approval prompt marker -> the already-authorized Slack user who
+        # triggered the agent turn. Interactive payloads do not carry the
+        # Hermes profile stamp, so re-running profile-scoped auth on a button
+        # click can reject the same owner who was authorized at message intake.
+        # Binding the button to its requester preserves least privilege without
+        # widening SLACK_ALLOWED_USERS globally.
+        self._approval_requesters: Dict[Any, str] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
@@ -6772,11 +6779,18 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = result.get("ts", "")
             if msg_ts:
                 team_id = self._metadata_team_id(metadata)
-                self._approval_resolved[
-                    self._workspace_message_marker(team_id, msg_ts)
-                ] = False
+                approval_marker = self._workspace_message_marker(team_id, msg_ts)
+                self._approval_resolved[approval_marker] = False
+                requester_user_id = str(
+                    (metadata or {}).get("slack_requester_user_id") or ""
+                ).strip()
+                if requester_user_id:
+                    self._approval_requesters[approval_marker] = requester_user_id
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._approval_requesters, self._APPROVAL_RESOLVED_MAX
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -7191,11 +7205,17 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
-            team_id=team_id,
+        approval_key = self._workspace_message_marker(team_id, msg_ts)
+        # Older or metadata-poor send paths key prompts by timestamp only.
+        # Select that key before requester authorization so the initiating
+        # user receives the same least-privilege exception in both cases.
+        if msg_ts in self._approval_resolved:
+            approval_key = msg_ts
+        expected_requester = self._approval_requesters.get(approval_key)
+        requester_matches = bool(expected_requester and user_id == expected_requester)
+
+        if not requester_matches and not self._is_interactive_user_authorized(
+            user_id, channel_id=channel_id, user_name=user_name, team_id=team_id
         ):
             logger.warning(
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",
@@ -7231,11 +7251,9 @@ class SlackAdapter(BasePlatformAdapter):
         # may have been stored without a team id (metadata-poor send path)
         # while the click event carries one, and that mismatch must not
         # swallow a legitimate first click.
-        approval_key = self._workspace_message_marker(team_id, msg_ts)
-        if msg_ts in self._approval_resolved:
-            approval_key = msg_ts
         if self._approval_resolved.pop(approval_key, True):
             return
+        self._approval_requesters.pop(approval_key, None)
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)

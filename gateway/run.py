@@ -21250,6 +21250,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+            user_id = getattr(source, "user_id", None)
+            if user_id:
+                metadata = dict(metadata or {})
+                metadata["slack_requester_user_id"] = str(user_id)
         return metadata
 
     def _thread_metadata_for_target(
