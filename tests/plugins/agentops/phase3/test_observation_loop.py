@@ -176,6 +176,12 @@ def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
         if hasattr(collector, "min_interval_seconds"):
             collector.min_interval_seconds = 0
     runbook = ObservationRunbook(loop)
+    assert runbook.drain_backlog(max_passes=1)["tail_reached"] is True
+    empty_day = datetime.now(timezone.utc).date()
+    empty_summary = loop.ledger.daily_summary(empty_day)
+    empty_terra = loop.ledger.terra_input(empty_day, max_items=500, max_bytes=8 * 1024 * 1024)
+    empty_receipt = hashlib.sha256(json.dumps({"summary": empty_summary, "terra_input": empty_terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    runbook.finalize_backlog_export(utc_day=empty_day, summary=empty_summary, terra_input=empty_terra, export_verified=True, export_receipt_sha256=empty_receipt)
     loop.collect_once()
     day = datetime.now(timezone.utc).date()
     summary = loop.ledger.daily_summary(day)
@@ -198,6 +204,12 @@ def test_runbook_export_receipt_is_bound_to_current_ledger(tmp_path):
         if hasattr(collector, "min_interval_seconds"):
             collector.min_interval_seconds = 0
     runbook = ObservationRunbook(loop)
+    assert runbook.drain_backlog(max_passes=1)["tail_reached"] is True
+    empty_day = datetime.now(timezone.utc).date()
+    empty_summary = loop.ledger.daily_summary(empty_day)
+    empty_terra = loop.ledger.terra_input(empty_day, max_items=500, max_bytes=8 * 1024 * 1024)
+    empty_receipt = hashlib.sha256(json.dumps({"summary": empty_summary, "terra_input": empty_terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    runbook.finalize_backlog_export(utc_day=empty_day, summary=empty_summary, terra_input=empty_terra, export_verified=True, export_receipt_sha256=empty_receipt)
     loop.collect_once()
     day = datetime.now(timezone.utc).date()
     old_summary = loop.ledger.daily_summary(day)
@@ -219,6 +231,8 @@ def test_runbook_rate_limit_is_safe_stop_not_catch_up(tmp_path):
     assert report["passes"] == 1
     assert report["stop_reason"] == "next_eligible_not_reached"
     assert report["next_eligible_seconds"] >= 60
+    second = ObservationRunbook(loop).drain_backlog(max_passes=2)
+    assert second["passes"] == 0 and second["stop_reason"] == "next_eligible_not_reached"
 
 
 def test_runbook_backlog_stops_on_ledger_budget(tmp_path):
@@ -235,6 +249,9 @@ def test_runbook_backlog_stops_on_ledger_budget(tmp_path):
 def test_runbook_rejects_inode_changed_tail(tmp_path):
     registry, log, _, _ = _trusted_registry(tmp_path)
     loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
     logs = next(item for item in loop.collectors if item.name == "logs")
     batch = logs.collect(loop.target)
     object.__setattr__(batch, "next_cursor", type(batch.next_cursor)(inode=batch.next_cursor.inode + 1, offset=batch.next_cursor.offset, source_id=batch.next_cursor.source_id))
@@ -279,6 +296,36 @@ def test_runbook_finalize_backlog_requires_verified_export_and_marks_day0(tmp_pa
     finalized = runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
     assert finalized["day1_cleanup"] is True and finalized["observation_day_counted"] is False
     assert finalized["next_observation_utc_day"] != day.isoformat() and len(loop.ledger.batches()) == 0
+    with pytest.raises(ObservationBoundaryError):
+        runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
+
+
+def test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop, max_events=3)
+    assert runbook.drain_backlog(max_passes=1)["tail_reached"] is True
+    day = datetime.now(timezone.utc).date()
+    summary = loop.ledger.daily_summary(day)
+    terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
+    loop.collect_once()
+    current = loop.ledger.batches()
+    old = dict(current[0])
+    old["collected_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    object.__setattr__(loop.ledger._records[0], "record", old)
+    with pytest.raises(ObservationBoundaryError, match="mixed UTC days"):
+        runbook.rotate_after_daily_export(utc_day=day, summary=loop.ledger.daily_summary(day), terra_input=loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024), export_verified=True, export_receipt_sha256="0" * 64)
+    assert len(loop.ledger.batches()) == len(current)
+    runbook._events.clear()
+    runbook.max_events = 0
+    with pytest.raises(ObservationBoundaryError, match="event budget"):
+        runbook.rotate_after_daily_export(utc_day=day, summary=loop.ledger.daily_summary(day), terra_input=loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024), export_verified=True, export_receipt_sha256="0" * 64)
+    assert len(loop.ledger.batches()) == len(current)
 
 
 def test_runbook_rejects_future_duplicate_slots_and_metadata_mutation(tmp_path):

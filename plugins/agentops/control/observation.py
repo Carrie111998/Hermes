@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
 import stat
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -421,6 +423,12 @@ class ObservationRunbook:
         self._events: list[dict[str, Any]] = []
         self._slot_keys: set[str] = set()
         self._backlog_tail_reached = False
+        self._state = "DRAINING"
+        self._next_eligible_at = 0.0
+
+    def _reserve_event(self) -> None:
+        if len(self._events) >= self.max_events:
+            raise ObservationBoundaryError("runbook event budget exceeded")
 
     def _metadata(self, *, stage: str, status: str, **fields: Any) -> dict[str, Any]:
         now = utc_now()
@@ -428,6 +436,7 @@ class ObservationRunbook:
             "run_id": str(uuid.uuid4()),
             "stage": stage,
             "status": status,
+            "runbook_state": self._state,
             "recorded_at_utc": now.isoformat().replace("+00:00", "Z"),
             "utc_day": now.date().isoformat(),
             "target_id": self.loop.target.target_id,
@@ -437,18 +446,28 @@ class ObservationRunbook:
             "ledger_bytes": self.loop.ledger.bytes_used,
             **fields,
         }
-        if len(self._events) >= self.max_events:
-            raise ObservationBoundaryError("runbook event budget exceeded")
+        self._reserve_event()
         self._events.append(item)
         return json.loads(json.dumps(item, sort_keys=True))
 
     def _next_eligible_seconds(self) -> float:
-        return max(float(getattr(collector, "min_interval_seconds", 0.0)) for collector in self.loop.collectors)
+        now = time.monotonic()
+        remaining = max(0.0, self._next_eligible_at - now)
+        for collector in self.loop.collectors:
+            interval = float(getattr(collector, "min_interval_seconds", 0.0))
+            last = float(getattr(collector, "_last_collection", 0.0) or 0.0)
+            if interval > 0 and last > 0:
+                remaining = max(remaining, interval - (now - last))
+        return max(0.0, remaining)
 
     def drain_backlog(self, *, max_passes: int = 64) -> dict[str, Any]:
         """Drain existing log backlog in bounded passes; it is not observation day 1."""
         if not isinstance(max_passes, int) or max_passes <= 0:
             raise ValueError("invalid backlog pass budget")
+        if self._state != "DRAINING":
+            raise ObservationBoundaryError("backlog drain is a one-shot stage")
+        if self._next_eligible_seconds() > 0:
+            return self._metadata(stage="backlog_drain", status="safe_stop", passes=0, tail_reached=False, stop_reason="next_eligible_not_reached", next_eligible_seconds=math.ceil(self._next_eligible_seconds()), observation_day_counted=False)
         logs = next((collector for collector in self.loop.collectors if collector.name == "logs"), None)
         if logs is None or not hasattr(logs, "path"):
             return self._metadata(stage="backlog_drain", status="safe_stop", passes=0, tail_reached=False, stop_reason="logs_collector_unavailable", observation_day_counted=False)
@@ -465,6 +484,7 @@ class ObservationRunbook:
             except ObservationBoundaryError:
                 stop_reason = "ledger_budget_exceeded"
                 return self._metadata(stage="backlog_drain", status="safe_stop", passes=passes, tail_reached=False, stop_reason=stop_reason, observation_day_counted=False)
+            self._next_eligible_at = time.monotonic() + max((float(getattr(collector, "min_interval_seconds", 0.0)) for collector in self.loop.collectors), default=0.0)
             log_batch = next((batch for batch in batches if batch.collector == "logs"), None)
             if log_batch is None or not log_batch.health.healthy:
                 stop_reason = log_batch.health.reason if log_batch is not None and log_batch.health.reason else "log_collection_unhealthy"
@@ -484,9 +504,10 @@ class ObservationRunbook:
                 tail_reached = True
                 stop_reason = "tail_reached"
                 self._backlog_tail_reached = True
+                self._state = "READY"
                 break
         status = "tail_reached" if tail_reached else "safe_stop"
-        return self._metadata(stage="backlog_drain", status=status, passes=passes, tail_reached=tail_reached, stop_reason=stop_reason, next_eligible_seconds=self._next_eligible_seconds() if stop_reason == "next_eligible_not_reached" else 0, observation_day_counted=False)
+        return self._metadata(stage="backlog_drain", status=status, passes=passes, tail_reached=tail_reached, stop_reason=stop_reason, next_eligible_seconds=math.ceil(self._next_eligible_seconds()) if stop_reason == "next_eligible_not_reached" else 0, observation_day_counted=False)
 
     def _verify_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool, export_receipt_sha256: str | None) -> tuple[date, str]:
         day = _utc_day(utc_day)
@@ -494,6 +515,12 @@ class ObservationRunbook:
             raise ObservationBoundaryError("daily export verification required")
         current_summary = self.loop.ledger.daily_summary(day)
         current_terra = self.loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+        record_days = {
+            _utc_day(datetime.fromisoformat(str(record["collected_at"])))
+            for record in self.loop.ledger.batches()
+        }
+        if record_days and record_days != {day}:
+            raise ObservationBoundaryError("daily export contains mixed UTC days")
         if json.dumps(summary, sort_keys=True, separators=(",", ":")) != json.dumps(current_summary, sort_keys=True, separators=(",", ":")) or json.dumps(terra_input, sort_keys=True, separators=(",", ":")) != json.dumps(current_terra, sort_keys=True, separators=(",", ":")):
             raise ObservationBoundaryError("daily export does not match current ledger")
         envelope = {"summary": current_summary, "terra_input": current_terra}
@@ -504,6 +531,9 @@ class ObservationRunbook:
 
     def rotate_after_daily_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
         """Replace only the in-memory ledger after a verified UTC export."""
+        if self._state != "OBSERVING":
+            raise ObservationBoundaryError("daily rotation requires observing stage")
+        self._reserve_event()
         day, receipt = self._verify_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
         if summary.get("day") != day.isoformat() or terra_input.get("summary", {}).get("day") != day.isoformat():
             raise ObservationBoundaryError("daily export UTC day mismatch")
@@ -514,12 +544,14 @@ class ObservationRunbook:
         return self._metadata(stage="daily_rotation", status="rotated", exported_utc_day=day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=True)
 
     def finalize_backlog_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
-        if not self._backlog_tail_reached:
+        if self._state != "READY" or not self._backlog_tail_reached:
             raise ObservationBoundaryError("backlog has not reached a verified tail")
+        self._reserve_event()
         day, receipt = self._verify_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
         cursor_keys_before = tuple(sorted(self.loop._cursors))
         self.loop.ledger = ObservationLedger(max_runs=self.loop.ledger.max_runs, max_signals=self.loop.ledger.max_signals, max_bytes=self.loop.ledger.max_bytes)
         next_day = day + timedelta(days=1)
+        self._state = "OBSERVING"
         return self._metadata(stage="backlog_finalize", status="finalized", exported_utc_day=day.isoformat(), next_observation_utc_day=next_day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=False, day1_cleanup=True)
 
     def record_missed_slot(self, scheduled_at: datetime) -> dict[str, Any]:
@@ -536,6 +568,10 @@ class ObservationRunbook:
 
     def metadata(self) -> tuple[dict[str, Any], ...]:
         return tuple(json.loads(json.dumps(item, sort_keys=True)) for item in self._events)
+
+    @property
+    def state(self) -> str:
+        return self._state
 
 
 class _UnavailableCronCollector:

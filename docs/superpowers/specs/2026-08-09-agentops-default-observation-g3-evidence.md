@@ -2,11 +2,12 @@
 
 **Status:** implementation/evidence contract only; seven-day production observation is pending.
 
-**Sol-reviewed AgentOps implementation head:** `fbdc57bdd`. Subsequent PR
-commits are documentation-only descendants; the AgentOps implementation tree
-remains identical. The latest local `tests/plugins/agentops` passed 153 tests
-and local `tests/plugins` passed 692 tests; compileall, static read-only scan,
-and diff check also passed.
+**Sol-reviewed AgentOps implementation baseline:** `fbdc57bdd`. The bounded
+runbook hardening in this candidate is a code descendant (it changes
+`observation.py` and the log collector); it is not a documentation-only
+descendant and requires independent review. The latest local
+`tests/plugins/agentops` passed 154 tests and local `tests/plugins` passed 693
+tests; final execution results are recorded with the candidate commit.
 
 ## Scope and trust boundary
 
@@ -40,7 +41,10 @@ is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
 ## Two-stage operating runbook
 
 1. **Day 1 backlog drain (not an observation day):** invoke
-   `ObservationRunbook.drain_backlog(max_passes=...)`. Each invocation performs
+   `ObservationRunbook.drain_backlog(max_passes=...)`. The runbook is a one-shot
+   `DRAINING → READY → OBSERVING` state machine: only the initial DRAINING
+   stage may drain, and a verified finalize transitions it to OBSERVING.
+   Each invocation performs
    at most one eligible collection pass: the next pass is safe-stopped until
    every collector's review-pack rate interval (at least 60 seconds in the
    default pack) is eligible. It uses the existing loop cursor and bounded
@@ -52,7 +56,7 @@ is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
    not replayed as bursts.
 2. **Daily observation rotation:** after a UTC day's `daily_summary` and full
    bounded `terra_input` have been exported and independently validated,
-   invoke `rotate_after_daily_export`. The operation recomputes the current
+   invoke `rotate_after_daily_export` only from OBSERVING. The operation recomputes the current
    UTC summary/Terra envelope, checks the redaction and 8 MiB/item budgets, and
    requires a SHA-256 receipt over that exact canonical envelope. It replaces
    only the in-memory ledger; the same loop instance and cursor map are
@@ -61,7 +65,8 @@ is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
    authoritative.
    After backlog reaches a verified tail, `finalize_backlog_export` performs the
    same receipt check, clears the Day0 ledger with `observation_day_counted=false`,
-   preserves cursors, and reports the next UTC observation day.
+   preserves cursors, and reports the next UTC observation day. Finalization is
+   one-shot; a second finalize or a second backlog drain is rejected.
 3. **Missed slot:** invoke `record_missed_slot(scheduled_at)` for metadata only;
    it records `catch_up=false`, `slot_satisfied=false`, and
    `day_success_eligible=false` and performs no collection. Future and duplicate
@@ -94,7 +99,7 @@ production writes.
 | Read-only Process/Launchd/Log/Cron collection and unchanged input hashes | `test_default_loop_collects_read_only_process_launchd_logs_and_cron` |
 | Fixed asset/fingerprint/label fail-closed binding on every pass | `test_default_loop_rejects_tampered_or_disabled_binding`, `test_launchd_asset_replacement_between_passes_fails_closed` |
 | No SQLite/lifecycle surface | `test_default_loop_does_not_expose_sqlite_or_lifecycle_surface` |
-| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_export_receipt_is_bound_to_current_ledger`, `test_runbook_backlog_stops_on_ledger_budget`, `test_runbook_rate_limit_is_safe_stop_not_catch_up`, `test_runbook_rejects_inode_changed_tail`, `test_runbook_rejects_path_rotation_before_declaring_tail`, `test_runbook_finalize_backlog_requires_verified_export_and_marks_day0`, `test_runbook_rejects_future_duplicate_slots_and_metadata_mutation` |
+| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_export_receipt_is_bound_to_current_ledger`, `test_runbook_backlog_stops_on_ledger_budget`, `test_runbook_rate_limit_is_safe_stop_not_catch_up`, `test_runbook_rejects_inode_changed_tail`, `test_runbook_rejects_path_rotation_before_declaring_tail`, `test_runbook_finalize_backlog_requires_verified_export_and_marks_day0`, `test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event`, `test_runbook_rejects_future_duplicate_slots_and_metadata_mutation` |
 
 ## Known limitations
 
