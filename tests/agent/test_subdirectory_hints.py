@@ -121,6 +121,27 @@ class TestSubdirectoryHintTracker:
         assert "Allowed sibling context" in result
         assert "DENIED AGENTS CONTEXT" not in result
 
+    def test_relative_deny_rule_skips_hint_file(self, project):
+        """Relative hint-file rules are anchored to the tracker working dir."""
+        mixed = project / "mixed-relative"
+        mixed.mkdir()
+        (mixed / "AGENTS.md").write_text("RELATIVE DENIED HINT")
+        (mixed / "CLAUDE.md").write_text("Allowed relative hint sibling")
+        (mixed / "data.txt").write_text("ordinary data")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=["mixed-relative/AGENTS.md"],
+        ):
+            result = tracker.check_tool_call(
+                "read_file", {"path": str(mixed / "data.txt")}
+            )
+
+        assert result is not None
+        assert "Allowed relative hint sibling" in result
+        assert "RELATIVE DENIED HINT" not in result
+
     def test_denied_working_dir_context_is_not_read_during_digest_seed(self, project):
         """Tracker initialization must not read a denied startup context file."""
         agents = project / "AGENTS.md"

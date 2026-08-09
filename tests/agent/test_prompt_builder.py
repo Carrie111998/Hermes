@@ -499,6 +499,22 @@ class TestBuildContextFilesPrompt:
         assert "Allowed startup context" in result
         assert "DENIED STARTUP CONTEXT" not in result
 
+    def test_permissions_deny_relative_rule_skips_exact_context_file(self, tmp_path):
+        """Relative context-file rules are anchored to the project cwd."""
+        from unittest.mock import patch
+
+        (tmp_path / "AGENTS.md").write_text("RELATIVE DENIED CONTEXT")
+        (tmp_path / "CLAUDE.md").write_text("Allowed relative-rule sibling")
+
+        with patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=["AGENTS.md"],
+        ):
+            result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Allowed relative-rule sibling" in result
+        assert "RELATIVE DENIED CONTEXT" not in result
+
     def test_denied_hermes_md_is_not_probed_before_allowed_agents_md(self, tmp_path):
         """Exact deny checks precede implicit .hermes.md file metadata access."""
         from pathlib import Path

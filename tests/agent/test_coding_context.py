@@ -63,6 +63,29 @@ class TestIsCodingContext:
                 config=cfg,
             ) is False
 
+    def test_relative_deny_rule_skips_workspace_detection_before_scan(self, tmp_path):
+        private = tmp_path / "private" / "secret.py"
+        private.parent.mkdir()
+        private.write_text("SECRET = True\n")
+        (tmp_path / "package.json").write_text("{}")
+        cfg = {"agent": {"coding_context": "auto"}}
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=["private/secret.py"],
+            ),
+            patch(
+                "agent.coding_context._marker_root",
+                side_effect=AssertionError("relative-denied workspace was probed"),
+            ),
+        ):
+            assert cc.is_coding_context(
+                platform="cli",
+                cwd=tmp_path,
+                config=cfg,
+            ) is False
+
 
 
     def test_auto_bare_git_repo_without_code_stays_general(self, tmp_path):

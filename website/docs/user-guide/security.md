@@ -141,7 +141,8 @@ permissions:
 Details:
 
 - Patterns are [fnmatch](https://docs.python.org/3/library/fnmatch.html) globs (`*`, `?`, `[...]`) matched **case-insensitively**. Command globs match the whole command text. Path globs match normalized, slash-separated paths with `~` expanded.
-- `permissions.deny.paths` applies to file tools: `read_file`, `write_file`, `patch`, and `search_files`. Denied paths are blocked before reads/writes. Recursive searches are rejected before backend enumeration when the requested root is denied or may overlap a denied descendant; the policy does not enter a denied subtree and filter it only afterward.
+- `permissions.deny.paths` applies to file tools (`read_file`, `write_file`, `patch`, and `search_files`) and implicit readers such as `@file`/`@folder` references, startup project context, progressive subdirectory hints, and coding-workspace discovery. Denied paths are blocked before reads/writes. Recursive searches are rejected before backend enumeration when the requested root is denied or may overlap a denied descendant; the policy does not enter a denied subtree and filter it only afterward.
+- Relative path rules are anchored to the active task/project working directory across explicit file tools and implicit context discovery.
 - Local path checks match both the lexical path supplied to the tool and its canonical filesystem identity, covering rules written against aliases as well as aliases that resolve into denied locations. Non-local backends are matched lexically after the existing backend path-resolution step and are never rewritten through host `realpath`.
 - Deny policy loading, validation, and matching errors fail closed. Malformed deny configuration blocks the affected operation until the configuration is fixed.
 - Matching runs over the same normalized/deobfuscated command variants the dangerous-pattern detector uses, so simple quoting tricks (`git pu""sh --force`) don't slip past a command rule.

@@ -273,7 +273,7 @@ def _expand_file_reference(
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
-    _ensure_reference_path_allowed(path)
+    _ensure_reference_path_allowed(path, base_path=cwd)
     if not path.exists():
         return f"{ref.raw}: file not found", None
     if not path.is_file():
@@ -307,7 +307,7 @@ def _expand_folder_reference(
     allowed_root: Path | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
-    _ensure_reference_path_allowed(path, search_root=True)
+    _ensure_reference_path_allowed(path, base_path=cwd, search_root=True)
     if not path.exists():
         return f"{ref.raw}: folder not found", None
     if not path.is_dir():
@@ -385,6 +385,7 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
 def _ensure_reference_path_allowed(
     path: Path,
     *,
+    base_path: Path,
     search_root: bool = False,
 ) -> None:
     try:
@@ -399,6 +400,7 @@ def _ensure_reference_path_allowed(
             match = match_permissions_deny_search_root(
                 str(path),
                 patterns=patterns,
+                base_path=base_path,
                 root_is_file=False,
                 canonicalize=True,
             )
@@ -406,6 +408,7 @@ def _ensure_reference_path_allowed(
             match = match_permissions_deny_path(
                 str(path),
                 patterns=patterns,
+                base_path=base_path,
                 canonicalize=True,
             )
         if match is not None:

@@ -197,6 +197,45 @@ def _normalize_pattern_for_match(pattern: str) -> str:
     ).casefold()
 
 
+def _patterns_with_local_base(
+    patterns: list[str],
+    base_path: str | os.PathLike[str] | None,
+) -> list[tuple[str, str]]:
+    """Pair match variants with their configured source rules.
+
+    Implicit readers resolve candidates to absolute local paths before policy
+    matching. Keeping both the raw rule and an anchored variant preserves the
+    lexical identity while making a rule such as ``secret/**`` mean the same
+    thing for implicit reads as it does for explicit file tools. The second
+    tuple item always remains the user's configured rule for truthful errors.
+    """
+    variants: list[tuple[str, str]] = [(pattern, pattern) for pattern in patterns]
+    if base_path is None:
+        return variants
+
+    base = _expand_tilde(str(base_path))
+    if not (
+        os.path.isabs(base)
+        or bool(re.match(r"^[A-Za-z]:[\\/]", base))
+        or base.startswith("\\\\")
+    ):
+        raise DenyPolicyError("path-policy base_path must be absolute")
+
+    for pattern in patterns:
+        expanded = _expand_tilde(pattern)
+        if (
+            os.path.isabs(expanded)
+            or bool(re.match(r"^[A-Za-z]:[\\/]", expanded))
+            or expanded.startswith("\\\\")
+        ):
+            continue
+        anchored = os.path.normpath(os.path.join(base, expanded))
+        pair = (anchored, pattern)
+        if pair not in variants:
+            variants.append(pair)
+    return variants
+
+
 def _normalize_pattern_variants(
     pattern: str,
     *,
@@ -286,6 +325,7 @@ def match_permissions_deny_path(
     path: str,
     *,
     patterns: list[str] | None = None,
+    base_path: str | os.PathLike[str] | None = None,
     canonicalize: bool = True,
     source: str = "permissions.deny.paths",
 ) -> DenyMatch | None:
@@ -297,15 +337,16 @@ def match_permissions_deny_path(
     if patterns is None:
         patterns = permissions_deny_paths()
     globs = parse_deny_patterns(patterns, field=source)
-    if not globs:
+    pattern_variants = _patterns_with_local_base(globs, base_path)
+    if not pattern_variants:
         return None
     candidates = _normalize_path_variants(path, canonicalize=canonicalize)
-    for pattern in globs:
+    for match_pattern, source_pattern in pattern_variants:
         if any(
-            _path_matches_pattern(candidate, pattern, canonicalize=canonicalize)
+            _path_matches_pattern(candidate, match_pattern, canonicalize=canonicalize)
             for candidate in candidates
         ):
-            return DenyMatch(pattern=pattern, source=source)
+            return DenyMatch(pattern=source_pattern, source=source)
     return None
 
 
@@ -313,6 +354,7 @@ def match_permissions_deny_search_root(
     path: str,
     *,
     patterns: list[str] | None = None,
+    base_path: str | os.PathLike[str] | None = None,
     root_is_file: bool = False,
     canonicalize: bool = True,
     source: str = "permissions.deny.paths",
@@ -326,23 +368,24 @@ def match_permissions_deny_search_root(
     if patterns is None:
         patterns = permissions_deny_paths()
     globs = parse_deny_patterns(patterns, field=source)
-    if not globs:
+    pattern_variants = _patterns_with_local_base(globs, base_path)
+    if not pattern_variants:
         return None
 
     candidates = tuple(
         candidate.rstrip("/")
         for candidate in _normalize_path_variants(path, canonicalize=canonicalize)
     )
-    for pattern in globs:
+    for match_pattern, source_pattern in pattern_variants:
         if any(
-            _path_matches_pattern(candidate, pattern, canonicalize=canonicalize)
+            _path_matches_pattern(candidate, match_pattern, canonicalize=canonicalize)
             for candidate in candidates
         ):
-            return DenyMatch(pattern=pattern, source=source)
+            return DenyMatch(pattern=source_pattern, source=source)
         if root_is_file:
             continue
         for prefix, segment_boundary in _search_overlap_prefixes(
-            pattern,
+            match_pattern,
             canonicalize=canonicalize,
         ):
             if any(
@@ -355,7 +398,7 @@ def match_permissions_deny_search_root(
                 )
                 for candidate in candidates
             ):
-                return DenyMatch(pattern=pattern, source=source)
+                return DenyMatch(pattern=source_pattern, source=source)
     return None
 
 

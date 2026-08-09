@@ -2029,7 +2029,7 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
-def _is_denied_project_context_path(path: Path) -> bool:
+def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
     """Apply permissions.deny.paths to implicit project-context reads."""
     try:
         from agent.deny_policy import (
@@ -2038,7 +2038,10 @@ def _is_denied_project_context_path(path: Path) -> bool:
         )
 
         return match_permissions_deny_path(
-            str(path), patterns=permissions_deny_paths(), canonicalize=True
+            str(path),
+            patterns=permissions_deny_paths(),
+            base_path=base_path,
+            canonicalize=True,
         ) is not None
     except Exception:
         logger.warning(
@@ -2124,11 +2127,13 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(
         cwd_path,
-        is_denied=_is_denied_project_context_path,
+        is_denied=lambda path: _is_denied_project_context_path(
+            path, base_path=cwd_path
+        ),
     )
     if not hermes_md_path:
         return ""
-    if _is_denied_project_context_path(hermes_md_path):
+    if _is_denied_project_context_path(hermes_md_path, base_path=cwd_path):
         return ""
     try:
         content = hermes_md_path.read_text(encoding="utf-8").strip()
@@ -2195,7 +2200,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     for directory in _agents_md_directory_chain(cwd_resolved):
         for name in ["AGENTS.md", "agents.md"]:
             candidate = directory / name
-            if _is_denied_project_context_path(candidate):
+            if _is_denied_project_context_path(candidate, base_path=cwd_resolved):
                 continue
             if not candidate.exists():
                 continue
@@ -2239,7 +2244,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
-        if _is_denied_project_context_path(candidate):
+        if _is_denied_project_context_path(candidate, base_path=cwd_path):
             continue
         if candidate.exists():
             try:
@@ -2260,7 +2265,10 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
-    if not _is_denied_project_context_path(cursorrules_file) and cursorrules_file.exists():
+    if (
+        not _is_denied_project_context_path(cursorrules_file, base_path=cwd_path)
+        and cursorrules_file.exists()
+    ):
         try:
             content = cursorrules_file.read_text(encoding="utf-8").strip()
             if content:
@@ -2271,13 +2279,13 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
     if (
-        not _is_denied_project_context_path(cursor_rules_dir)
+        not _is_denied_project_context_path(cursor_rules_dir, base_path=cwd_path)
         and cursor_rules_dir.exists()
         and cursor_rules_dir.is_dir()
     ):
         mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
         for mdc_file in mdc_files:
-            if _is_denied_project_context_path(mdc_file):
+            if _is_denied_project_context_path(mdc_file, base_path=cwd_path):
                 continue
             try:
                 content = mdc_file.read_text(encoding="utf-8").strip()
@@ -2338,7 +2346,7 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if _is_denied_project_context_path(cwd_path):
+    if _is_denied_project_context_path(cwd_path, base_path=cwd_path):
         logger.warning(
             "skipping project-context discovery: working directory is denied "
             "by permissions.deny.paths (%s)",

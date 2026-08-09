@@ -387,7 +387,11 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
         return Path(os.getcwd())
 
 
-def _is_denied_workspace_root(path: Path) -> bool:
+def _is_denied_workspace_root(
+    path: Path,
+    *,
+    base_path: Path | None = None,
+) -> bool:
     """Fail closed before coding-context discovery can enumerate *path*."""
     try:
         from agent.deny_policy import (
@@ -398,6 +402,7 @@ def _is_denied_workspace_root(path: Path) -> bool:
         return match_permissions_deny_search_root(
             str(path),
             patterns=permissions_deny_paths(),
+            base_path=base_path or path,
             root_is_file=False,
             canonicalize=True,
         ) is not None

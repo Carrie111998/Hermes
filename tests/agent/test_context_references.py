@@ -153,6 +153,29 @@ async def test_permissions_deny_blocks_file_reference_before_content_read(
     assert any("permissions.deny.paths" in warning for warning in result.warnings)
 
 
+@pytest.mark.asyncio
+async def test_permissions_deny_relative_rule_blocks_file_reference(
+    tmp_path: Path,
+):
+    from agent.context_references import preprocess_context_references_async
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("RELATIVE RULE SECRET", encoding="utf-8")
+
+    with patch(
+        "agent.deny_policy.permissions_deny_paths",
+        return_value=["secret.txt"],
+    ):
+        result = await preprocess_context_references_async(
+            "inspect @file:secret.txt",
+            cwd=tmp_path,
+            context_length=100_000,
+        )
+
+    assert "RELATIVE RULE SECRET" not in result.message
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+
+
 def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path: Path, monkeypatch):
     """Docker backend: a staged binary attachment's host path is rendered as the
     bind-mounted in-container path so the agent's tools can read it.

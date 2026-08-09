@@ -94,6 +94,18 @@ class TestPermissionsDenyPathMatching:
         )
         assert match is None
 
+    def test_relative_rule_anchors_to_explicit_local_base(self, tmp_path):
+        secret = tmp_path / "secret" / "file.txt"
+
+        match = deny_policy.match_permissions_deny_path(
+            str(secret),
+            patterns=["secret/**"],
+            base_path=str(tmp_path),
+        )
+
+        assert match is not None
+        assert match.pattern == "secret/**"
+
     def test_tilde_rule_uses_effective_profile_home(self):
         with patch(
             "hermes_constants.get_subprocess_home",

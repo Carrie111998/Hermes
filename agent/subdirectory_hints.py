@@ -68,7 +68,7 @@ def _is_ancestor_or_same(a: Path, b: Path) -> bool:
         return False
 
 
-def _is_denied_context_path(path: Path) -> bool:
+def _is_denied_context_path(path: Path, *, base_path: Path) -> bool:
     """Return whether progressive context discovery must not inspect *path*.
 
     Context hints are an implicit file-read path, so they inherit the same
@@ -83,7 +83,10 @@ def _is_denied_context_path(path: Path) -> bool:
 
         patterns = permissions_deny_paths()
         return match_permissions_deny_path(
-            str(path), patterns=patterns, canonicalize=True
+            str(path),
+            patterns=patterns,
+            base_path=base_path,
+            canonicalize=True,
         ) is not None
     except Exception:
         logger.warning(
@@ -127,7 +130,7 @@ class SubdirectoryHintTracker:
         """
         for filename in _HINT_FILENAMES:
             candidate = self.working_dir / filename
-            if _is_denied_context_path(candidate):
+            if _is_denied_context_path(candidate, base_path=self.working_dir):
                 continue
             try:
                 if not candidate.is_file():
@@ -198,10 +201,10 @@ class SubdirectoryHintTracker:
             p = Path(raw_path).expanduser()
             if not p.is_absolute():
                 p = self.working_dir / p
-            if _is_denied_context_path(p):
+            if _is_denied_context_path(p, base_path=self.working_dir):
                 return
             p = p.resolve()
-            if _is_denied_context_path(p):
+            if _is_denied_context_path(p, base_path=self.working_dir):
                 return
             # Use parent if it's a file path (has extension or doesn't exist as dir)
             if p.suffix or (p.exists() and p.is_file()):
@@ -310,7 +313,7 @@ class SubdirectoryHintTracker:
         found_hints = []
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
-            if _is_denied_context_path(hint_path):
+            if _is_denied_context_path(hint_path, base_path=self.working_dir):
                 continue
             try:
                 if not hint_path.is_file():
