@@ -77,6 +77,11 @@ def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     receipt = computer_use.write_computer_use_runtime_attestation(
         require_active_cua=True
     )
+    # Most verifier unit tests exercise content identity without independent
+    # commit authority. Keep that fixture stable whether the developer's
+    # source tree is dirty (pre-commit review) or clean (post-deploy review).
+    if receipt.get("source_identity", {}).get("kind") == "git-clean":
+        receipt["source_identity"]["kind"] = "dirty-attested-source"
     path = tmp_path / "receipt.json"
     path.write_text(json.dumps(receipt), encoding="utf-8")
     return path
@@ -131,7 +136,7 @@ def _committed_review_root(tmp_path: Path) -> Path:
         [
             "git", "-c", "user.name=Hermes Test", "-c",
             "user.email=hermes-test@example.invalid", "commit", "--quiet",
-            "-m", "test: materialize current attestation candidate",
+            "--allow-empty", "-m", "test: materialize current attestation candidate",
         ],
         cwd=review,
         check=True,
