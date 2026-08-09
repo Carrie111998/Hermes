@@ -36,7 +36,7 @@ import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -2930,6 +2930,12 @@ def _make_spotify_callback_handler(expected_path: str) -> tuple[type[BaseHTTPReq
     }
 
     class _SpotifyCallbackHandler(BaseHTTPRequestHandler):
+        # HTTP/1.0 closes the connection after each response. With HTTP/1.1
+        # keep-alive, a browser connection that stays open blocks the handler's
+        # next read, which wedges a single-threaded server forever (see
+        # _spotify_wait_for_callback below).
+        protocol_version = "HTTP/1.0"
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path != expected_path:
@@ -2967,8 +2973,11 @@ def _spotify_wait_for_callback(
     host, port, path = _spotify_validate_redirect_uri(redirect_uri)
     handler_cls, result = _make_spotify_callback_handler(path)
 
-    class _ReuseHTTPServer(HTTPServer):
+    class _ReuseHTTPServer(ThreadingHTTPServer):
         allow_reuse_address = True
+        # Each connection is handled in its own thread, so a slow/keep-alive
+        # client can never block serve_forever from noticing server.shutdown().
+        daemon_threads = True
 
     try:
         server = _ReuseHTTPServer((host, port), handler_cls)

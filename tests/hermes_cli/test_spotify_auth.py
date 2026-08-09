@@ -166,3 +166,88 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
     assert auth_mod.get_active_provider() == "nous"
 
 
+def test_spotify_wait_for_callback_does_not_deadlock_on_keepalive_connection() -> None:
+    """A keep-alive browser connection must not wedge the callback server.
+
+    Regression for the `hermes auth spotify` deadlock (2026-08): the old
+    server was a single-threaded HTTPServer whose server.shutdown() blocks
+    until serve_forever() returns. An HTTP/1.1 keep-alive connection that
+    stays open after the callback blocked the handler's next read, so
+    serve_forever never noticed the shutdown flag and the wizard hung
+    forever — even though the browser had already been served the
+    "Spotify authorization received" page and the code was captured.
+    """
+    import socket
+    import threading
+    import time
+
+    # Grab a free ephemeral port, then let the callback server bind it.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    redirect_uri = f"http://127.0.0.1:{port}/spotify/callback"
+    result_box: dict = {}
+
+    def _run_wait() -> None:
+        result_box["res"] = auth_mod._spotify_wait_for_callback(
+            redirect_uri, timeout_seconds=10
+        )
+
+    thread = threading.Thread(target=_run_wait, daemon=True)
+    thread.start()
+
+    # Bounded, positive sync: wait until the callback server is listening.
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise AssertionError("callback server never came up")
+            time.sleep(0.05)
+
+    # Send the real callback over HTTP/1.1 (Chrome-style). The server answers
+    # and closes this connection (HTTP/1.0 semantics), capturing the code.
+    sock.sendall(
+        (
+            f"GET /spotify/callback?code=abc123&state=xyz HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Connection: keep-alive\r\n\r\n"
+        ).encode()
+    )
+    # Read until EOF: the handler flushes headers, then the body, then closes
+    # (HTTP/1.0). A single recv can return headers before the buffered body
+    # lands, so collect until the connection closes.
+    sock.settimeout(2.0)
+    chunks = [sock.recv(4096)]
+    while True:
+        try:
+            data = sock.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+        except socket.timeout:
+            break
+    response = b"".join(chunks)
+    sock.close()
+
+    # Now open a SECOND connection that sends nothing — Chrome's speculative
+    # preconnect. On the old single-threaded HTTPServer, serve_forever accepts
+    # it after the callback and blocks reading the (never-sent) request, so
+    # server.shutdown() never returns — the wizard hangs forever even though
+    # the callback was already captured. ThreadingHTTPServer handles this
+    # idle connection in its own thread, so shutdown() cannot wedge.
+    idle = socket.create_connection(("127.0.0.1", port), timeout=1.0)
+    time.sleep(0.5)  # generous settle: serve_forever accepts idle within µs
+
+    thread.join(timeout=10.0)
+    idle.close()
+
+    assert not thread.is_alive(), "wait_for_callback deadlocked (shutdown hang)"
+    assert result_box["res"]["code"] == "abc123"
+    assert b"authorization received" in response
+
+
