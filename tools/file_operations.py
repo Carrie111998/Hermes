@@ -907,8 +907,14 @@ class ShellFileOperations(FileOperations):
             # overwrite the original bytes with mojibake. Treat a file whose
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # contains U+FFFD — except when the sampling head -c 1000 cuts
+            # inside a multi-byte UTF-8 char, whose truncated tail decodes to
+            # a single U+FFFD. So require a density threshold: genuine
+            # non-UTF-8 payloads produce U+FFFD at far higher rates (GBK ~10%+,
+            # binary blobs much higher), while a boundary cut yields at most
+            # one char in 1000 (<0.5%). 2% cleanly separates the two.
+            fffd = content_sample[:1000].count("\ufffd")
+            if fffd / min(len(content_sample), 1000) > 0.02:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
