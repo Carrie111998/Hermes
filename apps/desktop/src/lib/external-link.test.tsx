@@ -6,8 +6,10 @@ import {
   ExternalLink,
   fetchLinkTitle,
   hostPathLabel,
+  isSafeExternalUrl,
   isTitleFetchable,
   LinkifiedText,
+  openExternalLink,
   PrettyLink,
   urlSlugTitleLabel
 } from './external-link'
@@ -102,6 +104,22 @@ describe('external link helpers', () => {
     expect(bridge).toHaveBeenCalledTimes(1)
   })
 
+
+  it('rejects non-http(s) URLs before calling the desktop bridge', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+
+    expect(isSafeExternalUrl('https://example.com')).toBe(true)
+    expect(isSafeExternalUrl('file:///tmp/secret')).toBe(false)
+    expect(isSafeExternalUrl('javascript:alert(1)')).toBe(false)
+
+    openExternalLink('file:///tmp/secret')
+    openExternalLink('javascript:alert(1)')
+    expect(openExternal).not.toHaveBeenCalled()
+
+    openExternalLink('https://example.com/ok')
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/ok')
+  })
   it('opens links via the desktop bridge', () => {
     const openExternal = vi.fn().mockResolvedValue(undefined)
     installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
