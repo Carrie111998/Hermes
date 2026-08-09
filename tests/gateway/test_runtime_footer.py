@@ -14,6 +14,7 @@ from gateway.runtime_footer import (
     format_runtime_footer,
     resolve_footer_config,
 )
+from gateway.run import _resolve_assistant_delivery_modes
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,35 @@ def test_resolve_platform_can_add_fields_only():
     dc = resolve_footer_config(user, "discord")
     assert dc["enabled"] is True
     assert dc["fields"] == ["context_pct"]
+
+
+def test_footer_enabled_buffers_stream_and_interim_text_for_one_final_reply():
+    user = {"display": {"runtime_footer": {"enabled": True}}}
+
+    assert _resolve_assistant_delivery_modes(
+        user,
+        "telegram",
+        streaming_enabled=True,
+        interim_enabled=True,
+    ) == (False, False)
+
+
+def test_platform_footer_override_preserves_normal_streaming_policy():
+    user = {
+        "display": {
+            "runtime_footer": {"enabled": True},
+            "platforms": {
+                "telegram": {"runtime_footer": {"enabled": False}},
+            },
+        },
+    }
+
+    assert _resolve_assistant_delivery_modes(
+        user,
+        "telegram",
+        streaming_enabled=True,
+        interim_enabled=True,
+    ) == (True, True)
 
 
 # ---------------------------------------------------------------------------
