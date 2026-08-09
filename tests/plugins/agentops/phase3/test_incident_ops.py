@@ -86,6 +86,30 @@ def test_merge_marks_source_and_excludes_it_from_digest():
     assert source.fingerprint not in {item["fingerprint"] for item in service.digest("daily", now)["incidents"]}
 
 
+def test_merge_is_idempotent_and_merged_source_cannot_be_suppressed():
+    now = datetime.now(timezone.utc)
+    service = IncidentOpsService()
+    target = service.ingest(sig(now, "a"))
+    source = service.ingest(sig(now, "b", payload={"command_fingerprint": "sha256:" + "d" * 64, "state": "failed"}))
+    service.merge(target, source)
+    count, evidence = target.signal_count, len(target.evidence)
+    assert service.merge(target, source) is target
+    assert (target.signal_count, len(target.evidence)) == (count, evidence)
+    with pytest.raises(KeyError):
+        service.suppress(source.fingerprint)
+
+
+def test_suppression_identity_survives_window_until_expiry_then_reopens():
+    now = datetime.now(timezone.utc)
+    service = IncidentOpsService(window_seconds=1)
+    original = service.ingest(sig(now, "a"))
+    service.suppress(original.fingerprint, until=now + timedelta(seconds=100))
+    still_suppressed = service.ingest(sig(now + timedelta(seconds=50), "a"))
+    assert still_suppressed is original and still_suppressed.state == "suppressed"
+    reopened = service.ingest(sig(now + timedelta(seconds=101), "a"))
+    assert reopened is original and reopened.state == "reopened"
+
+
 def test_dashboard_auth_expiry_and_direct_reads_fail_closed():
     now = datetime.now(timezone.utc)
     incident = IncidentOpsService().ingest(sig(now))

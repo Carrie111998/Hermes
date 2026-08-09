@@ -52,11 +52,20 @@ class IncidentCorrelator:
             and incident.suppressed_until is not None
             and signal.observed_at >= incident.suppressed_until
         )
+        keep_suppressed = bool(
+            incident is not None
+            and incident.state == "suppressed"
+            and not force_reopen
+        )
         if force_reopen:
             incident.state = "reopened"
             incident.history.append("suppressed->reopened")
             incident.suppressed_until = None
-        if incident is None or (not force_reopen and signal.observed_at - incident.last_seen > self.window):
+        if incident is None or (
+            not force_reopen
+            and not keep_suppressed
+            and signal.observed_at - incident.last_seen > self.window
+        ):
             had_active = incident is not None
             if len(self._incidents) >= self.max_incidents:
                 raise RuntimeError("incident budget exceeded")
@@ -104,7 +113,12 @@ class IncidentCorrelator:
 
     def _find(self, fingerprint: str) -> Incident | None:
         return self._active_for(fingerprint) or next(
-            (item for item in reversed(self._history) if item.fingerprint == fingerprint), None
+            (
+                item
+                for item in reversed(self._history)
+                if item.fingerprint == fingerprint and item.state != "merged"
+            ),
+            None,
         )
 
     def suppress(self, fingerprint: str, until: datetime | None = None) -> Incident:
@@ -121,6 +135,12 @@ class IncidentCorrelator:
 
     def merge(self, target: Incident, source: Incident) -> Incident:
         if target is source:
+            return target
+        if target.state == "merged":
+            raise ValueError("cannot merge into merged incident")
+        if source.state == "merged":
+            # Merge is idempotent: retrying the same source must not duplicate
+            # evidence or counts after the source has already been removed.
             return target
         if len(target.evidence) + len(source.evidence) > self.max_history:
             raise RuntimeError("incident evidence budget exceeded")
