@@ -104,6 +104,22 @@ const baseProps = {
   voiceLabel: ''
 }
 
+describe('StatusRule session title', () => {
+  it('pins the named session at the far-right edge instead of the cwd label', () => {
+    const element = StatusRule({
+      ...baseProps,
+      sessionTitle: 'weekly-digest'
+    })
+
+    const rendered = textContent(element)
+    const title = findElementWithText(element, 'weekly-digest')
+
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered).not.toContain('~/repo')
+    expect(title?.props.backgroundColor).toBe(DEFAULT_THEME.color.accent)
+  })
+})
+
 describe('StatusRule background-subagent indicator', () => {
   it('renders ⛓ N on a wide terminal when subagents are running', () => {
     const element = StatusRule({
@@ -350,6 +366,52 @@ describe('StatusRule credits notice render priority', () => {
 
     // Model survives on a narrow terminal because the notice yields.
     expect(textContent(element)).toContain('opus 4.8')
+  })
+})
+
+describe('StatusRule battery indicator', () => {
+  it('renders the battery label with a battery glyph on AC-off', () => {
+    const element = StatusRule({
+      ...baseProps,
+      battery: { available: true, category: 'good', percent: 82, plugged: false }
+    })
+
+    expect(textContent(element)).toContain('🔋 82%')
+  })
+
+  it('uses a bolt glyph while charging', () => {
+    const element = StatusRule({
+      ...baseProps,
+      battery: { available: true, category: 'good', percent: 82, plugged: true }
+    })
+
+    expect(textContent(element)).toContain('⚡ 82%')
+  })
+
+  it('colours the read-out by category (critical → theme statusCritical)', () => {
+    const element = StatusRule({
+      ...baseProps,
+      battery: { available: true, category: 'critical', percent: 7, plugged: false }
+    })
+
+    const leaf = findElementWithText(element, '7%')
+    expect(leaf?.props.color).toBe(DEFAULT_THEME.color.statusCritical)
+  })
+
+  it('omits the segment when battery is null', () => {
+    const element = StatusRule({ ...baseProps, battery: null })
+
+    expect(textContent(element)).not.toContain('%🔋')
+    expect(textContent(element)).not.toContain('🔋')
+  })
+
+  it('omits the segment when no battery is available (desktop/server)', () => {
+    const element = StatusRule({
+      ...baseProps,
+      battery: { available: false, category: 'dim', percent: null, plugged: null }
+    })
+
+    expect(textContent(element)).not.toContain('🔋')
   })
 })
 
