@@ -3795,6 +3795,39 @@ def _mcp_tool_approval_check(
     args: dict,
     state_key: Optional[_ServerStateKey] = None,
 ) -> Optional[str]:
+    """Run one MCP approval check in the owning profile's config scope."""
+    approval_home = state_key[0] if isinstance(state_key, tuple) else None
+    if approval_home is None:
+        return _mcp_tool_approval_check_scoped(
+            server_name,
+            tool_name,
+            args,
+            state_key,
+        )
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(approval_home)
+    try:
+        return _mcp_tool_approval_check_scoped(
+            server_name,
+            tool_name,
+            args,
+            state_key,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _mcp_tool_approval_check_scoped(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+    state_key: Optional[_ServerStateKey] = None,
+) -> Optional[str]:
     """Apply native Hermes approval semantics to one MCP tool call.
 
     Read-only tools bypass the prompt.  Every other tool uses the existing
