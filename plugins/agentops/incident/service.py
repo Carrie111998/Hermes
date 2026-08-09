@@ -13,4 +13,4 @@ class IncidentOpsService:
     def ingest(self, signal: IncidentSignal): return self.correlator.ingest(signal)
     def review(self, incident) -> ReviewResult: return self.reviewer.review(incident)
     def notify(self, incident, now: datetime) -> bool: return self.notifier.allow(incident, now)
-    def digest(self, period: str, generated_at: datetime): return digest(list(self.correlator.incidents()), period=period, generated_at=generated_at)
+    def digest(self, period: str, generated_at: datetime): return digest(list(self.correlator.history()), period=period, generated_at=generated_at)
