@@ -163,17 +163,18 @@ async def test_send_numeric_dm():
 
 
 @pytest.mark.asyncio
-async def test_send_display_name_dm():
+@pytest.mark.parametrize("chat_id", ["alice", "１２"])
+async def test_send_display_name_dm(chat_id):
     """Display-name DMs use the bare command accepted by the daemon."""
     from gateway.config import PlatformConfig
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
     adapter._ws = AsyncMock()
 
-    result = await adapter.send("alice", "Hello, SimpleX!")
+    result = await adapter.send(chat_id, "Hello, SimpleX!")
 
     payload = json.loads(adapter._ws.send.call_args[0][0])
-    assert payload["cmd"] == "@alice Hello, SimpleX!"
+    assert payload["cmd"] == f"@{chat_id} Hello, SimpleX!"
     assert result.success is True
 
 
@@ -350,7 +351,8 @@ async def test_standalone_send_defaults_to_local_daemon(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_standalone_send_display_name_dm(monkeypatch):
+@pytest.mark.parametrize("chat_id", ["alice", "１２"])
+async def test_standalone_send_display_name_dm(monkeypatch, chat_id):
     pconfig = MagicMock()
     pconfig.extra = {"ws_url": "ws://localhost:5225"}
     sent_payloads = []
@@ -368,10 +370,10 @@ async def test_standalone_send_display_name_dm(monkeypatch):
     import websockets
     monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: DummyWs())
 
-    result = await _standalone_send(pconfig, "alice", "hi")
+    result = await _standalone_send(pconfig, chat_id, "hi")
 
-    assert sent_payloads[0]["cmd"] == "@alice hi"
-    assert result == {"success": True, "platform": "simplex", "chat_id": "alice"}
+    assert sent_payloads[0]["cmd"] == f"@{chat_id} hi"
+    assert result == {"success": True, "platform": "simplex", "chat_id": chat_id}
 
 
 @pytest.mark.asyncio

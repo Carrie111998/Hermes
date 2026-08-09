@@ -105,7 +105,7 @@ def _text_send_command(chat_id: str, text: str) -> str:
     """Compose a text send for a numeric ID, group ID, or display name."""
     if chat_id.startswith("group:"):
         chat_ref = f"#{chat_id[6:]}"
-    elif chat_id.isdigit():
+    elif chat_id.isascii() and chat_id.isdigit():
         chat_ref = f"@{chat_id}"
     else:
         return f"@{chat_id} {text}"
