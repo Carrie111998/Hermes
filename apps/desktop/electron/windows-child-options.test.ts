@@ -3,7 +3,12 @@ import { EventEmitter } from 'node:events'
 
 import { test } from 'vitest'
 
-import { stopBackendChild, stopBackendTreesForUpdate, waitForBackendExit } from './backend-child'
+import {
+  shouldHoldBackendQuit,
+  stopBackendChild,
+  stopBackendTreesForUpdate,
+  waitForBackendExit
+} from './backend-child'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 test('hiddenWindowsChildOptions adds windowsHide:true on Windows when unset', () => {
@@ -36,6 +41,12 @@ test('hiddenWindowsChildOptions defaults isWindows from process.platform when om
   const expectedHide = process.platform === 'win32'
 
   assert.equal(Boolean(result.windowsHide), expectedHide)
+})
+
+test('backend quit stays held while captured teardown is pending after registries clear', () => {
+  assert.equal(shouldHoldBackendQuit(false, 0, true), true)
+  assert.equal(shouldHoldBackendQuit(false, 1, false), true)
+  assert.equal(shouldHoldBackendQuit(true, 1, true), false)
 })
 
 function makeChild(overrides: Partial<{ pid: number | null; killed: boolean }> = {}) {

@@ -70,6 +70,10 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
   }
 }
 
+export function shouldHoldBackendQuit(done: boolean, processCount: number, teardownPending: boolean): boolean {
+  return !done && (processCount > 0 || teardownPending)
+}
+
 /** Wait for graceful exit, then force-kill a backend that ignored SIGTERM. */
 export async function waitForBackendExit(
   child: WaitableChild | null | undefined,

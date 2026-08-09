@@ -33,6 +33,7 @@ import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import {
+  shouldHoldBackendQuit,
   stopBackendChild as stopBackendChildImpl,
   stopBackendTreesForUpdate,
   waitForBackendExit as waitForBackendExitImpl
@@ -12490,7 +12491,9 @@ app.on('before-quit', event => {
     ...[...backendPool.values()].map(entry => entry.process)
   ].filter(child => child && child.exitCode === null && child.signalCode === null)
 
-  if (!backendQuitTeardownDone && backendProcesses.length > 0) {
+  if (
+    shouldHoldBackendQuit(backendQuitTeardownDone, backendProcesses.length, backendQuitTeardownPromise !== null)
+  ) {
     event.preventDefault()
 
     if (!backendQuitTeardownPromise) {
