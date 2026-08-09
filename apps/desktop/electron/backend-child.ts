@@ -93,8 +93,6 @@ export async function waitForBackendExit(
       } catch {
         // Already gone.
       }
-
-      resolve()
     }, timeoutMs)
 
     child.once('exit', () => {

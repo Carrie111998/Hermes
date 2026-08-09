@@ -143,13 +143,40 @@ test('waitForBackendExit force-kills a backend that ignores SIGTERM', async () =
     signalCode: null
   })
 
-  await waitForBackendExit(
+  const waiting = waitForBackendExit(
     child,
     { forceKillProcessTree: () => {}, isWindows: false },
     0
   )
 
+  await new Promise(resolve => setTimeout(resolve, 10))
   assert.deepEqual(calls, ['SIGKILL'])
+
+  child.emit('exit')
+  await waiting
+})
+
+test('waitForBackendExit does not resolve until the force-killed backend exits', async () => {
+  const child = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    kill: () => {},
+    killed: true,
+    pid: 4242,
+    signalCode: null
+  })
+
+  let resolved = false
+
+  const waiting = waitForBackendExit(child, { forceKillProcessTree: () => {}, isWindows: false }, 0).then(() => {
+    resolved = true
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(resolved, false)
+
+  child.emit('exit')
+  await waiting
+  assert.equal(resolved, true)
 })
 
 test('Windows update tree-kills captured roots without pre-signalling the primary backend', () => {
