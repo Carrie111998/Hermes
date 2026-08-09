@@ -63,6 +63,19 @@ EXECUTOR_LOCAL_PRE_RUNNING = frozenset(
 RUN_KIND_ATTEMPT = "attempt"
 RUN_KIND_PIPELINE = "pipeline"
 
+ATTEMPT_EPHEMERAL_KEYS = frozenset(
+    {
+        "candidate_commit",
+        "unit_name",
+        "unit_pid",
+        "host_start_time",
+        "jsonl_path",
+        "attempt_prompt",
+        "last_jsonl_size",
+        "last_jsonl_growth_at",
+    }
+)
+
 CLAIM_TTL_SECONDS = 15 * 60
 HEARTBEAT_INTERVAL_SECONDS = 60
 STALL_NO_OUTPUT_SECONDS = 10 * 60
@@ -299,6 +312,35 @@ def merge_pipeline_state(metadata: Optional[dict], updates: Mapping[str, Any]) -
     return base
 
 
+def clear_attempt_ephemeral(metadata: Optional[dict]) -> dict[str, Any]:
+    """Drop per-attempt fields when opening or re-entering a Cursor attempt."""
+    base = dict(metadata) if isinstance(metadata, dict) else {}
+    st = pipeline_state(base)
+    for key in ATTEMPT_EPHEMERAL_KEYS:
+        st.pop(key, None)
+    st["unit_started"] = False
+    st["spawn_pending"] = True
+    base["dev_pipeline"] = st
+    return base
+
+
+def resolve_reconcile_candidate(state: Mapping[str, Any]) -> tuple[Optional[str], bool]:
+    """Resolve candidate SHA and whether the attempt unit actually ran."""
+    unit_started = bool(state.get("unit_started"))
+    phase = state.get("phase")
+    candidate = state.get("candidate_commit")
+    if phase == PHASE_RUNNING and not unit_started:
+        return None, False
+    repo_path = state.get("repo_path")
+    if unit_started and repo_path:
+        head = git_head_sha(Path(str(repo_path)))
+        if head:
+            return head, True
+    if candidate and unit_started:
+        return str(candidate), True
+    return None, unit_started
+
+
 def save_run_metadata(
     conn: Any,
     run_id: int,
@@ -409,6 +451,8 @@ def start_new_run(
 ) -> int:
     """Insert a new run while the task stays ``running``."""
     base_meta = dict(metadata) if metadata else {}
+    if run_kind == RUN_KIND_ATTEMPT:
+        base_meta = clear_attempt_ephemeral(base_meta)
     base_meta = merge_pipeline_state(base_meta, {"run_kind": run_kind})
     now = int(time.time())
     lock = conn.execute(
@@ -1126,6 +1170,7 @@ def reconcile_task_state(
     unit_active: bool,
     pid_match: bool,
     candidate_commit: Optional[str],
+    unit_started: bool = False,
     attempts_used: int,
     max_attempts: int,
 ) -> ReconcileDecision:
@@ -1142,13 +1187,13 @@ def reconcile_task_state(
         return ReconcileDecision(action="resume", phase=str(phase))
     if phase in {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}:
         return ReconcileDecision(action="resume", phase=str(phase))
-    if phase == PHASE_RUNNING and candidate_commit:
-        return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
-    if phase == PHASE_RUNNING and not candidate_commit:
+    if phase == PHASE_RUNNING:
+        if candidate_commit and unit_started:
+            return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
         if attempts_used < max_attempts:
             return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
         return ReconcileDecision(action="block", reason="executor_restarted")
-    if candidate_commit:
+    if candidate_commit and unit_started:
         return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
     return ReconcileDecision(action="block", reason="executor_restarted")
 
@@ -1201,11 +1246,13 @@ def _apply_reconcile_decision(
         stop_task_units(conn, task_id, stop_fn, is_active_fn)
         # Re-evaluate after stopping stale unit.
         attempts = count_attempt_runs(conn, task_id)
+        candidate, unit_started = resolve_reconcile_candidate(state)
         decision = reconcile_task_state(
             state,
             unit_active=False,
             pid_match=False,
-            candidate_commit=state.get("candidate_commit"),
+            candidate_commit=candidate,
+            unit_started=unit_started,
             attempts_used=attempts,
             max_attempts=int(executor.cfg.get("max_attempts") or 2),
         )
@@ -1290,12 +1337,13 @@ def reconcile_board(
             stop_fn(str(unit))
             active = False
         attempts = count_attempt_runs(conn, task.id)
-        candidate = state.get("candidate_commit")
+        candidate, unit_started = resolve_reconcile_candidate(state)
         decision = reconcile_task_state(
             state,
             unit_active=active,
             pid_match=pid_ok,
             candidate_commit=candidate,
+            unit_started=unit_started,
             attempts_used=attempts,
             max_attempts=int(cfg.get("max_attempts") or 2),
         )
@@ -1618,6 +1666,7 @@ class DevExecutor:
         *,
         repair_context: Optional[str] = None,
     ) -> None:
+        meta = clear_attempt_ephemeral(meta)
         st = pipeline_state(meta)
         repo_dir = Path(str(st.get("repo_path") or ""))
         logs_root = Path(str(st.get("logs_root") or ""))
@@ -1869,7 +1918,8 @@ class DevExecutor:
         commands = contract.get("acceptance_commands") or []
         repo_dir = Path(str(st.get("repo_path") or ""))
         logs_root = Path(str(st.get("logs_root") or ""))
-        candidate = st.get("candidate_commit") or git_head_sha(repo_dir)
+        head = git_head_sha(repo_dir)
+        candidate = head or st.get("candidate_commit")
         base = st.get("base_commit") or ""
         verify_dir = repo_dir.parent / "verify"
         verify_base_dir = repo_dir.parent / "verify-base"

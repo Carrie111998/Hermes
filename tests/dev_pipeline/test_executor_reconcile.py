@@ -14,15 +14,16 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.mark.parametrize(
-    "unit_active,pid_match,candidate,phase,attempts,max_attempts,expected_action,expected_phase,expected_reason",
+    "unit_active,pid_match,candidate,phase,unit_started,attempts,max_attempts,expected_action,expected_phase,expected_reason",
     [
-        (True, True, "abc", "RUNNING", 1, 2, "adopt", "RUNNING", None),
-        (True, False, None, "RUNNING", 1, 2, "unit_gone", None, "pid_mismatch"),
-        (False, False, "abc123", "RUNNING", 1, 2, "resume", "VERIFYING", None),
-        (False, False, None, "RUNNING", 1, 2, "retry", "RUNNING", None),
-        (False, False, None, "RUNNING", 2, 2, "block", None, "executor_restarted"),
-        (False, False, "abc", "REVIEWING", 1, 2, "resume", "REVIEWING", None),
-        (False, False, "abc", "PUBLISHING", 1, 2, "resume", "PUBLISHING", None),
+        (True, True, "abc", "RUNNING", False, 1, 2, "adopt", "RUNNING", None),
+        (True, False, None, "RUNNING", False, 1, 2, "unit_gone", None, "pid_mismatch"),
+        (False, False, "abc123", "RUNNING", True, 1, 2, "resume", "VERIFYING", None),
+        (False, False, "abc123", "RUNNING", False, 1, 2, "retry", "RUNNING", None),
+        (False, False, None, "RUNNING", False, 1, 2, "retry", "RUNNING", None),
+        (False, False, None, "RUNNING", False, 2, 2, "block", None, "executor_restarted"),
+        (False, False, "abc", "REVIEWING", False, 1, 2, "resume", "REVIEWING", None),
+        (False, False, "abc", "PUBLISHING", False, 1, 2, "resume", "PUBLISHING", None),
     ],
 )
 def test_reconcile_task_state_matrix(
@@ -30,17 +31,22 @@ def test_reconcile_task_state_matrix(
     pid_match,
     candidate,
     phase,
+    unit_started,
     attempts,
     max_attempts,
     expected_action,
     expected_phase,
     expected_reason,
 ):
+    state = {"phase": phase, "unit_started": unit_started}
+    if candidate is not None:
+        state["candidate_commit"] = candidate
     decision = ex.reconcile_task_state(
-        {"phase": phase, "candidate_commit": candidate},
+        state,
         unit_active=unit_active,
         pid_match=pid_match,
-        candidate_commit=candidate,
+        candidate_commit=candidate if unit_started else None,
+        unit_started=unit_started,
         attempts_used=attempts,
         max_attempts=max_attempts,
     )
@@ -388,3 +394,73 @@ def test_reconcile_preparing_reruns_prepare_not_spawn(kanban_home_fixture):
                             is_active_fn=lambda _u: (False, "inactive"),
                         )
                         mock_new_run.assert_not_called()
+
+
+def test_reconcile_stale_candidate_without_unit_started_retries(kanban_home_fixture, tmp_path):
+    conn = kanban_home_fixture
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    task_id, _run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "RUNNING",
+            "candidate_commit": "C1",
+            "unit_started": False,
+            "repo_path": str(repo),
+        },
+    )
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    with patch.object(ex, "git_head_sha", return_value="C2"):
+        with patch.object(executor, "_spawn_attempt"):
+            decisions = ex.reconcile_board(
+                conn,
+                executor.cfg,
+                executor=executor,
+                is_active_fn=lambda _u: (False, "inactive"),
+            )
+    assert len(decisions) == 1
+    assert decisions[0].action == "retry"
+    assert decisions[0].phase == ex.PHASE_RUNNING
+
+
+def test_start_new_attempt_clears_stale_candidate(kanban_home_fixture):
+    conn = kanban_home_fixture
+    task_id, _run_id = _seed_running_task(
+        conn,
+        {
+            "phase": "RUNNING",
+            "candidate_commit": "C1",
+            "unit_name": "old-unit",
+            "unit_pid": 99,
+            "unit_started": True,
+        },
+    )
+    new_run = ex.start_new_run(
+        conn,
+        task_id,
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "phase": ex.PHASE_RUNNING,
+                "candidate_commit": "C1",
+                "unit_name": "old-unit",
+                "unit_pid": 99,
+                "host_start_time": 1,
+                "jsonl_path": "/tmp/old.jsonl",
+            },
+        ),
+    )
+    st = ex.pipeline_state(ex.load_run_metadata(conn, new_run))
+    assert st.get("candidate_commit") is None
+    assert st.get("unit_name") is None
+    assert st.get("unit_started") is False
+    assert st.get("spawn_pending") is True

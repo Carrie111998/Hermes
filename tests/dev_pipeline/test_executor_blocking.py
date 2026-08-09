@@ -238,8 +238,15 @@ def test_refused_spawn_tick_does_not_classify_completed(kanban_home, tmp_path):
     )
     executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_RUNNING)
 
-    with patch.object(executor, "_is_active", return_value=(False, "inactive")):
-        with patch.object(executor, "_finish_attempt") as mock_finish:
-            executor._phase_running(conn, task_id, run_id, meta, ex.pipeline_state(meta))
-            mock_finish.assert_not_called()
+    with patch.object(ex, "any_task_unit_active", return_value=(True, "foreign-unit")):
+        with patch.object(ex, "systemd_run_attempt") as mock_systemd:
+            with patch.object(executor, "_finish_attempt") as mock_finish:
+                executor._phase_running(
+                    conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                )
+                mock_systemd.assert_not_called()
+                mock_finish.assert_not_called()
+    meta_after = ex.load_run_metadata(conn, run_id)
+    assert ex.pipeline_state(meta_after).get("spawn_pending") is True
+    assert ex.pipeline_state(meta_after).get("unit_started") is False
     conn.close()
