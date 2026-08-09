@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from .fingerprint import incident_fingerprint
 from .models import Incident, IncidentSignal
@@ -41,10 +41,22 @@ class IncidentCorrelator:
         existing = self._seen.get(signal.signal_id)
         if existing is not None:
             return existing
+        if len(self._seen) >= self.max_history:
+            raise RuntimeError("signal id budget exceeded")
 
         fingerprint = incident_fingerprint(signal.signal_type, signal.payload, collector=signal.collector)
         incident = self._active_for(fingerprint)
-        if incident is None or signal.observed_at - incident.last_seen > self.window:
+        force_reopen = bool(
+            incident is not None
+            and incident.state == "suppressed"
+            and incident.suppressed_until is not None
+            and signal.observed_at >= incident.suppressed_until
+        )
+        if force_reopen:
+            incident.state = "reopened"
+            incident.history.append("suppressed->reopened")
+            incident.suppressed_until = None
+        if incident is None or (not force_reopen and signal.observed_at - incident.last_seen > self.window):
             had_active = incident is not None
             if len(self._incidents) >= self.max_incidents:
                 raise RuntimeError("incident budget exceeded")
@@ -83,6 +95,8 @@ class IncidentCorrelator:
         result: list[Incident] = []
         seen: set[int] = set()
         for incident in (*self._history, *self._incidents.values()):
+            if incident.state == "merged":
+                continue
             if id(incident) not in seen:
                 seen.add(id(incident))
                 result.append(incident)
@@ -93,13 +107,16 @@ class IncidentCorrelator:
             (item for item in reversed(self._history) if item.fingerprint == fingerprint), None
         )
 
-    def suppress(self, fingerprint: str) -> Incident:
+    def suppress(self, fingerprint: str, until: datetime | None = None) -> Incident:
         incident = self._find(fingerprint)
         if incident is None:
             raise KeyError(fingerprint)
+        if until is not None and (until.tzinfo is None or until <= incident.last_seen):
+            raise ValueError("suppression expiry must be timezone-aware and in the future")
         if incident.state != "suppressed":
             incident.history.append(f"{incident.state}->suppressed")
             incident.state = "suppressed"
+        incident.suppressed_until = until
         return incident
 
     def merge(self, target: Incident, source: Incident) -> Incident:
@@ -117,6 +134,7 @@ class IncidentCorrelator:
             target.severity = source.severity
         target.history.append("merged")
         source.history.append(f"merged_into:{target.fingerprint}")
+        source.state = "merged"
         for signal_id, incident in list(self._seen.items()):
             if incident is source:
                 self._seen[signal_id] = target
@@ -129,6 +147,8 @@ class IncidentCorrelator:
         all_ids = {item.signal_id for item in incident.evidence}
         if not signal_ids or not signal_ids.issubset(all_ids) or signal_ids == all_ids:
             raise ValueError("invalid split selection")
+        if len(self._incidents) >= self.max_incidents:
+            raise RuntimeError("incident budget exceeded")
         moved = [item for item in incident.evidence if item.signal_id in signal_ids]
         remaining = [item for item in incident.evidence if item.signal_id not in signal_ids]
         self._split_counter += 1

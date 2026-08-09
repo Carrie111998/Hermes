@@ -1,13 +1,14 @@
 from __future__ import annotations
 from .models import Incident
 
-STATES = ("open", "acknowledged", "resolved", "reopened", "suppressed")
+STATES = ("open", "acknowledged", "resolved", "reopened", "suppressed", "merged")
 _ALLOWED = {
     "open": {"acknowledged", "resolved", "suppressed"},
     "acknowledged": {"resolved", "reopened", "suppressed"},
     "resolved": {"reopened", "suppressed"},
     "reopened": {"acknowledged", "resolved", "suppressed"},
     "suppressed": {"reopened"},
+    "merged": set(),
 }
 
 def transition(incident: Incident, state: str) -> Incident:

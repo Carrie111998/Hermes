@@ -3,12 +3,14 @@ from .models import Incident
 import hashlib, hmac, re
 from datetime import datetime, timezone
 
+MAX_TOKEN_TTL_SECONDS = 24 * 60 * 60
+
 class ReadOnlyDashboard:
     """Structured read-only proxy; no chat, token, or Target mutation surface."""
     def __init__(self, incidents: list[Incident], *, token_hash: str, issued_at: datetime, expiry: datetime) -> None:
         if not isinstance(token_hash, str) or re.fullmatch(r"[0-9a-f]{64}", token_hash) is None:
             raise ValueError("token_hash must be a SHA-256 hex digest")
-        if issued_at.tzinfo is None or expiry.tzinfo is None or expiry <= issued_at:
+        if issued_at.tzinfo is None or expiry.tzinfo is None or expiry <= issued_at or (expiry - issued_at).total_seconds() > MAX_TOKEN_TTL_SECONDS:
             raise ValueError("dashboard token must have a bounded timezone-aware lifetime")
         self._incidents = tuple(incidents)
         self._token_hash = token_hash
