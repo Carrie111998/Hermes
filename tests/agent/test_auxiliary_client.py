@@ -106,6 +106,40 @@ class TestAuxiliaryMaxTokensParam:
 
 
 
+class TestNamedCustomProviderTaskEndpoint:
+    def test_task_endpoint_overrides_named_provider_endpoint_but_keeps_provider_key(self):
+        """A per-task endpoint must not be reset to the named provider URL.
+
+        The compression route needs to bypass an admission proxy while reusing
+        the named provider's credentials. Regression: resolution carried the
+        task endpoint to ``resolve_provider_client`` then the named-custom
+        branch silently overwrote it with ``providers.<name>.base_url``.
+        """
+        task_config = {
+            "provider": "custom:litellm",
+            "model": "nim-compact",
+            "base_url": "http://127.0.0.1:14010/v1",
+        }
+        provider_config = {
+            "name": "litellm",
+            "base_url": "http://127.0.0.1:14001/v1",
+            "api_key": "provider-key",
+        }
+        raw_client = MagicMock()
+
+        with (
+            patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=task_config),
+            patch("hermes_cli.runtime_provider._get_named_custom_provider", return_value=provider_config),
+            patch("agent.auxiliary_client._create_openai_client", return_value=raw_client) as create_client,
+        ):
+            client, model = get_text_auxiliary_client("compression")
+
+        assert client is raw_client
+        assert model == "nim-compact"
+        assert create_client.call_args.kwargs["base_url"] == "http://127.0.0.1:14010/v1"
+        assert create_client.call_args.kwargs["api_key"] == "provider-key"
+
+
 class TestResolveTaskProviderModel:
     @pytest.mark.parametrize(
         "provider",
