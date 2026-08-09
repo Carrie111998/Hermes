@@ -23,12 +23,8 @@ import { useHudThreadFocus } from './thread-focus'
 /** How long the transcript lingers at its glanceable opacity — after a turn
  *  lands, or after you let go of the composer — before it goes. This is the ONLY
  *  hold: the CSS carries no transition-delay, because two stacked holds read as
- *  a third fade state that nobody asked for. Focus keeps it open past this.
- *
- *  Long enough to actually be the middle stage. Under a second it read as part
- *  of the fade rather than a state you could still glance at and finish
- *  reading. */
-const HUD_RECENT_HOLD_MS = 2500
+ *  a third fade state that nobody asked for. Focus keeps it open past this. */
+const HUD_RECENT_HOLD_MS = 1100
 
 /** Band visibility timings, published to CSS as custom properties so this
  *  module and the stylesheet cannot drift apart. Reveal is quick — it is an
@@ -64,8 +60,7 @@ const hudBandMaxPx = () => Math.min(window.innerHeight * HUD_BAND_MAX_FRACTION, 
  *  rather than flipping to follow the screen edge the HUD is parked against. */
 const HUD_THREAD_ALWAYS_BELOW = true
 
-const composerHasFocus = () =>
-  document.activeElement?.closest(`[data-slot="${RICH_INPUT_SLOT}"]`) != null
+const composerHasFocus = () => document.activeElement?.closest(`[data-slot="${RICH_INPUT_SLOT}"]`) != null
 
 /**
  * True for a hold window after any conversation activity (a message landing,
