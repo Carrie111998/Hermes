@@ -145,8 +145,8 @@ def test_cron_missing_and_stale_assertions_are_unhealthy_and_runs_record_recurre
     signal = redact_signal(
         RawSignal(target.target_id, "test.collector", "signal.repeat", now, {"message": "same"})
     )
-    first = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(True))
-    second = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(False, "probe_failed"))
+    first = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(True), source_id="sha256:" + "2" * 64)
+    second = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(False, "probe_failed"), source_id="sha256:" + "2" * 64)
     store = open_observer_store(load_agentops_config(write_config()))
     try:
         store.commit_collection(first)
