@@ -57,6 +57,10 @@ _OUTBOUND_TIMEOUT_S = 30.0
 # adapter.disconnect. Three sequential awaits at 1.0s stay under the runner's
 # default 5s adapter disconnect budget (plus the 2s go_idle ACK budget).
 _TEARDOWN_AWAIT_TIMEOUT_S = 1.0
+# Bounded drain for in-flight outbound frames at disconnect: long enough for a
+# platform edit round-trip through the connector, short enough that shutdown
+# stays snappy when the connector is gone.
+_DISCONNECT_DRAIN_GRACE_S = 5.0
 
 # Phase 7 Unit 7d-B: the application close code the connector sends when it
 # rejects/revokes a gateway's WS upgrade auth (mirrors the connector's
@@ -502,6 +506,21 @@ class WebSocketRelayTransport:
 
     async def disconnect(self) -> None:
         self._closing = True
+        # Drain grace: a trailing outbound frame (typically the turn's
+        # finalize edit) may still be awaiting its outbound_result. Failing
+        # it immediately loses a message the connector was about to ack —
+        # staging incident 2026-08-09 froze a Slack reply at its preview
+        # snapshot exactly this way. Give in-flight requests a short bounded
+        # window to resolve before tearing the socket down.
+        pending = [f for f in self._pending.values() if not f.done()]
+        if pending:
+            try:
+                # asyncio.wait (not wait_for+gather): on timeout it must NOT
+                # cancel the futures — the fail-any-remaining loop below owns
+                # their terminal state.
+                await asyncio.wait(pending, timeout=_DISCONNECT_DRAIN_GRACE_S)
+            except Exception:  # noqa: BLE001 - grace is best-effort
+                pass
         if self._supervisor is not None:
             self._supervisor.cancel()
             try:
