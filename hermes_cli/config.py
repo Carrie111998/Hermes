@@ -4926,7 +4926,21 @@ def set_config_value(key: str, value: str, force: bool = False):
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
     if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
+        stripped = value.strip()
+        if stripped[:1] in ("[", "{"):
+            # A JSON/YAML collection literal (e.g. `hermes config set
+            # desktop.repo_scan_roots '["~/src"]'`). Before this parse, the
+            # literal was stored as a quoted STRING, which list-typed readers
+            # (isinstance(..., list) guards) silently rejected — falling back
+            # to defaults with no warning (#desktop repo_scan_roots scanning
+            # all of $HOME despite a configured root).
+            try:
+                parsed = fast_safe_load(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (list, dict)):
+                coerced_value = parsed
+        elif value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
             coerced_value = False

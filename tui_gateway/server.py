@@ -11556,6 +11556,39 @@ def _is_session_cwd_junk(cwd: str) -> bool:
     return real == home or real == hermes_home
 
 
+def _coerce_scan_path_list(value: Any, default: list) -> list[str]:
+    """Normalize a scan-path setting to a clean list of strings.
+
+    Tolerates a string-typed collection literal (``'["~/src"]'``) left behind
+    by older ``hermes config set`` versions, which stored list values as quoted
+    strings. Silently falling back to the default here meant an empty-roots
+    policy — i.e. "scan all of $HOME" — despite the user having configured a
+    root, and the stale-repo cache kept refilling with no hint why.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped[:1] == "[":
+            try:
+                from utils import fast_safe_load
+
+                parsed = fast_safe_load(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                logger.warning(
+                    "desktop scan path setting is a string-typed list literal "
+                    "(%r) — parsed it, but re-save it as a real YAML list",
+                    stripped,
+                )
+                value = parsed
+        elif stripped:
+            # A bare single path — accept it as a one-element list.
+            value = [stripped]
+    if not isinstance(value, list):
+        return list(default)
+    return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+
+
 def _repo_discovery_policy(raw: dict | None = None) -> dict:
     """Return the effective, profile-local Desktop repository scan policy."""
     from hermes_cli.config import DEFAULT_CONFIG
@@ -11574,16 +11607,10 @@ def _repo_discovery_policy(raw: dict | None = None) -> dict:
 
     return {
         "enabled": enabled if isinstance(enabled, bool) else defaults["repo_scan_enabled"],
-        "roots": [value.strip() for value in roots if isinstance(value, str) and value.strip()]
-        if isinstance(roots, list)
-        else list(defaults["repo_scan_roots"]),
-        "exclude_paths": [
-            value.strip()
-            for value in excludes
-            if isinstance(value, str) and value.strip()
-        ]
-        if isinstance(excludes, list)
-        else list(defaults["repo_scan_exclude_paths"]),
+        "roots": _coerce_scan_path_list(roots, defaults["repo_scan_roots"]),
+        "exclude_paths": _coerce_scan_path_list(
+            excludes, defaults["repo_scan_exclude_paths"]
+        ),
     }
 
 

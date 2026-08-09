@@ -723,3 +723,42 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Collection literals (issue: repo_scan_roots stored as a quoted string)
+# ---------------------------------------------------------------------------
+
+class TestCollectionLiteralCoercion:
+    """`config set` of a JSON/YAML list literal must store a real list.
+
+    Regression: `hermes config set desktop.repo_scan_roots '["~/src"]'` stored
+    the literal as a STRING; the desktop policy loader's isinstance-list guard
+    silently fell back to roots=[] ("scan all of $HOME") and stale repos kept
+    resurfacing in the Projects sidebar.
+    """
+
+    def test_list_literal_becomes_yaml_list(self, _isolated_hermes_home):
+        import yaml
+        set_config_value("desktop.repo_scan_roots", '["/tmp/a", "/tmp/b"]')
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["desktop"]["repo_scan_roots"] == ["/tmp/a", "/tmp/b"]
+
+    def test_empty_list_literal(self, _isolated_hermes_home):
+        import yaml
+        set_config_value("desktop.repo_scan_exclude_paths", "[]")
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["desktop"]["repo_scan_exclude_paths"] == []
+
+    def test_string_typed_default_is_not_parsed(self, _isolated_hermes_home):
+        """String-typed settings keep literal text (existing contract)."""
+        import yaml
+        set_config_value("display.skin", "[weird-but-literal]")
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["display"]["skin"] == "[weird-but-literal]"
+
+    def test_malformed_literal_stays_string(self, _isolated_hermes_home):
+        import yaml
+        set_config_value("desktop.repo_scan_roots", "[not: valid: yaml: [")
+        cfg = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert cfg["desktop"]["repo_scan_roots"] == "[not: valid: yaml: ["

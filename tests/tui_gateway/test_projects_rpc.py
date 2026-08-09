@@ -379,3 +379,45 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
     assert any(item["root"] == str(root) for item in accepted["repos"])
 
 
+
+
+# ---------------------------------------------------------------------------
+# _repo_discovery_policy tolerance for string-typed list settings
+# ---------------------------------------------------------------------------
+
+class TestScanPathCoercion:
+    """The policy loader must not silently discard a configured root.
+
+    Regression: a string-typed `repo_scan_roots: '["~/src"]'` (written by older
+    `hermes config set`) failed the isinstance-list guard and fell back to
+    roots=[] — scanning all of $HOME and refilling the discovered-repos cache
+    with stale entries.
+    """
+
+    def test_string_list_literal_is_parsed(self):
+        from tui_gateway.server import _repo_discovery_policy
+        policy = _repo_discovery_policy({"repo_scan_roots": '["/tmp/x"]'})
+        assert policy["roots"] == ["/tmp/x"]
+
+    def test_bare_string_path_becomes_single_root(self):
+        from tui_gateway.server import _repo_discovery_policy
+        policy = _repo_discovery_policy({"repo_scan_roots": "/tmp/x"})
+        assert policy["roots"] == ["/tmp/x"]
+
+    def test_real_list_unchanged(self):
+        from tui_gateway.server import _repo_discovery_policy
+        policy = _repo_discovery_policy({"repo_scan_roots": ["/tmp/a", " /tmp/b "]})
+        assert policy["roots"] == ["/tmp/a", "/tmp/b"]
+
+    def test_garbage_falls_back_to_default(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+        from tui_gateway.server import _repo_discovery_policy
+        policy = _repo_discovery_policy({"repo_scan_roots": 42})
+        assert policy["roots"] == list(DEFAULT_CONFIG["desktop"]["repo_scan_roots"])
+
+    def test_string_excludes_also_parsed(self):
+        from tui_gateway.server import _repo_discovery_policy
+        policy = _repo_discovery_policy(
+            {"repo_scan_exclude_paths": '["/tmp/skip"]'}
+        )
+        assert policy["exclude_paths"] == ["/tmp/skip"]
