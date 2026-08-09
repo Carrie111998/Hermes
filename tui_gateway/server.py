@@ -1668,6 +1668,8 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    client_surface: str = "",
+    client_window_context: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1692,8 +1694,8 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
-        "client_surface": session.get("client_surface") or "",
-        "client_window_context": session.get("client_window_context"),
+        "client_surface": client_surface,
+        "client_window_context": client_window_context,
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
@@ -1773,6 +1775,8 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    client_surface: str = "",
+    client_window_context: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1782,6 +1786,8 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        client_surface=client_surface,
+        client_window_context=client_window_context,
     )
 
     def _complete(done: dict) -> None:
@@ -7472,6 +7478,8 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    client_surface: str = "",
+    client_window_context: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7484,10 +7492,10 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
-    if session.get("client_surface"):
-        queued["client_surface"] = session["client_surface"]
-    if session.get("client_window_context") is not None:
-        queued["client_window_context"] = session["client_window_context"]
+    if client_surface:
+        queued["client_surface"] = client_surface
+    if client_window_context is not None:
+        queued["client_window_context"] = client_window_context
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7546,7 +7554,14 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    client_surface: str = "",
+    client_window_context: dict | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -7619,7 +7634,14 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            client_surface=client_surface,
+            client_window_context=client_window_context,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7668,10 +7690,18 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    client_surface=queued.get("client_surface") or "",
+                    client_window_context=queued.get("client_window_context"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    client_surface=queued.get("client_surface") or "",
+                    client_window_context=queued.get("client_window_context"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7689,6 +7719,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    client_surface=queued.get("client_surface") or "",
+                    client_window_context=queued.get("client_window_context"),
                 )
             else:
                 _run_prompt_submit(
@@ -7697,6 +7729,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    client_surface=queued.get("client_surface") or "",
+                    client_window_context=queued.get("client_window_context"),
                 )
     except Exception as exc:
         print(
@@ -9530,15 +9564,25 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _hud_surface_note(session: dict) -> str:
+def _hud_surface_note(
+    session: dict,
+    client_surface: str | None = None,
+    client_window_context: dict | None = None,
+) -> str:
     """The HUD-mode note for this turn, or "" when it was not typed there."""
-    if session.get("client_surface") != "hud":
+    surface = session.get("client_surface") if client_surface is None else client_surface
+    window_context = (
+        session.get("client_window_context")
+        if client_surface is None
+        else client_window_context
+    )
+    if surface != "hud":
         return ""
     from agent.prompt_builder import hud_surface_note
 
     return hud_surface_note(
         getattr(session.get("agent"), "valid_tool_names", None),
-        session.get("client_window_context"),
+        window_context,
     )
 
 
@@ -9570,6 +9614,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    client_surface: str | None = None,
+    client_window_context: dict | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9819,7 +9865,14 @@ def _run_prompt_submit(
 
             # Which window the message was typed into. HUD mode is per-turn
             # state, so it cannot live in the (byte-stable) system prompt.
-            run_message = _prepend_note(run_message, _hud_surface_note(session))
+            run_message = _prepend_note(
+                run_message,
+                _hud_surface_note(
+                    session,
+                    client_surface=client_surface,
+                    client_window_context=client_window_context,
+                ),
+            )
 
             def _stream(delta):
                 with session["history_lock"]:

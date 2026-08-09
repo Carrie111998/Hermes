@@ -139,8 +139,10 @@ def _(rid, params: dict) -> dict:
     # over another app when they are back in Hermes.
     from tui_gateway.methods_prompt import _hud_window_context
 
-    session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
-    session["client_window_context"] = _hud_window_context(params)
+    client_surface = "hud" if params.get("surface") == "hud" else ""
+    client_window_context = _hud_window_context(params)
+    session["client_surface"] = client_surface
+    session["client_window_context"] = client_window_context
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -170,6 +172,8 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            client_surface=client_surface,
+            client_window_context=client_window_context,
         )
         if busy_response is not None:
             return busy_response
@@ -306,7 +310,14 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid,
+            sid,
+            session,
+            text,
+            client_surface=client_surface,
+            client_window_context=client_window_context,
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -385,7 +396,14 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            client_surface=client_surface,
+            client_window_context=client_window_context,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

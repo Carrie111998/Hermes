@@ -178,14 +178,56 @@ class TestSurfaceRecording:
         assert busy_session["client_surface"] == ""
         assert busy_session["client_window_context"] is None
 
+    def test_later_queued_submit_cannot_relabel_the_active_turn(
+        self, busy_session, monkeypatch
+    ):
+        captured = []
+        ready = threading.Event()
+        busy_session["running"] = False
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
+        monkeypatch.setattr(
+            server,
+            "_wait_agent_for_prompt",
+            lambda *_args: ready.wait(1) and None,
+        )
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda *_args, **kwargs: captured.append(kwargs),
+        )
+
+        self._submit(
+            surface="hud",
+            window_context={"app": "Editor", "title": "A"},
+        )
+        self._submit()
+        ready.set()
+        busy_session["_run_thread"].join(1)
+
+        assert captured == [
+            {
+                "client_surface": "hud",
+                "client_window_context": {"app": "Editor", "title": "A"},
+            }
+        ]
+
 
 def test_compute_host_turn_frame_preserves_hud_window_context():
     session = _session(
+        client_surface="",
+        client_window_context=None,
+    )
+
+    frame = server._compute_host_turn_frame(
+        "r",
+        "s",
+        session,
+        "this",
         client_surface="hud",
         client_window_context={"app": "Browser", "title": "Docs"},
     )
-
-    frame = server._compute_host_turn_frame("r", "s", session, "this")
 
     assert frame["client_surface"] == "hud"
     assert frame["client_window_context"] == {"app": "Browser", "title": "Docs"}
