@@ -694,6 +694,20 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _is_valid_authorization_url(authorization_url: str) -> bool:
+    """Return True only for http(s) authorization URLs with a host.
+
+    MCP OAuth authorization endpoints are HTTPS (or HTTP on loopback).
+    Rejecting other schemes before ``webbrowser.open`` / dashboard publish
+    avoids navigating to ``javascript:``, ``file:``, or similar if a
+    compromised or misconfigured MCP server returns a hostile URL.
+    """
+    if not isinstance(authorization_url, str) or not authorization_url.strip():
+        return False
+    parsed = urlparse(authorization_url.strip())
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
 def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     """Return a redirect handler closure that closes over the given port.
 
@@ -712,6 +726,12 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         Opens the browser automatically when possible; always prints the URL
         as a fallback for headless/SSH/gateway environments.
         """
+        if not _is_valid_authorization_url(authorization_url):
+            raise ValueError(
+                "MCP OAuth authorization_url must be an http(s) URL with a host; "
+                f"got {authorization_url!r}"
+            )
+
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
