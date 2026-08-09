@@ -1,0 +1,80 @@
+name: evaOS release latest guard
+
+on:
+  release:
+    types: [published, edited, released]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: evaos-release-latest-guard
+  cancel-in-progress: false
+
+jobs:
+  restore-desktop-latest:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.release.tag_name, 'evaos-runtime-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep runtime releases prerelease and Desktop updater latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "release" && "${RELEASE_IS_PRERELEASE}" != "true" ]]; then
+            gh api \
+              --method PATCH \
+              "repos/${REPOSITORY}/releases/${RELEASE_ID}" \
+              -F prerelease=true \
+              --silent
+          fi
+
+          desktop_release="$(
+            gh api "repos/${REPOSITORY}/releases?per_page=100" --jq '
+              map(
+                select(
+                  .draft == false and
+                  .prerelease == false and
+                  (.tag_name | test("^v[0-9].*-es\\.[0-9]+$")) and
+                  any(.assets[]; .name == "latest-mac.yml") and
+                  any(.assets[]; .name | endswith(".dmg")) and
+                  any(.assets[]; .name | endswith(".zip")) and
+                  ([.assets[].name | select(endswith(".blockmap"))] | length) >= 2
+                )
+              )
+              | sort_by(.published_at)
+              | last
+              | [.id, .tag_name]
+              | @tsv
+            '
+          )"
+
+          if [[ -z "${desktop_release}" || "${desktop_release}" == $'\t' ]]; then
+            echo "::error::No complete stable Desktop updater release is available."
+            exit 1
+          fi
+
+          IFS=$'\t' read -r desktop_release_id desktop_tag <<< "${desktop_release}"
+
+          gh api \
+            --method PATCH \
+            "repos/${REPOSITORY}/releases/${desktop_release_id}" \
+            -f make_latest=true \
+            --silent
+
+          latest_tag="$(
+            gh api "repos/${REPOSITORY}/releases/latest" --jq '.tag_name'
+          )"
+          if [[ "${latest_tag}" != "${desktop_tag}" ]]; then
+            echo "::error::GitHub latest is ${latest_tag}; expected Desktop ${desktop_tag}."
+            exit 1
+          fi
+
+          echo "GitHub latest restored to complete Desktop updater ${desktop_tag}."
