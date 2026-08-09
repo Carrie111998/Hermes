@@ -27,6 +27,8 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _get_child_timeout,
+    _resolve_delegation_route,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -64,6 +66,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertEqual(props["route"]["type"], "string")
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -156,6 +160,43 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertIn("terminal", result)
         self.assertIn("file", result)
         self.assertIn("web", result)
+
+    def test_narrow_route_omits_unrelated_tool_and_skill_schemas(self):
+        import model_tools
+
+        parent = _make_mock_parent()
+        # A real CLI parent normally exposes one composite toolset. The route
+        # must still be able to select its narrower ``file`` subset.
+        parent.enabled_toolsets = ["hermes-cli", "mcp-unrelated"]
+        parent.disabled_toolsets = []
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Read only",
+                context=None,
+                toolsets=["file"],
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                delegation_cfg={"enabled_toolsets": ["file"]},
+                strict_toolsets=True,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=kwargs["enabled_toolsets"],
+            disabled_toolsets=kwargs["disabled_toolsets"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        names = {item["function"]["name"] for item in definitions}
+        self.assertIn("read_file", names)
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("skill_view", names)
 
     def test_mixed_composite_is_subtracted_at_child_assembly(self):
         """A mixed platform bundle must not re-expose blocked leaf tools.
@@ -645,6 +686,125 @@ class TestBlockedTools(unittest.TestCase):
         can batch mechanical work instead of burning reasoning iterations
         (Teknium, Jul 2026)."""
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
+
+
+class TestDelegationRoutes(unittest.TestCase):
+    def test_route_overlays_operator_fields_and_keeps_selection_call_scoped(self):
+        cfg, toolsets = _resolve_delegation_route(
+            {
+                "model": "default-model",
+                "provider": "custom",
+                "base_url": "https://default.example/v1",
+                "child_timeout_seconds": 900,
+                "routes": {
+                    "scout": {
+                        "model": "fast-model",
+                        "provider": "openrouter",
+                        "reasoning_effort": "low",
+                        "enabled_toolsets": ["file", "web"],
+                        "child_timeout_seconds": 75,
+                    }
+                },
+            },
+            "scout",
+        )
+
+        self.assertEqual(cfg["model"], "fast-model")
+        self.assertEqual(cfg["provider"], "openrouter")
+        self.assertNotIn("base_url", cfg)
+        self.assertEqual(toolsets, ["file", "web"])
+        self.assertEqual(_get_child_timeout(cfg), 75.0)
+
+    def test_invalid_route_policy_fails_closed(self):
+        invalid_routes = [
+            {"enabled_toolsets": []},
+            {"enabled_toolsets": ["file", ""]},
+            {"child_timeout_seconds": 0},
+            {"child_timeout_seconds": True},
+            {"unexpected": "field"},
+        ]
+        for route_cfg in invalid_routes:
+            with self.subTest(route_cfg=route_cfg):
+                with self.assertRaises(ValueError):
+                    _resolve_delegation_route(
+                        {"routes": {"scout": route_cfg}}, "scout"
+                    )
+
+    def test_delegate_applies_route_toolsets_and_freezes_timeout(self):
+        parent = _make_mock_parent()
+        parent._credential_pool = None
+        child = MagicMock()
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+            "messages": [],
+        }
+        config = {
+            "routes": {
+                "scout": {
+                    "enabled_toolsets": ["file"],
+                    "child_timeout_seconds": 60,
+                }
+            }
+        }
+        inherited_creds = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=config),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=inherited_creds,
+            ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                return_value=child,
+            ) as build_child,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Read one file",
+                    route="scout",
+                    background=False,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(build_child.call_args.kwargs["toolsets"], ["file"])
+        self.assertTrue(build_child.call_args.kwargs["strict_toolsets"])
+        self.assertNotIn("model", build_child.call_args.kwargs["delegation_cfg"])
+        self.assertEqual(child._delegate_child_timeout, 60.0)
+
+    def test_unknown_route_fails_before_child_construction(self):
+        parent = _make_mock_parent()
+        with (
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"routes": {"scout": {}}},
+            ),
+            patch("tools.delegate_tool._build_child_preserving_parent_tools") as build_child,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Must not start",
+                    route="missing",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("Unknown delegation route", result["error"])
+        build_child.assert_not_called()
 
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
@@ -1240,6 +1400,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "route": "scout",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -1255,6 +1416,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["route"], "scout")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
