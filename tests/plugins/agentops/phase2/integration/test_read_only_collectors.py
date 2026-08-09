@@ -27,7 +27,7 @@ def _target(path):
             kind=TargetKind.GATEWAY,
             criticality=Criticality.NONCRITICAL,
             observed_paths=(str(path),),
-            labels={"service_label": "ai.hermes.gateway-test"},
+            labels={"service_label": "ai.hermes.gateway"},
         )
     )
 

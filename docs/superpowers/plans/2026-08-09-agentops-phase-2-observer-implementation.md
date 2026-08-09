@@ -331,3 +331,12 @@ below are implemented and independently re-reviewed.
 - [x] Git symlink/root escape and cross-profile PID tests
 - [x] timed-out worker lifecycle, inspected-item budget, concurrent Bridge
   drain, out-of-order signal/cursor and manifest loader contract tests
+
+## Sol G2 Release Blocker Addendum 3 (2026-08-09)
+
+- [x] Complete `sqlite_master` object preflight rejects triggers/views/unknown objects.
+- [x] Re-read bounded Cron JSON on every collection; reject source changes and duplicate/undeclared assertions.
+- [x] Enforce source-aware monotonic cursor commits and reject empty-source cursors.
+- [x] Bind bootstrap process identity and Launchd labels; zero process matches are unhealthy.
+- [x] Execute Review Pack probes/actions/source-binding/required-field checks and apply runtime factory budgets.
+- [x] Bound detached timeout workers with a registry limit and explicit unhealthy budget exhaustion.

@@ -358,6 +358,9 @@ class CronObservation:
             isinstance(assertion, BusinessAssertion) for assertion in self.assertions
         ):
             raise ValueError("invalid cron observation")
+        names = [assertion.name for assertion in self.assertions]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate cron assertion")
         object.__setattr__(self, "assertions", tuple(self.assertions))
 
 

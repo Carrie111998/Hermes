@@ -53,9 +53,12 @@ class CronCollector:
         ):
             raise ValueError("invalid cron assertion ids")
         self._observation = observation
+        self._source_loader = None
         self.source_path = Path(source_path)
         self.source_id = asset_source_id(self.source_path)
         self.required_assertion_ids = frozenset(required_assertion_ids)
+        if len(self.required_assertion_ids) != len(required_assertion_ids):
+            raise ValueError("duplicate cron assertion id")
         self.review_pack = review_pack if review_pack is not None else load_review_pack()
         self.max_assertions = max_assertions
         self.max_bytes = max_bytes
@@ -73,6 +76,13 @@ class CronCollector:
     ) -> "CronCollector":
         """Create an observation from a bounded, regular JSON status file."""
         path = Path(source_path)
+        observation = cls._read_json_observation(path, max_bytes)
+        collector = cls(observation, source_path=path, required_assertion_ids=required_assertion_ids, max_bytes=max_bytes)
+        collector._source_loader = lambda: cls._read_json_observation(path, max_bytes)
+        return collector
+
+    @staticmethod
+    def _read_json_observation(path: Path, max_bytes: int) -> CronObservation:
         try:
             metadata = path.lstat()
             if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
@@ -105,14 +115,11 @@ class CronCollector:
                 )
                 for item in assertions_data
             )
+            if len({item.name for item in assertions}) != len(assertions):
+                raise ValueError("duplicate cron assertion")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("invalid cron status source") from exc
-        return cls(
-            CronObservation(execution, assertions),
-            source_path=path,
-            required_assertion_ids=required_assertion_ids,
-            max_bytes=max_bytes,
-        )
+        return CronObservation(execution, assertions)
 
     @staticmethod
     def _is_fresh(assertion: BusinessAssertion, observed_at: datetime) -> bool:
@@ -136,6 +143,11 @@ class CronCollector:
                 return failed_batch(target, self.name, "collector_rate_limited", source_id=self.source_id)
             self._last_collection = now
         observation = self._observation
+        if self._source_loader is not None:
+            try:
+                observation = self._source_loader()
+            except ValueError:
+                return failed_batch(target, self.name, "cron_source_invalid", source_id=self.source_id)
         if len(observation.assertions) > self.max_assertions:
             return failed_batch(target, self.name, "cron_assertion_budget_exceeded", source_id=self.source_id)
         observed_at = utc_now()
@@ -162,6 +174,14 @@ class CronCollector:
             )
         ]
         failures = list(missing)
+        undeclared_required = sorted(self.required_assertion_ids.difference(self.review_pack.assertions))
+        if undeclared_required:
+            failures.extend(undeclared_required)
+            signals.extend(redact_signal(RawSignal(
+                target_id=target.target_id, collector=self.name,
+                signal_type="cron.business_assertion_unknown", observed_at=observed_at,
+                severity="critical", payload={"name": name},
+            )) for name in undeclared_required)
         unknown = sorted(
             assertion.name for assertion in observation.assertions
             if assertion.mandatory and assertion.name not in self.review_pack.assertions

@@ -83,7 +83,7 @@ def bootstrap_gateway_registry() -> FleetRegistry:
             kind=TargetKind.GATEWAY,
             criticality=criticality,
             observed_paths=(logs_path, f"~/Library/LaunchAgents/{label}.plist"),
-            labels={"service_label": label, "profile": label_profile},
+            labels={"service_label": label, "profile": label_profile, "process_marker": label_profile, "command_fingerprint": "unconfigured"},
             existing_writer="launchd+hermes_gateway_watchdog",
         )
         for profile, label, logs_path, criticality, label_profile in _PROFILE_TARGETS

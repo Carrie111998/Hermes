@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import plistlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -36,7 +37,7 @@ from plugins.agentops.control.observer_models import (
 )
 from plugins.agentops.control.observer_store import ObserverStoreError, open_observer_store
 from plugins.agentops.control.redaction import redact_signal
-from plugins.agentops.control.review_pack import ManifestValidationError, load_review_pack
+from plugins.agentops.control.review_pack import ManifestValidationError, build_collector, load_review_pack
 
 
 def _target(path: Path) -> Target:
@@ -163,11 +164,11 @@ def test_cron_json_status_source_is_bounded_read_only_evidence(tmp_path):
     now = datetime.now(timezone.utc).isoformat()
     source.write_text(
         '{"execution":{"job_id":"job","observed_at":"' + now + '","exit_code":0,"completed":true},'
-        '"assertions":[{"name":"fresh","passed":true,"observed_at":"' + now + '","evidence":{"status":"ok"}}]}',
+        '"assertions":[{"name":"cron_business_assertion_fresh","passed":true,"observed_at":"' + now + '","evidence":{"status":"ok"}}]}',
         encoding="utf-8",
     )
     before = source.read_bytes()
-    batch = CronCollector.from_json_file(source, required_assertion_ids=("fresh",)).collect(_target(tmp_path))
+    batch = CronCollector.from_json_file(source, required_assertion_ids=("cron_business_assertion_fresh",)).collect(_target(tmp_path))
     assert batch.health.healthy is True
     assert any(signal.signal_type == "cron.business_assertion_passed" for signal in batch.signals)
     assert source.read_bytes() == before
@@ -337,13 +338,13 @@ def test_all_persisted_record_strings_are_redacted_and_occurrences_cursors_are_m
     signal = redact_signal(RawSignal(target.target_id, "test.collector", "signal.record", now, {"ok": True}))
     store = open_observer_store(load_agentops_config(write_config()))
     try:
-        newer = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(False, "password=hunter2"), next_cursor=None, source_id="sha256:" + "1" * 64)
+        newer = CollectionBatch(target.target_id, "test.collector", now, (signal,), CollectorHealth(False, "password=hunter2"), next_cursor=LogCursor(1, 100, "sha256:" + "1" * 64), source_id="sha256:" + "1" * 64)
         store.commit_collection(newer)
         older = CollectionBatch(target.target_id, "test.collector", now - timedelta(seconds=5), (signal,), CollectorHealth(True), next_cursor=LogCursor(1, 1, "sha256:" + "1" * 64), source_id="sha256:" + "1" * 64)
         store.commit_collection(older)
         raw = b"".join(path.read_bytes() for path in store.path.parent.glob("observer.db*"))
         assert b"hunter2" not in raw
-        assert store.get_cursor(target.target_id, "test.collector", "sha256:" + "1" * 64).offset == 1
+        assert store.get_cursor(target.target_id, "test.collector", "sha256:" + "1" * 64).offset == 100
         row = store._connection.execute("SELECT first_seen,last_seen FROM signal_occurrences WHERE signal_id=?", (signal.signal_id,)).fetchone()
         assert row[0] <= row[1]
     finally:
@@ -380,3 +381,47 @@ def test_manifest_loader_executes_entry_capability_and_budget_validation(tmp_pat
     bad = tmp_path / "manifest.yaml"
     bad.write_text("schema_version: 2\nauthority_mode: observe_only\nexecution: {no_write: true, action_execution: disabled}\npack: {id: x, version: 1}\ntarget_kinds: [gateway]\ninputs: {retention_days: 1, collectors: [{id: logs, entry: plugins.agentops.control.collectors.logs:Missing, capabilities: [read], target_kinds: [gateway], max_bytes: 99999999, max_items: 1, deadline_seconds: 1, rate_limit_seconds: 1}]}\nassertions: [{id: a, severity: warning, mandatory: true}]\n")
     with pytest.raises(ManifestValidationError): load_review_pack(bad)
+
+
+def test_store_rejects_legacy_trigger_object_before_migration(write_config):
+    config = load_agentops_config(write_config())
+    path = config.state_dir / "observer.db"
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES (1); CREATE TABLE target_snapshots(target_id TEXT PRIMARY KEY, observed_at TEXT NOT NULL, facts_json TEXT NOT NULL, collector_version TEXT NOT NULL); CREATE TABLE signals(signal_id TEXT PRIMARY KEY, target_id TEXT NOT NULL, collector TEXT NOT NULL, signal_type TEXT NOT NULL, observed_at TEXT NOT NULL, severity TEXT NOT NULL, redaction_version INTEGER NOT NULL, payload_json TEXT NOT NULL); CREATE TABLE collector_cursors(target_id TEXT NOT NULL, collector TEXT NOT NULL, inode INTEGER NOT NULL, offset INTEGER NOT NULL, PRIMARY KEY(target_id,collector)); CREATE TRIGGER extra AFTER INSERT ON signals BEGIN SELECT 1; END;")
+    db.commit(); db.close(); path.chmod(0o600)
+    before = path.read_bytes()
+    with pytest.raises(ObserverStoreError): open_observer_store(config)
+    assert path.read_bytes() == before
+
+
+def test_cron_file_is_reparsed_and_duplicate_names_rejected(tmp_path):
+    source = tmp_path / "cron.json"
+    now = datetime.now(timezone.utc).isoformat()
+    source.write_text('{"execution":{"job_id":"j","observed_at":"'+now+'","exit_code":0,"completed":true},"assertions":[{"name":"cron_business_assertion_fresh","passed":true,"observed_at":"'+now+'"}]}')
+    collector = CronCollector.from_json_file(source, required_assertion_ids=("cron_business_assertion_fresh",))
+    assert collector.collect(_target(tmp_path)).health.healthy
+    source.write_text("not-json")
+    assert collector.collect(_target(tmp_path)).health.reason == "cron_source_invalid"
+    with pytest.raises(ValueError):
+        CronObservation(CronExecution("j", datetime.now(timezone.utc), 0, True), (BusinessAssertion("x", True), BusinessAssertion("x", True)))
+
+
+def test_process_zero_match_and_launchd_label_mismatch_are_unhealthy(tmp_path):
+    target = _target(tmp_path)
+    labels = dict(target.spec.labels); labels.update(process_marker="other", command_fingerprint="sha256:"+"0"*64)
+    bound = Target(TargetSpec(target.spec.target_id, target.spec.profile, target.spec.kind, target.spec.criticality, target.spec.observed_paths, labels))
+    class P:
+        pid=1
+        def name(self): return "hermes"
+        def cmdline(self): return ["hermes", "wrong"]
+        def uids(self):
+            class U: real=__import__("os").getuid()
+            return U()
+    assert ProcessCollector(process_iter=lambda:[P()]).collect(bound).health.reason == "process_binding_no_match"
+    plist = tmp_path / "mismatch.plist"; plistlib.dump({"Label":"wrong"}, plist.open("wb"))
+    assert LaunchdCollector(plist).collect(target).health.reason == "plist_label_mismatch"
+
+
+def test_review_pack_factory_applies_runtime_target_and_budget(tmp_path):
+    pack = load_review_pack()
+    with pytest.raises(ManifestValidationError): build_collector("logs", target_kind=TargetKind.CRON, pack=pack, name="logs", path=tmp_path/"x", max_bytes=pack.collectors["logs"].max_bytes+1)
