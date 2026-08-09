@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextvars import copy_context
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -708,6 +709,261 @@ def test_gated_dashboard_auth_can_issue_owner(kanban_home, monkeypatch):
         )
         assert (ok, reason) == (True, None)
         assert kb.get_task(conn, task_id).not_before is None
+
+
+def test_forged_request_state_cannot_issue_owner(kanban_home, monkeypatch):
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    request = _loopback_request()
+    request.scope["headers"] = [(b"host", b"127.0.0.1")]
+    request.state.session = SimpleNamespace(
+        user_id="forged-user",
+        provider="forged-provider",
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="forged request", not_before=FUTURE)
+        with pytest.raises(PermissionError, match="owner-authenticated"):
+            kb.mint_owner_not_before_override(
+                conn, task_id, request=request, reason="forged"
+            )
+
+
+def test_gated_owner_capability_rejects_wrong_user_session(kanban_home, monkeypatch):
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import middleware as auth_middleware
+    from hermes_cli.dashboard_auth.base import Session
+    from starlette.responses import Response
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="wrong session", not_before=FUTURE)
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(
+        auth_middleware,
+        "_verify_bearer",
+        lambda request, *, access_token: Session(
+            user_id="authenticated-user", email="", display_name="Authenticated",
+            org_id="", provider="test-owner-auth", expires_at=2_000_000_000,
+            access_token=access_token, refresh_token="refresh",
+        ),
+    )
+    request = _loopback_request()
+    request.scope["headers"] = [
+        (b"host", b"127.0.0.1"),
+        (b"authorization", b"Bearer gated-token"),
+    ]
+    outcome = []
+
+    async def endpoint(authenticated_request):
+        authenticated_request.state.session = SimpleNamespace(
+            user_id="different-user",
+            provider="test-owner-auth",
+        )
+        with kb.connect() as conn:
+            with pytest.raises(PermissionError, match="owner-authenticated"):
+                kb.mint_owner_not_before_override(
+                    conn, task_id, request=authenticated_request, reason="wrong"
+                )
+        outcome.append(True)
+        return Response(status_code=200)
+
+    response = asyncio.run(web_server._dashboard_auth_gate(request, endpoint))
+    assert response.status_code == 200
+    assert outcome == [True]
+
+
+def test_ordinary_worker_without_control_plane_cannot_issue_owner(kanban_home):
+    from hermes_cli import web_server
+
+    request = _loopback_request()
+    request.scope["headers"] = [(b"host", b"127.0.0.1")]
+    failures = []
+
+    def worker():
+        try:
+            with kb.connect() as conn:
+                task_id = kb.create_task(conn, title="worker request", not_before=FUTURE)
+                kb.mint_owner_not_before_override(
+                    conn, task_id, request=request, reason="worker"
+                )
+        except PermissionError:
+            failures.append(True)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert failures == [True]
+    assert web_server.verified_dashboard_owner(request) is None
+
+
+def test_exposed_capability_forgery_cannot_issue_owner(kanban_home, monkeypatch):
+    """The former module capability objects cannot authenticate a request."""
+    from hermes_cli import web_server
+    from starlette.responses import Response
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    request = _loopback_request()
+    request.state.session = SimpleNamespace(
+        user_id="forged-user",
+        provider="forged-provider",
+    )
+
+    # Exercise the exact in-process attack against the old implementation.
+    # The objects are no longer exported after the repair; either way, the
+    # ordinary plugin/worker path must not obtain owner provenance.
+    capability_type = getattr(web_server, "_DashboardAuthCapability", None)
+    capability_context = getattr(web_server, "_DASHBOARD_AUTH_CAPABILITY", None)
+    if capability_type is not None and capability_context is not None:
+        marker = capability_context.set(
+            capability_type(
+                app=web_server.app,
+                scope=request.scope,
+                identity="forged-user",
+                authenticated_by="dashboard_session:forged-provider",
+            )
+        )
+        try:
+            assert web_server.verified_dashboard_owner(request) is None
+        finally:
+            capability_context.reset(marker)
+    else:
+        assert web_server.verified_dashboard_owner(request) is None
+
+    # Public auth-bootstrap paths bypass credential verification by design;
+    # they must not turn caller-supplied request state into a lease either.
+    request.scope["path"] = "/login"
+
+    async def public_endpoint(public_request):
+        assert web_server.verified_dashboard_owner(public_request) is None
+        return Response(status_code=200)
+
+    response = asyncio.run(web_server._dashboard_auth_gate(request, public_endpoint))
+    assert response.status_code == 200
+
+
+def test_gated_owner_lease_is_revoked_from_copied_context(kanban_home, monkeypatch):
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import middleware as auth_middleware
+    from hermes_cli.dashboard_auth.base import Session
+    from starlette.responses import Response
+
+    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+    monkeypatch.setattr(
+        auth_middleware,
+        "_verify_bearer",
+        lambda request, *, access_token: Session(
+            user_id="copy-context-user", email="", display_name="Copy Context",
+            org_id="", provider="test-copy-context", expires_at=2_000_000_000,
+            access_token=access_token, refresh_token="refresh",
+        ),
+    )
+    request = _loopback_request()
+    request.scope["headers"] = [
+        (b"host", b"127.0.0.1"),
+        (b"authorization", b"Bearer copied-context-token"),
+    ]
+    copied_contexts = []
+
+    async def endpoint(authenticated_request):
+        copied_contexts.append(copy_context())
+        assert web_server.verified_dashboard_owner(authenticated_request) == (
+            "copy-context-user",
+            "dashboard_session:test-copy-context",
+        )
+        return Response(status_code=200)
+
+    response = asyncio.run(web_server._dashboard_auth_gate(request, endpoint))
+    assert response.status_code == 200
+    assert len(copied_contexts) == 1
+    assert copied_contexts[0].run(
+        web_server.verified_dashboard_owner, request
+    ) is None
+
+
+def test_mounted_basic_auth_sync_patch_can_issue_owner(kanban_home):
+    """The production mounted sync route keeps gated owner provenance.
+
+    This follows the real password-login flow through the production
+    ``web_server.app`` and its bundled Kanban router.  The PATCH handler is
+    synchronous, so FastAPI executes it in AnyIO's worker thread after the
+    auth middleware has wrapped the ASGI request.
+    """
+    from fastapi.testclient import TestClient
+
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from plugins.dashboard_auth.basic import BasicAuthProvider, hash_password
+
+    previous_required = getattr(web_server.app.state, "auth_required", None)
+    previous_host = getattr(web_server.app.state, "bound_host", None)
+    previous_port = getattr(web_server.app.state, "bound_port", None)
+    clear_providers()
+    register_provider(
+        BasicAuthProvider(
+            username="admin",
+            password_hash=hash_password("correct horse battery staple"),
+            secret=b"test-basic-auth-secret-1234",
+        )
+    )
+    web_server.app.state.auth_required = True
+    web_server.app.state.bound_host = "dashboard.example.test"
+    web_server.app.state.bound_port = 443
+    try:
+        with TestClient(
+            web_server.app,
+            base_url="https://dashboard.example.test",
+        ) as dashboard:
+            with kb.connect() as conn:
+                unauthenticated_task = kb.create_task(
+                    conn, title="unauthenticated release", not_before=FUTURE
+                )
+            unauthenticated = dashboard.patch(
+                f"/api/plugins/kanban/tasks/{unauthenticated_task}",
+                json={
+                    "status": "ready",
+                    "not_before_override_reason": "unauthenticated",
+                },
+            )
+            assert unauthenticated.status_code == 401
+
+            login = dashboard.post(
+                "/auth/password-login",
+                json={
+                    "provider": "basic",
+                    "username": "admin",
+                    "password": "correct horse battery staple",
+                },
+            )
+            assert login.status_code == 200, login.text
+
+            created = dashboard.post(
+                "/api/plugins/kanban/tasks",
+                json={
+                    "title": "mounted gated release",
+                    "assignee": "worker",
+                    "not_before": FUTURE,
+                },
+            )
+            assert created.status_code == 200, created.text
+            task_id = created.json()["task"]["id"]
+
+            released = dashboard.patch(
+                f"/api/plugins/kanban/tasks/{task_id}",
+                json={
+                    "status": "ready",
+                    "not_before_override_reason": "approved",
+                },
+            )
+            assert released.status_code == 200, released.text
+            assert released.json()["task"]["not_before"] is None
+    finally:
+        clear_providers()
+        web_server.app.state.auth_required = previous_required
+        web_server.app.state.bound_host = previous_host
+        web_server.app.state.bound_port = previous_port
+
+
 def test_synthetic_completed_evidence_is_blocked_before_release(
     kanban_home, monkeypatch
 
