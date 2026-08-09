@@ -1354,7 +1354,6 @@ def web_search_advanced_tool(query: str, **kwargs: Any) -> str:
 def exa_agent_run_tool(
     instructions: str,
     output_schema: Optional[Dict[str, Any]] = None,
-    model: str = "exa-research-fast",
 ) -> str:
     """Run an Exa Agent (multi-step research) natively."""
     try:
@@ -1371,7 +1370,6 @@ def exa_agent_run_tool(
         response_data = provider.agent_run(
             instructions,
             output_schema=output_schema,
-            model=model,
         )
         return json.dumps(response_data, indent=2, ensure_ascii=False)
     except Exception as e:  # noqa: BLE001
@@ -1391,12 +1389,6 @@ WEB_AGENT_RUN_SCHEMA = {
             "output_schema": {
                 "type": "object",
                 "description": "Optional JSON Schema for structured output. Prefer a top-level object with bounded arrays and source/evidence fields.",
-            },
-            "model": {
-                "type": "string",
-                "enum": ["exa-research-fast", "exa-research", "exa-research-pro"],
-                "description": "Research model to use (default: exa-research-fast)",
-                "default": "exa-research-fast",
             },
         },
         "required": ["instructions"],
@@ -1423,7 +1415,6 @@ registry.register(
     handler=lambda args, **kw: exa_agent_run_tool(
         args.get("instructions", ""),
         output_schema=args.get("output_schema"),
-        model=args.get("model", "exa-research-fast"),
     ),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),

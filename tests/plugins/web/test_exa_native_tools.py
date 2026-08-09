@@ -89,3 +89,73 @@ class TestToolRegistration:
             # check_fn is the standard web availability gate; it must be set
             # so the tools only light up when a web backend is available.
             assert entry.check_fn is not None
+
+    def test_exa_agent_run_schema_has_no_dead_model_param(self) -> None:
+        """The model param was advertised but never sent to the API.
+
+        The Agent API derives effort from the run payload, so exposing a
+        selectable model that the handler silently drops is misleading.
+        It must not appear in the tool schema.
+        """
+        import tools.web_tools  # noqa: F401
+        from tools.registry import registry
+
+        entry = registry.get_entry("exa_agent_run")
+        assert entry is not None
+        props = entry.schema["parameters"]["properties"]
+        assert "model" not in props
+
+
+class TestAdvancedSearchSummarySubpages:
+    """advanced_search must surface summary/subpages it already pays for."""
+
+    def test_summary_and_subpages_mapped_into_results(self, monkeypatch) -> None:
+        from plugins.web.exa import provider as exa_provider
+
+        class _Result:
+            url = "https://example.com"
+            title = "Example"
+            highlights = ["a highlight"]
+            summary = "A short summary."
+            subpages = [{"url": "https://example.com/p1", "title": "p1"}]
+
+        class _Resp:
+            results = [_Result()]
+            search_time = 0.5
+
+        class _Client:
+            def search(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(exa_provider, "_get_exa_client", lambda: _Client())
+
+        out = exa_provider.ExaWebSearchProvider().advanced_search(
+            "test", enable_summary=True, subpages=2
+        )
+        assert out["success"] is True
+        item = out["data"]["web"][0]
+        assert item["summary"] == "A short summary."
+        assert item["subpages"] == [{"url": "https://example.com/p1", "title": "p1"}]
+
+    def test_summary_subpages_omitted_when_not_requested(self, monkeypatch) -> None:
+        from plugins.web.exa import provider as exa_provider
+
+        class _Result:
+            url = "https://example.com"
+            title = "Example"
+            highlights = []
+
+        class _Resp:
+            results = [_Result()]
+            search_time = 0.5
+
+        class _Client:
+            def search(self, *a, **k):
+                return _Resp()
+
+        monkeypatch.setattr(exa_provider, "_get_exa_client", lambda: _Client())
+
+        out = exa_provider.ExaWebSearchProvider().advanced_search("test")
+        item = out["data"]["web"][0]
+        assert "summary" not in item
+        assert "subpages" not in item

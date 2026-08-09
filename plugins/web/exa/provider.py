@@ -257,14 +257,17 @@ class ExaWebSearchProvider(WebSearchProvider):
             web_results = []
             for i, result in enumerate(response.results or []):
                 highlights = result.highlights or []
-                web_results.append(
-                    {
-                        "url": result.url or "",
-                        "title": result.title or "",
-                        "description": " ".join(highlights) if highlights else "",
-                        "position": i + 1,
-                    }
-                )
+                item: Dict[str, Any] = {
+                    "url": result.url or "",
+                    "title": result.title or "",
+                    "description": " ".join(highlights) if highlights else "",
+                    "position": i + 1,
+                }
+                if kwargs.get("enable_summary"):
+                    item["summary"] = result.summary or ""
+                if kwargs.get("subpages"):
+                    item["subpages"] = result.subpages or []
+                web_results.append(item)
 
             return {
                 "success": True,
