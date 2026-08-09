@@ -1046,7 +1046,7 @@ function PluginRowCard(props: PluginRowCardProps) {
                 title={row.user_hidden ? t.pluginsPage.showInSidebar : t.pluginsPage.hideFromSidebar}
                 onClick={() => {
                   void setRuntimeLoading(pluginId, async () => {
-                    await api.setPluginVisibility(row.name, !row.user_hidden);
+                    await api.setPluginVisibility(pluginId, !row.user_hidden);
                   });
                 }}
               >
