@@ -370,6 +370,43 @@ def test_builtin_toolset_survives_mcp_name_collision(monkeypatch):
     ) == ["hermes-acp", "memory", "mcp-memory"]
 
 
+def test_current_policy_reserves_native_names_from_acp_client_mcp_registration():
+    policy = session_mod._current_acp_capability_policy({})
+
+    assert {"all", "*", "memory", "coding"}.issubset(
+        set(policy["mcp_denied_names"])
+    )
+
+
+def test_current_policy_reserves_static_native_names_when_plugin_discovery_fails(
+    monkeypatch,
+):
+    def fail_discovery():
+        raise RuntimeError("broken plugin")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        _module("hermes_cli.plugins", discover_plugins=fail_discovery),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        _module(
+            "hermes_cli.tools_config",
+            _get_platform_tools=lambda *_args, **_kwargs: {"hermes-acp"},
+            _get_plugin_toolset_keys=lambda: set(),
+            enabled_mcp_server_names=lambda _config: set(),
+        ),
+    )
+
+    policy = session_mod._current_acp_capability_policy({})
+
+    assert {"all", "*", "memory", "coding"}.issubset(
+        set(policy["mcp_denied_names"])
+    )
+
+
 def test_explicit_builtin_mcp_collision_fails_closed(monkeypatch):
     """An ambiguous explicit name must grant neither native nor MCP capability."""
     monkeypatch.setitem(
@@ -406,6 +443,152 @@ def test_explicit_builtin_mcp_collision_fails_closed(monkeypatch):
     assert session_mod._expand_acp_enabled_toolsets(
         native, mcp_server_names=mcp_names
     ) == ["hermes-acp"]
+
+
+def test_explicit_builtin_mcp_collision_preserves_baseline_native_tools(monkeypatch):
+    """A colliding MCP name cannot revoke a separately granted ACP baseline."""
+    captured = {}
+    config = {
+        "model": {"default": "test-model"},
+        "mcp_servers": {"memory": {"enabled": True}},
+        "platform_toolsets": {"acp": ["hermes-acp", "memory"]},
+    }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = kwargs["model"]
+            self.tools = [
+                {"type": "function", "function": {"name": "memory"}},
+                {"type": "function", "function": {"name": "read_file"}},
+            ]
+            self.valid_tool_names = {"memory", "read_file"}
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", _module("run_agent", AIAgent=FakeAgent)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        _module("hermes_cli.config", load_config=lambda: config),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        _module(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        _module("hermes_cli.plugins", discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        _module(
+            "hermes_cli.tools_config",
+            _get_platform_tools=lambda *_args, **_kwargs: {
+                "hermes-acp",
+                "memory",
+            },
+            _get_plugin_toolset_keys=lambda: set(),
+            enabled_mcp_server_names=lambda _config: {"memory"},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        _module(
+            "hermes_cli.mcp_startup",
+            ensure_mcp_discovery_before_agent_build=lambda **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(session_mod, "_register_task_cwd", lambda *_args: None)
+
+    manager = session_mod.SessionManager(db=NoopDb())
+    agent = manager._make_agent(session_id="acp-test", cwd=".")
+
+    assert captured["enabled_toolsets"] == ["hermes-acp"]
+    assert set(captured["disabled_toolsets"]) == {"mcp-memory"}
+    assert agent.valid_tool_names == {"memory", "read_file"}
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        "memory",
+        "read_file",
+    ]
+    assert agent._acp_mcp_allowed_names == frozenset()
+
+
+def test_explicit_bundle_mcp_collision_preserves_independent_baseline(monkeypatch):
+    config = {
+        "model": {"default": "test-model"},
+        "mcp_servers": {"hermes-acp": {"enabled": True}},
+        "platform_toolsets": {"acp": ["hermes-acp"]},
+    }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.tools = [
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "terminal"}},
+                {"type": "function", "function": {"name": "memory_search"}},
+            ]
+            self.valid_tool_names = {"read_file", "terminal", "memory_search"}
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", _module("run_agent", AIAgent=FakeAgent)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        _module("hermes_cli.config", load_config=lambda: config),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        _module(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        _module("hermes_cli.plugins", discover_plugins=lambda: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        _module(
+            "hermes_cli.tools_config",
+            _get_platform_tools=lambda *_args, **_kwargs: {"hermes-acp"},
+            _get_plugin_toolset_keys=lambda: set(),
+            enabled_mcp_server_names=lambda _config: {"hermes-acp"},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        _module(
+            "hermes_cli.mcp_startup",
+            ensure_mcp_discovery_before_agent_build=lambda **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(session_mod, "_register_task_cwd", lambda *_args: None)
+
+    manager = session_mod.SessionManager(db=NoopDb())
+    agent = manager._make_agent(session_id="bundle-collision", cwd=".")
+
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        "read_file",
+        "terminal",
+        "memory_search",
+    ]
+    assert agent.valid_tool_names == {"read_file", "terminal", "memory_search"}
+    assert agent._acp_mcp_allowed_names == frozenset()
 
 
 def test_composite_mcp_collision_is_removed_before_native_resolution(monkeypatch):

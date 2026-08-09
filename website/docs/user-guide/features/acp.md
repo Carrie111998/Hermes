@@ -40,6 +40,18 @@ The base ACP toolset includes:
 
 It intentionally excludes things that do not fit typical editor UX, such as messaging delivery and cronjob management.
 
+ACP resolves native/plugin toolsets and MCP servers as separate capability
+namespaces. MCP servers are exposed under canonical `mcp-<server>` toolsets. If
+an unprefixed platform selection is ambiguous because the same name identifies
+both a native toolset and an MCP server, that selection does not grant either
+meaning. Capabilities granted independently by the curated `hermes-acp`
+baseline or an explicitly enabled native plugin remain available; an ambiguous
+MCP name cannot revoke them.
+
+The resolved capability policy is stored with the ACP session and copied across
+restore, fork, and model-switch operations. Later profile changes may tighten
+an existing session, but cannot silently widen its original tool or MCP access.
+
 ## Installation
 
 Install Hermes normally, then add the ACP extra from the install checkout:
