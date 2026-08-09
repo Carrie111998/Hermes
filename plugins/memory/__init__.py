@@ -194,9 +194,11 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
     results = []
 
     for name, child in _iter_provider_dirs():
-        # Read description from plugin.yaml if available
+        # Read description from the manifest, matching discovery precedence.
         desc = ""
         yaml_file = child / "plugin.yaml"
+        if not yaml_file.exists():
+            yaml_file = child / "plugin.yml"
         if yaml_file.exists():
             try:
                 import yaml
@@ -476,10 +478,12 @@ def discover_plugin_cli_commands() -> List[dict]:
         if not callable(register_cli):
             return results
 
-        # Read metadata from plugin.yaml if available
+        # Read metadata from the manifest, matching discovery precedence.
         help_text = f"Manage {active_provider} memory plugin"
         description = ""
         yaml_file = plugin_dir / "plugin.yaml"
+        if not yaml_file.exists():
+            yaml_file = plugin_dir / "plugin.yml"
         if yaml_file.exists():
             try:
                 import yaml
