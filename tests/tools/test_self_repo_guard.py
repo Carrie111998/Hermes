@@ -24,6 +24,39 @@ def _detect(command, cwd, root):
     return detect_self_repo_git_mutation(command, str(cwd), source_root=root)
 
 
+def _explicit_target_operands(
+    path: Path, path_style: str, cwd: Path
+) -> tuple[str, Path, Path]:
+    """Return distinct target spellings that share one guard-visible root."""
+    native_path = path
+    source_root = native_path
+    target_cwd = cwd
+    if native_path.drive:
+        drive = native_path.drive.removesuffix(":")
+        native_target = str(native_path)
+    else:
+        # On a host without drive semantics, the production resolver maps
+        # /c/... to the logical c:/... path relative to /. Use that same
+        # controlled logical root for both spellings instead of mixing the
+        # real fixture with an unrelated synthetic root.
+        drive = "c"
+        source_root = Path(f"{drive}:{native_path.as_posix()}")
+        target_cwd = Path("/")
+        native_target = str(source_root)
+
+    if path_style == "native":
+        target = native_target
+    else:
+        if native_path.drive:
+            tail = native_path.as_posix()[len(native_path.drive) :]
+        else:
+            tail = native_path.as_posix()
+        target = f"/{drive.lower()}{tail}"
+        assert target.startswith(f"/{drive.lower()}/")
+        assert target != native_target
+    return target, target_cwd, source_root
+
+
 class TestBlocksMutationsInSourceRepo:
     @pytest.mark.parametrize(
         "sub",
@@ -58,26 +91,22 @@ class TestBlocksMutationsInSourceRepo:
     def test_dash_c_quoted_windows_targeting_repo_from_outside(
         self, repo, tmp_path, path_style
     ):
-        native = str(repo)
-        cwd = tmp_path
-        source_root = repo
-        if path_style == "native":
-            target = native
-        else:
-            if ":" in native:
-                drive, tail = native.split(":", 1)
-                target = f"/{drive.lower()}{tail.replace(chr(92), '/') }"
-            else:
-                # POSIX has no drive to translate. Pair the distinct /c/ form
-                # with the equivalent logical native path for this resolver.
-                drive = "c"
-                target = f"/{drive}{native}"
-                source_root = Path(f"{drive}:{native}")
-                cwd = Path("/")
-            assert target.startswith(f"/{drive.lower()}/")
-            assert target != native
+        target, cwd, source_root = _explicit_target_operands(repo, path_style, tmp_path)
         hit, _ = _detect(f'git -C "{target}" checkout pr-51020', cwd, source_root)
         assert hit is True
+
+    def test_colon_bearing_posix_target_reaches_explicit_target_path(self):
+        colon_path = Path("/tmp/worker:123/hermes-agent")
+        target, cwd, source_root = _explicit_target_operands(
+            colon_path, "git_bash", Path("/")
+        )
+        assert colon_path.drive == ""
+        assert ":" in colon_path.as_posix()
+        hit, message = _detect(
+            f'git -C "{target}" checkout pr-51020', cwd, source_root
+        )
+        assert hit is True
+        assert message is not None
 
     def test_rejects_chained_explicit_targets(self, repo, tmp_path):
         other = tmp_path / "other-project"
