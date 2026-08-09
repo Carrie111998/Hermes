@@ -66,6 +66,59 @@ def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("custom_routable", [False, True])
+def test_custom_picker_rows_follow_runtime_activation(
+    monkeypatch,
+    custom_routable,
+):
+    """Every custom picker shape must share the runtime activation gate."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_runtime_provider_routable",
+        lambda provider: custom_routable if provider == "custom" else True,
+    )
+    probes = []
+
+    def _probe(*args, **kwargs):
+        probes.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr("hermes_cli.models.cached_fetch_api_models", _probe)
+
+    rows = list_authenticated_providers(
+        current_provider="custom",
+        current_model="bare-model",
+        current_base_url="https://bare.invalid/v1",
+        user_providers={
+            "named": {
+                "name": "Named Provider",
+                "base_url": "https://named.invalid/v1",
+                "models": ["named-model"],
+            }
+        },
+        custom_providers=[
+            {
+                "name": "Legacy Provider",
+                "base_url": "https://legacy.invalid/v1",
+                "models": ["legacy-model"],
+            }
+        ],
+        probe_custom_providers=True,
+        probe_current_custom_provider=True,
+        max_models=50,
+    )
+
+    custom_rows = {
+        row["slug"]
+        for row in rows
+        if row.get("source") in {"model-config", "user-config"}
+    }
+    expected = {"custom", "named", "custom:legacy-provider"}
+    assert custom_rows == (expected if custom_routable else set())
+    assert bool(probes) is custom_routable
+
+
 
 
 

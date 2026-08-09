@@ -2662,7 +2662,12 @@ def list_authenticated_providers(
     # produces two picker rows: one bare-slug ("openrouter") from section 3
     # and one "custom:openrouter" from section 4, both labelled identically.
     _section3_emitted_pairs: set = set()
-    if user_providers and isinstance(user_providers, dict):
+    _custom_runtime_routable = is_runtime_provider_routable("custom")
+    if (
+        _custom_runtime_routable
+        and user_providers
+        and isinstance(user_providers, dict)
+    ):
         # Group ``providers:`` entries by (api_url, key_env, api_mode) so that
         # multiple keyed providers pointing at the same endpoint with the
         # same credential and wire-protocol collapse into one picker row.
@@ -2917,7 +2922,8 @@ def list_authenticated_providers(
     # list_authenticated_providers(). Surface the active endpoint explicitly so
     # /model does not look like it ignored config.yaml.
     if (
-        _current_provider_norm == "custom"
+        _custom_runtime_routable
+        and _current_provider_norm == "custom"
         and current_base_url
         and "custom" not in seen_slugs
         and not any(
@@ -2969,7 +2975,11 @@ def list_authenticated_providers(
     # "Ollama" row with four models inside instead of four near-duplicates
     # that differ only by suffix. Same-host entries with different ``key_env``
     # or ``api_mode`` remain distinct providers.
-    if custom_providers and isinstance(custom_providers, list):
+    if (
+        _custom_runtime_routable
+        and custom_providers
+        and isinstance(custom_providers, list)
+    ):
         from collections import OrderedDict
 
         # Key by endpoint + credential identity + wire protocol + display
