@@ -70,3 +70,32 @@ async def test_disconnect_still_bounded_when_connector_silent():
 
     assert fut.done() and fut.exception() is not None
     assert elapsed < 10.0, f"teardown took {elapsed:.1f}s — grace must be bounded"
+
+
+def test_drain_grace_clamps_to_disconnect_budget(monkeypatch):
+    """Drain + the three sequential teardown awaits must fit the runner's
+    adapter-disconnect budget (default 5s): grace = budget - 3*1.0s - margin."""
+    from gateway.relay import ws_transport as wt
+
+    monkeypatch.delenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", raising=False)
+    grace = wt._disconnect_drain_grace_s()
+    budget = 5.0
+    reserved = 3 * wt._TEARDOWN_AWAIT_TIMEOUT_S
+    assert grace + reserved < budget, (
+        f"grace {grace}s + teardown awaits {reserved}s exceeds the runner's "
+        f"{budget}s disconnect budget — wait_for would cancel teardown "
+        "mid-drain and skip the fail-pending loop"
+    )
+    assert grace > 0, "budget default must still leave usable drain time"
+
+
+def test_drain_grace_honors_env_budget(monkeypatch):
+    from gateway.relay import ws_transport as wt
+
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "12")
+    assert wt._disconnect_drain_grace_s() == wt._DISCONNECT_DRAIN_GRACE_S
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "3.5")
+    grace = wt._disconnect_drain_grace_s()
+    assert 0 <= grace <= 3.5 - 3 * wt._TEARDOWN_AWAIT_TIMEOUT_S
+    monkeypatch.setenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "1")
+    assert wt._disconnect_drain_grace_s() == 0.0
