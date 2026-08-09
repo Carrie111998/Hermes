@@ -38,6 +38,7 @@ import io
 import json
 import pathlib
 import re
+import sys
 from email.message import Message
 from types import SimpleNamespace
 
@@ -269,7 +270,11 @@ class TestCanonicalV1Mapping:
         assert _method_info(method) == (operation, True)
 
     def test_canonical_set_covers_exactly_ten_operations(self):
-        assert set(CANONICAL_V1.values()) == {
+        # Derived from PRODUCTION (_method_info), not from in-file constants:
+        # the operation universe reachable through the real dispatch table
+        # must be exactly the ten spec operations.
+        reachable = {_method_info(m)[0] for m in ACCEPTED_METHODS}
+        assert reachable == {
             "send", "stream", "get", "list", "cancel", "subscribe",
             "push_create", "push_get", "push_list", "push_delete",
         }
@@ -331,13 +336,9 @@ class TestUnknownMethods:
         for method in ("tasks/destroy", "SendMessagee", "sendmessage", ""):
             assert _method_info(method) == ("", False), method
 
-    def test_dispatch_table_contracts_unknown_to_method_not_found(self):
-        """Dispatch-table contract: an empty operation is exactly the signal
-        do_POST turns into ERR_METHOD_NOT_FOUND (-32601)."""
-        operation, _ = _method_info("Bogus/Op")
-        assert not operation
-        payload = protocol.jsonrpc_error(7, protocol.ERR_METHOD_NOT_FOUND, "method not found: Bogus/Op")
-        assert payload["error"]["code"] == -32601
+    # NOTE: the -32601 wire contract is pinned by the genuine do_POST tests
+    # in TestDispatchUnknownMethod below — a helper-shape test here would be
+    # tautological (trust review R2 fix).
 
 
 # --------------------------------------------------------------------------
@@ -409,11 +410,21 @@ class TestOutboundDriftPin:
             f"in plugins/platforms/a2a/adapter.py or update this pin"
         )
 
-    def test_drift_pin_detects_a_bogus_outbound_method(self):
-        """Self-test the pin logic: an injected unknown method string must be
-        flagged, proving the net actually catches drift."""
-        bogus = {"SendMessage", "Bogus/Op"}
-        offenders = {s for s in bogus if s not in ACCEPTED_METHODS}
+    def test_drift_pin_detects_a_bogus_outbound_method(self, monkeypatch, tmp_path):
+        """Self-test the pin through the REAL extraction pipeline (not
+        hardcoded constants): a synthetic tools.py carrying an unknown
+        method must be flagged by the drift check. Trust review fix —
+        the previous version exercised set-difference logic only."""
+        fake = tmp_path / "tools.py"
+        fake.write_text(
+            'body = {"jsonrpc": "2.0", "method": "SendMessage"}\n'
+            'rogue = {"jsonrpc": "2.0", "method": "Bogus/Op"}\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sys.modules[__name__], "TOOLS_PATH", fake)
+        extracted = extract_outbound_methods()
+        assert "SendMessage" in extracted
+        offenders = {s for s in extracted if s not in ACCEPTED_METHODS}
         assert offenders == {"Bogus/Op"}
 
 
@@ -444,7 +455,11 @@ def _posted_with_headers(monkeypatch, body: dict, headers: dict | None):
 
 class TestA2AVersionGate:
     """Debate #2 + #3: the A2A-Version header gate is an interop chokepoint
-    and the outbound version must stay inside the inbound accepted set."""
+    and the outbound version must stay inside the inbound accepted set.
+
+    Positive cases are STRICT (trust-review fix): a version that passes the
+    gate must produce a real result — asserting only 'no invalid-params
+    error' would still pass if dispatch failed with an unrelated error."""
 
     def _send_body(self):
         return {
@@ -452,23 +467,33 @@ class TestA2AVersionGate:
             "params": {"message": protocol.text_message(protocol.ROLE_USER, "hi")},
         }
 
+    def _posted_passing_gate(self, monkeypatch, headers):
+        handler = _fake_handler(monkeypatch, self._send_body())
+        for k, v in (headers or {}).items():
+            handler.headers[k] = v
+        handler.server.adapter._await_reply = lambda pending: (
+            protocol.STATE_COMPLETED, "ok")
+        handler.do_POST()  # noqa: N802
+        handler.wfile.seek(0)
+        raw = handler.wfile.read().decode("utf-8")
+        _, _, payload = raw.partition("\r\n\r\n")
+        return json.loads(payload)
+
     def test_absent_version_header_dispatches(self, monkeypatch):
         # Legacy peers send no header — must NOT be rejected.
-        status, _, resp = _posted_with_headers(monkeypatch, self._send_body(), None)
-        assert status == 200
-        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+        resp = self._posted_passing_gate(monkeypatch, None)
+        assert "error" not in resp, resp.get("error")
+        assert "result" in resp
 
     def test_version_1_0_dispatches(self, monkeypatch):
-        status, _, resp = _posted_with_headers(
-            monkeypatch, self._send_body(), {"A2A-Version": "1.0"})
-        assert status == 200
-        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+        resp = self._posted_passing_gate(monkeypatch, {"A2A-Version": "1.0"})
+        assert "error" not in resp, resp.get("error")
+        assert "result" in resp
 
     def test_version_1_0_0_dispatches(self, monkeypatch):
-        status, _, resp = _posted_with_headers(
-            monkeypatch, self._send_body(), {"A2A-Version": "1.0.0"})
-        assert status == 200
-        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS
+        resp = self._posted_passing_gate(monkeypatch, {"A2A-Version": "1.0.0"})
+        assert "error" not in resp, resp.get("error")
+        assert "result" in resp
 
     @pytest.mark.parametrize("bad", ["0.3", "1.1", "2"])
     def test_unknown_version_rejected_invalid_params(self, monkeypatch, bad):
@@ -482,12 +507,12 @@ class TestA2AVersionGate:
         """Debate #3 round-trip on the VERSION axis: whatever tools.py sends
         as A2A-Version must pass our own inbound gate (silent-drift pin —
         bumping PROTOCOL_VERSION becomes a visible, reviewed change)."""
-        status, _, resp = _posted_with_headers(
-            monkeypatch, self._send_body(),
-            {"A2A-Version": protocol.PROTOCOL_VERSION})
-        assert status == 200
-        assert resp.get("error", {}).get("code") != protocol.ERR_INVALID_PARAMS, (
-            "outbound PROTOCOL_VERSION is rejected by our own inbound gate")
+        resp = self._posted_passing_gate(
+            monkeypatch, {"A2A-Version": protocol.PROTOCOL_VERSION})
+        assert "error" not in resp, (
+            "outbound PROTOCOL_VERSION is rejected by our own inbound gate: "
+            f"{resp.get('error')}")
+        assert "result" in resp
 
 
 class TestReverseMappingClosure:
@@ -581,4 +606,17 @@ class TestV1StreamDispatch:
             assert env.get("jsonrpc") == "2.0"
             assert env.get("id") == 31
             assert "result" in env, f"frame missing result: {env}"
+            # Trust-review fix: pin the inner StreamResponse content shape,
+            # not just the envelope — a stream of valid envelopes carrying
+            # garbage results must fail.
+            result = env["result"]
+            assert set(result) == {"statusUpdate"}, f"unexpected frame shape: {sorted(result)}"
+            su = result["statusUpdate"]
+            assert su["taskId"] and su["contextId"]
+            assert su["status"]["state"] in (
+                protocol.STATE_SUBMITTED, protocol.STATE_WORKING,
+                protocol.STATE_COMPLETED, protocol.STATE_FAILED,
+                protocol.STATE_INPUT_REQUIRED, protocol.STATE_AUTH_REQUIRED,
+                protocol.STATE_CANCELED, protocol.STATE_REJECTED,
+            ), su["status"]["state"]
         assert ": done" in body, "stream must end with the done comment"
