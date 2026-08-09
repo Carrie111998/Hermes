@@ -11,7 +11,11 @@ import ipaddress
 from pathlib import Path
 from typing import Any, TypeVar
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 _INTEGER_PATTERN = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
@@ -128,6 +132,24 @@ class BridgeConfig:
         cls,
         path: Path | None = None,
         environ: Mapping[str, str] | None = None,
+        *,
+        config_home: Path | None = None,
+    ) -> BridgeConfig:
+        scope_token = (
+            set_hermes_home_override(config_home) if config_home is not None else None
+        )
+        try:
+            return cls._load(path=path, environ=environ)
+        finally:
+            if scope_token is not None:
+                reset_hermes_home_override(scope_token)
+
+    @classmethod
+    def _load(
+        cls,
+        *,
+        path: Path | None,
+        environ: Mapping[str, str] | None,
     ) -> BridgeConfig:
         config_path = (
             path if path is not None else get_hermes_home() / "session_bridge.toml"
