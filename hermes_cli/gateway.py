@@ -294,6 +294,25 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     return _wait_for_pid_exit(pid, max(drain_timeout, 1.0))
 
 
+def _restart_gateway_for_update(pid: int, wait_timeout: float) -> str:
+    """Request a restart without deadlocking a gateway-owned updater.
+
+    A cron job can run Hermes update as a child of the gateway. Waiting for
+    that gateway to exit creates a cycle: restart waits for cron, while cron's
+    updater waits for restart. In that topology, request the restart and return
+    so the cron run can finish. Unrelated callers retain the normal bounded
+    drain wait.
+
+    Returns "deferred" when the caller must finish before restart, "exited"
+    after a completed graceful restart, or "failed" when handoff failed.
+    """
+    if _request_gateway_self_restart(pid):
+        return "deferred"
+    if _graceful_restart_via_sigusr1(pid, wait_timeout):
+        return "exited"
+    return "failed"
+
+
 def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
     """Wait up to ``timeout`` seconds for ``pid`` to leave the process table.
 
