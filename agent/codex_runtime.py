@@ -27,6 +27,47 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 logger = logging.getLogger(__name__)
 
 
+def _configured_mcp_dynamic_tools(agent) -> list[dict[str, Any]]:
+    """Project this session's registered MCP schemas onto Codex dynamic tools.
+
+    ``agent.tools`` is already filtered by the platform toolset policy.  The
+    registered-name map is the extra provenance check: a registry/native tool
+    that merely resembles an MCP name never crosses this boundary.
+    """
+    try:
+        from tools.mcp_tool import _mcp_tool_server_names
+
+        registered = set(_mcp_tool_server_names)
+    except Exception:
+        return []
+
+    dynamic_tools: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tool in getattr(agent, "tools", ()) or ():
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        parameters = function.get("parameters")
+        if (
+            not isinstance(name, str)
+            or name not in registered
+            or not isinstance(parameters, dict)
+            or name in seen
+        ):
+            continue
+        seen.add(name)
+        dynamic_tools.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": str(function.get("description") or ""),
+                "inputSchema": parameters,
+            }
+        )
+    return dynamic_tools
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -680,8 +721,32 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        dynamic_tools = _configured_mcp_dynamic_tools(agent)
+        allowed_dynamic_tools = {tool["name"] for tool in dynamic_tools}
+
+        def dispatch_dynamic_tool(
+            tool_name: str, arguments: dict[str, Any], call_id: str
+        ) -> Any:
+            # The session validates the name and argument shape before this
+            # callback. Keep the dispatcher scoped to the same exact snapshot.
+            import model_tools
+
+            return model_tools.handle_function_call(
+                tool_name,
+                arguments,
+                effective_task_id,
+                tool_call_id=call_id,
+                session_id=getattr(agent, "session_id", "") or "",
+                enabled_tools=sorted(allowed_dynamic_tools),
+                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            developer_instructions=getattr(agent, "_cached_system_prompt", None),
+            dynamic_tools=dynamic_tools,
+            dynamic_tool_handler=dispatch_dynamic_tool,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

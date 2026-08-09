@@ -7,6 +7,8 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -119,9 +121,14 @@ class FakeClient:
 
 
 def make_session(client: FakeClient, **kwargs) -> CodexAppServerSession:
+    def client_factory(**factory_kwargs):
+        client.factory_kwargs = factory_kwargs
+        return client
+
+    kwargs.setdefault("codex_home", "/tmp/no-codex-auth")
     return CodexAppServerSession(
         cwd="/tmp",
-        client_factory=lambda **kw: client,
+        client_factory=client_factory,
         **kwargs,
     )
 
@@ -173,6 +180,61 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_thread_start_forwards_profile_and_exact_dynamic_tools(self):
+        client = FakeClient()
+        dynamic_tools = [
+            {
+                "type": "function",
+                "name": "mcp__law_firm_ops__list_email_obligations",
+                "description": "List obligations.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ]
+        s = make_session(
+            client,
+            developer_instructions="Use the Legal Assistant profile.",
+            dynamic_tools=dynamic_tools,
+        )
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["developerInstructions"] == "Use the Legal Assistant profile."
+        assert params["dynamicTools"] == dynamic_tools
+        assert "outlook" not in str(params["dynamicTools"]).lower()
+
+    def test_thread_start_keeps_explicit_empty_dynamic_tools(self):
+        client = FakeClient()
+        s = make_session(client, dynamic_tools=[])
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["dynamicTools"] == []
+
+    def test_session_uses_private_codex_home(self):
+        client = FakeClient()
+        s = make_session(client)
+        assert s._codex_home != os.path.expanduser("~/.codex")
+        s.ensure_started()
+        assert client.factory_kwargs["codex_home"] == s._codex_home
+        s.close()
+        assert not os.path.exists(client.factory_kwargs["codex_home"])
+
+    def test_session_copies_only_restricted_auth_material(self, tmp_path):
+        auth_home = tmp_path / "codex-source"
+        auth_home.mkdir()
+        auth = auth_home / "auth.json"
+        auth.write_text('{"token":"test"}', encoding="utf-8")
+        (auth_home / "config.toml").write_text(
+            "[mcp_servers.outlook]\n", encoding="utf-8"
+        )
+        client = FakeClient()
+        s = make_session(client, codex_home=str(auth_home))
+        s.ensure_started()
+        isolated = Path(s._codex_home)
+        assert (isolated / "auth.json").read_text(encoding="utf-8") == '{"token":"test"}'
+        assert (isolated / "auth.json").stat().st_mode & 0o777 == 0o600
+        assert isolated.stat().st_mode & 0o777 == 0o700
+        assert not (isolated / "config.toml").exists()
+        s.close()
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -505,6 +567,130 @@ class TestCompactThread:
 # ---- approval bridge ----
 
 class TestServerRequestRouting:
+
+    def test_dynamic_tool_request_dispatches_once(self):
+        client = FakeClient()
+        dispatched = []
+
+        def dispatch(name, arguments, call_id):
+            dispatched.append((name, arguments, call_id))
+            return "ok"
+
+        client.queue_server_request(
+            "item/tool/call",
+            request_id="dynamic-1",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            callId="call-1",
+            tool="mcp__law_firm_ops__list_email_obligations",
+            arguments={"status": "open"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            dynamic_tools=[
+                {
+                    "name": "mcp__law_firm_ops__list_email_obligations",
+                    "type": "function",
+                }
+            ],
+            dynamic_tool_handler=dispatch,
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+        assert dispatched == [
+            (
+                "mcp__law_firm_ops__list_email_obligations",
+                {"status": "open"},
+                "call-1",
+            )
+        ]
+        assert client.responses == [
+            (
+                "dynamic-1",
+                {
+                    "success": True,
+                    "contentItems": [{"type": "inputText", "text": "ok"}],
+                },
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"callId": "call-1", "tool": "unknown", "arguments": {}},
+            {
+                "callId": "call-1",
+                "tool": "mcp__law_firm_ops__list_email_obligations",
+                "arguments": [],
+            },
+            {
+                "callId": "",
+                "tool": "mcp__law_firm_ops__list_email_obligations",
+                "arguments": {},
+            },
+        ],
+    )
+    def test_dynamic_tool_request_rejects_unknown_or_malformed(self, params):
+        client = FakeClient()
+        dispatched = []
+        client.queue_server_request(
+            "item/tool/call",
+            request_id="dynamic-1",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            **params,
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            dynamic_tools=[
+                {
+                    "name": "mcp__law_firm_ops__list_email_obligations",
+                    "type": "function",
+                }
+            ],
+            dynamic_tool_handler=lambda *args: dispatched.append(args),
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+        assert dispatched == []
+        assert client.responses[0][1]["success"] is False
+        assert client.responses[0][1]["contentItems"][0]["text"] == "Tool call unavailable."
+
+    def test_duplicate_dynamic_tool_request_is_not_redispatched(self):
+        client = FakeClient()
+        dispatched = []
+        params = {
+            "threadId": "thread-fake-001",
+            "turnId": "turn-fake-001",
+            "callId": "call-1",
+            "tool": "mcp__law_firm_ops__list_email_obligations",
+            "arguments": {},
+        }
+        client.queue_server_request("item/tool/call", request_id="dynamic-1", **params)
+        client.queue_server_request("item/tool/call", request_id="dynamic-2", **params)
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            dynamic_tools=[
+                {
+                    "name": "mcp__law_firm_ops__list_email_obligations",
+                    "type": "function",
+                }
+            ],
+            dynamic_tool_handler=lambda *args: dispatched.append(args) or "ok",
+        )
+        s.run_turn("hi", turn_timeout=1.0)
+        assert len(dispatched) == 1
+        assert client.responses[1][1]["success"] is False
 
 
 
@@ -895,4 +1081,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

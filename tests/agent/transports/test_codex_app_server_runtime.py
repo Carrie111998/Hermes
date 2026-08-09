@@ -7,6 +7,8 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -109,6 +111,55 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+
+class TestConfiguredMcpDynamicTools:
+    def test_only_registered_mcp_schemas_are_projected(self, monkeypatch) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        from tools import mcp_tool
+
+        monkeypatch.setattr(
+            mcp_tool,
+            "_mcp_tool_server_names",
+            {"mcp__law_firm_ops__list_email_obligations": "law_firm_ops"},
+        )
+        agent = SimpleNamespace(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__list_email_obligations",
+                        "description": "Canonical obligations.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "outlook_list_messages",
+                        "description": "Must not leak.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__spoofed__tool",
+                        "description": "Not registered.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+        )
+
+        assert _configured_mcp_dynamic_tools(agent) == [
+            {
+                "type": "function",
+                "name": "mcp__law_firm_ops__list_email_obligations",
+                "description": "Canonical obligations.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ]
 
 
 class TestSpawnEnvIsolation:
@@ -339,4 +390,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-
