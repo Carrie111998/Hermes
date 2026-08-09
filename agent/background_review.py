@@ -818,7 +818,15 @@ def _run_review_in_thread(
             # shares the parent's session_id (set below, for prompt-cache
             # warmth), so without this it would write its harness turn ("Review
             # the conversation above and update the skill library…") + its own
-            # response straight into the user's REAL session in state.db. On the
+            # response straight into the user's REAL session in state.db.
+            #
+            # Never "upgrade" this to constructing with ephemeral=True: because
+            # the fork runs under the PARENT's session id, init_agent's
+            # ephemeral wiring would register that shared id in the temporary
+            # registry and the DB layer would silently refuse the parent's own
+            # persistence. _persist_disabled is the correct (weaker) contract
+            # here — no transcript, but memory/skill tools stay usable, which
+            # is the fork's entire job. On the
             # user's next live turn the agent re-reads that injected user message
             # as a standing instruction and "becomes" the curator, refusing the
             # actual task. _persist_disabled hard-stops every DB write/lazy-open
