@@ -66,6 +66,9 @@ _FAILURE_REGISTRY: Final[
     ("mirror_jobs", "mirror_queue_health_failed"): (
         "queue", "queue_observation_failed", "retryable"
     ),
+    ("mirror_jobs", "codex_scan_failed"): (
+        "provider", "index_refresh_blocked", "retryable"
+    ),
     ("sidebar_registration", "sidebar_failed"): (
         "queue", "blocking_work_failed", "unknown"
     ),
