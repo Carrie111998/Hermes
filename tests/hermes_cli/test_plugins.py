@@ -103,6 +103,24 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    @pytest.mark.parametrize("manifest_name", [["invalid"], {"invalid": True}, None])
+    def test_non_string_manifest_name_is_ignored(
+        self, manifest_name, tmp_path, monkeypatch
+    ):
+        """Malformed names must not reach discovery's hash/key paths."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "invalid_name",
+            manifest_extra={"name": manifest_name},
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        assert "invalid_name" not in manager._plugins
+
     def test_enabled_portable_plugin_registers_components(
         self, tmp_path, monkeypatch
     ):

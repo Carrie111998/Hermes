@@ -2275,6 +2275,12 @@ class PluginManager:
                 return None
 
             name = data.get("name", plugin_dir.name)
+            if not isinstance(name, str):
+                logger.warning(
+                    "Plugin manifest %s has non-string name; ignoring",
+                    manifest_file,
+                )
+                return None
             key = f"{prefix}/{plugin_dir.name}" if prefix else name
 
             raw_kind = data.get("kind")
