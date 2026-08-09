@@ -1,9 +1,14 @@
 """Tiny real MCP stdio server used ONLY as a test fixture.
 
-Exposes one tool, ``echo``, that returns its ``text`` argument verbatim (or
-raises when called with ``{"fail": true}``). Not part of the CLI — a real
-process the record/replay tests spawn and record against, per the "no mocked
-transport" goal of ``hermes mcp fixtures``.
+Exposes two tools:
+- ``echo`` returns its ``text`` argument verbatim (or raises when called with
+  ``{"fail": true}``).
+- ``attachment`` returns a mix of text and image content, to exercise
+  non-text call results.
+
+Not part of the CLI — a real process the record/replay tests spawn and
+record against, per the "no mocked transport" goal of ``hermes mcp
+fixtures``.
 
 Run standalone: ``python -m tests.hermes_cli._mcp_toy_server``
 """
@@ -34,16 +39,26 @@ async def _run() -> None:
                         "fail": {"type": "boolean"},
                     },
                 },
-            )
+            ),
+            types.Tool(
+                name="attachment",
+                description="Return a mix of text and image content",
+                inputSchema={"type": "object", "properties": {}},
+            ),
         ]
 
     @server.call_tool()
-    async def _call_tool(name: str, arguments: dict) -> List[types.TextContent]:
-        if name != "echo":
-            raise ValueError(f"unknown tool {name!r}")
-        if arguments.get("fail"):
-            raise RuntimeError("toy server: intentional failure")
-        return [types.TextContent(type="text", text=str(arguments.get("text", "")))]
+    async def _call_tool(name: str, arguments: dict):
+        if name == "echo":
+            if arguments.get("fail"):
+                raise RuntimeError("toy server: intentional failure")
+            return [types.TextContent(type="text", text=str(arguments.get("text", "")))]
+        if name == "attachment":
+            return [
+                types.TextContent(type="text", text="caption"),
+                types.ImageContent(type="image", data="Zm9v", mimeType="image/png"),
+            ]
+        raise ValueError(f"unknown tool {name!r}")
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(

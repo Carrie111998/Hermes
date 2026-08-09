@@ -102,9 +102,16 @@ async def _record_async(
                 for name, arguments in calls:
                     try:
                         call_result = await session.call_tool(name, arguments)
+                        # The replay stub only ever serves TextContent (see
+                        # hermes_cli/mcp_replay_server.py), so non-text results
+                        # (images, audio, ...) would record with text=None and
+                        # then fail their own replay self-check. Filter them
+                        # out here instead of storing content the stub can't
+                        # round-trip.
                         content = [
-                            {"type": c.type, "text": getattr(c, "text", None)}
+                            {"type": c.type, "text": c.text}
                             for c in call_result.content
+                            if c.type == "text"
                         ]
                         fixture["calls"].append(
                             {

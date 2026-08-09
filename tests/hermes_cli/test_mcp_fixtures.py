@@ -50,7 +50,7 @@ def test_record_fixture_against_real_toy_server():
     assert fixture["schema_version"] == 1
     assert fixture["server_name"] == "toy"
     assert fixture["initialize"]["server_name"] == "hermes-mcp-toy-server"
-    assert [t["name"] for t in fixture["tools"]] == ["echo"]
+    assert {t["name"] for t in fixture["tools"]} == {"echo", "attachment"}
     assert fixture["calls"] == [
         {
             "name": "echo",
@@ -71,6 +71,17 @@ def test_record_fixture_captures_tool_side_error_as_is_error():
     call = fixture["calls"][0]
     assert call["is_error"] is True
     assert "intentional failure" in call["content"][0]["text"]
+
+
+def test_record_fixture_filters_non_text_content():
+    # Non-text content (images, audio, ...) would round-trip as
+    # `text: null` through the replay stub, which only ever serves
+    # TextContent — so it must be filtered out at record time instead.
+    fixture = record_fixture(
+        "toy", TOY_SERVER_CFG, [("attachment", {})], timeout=15
+    )
+    call = fixture["calls"][0]
+    assert call["content"] == [{"type": "text", "text": "caption"}]
 
 
 def test_record_fixture_requires_command():
@@ -101,7 +112,11 @@ async def test_replay_round_trip_matches_recorded_calls(tmp_path):
     fixture = await _record_async(
         "toy",
         TOY_SERVER_CFG,
-        [("echo", {"text": "round trip"}), ("echo", {"fail": True})],
+        [
+            ("echo", {"text": "round trip"}),
+            ("echo", {"fail": True}),
+            ("attachment", {}),
+        ],
         timeout=15,
     )
     fixture_path = tmp_path / "fixture.json"
