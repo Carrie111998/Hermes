@@ -551,6 +551,17 @@ def is_https_repo_url(repo: str) -> bool:
     return parsed.scheme == "https" and bool(parsed.netloc)
 
 
+def has_url_credentials(repo: str) -> bool:
+    """Return True when an https URL embeds userinfo (``user:token@host``).
+
+    Credentialed clone URLs are rejected: the token would persist in the
+    workspace ``.git/config`` where the attempt agent runs, and the agent
+    could push with it (verifier finding, 2026-08-10).
+    """
+    parsed = urlparse(repo)
+    return bool(parsed.username or parsed.password)
+
+
 def validate_repo_input(repo: str) -> tuple[bool, str | None]:
     """Validate repo parameter; return ``(ok, error_message)``."""
     repo = (repo or "").strip()
@@ -558,6 +569,11 @@ def validate_repo_input(repo: str) -> tuple[bool, str | None]:
         return False, "repo is required"
 
     if is_https_repo_url(repo):
+        if has_url_credentials(repo):
+            return False, (
+                "repo URL must not embed credentials (user:token@host); "
+                "the token would leak into the workspace git config"
+            )
         return True, None
 
     if repo.startswith("http://") or repo.startswith("git@"):

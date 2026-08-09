@@ -186,3 +186,24 @@ def test_notify_sub_registration_is_best_effort(kanban_home, git_repo, monkeypat
 
     result = _parse_result(raw)
     assert result["success"] is True
+
+
+class TestRepoUrlCredentialGuard:
+    def test_https_url_with_userinfo_rejected(self):
+        from hermes_cli.dev_pipeline import validate_repo_input
+
+        ok, err = validate_repo_input("https://user:secret-token@github.com/org/repo.git")
+        assert not ok
+        assert "credentials" in err
+
+    def test_https_url_with_bare_username_rejected(self):
+        from hermes_cli.dev_pipeline import validate_repo_input
+
+        ok, err = validate_repo_input("https://token@github.com/org/repo.git")
+        assert not ok
+
+    def test_plain_https_url_accepted(self):
+        from hermes_cli.dev_pipeline import validate_repo_input
+
+        ok, err = validate_repo_input("https://github.com/org/repo.git")
+        assert ok, err
