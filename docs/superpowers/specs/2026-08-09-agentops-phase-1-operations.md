@@ -31,13 +31,13 @@ Event 先由 Producer 写入 AgentOps 自身 spool；文件名为 event ID，使
 1. 用 schema-v1 与 secret gate 验证事件。
 2. 通过 `event_id` 向 SQLite 幂等 append。
 3. 成功或重复后删除 spool 文件。
-4. 未知 schema、损坏 JSON、非法 UTF-8 或无效事件进入 metadata-only quarantine；一律只保存内容 hash、大小、理由和 redacted 标志，绝不保留原始字节。
+4. 未知 schema、损坏 JSON、非法 UTF-8 或无效事件进入 metadata-only quarantine；一律只保存内容 hash、大小、理由和 redacted 标志，绝不保留原始字节。quarantine 使用唯一临时文件，启动时不读取地删除 orphan temp 并 fsync 父目录。
 
-spool 只提供本地崩溃恢复，不能触发 Target 行为。spool 与 quarantine 分别受容量预算限制；超限时拒绝新事件或显式记录脱敏 drop，并将控制面标为 degraded/observe-only，不会静默转为写修复。
+spool 只提供本地崩溃恢复，不能触发 Target 行为。spool 与 quarantine 分别受容量预算限制；超限时拒绝新事件或显式记录脱敏 drop，并将控制面标为 degraded/observe-only，不会静默转为写修复。任何 quarantine/orphan 清理失败都会被计入 replay `failed`，令 daemon health `ready=false`；若原始不可信文件无法脱敏或删除，绝不能报告健康。
 
 ## 4. daemon 启动、停止和未来 launchd
 
-Phase 1 仅允许测试或人工前台 daemon。没有 plist、没有 `launchctl bootstrap`、没有自动启动。daemon 必须持有独立进程锁；已有 socket 会先探测 health，存活实例拒绝第二实例，只有当前用户、受控目录且无监听的 stale UDS 才可由持锁实例清理。目录必须回读为 `0700`、socket 必须回读为 `0600`，任一 chmod/owner/symlink 检查失败均不启动 API。
+Phase 1 仅允许测试或人工前台 daemon。没有 plist、没有 `launchctl bootstrap`、没有自动启动。daemon 必须持有独立进程锁；锁以 `O_NOFOLLOW` 打开、校验当前用户和单一 hard link。已有 socket 会先探测 health，存活实例拒绝第二实例，只有当前用户、受控目录且无监听的 stale UDS 才可由持锁实例清理。目录必须回读为 `0700`、socket 必须回读为 `0600`，任一 chmod/owner/symlink 检查失败均不启动 API。
 
 未来（不在本阶段）的 launchd 设计为：
 

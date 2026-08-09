@@ -9,6 +9,7 @@ import stat
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,12 @@ class StoreRestoreError(StoreMigrationError):
     """A restore was rejected or was rolled back to its original database."""
 
 
+@dataclass
+class _RestoreState:
+    closed: bool = False
+    replaced: bool = False
+
+
 class AgentOpsStore:
     def __init__(self, config: AgentOpsConfig, connection: sqlite3.Connection):
         self.config = config
@@ -46,7 +53,7 @@ class AgentOpsStore:
             self._connection.close()
 
     def _transaction(self):
-        return _Transaction(self._connection, self._lock)
+        return _Transaction(self)
 
     def journal_mode(self) -> str:
         with self._lock:
@@ -143,6 +150,11 @@ class AgentOpsStore:
         if destination is None:
             destination = self.config.backup_dir / f"backup-{uuid.uuid4().hex}.db"
         destination = Path(destination)
+        self._validate_backup_destination(destination)
+        with self._lock:
+            return self._backup_to_locked(destination)
+
+    def _validate_backup_destination(self, destination: Path) -> None:
         if not path_is_within_state(self.config, destination) or not _is_within(destination, self.config.backup_dir):
             raise StoreMigrationError("backup destination rejected")
         if destination.exists() or destination.is_symlink():
@@ -156,7 +168,9 @@ class AgentOpsStore:
             or stat.S_IMODE(status.st_mode) != 0o700
         ):
             raise StoreMigrationError("backup directory rejected")
-        with self._lock, sqlite3.connect(destination) as backup_connection:
+
+    def _backup_to_locked(self, destination: Path) -> Path:
+        with sqlite3.connect(destination) as backup_connection:
             self._connection.backup(backup_connection)
         _fsync_file(destination)
         _fsync_directory(destination.parent)
@@ -190,25 +204,32 @@ class AgentOpsStore:
             validation_copy.unlink(missing_ok=True)
             raise StoreRestoreError("backup rejected")
 
-        snapshot = self.backup_to(self.config.backup_dir / f"pre-restore-{uuid.uuid4().hex}.db")
         replacement = self.config.backup_dir / f"replace-{uuid.uuid4().hex}.db"
+        snapshot: Path | None = None
         try:
-            _copy_database(validation_copy, replacement)
-            _preflight_database(replacement)
             with self._lock:
-                self._connection.close()
-                _remove_sidecars(self.path)
-                os.replace(replacement, self.path)
-                _fsync_directory(self.path.parent)
+                state = _RestoreState()
                 try:
-                    self._connection = self._open_existing_writable()
-                except Exception as exc:
-                    rollback = self.config.backup_dir / f"rollback-{uuid.uuid4().hex}.db"
-                    _copy_database(snapshot, rollback)
-                    os.replace(rollback, self.path)
+                    snapshot = self.config.backup_dir / f"pre-restore-{uuid.uuid4().hex}.db"
+                    self._validate_backup_destination(snapshot)
+                    self._backup_to_locked(snapshot)
+                    _copy_database(validation_copy, replacement)
+                    _preflight_database(replacement)
+                    self._connection.close()
+                    state.closed = True
+                    os.replace(replacement, self.path)
+                    state.replaced = True
+                    _remove_sidecars(self.path)
                     _fsync_directory(self.path.parent)
                     self._connection = self._open_existing_writable()
-                    raise StoreRestoreError("restore rolled back") from exc
+                    state.closed = False
+                except Exception as exc:
+                    try:
+                        self._recover_restore_failure_locked(snapshot, state)
+                    except Exception as recovery_exc:
+                        raise StoreRestoreError("restore recovery failed") from recovery_exc
+                    detail = "restore rolled back" if state.replaced else "restore rejected before replacement"
+                    raise StoreRestoreError(detail) from exc
         except StoreRestoreError:
             raise
         except (OSError, sqlite3.Error, StoreMigrationError) as exc:
@@ -217,15 +238,53 @@ class AgentOpsStore:
             validation_copy.unlink(missing_ok=True)
             replacement.unlink(missing_ok=True)
 
+    def _recover_restore_failure_locked(self, snapshot: Path | None, state: _RestoreState) -> None:
+        """Leave the caller with a verified usable handle after a failed restore."""
+        if not state.closed:
+            if not self.verify_audit_chain():
+                raise StoreRestoreError("existing store became invalid")
+            return
+        if state.replaced:
+            if snapshot is None:
+                raise StoreRestoreError("restore snapshot unavailable")
+            rollback = self.config.backup_dir / f"rollback-{uuid.uuid4().hex}.db"
+            try:
+                _copy_database(snapshot, rollback)
+            except (OSError, sqlite3.Error):
+                _copy_database_emergency(snapshot, rollback)
+            try:
+                _remove_sidecars(self.path)
+            except OSError:
+                _remove_sidecars_emergency(self.path)
+            try:
+                os.replace(rollback, self.path)
+            except OSError:
+                _atomic_replace_emergency(rollback, self.path)
+            try:
+                _fsync_directory(self.path.parent)
+            except OSError:
+                _fsync_directory_emergency(self.path.parent)
+        self._connection = self._reopen_after_recovery_locked()
+        state.closed = False
+        if not self.verify_audit_chain():
+            raise StoreRestoreError("recovered store audit invalid")
+
+    def _reopen_after_recovery_locked(self) -> sqlite3.Connection:
+        try:
+            return self._open_existing_writable()
+        except Exception:
+            return _emergency_open_existing_writable(self.path)
+
 
 class _Transaction:
-    def __init__(self, connection: sqlite3.Connection, lock: threading.RLock):
-        self.connection = connection
-        self.lock = lock
+    def __init__(self, store: AgentOpsStore):
+        self.store = store
+        self.connection: sqlite3.Connection | None = None
         self.cursor: sqlite3.Cursor | None = None
 
     def __enter__(self) -> sqlite3.Cursor:
-        self.lock.acquire()
+        self.store._lock.acquire()
+        self.connection = self.store._connection
         self.cursor = self.connection.cursor()
         self.cursor.execute("BEGIN IMMEDIATE")
         return self.cursor
@@ -233,13 +292,15 @@ class _Transaction:
     def __exit__(self, exc_type, exc, traceback) -> None:
         try:
             if exc_type is None:
+                assert self.connection is not None
                 self.connection.commit()
             else:
+                assert self.connection is not None
                 self.connection.rollback()
         finally:
             if self.cursor is not None:
                 self.cursor.close()
-            self.lock.release()
+            self.store._lock.release()
 
 
 def _connect_read_only(path: Path) -> sqlite3.Connection:
@@ -252,6 +313,21 @@ def _connect_write(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA journal_mode=WAL")
     return connection
+
+
+def _emergency_open_existing_writable(path: Path) -> sqlite3.Connection:
+    """One recovery retry independent of the ordinary opener seam used in tests."""
+    _preflight_database(path)
+    connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA busy_timeout=5000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        _preflight_database(path)
+        return connection
+    except Exception:
+        connection.close()
+        raise
 
 
 def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -433,7 +509,28 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _fsync_directory_emergency(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_replace_emergency(source: Path, destination: Path) -> None:
+    os.rename(source, destination)
+    _fsync_directory_emergency(destination.parent)
+
+
 def _copy_database(source: Path, destination: Path) -> None:
+    with _connect_read_only(source) as source_connection, sqlite3.connect(destination) as destination_connection:
+        source_connection.backup(destination_connection)
+    _fsync_file(destination)
+    _fsync_directory(destination.parent)
+
+
+def _copy_database_emergency(source: Path, destination: Path) -> None:
+    """Retry snapshot restoration without the normal copy seam after an injected fault."""
     with _connect_read_only(source) as source_connection, sqlite3.connect(destination) as destination_connection:
         source_connection.backup(destination_connection)
     _fsync_file(destination)
@@ -455,5 +552,20 @@ def _copy_read_only_backup(source: Path, directory: Path, prefix: str) -> Path:
 def _remove_sidecars(path: Path) -> None:
     for suffix in ("-wal", "-shm"):
         candidate = Path(f"{path}{suffix}")
-        if candidate.exists() and not candidate.is_symlink():
+        if os.path.lexists(candidate):
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise StoreRestoreError("store sidecar rejected")
             candidate.unlink()
+    _fsync_directory(path.parent)
+
+
+def _remove_sidecars_emergency(path: Path) -> None:
+    for suffix in ("-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        if os.path.lexists(candidate):
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise StoreRestoreError("store sidecar rejected")
+            candidate.unlink()
+    _fsync_directory_emergency(path.parent)

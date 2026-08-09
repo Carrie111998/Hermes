@@ -202,6 +202,7 @@ class SpoolReplayResult:
     duplicates: int = 0
     quarantined: int = 0
     dropped: int = 0
+    failed: int = 0
 
 
 @dataclass(frozen=True)

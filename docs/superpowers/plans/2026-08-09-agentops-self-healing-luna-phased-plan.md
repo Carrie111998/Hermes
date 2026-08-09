@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 本文档状态为“仅规划”；用户明确授权某个阶段之前，Luna 不得创建或修改实现文件。
+- Phase 0/1 已获本轮任务授权，且仅可在隔离 worktree 实施；Phase 2-7 仍为规划，未经新的书面授权不得创建或修改实现文件。
 - 禁止覆盖、清理、提交或重置当前工作区内任何用户已有修改。
 - 控制面必须独立于 Gateway 进程和模型可用性。
 - 第一版存储固定为本地 SQLite WAL；不引入 Postgres、Redis、NATS 或云端控制面。
@@ -129,7 +129,7 @@ tests/plugins/agentops/integration/test_daemon_restart.py
 
 ```python
 load_agentops_config(path: Path) -> AgentOpsConfig
-open_store(path: Path) -> AgentOpsStore
+open_store(config: AgentOpsConfig) -> AgentOpsStore
 append_event(event: EventEnvelope) -> AppendResult
 append_audit(event: AuditEvent) -> int
 get_health() -> ControlPlaneHealth

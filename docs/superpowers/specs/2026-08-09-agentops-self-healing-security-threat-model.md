@@ -2,12 +2,12 @@
 
 | 字段 | 内容 |
 |---|---|
-| 文档状态 | Proposed，等待用户书面确认 |
+| 文档状态 | Phase 1 已获授权实施（等待 G1 审阅）；完整平台后续阶段仍为规划 |
 | 版本 | 1.0 |
 | 日期 | 2026-08-09 |
 | 对应 PRD | [AgentOps 完整自愈平台 PRD](./2026-08-09-agentops-self-healing-platform-prd.md) |
 | 对应架构 | [技术架构](./2026-08-09-agentops-self-healing-technical-architecture.md) |
-| 实施授权 | 未授权；本文不授予任何自动修复、生产写入或发布权限 |
+| 实施授权 | 仅授权隔离 worktree 内的 Phase 0/1 `observe_only` 控制面；R1-R4、自动修复、生产写入或发布均未授权 |
 
 ## 1. 安全目标
 
