@@ -1499,6 +1499,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "worker_pid": r.worker_pid,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
+                    "max_runtime_seconds": r.max_runtime_seconds,
+                    "last_heartbeat_at": r.last_heartbeat_at,
                 }
                 for r in runs
             ],
@@ -2510,6 +2512,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
                 "ended_at": r.ended_at, "summary": r.summary,
                 "error": r.error, "metadata": r.metadata,
                 "worker_pid": r.worker_pid, "step_key": r.step_key,
+                "max_runtime_seconds": r.max_runtime_seconds,
+                "last_heartbeat_at": r.last_heartbeat_at,
             } for r in runs
         ], indent=2, ensure_ascii=False))
         return 0
