@@ -294,6 +294,35 @@ class TestShellFileOpsHelpers:
             "C:/Users/alice/notes.txt"
         ) == "'/c/Users/alice/notes.txt'"
 
+    def test_rg_escape_path_converts_msys_paths_back_to_windows(self, monkeypatch, file_ops):
+        import platform
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+
+        assert file_ops._rg_escape_path("/c/Users/alice/notes.txt") == (
+            r"'C:\Users\alice\notes.txt'"
+        )
+
+    def test_rg_file_search_uses_native_windows_path(self, mock_env, monkeypatch):
+        import platform
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        mock_env.execute.return_value = {
+            "output": "C:/Users/alice/skills/SKILL.md\n",
+            "returncode": 0,
+        }
+
+        ops = ShellFileOperations(mock_env)
+        ops._search_files_rg("SKILL.md", "/c/Users/alice/skills", 50, 0)
+
+        command = mock_env.execute.call_args.args[0]
+        assert "'/c/Users/alice/skills'" not in command
+        assert r"'C:\Users\alice\skills'" in command
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 
