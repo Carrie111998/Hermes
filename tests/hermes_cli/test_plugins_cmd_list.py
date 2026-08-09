@@ -252,7 +252,56 @@ def test_dashboard_enable_preserves_other_shared_manifest_key_deny(monkeypatch):
     ]
 
 
-def test_enable_identities_do_not_treat_key_leaf_as_runtime_identity(monkeypatch):
+def test_dashboard_disable_preserves_other_shared_manifest_key_allow(monkeypatch):
+    candidates = [
+        ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+        ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+    ]
+    saved = {}
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_resolve_plugin_key_and_source",
+        lambda _name: ("image_gen/xai", "bundled", "xai", "backend"),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+    )
+    monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"xai"})
+    monkeypatch.setattr(plugins_cmd, "_get_disabled_set", set)
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_enabled_set",
+        lambda value: saved.update(enabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd,
+        "_save_disabled_set",
+        lambda value: saved.update(disabled=set(value)),
+    )
+    monkeypatch.setattr(
+        plugins_cmd, "_toggle_plugin_toolset", lambda *args, **kwargs: None
+    )
+
+    result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+        "image_gen/xai",
+        enabled=False,
+    )
+
+    assert result["unchanged"] is False
+    assert saved == {
+        "enabled": {"video_gen/xai"},
+        "disabled": {"image_gen/xai"},
+    }
+    activation = PluginActivationState(
+        enabled=frozenset(saved["enabled"]),
+        disabled=frozenset(saved["disabled"]),
+    )
+    assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+        candidates[1]
+    ]
+
+
+def test_runtime_identities_do_not_treat_key_leaf_as_identity(monkeypatch):
     candidates = [
         (
             "xai-provider",
@@ -270,7 +319,7 @@ def test_enable_identities_do_not_treat_key_leaf_as_runtime_identity(monkeypatch
         plugins_cmd, "_discover_plugin_candidates", lambda: candidates
     )
 
-    identities, preserved = plugins_cmd._plugin_enable_identity_changes(
+    identities, preserved = plugins_cmd._plugin_runtime_identity_changes(
         "model-providers/xai",
         {"xai"},
     )

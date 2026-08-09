@@ -222,13 +222,22 @@ _AWS_SDK_CREDENTIAL_ENV_VARS = frozenset({
 })
 
 
-def _build_provider_env_blocklist() -> frozenset:
+def _build_provider_env_blocklist(*, include_active: bool = True) -> frozenset:
     """Derive the blocklist from provider, tool, and gateway config."""
     blocked: set[str] = set()
 
     try:
-        from hermes_cli.auth import get_known_provider_configs
-        for pconfig in get_known_provider_configs():
+        from hermes_cli.auth import (
+            get_builtin_provider_configs,
+            get_known_provider_configs,
+        )
+
+        provider_configs = (
+            get_known_provider_configs()
+            if include_active
+            else get_builtin_provider_configs()
+        )
+        for pconfig in provider_configs:
             blocked.update(pconfig.api_key_env_vars)
             if pconfig.auth_type == "aws_sdk":
                 blocked.update(_AWS_SDK_CREDENTIAL_ENV_VARS)
@@ -334,12 +343,16 @@ def _build_provider_env_blocklist() -> frozenset:
     return frozenset(blocked)
 
 
-_HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+_HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist(
+    include_active=False,
+)
 
 
 def _get_current_provider_env_blocklist() -> frozenset[str]:
     """Return static compatibility keys plus the current active-profile keys."""
-    return _HERMES_PROVIDER_ENV_BLOCKLIST | _build_provider_env_blocklist()
+    return _HERMES_PROVIDER_ENV_BLOCKLIST | _build_provider_env_blocklist(
+        include_active=True,
+    )
 
 # Active-virtualenv markers that must NOT leak into terminal subprocesses.
 # The gateway runs inside its own venv, so its process environment carries

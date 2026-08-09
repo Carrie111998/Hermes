@@ -377,17 +377,19 @@ class TestBlocklistCoverage:
         by the user's Claude Code install, not Hermes (#55878).
         """
         from hermes_cli.auth import PROVIDER_REGISTRY
+        from tools.environments.local import _get_current_provider_env_blocklist
 
         exempt = {"CLAUDE_CODE_OAUTH_TOKEN"}
+        current_blocklist = _get_current_provider_env_blocklist()
         for pconfig in PROVIDER_REGISTRY.values():
             for var in pconfig.api_key_env_vars:
                 if var in exempt:
                     continue
-                assert var in _HERMES_PROVIDER_ENV_BLOCKLIST, (
+                assert var in current_blocklist, (
                     f"Registry var {var} (provider={pconfig.id}) missing from blocklist"
                 )
             if pconfig.base_url_env_var:
-                assert pconfig.base_url_env_var in _HERMES_PROVIDER_ENV_BLOCKLIST, (
+                assert pconfig.base_url_env_var in current_blocklist, (
                     f"Registry base_url_env_var {pconfig.base_url_env_var} "
                     f"(provider={pconfig.id}) missing from blocklist"
                 )
@@ -433,6 +435,28 @@ class TestBlocklistCoverage:
         with patch.dict(os.environ, source, clear=True):
             assert "LATE_ACTIVE_API_KEY" not in hermes_subprocess_env()
             assert "LATE_ACTIVE_API_KEY" not in _make_run_env({})
+
+    def test_current_blocklist_does_not_retain_previous_profile_key(self, monkeypatch):
+        from hermes_cli import auth
+        from tools.environments.local import (
+            _HERMES_PROVIDER_ENV_BLOCKLIST,
+            _get_current_provider_env_blocklist,
+        )
+
+        active = auth.ProviderConfig(
+            id="profile-only",
+            name="Profile only",
+            auth_type="api_key",
+            api_key_env_vars=("PROFILE_ONLY_API_KEY_73132",),
+        )
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {active.id: active})
+
+        assert "PROFILE_ONLY_API_KEY_73132" not in _HERMES_PROVIDER_ENV_BLOCKLIST
+        assert "PROFILE_ONLY_API_KEY_73132" in _get_current_provider_env_blocklist()
+
+        monkeypatch.setattr(auth, "PROVIDER_REGISTRY", {})
+
+        assert "PROFILE_ONLY_API_KEY_73132" not in _get_current_provider_env_blocklist()
 
     def test_bedrock_bearer_token_is_in_blocklist(self):
         """auth_type='aws_sdk' providers contribute their Hermes-managed

@@ -875,26 +875,26 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     return None
 
 
-def _plugin_enable_identity_changes(
+def _plugin_runtime_identity_changes(
     key: str,
-    disabled: set[str],
+    configured: set[str],
 ) -> tuple[set[str], set[str]]:
-    """Return target identities to clear and shared other-key denies to keep."""
+    """Return target identities to clear and shared other-key entries to keep."""
     candidates = _discover_plugin_candidates()
     identities = {key}
     for entry in candidates:
         if entry[5] == key:
             identities.update((entry[0], entry[5]))
-    cleared_denies = disabled & identities
-    # A legacy manifest-name deny can cover several canonical groups. Replace
-    # it with canonical denies for every non-target group before removing it.
-    preserved_denies = {
+    cleared_entries = configured & identities
+    # A legacy manifest-name entry can cover several canonical groups. Replace
+    # it with canonical entries for every non-target group before removing it.
+    preserved_entries = {
         entry[5]
         for entry in candidates
         if entry[5] != key
-        and cleared_denies & {entry[0], entry[5]}
+        and cleared_entries & {entry[0], entry[5]}
     }
-    return identities, preserved_denies
+    return identities, preserved_entries
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
@@ -949,7 +949,7 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         source=source,
         kind=kind,
     ) == "enabled"
-    identities, preserved_denies = _plugin_enable_identity_changes(
+    identities, preserved_denies = _plugin_runtime_identity_changes(
         key,
         disabled,
     )
@@ -1042,9 +1042,13 @@ def cmd_disable(name: str) -> None:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
         return
 
-    aliases = {name, manifest_name, key, key.split("/")[-1]}
-    enabled.difference_update(aliases)
-    disabled.difference_update(aliases)
+    identities, preserved_enables = _plugin_runtime_identity_changes(
+        key,
+        enabled,
+    )
+    enabled.difference_update(identities)
+    enabled.update(preserved_enables)
+    disabled.difference_update(identities)
     disabled.add(key)
     _save_enabled_set(enabled)
     _save_disabled_set(disabled)
@@ -2228,7 +2232,7 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         kind=kind,
     )
     if enabled:
-        identities, preserved_denies = _plugin_enable_identity_changes(
+        identities, preserved_denies = _plugin_runtime_identity_changes(
             key,
             dis,
         )
@@ -2242,12 +2246,13 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
         _toggle_plugin_toolset(key, enable=True)
         return {"ok": True, "name": name, "key": key, "unchanged": False}
 
-    aliases = {name, manifest_name, key, key.split("/")[-1]}
     if status == "disabled":
         return {"ok": True, "name": name, "key": key, "unchanged": True}
 
-    en.difference_update(aliases)
-    dis.difference_update(aliases)
+    identities, preserved_enables = _plugin_runtime_identity_changes(key, en)
+    en.difference_update(identities)
+    en.update(preserved_enables)
+    dis.difference_update(identities)
     dis.add(key)
     _save_enabled_set(en)
     _save_disabled_set(dis)

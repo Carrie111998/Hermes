@@ -246,6 +246,53 @@ class TestEnableDisableNested:
             candidates[0]
         ]
 
+    def test_disable_shared_manifest_preserves_other_canonical_allow(
+        self,
+        monkeypatch,
+    ):
+        from hermes_cli import plugins_cmd
+        from hermes_cli.plugin_activation import PluginActivationState
+
+        candidates = [
+            ("xai", "1", "Images", "bundled", None, "image_gen/xai", "backend"),
+            ("xai", "1", "Video", "bundled", None, "video_gen/xai", "backend"),
+        ]
+        saved = {}
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_resolve_plugin_key_and_source",
+            lambda _name: ("image_gen/xai", "bundled", "xai", "backend"),
+        )
+        monkeypatch.setattr(
+            plugins_cmd, "_discover_plugin_candidates", lambda: candidates
+        )
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: {"xai"})
+        monkeypatch.setattr(plugins_cmd, "_get_disabled_set", set)
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_enabled_set",
+            lambda value: saved.update(enabled=set(value)),
+        )
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_save_disabled_set",
+            lambda value: saved.update(disabled=set(value)),
+        )
+
+        plugins_cmd.cmd_disable("image_gen/xai")
+
+        assert saved == {
+            "enabled": {"video_gen/xai"},
+            "disabled": {"image_gen/xai"},
+        }
+        activation = PluginActivationState(
+            enabled=frozenset(saved["enabled"]),
+            disabled=frozenset(saved["disabled"]),
+        )
+        assert plugins_cmd._select_active_plugin_entries(candidates, activation) == [
+            candidates[1]
+        ]
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable — built-in tool override consent (issue #29249)
