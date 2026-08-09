@@ -54,4 +54,64 @@ class TestMemoryStatusLabels:
         assert "disabled ✗" in out
 
 
+def _run_cmd_status_platforms(capfd, platform_toolsets):
+    """Run cmd_status with a multi-platform toolset config.
+
+    platform_toolsets: dict mapping platform name -> set of tools, used as
+    the side_effect of _get_platform_tools(config, plat, ...).
+    """
+    from hermes_cli.memory_setup import cmd_status
+
+    config = {"memory": {}, "platform_toolsets": platform_toolsets}
+
+    def _side_effect(config, plat, include_default_mcp_servers=False):
+        return platform_toolsets.get(plat, set())
+
+    with patch("hermes_cli.config.load_config", return_value=config):
+        with patch("hermes_cli.memory_setup._get_available_providers", return_value=[]):
+            with patch(
+                "hermes_cli.tools_config._get_platform_tools",
+                side_effect=_side_effect,
+            ):
+                cmd_status(args=None)
+
+    return capfd.readouterr().out
+
+
+class TestMemoryStatusMultiPlatform:
+    """Memory tool status must reflect the platform actually in use.
+
+    Regression for #81430: cmd_status hardcoded the "cli" platform, so a
+    gateway platform (Telegram/Discord) with memory enabled showed
+    "disabled" when the cli toolset lacked it.
+    """
+
+    def test_enabled_on_gateway_platform_not_cli_shows_enabled(self, capfd):
+        """The #81430 case: memory enabled for telegram, absent for cli."""
+        out = _run_cmd_status_platforms(
+            capfd,
+            {"cli": {"terminal", "web"}, "telegram": {"terminal", "memory"}},
+        )
+        # Summary line must not misreport: the tool IS enabled somewhere.
+        assert "Memory tool:        enabled ✓" in out
+        # Per-platform detail shows exactly where.
+        assert "Memory tool by platform:" in out
+        assert "cli          disabled ✗" in out
+        assert "telegram     enabled ✓" in out
+
+    def test_disabled_everywhere_still_disabled(self, capfd):
+        """When no configured platform enables memory, keep showing disabled."""
+        out = _run_cmd_status_platforms(
+            capfd,
+            {"cli": {"terminal"}, "telegram": {"terminal"}},
+        )
+        assert "Memory tool:        disabled ✗" in out
+
+    def test_no_platform_toolsets_falls_back_to_cli(self, capfd):
+        """Without platform_toolsets, behavior matches the old cli-only check."""
+        out = _run_cmd_status_platforms(capfd, {"cli": {"memory"}})
+        assert "Memory tool:        enabled ✓" in out
+        assert "Memory tool by platform:" not in out
+
+
 
