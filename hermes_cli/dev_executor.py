@@ -229,6 +229,44 @@ def unit_name(task_id: str, run_id: int) -> str:
     return f"hermes-dev-{safe_task}-{run_id}"
 
 
+def task_unit_prefix(task_id: str) -> str:
+    safe_task = re.sub(r"[^a-zA-Z0-9_-]", "-", task_id)
+    return f"hermes-dev-{safe_task}-"
+
+
+def iter_task_unit_names(conn: Any, task_id: str) -> list[str]:
+    """Return systemd unit names for all runs of a task (newest last)."""
+    runs = kb.list_runs(conn, task_id, include_active=True)
+    return [unit_name(task_id, r.id) for r in runs]
+
+
+def any_task_unit_active(
+    conn: Any,
+    task_id: str,
+    is_active_fn: Callable[[str], tuple[bool, str]],
+) -> tuple[bool, Optional[str]]:
+    """Return whether any attempt unit for *task_id* is active."""
+    for unit in iter_task_unit_names(conn, task_id):
+        if is_active_fn(unit)[0]:
+            return True, unit
+    return False, None
+
+
+def stop_task_units(
+    conn: Any,
+    task_id: str,
+    stop_fn: Callable[[str], bool],
+    is_active_fn: Callable[[str], tuple[bool, str]],
+) -> list[str]:
+    """Stop every active attempt unit for *task_id*."""
+    stopped: list[str] = []
+    for unit in iter_task_unit_names(conn, task_id):
+        if is_active_fn(unit)[0]:
+            stop_fn(unit)
+            stopped.append(unit)
+    return stopped
+
+
 def parse_task_body(body: Optional[str]) -> dict[str, Any]:
     if not body:
         return {}
@@ -303,12 +341,17 @@ def block_dev_task(
     run_id: Optional[int] = None,
 ) -> bool:
     """Block a task and record the dev-pipeline block kind in events."""
+    expected_run_id = run_id
+    if expected_run_id is not None:
+        current = kb._current_run_id(conn, task_id)
+        if current != expected_run_id:
+            expected_run_id = None
     ok = kb.block_task(
         conn,
         task_id,
         reason=reason,
         kind=None,
-        expected_run_id=run_id,
+        expected_run_id=expected_run_id,
     )
     if ok:
         with kb.write_txn(conn):
@@ -671,11 +714,18 @@ def clone_repo(
     return False, f"unsupported repo: {repo}"
 
 
-def ensure_dev_branch(repo_dir: Path, task_id: str) -> str:
+def ensure_dev_branch(
+    repo_dir: Path, task_id: str, base_branch: str
+) -> tuple[str, str]:
+    """Checkout *base_branch*, record its SHA, reset job branch from it.
+
+    Returns ``(dev_branch_name, base_commit_sha)``.
+    """
+    git_command(["checkout", base_branch], cwd=repo_dir)
+    base_sha = git_head_sha(repo_dir) or ""
     branch = f"hermes-dev/{task_id}"
-    if git_command(["checkout", branch], cwd=repo_dir).returncode != 0:
-        git_command(["checkout", "-b", branch], cwd=repo_dir)
-    return branch
+    git_command(["checkout", "-B", branch], cwd=repo_dir)
+    return branch, base_sha
 
 
 def git_head_sha(repo_dir: Path) -> Optional[str]:
@@ -1023,6 +1073,8 @@ def detect_stall(
 @dataclass
 class ReconcileDecision:
     action: str
+    task_id: str = ""
+    run_id: int = 0
     phase: Optional[str] = None
     reason: Optional[str] = None
     adopt: bool = False
@@ -1039,13 +1091,17 @@ def reconcile_task_state(
 ) -> ReconcileDecision:
     phase = state.get("phase")
     if unit_active and pid_match:
-        return ReconcileDecision(action="adopt", phase=str(phase), adopt=True)
+        return ReconcileDecision(
+            action="adopt",
+            phase=str(phase),
+            adopt=True,
+        )
     if unit_active and not pid_match:
         return ReconcileDecision(action="unit_gone", reason="pid_mismatch")
-    if candidate_commit and phase in POST_RUNNING_PHASES | {PHASE_VERIFYING}:
-        return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
     if phase in {PHASE_VERIFYING, PHASE_REVIEWING, PHASE_PUBLISHING}:
         return ReconcileDecision(action="resume", phase=str(phase))
+    if phase == PHASE_RUNNING and candidate_commit:
+        return ReconcileDecision(action="resume", phase=PHASE_VERIFYING)
     if phase in {PHASE_RUNNING, PHASE_PREPARING} and not candidate_commit:
         if attempts_used < max_attempts:
             return ReconcileDecision(action="retry", phase=PHASE_RUNNING)
@@ -1057,18 +1113,125 @@ def reconcile_task_state(
     return ReconcileDecision(action="block", reason="executor_restarted")
 
 
+def _apply_reconcile_decision(
+    executor: "DevExecutor",
+    conn: Any,
+    task_id: str,
+    run_id: int,
+    meta: dict[str, Any],
+    state: dict[str, Any],
+    decision: ReconcileDecision,
+    *,
+    stop_fn: Callable[[str], bool],
+    is_active_fn: Callable[[str], tuple[bool, str]],
+) -> None:
+    """Apply a reconcile decision: active-set, retry, or block."""
+    if decision.action in {"adopt", "resume"}:
+        phase = decision.phase or str(state.get("phase") or PHASE_RUNNING)
+        executor._active[task_id] = ActiveTask(
+            task_id=task_id,
+            run_id=run_id,
+            phase=phase,
+            last_jsonl_size=int(state.get("last_jsonl_size") or 0),
+            last_jsonl_growth_at=float(
+                state.get("last_jsonl_growth_at") or time.time()
+            ),
+        )
+        kb.heartbeat_claim(
+            conn,
+            task_id,
+            ttl_seconds=CLAIM_TTL_SECONDS,
+            claimer="dev-executor",
+        )
+        record_dev_phase(
+            conn,
+            task_id,
+            run_id,
+            phase,
+            {"reconcile": decision.action},
+        )
+        if decision.action == "resume":
+            executor._advance(conn, task_id)
+        return
+
+    if decision.action == "unit_gone":
+        unit = state.get("unit_name")
+        if unit:
+            stop_fn(str(unit))
+        stop_task_units(conn, task_id, stop_fn, is_active_fn)
+        # Re-evaluate after stopping stale unit.
+        attempts = count_attempt_runs(conn, task_id)
+        decision = reconcile_task_state(
+            state,
+            unit_active=False,
+            pid_match=False,
+            candidate_commit=state.get("candidate_commit"),
+            attempts_used=attempts,
+            max_attempts=int(executor.cfg.get("max_attempts") or 2),
+        )
+        _apply_reconcile_decision(
+            executor,
+            conn,
+            task_id,
+            run_id,
+            meta,
+            state,
+            decision,
+            stop_fn=stop_fn,
+            is_active_fn=is_active_fn,
+        )
+        return
+
+    if decision.action == "retry":
+        stop_task_units(conn, task_id, stop_fn, is_active_fn)
+        meta = merge_pipeline_state(meta, {"phase": PHASE_RUNNING})
+        save_run_metadata(conn, run_id, meta)
+        new_run = start_new_run(conn, task_id, metadata=meta)
+        executor._active[task_id] = ActiveTask(
+            task_id=task_id,
+            run_id=new_run,
+            phase=PHASE_RUNNING,
+        )
+        kb.heartbeat_claim(
+            conn,
+            task_id,
+            ttl_seconds=CLAIM_TTL_SECONDS,
+            claimer="dev-executor",
+        )
+        record_dev_phase(conn, task_id, new_run, PHASE_RUNNING, {"reconcile": "retry"})
+        executor._spawn_attempt(conn, task_id, new_run, meta, state)
+        return
+
+    if decision.action == "block":
+        stop_task_units(conn, task_id, stop_fn, is_active_fn)
+        block_dev_task(
+            conn,
+            task_id,
+            decision.reason or "executor_restarted",
+            decision.reason or "executor restarted with no recoverable state",
+            run_id=run_id,
+        )
+        executor._active.pop(task_id, None)
+        return
+
+
 def reconcile_board(
     conn: Any,
     cfg: Mapping[str, Any],
     *,
+    executor: Optional["DevExecutor"] = None,
     is_active_fn: Callable[[str], tuple[bool, str]] = systemctl_is_active,
     pid_match_fn: Callable[[Optional[int], Optional[int]], bool] = host_pid_is_ours,
+    stop_fn: Callable[[str], bool] = systemctl_stop,
 ) -> list[ReconcileDecision]:
-    board = str(cfg.get("board") or "dev")
     decisions: list[ReconcileDecision] = []
     tasks = kb.list_tasks(conn, status="running")
     for task in tasks:
-        run = kb.latest_run(conn, task.id)
+        run = None
+        if task.current_run_id:
+            run = kb.get_run(conn, task.current_run_id)
+        if run is None:
+            run = kb.latest_run(conn, task.id)
         if not run:
             continue
         meta = load_run_metadata(conn, run.id)
@@ -1083,6 +1246,9 @@ def reconcile_board(
             int(pid) if pid is not None else None,
             int(start) if start is not None else None,
         )
+        if active and not pid_ok:
+            stop_fn(str(unit))
+            active = False
         attempts = count_attempt_runs(conn, task.id)
         candidate = state.get("candidate_commit")
         decision = reconcile_task_state(
@@ -1093,14 +1259,20 @@ def reconcile_board(
             attempts_used=attempts,
             max_attempts=int(cfg.get("max_attempts") or 2),
         )
+        decision.task_id = task.id
+        decision.run_id = run.id
         decisions.append(decision)
-        if decision.adopt:
-            record_dev_phase(
+        if executor is not None:
+            _apply_reconcile_decision(
+                executor,
                 conn,
                 task.id,
                 run.id,
-                str(state.get("phase") or PHASE_RUNNING),
-                {"reconcile": "adopted"},
+                meta,
+                state,
+                decision,
+                stop_fn=stop_fn,
+                is_active_fn=is_active_fn,
             )
     return decisions
 
@@ -1146,7 +1318,13 @@ class DevExecutor:
         kb.create_board(self.board)
         conn = kb.connect(board=self.board)
         try:
-            reconcile_board(conn, self.cfg, is_active_fn=self._is_active)
+            reconcile_board(
+                conn,
+                self.cfg,
+                executor=self,
+                is_active_fn=self._is_active,
+                stop_fn=self._stop,
+            )
             self._drive_active(conn)
             self._claim_ready(conn)
         finally:
@@ -1234,6 +1412,22 @@ class DevExecutor:
         if handler:
             handler(conn, task_id, active.run_id, meta, state)
 
+    def _persist_phase_entry(
+        self,
+        conn: Any,
+        task_id: str,
+        run_id: int,
+        meta: dict,
+        phase: str,
+    ) -> dict:
+        """Persist phase to run metadata before any long I/O in the handler."""
+        meta = merge_pipeline_state(meta, {"phase": phase})
+        save_run_metadata(conn, run_id, meta)
+        record_dev_phase(conn, task_id, run_id, phase, {"entered": True})
+        if task_id in self._active:
+            self._active[task_id].phase = phase
+        return meta
+
     def _set_phase(
         self,
         conn: Any,
@@ -1257,6 +1451,7 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_PLANNING)
         task = kb.get_task(conn, task_id)
         body = parse_task_body(task.body if task else None)
         task_text = str(body.get("task") or "")
@@ -1303,7 +1498,8 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
-        contract = state.get("contract") or {}
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_ROUTING)
+        contract = pipeline_state(meta).get("contract") or state.get("contract") or {}
         decision, block_kind, reason = route_contract(contract)
         if decision == "block":
             block_dev_task(
@@ -1325,9 +1521,11 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_PREPARING)
+        st = pipeline_state(meta)
         body = parse_task_body(kb.get_task(conn, task_id).body)
-        repo = str(state.get("repo") or body.get("repo") or "")
-        branch = str(state.get("branch") or body.get("branch") or "main")
+        repo = str(st.get("repo") or state.get("repo") or body.get("repo") or "")
+        branch = str(st.get("branch") or state.get("branch") or body.get("branch") or "main")
         ws_root, logs_root = workspace_paths(task_id, self.board)
         ws_root.mkdir(parents=True, exist_ok=True)
         logs_root.mkdir(parents=True, exist_ok=True)
@@ -1337,10 +1535,8 @@ class DevExecutor:
             block_dev_task(conn, task_id, "infra_broken", err, run_id=run_id)
             self._active.pop(task_id, None)
             return
-        git_command(["checkout", branch], cwd=repo_dir)
-        dev_branch = ensure_dev_branch(repo_dir, task_id)
+        dev_branch, base_commit = ensure_dev_branch(repo_dir, task_id, branch)
         agents_source = install_pinned_agents(repo_dir)
-        base_commit = git_head_sha(repo_dir) or ""
         meta = merge_pipeline_state(
             meta,
             {
@@ -1353,7 +1549,7 @@ class DevExecutor:
             },
         )
         self._set_phase(conn, task_id, run_id, meta, PHASE_RUNNING)
-        self._spawn_attempt(conn, task_id, run_id, meta, state)
+        self._spawn_attempt(conn, task_id, run_id, meta, pipeline_state(meta))
 
     def _spawn_attempt(
         self,
@@ -1373,10 +1569,19 @@ class DevExecutor:
         body = parse_task_body(task.body if task else None)
         task_text = str(body.get("task") or "")
 
+        any_active, active_unit = any_task_unit_active(conn, task_id, self._is_active)
         unit = unit_name(task_id, run_id)
+        if any_active and active_unit != unit:
+            logger.warning(
+                "refusing spawn for %s: unit %s still active",
+                task_id,
+                active_unit,
+            )
+            return
         if self._is_active(unit)[0]:
             return
 
+        logs_root.mkdir(parents=True, exist_ok=True)
         jsonl_path = logs_root / f"attempt-{run_id}.jsonl"
         prompt = build_attempt_prompt(task_text, contract, repair_context=repair_context)
         runtime = int(self.cfg.get("cursor_timeout_seconds") or 1800)
@@ -1391,6 +1596,18 @@ class DevExecutor:
             "--lane",
             "cursor-bounded",
         ]
+        meta = merge_pipeline_state(
+            meta,
+            {
+                "unit_name": unit,
+                "jsonl_path": str(jsonl_path),
+                "attempt_prompt": prompt,
+                "repo_path": str(repo_dir),
+                "logs_root": str(logs_root),
+                "phase": PHASE_RUNNING,
+            },
+        )
+        save_run_metadata(conn, run_id, meta)
         ok, pid, start_time = systemd_run_attempt(
             unit=unit,
             runtime_max_sec=runtime,
@@ -1405,20 +1622,20 @@ class DevExecutor:
         meta = merge_pipeline_state(
             meta,
             {
-                "unit_name": unit,
                 "unit_pid": pid,
                 "host_start_time": start_time,
-                "jsonl_path": str(jsonl_path),
-                "attempt_prompt": prompt,
-                "phase": PHASE_RUNNING,
             },
         )
         save_run_metadata(conn, run_id, meta)
         record_dev_phase(conn, task_id, run_id, PHASE_RUNNING, {"unit": unit, "run_id": run_id})
         if task_id in self._active:
             self._active[task_id].run_id = run_id
-            self._active[task_id].last_jsonl_size = 0
-            self._active[task_id].last_jsonl_growth_at = time.time()
+            self._active[task_id].last_jsonl_size = int(
+                pipeline_state(meta).get("last_jsonl_size") or 0
+            )
+            self._active[task_id].last_jsonl_growth_at = float(
+                pipeline_state(meta).get("last_jsonl_growth_at") or time.time()
+            )
 
     def _phase_running(
         self,
@@ -1428,6 +1645,7 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_RUNNING)
         st = pipeline_state(meta)
         unit = str(st.get("unit_name") or unit_name(task_id, run_id))
         jsonl_path = Path(str(st.get("jsonl_path") or ""))
@@ -1452,6 +1670,14 @@ class DevExecutor:
             for item in coarse_progress_from_events(events):
                 record_dev_phase(conn, task_id, run_id, PHASE_RUNNING, item)
             active_task.last_jsonl_size = size
+            meta = merge_pipeline_state(
+                meta,
+                {
+                    "last_jsonl_size": active_task.last_jsonl_size,
+                    "last_jsonl_growth_at": active_task.last_jsonl_growth_at,
+                },
+            )
+            save_run_metadata(conn, run_id, meta)
             if stalled:
                 self._stop(unit)
                 self._finish_attempt(
@@ -1533,17 +1759,22 @@ class DevExecutor:
                 new_run = start_new_run(conn, task_id, metadata=meta)
                 if task_id in self._active:
                     self._active[task_id].run_id = new_run
-                self._spawn_attempt(conn, task_id, new_run, meta, st)
+                self._spawn_attempt(conn, task_id, new_run, meta, pipeline_state(meta))
             else:
-                kb.block_task(conn, task_id, reason=f"attempts exhausted: {classification}", kind=None)
+                block_dev_task(
+                    conn,
+                    task_id,
+                    "executor_restarted",
+                    f"attempts exhausted: {classification}",
+                    run_id=run_id,
+                )
                 self._active.pop(task_id, None)
             return
-        run = kb.latest_run(conn, task_id)
-        current_run = run.id if run else run_id
+        pipeline_run = start_new_run(conn, task_id, metadata=meta)
         if task_id in self._active:
-            self._active[task_id].run_id = current_run
-        fresh_meta = load_run_metadata(conn, current_run)
-        self._set_phase(conn, task_id, current_run, fresh_meta, PHASE_VERIFYING)
+            self._active[task_id].run_id = pipeline_run
+        fresh_meta = load_run_metadata(conn, pipeline_run)
+        self._set_phase(conn, task_id, pipeline_run, fresh_meta, PHASE_VERIFYING)
 
     def _phase_verifying(
         self,
@@ -1553,6 +1784,7 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_VERIFYING)
         st = pipeline_state(meta)
         contract = st.get("contract") or {}
         commands = contract.get("acceptance_commands") or []
@@ -1635,6 +1867,20 @@ class DevExecutor:
         save_run_metadata(conn, run_id, meta)
         self._set_phase(conn, task_id, run_id, meta, PHASE_REVIEWING)
 
+    def _scan_and_quarantine_diff(
+        self,
+        diff: str,
+        logs_root: Path,
+    ) -> list[dict[str, str]]:
+        findings = scan_diff_for_secrets(diff)
+        if findings:
+            logs_root.mkdir(parents=True, exist_ok=True)
+            (logs_root / "secret-scan-quarantine.json").write_text(
+                json.dumps(findings, indent=2),
+                encoding="utf-8",
+            )
+        return findings
+
     def _phase_reviewing(
         self,
         conn: Any,
@@ -1643,6 +1889,7 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_REVIEWING)
         st = pipeline_state(meta)
         contract = st.get("contract") or {}
         repo_dir = Path(str(st.get("repo_path") or ""))
@@ -1650,7 +1897,18 @@ class DevExecutor:
         logs_root.mkdir(parents=True, exist_ok=True)
         base = str(st.get("base_commit") or "")
         candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
-        diff = unified_diff(repo_dir, base, candidate)
+        full_diff = unified_diff(repo_dir, base, candidate)
+        if self._scan_and_quarantine_diff(full_diff, logs_root):
+            block_dev_task(
+                conn,
+                task_id,
+                "secret_in_diff",
+                "secret detected in diff before review",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        diff = full_diff
         if len(diff) > MAX_DIFF_REVIEW_BYTES:
             diff = diff[:MAX_DIFF_REVIEW_BYTES] + "\n... [truncated]\n"
         verification = st.get("verification") or {}
@@ -1750,10 +2008,12 @@ class DevExecutor:
         meta: dict,
         state: dict,
     ) -> None:
+        meta = self._persist_phase_entry(conn, task_id, run_id, meta, PHASE_PUBLISHING)
         st = pipeline_state(meta)
         contract = st.get("contract") or {}
         repo_dir = Path(str(st.get("repo_path") or ""))
         logs_root = Path(str(st.get("logs_root") or ""))
+        logs_root.mkdir(parents=True, exist_ok=True)
         branch = str(st.get("dev_branch") or f"hermes-dev/{task_id}")
         base = str(st.get("base_commit") or "")
         candidate = str(st.get("candidate_commit") or git_head_sha(repo_dir) or "")
@@ -1792,7 +2052,7 @@ class DevExecutor:
         if not self.enabled():
             logger.error("dev_pipeline.enabled is false — refusing to run")
             sys.exit(1)
-        reconcile_once(self.cfg)
+        reconcile_once(self.cfg, executor=self)
         tick_seconds = int(self.cfg.get("tick_seconds") or 15)
         while True:
             try:
@@ -1802,13 +2062,25 @@ class DevExecutor:
             time.sleep(tick_seconds)
 
 
-def reconcile_once(cfg: Optional[Mapping[str, Any]] = None) -> list[ReconcileDecision]:
+def reconcile_once(
+    cfg: Optional[Mapping[str, Any]] = None,
+    *,
+    executor: Optional[DevExecutor] = None,
+) -> list[ReconcileDecision]:
     cfg = dict(cfg or get_dev_pipeline_config())
     board = str(cfg.get("board") or "dev")
     kb.create_board(board)
     conn = kb.connect(board=board)
     try:
-        return reconcile_board(conn, cfg)
+        stop_fn = executor._stop if executor is not None else systemctl_stop
+        is_active_fn = executor._is_active if executor is not None else systemctl_is_active
+        return reconcile_board(
+            conn,
+            cfg,
+            executor=executor,
+            is_active_fn=is_active_fn,
+            stop_fn=stop_fn,
+        )
     finally:
         conn.close()
 
