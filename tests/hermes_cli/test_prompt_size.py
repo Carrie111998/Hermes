@@ -6,6 +6,7 @@ import pytest
 
 from hermes_cli.prompt_size import (
     _SKILLS_BLOCK_RE,
+    _build_inspection_agent,
     compute_prompt_breakdown,
     render_breakdown,
 )
@@ -68,6 +69,24 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     data = compute_prompt_breakdown("cli")
     assert data["system_prompt"]["bytes"] > 0
+
+
+def test_inspection_agent_honors_platform_tool_configuration(isolated_home):
+    """The meter weighs the same tool schemas a configured CLI session uses."""
+    (isolated_home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - web\n",
+        encoding="utf-8",
+    )
+
+    agent = _build_inspection_agent("cli")
+    tool_names = {
+        tool.get("function", {}).get("name") or tool.get("name")
+        for tool in agent.tools
+    }
+
+    assert agent.enabled_toolsets == ["web"]
+    assert "browser_navigate" not in tool_names
+    assert "delegate_task" not in tool_names
 
 
 def test_skills_index_reflects_installed_skills(isolated_home):
