@@ -47,6 +47,7 @@ def adapter():
     adapter._client = MagicMock()
     adapter._client.tree = MagicMock()
     adapter._client.http = AsyncMock()
+    adapter._client.http.bulk_upsert_global_commands = None
     adapter._client.application_id = "test_app_id"
 
     adapter._sleep_between_command_sync_mutations = AsyncMock()
@@ -78,6 +79,7 @@ async def test_safe_sync_deletes_before_creating():
     adapter._client = MagicMock()
     adapter._client.tree = MagicMock()
     adapter._client.http = AsyncMock()
+    adapter._client.http.bulk_upsert_global_commands = None
     adapter._client.application_id = "test_app_id"
     adapter._sleep_between_command_sync_mutations = AsyncMock()
     adapter._existing_command_to_payload = MagicMock(side_effect=lambda cmd: {"name": cmd.name})

@@ -1069,6 +1069,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        self._command_sync_lock = asyncio.Lock()
+        self._command_sync_retry_task: Optional[asyncio.Task] = None
         # WebSocket-level liveness probe. Discord REST and Gateway are distinct
         # transports: a REST 200 cannot prove that this client is still receiving
         # Gateway events. Sample the current Discord WebSocket's ready/open/ACK
@@ -1818,6 +1820,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._post_connect_task
             except asyncio.CancelledError:
                 pass
+        if self._command_sync_retry_task and not self._command_sync_retry_task.done():
+            self._command_sync_retry_task.cancel()
+            try:
+                await self._command_sync_retry_task
+            except asyncio.CancelledError:
+                pass
         if self._missed_message_backfill_task and not self._missed_message_backfill_task.done():
             self._missed_message_backfill_task.cancel()
             try:
@@ -1829,6 +1837,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
+        self._command_sync_retry_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
 
@@ -2028,7 +2037,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if interval > 0:
             await asyncio.sleep(interval)
 
-    async def _run_post_connect_initialization(self) -> None:
+    async def _run_post_connect_initialization(self, *, ignore_retry_after: bool = False) -> None:
+        async with self._command_sync_lock:
+            await self._run_post_connect_initialization_locked(
+                ignore_retry_after=ignore_retry_after,
+            )
+
+    async def _run_post_connect_initialization_locked(self, *, ignore_retry_after: bool = False) -> None:
         """Finish non-critical startup work after Discord is connected."""
         if not self._client:
             return
@@ -2045,7 +2060,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
             fingerprint = self._desired_command_sync_fingerprint()
-            skip_reason = self._command_sync_skip_reason(app_id, fingerprint)
+            skip_reason = (
+                None
+                if ignore_retry_after
+                else self._command_sync_skip_reason(app_id, fingerprint)
+            )
             if skip_reason:
                 logger.info("[%s] Skipping Discord slash command sync: %s", self.name, skip_reason)
                 return
@@ -2072,6 +2091,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     # conservative default so we don't slam the bucket again.
                     retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
                 self._record_command_sync_rate_limit(app_id, fingerprint, retry_after)
+                self._schedule_command_sync_retry(retry_after)
                 logger.warning(
                     "[%s] Discord rate-limited slash command sync; retrying after %.0fs",
                     self.name,
@@ -2103,6 +2123,31 @@ class DiscordAdapter(BasePlatformAdapter):
             raise
         except Exception as e:  # pragma: no cover - defensive logging
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
+
+    def _schedule_command_sync_retry(self, retry_after: float) -> None:
+        """Retry one rate-limited sync without overlapping reconnect handlers."""
+        current = self._command_sync_retry_task
+        if current and not current.done():
+            return
+
+        async def retry() -> None:
+            try:
+                await asyncio.sleep(max(1.0, float(retry_after)))
+                if self._client and not self._disconnecting:
+                    await self._run_post_connect_initialization(ignore_retry_after=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[%s] Scheduled Discord slash command sync retry failed",
+                    self.name,
+                    exc_info=True,
+                )
+            finally:
+                if self._command_sync_retry_task is asyncio.current_task():
+                    self._command_sync_retry_task = None
+
+        self._command_sync_retry_task = asyncio.create_task(retry())
 
     def _missed_message_backfill_enabled(self) -> bool:
         """Whether to reconcile Discord messages missed while the gateway was down."""
@@ -2896,6 +2941,7 @@ class DiscordAdapter(BasePlatformAdapter):
         deleted = 0
         http = self._client.http
         mutation_count = 0
+        operations = []
 
         async def mutate(call, *args):
             nonlocal mutation_count
@@ -2915,13 +2961,13 @@ class DiscordAdapter(BasePlatformAdapter):
         obsolete_keys = set(existing_by_key.keys()) - set(desired_by_key.keys())
         for key in obsolete_keys:
             current = existing_by_key.pop(key)
-            await mutate(http.delete_global_command, app_id, current.id)
+            operations.append((http.delete_global_command, (app_id, current.id)))
             deleted += 1
 
         for key, desired in desired_by_key.items():
             current = existing_by_key.pop(key, None)
             if current is None:
-                await mutate(http.upsert_global_command, app_id, desired)
+                operations.append((http.upsert_global_command, (app_id, desired)))
                 created += 1
                 continue
 
@@ -2933,13 +2979,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
 
             if self._patchable_app_command_payload(current_existing_payload) == self._patchable_app_command_payload(desired):
-                await mutate(http.delete_global_command, app_id, current.id)
-                await mutate(http.upsert_global_command, app_id, desired)
+                operations.append((http.delete_global_command, (app_id, current.id)))
+                operations.append((http.upsert_global_command, (app_id, desired)))
                 recreated += 1
                 continue
 
-            await mutate(http.edit_global_command, app_id, current.id, desired)
+            operations.append((http.edit_global_command, (app_id, current.id, desired)))
             updated += 1
+
+        bulk_upsert = getattr(http, "bulk_upsert_global_commands", None)
+        if len(operations) > 1 and callable(bulk_upsert):
+            await mutate(bulk_upsert, app_id, desired_payloads)
+        else:
+            for call, args in operations:
+                await mutate(call, *args)
 
         return {
             "total": len(desired_payloads),
