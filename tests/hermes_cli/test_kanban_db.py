@@ -164,6 +164,58 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
+def test_init_db_migrates_single_task_dispatch_lease_key_without_data_loss(tmp_path):
+    db_path = tmp_path / "legacy-dispatch-lease.db"
+    kb.init_db(db_path)
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DROP TRIGGER kanban_not_before_reject_leased_change")
+        conn.execute("DROP INDEX idx_not_before_dispatch_leases_expiry")
+        conn.execute("DROP TABLE kanban_not_before_dispatch_leases")
+        conn.execute(
+            """
+            CREATE TABLE kanban_not_before_dispatch_leases (
+                task_id TEXT PRIMARY KEY,
+                lease_hash TEXT NOT NULL,
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO kanban_not_before_dispatch_leases VALUES (?, ?, ?, ?)",
+            ("t_legacy", "legacy-hash", 100, 200),
+        )
+
+    kb.init_db(db_path)
+    with kb.connect(db_path=db_path) as conn:
+        primary_key = {
+            row["name"]: row["pk"]
+            for row in conn.execute(
+                "PRAGMA table_info(kanban_not_before_dispatch_leases)"
+            )
+        }
+        assert primary_key == {
+            "task_id": 1,
+            "lease_hash": 2,
+            "issued_at": 0,
+            "expires_at": 0,
+        }
+        row = conn.execute(
+            "SELECT task_id, lease_hash, issued_at, expires_at "
+            "FROM kanban_not_before_dispatch_leases"
+        ).fetchone()
+        assert tuple(row) == ("t_legacy", "legacy-hash", 100, 200)
+        conn.execute(
+            "INSERT INTO kanban_not_before_dispatch_leases VALUES (?, ?, ?, ?)",
+            ("t_legacy", "second-hash", 101, 201),
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_not_before_dispatch_leases "
+            "WHERE task_id = 't_legacy'"
+        ).fetchone()[0] == 2
+
+
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------

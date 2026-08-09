@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -304,6 +305,131 @@ def test_tool_dispatch_revalidates_same_task_gate_before_provider_and_keeps_othe
     assert not worker.is_alive()
     assert same_outcome and same_outcome[0].blocked is True
     assert provider_mutations == [other_task]
+
+
+def test_same_task_dispatches_hold_independent_leases_until_each_callback_finishes(
+    kanban_home, monkeypatch,
+):
+    """Parallel callbacks coexist; either live lease still protects the gate."""
+    from agent import relay_tools, tool_executor
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="parallel task", assignee="worker")
+        db_path = kb.kanban_db_path()
+
+    agent = SimpleNamespace(
+        quiet_mode=True,
+        tool_progress_mode="off",
+        _tool_guardrails=SimpleNamespace(
+            before_call=lambda _name, _args: SimpleNamespace(allows_execution=True)
+        ),
+    )
+    monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+    monkeypatch.setattr(tool_executor, "_emit_terminal_post_tool_call", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_tool_request_middleware",
+        lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware",
+        lambda _name, args, callback, **_kwargs: callback(args),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.resolve_pre_tool_block", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        relay_tools,
+        "execute",
+        lambda _name, args, callback, **_kwargs: (callback(args), args),
+    )
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    entered = {name: threading.Event() for name in ("first", "second")}
+    release = {name: threading.Event() for name in ("first", "second")}
+    provider_mutations: list[str] = []
+    outcomes = {}
+
+    def run(name: str):
+        def execute(_args):
+            provider_mutations.append(name)
+            entered[name].set()
+            assert release[name].wait(5)
+            return name
+
+        outcomes[name] = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="terminal",
+            function_args={"command": name},
+            effective_task_id=task_id,
+            tool_call_id=f"{name}-call",
+            execute=execute,
+        )
+
+    workers = {
+        name: threading.Thread(target=run, args=(name,))
+        for name in ("first", "second")
+    }
+    try:
+        for worker in workers.values():
+            worker.start()
+        assert all(event.wait(5) for event in entered.values())
+
+        with kb.connect(db_path=db_path) as conn:
+            leases = conn.execute(
+                "SELECT lease_hash FROM kanban_not_before_dispatch_leases "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            assert len(leases) == 2
+            assert len({row["lease_hash"] for row in leases}) == 2
+            with pytest.raises(sqlite3.IntegrityError, match="dispatch lease is active"):
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET not_before = ? WHERE id = ?",
+                        (FUTURE, task_id),
+                    )
+
+        release["first"].set()
+        workers["first"].join(timeout=5)
+        assert not workers["first"].is_alive()
+        with kb.connect(db_path=db_path) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM kanban_not_before_dispatch_leases "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0] == 1
+            with pytest.raises(sqlite3.IntegrityError, match="dispatch lease is active"):
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET not_before = ? WHERE id = ?",
+                        (FUTURE, task_id),
+                    )
+
+        release["second"].set()
+        workers["second"].join(timeout=5)
+        assert not workers["second"].is_alive()
+    finally:
+        for event in release.values():
+            event.set()
+        for worker in workers.values():
+            worker.join(timeout=5)
+
+    with kb.connect(db_path=db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_not_before_dispatch_leases "
+            "WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 0
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET not_before = ? WHERE id = ?",
+                (FUTURE, task_id),
+            )
+        assert kb.get_task(conn, task_id).not_before == FUTURE
+
+    assert sorted(provider_mutations) == ["first", "second"]
+    assert all(not outcome.blocked for outcome in outcomes.values())
 
 
 def test_dispatcher_and_default_assignment_make_no_mutation_before_release(

@@ -1697,10 +1697,11 @@ CREATE TABLE IF NOT EXISTS kanban_not_before_overrides (
 -- provider/tool call owns this task-scoped lease; the lease is released after
 -- the callback returns and expires safely if a worker disappears.
 CREATE TABLE IF NOT EXISTS kanban_not_before_dispatch_leases (
-    task_id      TEXT PRIMARY KEY,
+    task_id      TEXT NOT NULL,
     lease_hash   TEXT NOT NULL,
     issued_at    INTEGER NOT NULL,
-    expires_at   INTEGER NOT NULL
+    expires_at   INTEGER NOT NULL,
+    PRIMARY KEY (task_id, lease_hash)
 );
 
 -- Historical attempt record. Each time the dispatcher claims a task, a
@@ -2747,13 +2748,79 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS kanban_not_before_dispatch_leases (
+            task_id TEXT NOT NULL,
+            lease_hash TEXT NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (task_id, lease_hash)
+        )
+        """
+    )
+    lease_pk = {
+        row["name"]: row["pk"]
+        for row in conn.execute(
+            "PRAGMA table_info(kanban_not_before_dispatch_leases)"
+        )
+    }
+    if lease_pk.get("task_id") == 1 and lease_pk.get("lease_hash") == 0:
+        with write_txn(conn):
+            conn.execute("DROP TRIGGER IF EXISTS kanban_not_before_reject_leased_change")
+            conn.execute("DROP INDEX IF EXISTS idx_not_before_dispatch_leases_expiry")
+            conn.execute(
+                """
+                CREATE TABLE kanban_not_before_dispatch_leases_v2 (
+                    task_id TEXT NOT NULL,
+                    lease_hash TEXT NOT NULL,
+                    issued_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    PRIMARY KEY (task_id, lease_hash)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO kanban_not_before_dispatch_leases_v2
+                    (task_id, lease_hash, issued_at, expires_at)
+                SELECT task_id, lease_hash, issued_at, expires_at
+                FROM kanban_not_before_dispatch_leases
+                """
+            )
+            conn.execute("DROP TABLE kanban_not_before_dispatch_leases")
+            conn.execute(
+                "ALTER TABLE kanban_not_before_dispatch_leases_v2 "
+                "RENAME TO kanban_not_before_dispatch_leases"
+            )
+            conn.execute(
+                "CREATE INDEX idx_not_before_dispatch_leases_expiry "
+                "ON kanban_not_before_dispatch_leases(expires_at)"
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER kanban_not_before_reject_leased_change
+                BEFORE UPDATE OF not_before ON tasks
+                WHEN OLD.not_before IS NOT NEW.not_before
+                 AND EXISTS (
+                     SELECT 1 FROM kanban_not_before_dispatch_leases AS lease
+                     WHERE lease.task_id = OLD.id
+                       AND lease.expires_at > unixepoch()
+                 )
+                BEGIN
+                    SELECT RAISE(ABORT, 'not-before dispatch lease is active');
+                END
+                """
+            )
+
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS kanban_not_before_dispatch_leases (
-            task_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
             lease_hash TEXT NOT NULL,
             issued_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (task_id, lease_hash)
         );
         CREATE INDEX IF NOT EXISTS idx_not_before_dispatch_leases_expiry
             ON kanban_not_before_dispatch_leases(expires_at);

@@ -522,17 +522,6 @@ class _KanbanNotBeforeDispatchLease:
                     "WHERE task_id = ? AND expires_at <= ?",
                     (self.task_id, now),
                 )
-                active = self.conn.execute(
-                    "SELECT 1 FROM kanban_not_before_dispatch_leases "
-                    "WHERE task_id = ?",
-                    (self.task_id,),
-                ).fetchone()
-                if active is not None:
-                    self.block = (
-                        f"tool execution blocked for Kanban task {self.task_id}: "
-                        "another dispatch lease is active"
-                    )
-                    return self
                 self.conn.execute(
                     "INSERT INTO kanban_not_before_dispatch_leases "
                     "(task_id, lease_hash, issued_at, expires_at) VALUES (?, ?, ?, ?)",
