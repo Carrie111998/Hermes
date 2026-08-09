@@ -292,6 +292,14 @@ export function useGatewayBoot({
       }
     }
 
+    function bestEffortPrewarm(target: 'local' | 'remote') {
+      try {
+        prewarmBackend(target)
+      } catch {
+        // ignore inactive-root best-effort failures during boot
+      }
+    }
+
     // Soft gateway-mode apply: main tore down the primary without reloading.
     // Wipe session lists so skeletons retrigger, then re-dial in place.
     const softSwitch = async () => {
@@ -558,12 +566,12 @@ export function useGatewayBoot({
             .getConnectionConfig?.(connectionScope)
             .then(config => {
               if (config.remoteUrl.trim()) {
-                prewarmBackend('remote')
+                bestEffortPrewarm('remote')
               }
             })
             .catch(() => undefined)
         } else {
-          prewarmBackend('local')
+          bestEffortPrewarm('local')
         }
 
         // Profile adoption must land first: refreshSessions scopes its fetch by

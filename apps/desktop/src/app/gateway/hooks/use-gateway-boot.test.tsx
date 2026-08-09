@@ -2,7 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
-import { $currentCwd, $gatewayState } from '@/store/session'
+import { $connection, $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 
@@ -427,6 +427,65 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($gatewayState.get()).toBe('open')
     expect(setPrimaryBackendMode).toHaveBeenCalledWith('local')
     expect(prewarmBackend).not.toHaveBeenCalledWith('remote')
+  })
+
+  it.each([
+    {
+      label: 'saved remote config read rejects',
+      expectedMode: 'local' as const,
+      setup(desktop: ReturnType<typeof fakeDesktop>) {
+        desktop.getConnection = vi.fn(async () =>
+          ({
+            authMode: 'token' as const,
+            baseUrl: 'http://127.0.0.1:9191',
+            mode: 'local' as const,
+            profile: 'default',
+            token: 't',
+            wsUrl: 'ws://127.0.0.1:9191/api/ws?token=t'
+          }) as never
+        )
+        desktop.getConnectionConfig = vi.fn(async () => {
+          throw new Error('saved remote config read failed')
+        })
+      }
+    },
+    {
+      label: 'inactive-root prewarm throws',
+      expectedMode: 'remote' as const,
+      setup(desktop: ReturnType<typeof fakeDesktop>) {
+        desktop.getConnection = vi.fn(async () =>
+          ({
+            authMode: 'token' as const,
+            baseUrl: 'https://vps.example.com',
+            mode: 'remote' as const,
+            profile: 'default',
+            token: 't',
+            wsUrl: 'wss://vps.example.com/api/ws?token=t'
+          }) as never
+        )
+        prewarmBackend.mockImplementationOnce(() => {
+          throw new Error('inactive-root prewarm failed')
+        })
+      }
+    }
+  ])('keeps boot non-fatal when $label', async ({ expectedMode, setup }) => {
+    const desktop = fakeDesktop()
+    setup(desktop)
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($connection.get()).toMatchObject({
+      mode: expectedMode,
+      profile: 'default'
+    })
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get()).toMatchObject({
+      error: null,
+      phase: 'renderer.ready',
+      visible: false
+    })
   })
 
   it('a remote that drops post-boot keeps looping with NO boot.error (the dead-end CONNECTING combo)', async () => {
