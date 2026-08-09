@@ -2056,6 +2056,9 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
 os.environ["HERMES_TURN_LEASE_TIMEOUT"] = str(
     _DEFAULT_CONFIG["agent"]["gateway_turn_lease_timeout"]
 )
+os.environ["HERMES_REDACT_PHONE_NUMBERS"] = str(
+    _DEFAULT_CONFIG["privacy"]["redact_phone_numbers"]
+).lower()
 
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
@@ -2261,6 +2264,13 @@ if _config_path.exists():
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
+        _privacy_cfg = _cfg.get("privacy", {})
+        if isinstance(_privacy_cfg, dict):
+            _redact_phone_numbers = _privacy_cfg.get("redact_phone_numbers")
+            if _redact_phone_numbers is not None:
+                os.environ["HERMES_REDACT_PHONE_NUMBERS"] = str(
+                    _redact_phone_numbers
+                ).lower()
         # Gateway settings (media delivery allowlist + recency trust + strict mode)
         _gateway_cfg = _cfg.get("gateway", {})
         if isinstance(_gateway_cfg, dict):

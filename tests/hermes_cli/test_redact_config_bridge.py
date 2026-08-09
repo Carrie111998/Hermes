@@ -157,3 +157,54 @@ def test_dotenv_redact_secrets_beats_config_yaml(tmp_path):
     # .env value wins
     assert "REDACT_ENABLED=True" in result.stdout
     assert "ENV_VAR=true" in result.stdout
+
+
+def test_redact_phone_numbers_false_keeps_secret_redaction_enabled(tmp_path):
+    """privacy.redact_phone_numbers disables only E.164 masking."""
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            privacy:
+              redact_phone_numbers: false
+            security:
+              redact_secrets: true
+            """
+        )
+    )
+    (hermes_home / ".env").write_text("")
+
+    probe = textwrap.dedent(
+        """\
+        import sys, os
+        os.environ.pop("HERMES_REDACT_SECRETS", None)
+        os.environ.pop("HERMES_REDACT_PHONE_NUMBERS", None)
+        sys.path.insert(0, %r)
+        import hermes_cli.main
+        import agent.redact
+        text = "Call +15551234567 with OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012"
+        print(f"REDACT_ENABLED={agent.redact._REDACT_ENABLED}")
+        print(f"PHONE_REDACT_ENABLED={agent.redact._PHONE_REDACT_ENABLED}")
+        print(agent.redact.redact_sensitive_text(text))
+        """
+    ) % str(REPO_ROOT)
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(hermes_home)
+    env.pop("HERMES_REDACT_SECRETS", None)
+    env.pop("HERMES_REDACT_PHONE_NUMBERS", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        timeout=30,
+    )
+    assert result.returncode == 0, f"probe failed: {result.stderr}"
+    assert "REDACT_ENABLED=True" in result.stdout
+    assert "PHONE_REDACT_ENABLED=False" in result.stdout
+    assert "+15551234567" in result.stdout
+    assert "abc123def456" not in result.stdout
