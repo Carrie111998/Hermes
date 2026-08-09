@@ -10,6 +10,7 @@ import type { McpCatalogEntry, SkillHubSourcesResponse } from '@/types/hermes'
 const activeProfile = atom('default')
 const activeSessionId = atom<string | null>('session-1')
 const gateway = atom<null | { request: ReturnType<typeof vi.fn> }>(null)
+const getGoogleWorkspaceStatus = vi.fn()
 const getMcpCatalog = vi.fn()
 const getSkillHubSources = vi.fn()
 const searchSkillsHub = vi.fn()
@@ -17,6 +18,7 @@ const searchSkillsHub = vi.fn()
 vi.mock('@/hermes', () => ({
   authMcpServer: vi.fn(),
   getActionStatus: vi.fn(),
+  getGoogleWorkspaceStatus: () => getGoogleWorkspaceStatus(),
   getMcpCatalog: () => getMcpCatalog(),
   getMcpOAuthFlow: vi.fn(),
   getSkillHubSources: () => getSkillHubSources(),
@@ -108,6 +110,7 @@ beforeEach(() => {
   activeProfile.set('default')
   activeSessionId.set('session-1')
   gateway.set(null)
+  getGoogleWorkspaceStatus.mockResolvedValue({ configured: false, connected: false, scopes: [] })
   getMcpCatalog.mockResolvedValue({
     diagnostics: [],
     entries: [integration(), integration({ installed: true, name: 'notion' })]
