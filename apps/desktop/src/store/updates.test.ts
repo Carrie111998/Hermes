@@ -53,8 +53,6 @@ const {
   $updateOverlayOpen,
   $updateOverlayTarget,
   requestActiveUpdate,
-  openUpdatesWindow,
-  startActiveUpdate,
   resetUpdateApplyState,
   startUpdatePoller,
   stopUpdatePoller,
@@ -251,6 +249,25 @@ describe('checkBackendUpdates', () => {
     expect(result?.message).toBe('Docker images are immutable.')
   })
 
+  it('treats a null behind count with a reachable-update failure as a failed check', async () => {
+    setRemote(true)
+    checkHermesUpdateSpy.mockResolvedValue({
+      install_method: 'git',
+      current_version: '0.16.0',
+      behind: null,
+      update_available: false,
+      can_apply: true,
+      update_command: 'hermes update',
+      message: "Couldn't reach the update source — try again later."
+    })
+
+    const result = await checkBackendUpdates()
+
+    expect(result?.error).toBe('check-failed')
+    expect(result?.behind).toBeUndefined()
+    expect(result?.message).toMatch(/Couldn't reach the update source/)
+  })
+
   it('is a no-op in local mode (backend check only runs when remote)', async () => {
     setRemote(false)
     await checkBackendUpdates()
@@ -349,70 +366,6 @@ describe('requestActiveUpdate', () => {
 
     requestActiveUpdate()
     await vi.waitFor(() => expect(updateHermesSpy).toHaveBeenCalled())
-  })
-})
-
-describe('Desktop update entry points', () => {
-  const applyClientMock = vi.fn()
-  const checkClientMock = vi.fn()
-
-  beforeEach(() => {
-    storage.clear()
-    notifySpy.mockClear()
-    dismissSpy.mockClear()
-    applyClientMock.mockReset().mockResolvedValue({ ok: false, error: 'test-stop' })
-    checkClientMock.mockReset().mockResolvedValue(status({ behind: 0 }))
-    updateHermesSpy.mockReset().mockResolvedValue({ ok: true, name: 'update' })
-    checkHermesUpdateSpy.mockReset().mockResolvedValue({
-      install_method: 'git',
-      current_version: '0.4.2',
-      behind: 0,
-      update_available: false,
-      can_apply: true,
-      update_command: null,
-      message: null
-    })
-    getActionStatusSpy.mockReset().mockResolvedValue({ lines: [], running: false, exit_code: 0 })
-    resetUpdateApplyState()
-    $updateStatus.set(null)
-    $backendUpdateStatus.set(null)
-    $updateOverlayOpen.set(false)
-    $updateOverlayTarget.set('client')
-    setRemote(true)
-    ;(globalThis as unknown as { window: unknown }).window = {
-      hermesDesktop: { updates: { apply: applyClientMock, check: checkClientMock } }
-    }
-    vi.useRealTimers()
-  })
-
-  afterEach(async () => {
-    await vi.waitFor(() => expect($backendUpdateApply.get().applying).toBe(false), { timeout: 5000 })
-    setRemote(false)
-    delete (globalThis as unknown as { window?: unknown }).window
-  })
-
-  it('applies the CLIENT update from the About panel while connected to a remote backend', async () => {
-    startActiveUpdate('client')
-
-    expect($updateOverlayTarget.get()).toBe('client')
-    expect(applyClientMock).toHaveBeenCalledTimes(1)
-    expect(updateHermesSpy).not.toHaveBeenCalled()
-    await vi.waitFor(() => expect($updateApply.get().applying).toBe(false))
-  })
-
-  it('opens the CLIENT changelog from the About panel while connected to a remote backend', async () => {
-    openUpdatesWindow('client')
-
-    expect($updateOverlayTarget.get()).toBe('client')
-    await vi.waitFor(() => expect(checkClientMock).toHaveBeenCalledTimes(1))
-    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
-  })
-
-  it('preserves the connection-mode auto-select when no target is passed', () => {
-    openUpdatesWindow()
-
-    expect($updateOverlayTarget.get()).toBe('backend')
-    expect(checkClientMock).not.toHaveBeenCalled()
   })
 })
 

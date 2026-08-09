@@ -55,6 +55,16 @@ export interface VersionStatusResult {
   unknown: boolean
 }
 
+/** Prefer live session runtime info, then the independently fetched backend
+ * update status. Remote connections can populate the latter before any session
+ * has supplied a status snapshot, and the chip should remain visible then. */
+export function resolveBackendVersion(
+  runtimeVersion: null | string | undefined,
+  checkedVersion: null | string | undefined
+): string | null {
+  return runtimeVersion?.trim() || checkedVersion?.trim() || null
+}
+
 export function resolveVersionStatus({
   applyMessage,
   applying,

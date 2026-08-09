@@ -438,6 +438,8 @@ export interface Translations {
       version: (value: string) => string
       versionUnavailable: string
       updates: string
+      client: string
+      backend: string
       checkNow: string
       checking: string
       seeWhatsNew: string
@@ -449,6 +451,7 @@ export interface Translations {
       cantReach: string
       tapCheck: string
       updateReady: (count: number) => string
+      updateReadyUnknown: string
       lastChecked: (age: string) => string
       justNowSuffix: string
       automaticUpdates: string

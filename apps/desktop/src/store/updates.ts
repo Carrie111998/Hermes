@@ -236,15 +236,8 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
   })
 }
 
-/**
- * Open the updates overlay for the active target (auto-selected from the
- * connection mode) and kick off its check. When `target` is passed explicitly
- * it overrides the auto-select. Callers that know which component they want
- * (e.g. the About panel, whose status is always the client's) should pass the
- * target so the user action matches the displayed state.
- */
-export function openUpdatesWindow(target?: UpdateTarget): void {
-  openUpdateOverlayFor(target ?? (isRemoteMode() ? 'backend' : 'client'))
+export function openUpdatesWindow(): void {
+  openUpdateOverlayFor(isRemoteMode() ? 'backend' : 'client')
 }
 
 /**
@@ -256,6 +249,11 @@ export function openUpdatesWindow(target?: UpdateTarget): void {
  */
 export function startActiveUpdate(): void {
   const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
+
+  startUpdateFor(target)
+}
+
+export function startUpdateFor(target: UpdateTarget): void {
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
   void (target === 'backend' ? applyBackendUpdate() : applyUpdates())
@@ -272,7 +270,7 @@ export function requestActiveUpdate(): void {
   const status = target === 'backend' ? $backendUpdateStatus.get() : $updateStatus.get()
 
   if ((status?.behind ?? 0) > 0 || status?.updateAvailable) {
-    startActiveUpdate()
+    startUpdateFor(target)
 
     return
   }
@@ -313,13 +311,20 @@ function isRemoteMode(): boolean {
 }
 
 function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
-  const behind = res.behind ?? 0
+  // The backend uses `behind: null` when a git update check could not reach its
+  // source. Do not coerce that failure to zero: zero means authoritatively
+  // current and would make About claim "latest". Externally managed installs
+  // also report null, but `can_apply: false` is their explicit unsupported
+  // state rather than a failed reachable-source check.
+  const checkFailed = res.behind === null && !res.update_available && res.can_apply && Boolean(res.message)
+  const behind = res.behind ?? undefined
 
   return {
     supported: res.can_apply,
+    error: checkFailed ? 'check-failed' : undefined,
     message: res.message ?? undefined,
     updateAvailable: res.update_available,
-    behind: behind > 0 ? behind : 0,
+    behind: behind === undefined ? undefined : Math.max(behind, 0),
     currentVersion: res.current_version,
     targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
