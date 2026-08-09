@@ -685,6 +685,19 @@ async def _token_auth_seam(request: Request, call_next):
     return await token_auth_middleware(request, call_next)
 
 
+@app.middleware("http")
+async def _private_payload_cache_control(request: Request, call_next):
+    """Prevent browser/proxy storage of APIs and the mutable service worker."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    elif path == "/sw.js":
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Dashboard component health — in-process error/self-test counters that feed
 # the ``components`` dict on ``/api/status``.  That endpoint is in
