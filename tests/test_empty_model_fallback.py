@@ -115,6 +115,14 @@ class TestResolveGatewayModel:
         from gateway.run import _resolve_gateway_model
         assert _resolve_gateway_model({"model": {"default": "gpt-5.4"}}) == "gpt-5.4"
 
+    def test_expands_env_reference_when_loading_gateway_config(self, monkeypatch):
+        from gateway import run as gateway_run
+
+        monkeypatch.setenv("MODEL_NAME", "provider/model-from-env")
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {"model": {"default": "$" + "{env:MODEL_NAME}"}})
+
+        assert gateway_run._resolve_gateway_model() == "provider/model-from-env"
+
     def test_returns_model_key_fallback(self):
         from gateway.run import _resolve_gateway_model
         assert _resolve_gateway_model({"model": {"model": "gpt-5.4"}}) == "gpt-5.4"
