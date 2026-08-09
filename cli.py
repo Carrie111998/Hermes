@@ -14890,7 +14890,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # A temporary run persisted nothing, so there is nothing to resume.
             # Printing the hint anyway hands the user a command that cannot
             # work and implies the transcript is on disk -- the opposite of
-            # what --no_session promises. The run stats below are still true
+            # what --no-session promises. The run stats below are still true
             # and still useful, so only the resume promise is suppressed.
             if getattr(self, "_ephemeral", False):
                 print("Temporary session — nothing was saved, so it can't be resumed.")
