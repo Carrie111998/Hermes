@@ -6,6 +6,7 @@ import { HUD_WINDOW_TITLE, wireHudWindowTitle } from './hud-title'
 
 test('wireHudWindowTitle sets the distinct HUD title', () => {
   let title: string | null = null
+
   const win = {
     setTitle: (t: string) => {
       title = t
@@ -21,6 +22,7 @@ test('wireHudWindowTitle sets the distinct HUD title', () => {
 
 test('wireHudWindowTitle guards the title against the page overwriting it', () => {
   let handler: ((event: { preventDefault(): void }) => void) | null = null
+
   const win = {
     setTitle: () => {},
     on: (name: string, listener: (event: { preventDefault(): void }) => void) => {
