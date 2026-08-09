@@ -73,20 +73,23 @@ function Harness({ onBranchInNewChat }: { onBranchInNewChat?: (messageId: string
 }
 
 describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
-  it('shows the Branch in new chat button when a handler is provided (open chat)', async () => {
+  it('shows the Branch in new chat button enabled when a handler is provided (open chat)', async () => {
     render(<Harness onBranchInNewChat={() => undefined} />)
 
-    expect(await screen.findByRole('button', { name: 'Branch in new chat' })).toBeTruthy()
+    const button = await screen.findByRole('button', { name: 'Branch in new chat' })
+    expect(button).toBeTruthy()
+    expect(button).not.toBeDisabled()
   })
 
-  it('hides the Branch in new chat button when no handler is provided (session-tile / branched chat)', async () => {
+  it('keeps the Branch in new chat button mounted but disabled when no handler is provided (#81846)', async () => {
+    // The button is no longer unmounted when the callback is absent
+    // (which used to leave its layout slot missing until the next mount
+    // round-tripped through `useState` / `useRef` — "intermittently
+    // missing" repro). The affordance stays visible as disabled so the
+    // user always knows the action exists, and the click is a no-op.
     render(<Harness />)
 
-    // Wait for the assistant message to actually mount before asserting
-    // absence, so a missing button isn't just a false negative from an
-    // unrendered message.
-    await screen.findByText('done')
-
-    expect(screen.queryByRole('button', { name: 'Branch in new chat' })).toBeNull()
+    const button = await screen.findByRole('button', { name: 'Branch in new chat' })
+    expect(button).toBeDisabled()
   })
 })

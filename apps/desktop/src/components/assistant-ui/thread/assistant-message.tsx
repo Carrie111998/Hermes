@@ -199,17 +199,27 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
         data-slot="aui_msg-actions"
       >
         <MessageAge />
-        {onBranchInNewChat && (
-          <TooltipIconButton
-            onClick={() => {
-              triggerHaptic('selection')
-              onBranchInNewChat(messageId)
-            }}
-            tooltip={copy.branchNewChat}
-          >
-            <GitForkIcon className="size-3.5" />
-          </TooltipIconButton>
-        )}
+        {/* Always render the fork button so its layout slot stays stable
+            across re-renders; the earlier `&& onBranchInNewChat` guard
+            unmounted the button entirely when the callback reference
+            briefly nulled out (e.g. during a session-key switch), and the
+            next mount had to re-run `useState` / `useRef` initialization
+            before the user could click it (#81846). The button is now
+            disabled — not hidden — when the callback is absent, so the
+            affordance never disappears and the click is a no-op. */}
+        <TooltipIconButton
+          disabled={!onBranchInNewChat}
+          onClick={() => {
+            if (!onBranchInNewChat) {
+              return
+            }
+            triggerHaptic('selection')
+            onBranchInNewChat(messageId)
+          }}
+          tooltip={copy.branchNewChat}
+        >
+          <GitForkIcon className="size-3.5" />
+        </TooltipIconButton>
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
         <ReadAloudButton getText={getMessageText} messageId={messageId} />
         <ActionBarPrimitive.Reload asChild>
