@@ -128,6 +128,53 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def test_loop_blocks_at_budget_without_progress_signal(monkeypatch):
+    """Fail-closed: no progress_check_fn (or a falsy result) blocks exactly
+    like before this feature existed — no silent extension."""
+    _patch_judge(monkeypatch, ["continue"])
+    blocked = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: pytest.fail("should not run another turn"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.append(r),
+        max_turns=1,
+        first_response="working on it",
+        progress_check_fn=lambda: False,
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 1
+    assert len(blocked) == 1
+
+
+def test_loop_extends_budget_when_progress_detected(monkeypatch):
+    """A worker that hits its turn budget but is showing observable
+    progress gets a bounded extension instead of an immediate block, but
+    never past ``max_turns_ceiling``."""
+    _patch_judge(monkeypatch, ["continue"] * 5)
+    turns = []
+    blocked = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocked.append(r),
+        max_turns=1,
+        first_response="working on it",
+        progress_check_fn=lambda: True,
+        extension_turns=1,
+        max_turns_ceiling=2,
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert res["turns_used"] == 2  # one extended turn was granted, then the ceiling hit
+    assert len(turns) == 1
+    assert len(blocked) == 1
+
+
 
 
 

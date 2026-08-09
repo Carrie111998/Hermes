@@ -18083,6 +18083,35 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
+    # Snapshot progress markers before the loop starts so a stuck worker
+    # (no heartbeat, no operator comments since spawn) still blocks at the
+    # turn budget instead of extending forever.
+    loop_started_at = int(time.time())
+    conn = _kb.connect()
+    try:
+        _existing_comments = _kb.list_comments(conn, task_id)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    initial_comment_id = _existing_comments[-1].id if _existing_comments else 0
+
+    def _progress_check() -> bool:
+        c = _kb.connect()
+        try:
+            t = _kb.get_task(c, task_id)
+            if t is None:
+                return False
+            if t.last_heartbeat_at and t.last_heartbeat_at >= loop_started_at:
+                return True
+            return bool(_kb.list_comments_after(c, task_id, after_id=initial_comment_id))
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
             user_message=prompt,
@@ -18129,6 +18158,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         max_turns=max_turns,
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
+        progress_check_fn=_progress_check,
     )
 
 
