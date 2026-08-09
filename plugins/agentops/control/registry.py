@@ -62,7 +62,8 @@ class FleetRegistry:
         registered = len(self._targets)
         snapshotted = len(self._snapshots)
         coverage = 0 if registered == 0 else (snapshotted * 100) // registered
-        return FleetCoverage(registered, snapshotted, coverage)
+        disabled = ("processes",) if any(target.spec.labels.get("process_observation") == "disabled" for target in self._targets.values()) else ()
+        return FleetCoverage(registered, snapshotted, coverage, disabled)
 
 
 _PROFILE_TARGETS: tuple[tuple[str, str, str, Criticality, str], ...] = (

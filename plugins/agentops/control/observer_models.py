@@ -369,6 +369,7 @@ class FleetCoverage:
     registered_targets: int
     snapshotted_targets: int
     coverage_percent: int
+    unmanaged_collectors: tuple[str, ...] = ()
 
 
 def stable_signal_id(

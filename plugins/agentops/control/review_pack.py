@@ -53,7 +53,7 @@ class ReviewPack:
 
     @property
     def cron_mandatory_assertion_ids(self) -> frozenset[str]:
-        return frozenset(item for item in self.mandatory_assertion_ids if item.startswith("cron_business_assertion_"))
+        return frozenset(item for item in self.mandatory_assertion_ids if item.startswith("cron_"))
 
     def validate_collector(self, collector_id: str, target_kind: TargetKind | str) -> CollectorSpec:
         kind = target_kind.value if isinstance(target_kind, TargetKind) else str(target_kind)
@@ -143,6 +143,10 @@ def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: R
     module, symbol = spec.entry.split(":", 1)
     cls = getattr(importlib.import_module(module), symbol)
     runtime = dict(kwargs)
+    if collector_id == "cron" and "max_items" in runtime:
+        runtime.setdefault("max_assertions", runtime.pop("max_items"))
+    elif collector_id == "cron":
+        runtime.setdefault("max_assertions", spec.max_items)
     for name, value in (("max_bytes", spec.max_bytes), ("max_items", spec.max_items), ("min_interval_seconds", spec.rate_limit_seconds)):
         if name in runtime and name in {"max_bytes", "max_items"} and int(runtime[name]) > int(value):
             raise ManifestValidationError("runtime collector budget exceeds pack")
@@ -150,6 +154,8 @@ def build_collector(collector_id: str, *, target_kind: TargetKind | str, pack: R
             raise ManifestValidationError("runtime collector rate below pack")
         runtime.setdefault(name, value)
     runtime.pop("target_kind", None)
+    if collector_id == "cron":
+        runtime["review_pack"] = active
     try:
         accepted = inspect.signature(cls).parameters
         runtime = {key: value for key, value in runtime.items() if key in accepted}
