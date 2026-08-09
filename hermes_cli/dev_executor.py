@@ -906,6 +906,29 @@ def _shell_runner(
     )
 
 
+def command_result_from_timeout(
+    exc: subprocess.TimeoutExpired,
+    evidence_dir: Path,
+    *,
+    idx: int = 0,
+) -> CommandResult:
+    cmd = exc.cmd
+    if isinstance(cmd, (list, tuple)):
+        cmd_str = " ".join(str(part) for part in cmd)
+    else:
+        cmd_str = str(cmd or "unknown")
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    out_path = evidence_dir / f"cmd-{idx}.log"
+    msg = f"Command timed out after {exc.timeout}s: {cmd_str}"
+    out_path.write_text(msg, encoding="utf-8")
+    return CommandResult(
+        command=cmd_str,
+        exit_code=124,
+        output_path=out_path,
+        output_preview=msg,
+    )
+
+
 def run_verification(
     repo_dir: Path,
     commands: Sequence[str],
@@ -1481,20 +1504,22 @@ class DevExecutor:
         now = time.time()
         if now - active.last_heartbeat < HEARTBEAT_INTERVAL_SECONDS:
             return
+        self._heartbeat_now(conn, task_id)
+
+    def _heartbeat_now(self, conn: Any, task_id: str) -> None:
+        active = self._active.get(task_id)
+        if not active:
+            return
         kb.heartbeat_claim(
             conn,
             task_id,
             ttl_seconds=CLAIM_TTL_SECONDS,
             claimer="dev-executor",
         )
-        active.last_heartbeat = now
+        active.last_heartbeat = time.time()
 
     def _handle_external_block(self, conn: Any, task_id: str) -> None:
-        meta = load_run_metadata(conn, self._active.get(task_id, ActiveTask(task_id, 0, "")).run_id)
-        state = pipeline_state(meta)
-        unit = state.get("unit_name")
-        if unit:
-            self._stop(str(unit))
+        stop_task_units(conn, task_id, self._stop, self._is_active)
         record_dev_phase(conn, task_id, None, PHASE_RUNNING, {"cancelled_by_user": True})
 
     def _advance(self, conn: Any, task_id: str) -> None:
@@ -1939,13 +1964,31 @@ class DevExecutor:
 
         timeout = int(self.cfg.get("verify_command_timeout") or 600)
         env = build_attempt_env(os.environ, lane="cursor-bounded")
-        cand_results = run_verification(
-            verify_dir,
-            commands,
-            logs_root / "verify-candidate",
-            timeout=timeout,
-            env=env,
-        )
+        cand_evidence = logs_root / "verify-candidate"
+        self._heartbeat_now(conn, task_id)
+        try:
+            cand_results = run_verification(
+                verify_dir,
+                commands,
+                cand_evidence,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self._heartbeat_now(conn, task_id)
+            cand_results = [command_result_from_timeout(exc, cand_evidence)]
+            record_dev_phase(
+                conn,
+                task_id,
+                run_id,
+                PHASE_VERIFYING,
+                {
+                    "acceptance_timeout": True,
+                    "command": cand_results[0].command,
+                },
+            )
+        else:
+            self._heartbeat_now(conn, task_id)
         outcome = classify_verification(cand_results)
         verification: dict[str, Any] = {
             "outcome": outcome,
@@ -1961,13 +2004,31 @@ class DevExecutor:
                 shutil.rmtree(verify_base_dir, ignore_errors=True)
             git_command(["clone", str(repo_dir), str(verify_base_dir)], cwd=verify_base_dir.parent)
             git_command(["checkout", str(base)], cwd=verify_base_dir)
-            base_results = run_verification(
-                verify_base_dir,
-                commands,
-                logs_root / "verify-base",
-                timeout=timeout,
-                env=env,
-            )
+            base_evidence = logs_root / "verify-base"
+            self._heartbeat_now(conn, task_id)
+            try:
+                base_results = run_verification(
+                    verify_base_dir,
+                    commands,
+                    base_evidence,
+                    timeout=timeout,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._heartbeat_now(conn, task_id)
+                base_results = [command_result_from_timeout(exc, base_evidence)]
+                record_dev_phase(
+                    conn,
+                    task_id,
+                    run_id,
+                    PHASE_VERIFYING,
+                    {
+                        "acceptance_timeout": True,
+                        "command": base_results[0].command,
+                    },
+                )
+            else:
+                self._heartbeat_now(conn, task_id)
             outcome = classify_verification(cand_results, base_results)
             verification["base"] = [
                 {"command": r.command, "exit_code": r.exit_code, "log": str(r.output_path)}
@@ -1994,7 +2055,13 @@ class DevExecutor:
                     self._active[task_id].run_id = new_run
                 self._spawn_attempt(conn, task_id, new_run, meta, st, repair_context=repair)
                 return
-            kb.block_task(conn, task_id, reason="verification regression", kind=None)
+            block_dev_task(
+                conn,
+                task_id,
+                "verification_regression",
+                "verification regression",
+                run_id=run_id,
+            )
             self._active.pop(task_id, None)
             return
         if outcome == "baseline_failure":
@@ -2058,10 +2125,26 @@ class DevExecutor:
             f"Task:\n{task_text}\n\nPlan:\n{json.dumps(contract)}\n\n"
             f"Diff:\n{diff}\n\nVerification:\n{json.dumps(verification)}"
         )
-        kimi_proc = hermes_chat_review(kimi_prompt, cwd=repo_dir)
-        kimi_raw = (kimi_proc.stdout or "") + (kimi_proc.stderr or "")
-        (logs_root / "review-kimi.raw").write_text(kimi_raw[:200_000], encoding="utf-8")
-        kimi_verdict = parse_review_verdict(kimi_raw)
+        self._heartbeat_now(conn, task_id)
+        try:
+            kimi_proc = hermes_chat_review(kimi_prompt, cwd=repo_dir)
+        except subprocess.TimeoutExpired as exc:
+            self._heartbeat_now(conn, task_id)
+            timeout_msg = f"kimi review timed out after {exc.timeout}s\n"
+            (logs_root / "review-kimi.raw").write_text(timeout_msg, encoding="utf-8")
+            kimi_verdict = None
+            record_dev_phase(
+                conn,
+                task_id,
+                run_id,
+                PHASE_REVIEWING,
+                {"review_timeout": True, "reviewer": "kimi"},
+            )
+        else:
+            self._heartbeat_now(conn, task_id)
+            kimi_raw = (kimi_proc.stdout or "") + (kimi_proc.stderr or "")
+            (logs_root / "review-kimi.raw").write_text(kimi_raw[:200_000], encoding="utf-8")
+            kimi_verdict = parse_review_verdict(kimi_raw)
 
         grok_prompt = (
             "Delegate ONLY to the reviewer subagent. Read-only correctness/security "
@@ -2074,24 +2157,40 @@ class DevExecutor:
         grok_raw = ""
         if agent_bin:
             grok_jsonl = logs_root / "review-grok.jsonl"
-            proc = run_subprocess(
-                [
-                    agent_bin,
-                    "-p",
-                    "--trust",
-                    "--model",
-                    "kimi-k3-high",
-                    "--output-format",
-                    "stream-json",
-                    grok_prompt,
-                ],
-                cwd=repo_dir,
-                env=build_attempt_env(os.environ, lane="cursor-bounded"),
-                timeout=int(self.cfg.get("cursor_timeout_seconds") or 1800),
-            )
-            grok_raw = (proc.stdout or "") + (proc.stderr or "")
-            grok_jsonl.write_text(grok_raw[:500_000], encoding="utf-8")
-            grok_verdict = parse_review_verdict(grok_raw)
+            self._heartbeat_now(conn, task_id)
+            try:
+                proc = run_subprocess(
+                    [
+                        agent_bin,
+                        "-p",
+                        "--trust",
+                        "--model",
+                        "kimi-k3-high",
+                        "--output-format",
+                        "stream-json",
+                        grok_prompt,
+                    ],
+                    cwd=repo_dir,
+                    env=build_attempt_env(os.environ, lane="cursor-bounded"),
+                    timeout=int(self.cfg.get("cursor_timeout_seconds") or 1800),
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._heartbeat_now(conn, task_id)
+                timeout_msg = f"grok review timed out after {exc.timeout}s\n"
+                grok_jsonl.write_text(timeout_msg, encoding="utf-8")
+                grok_verdict = None
+                record_dev_phase(
+                    conn,
+                    task_id,
+                    run_id,
+                    PHASE_REVIEWING,
+                    {"review_timeout": True, "reviewer": "grok"},
+                )
+            else:
+                self._heartbeat_now(conn, task_id)
+                grok_raw = (proc.stdout or "") + (proc.stderr or "")
+                grok_jsonl.write_text(grok_raw[:500_000], encoding="utf-8")
+                grok_verdict = parse_review_verdict(grok_raw)
 
         reviews = {
             "kimi": kimi_verdict,
@@ -2130,10 +2229,9 @@ class DevExecutor:
                 if task_id in self._active:
                     self._active[task_id].run_id = new_run
                 self._spawn_attempt(conn, task_id, new_run, meta, st, repair_context=repair)
-                self._set_phase(conn, task_id, new_run, meta, PHASE_RUNNING)
                 return
 
-        kb.block_task(conn, task_id, reason="review failed", kind=None)
+        block_dev_task(conn, task_id, "review_failed", "review failed", run_id=run_id)
         self._active.pop(task_id, None)
 
     def _phase_publishing(
