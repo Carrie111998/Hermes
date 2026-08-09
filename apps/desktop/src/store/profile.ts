@@ -44,8 +44,40 @@ export function setActiveProfile(name: string): void {
   $activeProfile.set(name || 'default')
 }
 
+export type BackendTarget = 'local' | 'remote'
+
+const backendOptions = (target: BackendTarget): GatewayProfileOptions =>
+  target === 'local' ? { localOnly: true } : { remoteOnly: true }
+
 function profileTargetOptions(name: string): GatewayProfileOptions {
   return normalizeProfileKey(name) === 'default' && $connection.get()?.mode === 'remote' ? { localOnly: true } : {}
+}
+
+function sameTargetOptions(a: GatewayProfileOptions, b: GatewayProfileOptions): boolean {
+  return Boolean(a.localOnly) === Boolean(b.localOnly) && Boolean(a.remoteOnly) === Boolean(b.remoteOnly)
+}
+
+function isActiveGatewayTarget(profile: string, options: GatewayProfileOptions = {}): boolean {
+  if (normalizeProfileKey($activeGatewayProfile.get()) !== normalizeProfileKey(profile)) {
+    return false
+  }
+
+  const activeOptions = activeGatewayTargetOptions()
+
+  if (sameTargetOptions(activeOptions, options)) {
+    return true
+  }
+
+  if (normalizeProfileKey(profile) !== 'default') {
+    return false
+  }
+
+  const mode = $connection.get()?.mode
+
+  return Boolean(
+    (options.localOnly && mode === 'local' && !activeOptions.remoteOnly) ||
+      (options.remoteOnly && mode === 'remote' && !activeOptions.localOnly)
+  )
 }
 
 function mergeProfileCatalogs(
@@ -265,8 +297,9 @@ const prewarmedAt = new Map<string, number>()
 
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
+  const options = profileTargetOptions(key)
 
-  if (key === normalizeProfileKey($activeGatewayProfile.get())) {
+  if (isActiveGatewayTarget(key, options)) {
     return
   }
 
@@ -277,9 +310,27 @@ export function prewarmProfileBackend(name: string): void {
   }
 
   prewarmedAt.set(key, now)
-  const options = profileTargetOptions(key)
-  const prewarm = options.localOnly ? openGatewayForProfile(key, options) : openGatewayForProfile(key)
+  const prewarm = options.localOnly || options.remoteOnly ? openGatewayForProfile(key, options) : openGatewayForProfile(key)
   prewarm.catch(() => undefined)
+}
+
+export function prewarmBackend(target: BackendTarget): void {
+  const options = backendOptions(target)
+  const key = 'default'
+
+  if (isActiveGatewayTarget(key, options)) {
+    return
+  }
+
+  const now = Date.now()
+  const throttleKey = `${key}:${target}`
+
+  if (now - (prewarmedAt.get(throttleKey) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
+    return
+  }
+
+  prewarmedAt.set(throttleKey, now)
+  openGatewayForProfile(key, options).catch(() => undefined)
 }
 
 let gatewaySwitch: Promise<void> | null = null
@@ -333,12 +384,7 @@ export async function ensureGatewayProfile(
   }
 
   const target = normalizeProfileKey(profile)
-
-  const alreadyActive =
-    normalizeProfileKey($activeGatewayProfile.get()) === target &&
-    $gateway.get() &&
-    (!options.localOnly || $connection.get()?.mode !== 'remote') &&
-    (!options.remoteOnly || $connection.get()?.mode !== 'local')
+  const alreadyActive = isActiveGatewayTarget(target, options) && $gateway.get()
 
   if (alreadyActive) {
     return
@@ -349,11 +395,7 @@ export async function ensureGatewayProfile(
   if (gatewaySwitch) {
     await gatewaySwitch.catch(() => undefined)
 
-    const alreadyActiveAfterWait =
-      normalizeProfileKey($activeGatewayProfile.get()) === target &&
-      $gateway.get() &&
-      (!options.localOnly || $connection.get()?.mode !== 'remote') &&
-      (!options.remoteOnly || $connection.get()?.mode !== 'local')
+    const alreadyActiveAfterWait = isActiveGatewayTarget(target, options) && $gateway.get()
 
     if (alreadyActiveAfterWait) {
       return
@@ -425,6 +467,21 @@ export function selectProfile(name: string): void {
   }
 
   void ensureGatewayProfile(target, options)
+}
+
+export function selectBackend(target: BackendTarget): void {
+  const profile = 'default'
+  const options = backendOptions(target)
+  const switching = !isActiveGatewayTarget(profile, options)
+
+  $showAllProfiles.set(false)
+  $newChatProfile.set(profile)
+
+  if (switching) {
+    requestFreshSession()
+  }
+
+  void ensureGatewayProfile(profile, options).catch(() => undefined)
 }
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse

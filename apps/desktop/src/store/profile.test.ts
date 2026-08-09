@@ -23,8 +23,11 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 const {
   $activeGatewayProfile,
   $profiles,
+  $freshSessionRequest,
   ensureGatewayProfile,
+  prewarmBackend,
   prewarmProfileBackend,
+  selectBackend,
   refreshProfiles,
   selectProfile,
   touchActiveGatewayBackend
@@ -66,6 +69,7 @@ beforeEach(() => {
   $activeGatewayProfile.set('default')
   $connection.set(localConn())
   $profiles.set([])
+  $freshSessionRequest.set(0)
   vi.mocked(getProfiles).mockReset()
   vi.mocked(getProfiles).mockResolvedValue({ profiles: [] })
   touchBackend.mockClear()
@@ -172,6 +176,49 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
   })
 })
 
+describe('selectBackend', () => {
+  it('selects the local root explicitly from a remote root', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(remoteConn({ profile: 'default' }))
+
+    selectBackend('local')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { localOnly: true })
+  })
+
+  it('selects the remote root explicitly from a local root', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+
+    selectBackend('remote')
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
+  })
+
+  it('requests a fresh session only when the backend target changes', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+
+    selectBackend('local')
+    expect($freshSessionRequest.get()).toBe(0)
+
+    selectBackend('remote')
+    expect($freshSessionRequest.get()).toBe(1)
+  })
+
+  it('leaves the active connection in place when the background switch fails', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+    ensureGatewayForProfile.mockRejectedValueOnce(new Error('remote unavailable'))
+
+    selectBackend('remote')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect($connection.get()?.mode).toBe('local')
+  })
+})
+
 describe('profile-scoped cache invalidation', () => {
   it('drops the memory graph cache when the active gateway profile changes', () => {
     $activeGatewayProfile.set('coder')
@@ -182,6 +229,26 @@ describe('profile-scoped cache invalidation', () => {
 })
 
 describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
+  it('opens the local root without activating it', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(remoteConn({ profile: 'default' }))
+
+    prewarmBackend('local')
+
+    expect(openGatewayForProfile).toHaveBeenCalledWith('default', { localOnly: true })
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+  })
+
+  it('opens the remote root without activating it', () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+
+    prewarmBackend('remote')
+
+    expect(openGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
+    expect(ensureGatewayForProfile).not.toHaveBeenCalled()
+  })
+
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
     prewarmProfileBackend('warm-basic')
 
