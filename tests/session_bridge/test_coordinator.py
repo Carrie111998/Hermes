@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -354,6 +355,12 @@ class _BacklogCodexAdapter:
         self.inventory_calls = 0
         self.projected_native_ids: list[str] = []
         self.find_calls: list[str] = []
+        self.stderr_lines: list[str] = []
+        self.stderr_tail_calls: list[int] = []
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        self.stderr_tail_calls.append(n)
+        return list(self.stderr_lines)
 
     def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
         self.inventory_calls += 1
@@ -435,6 +442,12 @@ class _FullHistoryCodexAdapter:
         self.incremental_inventory_calls = 0
         self.full_inventory_calls: list[bool] = []
         self.projected_native_ids: list[str] = []
+        self.stderr_lines: list[str] = []
+        self.stderr_tail_calls: list[int] = []
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        self.stderr_tail_calls.append(n)
+        return list(self.stderr_lines)
 
     def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
         del archived
@@ -448,7 +461,11 @@ class _FullHistoryCodexAdapter:
     def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
         self.projected_native_ids.append(summary.native_id)
         if summary.native_id in self.failing_native_ids:
-            raise RuntimeError("synthetic Codex projection failure")
+            raise RuntimeError(
+                "synthetic Codex projection failure "
+                "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 "
+                "at C:/private/codex/full-history.jsonl"
+            )
         return _scan_projection(Provider.CODEX, summary.native_id)
 
 
@@ -1560,7 +1577,69 @@ async def test_scan_all_history_is_newest_first_catalog_only_and_aggregates_fail
     assert health["recent_error_codes"] == [
         "claude_scan_failed",
         "codex_scan_failed",
+        "codex_scan_failed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_full_history_codex_scan_records_redacted_thread_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    native_path = "C:/private/codex/full-history.jsonl"
+    failing = _codex_summary("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 300.0)
+    healthy = _codex_summary("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 200.0)
+    adapter = _FullHistoryCodexAdapter(
+        active=[failing, healthy],
+        archived=[],
+        failing_native_ids={failing.native_id},
+    )
+    adapter.stderr_lines = [f"stderr {secret} {native_path}"]
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=_StateStore([]),
+        adapters={Provider.CODEX: adapter},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        summary = await coordinator.scan_all_history(Provider.CODEX)
+
+    assert summary.failed == 1
+    assert summary.indexed == 1
+    assert adapter.projected_native_ids == [failing.native_id, healthy.native_id]
+    assert adapter.stderr_tail_calls == [12]
+    health = coordinator.health()
+    assert "codex_scan_failed" in health["recent_error_codes"]
+    serialized = json.dumps(health, sort_keys=True)
+    assert secret not in serialized
+    assert native_path not in serialized
+    assert "task:" not in serialized
+    assert "codex_scan_diagnostic" in caplog.text
+    assert "full_history_project" in caplog.text
+    assert "codex_scan_failed" in caplog.text
+    assert "task:" in caplog.text
+    assert failing.native_id not in caplog.text
+    assert secret not in caplog.text
+    assert native_path not in caplog.text
+
+
+def test_codex_scan_stderr_diagnostics_are_bounded_and_redact_relative_paths() -> None:
+    from session_bridge.coordinator import _redacted_codex_stderr_tail
+
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    native_path = "logs/codex/private.jsonl"
+
+    class OversizedAdapter:
+        def stderr_tail(self, n: int = 20) -> list[str]:
+            assert n == 12
+            return [f"stderr {secret} {native_path}"] * 20
+
+    result = _redacted_codex_stderr_tail(OversizedAdapter())
+
+    assert len(result) == 8
+    assert all(secret not in line for line in result)
+    assert all(native_path not in line for line in result)
+    assert all("[REDACTED_PATH]" in line for line in result)
 
 
 @pytest.mark.asyncio
@@ -2079,6 +2158,59 @@ async def test_claude_bounded_scan_retires_exactly_absent_persisted_pending_sour
 
 
 @pytest.mark.asyncio
+async def test_immediate_codex_scan_records_redacted_thread_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    native_path = "C:/private/codex/immediate.jsonl"
+    failing = _codex_summary("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 300.0)
+    healthy = _codex_summary("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 200.0)
+
+    class FailingAdapter(_BacklogCodexAdapter):
+        def project_thread(self, thread_summary: CodexThreadSummary) -> SessionProjection:
+            projection = super().project_thread(thread_summary)
+            if thread_summary.native_id == failing.native_id:
+                raise RuntimeError(f"projection failed {secret} at {native_path}")
+            return projection
+
+    adapter = FailingAdapter(
+        inventory_batches=[[failing, healthy]],
+        summaries_by_native_id={
+            failing.native_id: failing,
+            healthy.native_id: healthy,
+        },
+        operations=[],
+    )
+    adapter.stderr_lines = [f"stderr {secret} {native_path}"]
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=_RecordingStore(),
+        adapters={Provider.CODEX: adapter},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        result = await coordinator.scan_once(Provider.CODEX)
+
+    assert result.failed == 1
+    assert result.indexed == 1
+    assert adapter.projected_native_ids == [failing.native_id, healthy.native_id]
+    assert adapter.stderr_tail_calls == [12]
+    health = coordinator.health()
+    assert "codex_scan_failed" in health["recent_error_codes"]
+    serialized = json.dumps(health, sort_keys=True)
+    assert secret not in serialized
+    assert native_path not in serialized
+    assert "task:" not in serialized
+    assert "codex_scan_diagnostic" in caplog.text
+    assert "immediate_project" in caplog.text
+    assert "codex_scan_failed" in caplog.text
+    assert "task:" in caplog.text
+    assert failing.native_id not in caplog.text
+    assert secret not in caplog.text
+    assert native_path not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_loss() -> (
     None
 ):
@@ -2154,6 +2286,53 @@ async def test_codex_bounded_scan_stages_changed_inventory_before_seen_cache_los
         "indexed_total": 3,
         "remaining": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_persistent_codex_scan_records_redacted_thread_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
+    native_path = "C:/private/codex/persistent.jsonl"
+    summary = _codex_summary("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 300.0)
+    operations: list[tuple[object, ...]] = []
+
+    class FailingAdapter(_BacklogCodexAdapter):
+        def project_thread(self, thread_summary: CodexThreadSummary) -> SessionProjection:
+            super().project_thread(thread_summary)
+            raise RuntimeError(f"projection failed {secret} at {native_path}")
+
+    adapter = FailingAdapter(
+        inventory_batches=[[summary]],
+        summaries_by_native_id={summary.native_id: summary},
+        operations=operations,
+    )
+    adapter.stderr_lines = [f"stderr {secret} {native_path}"]
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=_StateStore(operations),
+        adapters={Provider.CODEX: adapter},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        result = await coordinator.scan_once(Provider.CODEX)
+
+    assert result.failed == 1
+    assert result.indexed == 0
+    assert adapter.stderr_tail_calls == [12]
+    health = coordinator.health()
+    assert "codex_scan_failed" in health["recent_error_codes"]
+    serialized = json.dumps(health, sort_keys=True)
+    assert secret not in serialized
+    assert native_path not in serialized
+    assert "task:" not in serialized
+    assert "codex_scan_diagnostic" in caplog.text
+    assert "persistent_project" in caplog.text
+    assert "codex_scan_failed" in caplog.text
+    assert "task:" in caplog.text
+    assert summary.native_id not in caplog.text
+    assert secret not in caplog.text
+    assert native_path not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -574,6 +574,7 @@ def test_recent_error_history_does_not_turn_current_work_error() -> None:
     ("capability", "code"),
     [
         ("catalog", "scan_failed"),
+        ("mirror_jobs", "codex_scan_failed"),
         ("sidebar_registration", "desktop_offline"),
         ("sidebar_hydration", "hydration_send_ambiguous"),
         ("claude_visibility", "claude_executable_unavailable"),
@@ -587,6 +588,8 @@ def test_registered_public_failure_codes_are_admitted(
         inputs["coordinator_health"]["providers"]["claude"][
             "degraded_reason"
         ] = code
+    elif capability == "mirror_jobs":
+        inputs["coordinator_health"]["recent_error_codes"] = [code]
     elif capability == "sidebar_registration":
         inputs["sidebar_status"]["recent_error_codes"] = [code]
     elif capability == "sidebar_hydration":

@@ -45,6 +45,17 @@ class FakeRequestClient:
         return deepcopy(response)
 
 
+class FakeStderrClient(FakeRequestClient):
+    def __init__(self, stderr_lines: list[str]) -> None:
+        super().__init__({})
+        self.stderr_lines = stderr_lines
+        self.stderr_tail_calls: list[int] = []
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        self.stderr_tail_calls.append(n)
+        return list(self.stderr_lines)
+
+
 class FakeInitializingClient(FakeRequestClient):
     def __init__(self, responses: dict[str, list[dict[str, Any] | Exception]]) -> None:
         super().__init__(responses)
@@ -100,6 +111,20 @@ def _read_with_items(*items: dict[str, Any]) -> dict[str, Any]:
             "turns": [{"id": "turn-1", "items": list(items)}],
         }
     }
+
+
+def test_source_adapter_forwards_bounded_stderr_tail() -> None:
+    client = FakeStderrClient(["first", "second"])
+    adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    assert adapter.stderr_tail(12) == ["first", "second"]
+    assert client.stderr_tail_calls == [12]
+
+
+def test_source_adapter_treats_missing_stderr_accessor_as_empty() -> None:
+    adapter = CodexSourceAdapter(FakeRequestClient({}), marker_secret=SECRET)
+
+    assert adapter.stderr_tail(12) == []
 
 
 class TestInventory:

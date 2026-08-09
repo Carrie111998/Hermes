@@ -519,6 +519,10 @@ class CodexSourceAdapter:
         else:
             raise TypeError("Codex trusted origins must be a mapping or callable")
 
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        method = getattr(self._client, "stderr_tail", None)
+        return list(method(n)) if callable(method) else []
+
     def _load_trusted_origins(self) -> dict[str, str]:
         value = self._trusted_origins_resolver()
         if not isinstance(value, Mapping):

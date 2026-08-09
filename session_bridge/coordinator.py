@@ -6,14 +6,17 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 import hashlib
 import inspect
+import logging
 import math
 import os
+import re
 from pathlib import Path
 import time
 from typing import Any, NoReturn, Protocol, cast
 import uuid
 
 import hermes_constants
+from agent.redact import redact_sensitive_text
 
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
 from .claude_visibility import (
@@ -79,6 +82,7 @@ from .store import (
     SessionBridgeStore,
     SidebarSource,
     SidebarSourcePage,
+    redact_codex_thread_id,
 )
 from .worktree import (
     WorktreeSnapshot,
@@ -86,6 +90,9 @@ from .worktree import (
     capture_worktree_snapshot,
     validate_worktree_snapshot,
 )
+
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -887,6 +894,19 @@ class _SidebarExecutor(Protocol):
 
 _ProviderHealth = dict[str, float | str | None]
 _RECENT_ERROR_LIMIT = 20
+_CODEX_SCAN_FAILURE_CODE = "codex_scan_failed"
+_CODEX_SCAN_STAGES = frozenset({
+    "full_history_project",
+    "immediate_project",
+    "persistent_project",
+})
+_CODEX_STDERR_TAIL_LINES = 12
+_CODEX_DIAGNOSTIC_MAX_LINES = 8
+_CODEX_DIAGNOSTIC_MAX_CHARS = 2048
+_PATH_FRAGMENT_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]|/|(?:\.{1,2}|~)[\\/]|\b[^\s'\"<>|\\/]+[\\/])"
+    r"(?:[^\s'\"<>|\\/]+[\\/])*[^\s'\"<>|]*"
+)
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
 _BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _RATE_STATE_KEY = "session-bridge:mirror-rate"
@@ -4278,7 +4298,13 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
+            except Exception as exc:
+                self._record_codex_scan_diagnostic(
+                    stage="full_history_project",
+                    native_id=getattr(thread_summary, "native_id", None),
+                    exc=exc,
+                    adapter=adapter,
+                )
                 failed += 1
                 continue
             indexed += 1
@@ -4376,7 +4402,13 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
+            except Exception as exc:
+                self._record_codex_scan_diagnostic(
+                    stage="immediate_project",
+                    native_id=getattr(thread_summary, "native_id", None),
+                    exc=exc,
+                    adapter=adapter,
+                )
                 failed += 1
                 continue
             indexed += 1
@@ -4751,7 +4783,13 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
+            except Exception as exc:
+                self._record_codex_scan_diagnostic(
+                    stage="persistent_project",
+                    native_id=native_id,
+                    exc=exc,
+                    adapter=adapter,
+                )
                 return ScanSummary(
                     provider=provider,
                     discovered=len(staged_ids),
@@ -4992,8 +5030,60 @@ class SessionBridgeCoordinator:
         self._recent_error_codes.append(code)
         del self._recent_error_codes[:-_RECENT_ERROR_LIMIT]
 
+    def _record_codex_scan_diagnostic(
+        self,
+        *,
+        stage: str,
+        native_id: object,
+        exc: BaseException,
+        adapter: object,
+    ) -> None:
+        if stage not in _CODEX_SCAN_STAGES:
+            raise ValueError("invalid Codex scan diagnostic stage")
+        native_tag = redact_codex_thread_id(native_id) or "unknown"
+        exception_detail = _redacted_codex_diagnostic_text(str(exc))
+        stderr = _redacted_codex_stderr_tail(adapter)
+        _LOG.warning(
+            "codex_scan_diagnostic stage=%s code=%s native=%s detail=%r stderr=%r stderr_lines=%d",
+            stage,
+            _CODEX_SCAN_FAILURE_CODE,
+            native_tag,
+            exception_detail,
+            stderr,
+            len(stderr),
+        )
+        self._record_error_code(_CODEX_SCAN_FAILURE_CODE)
+
     def _elapsed_ms(self, started: float) -> float:
         return max(0.0, (float(self._monotonic()) - started) * 1000.0)
+
+
+def _redacted_codex_diagnostic_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    redacted = redact_sensitive_text(value, force=True, redact_url_credentials=True)
+    redacted = _PATH_FRAGMENT_RE.sub("[REDACTED_PATH]", redacted)
+    return redacted[:_CODEX_DIAGNOSTIC_MAX_CHARS]
+
+
+def _redacted_codex_stderr_tail(adapter: object) -> tuple[str, ...]:
+    try:
+        getter = getattr(adapter, "stderr_tail", None)
+        raw = getter(_CODEX_STDERR_TAIL_LINES) if callable(getter) else ()
+    except Exception:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    safe: list[str] = []
+    for line in raw[:_CODEX_STDERR_TAIL_LINES]:
+        if not isinstance(line, str):
+            continue
+        redacted = _redacted_codex_diagnostic_text(line.strip())
+        if redacted:
+            safe.append(redacted)
+        if len(safe) == _CODEX_DIAGNOSTIC_MAX_LINES:
+            break
+    return tuple(safe)
 
 
 def _zero_scan(provider: Provider | None) -> ScanSummary:
