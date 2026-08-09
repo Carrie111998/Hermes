@@ -1798,10 +1798,11 @@ function updateGateDeps() {
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
-async function waitForUpdateToFinish() {
+async function waitForUpdateToFinish(isCancelled = () => false) {
   let announced = false
 
   const outcome = await waitForUpdateClearance(updateGateDeps(), {
+    isCancelled,
     onWaitTick: async reason => {
       if (!announced) {
         announced = true
@@ -1838,6 +1839,10 @@ async function waitForUpdateToFinish() {
     }
   } catch (err) {
     rememberLog(`[updates] could not read hand-off result: ${err.message}`)
+  }
+
+  if (outcome === 'cancelled') {
+    throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
   }
 
   if (outcome === 'clear') {
@@ -8266,7 +8271,8 @@ async function spawnPoolBackend(profile, entry) {
   {
     let poolAnnounced = false
 
-    await waitForUpdateClearance(updateGateDeps(), {
+    const updateClearance = await waitForUpdateClearance(updateGateDeps(), {
+      isCancelled: () => quitTeardown.started || backendPool.get(profile) !== entry,
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true
@@ -8276,6 +8282,10 @@ async function spawnPoolBackend(profile, entry) {
       pollMs: UPDATE_WAIT_POLL_MS,
       timeoutMs: UPDATE_WAIT_TIMEOUT_MS
     })
+
+    if (updateClearance === 'cancelled') {
+      throw new Error('Hermes backend start was cancelled because its profile connection changed or the Desktop is quitting.')
+    }
   }
 
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
@@ -8578,7 +8588,7 @@ async function startHermes() {
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
       // return before this waiter; local starts park until the updater exits.
-      waitForLocalStart: waitForUpdateToFinish
+      waitForLocalStart: () => waitForUpdateToFinish(() => quitTeardown.started)
     })
 
     if (setup.kind === 'remote') {
