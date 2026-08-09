@@ -248,9 +248,9 @@ const ROUTES = [
   },
   {
     name: 'a profile exposed by the primary remote backend shares it, scoped per request',
-    profile: 'ultra',
+    profile: 'remote-agent',
     opts: { primaryProfile: 'remote', primaryBackendRemote: true, profileRemoteOverride: false },
-    expected: { backend: 'primary', descriptorProfile: 'ultra', scopePath: true }
+    expected: { backend: 'primary', descriptorProfile: 'remote-agent', scopePath: true }
   },
   {
     name: 'a known local profile stays local while the primary profile is remote',
@@ -320,12 +320,12 @@ test('pathWithGlobalRemoteProfile appends profile in global remote mode', () => 
 
 test('pathWithGlobalRemoteProfile scopes profiles exposed by a primary remote backend', () => {
   assert.equal(
-    pathWithGlobalRemoteProfile('/api/model/info', 'ultra', {
+    pathWithGlobalRemoteProfile('/api/model/info', 'remote-agent', {
       primaryBackendRemote: true,
       primaryProfile: 'remote',
       profileRemoteOverride: false
     }),
-    '/api/model/info?profile=ultra'
+    '/api/model/info?profile=remote-agent'
   )
 })
 
@@ -455,8 +455,8 @@ test('buildGatewayWsUrl scopes a shared backend to the selected profile', () => 
   const buildScopedWsUrl = buildGatewayWsUrl as unknown as (baseUrl: string, token: string, profile?: string) => string
 
   assert.equal(
-    buildScopedWsUrl('https://host', 'token', 'ultra'),
-    'wss://host/api/ws?token=token&profile=ultra'
+    buildScopedWsUrl('https://host', 'token', 'remote-agent'),
+    'wss://host/api/ws?token=token&profile=remote-agent'
   )
 })
 
@@ -480,8 +480,8 @@ test('buildGatewayWsUrlWithTicket scopes a shared backend to the selected profil
   ) => string
 
   assert.equal(
-    buildScopedWsUrl('https://host', 'ticket', 'ultra'),
-    'wss://host/api/ws?ticket=ticket&profile=ultra'
+    buildScopedWsUrl('https://host', 'ticket', 'remote-agent'),
+    'wss://host/api/ws?ticket=ticket&profile=remote-agent'
   )
 })
 
