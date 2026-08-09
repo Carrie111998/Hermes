@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelOptions } from '@/hermes'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import {
   _resetLastLoadedProvidersForTests,
@@ -14,7 +15,8 @@ import {
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
 vi.mock('@/hermes', () => ({
-  getGlobalModelOptions: vi.fn(() => Promise.resolve(globalOptions))
+  getGlobalModelOptions: vi.fn(() => Promise.resolve(globalOptions)),
+  setApiRequestProfile: vi.fn()
 }))
 
 describe('requestModelOptions', () => {
@@ -153,6 +155,11 @@ describe('sessionProviderAdoptableFromCache', () => {
 
   beforeEach(() => {
     _resetLastLoadedProvidersForTests()
+    $activeGatewayProfile.set('default')
+  })
+
+  afterEach(() => {
+    $activeGatewayProfile.set('default')
   })
 
   it('adopts when no catalog has loaded yet', () => {
@@ -172,5 +179,47 @@ describe('sessionProviderAdoptableFromCache', () => {
     expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
     expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
     expect(sessionProviderAdoptableFromCache('anthropic')).toBe(false)
+  })
+
+  it('keys the mirror by profile: another profile catalog never leaks in', async () => {
+    await requestModelOptions({
+      gateway: {
+        request: vi.fn(() =>
+          Promise.resolve({ model: 'deepseek-v4-flash', provider: 'deepseek', providers: cachedCatalog })
+        )
+      } as never,
+      sessionId: null
+    })
+    // Profile 'default' now has a loaded catalog that would block xai-oauth.
+
+    $activeGatewayProfile.set('compass')
+
+    // The active profile has no entry yet — conservative, nothing to prove.
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(true)
+    expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
+
+    // A catalog fetched for 'compass' lands in its own slot and drives its own
+    // decisions while active...
+    await requestModelOptions({
+      gateway: {
+        request: vi.fn(() =>
+          Promise.resolve({
+            model: 'claude-sonnet-4.6',
+            provider: 'anthropic',
+            providers: [{ name: 'Anthropic', slug: 'anthropic', models: ['claude-sonnet-4.6'] }]
+          })
+        )
+      } as never,
+      sessionId: null
+    })
+    expect(sessionProviderAdoptableFromCache('anthropic')).toBe(true)
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
+
+    // ...while 'default' keeps its own view when re-activated (anthropic is
+    // absent from its catalog, so it must NOT inherit compass's verdict).
+    $activeGatewayProfile.set('default')
+    expect(sessionProviderAdoptableFromCache('anthropic')).toBe(false)
+    expect(sessionProviderAdoptableFromCache('xai-oauth')).toBe(false)
+    expect(sessionProviderAdoptableFromCache('deepseek')).toBe(true)
   })
 })
