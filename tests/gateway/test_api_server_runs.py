@@ -332,6 +332,17 @@ class TestStartRun:
         assert set(accepted) == TRUSTED_RUNTIME_ENV_KEYS
 
     @pytest.mark.asyncio
+    async def test_start_rejects_non_object_json_body(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs", json=[])
+            payload = await response.json()
+
+        assert response.status == 400
+        assert payload["error"]["type"] == "invalid_request_error"
+        assert payload["error"]["message"] == "request body must be an object"
+
+    @pytest.mark.asyncio
     async def test_run_output_exactly_redacts_scoped_api_key(self, adapter):
         app = _create_runs_app(adapter)
         token = "opaque-paperclip-test-value"

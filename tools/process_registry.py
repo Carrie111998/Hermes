@@ -1025,9 +1025,16 @@ class ProcessRegistry:
         # explicitly empty managed scope, removes ambient PAPERCLIP_* values
         # instead of inheriting a stale gateway identity.
         from agent.redact import get_exact_redactions
+        from gateway.runtime_context import get_runtime_env
         from tools.environments.local import _make_run_env
 
+        runtime_env = get_runtime_env()
         spawn_env = _make_run_env(env_vars or {})
+        # A managed request scope is already authoritative in ``spawn_env``.
+        # Do not run login/interactive startup files afterward: they could read
+        # or overwrite the request credential before the user command starts.
+        shell_flags = "-c" if runtime_env is not None else "-lic"
+        shell_command = f"set +m; {safe_command}"
 
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -1050,7 +1057,7 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = dict(spawn_env)
                 pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+                pty_argv = [user_shell, shell_flags, shell_command]
 
                 # Cgroup isolation for PTY mode (#70716, reviewer gap #1):
                 # Wrap the PTY command in a systemd scope so interactive
@@ -1143,7 +1150,7 @@ class ProcessRegistry:
         # kills only the worker instead of taking down the whole gateway
         # cgroup (and the messaging control plane with it).  We only do this
         # for both pipe mode and the PTY path above.
-        shell_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+        shell_argv = [user_shell, shell_flags, shell_command]
         use_systemd_scope = False
         under_supervisor = False
         try:

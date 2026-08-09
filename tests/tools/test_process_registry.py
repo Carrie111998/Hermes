@@ -704,6 +704,51 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+
+    @pytest.mark.parametrize(
+        ("runtime_env", "expected"),
+        [
+            ({}, "missing"),
+            (
+                {"PAPERCLIP_API_KEY": "scoped-token"},
+                "PAPERCLIP_API_KEY=scoped-token",
+            ),
+        ],
+    )
+    def test_spawn_local_pipe_restores_authoritative_scope_after_login_startup(
+        self, registry, tmp_path, runtime_env, expected
+    ):
+        from gateway.runtime_context import bind_runtime_env
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".bash_profile").write_text(
+            "printf 'startup=%s\\n' \"${PAPERCLIP_API_KEY-missing}\"\n"
+            "export PAPERCLIP_API_KEY=stale-login-token\n"
+            "export Paperclip_Api_Key=mixed-case-stale-login-token\n",
+            encoding="utf-8",
+        )
+        command = (
+            "python3 -c \"import os; "
+            "matches=sorted(f'{k}={v}' for k,v in os.environ.items() "
+            "if k.upper() == 'PAPERCLIP_API_KEY'); "
+            "print('|'.join(matches) or 'missing')\""
+        )
+
+        with patch.dict(
+            os.environ,
+            {"PATH": os.environ.get("PATH", ""), "HOME": str(home)},
+            clear=True,
+        ), patch("tools.process_registry._find_shell", return_value="/bin/bash"), patch.object(
+            registry, "_write_checkpoint"
+        ):
+            with bind_runtime_env(runtime_env):
+                session = registry.spawn_local(command, cwd=str(tmp_path))
+                result = registry.wait(session.id, timeout=10)
+
+        assert result["status"] == "exited"
+        assert result["output"].splitlines() == [expected]
+
     def test_spawn_local_pipe_uses_authoritative_request_scope(self, registry):
         from agent.redact import bind_exact_redactions
         from gateway.runtime_context import bind_runtime_env
@@ -712,6 +757,7 @@ class TestSpawnEnvSanitization:
         secret = "opaque-scoped-token-for-background-output"
 
         def fake_popen(cmd, **kwargs):
+            captured["cmd"] = cmd
             captured["env"] = kwargs["env"]
             proc = MagicMock()
             proc.pid = 4321
@@ -741,6 +787,8 @@ class TestSpawnEnvSanitization:
 
         assert captured["env"]["PAPERCLIP_API_KEY"] == "scoped-token"
         assert "PAPERCLIP_RUN_ID" not in captured["env"]
+        assert "scoped-token" not in captured["cmd"][-1]
+        assert captured["cmd"][1] == "-c"
         assert session.exact_redactions == (secret,)
 
     def test_spawn_local_pty_uses_authoritative_empty_request_scope(self, registry):
@@ -767,8 +815,10 @@ class TestSpawnEnvSanitization:
                 registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
 
         child_env = spawn.call_args.kwargs["env"]
+        child_argv = spawn.call_args.args[0]
         assert "PAPERCLIP_API_KEY" not in child_env
         assert "PAPERCLIP_RUN_ID" not in child_env
+        assert child_argv[1] == "-c"
 
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}

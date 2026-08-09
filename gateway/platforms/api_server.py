@@ -75,6 +75,8 @@ _RUN_RUNTIME_ENV_MAX_BYTES = 32 * 1024
 
 def _parse_run_runtime_env(body: Any) -> tuple[dict[str, str], Optional[str]]:
     """Validate the narrow subprocess environment accepted by ``/v1/runs``."""
+    if not isinstance(body, dict):
+        return {}, "request body must be an object"
     raw = body.get("runtime_env")
     environment = body.get("environment")
     if raw is not None and environment is not None:
