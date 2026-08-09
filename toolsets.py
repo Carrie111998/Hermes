@@ -74,6 +74,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # MoA consultation (gated via check_fn on the default MoA preset)
     "consult_moa",
+    # Durable dev-pipeline jobs (gated via check_fn on Cursor CLI + kanban)
+    "delegate_development",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -307,6 +309,15 @@ TOOLSETS = {
         "description": "Consult configured Mixture-of-Agents advisors while the acting model retains control",
         "tools": ["consult_moa"],
         "includes": []
+    },
+
+    "dev-pipeline": {
+        "description": (
+            "Durable automated development jobs — the dev-pipeline lane that "
+            "plans, implements, verifies, reviews, and opens draft PRs"
+        ),
+        "tools": ["delegate_development"],
+        "includes": [],
     },
 
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
