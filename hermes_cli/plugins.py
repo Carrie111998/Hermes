@@ -1590,34 +1590,29 @@ class PluginManager:
         if _env_enabled("HERMES_SAFE_MODE"):
             return False
 
-        plugins_config = raw_config.get("plugins")
-        if not isinstance(plugins_config, dict):
-            return False
-        enabled_value = plugins_config.get("enabled")
-        if not isinstance(enabled_value, list):
-            return False
-        enabled = {value for value in enabled_value if isinstance(value, str)}
-        disabled_value = plugins_config.get("disabled", [])
-        disabled = (
-            {value for value in disabled_value if isinstance(value, str)}
-            if isinstance(disabled_value, list)
-            else set()
-        )
-        if not enabled:
-            return False
+        from hermes_cli.plugin_activation import PluginActivationState
 
-        winners: Dict[str, PluginManifest] = {}
+        activation = PluginActivationState.from_config(raw_config)
+        grouped: Dict[str, List[PluginManifest]] = {}
         for manifest in self._collect_directory_manifests():
-            winners[manifest.key or manifest.name] = manifest
+            grouped.setdefault(manifest.key or manifest.name, []).append(manifest)
 
-        for manifest in winners.values():
-            if not manifest.portable:
+        for candidates in grouped.values():
+            selection = resolve_plugin_candidate_winner(
+                candidates,
+                lambda candidate: activation.status(
+                    name=candidate.name,
+                    key=candidate.key or candidate.name,
+                    source=candidate.source,
+                    kind=candidate.kind,
+                ),
+            )
+            if selection is None:
+                continue
+            manifest, status = selection
+            if status != "enabled" or not manifest.portable:
                 continue
             lookup_key = manifest.key or manifest.name
-            if lookup_key in disabled or manifest.name in disabled:
-                continue
-            if lookup_key not in enabled and manifest.name not in enabled:
-                continue
             try:
                 from hermes_cli.agent_plugins import _discover_mcp
 

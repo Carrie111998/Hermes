@@ -159,6 +159,64 @@ class TestPluginDiscovery:
         assert manager._plugins["native"].enabled is True
         assert manager._plugins["native"].module is not None
 
+    def test_portable_mcp_probe_uses_active_source_winner(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.agent_plugins import MCP_SCHEMA_V1, PLUGIN_SCHEMA_V1
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        portable = home / "plugins" / "cat" / "plug"
+        portable.mkdir(parents=True)
+        (portable / "plugin.json").write_text(
+            json.dumps({"$schema": PLUGIN_SCHEMA_V1, "name": "portable.test"})
+        )
+        (portable / "mcp.json").write_text(
+            json.dumps(
+                {
+                    "$schema": MCP_SCHEMA_V1,
+                    "mcpServers": {
+                        "remote": {
+                            "type": "streamable-http",
+                            "url": "https://example.test/mcp",
+                        }
+                    },
+                }
+            )
+        )
+        home.mkdir(exist_ok=True)
+        config = {"plugins": {"enabled": ["portable.test"]}}
+        (home / "config.yaml").write_text(yaml.safe_dump(config))
+
+        project = tmp_path / "project"
+        shadow = project / ".hermes" / "plugins" / "cat" / "plug"
+        shadow.mkdir(parents=True)
+        (shadow / "plugin.yaml").write_text(
+            yaml.safe_dump({"name": "native-shadow", "version": "1.0.0"})
+        )
+        (shadow / "__init__.py").write_text("def register(ctx):\n    pass\n")
+
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "1")
+        monkeypatch.chdir(project)
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
+
+        manager = PluginManager()
+        assert manager.has_enabled_portable_mcp(config)
+
+        manager.discover_and_load()
+
+        winner = manager._plugins["cat/plug"]
+        assert winner.enabled is True
+        assert winner.manifest.name == "portable.test"
+        [server] = manager.get_portable_mcp_servers().values()
+        assert server == {
+            "url": "https://example.test/mcp",
+            "strict_redirect_headers": True,
+        }
+
     def test_disabled_portable_plugin_registers_nothing(self, tmp_path, monkeypatch):
         from hermes_cli.agent_plugins import PLUGIN_SCHEMA_V1
         from hermes_cli import plugins as plugins_mod
