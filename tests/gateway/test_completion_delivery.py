@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _drain_gateway_watch_events
 from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
@@ -84,6 +84,26 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _watch_event(*, event_type="watch_match", session_id="proc_watch"):
+    event = {
+        "type": event_type,
+        "session_id": session_id,
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "platform": "telegram",
+        "chat_id": "12345",
+        "thread_id": "678",
+        "user_id": "owner-7",
+        "user_name": "Owner",
+        "message_id": "message-9",
+        "command": "claude",
+    }
+    if event_type == "watch_match":
+        event.update(pattern="Approve?", output="Approve? [y/N]", suppressed=0)
+    else:
+        event["message"] = "Watch patterns disabled"
+    return event
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -110,6 +130,117 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.parametrize("event_type", ["watch_match", "watch_disabled"])
+def test_idle_watch_event_wakes_exact_route_once(
+    monkeypatch, isolated_registry, event_type,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_watch_event(event_type=event_type))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert delivered.message_id == "message-9"
+    assert delivered.source == SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id="678",
+        user_id="owner-7",
+        user_name="Owner",
+    )
+    assert isolated.empty()
+    assert _drain_gateway_watch_events(isolated) == []
+
+
+def test_failed_idle_watch_injection_is_requeued_and_retried(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_watch_event())
+
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
+    )
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=3)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    assert isolated.empty()
+
+
+def test_idle_watch_and_async_delegation_events_coexist(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_watch_event())
+    isolated.put(_async_event("deleg_coexists"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    delivered_texts = [call.args[0].text for call in adapter.handle_message.await_args_list]
+    assert any("matched watch pattern" in text for text in delivered_texts)
+    assert any("Investigate flaky test" in text for text in delivered_texts)
+    assert isolated.empty()
+
+
+def test_idle_watcher_preserves_process_completion_and_drops_unknown_events(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    completion = _completion_event(started_at=10.0)
+    isolated.put(completion)
+    isolated.put({"type": "unsupported"})
+    isolated.put(_watch_event(session_id="proc_after_unknown"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    assert isolated.qsize() == 1
+    assert isolated.get_nowait() is completion
+
+
+def test_unroutable_idle_watch_does_not_block_routable_event(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    unroutable = _watch_event(session_id="proc_unroutable")
+    unroutable.update(session_key="", platform="", chat_id="", thread_id="")
+    isolated.put(unroutable)
+    isolated.put(_watch_event(session_id="proc_routable"))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    assert isolated.empty()
 
 
 def test_unroutable_async_event_is_not_requeued_forever(
