@@ -93,8 +93,10 @@ DEV_BLOCK_KINDS = frozenset(
         "acceptance_unverifiable",
         "lane_unavailable",
         "review_unavailable",
+        "review_failed",
         "secret_in_diff",
         "executor_restarted",
+        "verification_regression",
     }
 )
 
@@ -2006,6 +2008,7 @@ class DevExecutor:
             git_command(["checkout", str(base)], cwd=verify_base_dir)
             base_evidence = logs_root / "verify-base"
             self._heartbeat_now(conn, task_id)
+            base_timed_out = False
             try:
                 base_results = run_verification(
                     verify_base_dir,
@@ -2017,6 +2020,7 @@ class DevExecutor:
             except subprocess.TimeoutExpired as exc:
                 self._heartbeat_now(conn, task_id)
                 base_results = [command_result_from_timeout(exc, base_evidence)]
+                base_timed_out = True
                 record_dev_phase(
                     conn,
                     task_id,
@@ -2025,15 +2029,19 @@ class DevExecutor:
                     {
                         "acceptance_timeout": True,
                         "command": base_results[0].command,
+                        "base_verify": True,
                     },
                 )
             else:
                 self._heartbeat_now(conn, task_id)
-            outcome = classify_verification(cand_results, base_results)
             verification["base"] = [
                 {"command": r.command, "exit_code": r.exit_code, "log": str(r.output_path)}
                 for r in base_results
             ]
+            if base_timed_out:
+                outcome = "regression"
+            else:
+                outcome = classify_verification(cand_results, base_results)
             verification["outcome"] = outcome
 
         meta = merge_pipeline_state(meta, {"verification": verification, "mechanical_pass": outcome == "pass"})

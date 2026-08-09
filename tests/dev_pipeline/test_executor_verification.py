@@ -256,3 +256,92 @@ def test_verifying_exhausted_regression_emits_typed_dev_blocked_event(kanban_hom
 
     assert "verification_regression" in _dev_block_kinds(conn, task_id)
     conn.close()
+
+
+def test_verifying_base_timeout_forces_regression_not_baseline_failure(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs = tmp_path / "logs"
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body=json.dumps({"task": "fix bug"}),
+        workspace_kind="scratch",
+        board="dev",
+    )
+    kb.claim_task(conn, task_id, claimer="dev-executor")
+    kb._end_run(
+        conn,
+        task_id,
+        outcome="completed",
+        summary="attempt 1",
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "run_kind": ex.RUN_KIND_ATTEMPT,
+                "unit_started": True,
+                "candidate_commit": "bbb",
+            },
+        ),
+    )
+    pipeline_run = ex.start_pipeline_run(
+        conn,
+        task_id,
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "phase": ex.PHASE_VERIFYING,
+                "contract": {
+                    "task_summary": "x",
+                    "acceptance_commands": ["pytest"],
+                },
+                "repo_path": str(repo),
+                "logs_root": str(logs),
+                "base_commit": "aaa",
+                "candidate_commit": "bbb",
+            },
+        ),
+    )
+    meta = ex.load_run_metadata(conn, pipeline_run)
+    executor = ex.DevExecutor(_executor_cfg())
+    executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_VERIFYING)
+
+    cand_fail = [
+        ex.CommandResult(
+            command="pytest",
+            exit_code=1,
+            output_path=Path("/tmp/cand.log"),
+            output_preview="fail",
+        )
+    ]
+    base_timeout = subprocess.TimeoutExpired(cmd="pytest", timeout=600)
+    verify_calls = {"count": 0}
+
+    def fake_verification(*_args, **_kwargs):
+        verify_calls["count"] += 1
+        if verify_calls["count"] == 1:
+            return cand_fail
+        raise base_timeout
+
+    with patch.object(ex, "git_command"):
+        with patch.object(ex, "git_head_sha", return_value="bbb"):
+            with patch.object(ex, "run_verification", side_effect=fake_verification):
+                with patch.object(ex, "unified_diff", return_value="diff"):
+                    with patch.object(executor, "_spawn_attempt") as mock_spawn:
+                        executor._phase_verifying(
+                            conn,
+                            task_id,
+                            pipeline_run,
+                            meta,
+                            ex.pipeline_state(meta),
+                        )
+                        mock_spawn.assert_called_once()
+
+    saved = ex.load_run_metadata(conn, pipeline_run)
+    verification = ex.pipeline_state(saved).get("verification") or {}
+    assert verification.get("outcome") == "regression"
+    assert verification.get("outcome") != "baseline_failure"
+    assert ex.pipeline_state(saved).get("mechanical_pass") is False
+    conn.close()
