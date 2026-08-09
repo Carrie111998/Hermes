@@ -85,6 +85,22 @@ _PROFILE_TARGETS: tuple[tuple[str, str, str, Criticality, str], ...] = (
 )
 
 
+def _parse_deployment_asset(raw: bytes, label: str) -> list[str]:
+    try:
+        try:
+            data = plistlib.loads(raw)
+            args = data.get("ProgramArguments")
+        except (plistlib.InvalidFileException, ValueError):
+            args = json.loads(raw.decode("utf-8"))
+        if isinstance(args, dict):
+            args = args.get("ProgramArguments")
+        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise ValueError("deployment arguments invalid")
+        return args
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, plistlib.InvalidFileException) as exc:
+        raise ValueError("deployment asset rejected") from exc
+
+
 def bootstrap_gateway_registry() -> FleetRegistry:
     """Return the fixed five-profile inventory recorded during Phase 0."""
     def spec_for(profile, label, logs_path, criticality, label_profile):
@@ -97,9 +113,9 @@ def bootstrap_gateway_registry() -> FleetRegistry:
                 try:
                     data = plistlib.loads(raw)
                     args = data.get("ProgramArguments")
-                except (plistlib.InvalidFileException, ValueError):
-                    data = {"Label": label, "ProgramArguments": json.loads(raw.decode("utf-8"))}
-                    args = data["ProgramArguments"]
+                except (plistlib.InvalidFileException, ValueError, UnicodeDecodeError, TypeError):
+                    args = _parse_deployment_asset(raw, label)
+                    data = {"Label": label, "ProgramArguments": args}
                 if data.get("Label") == label and isinstance(args, list) and all(isinstance(x, str) for x in args):
                     expected = ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
                     if profile == "default" and args != expected:

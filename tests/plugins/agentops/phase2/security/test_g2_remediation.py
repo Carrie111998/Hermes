@@ -478,3 +478,11 @@ def test_factory_rejects_cron_budget_expansion():
     from plugins.agentops.control.observer_models import CronExecution, CronObservation
     with pytest.raises(ManifestValidationError):
         build_collector("cron", target_kind=TargetKind.CRON, source_path=Path("/tmp/status.json"), observation=CronObservation(CronExecution("j", datetime.now(timezone.utc), 0, True), ()), max_assertions=99)
+
+
+def test_default_deployment_asset_parser_rejects_malformed_and_wrong_arguments():
+    from plugins.agentops.control.registry import _parse_deployment_asset
+    expected = ["/Users/molly/Desktop/Hermes/venv/bin/python", "-m", "hermes_cli.main", "gateway", "run", "--replace"]
+    assert _parse_deployment_asset(("[" + ",".join('"'+item+'"' for item in expected) + "]").encode(), "ai.hermes.gateway") == expected
+    for raw in (b"not-json", b"\xff\xfe", b'{"ProgramArguments": [1]}'):
+        with pytest.raises(ValueError): _parse_deployment_asset(raw, "ai.hermes.gateway")
