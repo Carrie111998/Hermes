@@ -250,3 +250,55 @@ def test_refused_spawn_tick_does_not_classify_completed(kanban_home, tmp_path):
     assert ex.pipeline_state(meta_after).get("spawn_pending") is True
     assert ex.pipeline_state(meta_after).get("unit_started") is False
     conn.close()
+
+
+def test_external_block_stops_all_task_units(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body='{"task":"x"}',
+        workspace_kind="scratch",
+        board="dev",
+    )
+    kb.claim_task(conn, task_id, claimer="dev-executor")
+    run1 = kb.latest_run(conn, task_id)
+    run2 = ex.start_new_run(
+        conn, task_id, metadata={"dev_pipeline": {"phase": "RUNNING"}}
+    )
+    run3 = ex.start_new_run(
+        conn, task_id, metadata={"dev_pipeline": {"phase": "RUNNING"}}
+    )
+    unit1 = ex.unit_name(task_id, run1.id)
+    unit2 = ex.unit_name(task_id, run2)
+    unit3 = ex.unit_name(task_id, run3)
+    active_units = {unit1, unit2, unit3}
+
+    executor = ex.DevExecutor(
+        {
+            "enabled": True,
+            "board": "dev",
+            "max_attempts": 2,
+            "tick_seconds": 15,
+            "cursor_timeout_seconds": 1800,
+            "verify_command_timeout": 600,
+        }
+    )
+    executor._active[task_id] = ex.ActiveTask(task_id, run3, ex.PHASE_RUNNING)
+    stopped: list[str] = []
+
+    def fake_active(unit):
+        return unit in active_units, "active"
+
+    def fake_stop(unit):
+        stopped.append(unit)
+        active_units.discard(unit)
+        return True
+
+    with patch.object(executor, "_is_active", side_effect=fake_active):
+        with patch.object(executor, "_stop", side_effect=fake_stop):
+            executor._handle_external_block(conn, task_id)
+
+    assert set(stopped) == {unit1, unit2, unit3}
+    conn.close()

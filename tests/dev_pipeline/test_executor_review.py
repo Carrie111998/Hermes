@@ -2,12 +2,81 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hermes_cli import dev_executor as ex
+from hermes_cli import kanban_db as kb
+
+
+def _dev_block_kinds(conn, task_id: str) -> list[str]:
+    return [
+        (ev.payload or {}).get("block_kind")
+        for ev in kb.list_events(conn, task_id)
+        if ev.kind == "dev_blocked"
+    ]
+
+
+def _executor_cfg() -> dict:
+    return {
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    }
+
+
+def _setup_reviewing_task(conn, tmp_path, *, repair_used: bool = False) -> tuple[str, int, dict]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs = tmp_path / "logs"
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body=json.dumps({"task": "fix bug"}),
+        workspace_kind="scratch",
+        board="dev",
+    )
+    kb.claim_task(conn, task_id, claimer="dev-executor")
+    kb._end_run(
+        conn,
+        task_id,
+        outcome="completed",
+        summary="attempt 1",
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "run_kind": ex.RUN_KIND_ATTEMPT,
+                "unit_started": True,
+                "candidate_commit": "bbb",
+            },
+        ),
+    )
+    pipeline_run = ex.start_pipeline_run(
+        conn,
+        task_id,
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "phase": ex.PHASE_REVIEWING,
+                "repair_used": repair_used,
+                "contract": {"task_summary": "x", "acceptance_commands": ["true"]},
+                "repo_path": str(repo),
+                "logs_root": str(logs),
+                "base_commit": "aaa",
+                "candidate_commit": "bbb",
+                "mechanical_pass": True,
+            },
+        ),
+    )
+    meta = ex.load_run_metadata(conn, pipeline_run)
+    return task_id, pipeline_run, meta
 
 
 def test_parse_review_verdict_valid():
@@ -85,6 +154,118 @@ def test_kimi_grok_invocations_mocked_at_subprocess_boundary(kanban_home, tmp_pa
 
     kimi_mock.assert_called_once()
     grok_mock.assert_called_once()
+    conn.close()
+
+
+def test_review_repair_preserves_fresh_spawn_metadata(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    task_id, run_id, meta = _setup_reviewing_task(conn, tmp_path)
+    executor = ex.DevExecutor(_executor_cfg())
+    executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
+
+    fail_verdict = '{"verdict":"fail","blocking_findings":["bug"],"notes":[]}'
+    kimi_mock = MagicMock(
+        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})()
+    )
+    grok_mock = MagicMock(
+        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})()
+    )
+
+    with patch.object(ex, "git_head_sha", return_value=None):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(ex, "hermes_chat_review", kimi_mock):
+                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                    with patch.object(ex, "run_subprocess", grok_mock):
+                        with patch.object(executor, "_is_active", return_value=(False, "")):
+                            with patch.object(
+                                ex,
+                                "systemd_run_attempt",
+                                return_value=(True, 4242, 1_700_000_000),
+                            ):
+                                executor._phase_reviewing(
+                                    conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                                )
+
+    new_run_id = executor._active[task_id].run_id
+    assert new_run_id != run_id
+    new_meta = ex.load_run_metadata(conn, new_run_id)
+    st = ex.pipeline_state(new_meta)
+    assert st.get("unit_started") is True
+    assert st.get("unit_pid") == 4242
+    assert st.get("host_start_time") == 1_700_000_000
+    assert st.get("attempt_prompt")
+    assert st.get("run_kind") == ex.RUN_KIND_ATTEMPT
+    assert st.get("phase") == ex.PHASE_RUNNING
+    assert ex.count_attempt_runs(conn, task_id) == 2
+    conn.close()
+
+
+def test_reviewing_review_timeout_blocks_review_unavailable(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    task_id, run_id, meta = _setup_reviewing_task(conn, tmp_path)
+    logs = Path(ex.pipeline_state(meta)["logs_root"])
+    executor = ex.DevExecutor(_executor_cfg())
+    executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
+
+    pass_verdict = '{"verdict":"pass","blocking_findings":[],"notes":[]}'
+    timeout_exc = subprocess.TimeoutExpired(cmd="hermes chat", timeout=600)
+    heartbeat_calls: list[tuple] = []
+
+    def track_heartbeat(*args, **kwargs):
+        heartbeat_calls.append((args, kwargs))
+
+    with patch.object(ex, "git_head_sha", return_value=None):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(ex, "hermes_chat_review", side_effect=timeout_exc):
+                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                    with patch.object(
+                        ex,
+                        "run_subprocess",
+                        return_value=type("P", (), {"stdout": pass_verdict, "stderr": ""})(),
+                    ):
+                        with patch.object(kb, "heartbeat_claim", side_effect=track_heartbeat):
+                            executor._phase_reviewing(
+                                conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                            )
+
+    assert task_id not in executor._active
+    assert "review_unavailable" in _dev_block_kinds(conn, task_id)
+    assert (logs / "review-kimi.raw").read_text(encoding="utf-8").startswith(
+        "kimi review timed out"
+    )
+    assert len(heartbeat_calls) >= 2
+    conn.close()
+
+
+def test_reviewing_exhausted_repair_emits_typed_dev_blocked_event(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    task_id, run_id, meta = _setup_reviewing_task(conn, tmp_path, repair_used=True)
+    executor = ex.DevExecutor(_executor_cfg())
+    executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
+
+    fail_verdict = '{"verdict":"fail","blocking_findings":["bug"],"notes":[]}'
+    with patch.object(ex, "git_head_sha", return_value=None):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(
+                ex,
+                "hermes_chat_review",
+                return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})(),
+            ):
+                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                    with patch.object(
+                        ex,
+                        "run_subprocess",
+                        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})(),
+                    ):
+                        executor._phase_reviewing(
+                            conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                        )
+
+    assert "review_failed" in _dev_block_kinds(conn, task_id)
+    assert task_id not in executor._active
     conn.close()
 
 
