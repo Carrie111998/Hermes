@@ -247,6 +247,79 @@ def test_multiplex_write_approval_uses_owning_profile_mode(tmp_path, monkeypatch
     assert "did not approve" in json.loads(blocked)["error"]
 
 
+def test_lazy_profile_owned_server_scopes_approval_when_process_is_not_multiplex(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+    from tools.registry import registry
+
+    profile_home = tmp_path / "profiles" / "jane"
+    managed_root = tmp_path / "managed"
+    managed_profile = managed_root / "jane"
+    profile_home.mkdir(parents=True)
+    managed_profile.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "approvals:\n  mode: smart\n",
+        encoding="utf-8",
+    )
+    (managed_profile / "config.yaml").write_text(
+        "approvals:\n  mode: manual\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("EVAOS_HERMES_MANAGED_PROFILE_ROOT", str(managed_root))
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+    config_module._LOAD_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    entry = {
+        "tools": [
+            {
+                "name": "send_email",
+                "description": "",
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": {"readOnlyHint": False},
+            },
+        ]
+    }
+    registered = mcp_tool._register_from_cache_sync(
+        "pipedream",
+        {"auth": "evaos_lease", "app_slug": "gmail"},
+        entry,
+    )
+    assert len(registered) == 1
+    tool_entry = registry.get_entry(registered[0])
+    assert tool_entry is not None
+    connect = MagicMock()
+
+    try:
+        with patch("tools.approval._smart_approve") as smart, \
+             patch(
+                 "tools.approval.request_elicitation_consent",
+                 return_value="decline",
+             ) as consent, \
+             patch(
+                 "tools.mcp_tool._get_connected_server_for_call",
+                 connect,
+             ):
+            blocked = tool_entry.handler({"to": "owner@example.com"})
+    finally:
+        for tool_name in registered:
+            registry.deregister(tool_name)
+            mcp_tool._forget_mcp_tool_server(tool_name, str(profile_home))
+        mcp_tool._lazy_server_configs.pop("pipedream", None)
+        mcp_tool._lazy_server_fingerprints.pop("pipedream", None)
+        mcp_tool._lazy_server_tool_names.pop("pipedream", None)
+        config_module._LOAD_CONFIG_CACHE.clear()
+        managed_scope.invalidate_managed_cache()
+
+    smart.assert_not_called()
+    consent.assert_called_once()
+    connect.assert_not_called()
+    assert "did not approve" in json.loads(blocked)["error"]
+
+
 def test_off_mode_and_session_yolo_bypass_write_approval():
     from tools import approval
 
