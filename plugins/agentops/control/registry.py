@@ -74,7 +74,7 @@ class FleetRegistry:
         snapshotted = len(self._snapshots)
         out_scope = tuple(sorted(target.target_id for target in self._targets.values() if target.spec.labels.get("g2_scope") == "out_of_scope"))
         core_targets = [target for target in self._targets.values() if target.spec.labels.get("g2_scope", "core") == "core"]
-        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots and self._process_health.get(target.target_id, True))
+        core_snapshots = sum(1 for target in core_targets if target.target_id in self._snapshots and self._process_health.get(target.target_id, False))
         disabled_count = sum(1 for target in core_targets if target.spec.labels.get("process_observation") == "disabled")
         coverage = 0 if not core_targets else (max(0, core_snapshots - disabled_count) * 100) // len(core_targets)
         disabled = ("processes",) if disabled_count else ()

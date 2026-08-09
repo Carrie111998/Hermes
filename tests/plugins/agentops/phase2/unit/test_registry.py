@@ -38,6 +38,7 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
         registry.record_target_snapshot(
             TargetSnapshot(target_id=target.target_id, observed_at=observed_at, facts={"present": True})
         )
+    registry.record_process_result("hermes:profile:default:gateway", True)
 
     coverage = registry.coverage_report()
     assert (coverage.registered_targets, coverage.snapshotted_targets, coverage.coverage_percent) == (1, 1, 100)

@@ -501,11 +501,11 @@ def test_default_process_binding_accepts_exact_command_without_string_markers():
         def uids(self):
             class U: real = os.getuid()
             return U()
-    batch = ProcessCollector(name_contains="python", process_iter=lambda: [P()]).collect(target)
+    batch = ProcessCollector(process_iter=lambda: [P()]).collect(target)
     assert batch.health.healthy and len(batch.signals) == 1
     class Wrong(P):
         def name(self): return "python3.10"
-    assert not ProcessCollector(name_contains="python", process_iter=lambda: [Wrong()]).collect(target).health.healthy
+    assert not ProcessCollector(process_iter=lambda: [Wrong()]).collect(target).health.healthy
 
 
 def test_coverage_requires_process_health_evidence():
