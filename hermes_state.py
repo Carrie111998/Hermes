@@ -1821,6 +1821,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # EMFILE/Errno 24 (observed: ~80 leaked state.db connections on the
         # dashboard backend after ~10h uptime).
         self._read_gen = 0
+        # Idle-eviction sweeper state: one daemon thread per SessionDB,
+        # started lazily on the first registered read connection. It wakes
+        # every _READ_CONN_IDLE_SWEEP_INTERVAL and closes connections idle
+        # past _READ_CONN_IDLE_TIMEOUT (even under the cap), so a long-lived
+        # handle drains when it goes quiet instead of parking at the bound.
+        self._read_sweeper_started = False
         self._wal_active = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write
@@ -2043,6 +2049,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # before giving up on closing it (it then stays registered for the
     # shutdown drain, which retries).
     _READ_CONN_CLOSE_TIMEOUT = 2.0
+    # Idle-eviction for the bounded read cache: a connection that has not
+    # been used for _READ_CONN_IDLE_TIMEOUT seconds is closed by the
+    # per-instance daemon sweeper even when the cache is UNDER the bound.
+    # Without this, a long-lived handle that goes quiet (the dashboard
+    # parked overnight, a gateway between turns) sits at the cap forever —
+    # observed ~50 conns / ~240 FDs on an idle dashboard, 94% of the macOS
+    # 256 soft limit. With idle-eviction, the pool drains back toward zero
+    # ~one sweep after the handle stops being used, and re-warms lazily on
+    # the next read.
+    _READ_CONN_IDLE_TIMEOUT = 600.0
+    _READ_CONN_IDLE_SWEEP_INTERVAL = 120.0
 
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
@@ -2065,7 +2082,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the cache bound; close it and fall through to reopen (the
             # thread-local may outlive the eviction for threads that read
             # rarely).
-            if getattr(self._read_local, "gen", 0) != self._read_gen:
+            if getattr(self._read_local, "gen", 0) != self._read_gen or getattr(
+                conn, "_hermes_read_closed", False
+            ):
                 self._close_read_conn(conn)
                 # If our close (or the evictor's, racing us) succeeded, drop
                 # the closed connection from the registry so _read_conns only
@@ -2079,6 +2098,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._read_local.gen = 0
                 conn = None
             else:
+                setattr(conn, "_hermes_last_used", time.monotonic())  # type: ignore[attr-defined]
                 return conn
         if getattr(self._read_local, "failed", False):
             return None
@@ -2155,7 +2175,59 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         self._read_local.conn = conn
         self._read_local.gen = self._read_gen
+        setattr(conn, "_hermes_last_used", time.monotonic())  # type: ignore[attr-defined]
+        self._ensure_read_sweeper()
         return conn
+
+    def _ensure_read_sweeper(self) -> None:
+        """Start the idle-eviction sweeper thread once, lazily.
+
+        Only writable SessionDB handles ever register read connections
+        (read_only=True instances return None from _get_read_conn), so the
+        sweeper only exists on the long-lived handles that need it — the
+        dashboard's global _get_db(), the gateway runner's SessionDB.
+        Short-lived writable instances (cron create/update paths) may start
+        one, but the thread exits at the next sleep tick after close() sets
+        _read_conns_closed, so it never outlives its instance meaningfully.
+        """
+        if self._read_sweeper_started or self.read_only:
+            return
+        self._read_sweeper_started = True
+        t = threading.Thread(
+            target=self._read_conn_sweeper_loop,
+            name=f"hermes-read-sweeper-{id(self):x}",
+            daemon=True,
+        )
+        t.start()
+
+    def _read_conn_sweeper_loop(self) -> None:
+        """Close read connections idle past _READ_CONN_IDLE_TIMEOUT.
+
+        Owner-safe idle eviction: connections are closed through
+        _close_read_conn (per-conn RLock, at-most-once, re-register on
+        failure) and dropped from _read_conns only after a successful close.
+        Unlike the overflow evictor we do NOT bump _read_gen — the owners of
+        idle-evicted connections detect the close via conn._hermes_read_closed
+        on their next read and reopen lazily, so active threads keep their
+        warm connections while the pool drains when the handle goes quiet.
+        """
+        while not self._read_conns_closed:
+            time.sleep(self._READ_CONN_IDLE_SWEEP_INTERVAL)
+            if self._read_conns_closed:
+                return
+            now = time.monotonic()
+            stale = []
+            with self._read_conns_lock:
+                for conn in list(self._read_conns):
+                    last = getattr(conn, "_hermes_last_used", now)
+                    if now - last >= self._READ_CONN_IDLE_TIMEOUT:
+                        stale.append(conn)
+            for conn in stale:
+                if self._close_read_conn(conn):
+                    with self._read_conns_lock:
+                        self._read_conns.discard(conn)
+                # Failed close (busy conn): it stays registered and the
+                # shutdown drain retries it — same contract as overflow.
 
     def _close_read_conn(self, conn) -> bool:
         """Close one read connection safely; True when the fd is released.
@@ -2220,11 +2292,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The per-connection RLock is held for the whole yielded block so a
         cache eviction on another thread — which closes under the same lock —
         can never close a connection mid-statement. After acquiring the lock
-        we re-verify the connection is still the current generation: the
-        evictor may have closed it between _get_read_conn returning it and
-        this acquisition, and a query must never run on a closed connection.
-        On eviction mid-handoff we reopen and retry (bounded; under
-        pathological eviction churn we fall back to the locked writer path).
+        we re-verify the connection is still the current generation AND not
+        closed: the evictor (overflow or idle sweep) may have closed it
+        between _get_read_conn returning it and this acquisition, and a
+        query must never run on a closed connection. On eviction mid-handoff
+        we reopen and retry (bounded; under pathological eviction churn we
+        fall back to the locked writer path).
         """
         for _ in range(3):
             conn = self._get_read_conn()
@@ -2238,6 +2311,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if (
                     getattr(self._read_local, "conn", None) is conn
                     and getattr(self._read_local, "gen", 0) == self._read_gen
+                    and not getattr(conn, "_hermes_read_closed", False)
                 ):
                     yield conn
                     return
