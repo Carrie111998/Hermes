@@ -92,6 +92,71 @@ def test_parse_review_verdict_garbage_fail_closed():
     assert ex.parse_review_verdict("thanks for reviewing") is None
 
 
+def test_parse_verdict_with_nested_json_in_notes():
+    payload = {
+        "verdict": "pass",
+        "blocking_findings": [],
+        "notes": [
+            "Acceptance command `python -m pytest -q` exits 127 on both base "
+            "and candidate, a pre-existing environment failure.",
+            'Diff correctly implements the spec: /version returns exact body '
+            '{"version": "1.0.0"} with status 200 and Content-Type '
+            "application/json, matching existing handler conventions.",
+            "Unverified assumption: test_server.py must already import json.",
+        ],
+    }
+    parsed = ex.parse_review_verdict(json.dumps(payload))
+    assert parsed is not None
+    assert parsed["verdict"] == "pass"
+    assert parsed["notes"] == payload["notes"]
+
+
+def test_parse_verdict_inside_code_fence():
+    payload = {
+        "verdict": "fail",
+        "blocking_findings": ["missing import"],
+        "notes": ['notes mention a nested {"version": "1.0.0"} object'],
+    }
+    text = f"Here is my review:\n```json\n{json.dumps(payload, indent=2)}\n```\n"
+    parsed = ex.parse_review_verdict(text)
+    assert parsed is not None
+    assert parsed["verdict"] == "fail"
+    assert parsed["blocking_findings"] == ["missing import"]
+
+
+def test_parse_verdict_last_wins_with_nested():
+    example = json.dumps({
+        "verdict": "fail",
+        "blocking_findings": ["example finding"],
+        "notes": ['example note with a nested {"a": {"b": 1}} object'],
+    })
+    real = json.dumps({
+        "verdict": "pass",
+        "blocking_findings": [],
+        "notes": ['real note mentioning {"version": "1.0.0"}'],
+    })
+    parsed = ex.parse_review_verdict(
+        f"Format example: {example}\n\nActual verdict:\n{real}"
+    )
+    assert parsed is not None
+    assert parsed["verdict"] == "pass"
+    assert parsed["blocking_findings"] == []
+
+
+def test_parse_verdict_json_escaped_inside_jsonl():
+    payload = {
+        "verdict": "pass",
+        "blocking_findings": [],
+        "notes": ['note with nested {"version": "1.0.0"} object'],
+    }
+    fenced = f"```json\n{json.dumps(payload)}\n```"
+    event = {"type": "result", "result": fenced, "session_id": "abc"}
+    parsed = ex.parse_review_verdict(json.dumps(event) + "\n")
+    assert parsed is not None
+    assert parsed["verdict"] == "pass"
+    assert parsed["notes"] == payload["notes"]
+
+
 def test_parse_review_verdict_last_verdict_wins():
     example = '{"verdict":"pass","blocking_findings":[],"notes":["example"]}'
     real_fail = '{"verdict":"fail","blocking_findings":["bug"],"notes":["real"]}'

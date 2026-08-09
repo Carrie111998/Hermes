@@ -101,11 +101,6 @@ _ASSETS_AGENTS_DIR = (
     Path(__file__).resolve().parent / "dev_pipeline_assets" / "cursor-agents"
 )
 
-_VERDICT_JSON_RE = re.compile(
-    r'\{\s*"verdict"\s*:\s*"(?:pass|fail)"[^}]*\}',
-    re.IGNORECASE | re.DOTALL,
-)
-
 # ---------------------------------------------------------------------------
 # Thin subprocess / systemctl wrappers (mockable in tests)
 # ---------------------------------------------------------------------------
@@ -723,19 +718,62 @@ def classify_attempt(
     return "crashed"
 
 
-def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
-    """Parse strict JSON review verdict; fail-closed on garbage."""
-    if not text:
-        return None
-    # Reviewers may echo an example/template verdict before their real one;
-    # the authoritative verdict is the last verdict-shaped JSON object.
-    matches = list(_VERDICT_JSON_RE.finditer(text))
-    candidate = matches[-1].group(0) if matches else text.strip()
-    try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
-        obj = extract_json_object(text)
-        data = obj if isinstance(obj, dict) else None
+def _balanced_verdict_candidates(text: str) -> Iterator[str]:
+    """Yield balanced JSON objects rooted at each ``{"verdict"`` occurrence.
+
+    Notes fields may embed nested JSON objects (e.g. ``{"version": "1.0.0"}``),
+    so extraction tracks string literals and ``\\"`` escapes while counting
+    braces instead of matching up to the first closing brace. Reviewer output
+    captured as JSONL (``review-grok.jsonl``) carries the verdict JSON-escaped
+    inside a string field (``{\\"verdict\\":...``); those candidates are
+    decoded before yielding. Code fences are tolerated because the scan works
+    on the raw text.
+    """
+    for match in re.finditer(r'\{\s*(\\?)"verdict\\?"', text, re.IGNORECASE):
+        start = match.start()
+        escaped_mode = bool(match.group(1))
+        depth = 0
+        in_string = False
+        i = start
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if escaped_mode:
+                if ch == "\\" and i + 1 < n:
+                    if text[i + 1] == '"':
+                        in_string = not in_string
+                    i += 2
+                    continue
+                if ch == '"':
+                    # Unescaped quote: the containing JSON string ended before
+                    # the braces balanced — not a viable candidate.
+                    break
+            else:
+                if ch == "\\" and in_string:
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    i += 1
+                    continue
+            if not in_string:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start : i + 1]
+                        if escaped_mode:
+                            try:
+                                candidate = json.loads(f'"{candidate}"')
+                            except json.JSONDecodeError:
+                                break
+                        yield candidate
+                        break
+            i += 1
+
+
+def _validate_verdict(data: Any) -> Optional[dict[str, Any]]:
     if not isinstance(data, dict):
         return None
     verdict = str(data.get("verdict", "")).lower()
@@ -750,6 +788,26 @@ def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
         "blocking_findings": blocking,
         "notes": notes,
     }
+
+
+def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
+    """Parse strict JSON review verdict; fail-closed on garbage."""
+    if not text:
+        return None
+    # Reviewers may echo an example/template verdict before their real one;
+    # the authoritative verdict is the last verdict-shaped JSON object.
+    data: Optional[dict[str, Any]] = None
+    for candidate in _balanced_verdict_candidates(text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        validated = _validate_verdict(parsed)
+        if validated is not None:
+            data = validated
+    if data is not None:
+        return data
+    return _validate_verdict(extract_json_object(text))
 
 
 def review_gate(
