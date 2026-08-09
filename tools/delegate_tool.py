@@ -3894,11 +3894,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
-    parent_api_key``). This lets providers that store their key outside
-    ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
+    omitted, ordinary parents let ``_build_child_agent`` inherit their key.
+    MoA parents are the exception because their key is only a virtual-provider
+    sentinel; they resolve the configured delegation provider's real key.
 
     Otherwise, if ``delegation.provider`` is configured, the full credential
     bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
@@ -3933,7 +3931,42 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # lets providers that store their key in a non-OPENAI_API_KEY env var
         # (e.g. MINIMAX_API_KEY, DASHSCOPE_API_KEY) work without requiring
         # callers to duplicate the key under delegation.api_key.
-        api_key = configured_api_key  # None → inherited from parent in _build_child_agent
+        api_key = configured_api_key  # None → inherited from ordinary parents
+        parent_provider = str(getattr(parent_agent, "provider", "") or "").strip().lower()
+        if api_key is None and parent_provider == "moa":
+            if not configured_provider or _provider_lower == "moa":
+                raise ValueError(
+                    "Delegation from a MoA session cannot inherit the virtual-provider "
+                    "credential. Set delegation.provider to the real endpoint provider "
+                    "or set delegation.api_key."
+                )
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                credential_runtime = resolve_runtime_provider(
+                    requested=configured_provider,
+                    explicit_base_url=configured_base_url,
+                    target_model=configured_model,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot resolve delegation provider '{configured_provider}' "
+                    f"credentials for a MoA session: {exc}. Set delegation.api_key "
+                    "explicitly or configure the provider credential."
+                ) from exc
+            if (
+                credential_runtime.get("provider") == "moa"
+                or credential_runtime.get("source") == "moa-virtual-provider"
+            ):
+                api_key = None
+            else:
+                api_key = credential_runtime.get("api_key")
+            if not api_key:
+                raise ValueError(
+                    f"Delegation provider '{configured_provider}' resolved but has no "
+                    "real API key for a MoA session. Set delegation.api_key or "
+                    "configure the provider credential."
+                )
 
         # Use the shared URL-based api_mode detector (same path the main agent's
         # runtime resolver uses) so Anthropic-compatible direct endpoints with a
