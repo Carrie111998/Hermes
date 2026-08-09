@@ -31,11 +31,12 @@ from plugins.agentops.control.observer_models import (
     TargetSnapshot,
     Signal,
     LogCursor,
+    RawSignal,
     asset_source_id,
     thaw_value,
     utc_now,
 )
-from plugins.agentops.control.redaction import RedactionError, contains_secret, verify_redacted_signal
+from plugins.agentops.control.redaction import RedactionError, contains_secret, redact_signal, verify_redacted_signal
 from plugins.agentops.control.registry import FleetRegistry, bootstrap_gateway_registry
 from plugins.agentops.control.review_pack import ReviewPack, load_review_pack
 
@@ -67,9 +68,24 @@ def _detached_batch(batch: CollectionBatch) -> dict[str, Any]:
     }
 
 
+def _freeze_record(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_record(child) for key, child in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_record(child) for child in value)
+    return value
+
+
+def _utc_day(day: date | datetime | str) -> date:
+    if isinstance(day, datetime):
+        return day.astimezone(timezone.utc).date()
+    if isinstance(day, date):
+        return day
+    return date.fromisoformat(day)
+
+
 @dataclass(frozen=True)
 class _StoredBatch:
-    batch: CollectionBatch
     record: Mapping[str, Any]
     size_bytes: int
 
@@ -112,42 +128,43 @@ class ObservationLedger:
             raise ObservationBoundaryError("observation ledger budget exceeded")
         # The record is detached before this point; appending cannot be
         # affected by later mutation of a collector's input mapping.
-        self._records.append(_StoredBatch(batch=batch, record=MappingProxyType(record), size_bytes=size))
+        self._records.append(_StoredBatch(record=_freeze_record(record), size_bytes=size))
         self._signal_count += len(batch.signals)
         self._bytes += size
         return batch.observation_id
 
-    def batches(self) -> tuple[CollectionBatch, ...]:
-        return tuple(item.batch for item in self._records)
+    def batches(self) -> tuple[dict[str, Any], ...]:
+        """Return detached copies; the ledger never exposes its authority record."""
+        return tuple(thaw_value(item.record) for item in self._records)
 
     def _records_for_day(self, day: date | datetime | str) -> tuple[_StoredBatch, ...]:
-        if isinstance(day, datetime):
-            selected = day.astimezone(timezone.utc).date()
-        elif isinstance(day, date):
-            selected = day
-        else:
-            selected = date.fromisoformat(day)
-        return tuple(item for item in self._records if item.batch.collected_at.astimezone(timezone.utc).date() == selected)
+        selected = _utc_day(day)
+        return tuple(
+            item for item in self._records
+            if datetime.fromisoformat(str(item.record["collected_at"])).astimezone(timezone.utc).date() == selected
+        )
 
     def daily_summary(self, day: date | datetime | str) -> dict[str, Any]:
         records = self._records_for_day(day)
-        healthy = sum(1 for item in records if item.batch.health.healthy)
+        healthy = sum(1 for item in records if bool(item.record["healthy"]))
         reasons: dict[str, int] = {}
         collectors: dict[str, dict[str, int]] = {}
         for item in records:
-            batch = item.batch
-            if batch.health.reason:
-                reasons[batch.health.reason] = reasons.get(batch.health.reason, 0) + 1
-            bucket = collectors.setdefault(batch.collector, {"runs": 0, "healthy": 0, "signals": 0})
+            collector = str(item.record["collector"])
+            reason = item.record["reason"]
+            if reason:
+                reasons[str(reason)] = reasons.get(str(reason), 0) + 1
+            bucket = collectors.setdefault(collector, {"runs": 0, "healthy": 0, "signals": 0})
             bucket["runs"] += 1
-            bucket["healthy"] += int(batch.health.healthy)
-            bucket["signals"] += len(batch.signals)
+            bucket["healthy"] += int(bool(item.record["healthy"]))
+            bucket["signals"] += int(item.record["signal_count"])
+        selected_day = _utc_day(day)
         return {
-            "day": (day.date() if isinstance(day, datetime) else day).isoformat() if not isinstance(day, str) else day,
+            "day": selected_day.isoformat(),
             "run_count": len(records),
             "healthy_runs": healthy,
             "unhealthy_runs": len(records) - healthy,
-            "signal_count": sum(len(item.batch.signals) for item in records),
+            "signal_count": sum(int(item.record["signal_count"]) for item in records),
             "reasons": dict(sorted(reasons.items())),
             "collectors": {key: collectors[key] for key in sorted(collectors)},
             "authority_mode": "observe_only",
@@ -160,17 +177,18 @@ class ObservationLedger:
         records: list[dict[str, Any]] = []
         used = 0
         for stored in self._records_for_day(day):
-            for signal in stored.batch.signals:
+            record = thaw_value(stored.record)
+            for signal in record["signals"]:
                 if len(records) >= max_items:
                     break
                 item = {
-                    "observation_id": stored.batch.observation_id,
-                    "target_id": stored.batch.target_id,
-                    "collector": stored.batch.collector,
-                    "collected_at": stored.batch.collected_at.isoformat(),
-                    "health": stored.batch.health.healthy,
-                    "reason": stored.batch.health.reason,
-                    "signal": signal.to_dict(),
+                    "observation_id": record["observation_id"],
+                    "target_id": record["target_id"],
+                    "collector": record["collector"],
+                    "collected_at": record["collected_at"],
+                    "health": record["healthy"],
+                    "reason": record["reason"],
+                    "signal": signal,
                 }
                 size = len(_canonical_json(item))
                 if used + size > max_bytes:
@@ -189,6 +207,8 @@ class ObservationLedger:
         }
         if contains_secret(result):
             raise ObservationBoundaryError("Terra input redaction gate failed")
+        if len(_canonical_json(result)) > max_bytes:
+            raise ObservationBoundaryError("Terra input budget exceeded")
         return result
 
 
@@ -203,21 +223,41 @@ def _asset_is_trusted(path: Path) -> bool:
 def _read_trusted_asset(path: Path, *, max_bytes: int = 1024 * 1024) -> bytes:
     """Read one fixed asset through an O_NOFOLLOW descriptor and recheck identity."""
     before = path.lstat()
+    before_identity = (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_nlink, before.st_size)
     if not _asset_is_trusted(path) or before.st_size > max_bytes:
         raise ObservationBoundaryError("deployment asset identity rejected")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid, opened.st_nlink, opened.st_size)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid() or opened.st_nlink != 1 or opened_identity != before_identity:
             raise ObservationBoundaryError("deployment asset identity changed")
         raw = os.read(descriptor, max_bytes + 1)
     finally:
         os.close(descriptor)
     after = path.lstat()
-    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) or len(raw) > max_bytes:
+    after_identity = (after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_nlink, after.st_size)
+    if after_identity != before_identity or len(raw) > max_bytes:
         raise ObservationBoundaryError("deployment asset changed during read")
     return raw
+
+
+def _deployment_asset_details(raw: bytes) -> tuple[str, list[str]]:
+    try:
+        try:
+            data = plistlib.loads(raw)
+            args = data.get("ProgramArguments") if isinstance(data, dict) else None
+            label = data.get("Label") if isinstance(data, dict) else None
+        except (plistlib.InvalidFileException, ValueError, TypeError):
+            decoded = json.loads(raw.decode("utf-8"))
+            args = decoded.get("ProgramArguments") if isinstance(decoded, dict) else decoded
+            label = decoded.get("Label") if isinstance(decoded, dict) else "ai.hermes.gateway"
+        if label != "ai.hermes.gateway" or not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+            raise ValueError("deployment asset shape rejected")
+        return label, args
+    except (UnicodeDecodeError, json.JSONDecodeError, plistlib.InvalidFileException, TypeError, ValueError) as exc:
+        raise ObservationBoundaryError("default deployment asset contents are not trusted") from exc
 
 
 def _trusted_default_target(registry: FleetRegistry, *, fixed_asset: Path | None = None) -> tuple[Target, Path]:
@@ -240,22 +280,62 @@ def _trusted_default_target(registry: FleetRegistry, *, fixed_asset: Path | None
         raise ObservationBoundaryError("default deployment asset is not trusted")
     try:
         raw = _read_trusted_asset(plist)
-        try:
-            data = plistlib.loads(raw)
-            args = data.get("ProgramArguments") if isinstance(data, dict) else None
-            label = data.get("Label") if isinstance(data, dict) else None
-        except (plistlib.InvalidFileException, ValueError, TypeError):
-            decoded = json.loads(raw.decode("utf-8"))
-            args = decoded.get("ProgramArguments") if isinstance(decoded, dict) else decoded
-            label = decoded.get("Label") if isinstance(decoded, dict) else "ai.hermes.gateway"
-        if label != "ai.hermes.gateway" or not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-            raise ValueError("deployment asset shape rejected")
+        _, args = _deployment_asset_details(raw)
         digest = "sha256:" + hashlib.sha256("\x00".join(args).encode("utf-8")).hexdigest()
         if digest != labels.get("command_fingerprint"):
             raise ValueError("deployment fingerprint mismatch")
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, plistlib.InvalidFileException, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, ObservationBoundaryError) as exc:
         raise ObservationBoundaryError("default deployment asset contents are not trusted") from exc
     return target, plist
+
+
+class _TrustedLaunchdCollector:
+    """Launchd read probe with an identity-bound asset read on every pass."""
+
+    name = "launchd"
+
+    def __init__(self, plist_path: Path, *, max_bytes: int = 1024 * 1024, min_interval_seconds: float = 0.0) -> None:
+        if max_bytes <= 0 or min_interval_seconds < 0:
+            raise ValueError("invalid plist collector budget")
+        self.plist_path = Path(plist_path)
+        self.source_id = asset_source_id(self.plist_path)
+        self.max_bytes = max_bytes
+        self.min_interval_seconds = min_interval_seconds
+        self._last_collection = 0.0
+
+    def collect(self, target: Target, cursor: LogCursor | None = None) -> CollectionBatch:
+        import time
+        if not target.spec.observed_paths or not any(Path(path) == self.plist_path for path in target.spec.observed_paths):
+            return failed_batch(target, self.name, "asset_unbound", source_id=self.source_id)
+        now_mono = time.monotonic()
+        if now_mono - self._last_collection < self.min_interval_seconds:
+            return failed_batch(target, self.name, "collector_rate_limited", source_id=self.source_id)
+        self._last_collection = now_mono
+        try:
+            raw = _read_trusted_asset(self.plist_path, max_bytes=self.max_bytes)
+            _, args = _deployment_asset_details(raw)
+            expected = target.spec.labels.get("command_fingerprint")
+            fingerprint = "sha256:" + hashlib.sha256("\x00".join(args).encode("utf-8")).hexdigest()
+            if fingerprint != expected:
+                return failed_batch(target, self.name, "plist_command_fingerprint_mismatch", source_id=self.source_id)
+        except (OSError, ObservationBoundaryError):
+            return failed_batch(target, self.name, "plist_identity_rejected", source_id=self.source_id)
+        observed_at = utc_now()
+        signal = redact_signal(RawSignal(
+            target_id=target.target_id,
+            collector=self.name,
+            signal_type="launchd.configuration",
+            observed_at=observed_at,
+            payload={"label": "ai.hermes.gateway", "configuration_fingerprint": fingerprint},
+        ))
+        return CollectionBatch(
+            target_id=target.target_id,
+            collector=self.name,
+            collected_at=observed_at,
+            signals=(signal,),
+            health=CollectorHealth(healthy=True),
+            source_id=self.source_id,
+        )
 
 
 class DefaultObservationLoop:
@@ -292,7 +372,7 @@ class DefaultObservationLoop:
         launchd_spec = active_pack.collectors["launchd"]
         collectors: list[Any] = [
             ProcessCollector(max_items=process_spec.max_items, min_interval_seconds=process_spec.rate_limit_seconds, process_iter=process_iter),
-            LaunchdCollector(plist_path, max_bytes=launchd_spec.max_bytes, min_interval_seconds=launchd_spec.rate_limit_seconds),
+            _TrustedLaunchdCollector(plist_path, max_bytes=launchd_spec.max_bytes, min_interval_seconds=launchd_spec.rate_limit_seconds),
             LogCollector("logs", selected_log, max_bytes=log_spec.max_bytes, max_lines=log_spec.max_items, min_interval_seconds=log_spec.rate_limit_seconds),
         ]
         if cron_source_path is not None:

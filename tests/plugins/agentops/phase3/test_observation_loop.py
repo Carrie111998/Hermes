@@ -13,6 +13,7 @@ from plugins.agentops.control.collectors.base import failed_batch
 from plugins.agentops.control.observer_models import Criticality, Signal, Target, TargetKind, TargetSpec, utc_now
 from plugins.agentops.control.observation import DefaultObservationLoop, ObservationBoundaryError, ObservationLedger
 from plugins.agentops.control.registry import FleetRegistry
+from plugins.agentops.control.redaction import contains_secret
 
 
 def _trusted_registry(tmp_path: Path) -> tuple[FleetRegistry, Path, Path, Path]:
@@ -60,7 +61,7 @@ def test_ledger_is_append_only_detached_and_bounded(tmp_path):
     batch = failed_batch(target, "logs", "collector_failed", source_id="sha256:" + "a" * 64)
     ledger = ObservationLedger(max_runs=1, max_signals=1, max_bytes=10_000)
     first_id = ledger.append(batch)
-    assert first_id == batch.observation_id and ledger.batches() == (batch,)
+    assert first_id == batch.observation_id and ledger.batches()[0]["observation_id"] == batch.observation_id
     with pytest.raises(ObservationBoundaryError, match="budget"):
         ledger.append(batch)
     signal = Signal("sha256:" + "b" * 64, target.target_id, "logs", "log.line", utc_now(), {"message": "safe"})
@@ -69,6 +70,19 @@ def test_ledger_is_append_only_detached_and_bounded(tmp_path):
     object.__setattr__(signal, "payload", {"password": "hunter2"})
     with pytest.raises(ObservationBoundaryError):
         ObservationLedger().append(poisoned)
+
+
+def test_ledger_authority_record_survives_source_mutation(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    batches = loop.collect_once()
+    original = next(batch for batch in batches if batch.collector == "launchd")
+    assert original.signals
+    object.__setattr__(original.signals[0], "payload", {"password": "injected"})
+    stored = loop.ledger.batches()
+    launchd = next(item for item in stored if item["collector"] == "launchd")
+    assert "password" not in str(launchd) and "injected" not in str(launchd)
+    assert not contains_secret(launchd)
 
 
 def test_daily_summary_and_terra_input_are_bounded_and_no_actions(tmp_path):
@@ -81,6 +95,20 @@ def test_daily_summary_and_terra_input_are_bounded_and_no_actions(tmp_path):
     assert summary["unhealthy_runs"] == 1 and summary["automatic_repair"] is False
     handoff = ledger.terra_input(day, max_items=1, max_bytes=4096)
     assert handoff["actions"] == [] and len(handoff["evidence"]) == 0
+    with pytest.raises(ObservationBoundaryError, match="Terra input budget"):
+        ledger.terra_input(day, max_items=1, max_bytes=1)
+
+
+def test_daily_summary_uses_utc_day_label(tmp_path):
+    registry, _, _, _ = _trusted_registry(tmp_path)
+    target = registry.get_target("hermes:profile:default:gateway")
+    batch = failed_batch(target, "logs", "collector_failed", source_id="sha256:" + "e" * 64)
+    local_time = datetime(2026, 1, 1, 0, 30, tzinfo=timezone(timedelta(hours=2)))
+    object.__setattr__(batch, "collected_at", local_time)
+    ledger = ObservationLedger()
+    ledger.append(batch)
+    assert ledger.daily_summary("2025-12-31")["run_count"] == 1
+    assert ledger.daily_summary(local_time)["day"] == "2025-12-31"
 
 
 def test_default_loop_collects_read_only_process_launchd_logs_and_cron(tmp_path):
@@ -109,6 +137,16 @@ def test_default_loop_rejects_tampered_or_disabled_binding(tmp_path):
     bad_marker = TargetSpec(target_id=target.target_id, profile=target.spec.profile, kind=target.spec.kind, criticality=target.spec.criticality, observed_paths=target.spec.observed_paths, labels=labels)
     with pytest.raises(ObservationBoundaryError):
         DefaultObservationLoop.create(registry=FleetRegistry((bad_marker,)))
+
+
+def test_launchd_asset_replacement_between_passes_fails_closed(tmp_path):
+    registry, _, plist, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry)
+    plist.write_bytes(plistlib.dumps({"Label": "ai.hermes.gateway", "ProgramArguments": ["/bin/evil"]}))
+    launchd = next(item for item in loop.collectors if item.name == "launchd")
+    batch = launchd.collect(loop.target)
+    assert batch.health.healthy is False
+    assert batch.health.reason in {"plist_command_fingerprint_mismatch", "plist_identity_rejected"}
 
 
 def test_default_loop_does_not_expose_sqlite_or_lifecycle_surface(tmp_path):

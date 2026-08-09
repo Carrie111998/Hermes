@@ -52,10 +52,10 @@ production writes.
 
 | Area | Evidence |
 |---|---|
-| Bounded append-only sink, secret gate, budgets | `test_ledger_is_append_only_detached_and_bounded` |
-| Daily summary and Terra limits | `test_daily_summary_and_terra_input_are_bounded_and_no_actions` |
+| Bounded append-only sink, detached authority record, secret gate, budgets | `test_ledger_is_append_only_detached_and_bounded`, `test_ledger_authority_record_survives_source_mutation` |
+| Daily UTC summary and complete Terra envelope budget | `test_daily_summary_and_terra_input_are_bounded_and_no_actions`, `test_daily_summary_uses_utc_day_label` |
 | Read-only Process/Launchd/Log/Cron collection and unchanged input hashes | `test_default_loop_collects_read_only_process_launchd_logs_and_cron` |
-| Fixed asset/fingerprint/label fail-closed binding | `test_default_loop_rejects_tampered_or_disabled_binding` |
+| Fixed asset/fingerprint/label fail-closed binding on every pass | `test_default_loop_rejects_tampered_or_disabled_binding`, `test_launchd_asset_replacement_between_passes_fails_closed` |
 | No SQLite/lifecycle surface | `test_default_loop_does_not_expose_sqlite_or_lifecycle_surface` |
 
 ## Known limitations

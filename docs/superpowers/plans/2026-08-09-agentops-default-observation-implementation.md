@@ -4,7 +4,7 @@
 
 **Goal:** Build a bounded, in-memory, read-only observation loop for the trusted `default` Hermes deployment asset, producing daily summaries and a bounded Terra analysis input without changing Gateway, Target, business, LaunchAgent, or Cron state.
 
-**Architecture:** `DefaultObservationLoop` binds one immutable default `Target` from `bootstrap_gateway_registry()`, constructs only existing read-only Process/Launchd/Log/Cron collectors, and executes them through the Phase 2 deadline-isolated `collect_all`. `ObservationLedger` is the sole Phase 3 sink: it stores detached, redacted `CollectionBatch` evidence in memory with hard run/signal budgets, exposes daily summaries and a redacted Terra input, and has no SQLite or filesystem writer. A separate cadence helper describes the natural seven-day run protocol but does not install a scheduler.
+**Architecture:** `DefaultObservationLoop` binds one immutable default `Target` from `bootstrap_gateway_registry()`, revalidates the fixed deployment asset through an identity-checked `O_NOFOLLOW` read on every Launchd pass, constructs only existing read-only Process/Launchd/Log/Cron collectors, and executes them through the Phase 2 deadline-isolated `collect_all`. `ObservationLedger` is the sole Phase 3 sink: it stores only deep-frozen detached records in memory with hard run/signal/byte budgets, exposes UTC daily summaries and a fully bounded Terra input, and has no SQLite or filesystem writer. A separate cadence helper describes the natural seven-day run protocol but does not install a scheduler.
 
 **Tech Stack:** Python 3.11+, existing Phase 2 collectors and `CollectionBatch` contracts, `MemoryObserverStore`, `FleetRegistry`, `pytest`, JSON-compatible immutable evidence.
 
