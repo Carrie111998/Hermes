@@ -1484,15 +1484,14 @@ def execute_code(
         # can mix incompatible compiled extensions (for example, Python 3.12
         # NumPy with a Python 3.9 project interpreter).
         #
-        # Before re-injecting PYTHONPATH, strip any mismatched site-packages
-        # entries that leaked through _scrub_child_env (PYTHONPATH is in
-        # _SAFE_ENV_PREFIXES so it passes the scrub).  The sandbox runs the
-        # SAME Python as Hermes, so same-version Hermes venv entries are
-        # harmless - but cross-version entries (e.g. python3.11 from a
-        # different venv injected by systemd/Electron) would poison the
-        # sandbox's sys.path with ABI-incompatible C extensions (#74817).
-        from tools.environments.local import _strip_mismatched_site_packages
-        _strip_mismatched_site_packages(child_env)
+        # Before re-injecting PYTHONPATH, strip Hermes-owned entries that
+        # leaked through _scrub_child_env (PYTHONPATH is in _SAFE_ENV_PREFIXES
+        # so it passes the scrub).  The sandbox runs the SAME Python as
+        # Hermes, so the Hermes venv entries are redundant — and if they
+        # came from a different Hermes venv they would poison the sandbox's
+        # sys.path with ABI-incompatible C extensions (#74817).
+        from tools.environments.local import _strip_hermes_owned_pythonpath
+        _strip_hermes_owned_pythonpath(child_env)
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _existing_pp = child_env.get("PYTHONPATH", "")
         _pp_parts = [tmpdir]
