@@ -176,6 +176,41 @@ async def test_permissions_deny_relative_rule_blocks_file_reference(
     assert any("permissions.deny.paths" in warning for warning in result.warnings)
 
 
+@pytest.mark.asyncio
+async def test_permissions_deny_blocks_git_reference_before_subprocess(tmp_path: Path):
+    from agent.context_references import preprocess_context_references_async
+
+    root = tmp_path / "repo"
+    cwd = root / "src"
+    denied = root / "private"
+    cwd.mkdir(parents=True)
+    denied.mkdir()
+    git_marker = root / ".git"
+    original_exists = Path.exists
+
+    def guarded_exists(path_obj):
+        if path_obj == git_marker:
+            raise AssertionError("denied-overlap ancestor .git was probed")
+        return original_exists(path_obj)
+
+    with (
+        patch(
+            "agent.deny_policy.permissions_deny_paths",
+            return_value=[str(denied / "**")],
+        ),
+        patch.object(Path, "exists", guarded_exists),
+        patch("agent.context_references.subprocess.run") as mock_run,
+    ):
+        result = await preprocess_context_references_async(
+            "review @diff",
+            cwd=cwd,
+            context_length=100_000,
+        )
+
+    mock_run.assert_not_called()
+    assert any("permissions.deny.paths" in warning for warning in result.warnings)
+
+
 def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path: Path, monkeypatch):
     """Docker backend: a staged binary attachment's host path is rendered as the
     bind-mounted in-container path so the agent's tools can read it.

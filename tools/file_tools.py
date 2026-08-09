@@ -1749,6 +1749,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
+        # permissions.deny.paths is the user-configured security floor. Evaluate
+        # it before device detection, path canonicalization, document extraction,
+        # or backend acquisition so a denied spelling cannot trigger metadata I/O.
+        block_error = _check_permissions_deny_path(path, task_id)
+        if block_error:
+            return json.dumps({"error": block_error})
+
         # ── Device path guard ─────────────────────────────────────────
         # Block paths that would hang the process (infinite output,
         # blocking on input).  Pure path check — no I/O.
@@ -1760,14 +1767,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
-
-        # ── User configured deny policy ───────────────────────────────
-        # permissions.deny.paths is a deny-wins floor for file tools. Check it
-        # immediately after path resolution, before structured-document
-        # extraction or any other path that could open the target.
-        block_error = _check_permissions_deny_path(path, task_id)
-        if block_error:
-            return json.dumps({"error": block_error})
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.

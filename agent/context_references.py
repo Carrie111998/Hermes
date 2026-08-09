@@ -317,12 +317,29 @@ def _expand_folder_reference(
     return None, f"📁 {ref.raw} ({estimate_tokens_rough(listing)} tokens)\n{listing}"
 
 
+def _ensure_git_reference_allowed(cwd: Path) -> None:
+    """Reject Git context expansion before Git can read a denied worktree."""
+    _ensure_reference_path_allowed(cwd, base_path=cwd, search_root=True)
+    current = cwd.absolute()
+    for parent in [current, *current.parents]:
+        _ensure_reference_path_allowed(parent, base_path=cwd, search_root=True)
+        git_marker = parent / ".git"
+        _ensure_reference_path_allowed(git_marker, base_path=cwd)
+        if git_marker.exists():
+            return
+
+
 def _expand_git_reference(
     ref: ContextReference,
     cwd: Path,
     args: list[str],
     label: str,
 ) -> tuple[str | None, str | None]:
+    try:
+        _ensure_git_reference_allowed(cwd)
+    except ValueError as exc:
+        return f"{ref.raw}: {exc}", None
+
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         result = subprocess.run(

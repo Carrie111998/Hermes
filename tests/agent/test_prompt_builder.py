@@ -640,6 +640,35 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert result == ""
 
+    def test_permissions_deny_blocks_soul_before_metadata_probe(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        soul = hermes_home / "SOUL.md"
+        original_exists = Path.exists
+
+        def guarded_exists(path_obj):
+            if path_obj == soul:
+                raise AssertionError("denied SOUL.md metadata was probed")
+            return original_exists(path_obj)
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(soul)],
+            ),
+            patch.object(Path, "exists", guarded_exists),
+            patch("hermes_cli.config.ensure_hermes_home") as mock_ensure,
+        ):
+            from agent.prompt_builder import load_soul_md
+
+            assert load_soul_md() is None
+
+        mock_ensure.assert_not_called()
+
 
 
 
@@ -748,6 +777,28 @@ class TestFindGitRoot:
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
+
+    def test_denied_ancestor_root_stops_before_git_metadata_probe(self, tmp_path):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        root = tmp_path / "repo"
+        nested = root / "src"
+        nested.mkdir(parents=True)
+        git_marker = root / ".git"
+        original_exists = Path.exists
+
+        def guarded_exists(path_obj):
+            if path_obj == git_marker:
+                raise AssertionError("denied ancestor .git was probed")
+            return original_exists(path_obj)
+
+        with patch.object(Path, "exists", guarded_exists):
+            assert _find_git_root(
+                nested,
+                is_denied=lambda _path: False,
+                is_root_denied=lambda path: path == root,
+            ) is None
 
 
 class TestStripYamlFrontmatter:

@@ -79,15 +79,26 @@ def _scan_context_content(content: str, filename: str) -> str:
     return content
 
 
-def _find_git_root(start: Path) -> Optional[Path]:
+def _find_git_root(
+    start: Path,
+    *,
+    is_denied: Optional[Callable[[Path], bool]] = None,
+    is_root_denied: Optional[Callable[[Path], bool]] = None,
+) -> Optional[Path]:
     """Walk *start* and its parents looking for a ``.git`` directory.
 
     Returns the directory containing ``.git``, or ``None`` if we hit the
     filesystem root without finding one.
     """
-    current = start.resolve()
+    policy_aware = is_denied is not None or is_root_denied is not None
+    current = start.absolute() if policy_aware else start.resolve()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        if is_root_denied is not None and is_root_denied(parent):
+            return None
+        git_marker = parent / ".git"
+        if is_denied is not None and is_denied(git_marker):
+            return None
+        if git_marker.exists():
             return parent
     return None
 
@@ -99,6 +110,7 @@ def _find_hermes_md(
     cwd: Path,
     *,
     is_denied: Optional[Callable[[Path], bool]] = None,
+    is_root_denied: Optional[Callable[[Path], bool]] = None,
 ) -> Optional[Path]:
     """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
 
@@ -106,8 +118,13 @@ def _find_hermes_md(
     including) the git repository root.  Returns the first match, or
     ``None`` if nothing is found.
     """
-    stop_at = _find_git_root(cwd)
-    current = cwd.resolve()
+    stop_at = _find_git_root(
+        cwd,
+        is_denied=is_denied,
+        is_root_denied=is_root_denied,
+    )
+    policy_aware = is_denied is not None or is_root_denied is not None
+    current = cwd.absolute() if policy_aware else cwd.resolve()
 
     # When there is no git root, only check cwd itself – walking parents
     # could pick up a .hermes.md planted in /tmp, /home, etc.
@@ -2030,7 +2047,7 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # =========================================================================
 
 def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
-    """Apply permissions.deny.paths to implicit project-context reads."""
+    """Apply permissions.deny.paths to an implicit project-context file."""
     try:
         from agent.deny_policy import (
             match_permissions_deny_path,
@@ -2046,6 +2063,30 @@ def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
     except Exception:
         logger.warning(
             "permissions.deny.paths project-context check failed closed for %s",
+            path,
+            exc_info=True,
+        )
+        return True
+
+
+def _is_denied_project_context_root(path: Path, *, base_path: Path) -> bool:
+    """Fail closed before project-context discovery enumerates *path*."""
+    try:
+        from agent.deny_policy import (
+            match_permissions_deny_search_root,
+            permissions_deny_paths,
+        )
+
+        return match_permissions_deny_search_root(
+            str(path),
+            patterns=permissions_deny_paths(),
+            base_path=base_path,
+            root_is_file=False,
+            canonicalize=True,
+        ) is not None
+    except Exception:
+        logger.warning(
+            "permissions.deny.paths project-context root check failed closed for %s",
             path,
             exc_info=True,
         )
@@ -2099,13 +2140,21 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
+    soul_home = get_hermes_home()
+    soul_path = soul_home / "SOUL.md"
+    if _is_denied_project_context_path(soul_path, base_path=soul_home):
+        logger.warning(
+            "skipping SOUL.md: path is denied by permissions.deny.paths (%s)",
+            soul_path,
+        )
+        return None
+
     try:
         from hermes_cli.config import ensure_hermes_home
         ensure_hermes_home()
     except Exception as e:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
-    soul_path = get_hermes_home() / "SOUL.md"
     if not soul_path.exists():
         return None
     try:
@@ -2128,6 +2177,9 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
     hermes_md_path = _find_hermes_md(
         cwd_path,
         is_denied=lambda path: _is_denied_project_context_path(
+            path, base_path=cwd_path
+        ),
+        is_root_denied=lambda path: _is_denied_project_context_root(
             path, base_path=cwd_path
         ),
     )
@@ -2167,8 +2219,16 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
     sits outside it — only *cwd* itself is checked, matching the historical
     single-directory behavior.
     """
-    current = cwd_path.resolve()
-    root = _find_git_root(current)
+    current = cwd_path.absolute()
+    root = _find_git_root(
+        current,
+        is_denied=lambda path: _is_denied_project_context_path(
+            path, base_path=current
+        ),
+        is_root_denied=lambda path: _is_denied_project_context_root(
+            path, base_path=current
+        ),
+    )
     if root is None or root == current:
         return [current]
     try:

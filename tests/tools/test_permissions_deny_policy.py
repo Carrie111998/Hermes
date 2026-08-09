@@ -308,6 +308,26 @@ class TestPermissionsDenyFileTools:
         assert "do not read" not in result["error"]
         mock_get.assert_not_called()
 
+    def test_read_file_checks_user_policy_before_device_probe(self, monkeypatch, tmp_path):
+        secret = tmp_path / "secret.txt"
+        _install_permissions_config(monkeypatch, paths=[str(secret)])
+
+        with (
+            patch(
+                "tools.file_tools._is_blocked_device",
+                side_effect=AssertionError("device metadata probed before deny policy"),
+            ),
+            patch("tools.file_tools._get_file_ops") as mock_get,
+        ):
+            result = json.loads(file_tools.read_file_tool(
+                str(secret),
+                task_id="deny-before-device",
+            ))
+
+        assert "error" in result
+        assert "permissions.deny.paths" in result["error"]
+        mock_get.assert_not_called()
+
     def test_read_preserves_lexical_alias_before_task_resolution(self, monkeypatch):
         lexical = "C:/workspace/link/secret/file.txt"
         resolved = Path("C:/outside/secret/file.txt")

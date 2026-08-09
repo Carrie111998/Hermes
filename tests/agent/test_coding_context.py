@@ -467,6 +467,29 @@ class TestProfiles:
 # ── detection signals ───────────────────────────────────────────────────────
 
 class TestDetection:
+    def test_denied_marker_is_not_probed(self, tmp_path):
+        root = tmp_path / "repo"
+        nested = root / "src"
+        denied = root / "private"
+        nested.mkdir(parents=True)
+        denied.mkdir()
+        marker = root / "pyproject.toml"
+        original_exists = Path.exists
+
+        def guarded_exists(path_obj):
+            if path_obj == marker:
+                raise AssertionError("marker inside denied-overlap root was probed")
+            return original_exists(path_obj)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(denied / "**")],
+            ),
+            patch.object(Path, "exists", guarded_exists),
+        ):
+            assert cc._marker_root(nested, policy_base_path=nested) is None
+
     @pytest.mark.parametrize("marker", ["pyproject.toml", "package.json", "go.mod", "AGENTS.md"])
     def test_project_manifest_triggers_without_git(self, tmp_path, marker):
         (tmp_path / marker).write_text("x")
