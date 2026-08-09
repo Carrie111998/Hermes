@@ -180,10 +180,13 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
     env_writes: dict[str, str] = {}
     if llm_def.get("needs_key") and flags.get("oss_llm_key"):
         env_writes[llm_def["env_var"]] = flags["oss_llm_key"]
-    # Gate on env_var, not needs_key: providers with an OPTIONAL key (ollama
-    # behind an authenticated front) declare env_var without needs_key, and
-    # --oss-embedder-key used to be silently discarded for them.
-    if embedder_def.get("env_var") and flags.get("oss_embedder_key"):
+    # Providers with an OPTIONAL key (ollama behind an authenticated front)
+    # declare key_config_field: the key rides in mem0.json's embedder config
+    # — where _backend.py scopes it into mem0's client — never in an env
+    # var. --oss-embedder-key used to be silently discarded for them.
+    if embedder_def.get("key_config_field") and flags.get("oss_embedder_key"):
+        embedder_config[embedder_def["key_config_field"]] = flags["oss_embedder_key"]
+    elif embedder_def.get("env_var") and flags.get("oss_embedder_key"):
         env_writes[embedder_def["env_var"]] = flags["oss_embedder_key"]
     elif embedder_def.get("needs_key") and embedder_id == llm_id and flags.get("oss_llm_key"):
         env_writes[embedder_def["env_var"]] = flags["oss_llm_key"]
@@ -931,11 +934,14 @@ def _run_connectivity_checks(oss_config: dict, env_writes: dict[str, str] | None
         if not ok:
             print(f"  Warning: {msg}")
 
-    ollama_key = (env_writes or {}).get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY", "")
+    # Bearer resolution mirrors what the backend will actually send: each
+    # block's own config.api_key (the scoped path _backend.py honors), with
+    # the env fallbacks kept only for hand-managed setups.
+    env_key = (env_writes or {}).get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_API_KEY", "")
     llm = oss_config.get("llm", {})
     if llm.get("provider") == "ollama":
         url = llm.get("config", {}).get("ollama_base_url", "http://localhost:11434")
-        ok, msg = _check_ollama(url, ollama_key)
+        ok, msg = _check_ollama(url, llm.get("config", {}).get("api_key") or env_key)
         if not ok:
             print(f"  Warning: {msg}")
 
@@ -945,7 +951,7 @@ def _run_connectivity_checks(oss_config: dict, env_writes: dict[str, str] | None
     if embedder.get("provider") == "ollama":
         emb_url = embedder.get("config", {}).get("ollama_base_url", "http://localhost:11434")
         if emb_url != llm.get("config", {}).get("ollama_base_url"):
-            ok, msg = _check_ollama(emb_url, ollama_key)
+            ok, msg = _check_ollama(emb_url, embedder.get("config", {}).get("api_key") or env_key)
             if not ok:
                 print(f"  Warning: embedder: {msg}")
 

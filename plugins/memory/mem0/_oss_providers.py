@@ -37,11 +37,13 @@ EMBEDDER_PROVIDERS: dict[str, dict[str, Any]] = {
         # No key REQUIRED (needs_key False keeps the interactive flow
         # promptless), but an optional one is honored: a fronted/authenticated
         # Ollama endpoint (e.g. behind a bearer-guarding reverse proxy) takes
-        # the key via OLLAMA_API_KEY, which the ollama python client
-        # auto-attaches as `Authorization: Bearer`. mem0's OllamaEmbedding
-        # ignores embedder.config.api_key, so the env var is the working path.
+        # the key IN the embedder config, which _backend.py scopes into
+        # mem0's ollama client construction as an Authorization header.
+        # Deliberately NOT an env var: OLLAMA_API_KEY is the Ollama Cloud
+        # provider's variable, and a process-wide value reaches its surfaces
+        # (the model picker's catalog probe sends it to ollama.com).
         "needs_key": False,
-        "env_var": "OLLAMA_API_KEY",
+        "key_config_field": "api_key",
         "default_model": "nomic-embed-text",
         "default_url": "http://localhost:11434",
         "base_url_key": "ollama_base_url",

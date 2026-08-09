@@ -342,3 +342,64 @@ class TestSelfHostedBackend:
         s = _StubServer()
         with pytest.raises(httpx.HTTPStatusError):
             _backend(s).delete("missing")  # 404 -> raise_for_status; 'not found' won't trip breaker
+
+
+class TestPatchMem0OllamaClient:
+    """The bearer for an authenticated ollama endpoint is scoped into mem0's
+    client construction — never a process-wide env var, which is the Ollama
+    Cloud provider's variable and reaches its surfaces (the model picker's
+    catalog probe sends it to ollama.com)."""
+
+    def _fake_module(self, monkeypatch, name="fake_mem0_ollama"):
+        import sys
+        import types
+
+        calls = []
+
+        def fake_client(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "client"
+
+        mod = types.ModuleType(name)
+        mod.Client = fake_client
+        monkeypatch.setitem(sys.modules, name, mod)
+        return mod, calls
+
+    def test_injects_bearer_header(self, monkeypatch):
+        from plugins.memory.mem0._backend import _patch_mem0_ollama_client
+
+        mod, calls = self._fake_module(monkeypatch)
+        _patch_mem0_ollama_client(mod.__name__, "sekrit")
+        assert mod.Client(host="https://embed.example") == "client"
+        _, kwargs = calls[-1]
+        assert kwargs["headers"]["Authorization"] == "Bearer sekrit"
+        assert kwargs["host"] == "https://embed.example"
+
+    def test_caller_supplied_authorization_wins(self, monkeypatch):
+        from plugins.memory.mem0._backend import _patch_mem0_ollama_client
+
+        mod, calls = self._fake_module(monkeypatch)
+        _patch_mem0_ollama_client(mod.__name__, "sekrit")
+        mod.Client(host="h", headers={"authorization": "Bearer theirs"})
+        _, kwargs = calls[-1]
+        assert kwargs["headers"] == {"authorization": "Bearer theirs"}
+
+    def test_repatch_is_idempotent_not_nested(self, monkeypatch):
+        """A re-init (new key) must patch from the ORIGINAL client, not wrap
+        the previous wrapper — nesting would send two Authorization values."""
+        from plugins.memory.mem0._backend import _patch_mem0_ollama_client
+
+        mod, calls = self._fake_module(monkeypatch)
+        _patch_mem0_ollama_client(mod.__name__, "old-key")
+        _patch_mem0_ollama_client(mod.__name__, "new-key")
+        mod.Client(host="h")
+        _, kwargs = calls[-1]
+        assert kwargs["headers"]["Authorization"] == "Bearer new-key"
+        assert mod._hermes_unauthed_client.__name__ == "fake_client"
+
+    def test_missing_module_degrades_quietly(self):
+        """mem0 is installed unpinned on deployed agents; a moved attribute
+        or absent module must log and return, never raise."""
+        from plugins.memory.mem0._backend import _patch_mem0_ollama_client
+
+        _patch_mem0_ollama_client("hermes_test_no_such_module", "k")  # no raise
