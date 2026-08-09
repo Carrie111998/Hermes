@@ -1,5 +1,6 @@
 import asyncio
 import time
+from unittest.mock import MagicMock
 
 
 class _FakeProc:
@@ -21,6 +22,30 @@ class _FakeProc:
 
     def kill(self):
         self.killed = True
+
+
+def test_pairing_process_receives_proxy_from_dotenv(monkeypatch, tmp_path):
+    from hermes_cli import web_server as ws
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.js").write_text("// bridge\n", encoding="utf-8")
+    proc = MagicMock()
+    monkeypatch.setattr(
+        "gateway.platforms.whatsapp_common.resolve_whatsapp_bridge_dir",
+        lambda: bridge_dir,
+    )
+    monkeypatch.setattr(ws, "_ensure_whatsapp_bridge_dependencies", lambda _path: None)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda _name: "/node")
+    monkeypatch.setattr("hermes_constants.with_hermes_node_path", lambda: {"PATH": "/bin"})
+    monkeypatch.setattr(ws, "get_env_value", lambda key: "http://proxy.invalid:8080" if key == "WHATSAPP_PROXY_URL" else None)
+    monkeypatch.setattr(ws.subprocess, "Popen", MagicMock(return_value=proc))
+
+    result = ws._spawn_whatsapp_pairing_process(tmp_path / "session", "bot")
+
+    assert result is proc
+    env = ws.subprocess.Popen.call_args.kwargs["env"]
+    assert env["WHATSAPP_PROXY_URL"] == "http://proxy.invalid:8080"
 
 
 
@@ -113,7 +138,6 @@ def test_start_whatsapp_onboarding_existing_creds_returns_linked_account(monkeyp
     assert old_proc.terminated is True
     assert ws._whatsapp_onboarding_sessions["existing-creds"].account_phone == "15551234567"
     ws._whatsapp_onboarding_sessions.clear()
-
 
 
 

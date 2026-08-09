@@ -140,6 +140,20 @@ sudo hermes gateway install --system   # Linux only: boot-time system service
 
 The gateway starts the WhatsApp bridge automatically using the saved session.
 
+### HTTP proxy (optional)
+
+Networks that require an outbound HTTP proxy can route all Baileys traffic
+through it by adding the URL to `~/.hermes/.env`:
+
+```bash
+WHATSAPP_PROXY_URL=http://user:password@proxy.example.com:8080
+```
+
+Only `http://` and `https://` proxy URLs are accepted. The setting covers the
+WhatsApp Web socket, version checks, media uploads, and media downloads. Leave
+it unset for direct networking. Because the URL may contain credentials, keep
+it in `.env` rather than `config.yaml`.
+
 ---
 
 ## Session Persistence

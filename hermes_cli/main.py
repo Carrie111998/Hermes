@@ -2984,6 +2984,10 @@ def cmd_whatsapp(args):
     print()
 
     try:
+        bridge_env = with_hermes_node_path()
+        proxy_url = get_env_value("WHATSAPP_PROXY_URL")
+        if proxy_url:
+            bridge_env["WHATSAPP_PROXY_URL"] = proxy_url
         subprocess.run(
             [
                 find_node_executable("node") or "node",
@@ -2993,7 +2997,7 @@ def cmd_whatsapp(args):
                 str(session_dir),
             ],
             cwd=str(bridge_dir),
-            env=with_hermes_node_path(),
+            env=bridge_env,
         )
     except KeyboardInterrupt:
         pass

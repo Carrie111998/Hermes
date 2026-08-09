@@ -31,3 +31,7 @@ optional_env:
     description: "Display name for the WhatsApp home channel"
     prompt: "Home channel display name"
     password: false
+  - name: WHATSAPP_PROXY_URL
+    description: "Optional HTTP(S) proxy URL for all WhatsApp bridge traffic"
+    prompt: "WhatsApp proxy URL (leave blank for direct networking)"
+    password: true

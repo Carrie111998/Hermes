@@ -355,6 +355,14 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _proxy_config_hash(proxy_url: str) -> str:
+    """Return a non-secret bridge configuration fingerprint."""
+    if not proxy_url:
+        return ""
+    import hashlib
+    return hashlib.sha256(proxy_url.encode("utf-8")).hexdigest()[:16]
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -428,6 +436,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._proxy_url = _wenv("WHATSAPP_PROXY_URL").strip()
         self._dm_policy = str(config.extra.get("dm_policy") or _wenv("WHATSAPP_DM_POLICY", "pairing")).strip().lower()
         # Prefer config.extra, then the documented WHATSAPP_ALLOWED_USERS env
         # (setup wizard / pairing mirror). Select by key *presence* so an
@@ -638,7 +647,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                running_proxy_hash = str(data.get("proxyHash") or "")
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_proxy_hash == _proxy_config_hash(self._proxy_url)
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -654,7 +667,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "bridge configuration changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -685,6 +698,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
             )
+            # Always replace the process-global value with the active profile's
+            # scoped secret. An empty value must not leak another profile's
+            # credential-bearing proxy URL into this bridge.
+            bridge_env.pop("WHATSAPP_PROXY_URL", None)
+            if self._proxy_url:
+                bridge_env["WHATSAPP_PROXY_URL"] = self._proxy_url
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge

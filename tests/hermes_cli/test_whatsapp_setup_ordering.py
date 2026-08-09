@@ -138,3 +138,37 @@ def test_existing_pairing_skip_branch_enables_whatsapp(isolated_home, monkeypatc
 
     # The skip-rebar branch should have set the env var on its way out.
     assert _env_value(isolated_home, "WHATSAPP_ENABLED") == "true"
+
+
+def test_pairing_process_receives_proxy_from_dotenv(isolated_home, monkeypatch):
+    from hermes_cli.main import cmd_whatsapp
+
+    monkeypatch.setenv("WHATSAPP_MODE", "bot")
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "15551234567")
+    monkeypatch.setenv("WHATSAPP_PROXY_URL", "http://proxy.invalid:8080")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "n")
+    monkeypatch.setattr("hermes_cli.main._require_tty", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "gateway.platforms.whatsapp_common.resolve_whatsapp_bridge_dir",
+        lambda: isolated_home / "bridge",
+    )
+    bridge_dir = isolated_home / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.js").write_text("// bridge\n", encoding="utf-8")
+    (bridge_dir / "node_modules").mkdir()
+    captured = {}
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "hermes_constants.with_hermes_node_path",
+        lambda: {"PATH": "/bin"},
+    )
+
+    with redirect_stdout(io.StringIO()):
+        cmd_whatsapp(MagicMock())
+
+    assert captured["env"]["WHATSAPP_PROXY_URL"] == "http://proxy.invalid:8080"

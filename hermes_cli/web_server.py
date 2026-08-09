@@ -64,6 +64,7 @@ from hermes_cli.config import (
     clear_model_endpoint_credentials,
     get_config_path,
     get_env_path,
+    get_env_value,
     get_hermes_home,
     get_process_hermes_home,
     load_config,
@@ -8666,6 +8667,9 @@ def _spawn_whatsapp_pairing_process(session_path: Path, mode: str) -> subprocess
     env = with_hermes_node_path()
     env["WHATSAPP_MODE"] = mode
     env["WHATSAPP_DM_POLICY"] = "pairing"
+    proxy_url = get_env_value("WHATSAPP_PROXY_URL")
+    if proxy_url:
+        env["WHATSAPP_PROXY_URL"] = proxy_url
     return subprocess.Popen(
         [
             node,

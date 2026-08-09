@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { installWhatsAppProxy } from './proxy.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -60,6 +61,12 @@ const WHATSAPP_DEBUG =
   process.env &&
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+
+const WHATSAPP_PROXY_URL = String(process.env.WHATSAPP_PROXY_URL || '').trim();
+const whatsappProxy = installWhatsAppProxy(WHATSAPP_PROXY_URL);
+const PROXY_HASH = WHATSAPP_PROXY_URL
+  ? createHash('sha256').update(WHATSAPP_PROXY_URL).digest('hex').slice(0, 16)
+  : '';
 
 // Opt-in: when true (and WHATSAPP_MODE === 'bot'), fromMe inbound messages
 // that are NOT echoes of our own /send or /send-media calls are forwarded
@@ -396,7 +403,9 @@ function emitPairEvent(event) {
 }
 
 const scheduleReconnect = createReconnectScheduler(() => startSocket());
-const getWAVersion = createVersionResolver(fetchLatestBaileysVersion);
+const getWAVersion = createVersionResolver(
+  () => fetchLatestBaileysVersion(whatsappProxy.versionFetchOptions),
+);
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -406,6 +415,8 @@ async function startSocket() {
     ...(version ? { version } : {}),
     auth: state,
     logger,
+    agent: whatsappProxy.httpAgent,
+    fetchAgent: whatsappProxy.httpAgent,
     printQRInTerminal: false,
     browser: ['Hermes Agent', 'Chrome', '120.0'],
     syncFullHistory: false,
@@ -726,7 +737,7 @@ async function startSocket() {
         senderNumber,
         botIds,
         isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', whatsappProxy.mediaDownloadOptions, { logger, reuploadRequest: sock.updateMediaMessage }),
         cacheDirs: {
           image: IMAGE_CACHE_DIR,
           document: DOCUMENT_CACHE_DIR,
@@ -1111,6 +1122,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    proxyHash: PROXY_HASH,
   });
 });
 
