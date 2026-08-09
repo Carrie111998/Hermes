@@ -40,13 +40,24 @@ from __future__ import annotations
 
 import atexit
 import base64
+import concurrent.futures
+import hashlib
+import importlib
 import json
 import logging
 import os
+import platform
+import queue
 import re
 import struct
+import subprocess
 import sys
 import threading
+import time
+import types
+from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
@@ -168,6 +179,1084 @@ _session_auto_approve: Dict[str, bool] = {}
 _always_allow: Dict[str, set] = {}
 
 
+class BackendLifecycleState(str, Enum):
+    STARTING = "STARTING"
+    ACTIVE = "ACTIVE"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    FAILED = "FAILED"
+
+
+@dataclass
+class ComputerUseReleaseResult:
+    session_id: str
+    generation: Optional[int]
+    status: str
+    reason: str
+    elapsed_ms: float = 0.0
+    error: Optional[str] = None
+
+    @property
+    def released(self) -> bool:
+        return self.status == "released"
+
+    def __bool__(self) -> bool:
+        return self.released
+
+
+@dataclass(frozen=True)
+class ComputerUseTerminalTransition:
+    session_id: str
+    generation: Optional[int]
+    invalidated_publications: tuple["ComputerUseSessionPublication", ...] = ()
+
+
+@dataclass(frozen=True)
+class ComputerUseSessionReactivation:
+    session_id: str
+
+
+@dataclass(eq=False)
+class ComputerUseSessionPublication:
+    session_id: str
+    route_key: Optional[str] = None
+    route_epoch: int = 0
+    active: bool = True
+
+
+@dataclass
+class _BackendRecord:
+    session_id: str
+    generation: int
+    permission_mode: str
+    backend: ComputerUseBackend
+    call_lock: threading.RLock
+    state: BackendLifecycleState = BackendLifecycleState.STARTING
+    close_requested_at: Optional[float] = None
+    close_reason: Optional[str] = None
+    last_error: Optional[str] = None
+    close_attempts: int = 0
+
+
+_backend_records: Dict[str, _BackendRecord] = {}
+_terminal_transitions: Dict[str, ComputerUseTerminalTransition] = {}
+_session_reactivations: Dict[str, ComputerUseSessionReactivation] = {}
+_managed_session_publications: Dict[
+    str, set[ComputerUseSessionPublication]
+] = {}
+_managed_routing_enabled = False
+_managed_session_validator = None
+_session_route_epoch_sequence = 0
+_backend_lookup_state = threading.local()
+_backend_generation_counters: OrderedDict[str, int] = OrderedDict()
+_backend_generation_sequence = 0
+_BACKEND_GENERATION_TOMBSTONE_CAP = 4096
+_DEFAULT_RELEASE_TIMEOUT = 5.0
+_EXPECTED_GENERATION_UNSET = object()
+
+
+def _next_backend_generation_locked(sid: str) -> int:
+    global _backend_generation_sequence
+    _backend_generation_sequence += 1
+    generation = _backend_generation_sequence
+    _backend_generation_counters[sid] = generation
+    _backend_generation_counters.move_to_end(sid)
+    while len(_backend_generation_counters) > _BACKEND_GENERATION_TOMBSTONE_CAP:
+        for oldest_sid in tuple(_backend_generation_counters):
+            if oldest_sid != sid and oldest_sid not in _backend_records:
+                _backend_generation_counters.pop(oldest_sid, None)
+                break
+        else:
+            # More active sessions than the tombstone cap: keep their exact
+            # generations rather than corrupting ownership or looping forever.
+            break
+    return generation
+
+
+def _stamp_backend_lookup_locked(
+    sid: str,
+    backend: ComputerUseBackend,
+    *,
+    route_allowed: bool,
+) -> None:
+    _backend_lookup_state.value = (
+        sid,
+        id(backend),
+        _session_route_epoch_sequence,
+        route_allowed,
+    )
+
+
+def _record_from_legacy_cache_locked(sid: str) -> Optional[_BackendRecord]:
+    """Normalize direct test/integration cache injection into lifecycle state."""
+    record = _backend_records.get(sid)
+    if record is not None:
+        return record
+    backend = _backends.get(sid)
+    if backend is None and sid == "":
+        backend = _backend
+    if backend is None:
+        return None
+    call_lock = _backend_call_locks.setdefault(sid, threading.RLock())
+    record = _BackendRecord(
+        session_id=sid,
+        generation=_next_backend_generation_locked(sid),
+        permission_mode=_backend_permission_modes.get(sid, "standard"),
+        backend=backend,
+        call_lock=call_lock,
+        state=BackendLifecycleState.ACTIVE,
+    )
+    _backend_records[sid] = record
+    return record
+
+
+def _has_active_publication_locked(sid: str) -> bool:
+    return any(
+        publication.active
+        for publication in _managed_session_publications.get(sid, ())
+    )
+
+
+def set_computer_use_session_validator(validator) -> None:
+    """Install the gateway's authoritative current-route validator."""
+    global _managed_routing_enabled, _managed_session_validator
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        _managed_session_validator = validator
+        _managed_routing_enabled = validator is not None
+        _session_route_epoch_sequence += 1
+
+
+def _validate_managed_publication(sid: str) -> tuple[bool, int]:
+    """Validate admission without lock inversion across route epoch changes."""
+    while True:
+        with _backend_lock:
+            epoch = _session_route_epoch_sequence
+            if not sid or not _managed_routing_enabled:
+                return True, epoch
+            if _has_active_publication_locked(sid):
+                return True, epoch
+            validator = _managed_session_validator
+        try:
+            # ``None`` requests a current-session-id lookup, not authority to
+            # mint a run publication. Publication itself always supplies and
+            # validates an exact route key.
+            allowed = bool(validator(None, sid)) if callable(validator) else False
+        except Exception:
+            allowed = False
+        with _backend_lock:
+            if epoch == _session_route_epoch_sequence:
+                return allowed, epoch
+
+
+def publish_computer_use_session(
+    session_id: str,
+    *,
+    route_key: Optional[str] = None,
+) -> ComputerUseSessionPublication:
+    """Publish one route-bound run lease after authoritative validation.
+
+    The validator runs outside ``_backend_lock`` to avoid lock inversion with
+    SessionStore.  The scalar route epoch is then rechecked under the lock, so
+    a terminal transition or reactivation that starts during validation makes
+    this attempt retry instead of minting a stale capability.
+    """
+    global _managed_routing_enabled
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("managed computer_use publication requires a session id")
+    normalized_route_key = str(route_key or "") or None
+    while True:
+        with _backend_lock:
+            epoch = _session_route_epoch_sequence
+            validator = _managed_session_validator
+            validator_required = callable(validator)
+        if validator_required:
+            if normalized_route_key is None:
+                raise ValueError(
+                    "managed computer_use publication requires an exact route key"
+                )
+            try:
+                allowed = bool(validator(normalized_route_key, sid))
+            except Exception:
+                allowed = False
+        else:
+            # Backward-compatible unmanaged CLI/test seam.  The first lease
+            # still enables publication-only admission after it is removed.
+            allowed = True
+        with _backend_lock:
+            if epoch != _session_route_epoch_sequence:
+                continue
+            if sid in _terminal_transitions or sid in _session_reactivations:
+                raise RuntimeError(
+                    f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+                )
+            if not allowed:
+                raise RuntimeError(
+                    f"computer_use session {sid!r} does not match the authoritative route"
+                )
+            _managed_routing_enabled = True
+            publication = ComputerUseSessionPublication(
+                session_id=sid,
+                route_key=normalized_route_key,
+                route_epoch=epoch,
+            )
+            _managed_session_publications.setdefault(sid, set()).add(publication)
+            return publication
+
+
+def unpublish_computer_use_session(
+    publication: ComputerUseSessionPublication,
+) -> None:
+    """Release one exact run-scoped publication and reclaim its map entry."""
+    with _backend_lock:
+        publications = _managed_session_publications.get(publication.session_id)
+        if publications is None or publication not in publications:
+            raise RuntimeError("computer_use session publication token mismatch")
+        publications.remove(publication)
+        publication.active = False
+        if not publications:
+            _managed_session_publications.pop(publication.session_id, None)
+
+
+def get_computer_use_session_generation(session_id: str) -> Optional[int]:
+    sid = str(session_id or "")
+    if not sid:
+        return None
+    with _backend_lock:
+        record = _record_from_legacy_cache_locked(sid)
+        return record.generation if record is not None else None
+
+
+def begin_computer_use_terminal_transition(
+    session_id: str,
+) -> ComputerUseTerminalTransition:
+    """Fence one session ID against CUA acquisition through route publication."""
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("terminal computer_use transition requires a session id")
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        if sid in _terminal_transitions or sid in _session_reactivations:
+            raise RuntimeError(
+                f"computer_use backend for session {sid!r} already has a lifecycle transition"
+            )
+        _session_route_epoch_sequence += 1
+        invalidated_publications = tuple(
+            publication
+            for publication in _managed_session_publications.get(sid, ())
+            if publication.active
+        )
+        for publication in invalidated_publications:
+            publication.active = False
+        record = _record_from_legacy_cache_locked(sid)
+        token = ComputerUseTerminalTransition(
+            session_id=sid,
+            generation=record.generation if record is not None else None,
+            invalidated_publications=invalidated_publications,
+        )
+        _terminal_transitions[sid] = token
+        return token
+
+
+def end_computer_use_terminal_transition(
+    transition: ComputerUseTerminalTransition,
+    *,
+    retire: bool = False,
+) -> None:
+    """Remove one exact fence after confirmed route publication."""
+    global _managed_routing_enabled, _session_route_epoch_sequence
+    with _backend_lock:
+        current = _terminal_transitions.get(transition.session_id)
+        if current is not transition:
+            raise RuntimeError("computer_use terminal transition token mismatch")
+        _terminal_transitions.pop(transition.session_id, None)
+        _session_route_epoch_sequence += 1
+        if retire:
+            _managed_routing_enabled = True
+        else:
+            publications = _managed_session_publications.get(
+                transition.session_id,
+                set(),
+            )
+            for publication in transition.invalidated_publications:
+                if publication in publications:
+                    publication.active = True
+
+
+def is_computer_use_session_retired(session_id: str) -> bool:
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    with _backend_lock:
+        return _managed_routing_enabled and not _has_active_publication_locked(sid)
+
+
+def begin_computer_use_session_reactivation(
+    session_id: str,
+) -> ComputerUseSessionReactivation:
+    """Fence and re-arm one explicitly republished historical route ID."""
+    sid = str(session_id or "")
+    if not sid:
+        raise ValueError("computer_use reactivation requires a session id")
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        if _has_active_publication_locked(sid):
+            raise RuntimeError(
+                f"computer_use session {sid!r} is already published"
+            )
+        if sid in _terminal_transitions or sid in _session_reactivations:
+            raise RuntimeError(
+                f"computer_use session {sid!r} already has a lifecycle fence"
+            )
+        if _record_from_legacy_cache_locked(sid) is not None:
+            raise RuntimeError(
+                f"computer_use retired session {sid!r} still owns a backend"
+            )
+        token = ComputerUseSessionReactivation(session_id=sid)
+        _session_route_epoch_sequence += 1
+        _session_reactivations[sid] = token
+        return token
+
+
+def end_computer_use_session_reactivation(
+    reactivation: ComputerUseSessionReactivation,
+    *,
+    succeeded: bool,
+) -> None:
+    """Finish one exact reactivation fence or restore retirement on failure."""
+    global _session_route_epoch_sequence
+    with _backend_lock:
+        current = _session_reactivations.get(reactivation.session_id)
+        if current is not reactivation:
+            raise RuntimeError("computer_use session reactivation token mismatch")
+        _session_reactivations.pop(reactivation.session_id, None)
+        _session_route_epoch_sequence += 1
+
+
+def computer_use_lifecycle_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Return a secret-free, operator-facing lifecycle snapshot."""
+    with _backend_lock:
+        return {
+            sid: {
+                "generation": record.generation,
+                "state": record.state.value,
+                "permission_mode": record.permission_mode,
+                "close_reason": record.close_reason,
+                "close_attempts": record.close_attempts,
+                "last_error": record.last_error,
+            }
+            for sid, record in _backend_records.items()
+        }
+
+
+class _CleanupSupervisor:
+    """Bounded, tracked executor with deduplicated deferred admission."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 2,
+        max_pending: int = 64,
+        max_deferred: int = 256,
+    ) -> None:
+        self._max_pending = max_pending
+        self._max_deferred = max_deferred
+        self._slots = threading.BoundedSemaphore(max_pending)
+        self._lock = threading.Lock()
+        self._work_queue: queue.Queue[
+            Optional[tuple[tuple[str, Optional[int]], str, Dict[str, Any]]]
+        ] = queue.Queue(maxsize=max_pending)
+        self._workers: list[threading.Thread] = []
+        for index in range(max_workers):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"computer-use-cleanup-{index}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+        self._active_keys: set[tuple[str, Optional[int]]] = set()
+        self._deferred: OrderedDict[
+            tuple[str, Optional[int]], tuple[str, Dict[str, Any]]
+        ] = OrderedDict()
+        self._inflight: Dict[
+            tuple[str, Optional[int]], concurrent.futures.Future
+        ] = {}
+        self._closed = False
+
+    @staticmethod
+    def _rejected_result(
+        sid: str,
+        kwargs: Dict[str, Any],
+        error: str,
+    ) -> ComputerUseReleaseResult:
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=kwargs.get("expected_generation"),
+            status="queue_rejected",
+            reason=str(kwargs.get("reason") or "unspecified"),
+            error=error,
+        )
+
+    def _launch_locked(
+        self,
+        key: tuple[str, Optional[int]],
+        sid: str,
+        kwargs: Dict[str, Any],
+    ) -> Optional[str]:
+        """Launch after one slot was acquired; caller holds ``_lock``."""
+        self._active_keys.add(key)
+        try:
+            self._work_queue.put_nowait((key, sid, kwargs))
+        except queue.Full:
+            self._active_keys.discard(key)
+            self._slots.release()
+            return "cleanup worker queue unexpectedly full"
+        return None
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._work_queue.get()
+            try:
+                if item is None:
+                    return
+                key, sid, kwargs = item
+                self._run_release(key, sid, kwargs)
+            finally:
+                self._work_queue.task_done()
+
+    def _run_release(
+        self,
+        key: tuple[str, Optional[int]],
+        sid: str,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        try:
+            result = _release_computer_use_session_with_retries(sid, **kwargs)
+        except Exception as exc:
+            result = ComputerUseReleaseResult(
+                session_id=sid,
+                generation=kwargs.get("expected_generation"),
+                status="failed",
+                reason=str(kwargs.get("reason") or "unspecified"),
+                error=f"cleanup worker raised: {exc!r}",
+            )
+        self._complete(key, result)
+
+    def _complete(
+        self,
+        key: tuple[str, Optional[int]],
+        result: ComputerUseReleaseResult,
+    ) -> None:
+        completions: list[
+            tuple[concurrent.futures.Future, ComputerUseReleaseResult]
+        ] = []
+        with self._lock:
+            external = self._inflight.pop(key, None)
+            self._active_keys.discard(key)
+            self._slots.release()
+            if external is not None:
+                completions.append((external, result))
+
+            # A completion admits the oldest deferred exact owner. If executor
+            # shutdown races admission, reject it truthfully and continue so no
+            # deferred future is left pending forever.
+            while self._deferred and self._slots.acquire(blocking=False):
+                deferred_key, (sid, kwargs) = self._deferred.popitem(last=False)
+                launch_error = self._launch_locked(deferred_key, sid, kwargs)
+                if launch_error is None:
+                    break
+                deferred_future = self._inflight.pop(deferred_key, None)
+                if deferred_future is not None:
+                    completions.append(
+                        (
+                            deferred_future,
+                            self._rejected_result(sid, kwargs, launch_error),
+                        )
+                    )
+        for future, completion in completions:
+            if not future.done():
+                future.set_result(completion)
+
+    def submit(self, session_id: str, **kwargs: Any) -> concurrent.futures.Future:
+        sid = str(session_id or "")
+        key = (sid, kwargs.get("expected_generation"))
+        rejected: Optional[ComputerUseReleaseResult] = None
+        with self._lock:
+            duplicate = self._inflight.get(key)
+            if duplicate is not None:
+                return duplicate
+            external: concurrent.futures.Future = concurrent.futures.Future()
+            if self._closed:
+                rejected = self._rejected_result(
+                    sid, kwargs, "cleanup supervisor closed"
+                )
+            else:
+                self._inflight[key] = external
+                if self._slots.acquire(blocking=False):
+                    launch_error = self._launch_locked(key, sid, dict(kwargs))
+                    if launch_error is not None:
+                        self._inflight.pop(key, None)
+                        rejected = self._rejected_result(
+                            sid, kwargs, launch_error
+                        )
+                elif len(self._deferred) < self._max_deferred:
+                    self._deferred[key] = (sid, dict(kwargs))
+                else:
+                    self._inflight.pop(key, None)
+                    rejected = self._rejected_result(
+                        sid,
+                        kwargs,
+                        "cleanup deferred-admission queue full; exact owner retained",
+                    )
+        if rejected is not None:
+            if "exact owner retained" in str(rejected.error or ""):
+                _mark_cleanup_admission_failure(
+                    sid,
+                    kwargs.get("expected_generation"),
+                    str(rejected.error),
+                )
+            external.set_result(rejected)
+            logger.error(
+                "computer_use cleanup rejected session=%s generation=%s reason=%s error=%s",
+                sid,
+                kwargs.get("expected_generation"),
+                kwargs.get("reason"),
+                rejected.error,
+            )
+        return external
+
+    def drain(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                if not self._active_keys and not self._deferred:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "pending": len(self._active_keys),
+                "deferred": len(self._deferred),
+                "capacity": self._max_pending,
+                "deferred_capacity": self._max_deferred,
+                "closed": self._closed,
+            }
+
+    def shutdown(self, timeout: float) -> bool:
+        with self._lock:
+            self._closed = True
+        deadline = time.monotonic() + max(0.0, timeout)
+        drained = self.drain(timeout)
+        if not drained:
+            # Do not enqueue stop sentinels ahead of deferred work. Workers are
+            # daemonized, so a wedged backend cannot block interpreter exit;
+            # a later shutdown/drain call can still reap them if work unwinds.
+            return False
+        for _ in self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._work_queue.put(None, timeout=remaining)
+            except queue.Full:
+                break
+        for worker in self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        # Workers are daemonized deliberately: a backend violating its bounded
+        # stop contract cannot hold interpreter shutdown hostage. Active exact
+        # ownership remains visible in lifecycle state until process exit.
+        return drained and not any(worker.is_alive() for worker in self._workers)
+
+
+def _mark_cleanup_admission_failure(
+    sid: str,
+    expected_generation: Any,
+    error: str,
+) -> None:
+    """Fail closed if even the bounded deferred queue cannot admit ownership."""
+    if not isinstance(expected_generation, int) or isinstance(
+        expected_generation, bool
+    ):
+        return
+    with _backend_lock:
+        record = _backend_records.get(sid)
+        if record is None or record.generation != expected_generation:
+            return
+        record.state = BackendLifecycleState.FAILED
+        record.close_reason = "cleanup_admission_failure"
+        record.last_error = error
+
+
+_cleanup_supervisor = _CleanupSupervisor()
+
+
+def computer_use_cleanup_snapshot() -> Dict[str, Any]:
+    """Return bounded-supervisor queue depth without exposing session content."""
+    return _cleanup_supervisor.snapshot()
+
+
+def computer_use_process_snapshot() -> List[Dict[str, Any]]:
+    """Return direct/recursive cua-driver descendants for operator diagnostics."""
+    try:
+        import psutil
+
+        parent = psutil.Process()
+        rows = []
+        for child in parent.children(recursive=True):
+            try:
+                name = child.name()
+                if "cua-driver" not in name.lower():
+                    continue
+                rows.append({
+                    "pid": child.pid,
+                    "ppid": child.ppid(),
+                    "name": name,
+                    "create_time": child.create_time(),
+                    "status": child.status(),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return sorted(rows, key=lambda row: (row["create_time"], row["pid"]))
+    except Exception:
+        logger.debug("computer_use process snapshot failed", exc_info=True)
+        return []
+
+
+_CUA_ATTESTATION_MODULES = (
+    "tools/computer_use/tool.py",
+    "tools/computer_use/cua_backend.py",
+    "tools/computer_use/browser_route.py",
+    "gateway/run.py",
+    "gateway/session.py",
+    "hermes_state.py",
+    "tools/approval.py",
+)
+_CUA_ATTESTATION_CALLABLES = (
+    "tools.computer_use.tool:set_computer_use_session_validator",
+    "tools.computer_use.tool:_validate_managed_publication",
+    "tools.computer_use.tool:publish_computer_use_session",
+    "tools.computer_use.tool:unpublish_computer_use_session",
+    "tools.computer_use.tool:begin_computer_use_terminal_transition",
+    "tools.computer_use.tool:end_computer_use_terminal_transition",
+    "tools.computer_use.tool:_cua_permission_mode",
+    "tools.computer_use.tool:_get_backend",
+    "tools.computer_use.tool:_acquire_backend_for_call",
+    "tools.computer_use.tool:release_computer_use_session_result",
+    "tools.computer_use.tool:handle_computer_use",
+    "tools.computer_use.tool:_dispatch",
+    "tools.computer_use.cua_backend:_AsyncBridge.run",
+    "tools.computer_use.cua_backend:_CuaDriverSession._lifecycle_coro",
+    "tools.computer_use.cua_backend:_CuaDriverSession.start",
+    "tools.computer_use.cua_backend:_CuaDriverSession._attest_runtime_locked",
+    "tools.computer_use.cua_backend:_CuaDriverSession.call_tool",
+    "tools.computer_use.cua_backend:_CuaDriverSession._call_tool_via_cli",
+    "tools.computer_use.cua_backend:_CuaDriverSession._restart_session_locked",
+    "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.start",
+    "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.stop",
+    "tools.computer_use.cua_backend:CuaDriverBackend.set_runtime_attestation_callback",
+    "tools.computer_use.cua_backend:CuaDriverBackend.start",
+    "tools.computer_use.cua_backend:CuaDriverBackend.stop",
+    "tools.computer_use.cua_backend:CuaDriverBackend.capture",
+    "tools.computer_use.cua_backend:CuaDriverBackend._apply_delivery",
+    "tools.computer_use.cua_backend:CuaDriverBackend._run_input_action",
+    "tools.computer_use.cua_backend:CuaDriverBackend._action",
+    "tools.computer_use.cua_backend:CuaDriverBackend._maybe_attach_element_token",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_state",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_prepare",
+    "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_action",
+    "gateway.run:GatewayRunner._run_agent",
+    "gateway.session:SessionStore.ensure_route_matches",
+    "gateway.session:SessionStore.route_matches",
+    "gateway.session:SessionStore._run_route_transition",
+    "gateway.session:SessionStore.prune_old_entries",
+    "hermes_state:SessionDB._execute_write",
+    "hermes_state:SessionDB.publish_compression_child",
+    "hermes_state:SessionDB.promote_to_session_reset",
+    "tools.approval:get_current_session_key",
+    "tools.approval:is_approval_bypass_active_for_session",
+)
+
+
+def _canonical_code_payload(code: types.CodeType) -> Dict[str, Any]:
+    """Serialize code semantics without marshal's construction-sensitive graph."""
+    def constant(value: Any) -> Any:
+        if isinstance(value, types.CodeType):
+            return {"type": "code", "value": _canonical_code_payload(value)}
+        if value is None or isinstance(value, (bool, int, str)):
+            return {"type": type(value).__name__, "value": value}
+        if isinstance(value, float):
+            return {"type": "float", "value": value.hex()}
+        if isinstance(value, complex):
+            return {"type": "complex", "real": value.real.hex(), "imag": value.imag.hex()}
+        if isinstance(value, bytes):
+            return {"type": "bytes", "value": value.hex()}
+        if isinstance(value, tuple):
+            return {"type": "tuple", "value": [constant(item) for item in value]}
+        if isinstance(value, frozenset):
+            return {"type": "frozenset", "value": sorted(
+                (constant(item) for item in value), key=lambda item: json.dumps(item, sort_keys=True)
+            )}
+        raise TypeError(f"unsupported code constant type: {type(value)!r}")
+
+    return {
+        "argcount": code.co_argcount, "posonlyargcount": code.co_posonlyargcount,
+        "kwonlyargcount": code.co_kwonlyargcount, "nlocals": code.co_nlocals,
+        "stacksize": code.co_stacksize, "flags": code.co_flags,
+        "code": code.co_code.hex(), "consts": [constant(value) for value in code.co_consts],
+        "names": list(code.co_names), "varnames": list(code.co_varnames),
+        "freevars": list(code.co_freevars), "cellvars": list(code.co_cellvars),
+        "filename": code.co_filename, "qualname": code.co_qualname,
+        "firstlineno": code.co_firstlineno, "linetable": code.co_linetable.hex(),
+        "exceptiontable": code.co_exceptiontable.hex(),
+    }
+
+
+def _code_fingerprint(code: types.CodeType) -> str:
+    payload = json.dumps(_canonical_code_payload(code), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("ascii")).hexdigest()
+
+
+def _attestation_repo_root() -> "Path":
+    from pathlib import Path
+    return Path(__file__).resolve().parents[2]
+
+
+def _git_output(repo_root: "Path", *args: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(["git", "-C", str(repo_root), *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _collect_attested_source_identity(repo_root: "Path", paths: tuple[str, ...], modules: Dict[str, Any]) -> Dict[str, Any]:
+    head = _git_output(repo_root, "rev-parse", "HEAD")
+    tree = _git_output(repo_root, "rev-parse", "HEAD^{tree}")
+    rows: Dict[str, Any] = {}
+    all_match = bool(head and tree)
+    for relative_path in paths:
+        head_blob = _git_output(repo_root, "rev-parse", f"HEAD:{relative_path}") if head else None
+        tracked = _git_output(repo_root, "ls-files", "--error-unmatch", "--", relative_path) is not None
+        dirty = _git_output(repo_root, "diff", "--quiet", "HEAD", "--", relative_path)
+        matches_head = bool(head_blob and tracked and dirty == "")
+        all_match = all_match and matches_head
+        rows[relative_path] = {"worktree_sha256": modules[relative_path]["sha256"], "head_blob": head_blob, "matches_head": matches_head}
+    manifest = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    if not head or not tree:
+        return {"kind": "unversioned", "attested_paths": rows, "review_source_sha256": hashlib.sha256(manifest.encode("ascii")).hexdigest()}
+    return {"repository": {"vcs": "git", "root": str(repo_root), "head_commit": head, "head_tree": tree}, "kind": "git-clean" if all_match else "dirty-attested-source", "attested_paths": rows, "review_source_sha256": hashlib.sha256(manifest.encode("ascii")).hexdigest()}
+
+
+def _resolve_attested_callable(identity: str, supplied: Dict[str, Any]) -> Any:
+    module_name, qualname = identity.split(":", 1)
+    for value in supplied.values():
+        target = getattr(value, "__func__", value)
+        if getattr(target, "__module__", None) == module_name and getattr(target, "__qualname__", None) == qualname:
+            return target
+    target: Any = importlib.import_module(module_name)
+    for part in qualname.split("."):
+        target = getattr(target, part)
+    return getattr(target, "__func__", target)
+
+
+_NATIVE_RUNTIME_ARTIFACTS = (
+    "python_runtime",
+    "sqlite3_extension",
+    "psutil_extension",
+    "cua_driver_launcher",
+    "cua_driver_executable",
+)
+
+
+def _attested_native_file(path: "Path") -> Dict[str, Any]:
+    """Return a canonical, byte-bound native file identity or fail closed."""
+    canonical = path.resolve(strict=True)
+    if not canonical.is_file():
+        raise RuntimeError(f"required native runtime artifact is not a file: {canonical}")
+    raw = canonical.read_bytes()
+    return {
+        "canonical_path": str(canonical),
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _python_runtime_library() -> "Path":
+    """Resolve the loaded Python runtime library without accepting receipt input."""
+    from pathlib import Path
+    import sysconfig
+
+    names = [
+        value for value in (
+            sysconfig.get_config_var("LDLIBRARY"),
+            sysconfig.get_config_var("LIBRARY"),
+            f"python{sys.version_info.major}{sys.version_info.minor}.dll" if os.name == "nt" else None,
+        ) if isinstance(value, str) and value
+    ]
+    directories = [
+        Path(sys.base_prefix), Path(sys.prefix), Path(sys.executable).resolve().parent,
+    ]
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if isinstance(libdir, str) and libdir:
+        directories.insert(0, Path(libdir))
+    for directory in directories:
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate.resolve(strict=True)
+    raise RuntimeError("could not resolve the Python runtime library")
+
+
+def _live_cua_driver_processes(
+    *,
+    owner_pid: Optional[int] = None,
+    owner_create_time: Optional[float] = None,
+    owner_executable: Optional[str] = None,
+    require_active: bool = False,
+) -> List[Dict[str, Any]]:
+    """Bind only direct cua-driver children of one exact gateway process."""
+    from pathlib import Path
+    import psutil
+
+    owner_pid = os.getpid() if owner_pid is None else int(owner_pid)
+    owner = psutil.Process(owner_pid)
+    actual_owner_create_time = owner.create_time()
+    actual_owner_executable = owner.exe()
+    if owner_create_time is None:
+        owner_create_time = actual_owner_create_time
+    if owner_executable is None:
+        owner_executable = actual_owner_executable
+    if abs(float(owner_create_time) - actual_owner_create_time) > 0.001:
+        raise RuntimeError("gateway owner process create time changed during attestation")
+    if Path(owner_executable).resolve(strict=True) != Path(
+        actual_owner_executable
+    ).resolve(strict=True):
+        raise RuntimeError("gateway owner executable changed during attestation")
+
+    parent_identity = {
+        "pid": owner_pid,
+        "process_create_time": float(owner_create_time),
+        "executable": str(owner_executable),
+    }
+    rows: List[Dict[str, Any]] = []
+    for process in psutil.process_iter(["pid", "name"]):
+        try:
+            if "cua-driver" not in str(process.info.get("name") or "").lower():
+                continue
+            if process.ppid() != owner_pid:
+                continue
+            parent = process.parent()
+            if parent is None or parent.pid != owner_pid:
+                continue
+            if abs(parent.create_time() - float(owner_create_time)) > 0.001:
+                continue
+            if Path(parent.exe()).resolve(strict=True) != Path(
+                owner_executable
+            ).resolve(strict=True):
+                continue
+            argv = process.cmdline()
+            if not isinstance(argv, list) or not argv or not all(
+                isinstance(value, str) for value in argv
+            ):
+                raise RuntimeError("owned cua-driver command line is unavailable")
+            # argv[0] is the concrete launcher actually used for this process;
+            # it is intentionally distinct from Process.exe() on shim installs.
+            _attested_native_file(Path(argv[0]))
+            rows.append({
+                "pid": process.pid,
+                "process_create_time": process.create_time(),
+                "ppid": owner_pid,
+                "executable": _attested_native_file(Path(process.exe())),
+                "parent": dict(parent_identity),
+                "argv": argv,
+            })
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+    rows.sort(key=lambda row: (row["process_create_time"], row["pid"]))
+    if require_active and not rows:
+        raise RuntimeError("no gateway-owned cua-driver process is available for attestation")
+    executable_identities = {
+        (row["executable"]["canonical_path"], row["executable"]["sha256"])
+        for row in rows
+    }
+    launcher_identities = {
+        (
+            artifact["canonical_path"],
+            artifact["sha256"],
+        )
+        for artifact in (
+            _attested_native_file(Path(row["argv"][0])) for row in rows
+        )
+    }
+    if len(executable_identities) > 1:
+        raise RuntimeError("owned cua-driver processes use ambiguous executable bytes")
+    if len(launcher_identities) > 1:
+        raise RuntimeError("owned cua-driver processes use ambiguous launcher bytes")
+    return rows
+
+
+def _native_runtime_artifacts(
+    cua_driver_processes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Bind the exact native dependencies and concrete CUA launch/runtime files."""
+    from pathlib import Path
+    import _sqlite3
+    import psutil
+    from tools.computer_use.cua_backend import resolve_cua_driver_cmd
+
+    extension_name = {
+        "win32": "psutil._psutil_windows",
+        "darwin": "psutil._psutil_osx",
+    }.get(sys.platform, "psutil._psutil_linux")
+    psutil_extension = importlib.import_module(extension_name)
+    process_rows = list(cua_driver_processes or [])
+    if process_rows:
+        launcher = _attested_native_file(Path(process_rows[0]["argv"][0]))
+        runtime_executable = dict(process_rows[0]["executable"])
+    else:
+        driver = resolve_cua_driver_cmd()
+        if not driver:
+            raise RuntimeError("could not resolve the cua-driver launcher in use")
+        launcher = _attested_native_file(Path(driver))
+        # Startup-phase evidence is prospective only. Final verification
+        # rejects that phase and requires a refreshed gateway-owned process.
+        runtime_executable = dict(launcher)
+    artifacts = {
+        "python_runtime": _attested_native_file(_python_runtime_library()),
+        "sqlite3_extension": _attested_native_file(Path(_sqlite3.__file__)),
+        "psutil_extension": _attested_native_file(Path(psutil_extension.__file__)),
+        "cua_driver_launcher": launcher,
+        "cua_driver_executable": runtime_executable,
+    }
+    if set(artifacts) != set(_NATIVE_RUNTIME_ARTIFACTS):
+        raise RuntimeError("native runtime artifact policy is incomplete")
+    return artifacts
+
+
+def _atomic_write_attestation(path: "Path", raw: bytes) -> None:
+    """Durably replace one required receipt before reporting success."""
+    from pathlib import Path
+    import uuid
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / (
+        f".cua-attest-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+            move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            move_file.restype = wintypes.BOOL
+            # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH. Concurrent
+            # runtime refreshes may briefly contend on the current receipt;
+            # retry only Windows access/sharing violations within a fixed bound.
+            import time as _time
+
+            for attempt in range(50):
+                if move_file(str(temporary), str(destination), 0x1 | 0x8):
+                    break
+                error = ctypes.get_last_error()
+                if error not in {5, 32} or attempt == 49:
+                    raise OSError(error, "MoveFileExW failed")
+                _time.sleep(min(0.002 * (attempt + 1), 0.05))
+        else:
+            os.replace(temporary, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_computer_use_runtime_attestation(
+    extra_callables: Optional[Dict[str, Any]] = None,
+    *,
+    require_active_cua: bool = False,
+) -> Dict[str, Any]:
+    """Durably bind the gateway and, after startup, its exact CUA children."""
+    from datetime import datetime, timezone
+    from pathlib import Path
+    import uuid
+    from hermes_constants import get_hermes_home
+
+    importlib.import_module("tools.computer_use.cua_backend")
+    repo_root = _attestation_repo_root()
+    modules: Dict[str, Any] = {}
+    for relative_path in _CUA_ATTESTATION_MODULES:
+        source_path = (repo_root / relative_path).resolve()
+        raw = source_path.read_bytes()
+        modules[relative_path] = {"source_path": str(source_path), "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    supplied = extra_callables or {}
+    callables: Dict[str, Any] = {}
+    for identity in _CUA_ATTESTATION_CALLABLES:
+        target = _resolve_attested_callable(identity, supplied)
+        code = getattr(target, "__code__", None)
+        if code is None:
+            raise RuntimeError(f"attestation callable has no code: {identity}")
+        source_path = Path(code.co_filename).resolve()
+        try:
+            relative_path = source_path.relative_to(repo_root).as_posix()
+        except ValueError as exc:
+            raise RuntimeError(f"attestation callable outside repository: {identity}") from exc
+        callables[identity] = {"module": target.__module__, "qualname": target.__qualname__, "source_relative_path": relative_path, "first_line": code.co_firstlineno, "code_sha256": _code_fingerprint(code)}
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        parent = process.parent()
+        process_create_time, process_executable = process.create_time(), process.exe()
+        parent_identity = {
+            "pid": parent.pid,
+            "process_create_time": parent.create_time(),
+            "executable": parent.exe(),
+        }
+        if not process_executable or not parent_identity["executable"]:
+            raise RuntimeError("live gateway process identity is unavailable")
+    except Exception as exc:
+        raise RuntimeError("could not attest live gateway process identity") from exc
+    output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
+    archive_dir = output.parent / "cua_gateway_attestations"
+    captured_at = datetime.now(timezone.utc)
+    archive = archive_dir / (
+        f"{os.getpid()}-{int(process_create_time * 1_000_000)}-"
+        f"{int(captured_at.timestamp() * 1_000_000)}-{uuid.uuid4().hex}.json"
+    )
+    cua_driver_processes = _live_cua_driver_processes(
+        owner_pid=os.getpid(),
+        owner_create_time=process_create_time,
+        owner_executable=process_executable,
+        require_active=require_active_cua,
+    )
+    runtime_phase = "cua_active" if cua_driver_processes else "gateway_startup"
+    receipt = {"schema": 3, "runtime_phase": runtime_phase, "captured_at": captured_at.isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "parent": parent_identity, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "native_runtime_artifacts": _native_runtime_artifacts(cua_driver_processes), "cua_driver_processes": cua_driver_processes, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
+    encoded = json.dumps(receipt, indent=2).encode("utf-8")
+    # Archive first, then publish the current pointer. A crash between these
+    # writes leaves either the previous current receipt or a final verifier
+    # failure; it cannot publish a current receipt without its archive.
+    _atomic_write_attestation(archive, encoded)
+    _atomic_write_attestation(output, encoded)
+    return receipt
+
+
 def _cua_permission_mode(session_id: str) -> str:
     """Map Hermes's explicit approval bypass onto Cua's immutable mode.
 
@@ -202,36 +1291,55 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
     global _backend
     sid = str(session_id or "")
     while True:
-        stale_backend: Optional[ComputerUseBackend] = None
-        stale_lock: Optional[threading.RLock] = None
+        release_generation: Optional[int] = None
+        route_allowed, route_epoch = _validate_managed_publication(sid)
         with _backend_lock:
-            # Resolve the mode while holding the cache lock. Session YOLO
-            # mutation never holds the approval lock while releasing this
-            # cache, so the lock order cannot cycle.
+            if route_epoch != _session_route_epoch_sequence:
+                continue
+            if sid in _terminal_transitions or sid in _session_reactivations:
+                raise RuntimeError(
+                    f"computer_use backend for session {sid!r} is fenced by a terminal transition"
+                )
+            if not route_allowed:
+                raise RuntimeError(
+                    f"computer_use backend for retired or unpublished session {sid!r} is unavailable"
+                )
             permission_mode = _cua_permission_mode(sid)
             if sid == "" and _backend is not None and sid not in _backends:
-                # Preserve the long-standing empty-session injection hook used
-                # by integrations and tests while normalizing it into the
-                # session-owned cache/lifecycle path.
                 _backends[sid] = _backend
                 _backend_call_locks[sid] = threading.RLock()
                 _backend_permission_modes[sid] = permission_mode
-            cached = _backends.get(sid)
-            if cached is not None:
-                if _backend_permission_modes.get(sid, "standard") == permission_mode:
-                    return cached
-                # Cua's permission mode cannot change after daemon startup. A
-                # /yolo toggle replaces only this session's backend.
-                stale_backend = _backends.pop(sid)
-                stale_lock = _backend_call_locks.pop(sid, None)
-                _backend_permission_modes.pop(sid, None)
-                if sid == "":
-                    _backend = None
+            record = _record_from_legacy_cache_locked(sid)
+            if record is not None:
+                if record.state == BackendLifecycleState.ACTIVE:
+                    if record.permission_mode == permission_mode:
+                        _stamp_backend_lookup_locked(
+                            sid,
+                            record.backend,
+                            route_allowed=route_allowed,
+                        )
+                        return record.backend
+                    release_generation = record.generation
+                elif record.state == BackendLifecycleState.CLOSING:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} is closing"
+                    )
+                elif record.state == BackendLifecycleState.FAILED:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} cleanup failed; "
+                        "retry release before recreating it"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} is "
+                        f"{record.state.value.lower()}"
+                    )
             else:
                 backend_name = os.environ.get(
                     "HERMES_COMPUTER_USE_BACKEND", "cua"
                 ).lower()
-                if backend_name in {"cua", "cua-driver", ""}:
+                is_cua_backend = backend_name in {"cua", "cua-driver", ""}
+                if is_cua_backend:
                     from tools.computer_use.cua_backend import CuaDriverBackend
 
                     backend = CuaDriverBackend(permission_mode=permission_mode)
@@ -241,133 +1349,511 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                     raise RuntimeError(
                         f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}"
                     )
-                # Starting under the cache lock preserves the existing
-                # one-backend-per-session invariant. A concurrent mode toggle
-                # releases this backend before returning to its caller.
-                backend.start()
+                requires_runtime_attestation = (
+                    getattr(backend, "_requires_runtime_attestation", False) is True
+                )
+                if requires_runtime_attestation:
+                    configure_attestation = getattr(
+                        backend,
+                        "set_runtime_attestation_callback",
+                        None,
+                    )
+                    if not callable(configure_attestation):
+                        raise RuntimeError(
+                            "CUA backend requires runtime attestation but exposes no "
+                            "replacement-attestation hook"
+                        )
+                    configure_attestation(
+                        lambda: write_computer_use_runtime_attestation(
+                            require_active_cua=True
+                        )
+                    )
+                call_lock = threading.RLock()
+                record = _BackendRecord(
+                    session_id=sid,
+                    generation=_next_backend_generation_locked(sid),
+                    permission_mode=permission_mode,
+                    backend=backend,
+                    call_lock=call_lock,
+                )
+                _backend_records[sid] = record
                 _backends[sid] = backend
-                _backend_call_locks[sid] = threading.RLock()
+                _backend_call_locks[sid] = call_lock
                 _backend_permission_modes[sid] = permission_mode
                 if sid == "":
                     _backend = backend
+                try:
+                    backend.start()
+                    if requires_runtime_attestation:
+                        # The gateway-startup receipt is prospective. Refresh it
+                        # only after this backend has spawned its exact direct
+                        # cua-driver child, and do not publish ACTIVE authority
+                        # unless the durable active-runtime receipt succeeds.
+                        write_computer_use_runtime_attestation(
+                            require_active_cua=True
+                        )
+                except Exception as exc:
+                    record.state = BackendLifecycleState.FAILED
+                    record.last_error = repr(exc)
+                    try:
+                        backend.stop()
+                    except Exception as cleanup_exc:
+                        record.last_error = (
+                            f"start={exc!r}; cleanup={cleanup_exc!r}"
+                        )
+                        logger.error(
+                            "computer_use startup cleanup failed session=%s "
+                            "generation=%s error=%s",
+                            sid,
+                            record.generation,
+                            cleanup_exc,
+                        )
+                    else:
+                        _backend_records.pop(sid, None)
+                        _backends.pop(sid, None)
+                        _backend_call_locks.pop(sid, None)
+                        _backend_permission_modes.pop(sid, None)
+                        if sid == "" and _backend is backend:
+                            _backend = None
+                    raise
+                record.state = BackendLifecycleState.ACTIVE
+                logger.info(
+                    "computer_use lifecycle session=%s generation=%s state=ACTIVE",
+                    sid,
+                    record.generation,
+                )
+                _stamp_backend_lookup_locked(
+                    sid,
+                    backend,
+                    route_allowed=route_allowed,
+                )
                 return backend
 
-        # Stop a mismatched backend outside the global cache lock. Another
-        # session can continue creating or releasing its own backend, and the
-        # loop re-reads the authoritative mode before installing a replacement.
-        try:
-            if stale_lock is not None:
-                with stale_lock:
-                    stale_backend.stop()
-            elif stale_backend is not None:
-                stale_backend.stop()
-        except Exception:
-            pass
+        # Permission-mode changes are hard lifecycle boundaries. The exact
+        # generation stays installed while it closes, so no same-SID backend can
+        # be recreated until stop has succeeded.
+        result = release_computer_use_session_result(
+            sid,
+            expected_generation=release_generation,
+            timeout=_DEFAULT_RELEASE_TIMEOUT,
+            reason="permission_mode_change",
+            allow_empty_session=(sid == ""),
+        )
+        if not result.released:
+            raise RuntimeError(
+                f"computer_use permission-mode transition failed for {sid!r}: "
+                f"{result.status}: {result.error or ''}"
+            )
 
 
-def release_computer_use_session(session_id: str) -> bool:
-    """Release one session-owned computer-use backend.
+def _acquire_backend_for_call(
+    session_id: str,
+) -> tuple[ComputerUseBackend, threading.RLock]:
+    """Acquire an action lease that cannot outlive its exact active backend."""
+    global _backend
+    sid = str(session_id or "")
+    for _ in range(3):
+        backend = _get_backend(session_id=sid)
+        lookup = getattr(_backend_lookup_state, "value", None)
+        expected_route_epoch = (
+            lookup[2]
+            if (
+                isinstance(lookup, tuple)
+                and len(lookup) == 4
+                and lookup[0] == sid
+                and lookup[1] == id(backend)
+                and lookup[3] is True
+            )
+            else None
+        )
+        with _backend_lock:
+            record = _record_from_legacy_cache_locked(sid)
+            if record is None and sid == "":
+                # Preserve the long-standing test/plugin seam where _get_backend
+                # itself is replaced and returns a pre-started backend. Restrict
+                # this normalization to the legacy empty-session namespace so
+                # hard session cleanup still requires authoritative ownership.
+                call_lock = threading.RLock()
+                record = _BackendRecord(
+                    session_id=sid,
+                    generation=_next_backend_generation_locked(sid),
+                    permission_mode=_cua_permission_mode(sid),
+                    backend=backend,
+                    call_lock=call_lock,
+                    state=BackendLifecycleState.ACTIVE,
+                )
+                _backend_records[sid] = record
+                _backends[sid] = backend
+                _backend_call_locks[sid] = call_lock
+                _backend_permission_modes[sid] = record.permission_mode
+                _backend = backend
+            if record is None or record.backend is not backend:
+                if (
+                    expected_route_epoch is not None
+                    and expected_route_epoch != _session_route_epoch_sequence
+                ):
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} changed while acquiring action lease"
+                    )
+                continue
+            call_lock = record.call_lock
+        call_lock.acquire()
+        with _backend_lock:
+            current = _backend_records.get(sid)
+            current_route_epoch = _session_route_epoch_sequence
+            if (
+                current is record
+                and current.backend is backend
+                and current.state == BackendLifecycleState.ACTIVE
+                and sid not in _terminal_transitions
+                and sid not in _session_reactivations
+                and (
+                    not sid
+                    or (
+                        expected_route_epoch is not None
+                        and expected_route_epoch == current_route_epoch
+                    )
+                )
+            ):
+                return backend, call_lock
+        call_lock.release()
+        if (
+            expected_route_epoch is not None
+            and expected_route_epoch != current_route_epoch
+        ):
+            raise RuntimeError(
+                f"computer_use backend for session {sid!r} changed while acquiring action lease"
+            )
+    raise RuntimeError(
+        f"computer_use backend for session {sid!r} changed while acquiring action lease"
+    )
 
-    This is the production lifecycle seam for hosts and policy plugins. It
-    removes the exact session backend, its call lock, and its recorded
-    permission mode before stopping the backend, so new lookups cannot retain
-    the stale target/ref namespace — and stops a private embedded daemon when
-    Hermes YOLO selected unrestricted mode. Approval state is cleared even
-    when no backend was started.
 
-    Returns ``True`` when a backend was found and released, ``False`` when the
-    session was already absent. Safe to call repeatedly.
+def release_computer_use_session_result(
+    session_id: str,
+    *,
+    expected_generation: Any = _EXPECTED_GENERATION_UNSET,
+    timeout: float = _DEFAULT_RELEASE_TIMEOUT,
+    reason: str = "explicit",
+    allow_empty_session: bool = False,
+) -> ComputerUseReleaseResult:
+    """Close one exact backend generation with bounded, truthful lifecycle state.
+
+    Omitting ``expected_generation`` preserves the historical public call shape,
+    but it never authorizes wildcard teardown: the exact active generation is
+    snapshotted under ``_backend_lock``. Passing ``None`` explicitly remains an
+    invalid generation.
     """
     global _backend
     sid = str(session_id or "")
+    started = time.monotonic()
+    generation_omitted = expected_generation is _EXPECTED_GENERATION_UNSET
+    if (
+        not generation_omitted
+        and (type(expected_generation) is not int or expected_generation <= 0)
+    ):
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=expected_generation,
+            status="mismatch",
+            reason=reason,
+            error="expected_generation must be a positive integer",
+        )
+    if not sid and not allow_empty_session:
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=None if generation_omitted else expected_generation,
+            status="mismatch",
+            reason=reason,
+            error="empty session id rejected",
+        )
+
     with _backend_lock:
-        backend = _backends.pop(sid, None)
-        call_lock = _backend_call_locks.pop(sid, None)
-        _backend_permission_modes.pop(sid, None)
-        # Preserve the backward-compatible empty-session injection hook:
-        # older callers/tests may populate only `_backend`.
-        if sid == "" and backend is None:
-            backend = _backend
-        if sid == "" and _backend is backend:
-            _backend = None
+        record = _record_from_legacy_cache_locked(sid)
+        if generation_omitted:
+            if record is None:
+                return ComputerUseReleaseResult(
+                    session_id=sid,
+                    generation=None,
+                    status="already_absent",
+                    reason=reason,
+                )
+            expected_generation = record.generation
+        if record is None:
+            last_generation = _backend_generation_counters.get(sid)
+            idempotent_absence = (
+                expected_generation is None
+                or (
+                    last_generation is not None
+                    and expected_generation == last_generation
+                )
+            )
+            status = "already_absent" if idempotent_absence else "mismatch"
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=expected_generation,
+                status=status,
+                reason=reason,
+                error=None if status == "already_absent" else "generation absent",
+            )
+        if expected_generation is not None and record.generation != expected_generation:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="mismatch",
+                reason=reason,
+                error=f"expected generation {expected_generation}",
+            )
+        if record.state == BackendLifecycleState.CLOSING:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="already_closing",
+                reason=reason,
+            )
+        if record.state == BackendLifecycleState.CLOSED:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="already_absent",
+                reason=reason,
+            )
+        record.state = BackendLifecycleState.CLOSING
+        record.close_requested_at = time.monotonic()
+        record.close_reason = reason
+        record.close_attempts += 1
+        record.last_error = None
+        generation = record.generation
+        backend = record.backend
+        call_lock = record.call_lock
 
     with _approval_lock:
         _session_auto_approve.pop(sid, None)
         _always_allow.pop(sid, None)
 
-    if backend is None:
-        return False
+    logger.info(
+        "computer_use lifecycle session=%s generation=%s state=CLOSING reason=%s",
+        sid,
+        generation,
+        reason,
+    )
+    acquired = False
     try:
-        # Let an in-flight action finish before ending the driver session and
-        # dropping its target/ref state. Do not hold the global cache lock
-        # while waiting: unrelated Hermes sessions remain independent.
-        if call_lock is not None:
-            with call_lock:
-                backend.stop()
+        acquired = call_lock.acquire(timeout=max(0.0, timeout))
+        if not acquired:
+            error = f"in-flight call did not quiesce within {timeout:.3f}s"
+            with _backend_lock:
+                current = _backend_records.get(sid)
+                if current is record:
+                    record.state = BackendLifecycleState.FAILED
+                    record.last_error = error
+            status = "timed_out"
         else:
-            backend.stop()
-    except Exception:
-        logger.debug(
-            "computer_use backend release failed for session %s",
-            sid,
-            exc_info=True,
+            try:
+                backend.stop()
+            except Exception as exc:
+                error = repr(exc)
+                with _backend_lock:
+                    current = _backend_records.get(sid)
+                    if current is record:
+                        record.state = BackendLifecycleState.FAILED
+                        record.last_error = error
+                status = "failed"
+            else:
+                error = None
+                with _backend_lock:
+                    current = _backend_records.get(sid)
+                    if current is not record:
+                        status = "mismatch"
+                        error = "lifecycle record changed during close"
+                    else:
+                        record.state = BackendLifecycleState.CLOSED
+                        _backend_records.pop(sid, None)
+                        _backends.pop(sid, None)
+                        _backend_call_locks.pop(sid, None)
+                        _backend_permission_modes.pop(sid, None)
+                        if sid == "" and _backend is backend:
+                            _backend = None
+                        status = "released"
+    finally:
+        if acquired:
+            call_lock.release()
+
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    log = logger.info if status == "released" else logger.error
+    log(
+        "computer_use lifecycle session=%s generation=%s status=%s "
+        "reason=%s elapsed_ms=%.1f error=%s",
+        sid,
+        generation,
+        status,
+        reason,
+        elapsed_ms,
+        error,
+    )
+    return ComputerUseReleaseResult(
+        session_id=sid,
+        generation=generation,
+        status=status,
+        reason=reason,
+        elapsed_ms=elapsed_ms,
+        error=error,
+    )
+
+
+def _release_computer_use_session_with_retries(
+    session_id: str,
+    *,
+    expected_generation: int,
+    timeout: float,
+    reason: str,
+    allow_empty_session: bool,
+    max_attempts: int = 3,
+    retry_delay: float = 0.1,
+) -> ComputerUseReleaseResult:
+    """Run bounded retries for transient quiescence/stop failures."""
+    result: Optional[ComputerUseReleaseResult] = None
+    for attempt in range(1, max(1, max_attempts) + 1):
+        result = release_computer_use_session_result(
+            session_id,
+            expected_generation=expected_generation,
+            timeout=timeout,
+            reason=f"{reason}:attempt-{attempt}",
+            allow_empty_session=allow_empty_session,
         )
-    return True
+        if result.status not in {"timed_out", "failed"}:
+            return result
+        if attempt < max_attempts:
+            time.sleep(max(0.0, retry_delay) * attempt)
+    assert result is not None
+    return result
+
+
+def release_computer_use_session(session_id: str) -> bool:
+    """Backward-compatible bool adapter that snapshots one exact generation."""
+    sid = str(session_id or "")
+    with _backend_lock:
+        record = _record_from_legacy_cache_locked(sid)
+        if record is None:
+            return False
+        generation = record.generation
+    result = release_computer_use_session_result(
+        sid,
+        expected_generation=generation,
+        timeout=_DEFAULT_RELEASE_TIMEOUT,
+        reason="explicit",
+        allow_empty_session=True,
+    )
+    return result.released
+
+
+def submit_computer_use_session_release(
+    session_id: str,
+    *,
+    expected_generation: int,
+    timeout: float = _DEFAULT_RELEASE_TIMEOUT,
+    reason: str,
+    max_attempts: int = 3,
+    retry_delay: float = 0.1,
+) -> concurrent.futures.Future:
+    """Submit one exact generation close to the bounded cleanup supervisor."""
+    if type(expected_generation) is not int or expected_generation <= 0:
+        raise ValueError("expected_generation must be a positive integer")
+    return _cleanup_supervisor.submit(
+        session_id,
+        expected_generation=expected_generation,
+        timeout=timeout,
+        reason=reason,
+        allow_empty_session=False,
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+    )
+
+
+def drain_computer_use_cleanup(timeout: float = _DEFAULT_RELEASE_TIMEOUT) -> bool:
+    return _cleanup_supervisor.drain(timeout)
 
 
 def _shutdown_backend_atexit() -> None:
-    """Stop all cached backends so cua-driver children don't outlive us.
+    """Boundedly drain tracked cleanup, then close every remaining generation."""
+    try:
+        drain_computer_use_cleanup(timeout=_DEFAULT_RELEASE_TIMEOUT)
+    except Exception:
+        logger.debug("computer_use cleanup drain failed during shutdown", exc_info=True)
 
-    Each session backend holds a long-lived ``cua-driver`` subprocess, so
-    without this a driver can survive the Hermes process that spawned it
-    (#28152 item 3). #69903 kept the orphan from burning a core by disabling
-    the cursor overlay; the process itself still lingered.
-
-    Mirrors ``browser_tool``'s ``atexit.register(_emergency_cleanup_all_sessions)``
-    — same spawn-and-drive-a-subprocess shape. atexit only, no signal handlers:
-    a ``SystemExit`` raised from a prompt_toolkit key binding corrupts its
-    coroutine state and makes the process unkillable. Never raises, since an
-    exception escaping atexit prints a traceback on every exit.
-    """
-    global _backend
-    # Drop the global lock before stop() — teardown budgets 5s and shouldn't
-    # block an unrelated caller waiting to spawn.
     with _backend_lock:
-        unique = {
-            id(backend): (backend, _backend_call_locks.get(sid))
-            for sid, backend in _backends.items()
-        }
-        if _backend is not None:
-            unique.setdefault(
-                id(_backend),
-                (_backend, _backend_call_locks.get("")),
+        records = [
+            (sid, record.generation)
+            for sid, record in _backend_records.items()
+        ]
+        # Preserve direct legacy injection even if it has not been normalized.
+        for sid in tuple(_backends):
+            record = _record_from_legacy_cache_locked(sid)
+            if record is not None and (sid, record.generation) not in records:
+                records.append((sid, record.generation))
+        if _backend is not None and "" not in _backends:
+            record = _record_from_legacy_cache_locked("")
+            if record is not None and ("", record.generation) not in records:
+                records.append(("", record.generation))
+
+    for sid, generation in records:
+        try:
+            release_computer_use_session_result(
+                sid,
+                expected_generation=generation,
+                timeout=_DEFAULT_RELEASE_TIMEOUT,
+                reason="process_shutdown",
+                allow_empty_session=True,
             )
-        _backend = None
-        _backends.clear()
-        _backend_call_locks.clear()
-        _backend_permission_modes.clear()
+        except Exception:
+            logger.debug(
+                "computer_use shutdown release failed session=%s generation=%s",
+                sid,
+                generation,
+                exc_info=True,
+            )
 
     with _approval_lock:
         _session_auto_approve.clear()
         _always_allow.clear()
 
-    for backend, call_lock in unique.values():
+
+def _finalize_computer_use_atexit() -> None:
+    try:
+        _shutdown_backend_atexit()
+    finally:
         try:
-            if call_lock is not None:
-                with call_lock:
-                    backend.stop()
-            else:
-                backend.stop()
-        except Exception as e:
-            logger.debug("cua-driver atexit teardown failed: %s", e)
+            _cleanup_supervisor.shutdown(timeout=_DEFAULT_RELEASE_TIMEOUT)
+        except Exception:
+            pass
 
 
-atexit.register(_shutdown_backend_atexit)
+atexit.register(_finalize_computer_use_atexit)
 
 
 def reset_backend_for_tests() -> None:  # pragma: no cover
-    """Test helper — tear down the cached backend and per-session state."""
+    """Test helper — tear down cached backends and reset lifecycle state."""
+    global _backend, _backend_generation_sequence
+    global _managed_routing_enabled, _managed_session_validator
+    global _session_route_epoch_sequence
     _shutdown_backend_atexit()
+    with _backend_lock:
+        _backend = None
+        _backends.clear()
+        _backend_call_locks.clear()
+        _backend_permission_modes.clear()
+        _backend_records.clear()
+        _terminal_transitions.clear()
+        _session_reactivations.clear()
+        _managed_session_publications.clear()
+        _managed_routing_enabled = False
+        _managed_session_validator = None
+        _session_route_epoch_sequence = 0
+        _backend_generation_counters.clear()
+        _backend_generation_sequence = 0
+    with _approval_lock:
+        _session_auto_approve.clear()
+        _always_allow.clear()
     _AUX_VISION_ROUTE_CACHE.clear()
 
 
@@ -491,24 +1977,41 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if err is not None:
             return err
 
-    # Dispatch to backend.
+    # Dispatch through an exact-generation action lease. Teardown can mark the
+    # record CLOSING concurrently, but cannot stop the backend until this lease
+    # releases its per-session call lock.
+    call_lock = None
     try:
-        backend = _get_backend(session_id=session_id)
+        backend, call_lock = _acquire_backend_for_call(session_id)
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
             "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                     "If a Python dependency is missing, the error above shows the exact install command.",
         })
-
     try:
-        with _backend_lock:
-            call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
-        with call_lock:
-            return _dispatch(backend, action, args)
+        return _dispatch(backend, action, args)
     except Exception as e:
+        if getattr(e, "cua_action_termination_unconfirmed", False):
+            # The action lease is about to be released, but the exact driver
+            # coroutine may still be running. Poison this generation before
+            # releasing the lock so no successor action can overlap it. Only
+            # exact-generation teardown may clear the failed record.
+            with _backend_lock:
+                record = _backend_records.get(session_id)
+                if (
+                    record is not None
+                    and record.backend is backend
+                    and record.state == BackendLifecycleState.ACTIVE
+                ):
+                    record.state = BackendLifecycleState.FAILED
+                    record.close_reason = "action_termination_unconfirmed"
+                    record.last_error = repr(e)
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
+    finally:
+        if call_lock is not None:
+            call_lock.release()
 
 
 def _request_approval(action: str, args: Dict[str, Any],

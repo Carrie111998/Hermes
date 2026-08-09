@@ -468,19 +468,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
-    # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
-    #     at import time. When the module is first imported at collection (any
-    #     test file with a top-level ``from hermes_state import ...``) that
-    #     happens BEFORE this fixture ever runs, so every argless
-    #     ``SessionDB()`` in every test opens the developer's REAL state.db —
-    #     reading real sessions into assertions and writing test rows into the
-    #     real profile. Re-pin the constant to this test's home. (Several test
-    #     files already do this locally; this makes it an invariant.)
-    hermes_state_mod = sys.modules.get("hermes_state")
-    if hermes_state_mod is not None and hasattr(hermes_state_mod, "DEFAULT_DB_PATH"):
-        monkeypatch.setattr(
-            hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
-        )
+    # ``SessionDB`` now resolves ``get_hermes_home()`` at construction time.
+    # Do not re-pin its legacy import-time constant here: doing so overrides a
+    # test's later, intentional HERMES_HOME redirect and makes outcomes depend
+    # on whether another test imported hermes_state during collection.
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

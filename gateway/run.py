@@ -4762,6 +4762,7 @@ class TurnRunner:
             if _peek_entry and len(_peek_entry) > 3:
                 _peek_cached_sid = _peek_entry[3]
         _cached_sid_is_dead = False
+        _peek_cached_cua_generation = None
         if (
             _peek_cached_sid is not None
             and ctx.session_id is not None
@@ -4773,6 +4774,19 @@ class TurnRunner:
                 )
             except Exception:
                 _cached_sid_is_dead = False
+            if _cached_sid_is_dead and _peek_cached_sid:
+                try:
+                    from tools.computer_use import get_computer_use_session_generation
+
+                    _peek_cached_cua_generation = get_computer_use_session_generation(
+                        _peek_cached_sid
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not snapshot computer_use generation for dead session %s",
+                        _peek_cached_sid,
+                        exc_info=True,
+                    )
 
         # Detect cross-process writes: when another process (e.g. hermes
         # dashboard) appends to the same session in the shared SessionDB,
@@ -4791,6 +4805,7 @@ class TurnRunner:
                 pass
 
         _xproc_evicted_agent = None
+        _xproc_evicted_cua_release = None
         if _cache_lock and _cache is not None:
             with _cache_lock:
                 cached = _cache.get(ctx.session_key)
@@ -4856,6 +4871,15 @@ class TurnRunner:
                             # block the event loop / cache lock on
                             # memory-provider shutdown or socket teardown.
                             _xproc_evicted_agent = _ev_agent
+                            if (
+                                isinstance(_cached_sid, str)
+                                and _cached_sid.strip()
+                                and _peek_cached_cua_generation is not None
+                            ):
+                                _xproc_evicted_cua_release = (
+                                    _cached_sid,
+                                    _peek_cached_cua_generation,
+                                )
                     elif (
                         not _session_id_mismatch
                         and _cached_mc is not None
@@ -4915,25 +4939,22 @@ class TurnRunner:
                 agent, self._runner._refresh_fallback_model(),
             )
 
-        # Lock released — now schedule cleanup of any cross-process-evicted
-        # agent on a daemon thread so memory-provider shutdown / socket
-        # teardown never blocks the gateway event loop or the cache lock
-        # the session-expiry watcher needs (#52197).
+        # Lock released — perform cleanup in this tracked turn worker. The
+        # helper itself uses bounded computer_use quiescence and an exact
+        # (session_id, generation) token for hard dead-session boundaries.
+        # Generic same-session transcript refresh remains soft.
         if _xproc_evicted_agent is not None:
             try:
-                threading.Thread(
-                    target=self._runner._release_evicted_agent_soft,
-                    args=(_xproc_evicted_agent,),
-                    daemon=True,
-                    name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
-                ).start()
+                self._runner._release_evicted_agent_soft(
+                    _xproc_evicted_agent,
+                    computer_use_release=_xproc_evicted_cua_release,
+                )
             except Exception:
-                # Interpreter shutdown or thread-spawn failure — release
-                # inline as a best-effort fallback.
-                try:
-                    self._runner._release_evicted_agent_soft(_xproc_evicted_agent)
-                except Exception:
-                    pass
+                logger.warning(
+                    "Tracked cross-process agent cleanup failed for %s",
+                    ctx.session_key,
+                    exc_info=True,
+                )
 
         if agent is None:
             # Config changed or first message — create fresh agent
@@ -6016,7 +6037,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            before_auto_reset_fn=lambda sid, reset_reason: (
+                self._begin_terminal_computer_use_sync(
+                    sid,
+                    reason=f"auto_reset:{reset_reason}",
+                )
+            ),
+            before_terminal_completion_fn=(
+                self._prepare_terminal_route_completion_sync
+            ),
+            after_auto_reset_fn=lambda _sid, transition, succeeded: (
+                self._end_terminal_computer_use_sync(
+                    transition,
+                    succeeded=succeeded,
+                )
+            ),
         )
+        from tools.computer_use import write_computer_use_runtime_attestation
+
+        session_validator = lambda route_key, sid: (
+            self.session_store.ensure_route_matches(route_key, sid)
+        )
+        try:
+            write_computer_use_runtime_attestation({
+                "GatewayRunner._run_agent": self._run_agent,
+                "SessionStore.ensure_route_matches": (
+                    self.session_store.ensure_route_matches
+                ),
+                "SessionStore.route_matches": self.session_store.route_matches,
+                "SessionStore._run_route_transition": (
+                    self.session_store._run_route_transition
+                ),
+                "SessionStore.prune_old_entries": (
+                    self.session_store.prune_old_entries
+                ),
+            })
+        except Exception as exc:
+            logger.exception("Could not write CUA gateway runtime attestation")
+            raise RuntimeError(
+                "CUA gateway runtime attestation is required for startup"
+            ) from exc
+        # Publish process-global route authority only after this runner's
+        # required attestation is durable. A failed constructor therefore
+        # cannot overwrite or clear authority owned by an existing runner.
+        from tools.computer_use import set_computer_use_session_validator
+
+        set_computer_use_session_validator(session_validator)
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
@@ -6163,6 +6229,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import threading as _threading
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
+        self._terminal_reactivations: Dict[int, Any] = {}
+        self._terminal_reactivations_lock = _threading.Lock()
+        self._terminal_cleanup_agents: Dict[int, Any] = {}
+        self._terminal_cleanup_agents_lock = _threading.Lock()
 
         # Conversation-scoped per-session state (/model, /model --once,
         # /reasoning, /fast overrides; per-turn sidecar notes; ephemeral
@@ -9777,6 +9847,244 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    def _begin_terminal_computer_use_sync(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> Any:
+        """Fence admission, then confirm exact teardown while retaining the fence."""
+        sid = str(session_id or "")
+        if not sid:
+            return None
+        from tools.computer_use import (
+            begin_computer_use_terminal_transition,
+            end_computer_use_terminal_transition,
+        )
+
+        transition = begin_computer_use_terminal_transition(sid)
+        try:
+            result = self._release_terminal_computer_use_exact_sync(
+                sid,
+                expected_generation=transition.generation,
+                reason=reason,
+            )
+            return transition, result, reason
+        except BaseException:
+            end_computer_use_terminal_transition(transition)
+            raise
+
+    def _prepare_terminal_route_completion_sync(
+        self,
+        session_id: str,
+        lease: Any,
+        session_key: str,
+    ) -> None:
+        """Finish old-route resources and fence any explicit reactivation."""
+        reason = lease[2] if isinstance(lease, tuple) and len(lease) > 2 else ""
+        is_expiry = reason == "auto_reset:session_expired"
+        transition_key = id(lease[0])
+        evicted_agent = None
+        cleanup_agents = getattr(self, "_terminal_cleanup_agents", None)
+        cleanup_agents_lock = getattr(
+            self,
+            "_terminal_cleanup_agents_lock",
+            None,
+        )
+        if is_expiry and cleanup_agents is not None and cleanup_agents_lock is not None:
+            with cleanup_agents_lock:
+                evicted_agent = cleanup_agents.get(transition_key)
+        if evicted_agent is None:
+            evicted_agent = self._evict_cached_agent(
+                session_key,
+                soft_release=not is_expiry,
+            )
+            if (
+                is_expiry
+                and evicted_agent is not None
+                and cleanup_agents is not None
+                and cleanup_agents_lock is not None
+            ):
+                with cleanup_agents_lock:
+                    cleanup_agents[transition_key] = evicted_agent
+        self._clear_conversation_scope(
+            session_key,
+            reason="terminal_route_replaced",
+        )
+        if is_expiry:
+            if evicted_agent is not None:
+                try:
+                    evicted_agent._end_session_on_close = False
+                except Exception:
+                    pass
+            try:
+                from hermes_cli.lifecycle import finalize_session
+
+                parts = session_key.split(":")
+                platform = parts[2] if len(parts) > 2 else ""
+                finalize_session(
+                    session_id=session_id,
+                    platform=platform,
+                    reason="session_expired",
+                )
+            except Exception:
+                pass
+            if evicted_agent is not None:
+                self._cleanup_agent_resources(evicted_agent, strict=True)
+                if cleanup_agents is not None and cleanup_agents_lock is not None:
+                    with cleanup_agents_lock:
+                        if cleanup_agents.get(transition_key) is evicted_agent:
+                            cleanup_agents.pop(transition_key, None)
+
+        replacement_id = self.session_store.peek_session_id(session_key)
+        if not replacement_id or replacement_id == session_id:
+            return
+        reactivations_lock = getattr(
+            self,
+            "_terminal_reactivations_lock",
+            None,
+        )
+        reactivations = getattr(self, "_terminal_reactivations", None)
+        if reactivations_lock is None or reactivations is None:
+            # Compatibility for partial GatewayRunner test/embedding objects.
+            return
+        from tools.computer_use import (
+            begin_computer_use_session_reactivation,
+            is_computer_use_session_retired,
+        )
+
+        if is_computer_use_session_retired(replacement_id):
+            reactivation = begin_computer_use_session_reactivation(replacement_id)
+            transition = lease[0]
+            with self._terminal_reactivations_lock:
+                self._terminal_reactivations[id(transition)] = reactivation
+
+    def _end_terminal_computer_use_sync(
+        self,
+        lease: Any,
+        *,
+        succeeded: bool,
+    ) -> None:
+        if lease is None:
+            return
+        from tools.computer_use import (
+            end_computer_use_session_reactivation,
+            end_computer_use_terminal_transition,
+        )
+
+        transition = lease[0]
+        reactivation = None
+        reactivation_lock = getattr(
+            self,
+            "_terminal_reactivations_lock",
+            None,
+        )
+        reactivations = getattr(self, "_terminal_reactivations", None)
+        if reactivation_lock is not None and reactivations is not None:
+            with reactivation_lock:
+                reactivation = reactivations.pop(id(transition), None)
+        if not succeeded:
+            if reactivation is not None:
+                end_computer_use_session_reactivation(
+                    reactivation,
+                    succeeded=False,
+                )
+            return
+        try:
+            end_computer_use_terminal_transition(transition, retire=True)
+        except BaseException:
+            if reactivation is not None:
+                end_computer_use_session_reactivation(
+                    reactivation,
+                    succeeded=False,
+                )
+            raise
+        if reactivation is not None:
+            end_computer_use_session_reactivation(
+                reactivation,
+                succeeded=True,
+            )
+
+    def _release_terminal_computer_use_sync(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> Any:
+        """Confirm teardown with admission fenced for this bounded call."""
+        lease = self._begin_terminal_computer_use_sync(
+            session_id, reason=reason
+        )
+        try:
+            return lease[1] if lease is not None else None
+        finally:
+            self._end_terminal_computer_use_sync(lease, succeeded=True)
+
+    def _release_terminal_computer_use_exact_sync(
+        self,
+        session_id: str,
+        *,
+        expected_generation: Optional[int],
+        reason: str,
+    ) -> Any:
+        """Confirm exact CUA teardown before publishing a terminal boundary."""
+        sid = str(session_id or "")
+        if not sid:
+            return None
+        from tools.computer_use import (
+            get_computer_use_session_generation,
+            submit_computer_use_session_release,
+        )
+
+        generation = expected_generation
+        if generation is None:
+            return None
+        if type(generation) is not int or generation <= 0:
+            raise RuntimeError(
+                f"invalid computer_use generation for terminal boundary: {generation!r}"
+            )
+        future = submit_computer_use_session_release(
+            sid,
+            expected_generation=generation,
+            timeout=5.0,
+            reason=reason,
+            max_attempts=3,
+            retry_delay=0.25,
+        )
+        try:
+            result = future.result(timeout=20.0)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"computer_use terminal release timed out: session={sid} generation={generation}"
+            ) from exc
+        if result.status not in {"released", "already_absent"}:
+            raise RuntimeError(
+                "computer_use terminal release failed: "
+                f"session={sid} generation={generation} status={result.status} "
+                f"error={result.error or ''}"
+            )
+        remaining_generation = get_computer_use_session_generation(sid)
+        if remaining_generation is not None:
+            raise RuntimeError(
+                "computer_use terminal release completed but the session remained active: "
+                f"session={sid} released_generation={generation} "
+                f"current_generation={remaining_generation}"
+            )
+        return result
+
+    async def _release_terminal_computer_use(
+        self,
+        session_id: str,
+        *,
+        reason: str,
+    ) -> Any:
+        """Async facade for exact terminal-boundary CUA teardown."""
+        return await asyncio.to_thread(
+            self._release_terminal_computer_use_sync,
+            session_id,
+            reason=reason,
+        )
+
     async def _cleanup_agent_resources_off_loop(
         self, agent: Any, *, context: str = ""
     ) -> None:
@@ -9817,10 +10125,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cleanup_exc,
             )
 
-    def _cleanup_agent_resources(self, agent: Any) -> None:
-        """Best-effort cleanup for temporary or cached agent instances."""
+    def _cleanup_agent_resources(self, agent: Any, *, strict: bool = False) -> None:
+        """Clean up temporary or cached agent resources.
+
+        Normal cache cleanup is best-effort. Terminal route retirement passes
+        ``strict=True`` so a failed route-owned shutdown preserves the terminal
+        fence instead of reopening admission over a partially live old agent.
+        """
         if agent is None:
             return
+        cleanup_errors: list[BaseException] = []
         try:
             if hasattr(agent, "shutdown_memory_provider"):
                 # Drain queued memory writes BEFORE tearing the provider down.
@@ -9856,16 +10170,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent.shutdown_memory_provider(session_messages)
                 else:
                     agent.shutdown_memory_provider()
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_errors.append(exc)
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) to prevent zombie
         # process accumulation.
         try:
             if hasattr(agent, "close"):
                 agent.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            cleanup_errors.append(exc)
         # Auxiliary async clients (session_search/web/vision/etc.) live in a
         # process-global cache and are created inside worker threads. Clean up
         # any entries whose event loop is now dead so their httpx transports do
@@ -9875,6 +10189,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleanup_stale_async_clients()
         except Exception:
             pass
+        if strict and cleanup_errors:
+            messages = "; ".join(str(exc) for exc in cleanup_errors)
+            raise RuntimeError(f"agent resource cleanup failed: {messages}") from cleanup_errors[0]
 
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
@@ -12163,7 +12480,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(60)  # initial delay — let the gateway fully start
         _finalize_failures: dict[str, int] = {}  # session_id -> consecutive failure count
-        _MAX_FINALIZE_RETRIES = 3
         while self._running:
             try:
                 await self.async_session_store._ensure_loaded()
@@ -12192,88 +12508,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         len(_expired_entries), _plat_summary,
                     )
 
+                _retired_session_ids: set[str] = set()
                 for key, entry in _expired_entries:
                     try:
-                        try:
-                            from hermes_cli.lifecycle import finalize_session
-                            _parts = key.split(":")
-                            _platform = _parts[2] if len(_parts) > 2 else ""
-                            finalize_session(
-                                session_id=entry.session_id,
-                                platform=_platform,
-                                reason="session_expired",
-                            )
-                        except Exception:
-                            pass
-                        # Shut down memory provider and close tool resources
-                        # on the cached agent.  Idle agents live in
-                        # _agent_cache (not _running_agents), so look there.
-                        _cached_agent = None
-                        _cache_lock = getattr(self, "_agent_cache_lock", None)
-                        if _cache_lock is not None:
-                            with _cache_lock:
-                                _cached = self._agent_cache.get(key)
-                                _cached_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
-                        # Fall back to _running_agents in case the agent is
-                        # still mid-turn when the expiry fires.
-                        if _cached_agent is None:
-                            _exp_state = self._peek_session_state(key)
-                            _cached_agent = _exp_state.turn.agent if _exp_state else None
-                        if _cached_agent and _cached_agent is not _AGENT_PENDING_SENTINEL:
-                            await self._cleanup_agent_resources_off_loop(
-                                _cached_agent, context="session expiry"
-                            )
-                        # Drop the cache entry so the AIAgent (and its LLM
-                        # clients, tool schemas, memory provider refs) can
-                        # be garbage-collected.  Otherwise the cache grows
-                        # unbounded across the gateway's lifetime.
-                        self._evict_cached_agent(key)
-                        # Permanently finalizing this session — one funnel
-                        # call drops every conversation-scoped dict AND the
-                        # boundary security state (approvals, update
-                        # prompts, slash-confirm) so the dicts don't grow
-                        # unbounded across the gateway's lifetime. (Idle
-                        # agent-cache eviction must NOT do this: the
-                        # session is still alive and a resumed turn rebuilds
-                        # its agent from these overrides. Only true session
-                        # finalization, /new, and /reset clear them.) See
-                        # _CONVERSATION_SCOPED_STATE.
-                        self._clear_conversation_scope(
-                            key, reason="expiry_finalized"
+                        # Expiry is a real route retirement, not a metadata-only
+                        # flag. SessionStore owns the per-key reservation, durable
+                        # recovery marker, exact CUA release, replacement routing
+                        # writes, and old-ID retirement as one terminal boundary.
+                        replacement = await self.async_session_store.reset_session(
+                            key,
+                            reset_reason="session_expired",
+                            expected_session_id=entry.session_id,
                         )
-                        # Persist the finalized flag to sessions.json AND
-                        # state.db (single write-path, #9006) — also drops
-                        # the persisted /model override, since finalization
-                        # is a conversation boundary.
-                        await self.async_session_store.set_expiry_finalized(entry)
+                        if replacement is None:
+                            raise RuntimeError(
+                                "expired route disappeared before terminal reset"
+                            )
                         logger.debug(
-                            "Session expiry finalized for %s",
+                            "Session expiry retired %s and published %s",
                             entry.session_id,
+                            replacement.session_id,
                         )
+                        _retired_session_ids.add(entry.session_id)
                         _finalize_failures.pop(entry.session_id, None)
                     except Exception as e:
                         failures = _finalize_failures.get(entry.session_id, 0) + 1
                         _finalize_failures[entry.session_id] = failures
-                        if failures >= _MAX_FINALIZE_RETRIES:
-                            logger.warning(
-                                "Session finalize gave up after %d attempts for %s: %s. "
-                                "Marking as finalized to prevent infinite retry loop.",
-                                failures, entry.session_id, e,
-                            )
-                            await self.async_session_store.set_expiry_finalized(
-                                entry, clear_model_override=False
-                            )
-                            _finalize_failures.pop(entry.session_id, None)
-                        else:
-                            logger.debug(
-                                "Session finalize failed (%d/%d) for %s: %s",
-                                failures, _MAX_FINALIZE_RETRIES, entry.session_id, e,
-                            )
+                        logger.error(
+                            "Session expiry retained pending after attempt %d for %s: %s",
+                            failures,
+                            entry.session_id,
+                            e,
+                        )
 
                 if _expired_entries:
-                    _done = sum(
-                        1 for _, e in _expired_entries if e.expiry_finalized
-                    )
+                    _done = len(_retired_session_ids)
                     _failed = len(_expired_entries) - _done
                     if _failed:
                         logger.info(
@@ -13285,6 +13554,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
             self._shutdown_event.set()
+
+            # Drain exact-generation CUA cleanup submitted by dead-cache
+            # invalidation. Keep the event loop responsive and bound the wait;
+            # the final process sweep below remains the last-resort containment.
+            try:
+                from tools.computer_use import (
+                    computer_use_cleanup_snapshot,
+                    drain_computer_use_cleanup,
+                )
+
+                _cua_drained = await asyncio.to_thread(
+                    drain_computer_use_cleanup,
+                    10.0,
+                )
+                if not _cua_drained:
+                    logger.warning(
+                        "Timed out draining computer_use cleanup supervisor: %s",
+                        computer_use_cleanup_snapshot(),
+                    )
+            except Exception as _e:
+                logger.debug("computer_use cleanup drain error: %s", _e)
 
             # Global cleanup: kill any remaining tool subprocesses not tied
             # to a specific agent (catch-all for zombie prevention). On the
@@ -16839,6 +17129,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # wiping model/reasoning overrides set between turns (Closes #48031).
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
+            # Exact CUA teardown already completed inside SessionStore's
+            # single-flight pre-rotation callback, before this replacement was
+            # published or persisted.
             # Treat auto-reset as a full conversation boundary — clear every
             # conversation-scoped per-session dict in one funnel call so the
             # fresh session does not inherit the previous conversation's
@@ -18022,21 +18315,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=event.message_type,
+            from tools.computer_use import (
+                publish_computer_use_session,
+                unpublish_computer_use_session,
             )
+
+            _cua_publication = publish_computer_use_session(
+                _run_start_session_id,
+                route_key=session_key,
+            )
+            try:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    message_type=event.message_type,
+                )
+            finally:
+                unpublish_computer_use_session(_cua_publication)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -18390,7 +18695,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
                 )
-                new_entry = await self.async_session_store.reset_session(session_key)
+                new_entry = await self.async_session_store.reset_session(
+                    session_key,
+                    reset_reason="compression_exhausted",
+                )
                 self._evict_cached_agent(session_key)
                 # Conversation boundary: one funnel call clears every
                 # conversation-scoped per-session dict (#58403 and siblings).
@@ -23940,7 +24248,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
-    def _evict_cached_agent(self, session_key: str) -> None:
+    def _evict_cached_agent(
+        self,
+        session_key: str,
+        *,
+        soft_release: bool = True,
+    ) -> Any:
         """Remove a cached agent for a session (called on /new, /model, etc).
 
         Pops the entry AND soft-releases the evicted agent's LLM client
@@ -23984,7 +24297,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else evicted
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
-            return
+            return None
+        if not soft_release:
+            return agent
 
         # Don't tear down an agent that's actively mid-turn — its client,
         # sandbox and child subagents are in use by the running request.
@@ -23994,7 +24309,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if a is not None and a is not _AGENT_PENDING_SENTINEL
         }
         if id(agent) in running_ids:
-            return
+            return agent
 
         try:
             threading.Thread(
@@ -24010,6 +24325,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_evicted_agent_soft(agent)
             except Exception:
                 pass
+        return agent
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -24105,18 +24421,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._commit_memory_before_soft_evict(agent, key)
         self._release_evicted_agent_soft(agent)
 
-    def _release_evicted_agent_soft(self, agent: Any) -> None:
-        """Soft cleanup for cache-evicted agents — preserves session tool state.
-
-        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
-        Distinct from _cleanup_agent_resources (full teardown) because a
-        cache-evicted session may resume at any time — its terminal
-        sandbox, browser daemon, and tracked bg processes must outlive
-        the Python AIAgent instance so the next agent built for the
-        same task_id inherits them.
-        """
+    def _release_evicted_agent_soft(
+        self,
+        agent: Any,
+        *,
+        computer_use_release: Optional[tuple[str, int]] = None,
+    ) -> Any:
+        """Release agent clients; optionally close one exact dead-session CUA generation."""
         if agent is None:
-            return
+            return None
+        release_result = None
+        if computer_use_release is not None:
+            sid, generation = computer_use_release
+            agent_sid = str(getattr(agent, "session_id", "") or "")
+            if (
+                not sid
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation <= 0
+                or agent_sid != sid
+            ):
+                logger.error(
+                    "Rejected computer_use hard release: agent_sid=%s request_sid=%s "
+                    "generation=%r",
+                    agent_sid,
+                    sid,
+                    generation,
+                )
+            else:
+                try:
+                    from tools.computer_use import submit_computer_use_session_release
+
+                    release_result = submit_computer_use_session_release(
+                        sid,
+                        expected_generation=generation,
+                        timeout=5.0,
+                        reason="dead_cached_session",
+                        max_attempts=3,
+                        retry_delay=0.25,
+                    )
+
+                    def _log_cua_release(done: Any) -> None:
+                        try:
+                            result = done.result()
+                        except Exception:
+                            logger.exception(
+                                "computer_use hard release future raised: "
+                                "session=%s generation=%s",
+                                sid,
+                                generation,
+                            )
+                            return
+                        if result.status not in {"released", "already_absent"}:
+                            logger.error(
+                                "computer_use hard release did not complete: "
+                                "session=%s generation=%s status=%s error=%s",
+                                sid,
+                                generation,
+                                result.status,
+                                result.error,
+                            )
+
+                    release_result.add_done_callback(_log_cua_release)
+                except Exception:
+                    logger.exception(
+                        "computer_use hard release submission raised: "
+                        "session=%s generation=%s",
+                        sid,
+                        generation,
+                    )
         try:
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
@@ -24125,7 +24498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fall back to the legacy full-close path.
                 self._cleanup_agent_resources(agent)
         except Exception:
-            pass
+            logger.debug("Soft agent client release failed", exc_info=True)
         # Free conversation history memory — can be tens of MB with tool
         # outputs (file reads, terminal output, search results) on heavy
         # 100+-tool-call sessions. release_clients() deliberately preserves
@@ -24141,6 +24514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # agents the memory valve targets.
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
+        return release_result
 
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process.

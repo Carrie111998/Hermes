@@ -15,13 +15,17 @@ tests pin the prune behaviour:
 """
 
 import json
+import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 from gateway.config import GatewayConfig, Platform, SessionResetPolicy
-from gateway.session import SessionEntry, SessionStore
+from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
 def test_session_store_default_db_uses_runtime_hermes_home(tmp_path, monkeypatch):
@@ -150,6 +154,189 @@ class TestPruneBasics:
         assert removed == 1
         assert "active" not in store._entries
 
+
+    def test_prune_publishes_route_absence_only_after_sqlite_close(self, tmp_path):
+        store = _make_store(tmp_path)
+        store._entries["stale"] = _entry(
+            "stale", age_days=500, session_id="stale-sid"
+        )
+        events = []
+        fake_db = MagicMock()
+        fake_db.save_gateway_routing_entry.return_value = None
+        fake_db.replace_gateway_routing_entries.return_value = None
+        fake_db.end_session.side_effect = (
+            lambda *_args, **_kwargs: events.append("sqlite:end")
+        )
+        store._db = fake_db
+        original_save_entries = store._save_entries
+
+        def _save_entries(*args, **kwargs):
+            events.append(
+                "route:absent" if "stale" not in store._entries else "route:present"
+            )
+            return original_save_entries(*args, **kwargs)
+
+        store._save_entries = _save_entries
+
+        assert store.prune_old_entries(90) == 1
+        assert events.index("sqlite:end") < events.index("route:absent")
+
+    def test_prune_process_death_after_sqlite_close_recovers_durable_marker(
+        self, tmp_path
+    ):
+        repo = Path(__file__).resolve().parents[2]
+        hermes_home = tmp_path / "hermes-home"
+        sessions_dir = tmp_path / "sessions"
+        env = os.environ.copy()
+        env.update({
+            "HERMES_HOME": str(hermes_home),
+            "PRUNE_TEST_SESSIONS": str(sessions_dir),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        crash_script = r'''
+import os
+from datetime import timedelta
+from pathlib import Path
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore, _now
+
+store = SessionStore(
+    sessions_dir=Path(os.environ["PRUNE_TEST_SESSIONS"]),
+    config=GatewayConfig(),
+)
+source = SessionSource(
+    platform=Platform.TELEGRAM,
+    chat_id="prune-crash-chat",
+    user_id="prune-crash-user",
+    chat_type="dm",
+)
+entry = store.get_or_create_session(source)
+entry.updated_at = _now() - timedelta(days=500)
+store._save_entries(require_primary_db=True)
+real_end = store._db.end_session
+def end_then_die(*args, **kwargs):
+    real_end(*args, **kwargs)
+    os._exit(73)
+store._db.end_session = end_then_die
+store.prune_old_entries(90)
+'''
+        crashed = subprocess.run(
+            [sys.executable, "-c", crash_script],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        assert crashed.returncode == 73, crashed.stderr
+
+        recovery_script = r'''
+import json
+import os
+from pathlib import Path
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore, build_session_key
+
+store = SessionStore(
+    sessions_dir=Path(os.environ["PRUNE_TEST_SESSIONS"]),
+    config=GatewayConfig(),
+)
+source = SessionSource(
+    platform=Platform.TELEGRAM,
+    chat_id="prune-crash-chat",
+    user_id="prune-crash-user",
+    chat_type="dm",
+)
+key = build_session_key(source)
+store._ensure_loaded()
+before = store._entries[key]
+marker = before.metadata.get("terminal_transition")
+replacement = store.get_or_create_session(source)
+print("RESULT=" + json.dumps({
+    "old_session_id": before.session_id,
+    "marker_reason": marker.get("reason") if marker else None,
+    "replacement_session_id": replacement.session_id,
+    "replacement_has_marker": "terminal_transition" in replacement.metadata,
+}))
+'''
+        recovered = subprocess.run(
+            [sys.executable, "-c", recovery_script],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        assert recovered.returncode == 0, recovered.stderr
+        result_line = next(
+            line for line in recovered.stdout.splitlines() if line.startswith("RESULT=")
+        )
+        result = json.loads(result_line.removeprefix("RESULT="))
+        assert result["marker_reason"] == "session_prune"
+        assert result["replacement_session_id"] != result["old_session_id"]
+        assert result["replacement_has_marker"] is False
+
+    def test_prune_recovery_publishes_absence_before_fresh_route(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="prune-recovery-chat",
+            user_id="prune-recovery-user",
+            chat_type="dm",
+        )
+        original = store.get_or_create_session(source)
+        original.metadata["terminal_transition"] = {
+            "session_id": original.session_id,
+            "reason": "session_prune",
+            "token": "prune-recovery-token",
+        }
+        store._save_entries()
+        events = []
+        original_save_entries = store._save_entries
+
+        def _save_entries(*args, **kwargs):
+            current = store._entries.get(original.session_key)
+            events.append(
+                "route:absent"
+                if current is None
+                else f"route:{current.session_id}"
+            )
+            return original_save_entries(*args, **kwargs)
+
+        store._save_entries = _save_entries
+        replacement = store.get_or_create_session(source)
+
+        assert "route:absent" in events
+        assert events.index("route:absent") < events.index(
+            f"route:{replacement.session_id}"
+        )
+
+    def test_prune_routes_through_terminal_teardown_boundary(self, tmp_path):
+        store = _make_store(tmp_path)
+        store._entries["stale"] = _entry(
+            "stale", age_days=500, session_id="stale-sid"
+        )
+        events = []
+
+        def _begin(sid, reason):
+            events.append(("begin", sid, reason))
+            return object()
+
+        def _complete(sid, token, key):
+            assert key not in store._entries
+            events.append(("complete", sid, key, token))
+
+        def _end(sid, token, succeeded):
+            events.append(("end", sid, succeeded, token))
+
+        store._before_auto_reset_fn = _begin
+        store._before_terminal_completion_fn = _complete
+        store._after_auto_reset_fn = _end
+
+        assert store.prune_old_entries(max_age_days=90) == 1
+        assert events[0][:3] == ("begin", "stale-sid", "session_prune")
+        assert events[1][:3] == ("complete", "stale-sid", "stale")
+        assert events[2][0:3] == ("end", "stale-sid", True)
 
     def test_prune_is_thread_safe(self, tmp_path):
         """Prune acquires _lock internally; concurrent update_session is safe."""

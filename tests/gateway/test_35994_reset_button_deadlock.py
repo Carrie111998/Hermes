@@ -73,6 +73,7 @@ def _make_runner_with_cached_agent(close_fn):
     runner.session_store.reset_session.return_value = new_entry
     runner.session_store._entries = {session_key: session_entry}
     runner.session_store._generate_session_key.return_value = session_key
+    runner.session_store.peek_session_id.return_value = "sess-old"
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
@@ -87,6 +88,26 @@ def _make_runner_with_cached_agent(close_fn):
     agent.shutdown_memory_provider = MagicMock()
     runner._agent_cache = {session_key: agent}
     return runner
+
+
+def test_reset_delegates_terminal_cua_boundary_to_session_store():
+    runner = _make_runner_with_cached_agent(lambda: None)
+    order = []
+    runner._release_terminal_computer_use = AsyncMock()
+    new_entry = runner.session_store.reset_session.return_value
+
+    def reset_session(session_key, *, reset_reason):
+        order.append(("reset", session_key, reset_reason))
+        return new_entry
+
+    runner.session_store.reset_session.side_effect = reset_session
+
+    asyncio.run(runner._handle_reset_command(_make_event("/new")))
+
+    runner._release_terminal_computer_use.assert_not_awaited()
+    assert order == [
+        ("reset", new_entry.session_key, "session_reset")
+    ]
 
 
 @pytest.mark.asyncio

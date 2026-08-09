@@ -130,9 +130,10 @@ class GatewaySlashCommandsMixin:
         # Idempotent, so the run's finally calling it again is harmless.
         self._release_running_agent_state(session_key)
 
-        # Snapshot the old entry so on_session_finalize can report the
-        # expiring session id before reset_session() rotates it.
-        old_entry = self.session_store._entries.get(session_key)
+        # Snapshot the old ID through SessionStore's lock-protected API for
+        # finalization metadata. CUA teardown itself is owned by the fenced
+        # reset transition below.
+        _old_sid = await self.async_session_store.peek_session_id(session_key)
 
         # Close tool resources on the old agent (terminal sandboxes, browser
         # daemons, background processes) before evicting from cache.
@@ -195,7 +196,7 @@ class GatewaySlashCommandsMixin:
 
             interrupt_for_session(
                 session_key=session_key,
-                parent_session_id=str(getattr(old_entry, "session_id", "") or ""),
+                parent_session_id=str(_old_sid or ""),
                 reason="session_reset",
             )
         except Exception:
@@ -214,12 +215,13 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
-        new_entry = await self.async_session_store.reset_session(session_key)
+        new_entry = await self.async_session_store.reset_session(
+            session_key,
+            reset_reason="session_reset",
+        )
 
         # (Conversation-scoped overrides + security state were already
         # cleared via _clear_conversation_scope above.)
-
-        _old_sid = old_entry.session_id if old_entry else None
 
         # Fire plugin on_session_finalize hook (session boundary)
         try:

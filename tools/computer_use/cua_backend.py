@@ -52,7 +52,7 @@ import threading
 import time
 import uuid
 from pathlib import PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.backend import (
@@ -504,7 +504,6 @@ class _EmbeddedCuaDaemon:
 
     def stop(self) -> None:
         process = self._process
-        self._process = None
         if process is not None and process.poll() is None:
             from tools.environments.local import _sanitize_subprocess_env
 
@@ -528,6 +527,12 @@ class _EmbeddedCuaDaemon:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait(timeout=2.0)
+            if process.poll() is None:
+                raise RuntimeError("embedded cua-driver daemon did not exit")
+        # Forget ownership only after confirmed exit; a failed stop remains
+        # retryable and cannot be reported as a successful generation close.
+        if self._process is process:
+            self._process = None
         if sys.platform != "win32" and os.path.exists(self.socket_path):
             try:
                 os.remove(self.socket_path)
@@ -1014,13 +1019,24 @@ def _parse_key_combo(keys: str) -> Tuple[Optional[str], List[str]]:
 # Asyncio bridge — one long-lived loop on a background thread
 # ---------------------------------------------------------------------------
 
+class CuaActionTerminationUnconfirmed(RuntimeError):
+    """The caller returned while its exact driver action may still be live."""
+
+    cua_action_termination_unconfirmed = True
+
+
 class _AsyncBridge:
     """Runs one asyncio loop on a daemon thread; marshals coroutines from the caller."""
+
+    _CALL_CANCEL_CONFIRM_TIMEOUT = 2.0
+    _INFLIGHT_DRAIN_TIMEOUT = 2.0
 
     def __init__(self) -> None:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
+        self._inflight_lock = threading.Lock()
+        self._inflight_events: set[threading.Event] = set()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1050,16 +1066,61 @@ class _AsyncBridge:
             if asyncio.iscoroutine(coro):
                 coro.close()
             raise RuntimeError("cua-driver bridge not started")
-        fut = safe_schedule_threadsafe(coro, self._loop)
+
+        completed = threading.Event()
+
+        async def _tracked():
+            try:
+                return await coro
+            finally:
+                completed.set()
+                with self._inflight_lock:
+                    self._inflight_events.discard(completed)
+
+        tracked = _tracked()
+        with self._inflight_lock:
+            self._inflight_events.add(completed)
+        fut = safe_schedule_threadsafe(tracked, self._loop)
         if fut is None:
+            with self._inflight_lock:
+                self._inflight_events.discard(completed)
+            tracked.close()
+            if asyncio.iscoroutine(coro):
+                coro.close()
             raise RuntimeError("cua-driver bridge not started")
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            fut.cancel()
+            if not completed.wait(timeout=self._CALL_CANCEL_CONFIRM_TIMEOUT):
+                raise CuaActionTerminationUnconfirmed(
+                    "cua-driver action timed out and cancellation was not confirmed"
+                ) from exc
+            raise
 
     def stop(self) -> None:
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=2.0)
+        deadline = time.monotonic() + self._INFLIGHT_DRAIN_TIMEOUT
+        while True:
+            with self._inflight_lock:
+                pending = [event for event in self._inflight_events if not event.is_set()]
+                self._inflight_events.intersection_update(pending)
+            if not pending:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"cua-driver bridge still has {len(pending)} in-flight action(s)"
+                )
+            pending[0].wait(timeout=remaining)
+
+        loop = self._loop
+        thread = self._thread
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                raise RuntimeError("cua-driver asyncio bridge did not stop within 2s")
         self._thread = None
         self._loop = None
 
@@ -1087,9 +1148,11 @@ class _CuaDriverSession:
         self,
         bridge: _AsyncBridge,
         embedded_daemon: Optional[_EmbeddedCuaDaemon] = None,
+        runtime_attestation_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         self._bridge = bridge
         self._embedded_daemon = embedded_daemon
+        self._runtime_attestation_callback = runtime_attestation_callback
         self._session = None
         self._lock = threading.Lock()
         self._started = False
@@ -1109,6 +1172,7 @@ class _CuaDriverSession:
         self._capability_version: str = ""
         # Lifecycle plumbing — see class docstring above.
         self._ready_event = threading.Event()
+        self._closed_event = threading.Event()
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
@@ -1214,6 +1278,7 @@ class _CuaDriverSession:
             # the bridge-loop thread without taking self._lock (which stop()
             # may hold while awaiting this coro's future). See #55048 Bug 1.
             self._started = False
+            self._closed_event.set()
 
     async def _populate_capabilities(self, session: Any) -> None:
         """Surface 4: cache per-tool capability sets + capability_version
@@ -1267,13 +1332,33 @@ class _CuaDriverSession:
                 return
             self._bridge.start()
             self._start_lifecycle_locked()
+            self._attest_runtime_locked()
             self._started = True
+
+    def _attest_runtime_locked(self) -> None:
+        """Attest a newly spawned MCP child before it can perform an action."""
+        callback = getattr(self, "_runtime_attestation_callback", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as attestation_error:
+            self._started = False
+            try:
+                self._stop_lifecycle_locked()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "runtime attestation failed and replacement cleanup was unconfirmed: "
+                    f"attestation={attestation_error!r}; cleanup={cleanup_error!r}"
+                ) from attestation_error
+            raise
 
     def _start_lifecycle_locked(self) -> None:
         """Spawn the lifecycle owner and wait for it to reach ready.
         Caller must hold self._lock."""
         # Reset per-session state.
         self._ready_event = threading.Event()
+        self._closed_event = threading.Event()
         self._setup_error = None
         self._shutdown_event = None
         # Fire-and-forget schedule on the bridge loop. The future tracks
@@ -1308,29 +1393,43 @@ class _CuaDriverSession:
 
     def stop(self) -> None:
         with self._lock:
-            if not self._started:
+            if not self._started and self._lifecycle_future is None:
                 return
             self._started = False
             self._stop_lifecycle_locked()
 
     def _stop_lifecycle_locked(self) -> None:
-        """Signal shutdown + wait for the lifecycle coroutine to unwind.
-        Caller must hold self._lock."""
+        """Signal shutdown and confirm the lifecycle owner actually exited."""
         self._signal_shutdown_locked()
         fut = self._lifecycle_future
         if fut is None:
             return
         try:
-            # 5s budget for context unwind (stdio_client teardown).
+            # 5s graceful budget for stdio_client / ClientSession unwind.
             fut.result(timeout=5.0)
         except concurrent.futures.TimeoutError:
-            logger.warning("cua-driver session shutdown timed out (5s)")
-        except Exception as e:
-            # Real shutdown errors (not the previous cancel-scope race
-            # which is now structurally impossible) still get surfaced.
-            logger.warning("cua-driver shutdown error: %s", e)
-        finally:
-            self._lifecycle_future = None
+            logger.warning(
+                "cua-driver session shutdown timed out (5s); cancelling lifecycle"
+            )
+            fut.cancel()
+            # The run_coroutine_threadsafe proxy can report CancelledError as
+            # soon as cancellation is requested, before async context managers
+            # finish terminating the stdio child. The lifecycle-owned event is
+            # set only after those contexts have exited.
+            if not self._closed_event.wait(timeout=2.0):
+                raise RuntimeError(
+                    "cua-driver lifecycle did not exit after cancellation"
+                )
+        except concurrent.futures.CancelledError:
+            if not self._closed_event.wait(timeout=2.0):
+                raise RuntimeError(
+                    "cancelled cua-driver lifecycle did not confirm context exit"
+                )
+        except Exception as exc:
+            raise RuntimeError(f"cua-driver shutdown error: {exc}") from exc
+        if not self._closed_event.is_set():
+            raise RuntimeError("cua-driver lifecycle stop returned before context exit")
+        self._lifecycle_future = None
 
     def _signal_shutdown_locked(self) -> None:
         """Set the asyncio shutdown event from the caller's thread."""
@@ -1504,15 +1603,16 @@ class _CuaDriverSession:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
         if self._started:
-            try:
-                self._stop_lifecycle_locked()
-            except Exception as e:
-                logger.debug("cua-driver session cleanup before reconnect failed: %s", e)
+            self._started = False
+            # An unconfirmed old-child teardown is an ownership failure. Do not
+            # overlap it with a replacement process or retry the action.
+            self._stop_lifecycle_locked()
         self._started = False
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
         self._capability_version = ""
         self._start_lifecycle_locked()
+        self._attest_runtime_locked()
         self._started = True
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
@@ -1535,6 +1635,10 @@ class _CuaDriverSession:
         call is itself retried a few times with backoff, since the underlying
         daemon socket can still be momentarily busy.
         """
+        if getattr(self, "_runtime_attestation_callback", None) is not None:
+            raise RuntimeError(
+                "cua-driver CLI fallback cannot satisfy required runtime attestation"
+            )
         import subprocess as _subprocess
         import tempfile as _tempfile
         import time as _time
@@ -1907,7 +2011,13 @@ def _apps_from_windows(windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 class CuaDriverBackend(ComputerUseBackend):
     """Default computer-use backend. Cross-platform via cua-driver MCP."""
 
-    def __init__(self, permission_mode: str = "standard") -> None:
+    _requires_runtime_attestation = True
+
+    def __init__(
+        self,
+        permission_mode: str = "standard",
+        runtime_attestation_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
         if permission_mode not in {"standard", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
@@ -1917,7 +2027,11 @@ class CuaDriverBackend(ComputerUseBackend):
             else None
         )
         self._bridge = _AsyncBridge()
-        self._session = _CuaDriverSession(self._bridge, self._embedded_daemon)
+        self._session = _CuaDriverSession(
+            self._bridge,
+            self._embedded_daemon,
+            runtime_attestation_callback,
+        )
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
@@ -1956,6 +2070,15 @@ class CuaDriverBackend(ComputerUseBackend):
             call_tool=self._session.call_tool,
             has_tool=self._session._has_tool,
         )
+
+    def set_runtime_attestation_callback(
+        self,
+        callback: Callable[[], None],
+    ) -> None:
+        """Install the managed-gateway process replacement attestation gate."""
+        if not callable(callback):
+            raise TypeError("runtime attestation callback must be callable")
+        self._session._runtime_attestation_callback = callback
 
     def _browser_route(self) -> CuaTypedBrowserRoute:
         """Return the per-backend typed route, including test-constructed instances."""
@@ -2038,17 +2161,17 @@ class CuaDriverBackend(ComputerUseBackend):
         # the session_end hook cua-driver registers internally.
         if self._session._started:
             try:
-                self._session.call_tool("end_session", {"session": self._session_id})
+                self._session.call_tool(
+                    "end_session",
+                    {"session": self._session_id},
+                    timeout=2.0,
+                )
             except Exception as e:
                 logger.debug("cua-driver end_session failed (continuing teardown): %s", e)
-        try:
-            self._session.stop()
-        finally:
-            try:
-                self._bridge.stop()
-            finally:
-                if self._embedded_daemon is not None:
-                    self._embedded_daemon.stop()
+        self._session.stop()
+        self._bridge.stop()
+        if self._embedded_daemon is not None:
+            self._embedded_daemon.stop()
 
     def is_available(self) -> bool:
         # cua-driver runs on macOS, Windows, and Linux. The Linux path is

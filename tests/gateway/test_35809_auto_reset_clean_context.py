@@ -76,6 +76,27 @@ def _find_compression_exhausted_reset_block() -> ast.If:
 
 
 class TestAutoResetBlockReSyncsBinding:
+    def test_terminal_release_is_owned_by_fenced_reset(self):
+        block = _find_compression_exhausted_reset_block()
+        calls = [
+            node
+            for node in ast.walk(block)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        ]
+        assert not any(
+            node.func.attr == "_release_terminal_computer_use" for node in calls
+        )
+        reset_call = next(
+            node for node in calls if node.func.attr == "reset_session"
+        )
+        reset_reason = next(
+            keyword.value
+            for keyword in reset_call.keywords
+            if keyword.arg == "reset_reason"
+        )
+        assert isinstance(reset_reason, ast.Constant)
+        assert reset_reason.value == "compression_exhausted"
+
     def test_reset_session_return_is_captured(self):
         """``reset_session`` must be assigned, not called-and-discarded —
         the fresh entry is needed to re-point the binding and drop the stale

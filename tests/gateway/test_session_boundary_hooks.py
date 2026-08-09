@@ -1,4 +1,6 @@
 """Tests that on_session_finalize and on_session_reset plugin hooks fire in the gateway."""
+import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -115,8 +117,28 @@ async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
     runner.session_store._lock.__enter__ = MagicMock(return_value=None)
     runner.session_store._lock.__exit__ = MagicMock(return_value=None)
     runner.session_store._save = MagicMock()
+    replacement_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-expired-replacement",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.peek_session_id.return_value = replacement_entry.session_id
+    runner._clear_conversation_scope = MagicMock()
 
-    runner._evict_cached_agent = MagicMock()
+    def reset_with_terminal_completion(*_args, **_kwargs):
+        runner._prepare_terminal_route_completion_sync(
+            expired_entry.session_id,
+            (object(), object(), "auto_reset:session_expired"),
+            session_key,
+        )
+        return replacement_entry
+
+    runner.session_store.reset_session.side_effect = reset_with_terminal_completion
+
+    runner._evict_cached_agent = MagicMock(return_value=None)
     runner._cleanup_agent_resources = MagicMock()
     runner._sweep_idle_cached_agents = MagicMock(return_value=0)
 
@@ -193,6 +215,26 @@ async def test_idle_expiry_clears_last_resolved_model(mock_invoke_hook):
     runner.session_store._lock.__enter__ = MagicMock(return_value=None)
     runner.session_store._lock.__exit__ = MagicMock(return_value=None)
     runner.session_store._save = MagicMock()
+    replacement_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-expired-replacement",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+
+    runner.session_store.peek_session_id.return_value = replacement_entry.session_id
+
+    def reset_with_terminal_completion(*args, **kwargs):
+        runner._prepare_terminal_route_completion_sync(
+            expired_entry.session_id,
+            (object(), object(), "auto_reset:session_expired"),
+            session_key,
+        )
+        return replacement_entry
+
+    runner.session_store.reset_session.side_effect = reset_with_terminal_completion
 
     runner._evict_cached_agent = MagicMock()
     runner._cleanup_agent_resources = MagicMock()
@@ -226,3 +268,178 @@ async def test_idle_expiry_clears_last_resolved_model(mock_invoke_hook):
         "session-expiry finalization must only clear the expired session's "
         "own key, not unrelated sessions' cached entries"
     )
+
+
+def test_idle_expiry_confirms_exact_computer_use_release_before_finalizing():
+    from datetime import timedelta
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._last_session_store_prune_ts = __import__("time").time()
+    runner._last_agent_cache_pressure_sweep_ts = __import__("time").time()
+
+    session_key = "agent:main:telegram:dm:cua-expiry"
+    expired_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-cua-expired",
+        created_at=datetime.now() - timedelta(hours=2),
+        updated_at=datetime.now() - timedelta(hours=2),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: expired_entry}
+    runner.session_store._is_session_expired.return_value = True
+    replacement = SessionEntry(
+        session_key=session_key,
+        session_id="sess-cua-replacement",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.peek_session_id.return_value = replacement.session_id
+
+    def reset_with_terminal_completion(*_args, **_kwargs):
+        runner._prepare_terminal_route_completion_sync(
+            expired_entry.session_id,
+            (object(), object(), "auto_reset:session_expired"),
+            session_key,
+        )
+        return replacement
+
+    runner.session_store.reset_session.side_effect = reset_with_terminal_completion
+    runner._evict_cached_agent = MagicMock(return_value=None)
+    runner._cleanup_agent_resources = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
+    runner._sweep_idle_cached_agents = MagicMock(return_value=0)
+    runner._sweep_agent_cache_under_pressure = MagicMock()
+
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_):
+        await original_sleep(0)
+
+    def stop_after_finalize(*args, **kwargs):
+        runner._running = False
+        return []
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fast_sleep), patch(
+        "hermes_cli.lifecycle.finalize_session", side_effect=stop_after_finalize
+    ):
+        asyncio.run(runner._session_expiry_watcher(interval=0))
+
+    runner.session_store.reset_session.assert_called_once_with(
+        session_key,
+        reset_reason="session_expired",
+        expected_session_id=expired_entry.session_id,
+    )
+    runner.session_store.set_expiry_finalized.assert_not_called()
+
+
+def test_idle_expiry_retires_old_cua_id_and_publishes_fresh_route(tmp_path):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from tools.computer_use import tool as computer_use
+
+    config = GatewayConfig()
+    config.sessions_dir = tmp_path
+    runner = GatewayRunner(config)
+    runner.session_store._db = None
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="expiry-race",
+        user_id="expiry-user",
+        chat_type="dm",
+    )
+    old_entry = runner.session_store.get_or_create_session(source)
+    old_id = old_entry.session_id
+    backend = MagicMock()
+    backend.permission_mode = "standard"
+    backend.start.return_value = None
+    backend.stop.return_value = None
+    runner.session_store._is_session_expired = MagicMock(return_value=True)
+    runner._running = True
+
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_):
+        await original_sleep(0)
+
+    def stop_after_finalize(*args, **kwargs):
+        runner._running = False
+
+    with patch(
+        "tools.computer_use.cua_backend.CuaDriverBackend", return_value=backend
+    ), patch("gateway.run.asyncio.sleep", side_effect=fast_sleep), patch(
+        "hermes_cli.lifecycle.finalize_session", side_effect=stop_after_finalize
+    ):
+        computer_use._get_backend(old_id)
+        asyncio.run(runner._session_expiry_watcher(interval=0))
+        replacement = runner.session_store._entries[old_entry.session_key]
+        assert replacement.session_id != old_id
+        with pytest.raises(RuntimeError, match="retired"):
+            computer_use._get_backend(old_id)
+
+    persisted = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert persisted[old_entry.session_key]["session_id"] == replacement.session_id
+    computer_use.reset_backend_for_tests()
+
+
+def test_idle_expiry_never_marks_finalized_when_computer_use_release_fails():
+    from datetime import timedelta
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner._last_session_store_prune_ts = __import__("time").time()
+
+    session_key = "agent:main:telegram:dm:cua-failed-expiry"
+    expired_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-cua-failed",
+        created_at=datetime.now() - timedelta(hours=2),
+        updated_at=datetime.now() - timedelta(hours=2),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store._entries = {session_key: expired_entry}
+    runner.session_store._is_session_expired.return_value = True
+    runner._evict_cached_agent = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
+    runner._sweep_idle_cached_agents = MagicMock(return_value=0)
+    runner._sweep_agent_cache_under_pressure = MagicMock()
+
+    attempts = 0
+
+    def fail_reset(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts >= 3:
+            runner._running = False
+        raise RuntimeError("terminal reset failed")
+
+    runner.session_store.reset_session.side_effect = fail_reset
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=fast_sleep), patch(
+        "hermes_cli.lifecycle.finalize_session"
+    ) as finalize:
+        asyncio.run(runner._session_expiry_watcher(interval=0))
+
+    assert attempts == 3
+    finalize.assert_not_called()
+    runner.session_store.set_expiry_finalized.assert_not_called()
+    assert expired_entry.expiry_finalized is False

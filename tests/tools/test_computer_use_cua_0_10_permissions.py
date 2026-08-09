@@ -167,9 +167,9 @@ def test_unrestricted_embedded_daemon_uses_private_socket_and_two_part_ack():
     from tools.computer_use import cua_backend
 
     process = Mock()
-    process.poll.return_value = None
     process.stderr = []
     process.wait.return_value = 0
+    process.poll.side_effect = lambda: 0 if process.wait.called else None
     status = SimpleNamespace(returncode=0, stdout="running", stderr="")
     stopped = SimpleNamespace(returncode=0, stdout="", stderr="")
 
