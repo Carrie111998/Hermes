@@ -1737,7 +1737,50 @@ class DevExecutor:
                 self._active.pop(task_id, None)
                 return
         summary = build_repo_summary(repo_dir)
-        contract, block_kind, advisors = run_planning(task_text, summary)
+        planning_timeout = int(self.cfg.get("planning_timeout_seconds") or 900)
+        outcome: dict[str, Any] = {}
+
+        def _planning_target() -> None:
+            try:
+                outcome["result"] = run_planning(task_text, summary)
+            except Exception as exc:
+                outcome["error"] = exc
+
+        with self._heartbeat_scope(conn, task_id):
+            # Hard overall timeout: a hung MoA provider (e.g. an SSL read
+            # with no effective timeout) must not wedge the tick loop. On
+            # timeout the leaked daemon thread is left running — the provider
+            # call will eventually error out or be garbage — while the run is
+            # failed deterministically below instead of blocking forever.
+            planning_thread = threading.Thread(
+                target=_planning_target,
+                daemon=True,
+                name=f"dev-plan-{task_id}",
+            )
+            planning_thread.start()
+            planning_thread.join(timeout=planning_timeout)
+        if planning_thread.is_alive():
+            block_dev_task(
+                conn,
+                task_id,
+                "planning_unavailable",
+                f"planning timed out after {planning_timeout}s",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        planning_error = outcome.get("error")
+        if planning_error is not None:
+            block_dev_task(
+                conn,
+                task_id,
+                "planning_unavailable",
+                f"planning unavailable: {planning_error}",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        contract, block_kind, advisors = outcome["result"]
         record_dev_phase(
             conn,
             task_id,
