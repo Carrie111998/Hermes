@@ -639,7 +639,13 @@ def test_verifier_writes_atomic_byte_exact_live_verification_receipt(tmp_path, m
     result = subprocess.run(command, cwd=ROOT, capture_output=True, check=False)
     assert result.returncode != 0  # The producer is dirty, so a commit claim must fail closed.
     live = json.loads(verification_receipt.read_text(encoding="utf-8"))
-    assert live["schema"] == 2
+    input_attestation = receipt.read_bytes()
+    assert live["schema"] == 3
+    assert live["input_attestation"] == {
+        "path": str(receipt.resolve()),
+        "length": len(input_attestation),
+        "sha256": hashlib.sha256(input_attestation).hexdigest(),
+    }
     assert live["invocation"]["interpreter"] == str(Path(sys.executable).resolve())
     assert live["invocation"]["verifier_path"] == str(SCRIPT.resolve())
     assert live["invocation"]["cwd"] == str(ROOT.resolve())
@@ -684,6 +690,39 @@ def test_verification_receipt_uses_durable_replace_boundary(tmp_path, monkeypatc
     assert output.is_file()
 
 
+def test_verification_receipt_survives_input_removal_after_capture(tmp_path):
+    verifier = runpy.run_path(str(SCRIPT))
+    output = tmp_path / "final-result.json"
+    receipt = tmp_path / "input.json"
+    receipt.write_bytes(b'{"captured":true}')
+    canonical_receipt = receipt.resolve(strict=True)
+    captured_bytes = receipt.read_bytes()
+    receipt.unlink()
+    args = types.SimpleNamespace(
+        receipt=receipt,
+        review_root=tmp_path / "review",
+        deployed_root=tmp_path / "deployed",
+        expected_commit=None,
+    )
+
+    verifier["_write_verification_receipt"](
+        output,
+        args,
+        0,
+        b"ok\n",
+        b"",
+        captured_bytes,
+        canonical_receipt,
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["input_attestation"] == {
+        "path": str(canonical_receipt),
+        "length": len(captured_bytes),
+        "sha256": hashlib.sha256(captured_bytes).hexdigest(),
+    }
+
+
 def test_runtime_process_replacement_gate_is_fixed_attested_policy():
     from tools.computer_use import tool as computer_use
 
@@ -719,7 +758,7 @@ def test_verification_receipt_concurrent_writers_use_unique_temp_files(tmp_path)
             future.result(timeout=15)
 
     payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["schema"] == 2
+    assert payload["schema"] == 3
     assert payload["result"]["exit_code"] in {0, 1}
     assert not list(tmp_path.glob("*.tmp"))
 
@@ -743,7 +782,7 @@ def test_verification_receipt_temp_name_is_bounded_for_long_destination(tmp_path
         with pytest.raises(OSError):
             vulnerable_temp.open("wb")
         verifier["_write_verification_receipt"](output, args, 0, b"ok\n", b"")
-        assert json.loads(output.read_text(encoding="utf-8"))["schema"] == 2
+        assert json.loads(output.read_text(encoding="utf-8"))["schema"] == 3
         assert not list(short_parent.glob("*.tmp"))
         assert not list(short_parent.glob(".*.tmp"))
     finally:

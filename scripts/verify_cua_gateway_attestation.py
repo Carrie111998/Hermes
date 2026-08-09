@@ -488,6 +488,8 @@ def _write_verification_receipt(
     exit_code: int,
     stdout: bytes,
     stderr: bytes,
+    input_receipt_bytes: bytes | None = None,
+    input_receipt_path: Path | None = None,
 ) -> None:
     """Atomically persist the exact verifier invocation and byte result."""
     def stream(raw: bytes) -> dict[str, Any]:
@@ -497,8 +499,22 @@ def _write_verification_receipt(
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
 
+    receipt_path = (
+        input_receipt_path
+        if input_receipt_path is not None
+        else args.receipt.resolve(strict=input_receipt_bytes is not None)
+    )
     payload = {
-        "schema": 2,
+        "schema": 3,
+        "input_attestation": {
+            "path": str(receipt_path),
+            "length": len(input_receipt_bytes) if input_receipt_bytes is not None else None,
+            "sha256": (
+                hashlib.sha256(input_receipt_bytes).hexdigest()
+                if input_receipt_bytes is not None
+                else None
+            ),
+        },
         "invocation": {
             "interpreter": str(Path(sys.executable).resolve()),
             "verifier_path": str(Path(__file__).resolve()),
@@ -508,7 +524,7 @@ def _write_verification_receipt(
                 str(Path(__file__).resolve()),
                 *sys.argv[1:],
             ],
-            "receipt_path": str(args.receipt),
+            "receipt_path": str(receipt_path),
             "review_root": str(args.review_root),
             "deployed_root": str(args.deployed_root),
             "expected_commit": args.expected_commit,
@@ -543,8 +559,12 @@ def main() -> int:
     args = parser.parse_args()
     stdout = b""
     stderr = b""
+    receipt_bytes: bytes | None = None
+    receipt_path: Path | None = None
     try:
-        receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
+        receipt_path = args.receipt.resolve(strict=True)
+        receipt_bytes = receipt_path.read_bytes()
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
         stdout = (verify(receipt, args.review_root, args.deployed_root, args.expected_commit) + "\n").encode("utf-8")
         exit_code = 0
     except (OSError, ValueError, KeyError, VerificationError) as exc:
@@ -555,7 +575,15 @@ def main() -> int:
     if stderr:
         sys.stderr.buffer.write(stderr)
     if args.verification_receipt is not None:
-        _write_verification_receipt(args.verification_receipt, args, exit_code, stdout, stderr)
+        _write_verification_receipt(
+            args.verification_receipt,
+            args,
+            exit_code,
+            stdout,
+            stderr,
+            receipt_bytes,
+            receipt_path,
+        )
     return exit_code
 
 if __name__ == "__main__":
