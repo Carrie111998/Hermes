@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { chatMessageText, type ChatMessage } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 
 import { reconcileResumeMessages } from './utils'
 
