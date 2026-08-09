@@ -28,6 +28,10 @@ def test_fleet_snapshot_coverage_reaches_one_hundred_percent_only_after_all_targ
     default = registry.get_target("hermes:profile:default:gateway")
     assert default.spec.labels.get("process_observation") == "enabled"
     assert default.spec.labels.get("process_marker") == "default"
+    for target in registry.list_targets():
+        if target.spec.profile != "default":
+            assert "process_marker_optional" not in target.spec.labels
+            assert "process_command_label_optional" not in target.spec.labels
     observed_at = datetime(2026, 8, 9, tzinfo=timezone.utc)
 
     for target in registry.list_targets():
