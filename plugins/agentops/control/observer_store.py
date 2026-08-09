@@ -260,6 +260,8 @@ class ObserverStore:
         existed = self.path.exists()
         identity = _database_identity(self.path) if existed else None
         prior_version = _preflight_existing_database(self.path, identity) if existed else 0
+        if prior_version == 1:
+            raise ObserverStoreError("legacy observer migration disabled without fd-bound handle")
         if not existed:
             _create_empty_database(self.path)
         try:
