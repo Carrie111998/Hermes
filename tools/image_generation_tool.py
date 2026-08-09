@@ -23,6 +23,8 @@ update when it's noticed.
 import json
 import logging
 import os
+import base64
+import mimetypes
 import datetime
 import threading
 import uuid
@@ -730,6 +732,30 @@ def _looks_like_absolute_file_path(value: str) -> bool:
         return True
     return len(value) >= 3 and value[1] == ":" and value[2] in {"/", "\\"}
 
+def _local_file_to_data_uri(path: str):
+    """Read a local file and return a base64 data URI.
+    Returns None if the file is not a readable local path.
+    Returns the original string if already a URL or data URI."""
+    if not path or not isinstance(path, str):
+        return None
+    if path.startswith(("http://", "https://", "data:")):
+        return path
+    expanded = os.path.expanduser(path)
+    if not os.path.isfile(expanded):
+        logger.warning("image_generate: local file not found: %s", expanded)
+        return None
+    try:
+        mime_type = mimetypes.guess_type(expanded)[0] or "image/png"
+        with open(expanded, "rb") as f:
+            img_bytes = f.read()
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        data_uri = f"data:{mime_type};base64,{b64}"
+        logger.info("image_generate: converted %s (%d bytes) to data URI", expanded, len(img_bytes))
+        return data_uri
+    except Exception as exc:
+        logger.warning("image_generate: failed to read %s: %s", expanded, exc)
+        return None
+
 
 def _active_terminal_env(task_id: str | None):
     try:
@@ -871,6 +897,20 @@ def image_generate_tool(
         for ref in reference_image_urls:
             if isinstance(ref, str) and ref.strip():
                 source_images.append(ref.strip())
+
+    # Convert local file paths to base64 data URIs.
+    # FAL cannot access local filesystem - raw paths fail with 422.
+    resolved_sources = []
+    for src in source_images:
+        if _looks_like_absolute_file_path(src):
+            data_uri = _local_file_to_data_uri(src)
+            if data_uri:
+                resolved_sources.append(data_uri)
+                continue
+            logger.warning("image_generate: dropping unreachable source image %s", src)
+        else:
+            resolved_sources.append(src)
+    source_images = resolved_sources
 
     edit_endpoint = meta.get("edit_endpoint")
     use_edit = bool(source_images) and bool(edit_endpoint)
