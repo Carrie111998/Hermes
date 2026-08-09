@@ -341,6 +341,11 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
     (LANG=C, Chromebooks, minimal containers).  Returns True if any
     non-ASCII content was found and sanitized.
     """
+    from agent.skill_commands import (
+        CACHE_STABLE_PREFIX_LEN_KEY,
+        get_cache_stable_prefix_len,
+    )
+
     found = False
     for msg in messages:
         if not isinstance(msg, dict):
@@ -348,11 +353,41 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
         # Sanitize content (string)
         content = msg.get("content")
         if isinstance(content, str):
-            sanitized = _strip_non_ascii(content)
+            prefix_len = get_cache_stable_prefix_len(content)
+            if prefix_len is None:
+                existing = msg.get(CACHE_STABLE_PREFIX_LEN_KEY)
+                if isinstance(existing, int):
+                    prefix_len = existing
+            if isinstance(prefix_len, int) and 0 < prefix_len < len(content):
+                # Strip each side independently so the character offset keeps
+                # pointing at the same stable/volatile boundary after chars
+                # before it are deleted.
+                stable = _strip_non_ascii(content[:prefix_len])
+                volatile = _strip_non_ascii(content[prefix_len:])
+                sanitized = stable + volatile
+                if stable and volatile:
+                    msg[CACHE_STABLE_PREFIX_LEN_KEY] = len(stable)
+                else:
+                    msg.pop(CACHE_STABLE_PREFIX_LEN_KEY, None)
+            else:
+                sanitized = _strip_non_ascii(content)
+                msg.pop(CACHE_STABLE_PREFIX_LEN_KEY, None)
             if sanitized != content:
                 msg["content"] = sanitized
                 found = True
         elif isinstance(content, list):
+            declared_len = msg.get(CACHE_STABLE_PREFIX_LEN_KEY)
+            cache_split_shape = (
+                msg.get("role") == "user"
+                and len(content) == 2
+                and isinstance(declared_len, int)
+                and all(
+                    isinstance(part, dict)
+                    and isinstance(part.get("text"), str)
+                    for part in content
+                )
+                and len(content[0]["text"]) == declared_len
+            )
             for part in content:
                 if isinstance(part, dict):
                     text = part.get("text")
@@ -361,6 +396,13 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                         if sanitized != text:
                             part["text"] = sanitized
                             found = True
+            if cache_split_shape:
+                stable = content[0]["text"]
+                volatile = content[1]["text"]
+                if stable and volatile:
+                    msg[CACHE_STABLE_PREFIX_LEN_KEY] = len(stable)
+                else:
+                    msg.pop(CACHE_STABLE_PREFIX_LEN_KEY, None)
         # Sanitize name field (can contain non-ASCII in tool results)
         name = msg.get("name")
         if isinstance(name, str):

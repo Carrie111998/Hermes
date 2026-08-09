@@ -35,6 +35,56 @@ class TestSanitizeMessagesNonAscii:
         assert _sanitize_messages_non_ascii(messages) is False
         assert messages[0]["content"] == "hello"
 
+    def test_rebases_cache_boundary_after_stripping_stable_prefix(self):
+        from agent.prompt_caching import _apply_cache_marker
+        from agent.skill_commands import (
+            CACHE_STABLE_PREFIX_LEN_KEY,
+            annotate_cache_stable_prefix,
+            with_cache_stable_prefix,
+        )
+
+        stable = "stable café\n"
+        ticket = "ticket=A/time=1"
+        message = annotate_cache_stable_prefix({
+            "role": "user",
+            "content": with_cache_stable_prefix(
+                stable + ticket,
+                len(stable),
+            ),
+        })
+
+        assert _sanitize_messages_non_ascii([message]) is True
+        _apply_cache_marker(message, {"type": "ephemeral"})
+
+        assert message[CACHE_STABLE_PREFIX_LEN_KEY] == len("stable caf\n")
+        assert message["content"][0]["text"] == "stable caf\n"
+        assert message["content"][1]["text"] == ticket
+
+    def test_rebases_already_decorated_cache_boundary(self):
+        from agent.prompt_caching import _apply_cache_marker
+        from agent.skill_commands import (
+            CACHE_STABLE_PREFIX_LEN_KEY,
+            annotate_cache_stable_prefix,
+            with_cache_stable_prefix,
+        )
+
+        stable = "stable café\n"
+        ticket = "ticket=A/time=1"
+        message = annotate_cache_stable_prefix({
+            "role": "user",
+            "content": with_cache_stable_prefix(
+                stable + ticket,
+                len(stable),
+            ),
+        })
+        _apply_cache_marker(message, {"type": "ephemeral"})
+
+        assert _sanitize_messages_non_ascii([message]) is True
+
+        assert message[CACHE_STABLE_PREFIX_LEN_KEY] == len("stable caf\n")
+        assert message["content"][0]["text"] == "stable caf\n"
+        assert message["content"][1]["text"] == ticket
+
 
 
 
