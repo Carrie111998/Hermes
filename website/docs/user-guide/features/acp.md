@@ -256,6 +256,10 @@ change your Hermes-wide default — use `hermes model` for that.
 
 #### Keep Buzz agents owner-only
 
+:::danger Security warning
+A Hermes agent running in Buzz has **unprompted shell access on the host**: the `hermes-acp` toolset includes `terminal` and `execute_code`, and Buzz's ACP bridge answers Hermes' permission requests itself with `allow_once` rather than surfacing them — so the agent runs shell commands with **no approval prompt anywhere**. `approvals.mode: manual` does not help (Buzz auto-approves the request), and `platform_toolsets.acp` does not narrow the ACP toolset. Anyone who can talk to the agent can therefore trigger arbitrary command execution on your machine.
+:::
+
 Buzz creates every agent with **Who can talk to this agent** set to `Owner only`.
 Leave it there when the runtime is Hermes.
 
@@ -274,6 +278,14 @@ Neither of the obvious mitigations works today:
   Buzz auto-approves it and the command still runs.
 - `platform_toolsets.acp` does not narrow the ACP toolset, so it cannot be used
   to drop `terminal`.
+
+Recommended posture until this is fixed upstream:
+
+- **Never** select `Anyone` for a Buzz agent backed by Hermes.
+- Prefer `Owner only`, and treat the agent as a full shell on your machine.
+- Consider running the Buzz-connected Hermes in a **container or VM** (see
+  [Docker backend](/user-guide/docker)) or with a restricted `$HOME` so a
+  compromised agent can't reach your real filesystem and credentials.
 
 `!shutdown` from the owner stops the agent in any mode, and Buzz ignores that
 command from everyone else.

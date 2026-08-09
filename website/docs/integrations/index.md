@@ -81,6 +81,7 @@ Speech-to-text supports eight providers: local faster-whisper (free, runs on-dev
 ## Programmatic Access
 
 - **[API Server](/user-guide/features/api-server)** — Expose Hermes as an OpenAI-compatible HTTP endpoint. Any frontend that speaks the OpenAI format — Open WebUI, LobeChat, LibreChat, NextChat, ChatBox — can connect and use Hermes as a backend with its full toolset.
+- **[`hermes -z` (scripted one-shot)](/reference/cli-commands#hermes--z-prompt--scripted-one-shot)** — For shell scripts, CI, and cron: single prompt in, final response text out, nothing else on stdout. Supports `--usage-file` for a JSON usage report. This is the fastest way to call Hermes from a pipeline when you only need the final answer.
 
 ## Memory & Personalization
 

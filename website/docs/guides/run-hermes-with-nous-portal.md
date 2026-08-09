@@ -33,7 +33,7 @@ This single command does five things:
 1. Opens your browser to portal.nousresearch.com for OAuth login
 2. Stores the refresh token at `~/.hermes/auth.json`
 3. Sets `model.provider: nous` in `~/.hermes/config.yaml`
-4. Picks a default agentic model (`anthropic/claude-sonnet-4.6` or similar)
+4. Picks a default agentic model (`anthropic/claude-sonnet-5` or similar)
 5. Turns on the Tool Gateway for web search, image generation, TTS, and browser automation
 
 When it finishes, you're back at your terminal ready to chat.
@@ -98,7 +98,7 @@ You should see Hermes call `web_search` (Firecrawl-backed, through the gateway) 
 `hermes setup --portal` lets you pick a model during setup, but the whole point of the subscription is access to the full catalog — switch any time with `/model` mid-session:
 
 ```bash
-/model anthropic/claude-sonnet-4.6     # best general-purpose agentic
+/model anthropic/claude-sonnet-5     # best general-purpose agentic
 /model openai/gpt-5.4                  # strong reasoning + tool calling
 /model google/gemini-2.5-pro           # huge context window
 /model deepseek/deepseek-v3.2          # cost-effective coder
@@ -115,7 +115,7 @@ Pick a different default permanently:
 
 ```bash
 # in your terminal, outside any session
-hermes config set model.default anthropic/claude-sonnet-4.6
+hermes config set model.default anthropic/claude-sonnet-5
 ```
 
 ### Don't pick Hermes-4 for agent work

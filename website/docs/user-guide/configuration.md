@@ -30,13 +30,16 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ## Managing Configuration
 
 ```bash
-hermes config              # View current configuration
+hermes config              # View current configuration (alias for `config show`)
+hermes config show         # Show current config values
 hermes config edit         # Open config.yaml in your editor
 hermes config get KEY      # Print a resolved value
 hermes config set KEY VAL  # Set a specific value
 hermes config unset KEY    # Remove a user-set value
 hermes config check        # Check for missing options (after updates)
 hermes config migrate      # Interactively add missing options
+hermes config path         # Print the config file path
+hermes config env-path     # Print the .env file path
 
 # Examples:
 hermes config get model

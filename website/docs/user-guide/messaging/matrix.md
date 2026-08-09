@@ -802,8 +802,13 @@ services:
 ```dockerfile
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y libolm-dev && rm -rf /var/lib/apt/lists/*
-RUN cd ~/.hermes/hermes-agent && uv pip install -e ".[matrix]"
+RUN apt-get update && apt-get install -y libolm-dev curl && rm -rf /var/lib/apt/lists/*
+
+# Install Hermes + the Matrix extra inside the container.
+# (The base image has no checkout — the installer clones to ~/.hermes/hermes-agent
+# and creates the venv at ~/.hermes/hermes-agent/venv.)
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash && \
+    cd ~/.hermes/hermes-agent && ~/.hermes/hermes-agent/venv/bin/uv pip install -e ".[matrix]"
 
 CMD ["hermes", "gateway"]
 ```

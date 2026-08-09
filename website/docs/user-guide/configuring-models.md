@@ -109,7 +109,7 @@ When you save via the dashboard, Hermes writes to `~/.hermes/config.yaml`:
 ```yaml
 model:
   provider: openrouter
-  default: anthropic/claude-opus-4.7
+  default: anthropic/claude-opus-4.8
   base_url: ''        # cleared on provider switch
   api_mode: chat_completions
 ```
@@ -217,7 +217,7 @@ Three things to check:
 
 ### I picked a model but Hermes switched providers on me
 
-On OpenRouter (or any aggregator), bare model names resolve *within* the aggregator first. So `claude-sonnet-4` on OpenRouter becomes `anthropic/claude-sonnet-4.6`, staying on your OpenRouter auth. But if you typed `claude-sonnet-4` on a native Anthropic auth, it would stay as `claude-sonnet-4-6`. If you see an unexpected provider switch, check that your current provider is what you expect — the picker always shows the current main at the top of the dialog.
+On OpenRouter (or any aggregator), bare model names resolve *within* the aggregator first. So `claude-sonnet-4` on OpenRouter becomes `anthropic/claude-sonnet-5`, staying on your OpenRouter auth. But if you typed `claude-sonnet-4` on a native Anthropic auth, it would stay as `claude-sonnet-4-6`. If you see an unexpected provider switch, check that your current provider is what you expect — the picker always shows the current main at the top of the dialog.
 
 ## Alternative methods
 
@@ -294,7 +294,7 @@ curl -H "X-Hermes-Session-Token: $TOKEN" http://localhost:PORT/api/model/auxilia
 
 # Set the main model
 curl -X POST -H "Content-Type: application/json" -H "X-Hermes-Session-Token: $TOKEN" \
-  -d '{"scope":"main","provider":"openrouter","model":"anthropic/claude-opus-4.7"}' \
+  -d '{"scope":"main","provider":"openrouter","model":"anthropic/claude-opus-4.8"}' \
   http://localhost:PORT/api/model/set
 
 # Override a single auxiliary task

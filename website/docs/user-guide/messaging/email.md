@@ -93,7 +93,7 @@ sudo hermes gateway install --system   # Linux only: boot-time system service
 
 On startup, the adapter:
 1. Tests IMAP and SMTP connections
-2. Marks all existing inbox messages as "seen" (only processes new emails)
+2. Marks all existing inbox messages as "seen" (only processes new emails). **Note:** this marks every pre-existing message as read on the first run — for a shared inbox this can hide mail from other readers. If that matters, start with an empty or dedicated inbox, or process the backlog first (the adapter never un-marks messages).
 3. Starts polling for new messages
 
 ---

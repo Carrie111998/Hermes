@@ -8,6 +8,21 @@ sidebar_position: 1
 
 This page covers setting up inference providers for Hermes Agent — from cloud APIs like OpenRouter and Anthropic, to self-hosted endpoints like Ollama and vLLM, to advanced routing and fallback configurations. You need at least one provider configured to use Hermes.
 
+## Current Model Names (canonical reference)
+
+Model identifiers differ between providers — OpenRouter-style slugs (`anthropic/claude-sonnet-5`), Bedrock inference-profile IDs (`us.anthropic.claude-sonnet-4-6`), and dated snapshot IDs (`claude-sonnet-4-5-20250929`) are **all valid but refer to different naming schemes**. Before copying a model name from an example into a config or `/model` command, check which scheme the target provider uses.
+
+Curated current-model lists are fetched from the [live model catalog](/reference/model-catalog):
+
+| Provider | Current models (as of latest catalog) |
+|----------|----------------------------------------|
+| OpenRouter / Nous Portal | `anthropic/claude-sonnet-5`, `anthropic/claude-opus-4.8`, `anthropic/claude-haiku-4.5`, `openai/gpt-5.6-sol`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `google/gemini-3.6-flash`, `google/gemini-3.1-pro-preview`, `x-ai/grok-4.5`, `deepseek/deepseek-v4-pro`, `deepseek/deepseek-v4-flash`, `qwen/qwen3.8-max`, `moonshotai/kimi-k3`, `minimax/minimax-m3` |
+| Bedrock | `us.anthropic.claude-sonnet-4-6`, `us.anthropic.claude-opus-4-6-v1` (inference-profile prefix required — bare IDs fail with "on-demand throughput isn't supported") |
+| Gemini | `gemini-3.6-flash` (Flash tier), `gemini-3.1-pro-preview` (Pro tier) |
+| Grok | `grok-4.5` (chat + `x_search`) |
+
+**These names rotate.** Run `hermes model` (or `/model` in-session) for the live picker list — the catalog is refreshed independently of Hermes releases, so examples in this doc set age faster than the code.
+
 ## Inference Providers
 
 You need at least one way to connect to an LLM. Use `hermes model` to switch providers and models interactively, or configure directly:
