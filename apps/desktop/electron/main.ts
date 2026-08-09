@@ -1064,13 +1064,13 @@ const remoteRevalidation = new RemoteRevalidationCoordinator()
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
-// Additional per-profile backends, keyed by profile name. The PRIMARY backend
+// Additional per-profile backends, keyed by routing target. The PRIMARY backend
 // (the desktop's launch profile) stays managed by backendConnectionState +
 // startHermes(); this pool only holds EXTRA profile
 // backends spawned lazily when a session belongs to a different profile. A user
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
-const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+const backendPool = new Map() // targetKey -> { process, port, token, connectionPromise, lastActiveAt }
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -7622,14 +7622,34 @@ function persistSshConnectionToken(profile, source, token) {
 }
 
 // Resolve the remote backend for a given profile, or null when that profile
-// should run a LOCAL backend. Precedence:
+// should run a LOCAL backend. Explicit localOnly skips remote resolution
+// entirely; explicit remoteOnly uses the saved global remote block even when
+// the active primary mode is local. Otherwise precedence is:
 //   1. explicit per-profile remote override (connection.json `profiles[name]`)
 //   2. env override (HERMES_DESKTOP_REMOTE_URL/_TOKEN) — applies app-wide
 //   3. global remote (connection.json `mode: 'remote'`)
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
-async function resolveRemoteBackend(profile) {
+async function resolveRemoteBackend(profile, options: any = {}) {
+  if (Reflect.get(options, 'localOnly') === true) {
+    return null
+  }
+
   const config = readDesktopConnectionConfig()
+
+  if (Reflect.get(options, 'remoteOnly') === true) {
+    const authMode = normAuthMode(config.remote?.authMode)
+    const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
+
+    return buildRemoteConnection(
+      config.remote?.url,
+      authMode,
+      token,
+      'settings',
+      undefined,
+      config.mode === 'cloud' ? 'cloud' : 'url'
+    )
+  }
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
   //    over the env override so an explicitly-configured profile always
@@ -8104,7 +8124,7 @@ function localProfileExists(profile) {
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
-/** @param {{localOnly?: boolean}} [options] */
+/** @param {{localOnly?: boolean, remoteOnly?: boolean}} [options] */
 function profileRouteOptions(profile, options = {}) {
   return {
     globalRemote: globalRemoteActive(),
@@ -8112,17 +8132,33 @@ function profileRouteOptions(profile, options = {}) {
     localProfile: localProfileExists(profile),
     primaryBackendRemote: primaryBackendIsRemote(),
     primaryProfile: primaryProfileKey(),
-    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
+    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile)),
+    remoteOnly: Reflect.get(options, 'remoteOnly') === true
   }
+}
+
+function backendPoolTargetKey(profile, options = {}) {
+  const key = connectionScopeKey(profile) || primaryProfileKey()
+
+  if (Reflect.get(options, 'localOnly') === true) {
+    return `local:${key}`
+  }
+
+  if (Reflect.get(options, 'remoteOnly') === true) {
+    return `remote:${key}`
+  }
+
+  return key
 }
 
 // Resolve a backend connection for the given profile, per the routing table in
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
-/** @param {{localOnly?: boolean}} [options] */
+/** @param {{localOnly?: boolean, remoteOnly?: boolean}} [options] */
 async function ensureBackend(profile, options = {}) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
-  const route = resolveProfileBackendRoute(key, profileRouteOptions(key, options))
+  const routeOptions = profileRouteOptions(key, options)
+  const route = resolveProfileBackendRoute(key, routeOptions)
 
   if (route.backend === 'primary') {
     const connection = await startHermes()
@@ -8134,7 +8170,8 @@ async function ensureBackend(profile, options = {}) {
       : connection
   }
 
-  const existing = backendPool.get(key)
+  const targetKey = backendPoolTargetKey(key, options)
+  const existing = backendPool.get(targetKey)
 
   if (existing) {
     existing.lastActiveAt = Date.now()
@@ -8153,11 +8190,11 @@ async function ensureBackend(profile, options = {}) {
     remoteBaseUrl: null
   }
 
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
+  entry.connectionPromise = spawnPoolBackend(key, entry, targetKey, options).catch(error => {
+    backendPool.delete(targetKey)
     throw error
   })
-  backendPool.set(key, entry)
+  backendPool.set(targetKey, entry)
   startPoolIdleReaper()
 
   return entry.connectionPromise
@@ -8237,14 +8274,14 @@ function startPoolIdleReaper() {
 // Spawn an additional dashboard backend pinned to a named profile. Mirrors the
 // local-spawn portion of startHermes() but without the boot-progress UI,
 // bootstrap, or remote handling (those belong to the primary backend only).
-async function spawnPoolBackend(profile, entry) {
+async function spawnPoolBackend(profile, entry, targetKey, options = {}) {
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
   // In either case there is no local child to spawn — we just verify the
   // remote is reachable and hand back its connection descriptor. The pool
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
-  const remote = await resolveRemoteBackend(profile)
+  const remote = await resolveRemoteBackend(profile, options)
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
@@ -8336,12 +8373,12 @@ async function spawnPoolBackend(profile, entry) {
 
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
-    backendPool.delete(profile)
+    backendPool.delete(targetKey)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
-    backendPool.delete(profile)
+    backendPool.delete(targetKey)
 
     if (!ready) {
       rejectStart?.(
@@ -10834,7 +10871,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const tornDownProfile = await prepareProfileDeleteRequest(request)
 
   const profile = request?.profile
-  const routeOptions = { localOnly: request?.localOnly === true }
+  const routeOptions = { localOnly: request?.localOnly === true, remoteOnly: request?.remoteOnly === true }
   // After tearing down a backend for profile deletion, route to the primary
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,

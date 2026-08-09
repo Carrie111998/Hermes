@@ -306,6 +306,28 @@ test('resolveProfileBackendRoute sends an explicit local default to a pool besid
   )
 })
 
+test('routes a remote-only root to a pool when the primary backend is local', () => {
+  assert.deepEqual(
+    resolveProfileBackendRoute('default', {
+      primaryBackendRemote: false,
+      primaryProfile: 'default',
+      remoteOnly: true
+    }),
+    { backend: 'pool', descriptorProfile: null, scopePath: false }
+  )
+})
+
+test('keeps a remote-only root on a remote primary', () => {
+  assert.deepEqual(
+    resolveProfileBackendRoute('default', {
+      primaryBackendRemote: true,
+      primaryProfile: 'default',
+      remoteOnly: true
+    }),
+    { backend: 'primary', descriptorProfile: null, scopePath: false }
+  )
+})
+
 test('resolveProfileBackendRoute only tags a descriptor when the backend is shared', () => {
   // A pooled backend is already scoped to its profile, so tagging it would
   // imply a second scope the caller must reconcile. Only the shared

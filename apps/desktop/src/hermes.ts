@@ -1473,10 +1473,14 @@ export function instantiateAutomationBlueprint(
   })
 }
 
-export function getProfiles(profile?: null | string, options: { localOnly?: boolean } = {}): Promise<ProfilesResponse> {
+export function getProfiles(
+  profile?: null | string,
+  options: { localOnly?: boolean; remoteOnly?: boolean } = {}
+): Promise<ProfilesResponse> {
   return window.hermesDesktop.api<ProfilesResponse>({
     ...profileScoped(profile),
     ...(options.localOnly ? { localOnly: true } : {}),
+    ...(options.remoteOnly ? { remoteOnly: true } : {}),
     path: '/api/profiles',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })

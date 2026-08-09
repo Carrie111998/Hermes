@@ -384,6 +384,7 @@ export interface ProfileRouteOptions {
   primaryBackendRemote?: boolean
   primaryProfile?: null | string
   profileRemoteOverride?: boolean
+  remoteOnly?: boolean
 }
 
 export interface ProfileBackendRoute {
@@ -429,6 +430,10 @@ function resolveProfileBackendRoute(profile, opts: ProfileRouteOptions = {}): Pr
   // the primary-profile fast path below makes both roots address the same
   // backend.
   if (opts.localOnly && opts.localProfile && opts.primaryBackendRemote) {
+    return { backend: 'pool', descriptorProfile: null, scopePath: false }
+  }
+
+  if (opts.remoteOnly && !opts.primaryBackendRemote) {
     return { backend: 'pool', descriptorProfile: null, scopePath: false }
   }
 
