@@ -42,7 +42,9 @@ const remoteConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
 const localConn = (over: Partial<HermesConnection> = {}): HermesConnection =>
   ({ baseUrl: '', mode: 'local', profile: 'default', ...over }) as HermesConnection
 
-const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnection>>()
+const getConnection = vi.fn<
+  (profile?: string | null, options?: { localOnly?: boolean; remoteOnly?: boolean }) => Promise<HermesConnection>
+>()
 
 beforeEach(() => {
   getConnection.mockReset()
@@ -103,6 +105,19 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect($connection.get()?.mode).toBe('local')
   })
 
+  it('routes the remote default explicitly when a local default is active', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+    getConnection.mockResolvedValue(remoteConn({ profile: 'default' }))
+
+    await ensureGatewayProfile('default', { remoteOnly: true })
+
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
+    expect(getConnection).toHaveBeenCalledWith('default', { remoteOnly: true })
+    expect($connection.get()?.mode).toBe('remote')
+    expect($connection.get()?.profile).toBe('default')
+  })
+
   it('selects the local default instead of no-oping on a remote default with the same name', () => {
     $activeGatewayProfile.set('default')
     $connection.set(remoteConn({ profile: 'default' }))
@@ -130,6 +145,17 @@ describe('ensureGatewayProfile → $connection sync (#46651)', () => {
     expect(getConnection).not.toHaveBeenCalled()
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
     expect($connection.get()?.mode).toBe('remote')
+  })
+
+  it('does not no-op a remote default target just because the local default is active', async () => {
+    $activeGatewayProfile.set('default')
+    $connection.set(localConn())
+    getConnection.mockResolvedValue(remoteConn({ profile: 'default' }))
+
+    await ensureGatewayProfile('default', { remoteOnly: true })
+
+    expect(getConnection).toHaveBeenCalledWith('default', { remoteOnly: true })
+    expect(ensureGatewayForProfile).toHaveBeenCalledWith('default', { remoteOnly: true })
   })
 })
 

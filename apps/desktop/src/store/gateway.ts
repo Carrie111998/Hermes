@@ -18,13 +18,77 @@ import { setGatewayState } from '@/store/session'
 
 const normKey = (profile: string | null | undefined): string => (profile ?? '').trim() || 'default'
 const LOCAL_TARGET_PREFIX = '__local__:'
+const REMOTE_TARGET_PREFIX = '__remote__:'
+
+type BackendMode = 'local' | 'remote'
+type GatewayTargetMode = 'plain' | 'localOnly' | 'remoteOnly'
 
 export interface GatewayProfileOptions {
   localOnly?: boolean
+  remoteOnly?: boolean
 }
 
-const targetKey = (profile: string, options: GatewayProfileOptions = {}): string =>
-  options.localOnly ? `${LOCAL_TARGET_PREFIX}${normKey(profile)}` : normKey(profile)
+export const gatewayTargetKey = (profile: string, options: GatewayProfileOptions = {}): string => {
+  const key = normKey(profile)
+
+  if (options.localOnly) {
+    return `${LOCAL_TARGET_PREFIX}${key}`
+  }
+
+  if (options.remoteOnly) {
+    return `${REMOTE_TARGET_PREFIX}${key}`
+  }
+
+  return key
+}
+
+function targetMode(options: GatewayProfileOptions = {}): GatewayTargetMode {
+  if (options.localOnly) {
+    return 'localOnly'
+  }
+
+  if (options.remoteOnly) {
+    return 'remoteOnly'
+  }
+
+  return 'plain'
+}
+
+function targetOptions(mode: GatewayTargetMode): GatewayProfileOptions {
+  if (mode === 'localOnly') {
+    return { localOnly: true }
+  }
+
+  if (mode === 'remoteOnly') {
+    return { remoteOnly: true }
+  }
+
+  return {}
+}
+
+function resolvedTargetKey(
+  profile: string,
+  options: GatewayProfileOptions,
+  primaryMode: BackendMode,
+  primaryProfile: string
+): string {
+  const key = normKey(profile)
+  const target = gatewayTargetKey(key, options)
+
+  if (key !== primaryProfile) {
+    return target
+  }
+
+  if (options.localOnly && primaryMode === 'local') {
+    return primaryProfile
+  }
+
+  if (options.remoteOnly && primaryMode === 'remote') {
+    return primaryProfile
+  }
+
+  return target
+}
 
 // Read connection state through a call so TS control-flow analysis doesn't
 // narrow the getter to a constant across guards (it genuinely changes).
@@ -39,6 +103,7 @@ interface Secondary {
   key: string
   profile: string
   localOnly: boolean
+  remoteOnly: boolean
   gateway: HermesGateway
   offEvent: () => void
   offState: () => void
@@ -64,10 +129,11 @@ interface Secondary {
 interface GatewayRegistryState {
   config: RegistryConfig | null
   primaryGateway: HermesGateway | null
+  primaryBackendMode: BackendMode
   primaryProfile: string
   activeKey: string
   activeProfile: string
-  activeLocalOnly: boolean
+  activeTargetMode: GatewayTargetMode
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
 }
@@ -78,10 +144,11 @@ function createRegistryState(): GatewayRegistryState {
   return {
     config: null,
     primaryGateway: null,
+    primaryBackendMode: 'local',
     primaryProfile: 'default',
     activeKey: 'default',
     activeProfile: 'default',
-    activeLocalOnly: false,
+    activeTargetMode: 'plain',
     secondaries: new Map<string, Secondary>(),
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
@@ -133,6 +200,12 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
   g.primaryGateway = gateway
   g.primaryProfile = normKey(profile)
+  syncActiveTarget()
+}
+
+export function setPrimaryBackendMode(mode: BackendMode): void {
+  g.primaryBackendMode = mode
+  syncActiveTarget()
 }
 
 export function isActivePrimary(): boolean {
@@ -167,13 +240,23 @@ export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(g.primaryProfile, state)
 }
 
-function setActive(key: string, profile: string, localOnly = false): void {
+function setActive(key: string, profile: string, mode: GatewayTargetMode = 'plain'): void {
   g.activeKey = key
   g.activeProfile = normKey(profile)
-  g.activeLocalOnly = localOnly
+  g.activeTargetMode = mode
   const gateway = activeGateway()
   g.$gateway.set(gateway)
   setGatewayState(gateway?.connectionState ?? 'closed')
+}
+
+function syncActiveTarget(): void {
+  const key = resolvedTargetKey(g.activeProfile, targetOptions(g.activeTargetMode), g.primaryBackendMode, g.primaryProfile)
+
+  if (key === g.activeKey) {
+    return
+  }
+
+  setActive(key, g.activeProfile, g.activeTargetMode)
 }
 
 function clearTimer(entry: Secondary): void {
@@ -190,10 +273,11 @@ async function openSecondary(entry: Secondary): Promise<void> {
     return
   }
 
-  const conn = await desktop.getConnection(entry.profile, entry.localOnly ? { localOnly: true } : undefined)
+  const options = entry.localOnly ? { localOnly: true } : entry.remoteOnly ? { remoteOnly: true } : undefined
+  const conn = await desktop.getConnection(entry.profile, options)
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
   await entry.gateway.connect(wsUrl)
-  void desktop.touchBackend?.(entry.profile).catch(() => undefined)
+  void desktop.touchBackend?.(entry.profile, options).catch(() => undefined)
 }
 
 function scheduleReconnect(entry: Secondary): void {
@@ -232,13 +316,14 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   }
 }
 
-function createSecondary(key: string, profile: string, localOnly = false): Secondary {
+function createSecondary(key: string, profile: string, mode: GatewayTargetMode = 'plain'): Secondary {
   const gateway = new HermesGateway()
 
   const entry: Secondary = {
     key,
     profile,
-    localOnly,
+    localOnly: mode === 'localOnly',
+    remoteOnly: mode === 'remoteOnly',
     gateway,
     offEvent: () => {},
     offState: () => {},
@@ -272,13 +357,14 @@ function createSecondary(key: string, profile: string, localOnly = false): Secon
 // backend must not start a background retry loop — the real switch owns retry
 // and error UX. An already-open (or primary) profile is a no-op.
 export async function openGatewayForProfile(profile: string, options: GatewayProfileOptions = {}): Promise<void> {
-  const key = targetKey(profile, options)
+  const mode = targetMode(options)
+  const key = resolvedTargetKey(profile, options, g.primaryBackendMode, g.primaryProfile)
 
-  if (!options.localOnly && key === g.primaryProfile) {
+  if (key === g.primaryProfile) {
     return
   }
 
-  const entry = g.secondaries.get(key) ?? createSecondary(key, profile, Boolean(options.localOnly))
+  const entry = g.secondaries.get(key) ?? createSecondary(key, profile, mode)
   entry.wantOpen = true
 
   if (!isOpen(entry.gateway)) {
@@ -289,10 +375,11 @@ export async function openGatewayForProfile(profile: string, options: GatewayPro
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
 export async function ensureGatewayForProfile(profile: string, options: GatewayProfileOptions = {}): Promise<void> {
-  const key = targetKey(profile, options)
+  const mode = targetMode(options)
+  const key = resolvedTargetKey(profile, options, g.primaryBackendMode, g.primaryProfile)
 
-  if (!options.localOnly && key === g.primaryProfile) {
-    setActive(key, profile)
+  if (key === g.primaryProfile) {
+    setActive(key, profile, mode)
 
     return
   }
@@ -300,7 +387,7 @@ export async function ensureGatewayForProfile(profile: string, options: GatewayP
   let entry = g.secondaries.get(key)
 
   if (!entry) {
-    entry = createSecondary(key, profile, Boolean(options.localOnly))
+    entry = createSecondary(key, profile, mode)
   }
 
   entry.wantOpen = true
@@ -316,7 +403,7 @@ export async function ensureGatewayForProfile(profile: string, options: GatewayP
     }
   }
 
-  setActive(key, profile, Boolean(options.localOnly))
+  setActive(key, profile, mode)
 }
 
 // Reconnect the active gateway after a transient request failure. Primary
@@ -335,7 +422,7 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
 
   if (!entry) {
     try {
-      await ensureGatewayForProfile(g.activeProfile, { localOnly: g.activeLocalOnly })
+      await ensureGatewayForProfile(g.activeProfile, targetOptions(g.activeTargetMode))
     } catch {
       return null
     }
@@ -374,7 +461,8 @@ export function touchSecondaryGateways(): void {
 
   for (const entry of g.secondaries.values()) {
     if (entry.wantOpen) {
-      void desktop?.touchBackend?.(entry.profile).catch(() => undefined)
+      const options = entry.localOnly ? { localOnly: true } : entry.remoteOnly ? { remoteOnly: true } : undefined
+      void desktop?.touchBackend?.(entry.profile, options).catch(() => undefined)
     }
   }
 }

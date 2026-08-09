@@ -8211,7 +8211,16 @@ async function ensureBackend(profile, options = {}) {
 // Mark a pool profile as recently used so the idle reaper spares it. The
 // renderer calls this when it opens a profile's chat WS and periodically while
 // streaming, since the main process can't see the direct renderer↔backend WS.
-function touchPoolBackend(profile) {
+function touchPoolBackend(profile, options) {
+  const key = backendPoolTargetKey(profile, options)
+  const entry = backendPool.get(key)
+
+  if (entry) {
+    entry.lastActiveAt = Date.now()
+
+    return
+  }
+
   touchBackendPoolEntries(backendPool, profile, Date.now())
 }
 
@@ -10053,8 +10062,8 @@ function revalidatePool() {
   })
 }
 
-ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
-  touchPoolBackend(profile)
+ipcMain.handle('hermes:backend:touch', async (_event, profile, options) => {
+  touchPoolBackend(profile, options)
 
   return { ok: true }
 })

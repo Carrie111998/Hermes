@@ -298,7 +298,7 @@ async function syncConnectionToActiveProfile(profile: string, options: GatewayPr
   }
 
   try {
-    const connection = options.localOnly ? await getConnection(profile, options) : await getConnection(profile)
+    const connection = options.localOnly || options.remoteOnly ? await getConnection(profile, options) : await getConnection(profile)
     setConnection(connection)
   } catch {
     // Leave the prior connection in place; boot/reconnect resyncs it later.
@@ -331,7 +331,8 @@ export async function ensureGatewayProfile(
   const alreadyActive =
     normalizeProfileKey($activeGatewayProfile.get()) === target &&
     $gateway.get() &&
-    (!options.localOnly || $connection.get()?.mode !== 'remote')
+    (!options.localOnly || $connection.get()?.mode !== 'remote') &&
+    (!options.remoteOnly || $connection.get()?.mode !== 'local')
 
   if (alreadyActive) {
     return
@@ -345,7 +346,8 @@ export async function ensureGatewayProfile(
     const alreadyActiveAfterWait =
       normalizeProfileKey($activeGatewayProfile.get()) === target &&
       $gateway.get() &&
-      (!options.localOnly || $connection.get()?.mode !== 'remote')
+      (!options.localOnly || $connection.get()?.mode !== 'remote') &&
+      (!options.remoteOnly || $connection.get()?.mode !== 'local')
 
     if (alreadyActiveAfterWait) {
       return
@@ -356,7 +358,7 @@ export async function ensureGatewayProfile(
   gatewaySwitch = (async () => {
     // ensureGatewayForProfile opens (or reuses) the target's socket and points
     // the active gateway at it — without closing the profile you came from.
-    const gateway = options.localOnly ? ensureGatewayForProfile(target, options) : ensureGatewayForProfile(target)
+    const gateway = options.localOnly || options.remoteOnly ? ensureGatewayForProfile(target, options) : ensureGatewayForProfile(target)
     await gateway
     $activeGatewayProfile.set(target)
     // The active backend just changed; resync $connection so remote-aware

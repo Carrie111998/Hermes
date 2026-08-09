@@ -21,6 +21,7 @@ import {
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
+  setPrimaryBackendMode,
   setPrimaryGateway,
   touchSecondaryGateways
 } from '@/store/gateway'
@@ -99,6 +100,7 @@ export function useGatewayBoot({
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
       setConnection(next)
+      setPrimaryBackendMode(next?.mode === 'remote' ? 'remote' : 'local')
     }
 
     if (!desktop) {
