@@ -32,6 +32,15 @@ _MAX_READ_BYTES = 1024 * 1024
 
 
 def _safe_directory(path: Path) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            if stat.S_ISLNK(current.lstat().st_mode):
+                raise OSError("symlink component rejected")
+        except FileNotFoundError:
+            break
     metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise OSError("directory rejected")
@@ -178,6 +187,8 @@ class GitStateCollector:
             self._last_collection = now
         try:
             git_dir, common_dir = self._layout()
+            if not target_allows_asset(target, git_dir) or not target_allows_asset(target, common_dir):
+                return failed_batch(target, self.name, "git_metadata_unbound", source_id=self.source_id)
             object_id, reference = self._head(git_dir, common_dir)
         except Exception:
             return failed_batch(target, self.name, "git_read_failed", source_id=self.source_id)

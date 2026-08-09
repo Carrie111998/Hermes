@@ -6,8 +6,9 @@
 does not authorize a production rollout, lifecycle operation, Gateway,
 LaunchAgent or Cron change, LLM, Dashboard, R1-R4, merge or push.
 
-Sol's first G2 review returned `changes_requested`; this document replaces the
-invalidated initial evidence. It is a request for fresh independent G2 review,
+Sol's first G2 review returned `changes_requested`; the first remediation
+passed both P0 checks but the second review found additional counterexamples.
+This document is superseded again pending the second remediation commit. It is
 not a G2 approval claim.
 
 ## Scope and protected assets
@@ -32,8 +33,10 @@ not a G2 approval claim.
 | P1-3 Bridge mutation/race | Queue contains canonical JSON, validates again before enqueue/drain, and holds a lock around queue/capacity state | `test_bridge_copies_nested_payload_revalidates_and_remains_capacity_bounded` |
 | P1-4 Git traversal/layout | Strict ref grammar, root containment and no symlink components; direct read support for gitdir/commondir/packed-refs | `test_git_ref_traversal_is_rejected_and_standard_worktree_packed_refs_are_read` |
 | P1-5 source binding/deadline/budgets | Target observed paths/labels bind sources; bounded source reads/items/rates; fan-out has caller-visible deadline | `test_asset_binding_deadline_and_snapshot_deep_freeze`, `test_process_plist_and_cron_collectors_enforce_item_or_byte_budgets` |
-| P1-6 ObserverStore preflight | Marker/owner/mode/fixed-path/inode checks and read-only exact schema/version/integrity preflight precede writable SQLite/WAL | `test_unrelated_existing_observer_database_is_unchanged_before_preflight` |
-| P1-7 manifest semantics | Versioned pack declares target kinds, bounded probes, assertions, classification, retention, no-write production-read/dry-run and manual failure runbook | `test_review_pack_manifest.py` |
+| P1-6 ObserverStore preflight | Marker/owner/mode/fixed-path/inode checks and read-only exact schema/version/integrity/constraint preflight precede writable SQLite/WAL | `test_unrelated_existing_observer_database_is_unchanged_before_preflight`, `test_same_named_incompatible_observer_schema_is_rejected_without_wal_or_bytes_change` |
+| P1-7 manifest semantics | Versioned pack declares target kinds, bounded probes, assertions, classification, retention, no-write production-read/dry-run and manual failure runbook | `test_review_pack_manifest.py`, `test_manifest_loader_executes_entry_capability_and_budget_validation` |
+| G2 second-round full-record gate | Every persisted string is redacted/rescanned; cron execution and mandatory assertion freshness/authority are fail-closed | `test_all_persisted_record_strings_are_redacted_and_occurrences_cursors_are_monotonic`, `test_cron_unknown_mandatory_and_stale_execution_are_unhealthy` |
+| G2 second-round delivery/order | Bridge claims in-flight events exactly once; cursor and occurrence updates are monotonic; timeout lifecycle is explicit | `test_bridge_concurrent_drain_claims_each_event_once`, `test_asset_binding_deadline_and_snapshot_deep_freeze` |
 | P2 deep freeze/interpreter parity | Recursive immutable mappings detach snapshot/signal data; separate Python 3.14 environment contains dependencies | `test_asset_binding_deadline_and_snapshot_deep_freeze`; Python 3.14 command below |
 
 ## Fresh verification output
@@ -43,7 +46,7 @@ not a G2 approval claim.
 ```
 
 ```text
-102 passed in 3.40s
+107 passed in 3.47s
 ```
 
 ```bash
@@ -51,7 +54,7 @@ not a G2 approval claim.
 ```
 
 ```text
-102 passed in 6.14s
+107 passed in 6.24s
 ```
 
 The Python 3.14 environment is isolated at `/private/tmp/agentops-py314.qSSO12`;
@@ -63,7 +66,7 @@ without changing the main project environment.
 ```
 
 ```text
-122 passed in 2.37s
+122 passed in 2.54s
 ```
 
 ```text
@@ -83,8 +86,8 @@ python 3.14 compileall: PASS
   live writer. Validation may only run on a separately authorized,
   AgentOps-owned copy in a later phase.
 - A timed-out collector's Python worker cannot be force-killed safely; its
-  caller returns a bounded unhealthy batch and continues. Phase 2 collectors
-  contain no target-write primitive.
+  caller returns a bounded unhealthy batch with `worker_detached=true` and
+  continues. Phase 2 collectors contain no target-write primitive.
 - Git dirty state remains `unknown`; the collector only reads direct Git
   metadata and refuses to infer a clean worktree.
 - G2 still requires independent security/architecture review. No conclusion in

@@ -20,32 +20,50 @@ inputs:
   retention_days: 14
   collectors:
     - id: logs
+      entry: plugins.agentops.control.collectors.logs:LogCollector
+      capabilities: [read_regular_file]
+      target_kinds: [gateway]
       source_binding: target.observed_paths
       max_bytes: 65536
       max_items: 200
       deadline_seconds: 1
       rate_limit_seconds: 15
     - id: processes
-      source_binding: target.labels.service_label
+      entry: plugins.agentops.control.collectors.processes:ProcessCollector
+      capabilities: [read_process_snapshot]
+      target_kinds: [gateway]
+      source_binding: target.labels.service_label+process_marker+command_fingerprint+owner_uid
       max_items: 256
       deadline_seconds: 1
       rate_limit_seconds: 15
     - id: launchd
+      entry: plugins.agentops.control.collectors.launchd:LaunchdCollector
+      capabilities: [read_plist]
+      target_kinds: [gateway]
       source_binding: target.observed_paths
       max_bytes: 1048576
       deadline_seconds: 1
       rate_limit_seconds: 60
     - id: cron
+      entry: plugins.agentops.control.collectors.cron:CronCollector
+      capabilities: [read_cron_status]
+      target_kinds: [cron]
       source_binding: target.observed_paths
       max_items: 32
       deadline_seconds: 1
       rate_limit_seconds: 60
     - id: sqlite_health
+      entry: plugins.agentops.control.collectors.sqlite_health:SQLiteHealthCollector
+      capabilities: [read_file_metadata]
+      target_kinds: [sqlite]
       source_binding: target.observed_paths
       max_items: 3
       deadline_seconds: 1
       rate_limit_seconds: 60
     - id: git_state
+      entry: plugins.agentops.control.collectors.git_state:GitStateCollector
+      capabilities: [read_git_metadata]
+      target_kinds: [repository]
       source_binding: target.observed_paths
       max_bytes: 1048576
       deadline_seconds: 1
