@@ -233,6 +233,21 @@ export const zhHant = defineLocale({
       billing: '帳單',
       notifications: '通知'
     },
+    customEndpoints: {
+      apiMode: 'API 模式',
+      modes: {
+        auto: '自動偵測',
+        chatCompletions: 'Chat Completions',
+        responses: 'Responses / Codex',
+        anthropicMessages: 'Anthropic Messages'
+      },
+      descriptions: {
+        auto: '讓 Hermes 根據端點 URL 推斷協定。',
+        chatCompletions: '使用 /chat/completions；端點 URL 通常以 /v1 結尾。',
+        responses: '使用 /responses；端點 URL 通常以 /v1 結尾。測試會傳送一個單 token 請求。',
+        anthropicMessages: '使用 /v1/messages；請填寫不含結尾 /v1 的 API 根網址。測試會傳送一個單 token 請求。'
+      }
+    },
     notifications: {
       title: '通知',
       intro: '原生桌面通知，與應用程式內提示不同。設定會依裝置保存，每台電腦各自獨立。',

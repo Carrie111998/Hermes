@@ -7279,6 +7279,34 @@ def _config_api_key_is_env_ref(endpoint_id: str) -> bool:
     return bool(isinstance(raw_key, str) and re.search(r"\$\{[^}]+\}", raw_key))
 
 
+_CUSTOM_ENDPOINT_TRANSPORTS = {
+    "chat_completions": "openai_chat",
+    "codex_responses": "codex_responses",
+    "anthropic_messages": "anthropic_messages",
+}
+
+
+def _custom_endpoint_api_mode(entry: Dict[str, Any]) -> str:
+    """Return the Desktop-facing API mode for a v12 provider entry."""
+    raw_mode = str(entry.get("transport") or entry.get("api_mode") or "").strip()
+    if raw_mode == "openai_chat":
+        return "chat_completions"
+    if raw_mode in _CUSTOM_ENDPOINT_TRANSPORTS:
+        return raw_mode
+    return "auto"
+
+
+def _mirror_custom_endpoint_api_mode(
+    model_cfg: Dict[str, Any], entry: Dict[str, Any]
+) -> None:
+    """Keep the active model's runtime mode aligned with its provider entry."""
+    api_mode = _custom_endpoint_api_mode(entry)
+    if api_mode == "auto":
+        model_cfg.pop("api_mode", None)
+    else:
+        model_cfg["api_mode"] = api_mode
+
+
 def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     current_provider = str(model_cfg.get("provider", "") or "")
@@ -7304,6 +7332,7 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 "base_url": base_url,
                 "model": endpoint_model,
                 "models": models,
+                "api_mode": _custom_endpoint_api_mode(raw_entry),
                 "context_length": raw_entry.get("context_length"),
                 "discover_models": bool(raw_entry.get("discover_models", True)),
                 "has_api_key": has_api_key,
@@ -7320,6 +7349,7 @@ def _custom_endpoint_response(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "base_url": current_base_url,
             "model": current_model,
             "models": [current_model] if current_model else [],
+            "api_mode": _custom_endpoint_api_mode(model_cfg),
             "context_length": model_cfg.get("context_length"),
             "discover_models": True,
             "has_api_key": has_api_key,
@@ -7356,7 +7386,7 @@ def _detach_main_model_from_provider(cfg: Dict[str, Any], provider_key: str) -> 
         return
     if str(model_cfg.get("provider") or "").strip().lower() != provider_key:
         return
-    for field in ("provider", "base_url", "api_key", "key_env"):
+    for field in ("provider", "base_url", "api_key", "key_env", "api_mode"):
         model_cfg.pop(field, None)
     cfg["model"] = model_cfg
 
@@ -7398,6 +7428,17 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         "model": model,
         "discover_models": bool(body.discover_models),
     })
+    # ``providers`` is the v12 config shape, where ``transport`` is canonical.
+    # Keep ``api_mode`` as the Desktop API name because it matches the runtime
+    # vocabulary and the existing CLI prompt. An omitted field comes from an
+    # older client and preserves hand-written config; explicit Auto removes it.
+    if body.api_mode is not None:
+        transport = _CUSTOM_ENDPOINT_TRANSPORTS.get(body.api_mode)
+        if transport:
+            entry["transport"] = transport
+        else:
+            entry.pop("transport", None)
+        entry.pop("api_mode", None)
     # Same for the model map: merge rather than replace, so existing models
     # keep their context lengths. ``body.models`` is the catalogue the panel's
     # Test button already discovered — without it only the one hand-typed
@@ -7450,6 +7491,8 @@ def _write_custom_endpoint(cfg: Dict[str, Any], body: CustomEndpointUpdate) -> T
         if entry.get("key_env") and isinstance(cfg["model"], dict):
             cfg["model"]["key_env"] = entry["key_env"]
             cfg["model"].pop("api_key", None)
+        if isinstance(cfg["model"], dict):
+            _mirror_custom_endpoint_api_mode(cfg["model"], entry)
 
     return endpoint_id, entry
 
@@ -7505,6 +7548,7 @@ def activate_custom_endpoint(endpoint_id: str):
             model_cfg.pop("api_key", None)
         elif entry.get("api_key"):
             model_cfg["api_key"] = entry["api_key"]
+        _mirror_custom_endpoint_api_mode(model_cfg, entry)
         cfg["model"] = model_cfg
         save_config(cfg)
         return {"ok": True, "provider": provider_key, "model": model}
@@ -7541,21 +7585,58 @@ def delete_custom_endpoint(endpoint_id: str):
 
 @app.post("/api/providers/custom-endpoints/validate")
 async def validate_custom_endpoint(body: CustomEndpointUpdate):
-    """Probe a custom endpoint by calling its OpenAI-compatible /models URL."""
+    """Probe a custom endpoint using its selected API compatibility mode."""
     import httpx
 
     base_url = (body.base_url or "").strip().rstrip("/")
     if not base_url:
         return {"ok": False, "reachable": True, "message": "Enter an endpoint URL first.", "models": []}
 
-    url = base_url + "/models"
+    api_mode = body.api_mode or "auto"
+    if api_mode == "auto":
+        from hermes_cli.runtime_provider import _detect_api_mode_for_url
+
+        api_mode = _detect_api_mode_for_url(base_url) or "chat_completions"
+
     headers = {"Accept": "application/json"}
-    if body.api_key and body.api_key.strip():
-        headers["Authorization"] = f"Bearer {body.api_key.strip()}"
+    request_body: Optional[Dict[str, Any]] = None
+    if api_mode == "anthropic_messages":
+        # Match the Anthropic SDK used at runtime: it appends /v1/messages to
+        # the configured base URL. A user-entered trailing /v1 therefore fails
+        # this probe too instead of producing a false-positive Test result.
+        url = base_url + "/v1/messages"
+        headers.update({
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        })
+        if body.api_key and body.api_key.strip():
+            headers["x-api-key"] = body.api_key.strip()
+        request_body = {
+            "model": body.model.strip(),
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "."}],
+        }
+    elif api_mode == "codex_responses":
+        url = base_url + "/responses"
+        headers["Content-Type"] = "application/json"
+        if body.api_key and body.api_key.strip():
+            headers["Authorization"] = f"Bearer {body.api_key.strip()}"
+        request_body = {
+            "model": body.model.strip(),
+            "input": ".",
+            "max_output_tokens": 1,
+        }
+    else:
+        url = base_url + "/models"
+        if body.api_key and body.api_key.strip():
+            headers["Authorization"] = f"Bearer {body.api_key.strip()}"
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
-            resp = await client.get(url, headers=headers)
+            if request_body is None:
+                resp = await client.get(url, headers=headers)
+            else:
+                resp = await client.post(url, headers=headers, json=request_body)
     except Exception:
         return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
 
@@ -7564,7 +7645,8 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
     if not resp.is_success:
         return {"ok": False, "reachable": True, "message": f"Endpoint returned HTTP {resp.status_code}.", "models": []}
 
-    return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
+    models = _parse_model_ids(resp) if request_body is None else []
+    return {"ok": True, "reachable": True, "message": "", "models": models}
 
 
 @app.post("/api/providers/validate")

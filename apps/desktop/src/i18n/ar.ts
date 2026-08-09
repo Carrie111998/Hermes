@@ -305,6 +305,21 @@ export const ar = defineLocale({
       keybinds: 'اختصارات لوحة المفاتيح',
       plugins: 'الإضافات'
     },
+    customEndpoints: {
+      apiMode: 'وضع API',
+      modes: {
+        auto: 'اكتشاف تلقائي',
+        chatCompletions: 'Chat Completions',
+        responses: 'Responses / Codex',
+        anthropicMessages: 'Anthropic Messages'
+      },
+      descriptions: {
+        auto: 'دع Hermes يستنتج البروتوكول من عنوان URL لنقطة النهاية.',
+        chatCompletions: 'يستخدم /chat/completions؛ وينتهي عنوان نقطة النهاية عادةً بـ /v1.',
+        responses: 'يستخدم /responses؛ وينتهي عنوان نقطة النهاية عادةً بـ /v1. يرسل الاختبار طلباً من رمز واحد.',
+        anthropicMessages: 'يستخدم /v1/messages؛ أدخل جذر API من دون /v1 في النهاية. يرسل الاختبار طلباً من رمز واحد.'
+      }
+    },
     plugins: {
       title: 'إضافات سطح المكتب',
       blurb:

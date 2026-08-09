@@ -1553,6 +1553,7 @@ class TestWebServerEndpoints:
                 "base_url": "https://llm.acme.corp/v1",
                 "model": "acme/model-1",
                 "api_key": "sk-acme-secret",
+                "api_mode": "anthropic_messages",
             },
         )
         assert self.client.post(
@@ -1574,6 +1575,7 @@ class TestWebServerEndpoints:
         assert not model_cfg.get("api_key"), "deleted endpoint's key still in config.yaml"
         assert not model_cfg.get("key_env"), "deleted endpoint's key ref still in config.yaml"
         assert not model_cfg.get("base_url"), "deleted endpoint's host still routed to"
+        assert not model_cfg.get("api_mode"), "deleted endpoint's protocol still active"
         assert not model_cfg.get("provider")
         assert not get_env_value(env_var), "deleted endpoint's key still in .env"
 
@@ -1691,6 +1693,109 @@ class TestWebServerEndpoints:
         assert endpoint["has_api_key"] is True
         assert "sk-in-env" not in (endpoint["api_key_preview"] or "")
 
+    def test_custom_endpoint_api_mode_round_trips_and_becomes_the_active_transport(self):
+        """Desktop-selected protocol must reach both provider and active model config."""
+        from hermes_cli.config import load_config
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "claude-proxy",
+                "name": "Claude Proxy",
+                "base_url": "https://claude.example.com",
+                "model": "claude-opus-5",
+                "api_mode": "anthropic_messages",
+                "make_default": True,
+            },
+        )
+
+        assert response.status_code == 200
+        endpoint = next(
+            item
+            for item in response.json()["endpoints"]
+            if item["id"] == "claude-proxy"
+        )
+        assert endpoint["api_mode"] == "anthropic_messages"
+
+        cfg = load_config()
+        assert cfg["providers"]["claude-proxy"]["transport"] == "anthropic_messages"
+        assert "api_mode" not in cfg["providers"]["claude-proxy"]
+        assert cfg["model"]["api_mode"] == "anthropic_messages"
+
+        runtime = resolve_runtime_provider(requested="claude-proxy")
+        assert runtime["base_url"] == "https://claude.example.com"
+        assert runtime["api_mode"] == "anthropic_messages"
+
+    def test_custom_endpoint_auto_mode_clears_an_explicit_transport(self):
+        """Choosing Auto must remove an earlier explicit mode, including its model mirror."""
+        from hermes_cli.config import load_config
+
+        payload = {
+            "id": "claude-proxy",
+            "name": "Claude Proxy",
+            "base_url": "https://claude.example.com",
+            "model": "claude-opus-5",
+            "api_mode": "anthropic_messages",
+            "make_default": True,
+        }
+        assert self.client.post(
+            "/api/providers/custom-endpoints", json=payload
+        ).status_code == 200
+
+        payload["api_mode"] = "auto"
+        response = self.client.post("/api/providers/custom-endpoints", json=payload)
+
+        assert response.status_code == 200
+        cfg = load_config()
+        entry = cfg["providers"]["claude-proxy"]
+        assert "transport" not in entry
+        assert "api_mode" not in entry
+        assert "api_mode" not in cfg["model"]
+
+    def test_custom_endpoint_omitted_api_mode_preserves_hand_written_transport(self):
+        """Older clients editing another field must not erase a hand-written transport."""
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config()
+        cfg["providers"] = {
+            "claude-proxy": {
+                "name": "Claude Proxy",
+                "base_url": "https://claude.example.com",
+                "model": "claude-opus-5",
+                "transport": "anthropic_messages",
+            }
+        }
+        save_config(cfg)
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "id": "claude-proxy",
+                "name": "Renamed Claude Proxy",
+                "base_url": "https://claude.example.com",
+                "model": "claude-opus-5",
+            },
+        )
+
+        assert response.status_code == 200
+        assert load_config()["providers"]["claude-proxy"]["transport"] == (
+            "anthropic_messages"
+        )
+
+    def test_custom_endpoint_rejects_unknown_api_mode(self):
+        response = self.client.post(
+            "/api/providers/custom-endpoints",
+            json={
+                "name": "Broken",
+                "base_url": "https://example.com",
+                "model": "model-1",
+                "api_mode": "not-a-real-mode",
+            },
+        )
+
+        assert response.status_code == 422
+
     def test_activating_an_endpoint_carries_its_credential_either_way(self):
         """Activate must work for both key_env and pre-#69449 plaintext entries."""
         from hermes_cli.config import load_config, save_config
@@ -1702,6 +1807,7 @@ class TestWebServerEndpoints:
                 "base_url": "https://llm.legacy.com/v1",
                 "model": "m",
                 "api_key": "sk-legacy",
+                "api_mode": "codex_responses",
                 "models": {"m": {}},
             },
             "modern": {
@@ -1709,6 +1815,7 @@ class TestWebServerEndpoints:
                 "base_url": "https://llm.modern.com/v1",
                 "model": "m",
                 "key_env": "MODERN_API_KEY",
+                "transport": "anthropic_messages",
                 "models": {"m": {}},
             },
         }
@@ -1717,11 +1824,13 @@ class TestWebServerEndpoints:
         self.client.post("/api/providers/custom-endpoints/modern/activate", json={})
         model_cfg = load_config()["model"]
         assert model_cfg["key_env"] == "MODERN_API_KEY"
+        assert model_cfg["api_mode"] == "anthropic_messages"
         assert "api_key" not in model_cfg
 
         self.client.post("/api/providers/custom-endpoints/legacy/activate", json={})
         model_cfg = load_config()["model"]
         assert model_cfg["api_key"] == "sk-legacy"
+        assert model_cfg["api_mode"] == "codex_responses"
 
     def test_get_sessions_rejects_negative_limit(self):
         """limit=-1 must be rejected (422), not passed through to SQLite as
@@ -4194,6 +4303,67 @@ class TestValidateProviderCredential:
             "headers": {
                 "Accept": "application/json",
                 "Authorization": "Bearer local-secret",
+            },
+        }
+
+    def test_anthropic_custom_endpoint_probe_uses_messages_protocol(self, monkeypatch):
+        """The Desktop Test button must exercise the selected wire protocol."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            is_success = True
+
+        class _Client:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, url, *args, headers=None, json=None, **kwargs):
+                captured["url"] = url
+                captured["headers"] = headers
+                captured["json"] = json
+                return _Resp()
+
+            async def get(self, *args, **kwargs):
+                raise AssertionError("Anthropic validation fell back to /models")
+
+        monkeypatch.setattr("httpx.AsyncClient", _Client)
+
+        response = self.client.post(
+            "/api/providers/custom-endpoints/validate",
+            json={
+                "name": "Claude Proxy",
+                "base_url": "https://claude.example.com",
+                "model": "claude-opus-5",
+                "api_key": "sk-ant-secret",
+                "api_mode": "anthropic_messages",
+            },
+        )
+
+        assert response.json() == {
+            "ok": True,
+            "reachable": True,
+            "message": "",
+            "models": [],
+        }
+        assert captured == {
+            "url": "https://claude.example.com/v1/messages",
+            "headers": {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01",
+                "x-api-key": "sk-ant-secret",
+            },
+            "json": {
+                "model": "claude-opus-5",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "."}],
             },
         }
 

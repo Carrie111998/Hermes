@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   activateCustomEndpoint,
   deleteCustomEndpoint,
@@ -10,11 +11,12 @@ import {
   saveCustomEndpoint,
   validateCustomEndpoint
 } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { Check, Globe, Loader2, Plus, Save, Trash2, Zap } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import type { CustomEndpoint, CustomEndpointUpdate } from '@/types/hermes'
+import type { CustomEndpoint, CustomEndpointApiMode, CustomEndpointUpdate } from '@/types/hermes'
 
 import { EmptyState, Pill, SectionHeading, SettingsContent, SettingsSkeleton } from './primitives'
 
@@ -24,6 +26,7 @@ interface CustomEndpointsSettingsProps {
 }
 
 interface EndpointForm {
+  apiMode: CustomEndpointApiMode
   apiKey: string
   baseUrl: string
   contextLength: string
@@ -35,6 +38,7 @@ interface EndpointForm {
 }
 
 const EMPTY_FORM: EndpointForm = {
+  apiMode: 'auto',
   apiKey: '',
   baseUrl: '',
   contextLength: '',
@@ -47,6 +51,7 @@ const EMPTY_FORM: EndpointForm = {
 
 function formFromEndpoint(endpoint: CustomEndpoint): EndpointForm {
   return {
+    apiMode: endpoint.api_mode ?? 'auto',
     apiKey: '',
     baseUrl: endpoint.base_url,
     contextLength: endpoint.context_length ? String(endpoint.context_length) : '',
@@ -62,6 +67,7 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
   const contextLength = Number.parseInt(form.contextLength, 10)
 
   return {
+    api_mode: form.apiMode,
     id: form.id.trim() || undefined,
     name: form.name.trim(),
     base_url: form.baseUrl.trim(),
@@ -75,6 +81,8 @@ function toPayload(form: EndpointForm, models?: string[]): CustomEndpointUpdate 
 }
 
 export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: CustomEndpointsSettingsProps) {
+  const { t } = useI18n()
+  const messages = t.settings.customEndpoints
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
@@ -312,14 +320,39 @@ export function CustomEndpointsSettings({ onConfigSaved, onMainModelChanged }: C
                 />
               </label>
             </div>
-            <label className="grid gap-1.5 text-xs text-muted-foreground">
-              Endpoint URL
-              <Input
-                onChange={event => setForm(current => ({ ...current, baseUrl: event.target.value }))}
-                placeholder="http://127.0.0.1:8081/v1"
-                value={form.baseUrl}
-              />
-            </label>
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_15rem]">
+              <label className="grid gap-1.5 text-xs text-muted-foreground">
+                Endpoint URL
+                <Input
+                  onChange={event => setForm(current => ({ ...current, baseUrl: event.target.value }))}
+                  placeholder="http://127.0.0.1:8081/v1"
+                  value={form.baseUrl}
+                />
+              </label>
+              <label className="grid gap-1.5 text-xs text-muted-foreground">
+                {messages.apiMode}
+                <Select
+                  onValueChange={value => setForm(current => ({ ...current, apiMode: value as CustomEndpointApiMode }))}
+                  value={form.apiMode}
+                >
+                  <SelectTrigger aria-label={messages.apiMode}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="auto">{messages.modes.auto}</SelectItem>
+                    <SelectItem value="chat_completions">{messages.modes.chatCompletions}</SelectItem>
+                    <SelectItem value="codex_responses">{messages.modes.responses}</SelectItem>
+                    <SelectItem value="anthropic_messages">{messages.modes.anthropicMessages}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {form.apiMode === 'auto' && messages.descriptions.auto}
+              {form.apiMode === 'chat_completions' && messages.descriptions.chatCompletions}
+              {form.apiMode === 'codex_responses' && messages.descriptions.responses}
+              {form.apiMode === 'anthropic_messages' && messages.descriptions.anthropicMessages}
+            </p>
             <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]">
               <label className="grid gap-1.5 text-xs text-muted-foreground">
                 Default Model
