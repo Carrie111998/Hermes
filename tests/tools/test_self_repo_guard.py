@@ -54,8 +54,24 @@ class TestBlocksMutationsInSourceRepo:
         hit, _ = _detect("git checkout main", repo / "agent", repo)
         assert hit is True
 
-    def test_dash_c_targeting_repo_from_outside(self, repo, tmp_path):
-        hit, _ = _detect(f"git -C {repo} checkout pr-51020", tmp_path, repo)
+    @pytest.mark.parametrize("path_style", ["native", "git_bash"])
+    def test_dash_c_quoted_windows_targeting_repo_from_outside(
+        self, repo, tmp_path, path_style
+    ):
+        native = str(repo)
+        if path_style == "native":
+            target = native
+        else:
+            drive, tail = native.split(":", 1)
+            target = f"/{drive.lower()}{tail.replace(chr(92), '/') }"
+        hit, _ = _detect(f'git -C "{target}" checkout pr-51020', tmp_path, repo)
+        assert hit is True
+
+    def test_rejects_chained_explicit_targets(self, repo, tmp_path):
+        other = tmp_path / "other-project"
+        other.mkdir()
+        command = f'git -C "{repo}" -C "{other}" checkout pr-51020'
+        hit, _ = _detect(command, tmp_path, repo)
         assert hit is True
 
     def test_cd_into_repo_then_checkout(self, repo, tmp_path):

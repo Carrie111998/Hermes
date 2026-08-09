@@ -150,7 +150,11 @@ def get_running_source_root() -> Path | None:
 
 
 def _resolve(path_str: str, base: Path) -> Path:
-    path = Path(os.path.expanduser(path_str))
+    expanded = os.path.expanduser(path_str)
+    git_bash_drive = re.fullmatch(r"/([A-Za-z])/(.*)", expanded)
+    if git_bash_drive:
+        expanded = f"{git_bash_drive.group(1)}:/{git_bash_drive.group(2)}"
+    path = Path(expanded)
     if not path.is_absolute():
         path = base / path
     try:
@@ -170,16 +174,36 @@ def _executable_name(value: str) -> str:
     return Path(value.replace("\\", "/")).name.removesuffix(".exe").lower()
 
 
+def _git_path_word(raw_word: str) -> str:
+    """Keep native Windows separators in explicit Git path operands.
+
+    The shared shell deobfuscator treats every backslash as a shell escape.
+    That is correct for generic command words but corrupts a native Windows
+    path such as ``D:\\Temp\\hermes`` before Git target resolution sees it.
+    """
+    if len(raw_word) >= 2 and raw_word[0] == raw_word[-1] == '"':
+        return raw_word[1:-1]
+    return raw_word
+
+
 def _shell_words_at(command: str, start: int) -> list[str]:
     words: list[str] = []
     cursor = start
+    preserve_next_git_path = False
     for _ in range(64):
         word_start, word_end, raw_word = _read_shell_word(command, cursor)
         if word_start == word_end:
             break
         if words and "\n" in command[cursor:word_start]:
             break
-        words.append(_deobfuscate_shell_word_for_detection(raw_word))
+        if preserve_next_git_path:
+            word = _git_path_word(raw_word)
+            preserve_next_git_path = False
+        else:
+            word = _deobfuscate_shell_word_for_detection(raw_word)
+        words.append(word)
+        if word in {"-C", "--git-dir", "--work-tree"}:
+            preserve_next_git_path = True
         cursor = word_end
     return words
 
@@ -457,10 +481,12 @@ def _git_target_and_subcommand(
     args: list[str],
     current_dir: Path,
     env: dict[str, str],
-) -> tuple[Path, str | None, list[str], dict[str, str]]:
+) -> tuple[Path, str | None, list[str], dict[str, str], bool]:
     target = current_dir
     work_tree: str | None = None
     aliases: dict[str, str] = {}
+    ambiguous_target = False
+    target_option_seen = False
     index = 0
 
     while index < len(args):
@@ -469,10 +495,14 @@ def _git_target_and_subcommand(
             index += 1
             break
         if arg == "-C" and index + 1 < len(args):
+            ambiguous_target = ambiguous_target or target_option_seen
+            target_option_seen = True
             target = _resolve(args[index + 1], target)
             index += 2
             continue
         if arg.startswith("-C") and len(arg) > 2:
+            ambiguous_target = ambiguous_target or target_option_seen
+            target_option_seen = True
             target = _resolve(arg[2:], target)
             index += 1
             continue
@@ -506,7 +536,7 @@ def _git_target_and_subcommand(
     if explicit_work_tree:
         target = _resolve(explicit_work_tree, target)
     subcommand = args[index].lower() if index < len(args) else None
-    return target, subcommand, args[index + 1 :], aliases
+    return target, subcommand, args[index + 1 :], aliases, ambiguous_target
 
 
 def _mutates_worktree(subcommand: str, args: list[str]) -> bool:
@@ -587,7 +617,7 @@ def _inspect_git(
     root: Path,
     depth: int,
 ) -> str | None:
-    target, subcommand, sub_args, inline_aliases = _git_target_and_subcommand(
+    target, subcommand, sub_args, inline_aliases, ambiguous_target = _git_target_and_subcommand(
         args, current_dir, env
     )
     if subcommand is None:
@@ -595,6 +625,8 @@ def _inspect_git(
     # `worktree` names its victim as an argument, so the cwd check does not apply.
     if subcommand == "worktree":
         return _inspect_git_worktree(sub_args, target, root)
+    if ambiguous_target:
+        return f"git {subcommand}"
     if not _is_within(target, root):
         return None
     if _mutates_worktree(subcommand, sub_args):
