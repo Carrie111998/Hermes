@@ -135,6 +135,10 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# The env var name used for the write-only subprocess stamp (see
+# tools/environments/local.py). Never read back as configuration.
+DESKTOP_CONNECTION_MODE_ENV = "HERMES_DESKTOP_CONNECTION_MODE"
+
 # The resolved Desktop connection mode for this turn: 'local' when the Desktop
 # app drives its own local backend, 'remote' when it drives an SSH/URL/cloud
 # backend on another machine. ``None`` for every non-Desktop surface (CLI, TUI,
@@ -152,10 +156,7 @@ _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_
 # ``tools/environments/local.py`` stamps it onto child environments write-only
 # (always overwritten, stripped when unset) so skills and their helper scripts
 # can branch on it without it ever becoming an input.
-_DESKTOP_CONNECTION_MODE: ContextVar = ContextVar("HERMES_DESKTOP_CONNECTION_MODE", default=_UNSET)
-
-# The env var name used for the write-only subprocess stamp. Not read anywhere.
-DESKTOP_CONNECTION_MODE_ENV = "HERMES_DESKTOP_CONNECTION_MODE"
+_DESKTOP_CONNECTION_MODE: ContextVar = ContextVar(DESKTOP_CONNECTION_MODE_ENV, default=_UNSET)
 
 # Saved-config connection modes that resolve to a backend on another machine.
 # The Desktop descriptor already collapses these to 'remote', but the RPC edge

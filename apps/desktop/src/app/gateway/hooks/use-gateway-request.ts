@@ -113,13 +113,14 @@ export function useGatewayRequest() {
       }
 
       // Announce the live connection mode on session/prompt RPCs (#82140).
-      // Read here, per request, so a connection or profile switch reaches the
-      // backend on the very next turn — $connection is kept in lockstep with
-      // the active profile by syncConnectionToActiveProfile.
-      const params = withConnectionMode(method, rawParams, resolveConnectionMode($connection.get()))
+      // Resolved per attempt, not per call: $connection is kept in lockstep
+      // with the active profile by syncConnectionToActiveProfile and is
+      // rewritten by the reconnect below, so re-reading on the retry sends the
+      // mode of the connection the retry actually lands on.
+      const announce = () => withConnectionMode(method, rawParams, resolveConnectionMode($connection.get()))
 
       try {
-        return await gateway.request<T>(method, params, timeoutMs, signal)
+        return await gateway.request<T>(method, announce(), timeoutMs, signal)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
@@ -145,7 +146,7 @@ export function useGatewayRequest() {
           throw error
         }
 
-        return recovered.request<T>(method, params, timeoutMs, signal)
+        return recovered.request<T>(method, announce(), timeoutMs, signal)
       }
     },
     [ensureGatewayOpen]
