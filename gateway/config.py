@@ -191,9 +191,15 @@ def coerce_systemd_watchdog_seconds(
     return parsed
 
 
-# systemd accepts a plain byte count, a K/M/G/T/P/E suffixed size, a
-# percentage of physical memory, or the literal ``infinity``.
-_SYSTEMD_MEMORY_LIMIT_RE = re.compile(r"(?:[1-9]\d*[KMGTPE]?|100%|[1-9]\d?%|infinity)\Z")
+# systemd's size grammar: a byte count with an optional fractional part and an
+# optional K/M/G/T/P/E suffix, or a whitespace-separated sum of those. Only
+# spaces and tabs join the parts -- a newline would open a second directive.
+_SYSTEMD_SIZE = r"\d+(?:\.\d+)?[KMGTPE]?"
+# A limit is one of those sizes, a percentage of physical memory, or the
+# literal ``infinity``.
+_SYSTEMD_MEMORY_LIMIT_RE = re.compile(
+    rf"(?:(?P<size>{_SYSTEMD_SIZE}(?:[ \t]+{_SYSTEMD_SIZE})*)|100%|[1-9]\d?%|infinity)\Z"
+)
 
 
 def coerce_systemd_memory_limit(
@@ -224,13 +230,19 @@ def coerce_systemd_memory_limit(
     raw = value.strip()
     if not raw:
         return ""
-    if not raw.isascii() or not _SYSTEMD_MEMORY_LIMIT_RE.match(raw):
+    match = _SYSTEMD_MEMORY_LIMIT_RE.match(raw) if raw.isascii() else None
+    if match is None:
         logger.warning(
             "Ignoring invalid %s=%r (expected a systemd memory size such as "
-            "8G, 6144M, a byte count, a percentage, or infinity)",
+            "8G, 6144M, 1.5G, 1G 500M, a byte count, a percentage, or infinity)",
             key,
             value,
         )
+        return ""
+    if match.group("size") and not any(
+        float(part.rstrip("KMGTPE")) for part in raw.split()
+    ):
+        logger.warning("Ignoring invalid %s=%r (expected a positive size)", key, value)
         return ""
     return raw
 

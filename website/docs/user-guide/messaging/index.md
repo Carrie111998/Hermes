@@ -203,9 +203,11 @@ Regenerate the service unit after changing this setting:
 hermes gateway install --force
 ```
 
-Both accept any size systemd understands (`8G`, `6144M`, a plain byte count, a
-percentage, or `infinity`); an unrecognized value is ignored and leaves the
-unit unlimited. Setting these in config rather than editing the unit by hand
+Both accept any size systemd understands: a byte count with an optional
+fractional part and an optional `K`/`M`/`G`/`T`/`P`/`E` suffix (`8G`, `6144M`,
+`1.5G`, `2147483648`), a whitespace-separated sum of those (`1G 500M`), a
+percentage of physical memory, or `infinity`. A value outside that grammar —
+or one that adds up to zero — is ignored and leaves the unit unlimited. Setting these in config rather than editing the unit by hand
 matters because Hermes rewrites its own unit file whenever the install drifts,
 which would otherwise wipe a hand-added `MemoryMax=`.
 

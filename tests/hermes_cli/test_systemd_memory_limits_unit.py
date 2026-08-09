@@ -26,7 +26,19 @@ def _unit_with(monkeypatch, data: dict) -> str:
 
 class TestLimitCoercion:
     @pytest.mark.parametrize(
-        "value", ["8G", "6144M", "2147483648", "80%", "infinity", " 8G "]
+        "value",
+        [
+            "8G",
+            "6144M",
+            "2147483648",
+            "80%",
+            "infinity",
+            " 8G ",
+            "1.5G",
+            "0.5G",
+            "1G 500M",
+            "1G\t500M",
+        ],
     )
     def test_supported_systemd_sizes_are_kept(self, value):
         assert coerce_systemd_memory_limit(value) == value.strip()
@@ -42,8 +54,14 @@ class TestLimitCoercion:
             "8 GB",
             "eight",
             "8G\nExecStartPre=/bin/rm -rf /",
+            "1G\n500M",
             "-8G",
             "8Z",
+            "1.5.5G",
+            "1,5G",
+            "0",
+            "0G",
+            "0.0G",
         ],
     )
     def test_unusable_values_resolve_to_absent(self, value):
