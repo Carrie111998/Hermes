@@ -2088,6 +2088,8 @@ class SlackAdapter(BasePlatformAdapter):
                 "hermes_approve_session",
                 "hermes_approve_always",
                 "hermes_deny",
+                "hermes_action_approve",
+                "hermes_action_decline",
             ):
                 self._app.action(_action_id)(self._handle_approval_action)
 
@@ -6366,6 +6368,96 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Approval button support (Block Kit) -----
 
+    async def send_action_approval(
+        self,
+        chat_id: str,
+        session_key: str,
+        approval_id: str,
+        title: str,
+        summary: str,
+        facts: Optional[list[str]] = None,
+        approve_label: str = "Approve",
+        decline_label: str = "Decline",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a domain-worded, one-shot action approval prompt.
+
+        Unlike command approval this surface never offers session or permanent
+        grants.  The waiting caller receives click-time identity only after the
+        normal Slack interactive-user authorization check succeeds.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        chat_id = await self._ensure_dm_conversation(
+            chat_id, team_id=self._metadata_team_id(metadata)
+        )
+        try:
+            thread_ts = self._resolve_thread_ts(None, metadata)
+            title = (title or "Approve action")[:150]
+            summary = summary or "Review this action."
+            fact_lines = [f"• {item}" for item in (facts or []) if isinstance(item, str)]
+            body = summary
+            if fact_lines:
+                body += "\n" + "\n".join(fact_lines)
+            rendered = f"*{title}*\n\n{body}"
+            if len(rendered) > 3000:
+                return SendResult(success=False, error="Action approval prompt exceeds Slack limit")
+            decision_value = json.dumps(
+                {"session_key": session_key, "approval_id": approval_id},
+                separators=(",", ":"),
+            )
+
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": rendered},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": (approve_label or "Approve")[:75]},
+                            "style": "primary",
+                            "action_id": "hermes_action_approve",
+                            "value": decision_value,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": (decline_label or "Decline")[:75]},
+                            "style": "danger",
+                            "action_id": "hermes_action_decline",
+                            "value": decision_value,
+                        },
+                    ],
+                },
+            ]
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": f"Action approval required: {title}",
+                "blocks": sanitize_blocks(blocks),
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(
+                chat_id, team_id=self._metadata_team_id(metadata)
+            ).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+            if msg_ts:
+                team_id = self._metadata_team_id(metadata)
+                self._approval_resolved[
+                    self._workspace_message_marker(team_id, msg_ts)
+                ] = False
+                self._trim_oldest_dict_entries(
+                    self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+            return SendResult(success=True, message_id=msg_ts, raw_response=result)
+        except Exception as exc:
+            logger.error("[Slack] send_action_approval failed: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
     async def send_exec_approval(
         self,
         chat_id: str,
@@ -6873,6 +6965,17 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         session_key = action.get("value", "")
+        approval_id = ""
+        if action_id in {"hermes_action_approve", "hermes_action_decline"}:
+            try:
+                decision_value = json.loads(session_key)
+                session_key = str(decision_value["session_key"])
+                approval_id = str(decision_value["approval_id"])
+                if not session_key or not approval_id:
+                    raise ValueError("empty action approval binding")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("[Slack] Malformed action approval binding — ignoring")
+                return
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -6911,6 +7014,8 @@ class SlackAdapter(BasePlatformAdapter):
             "hermes_approve_session": "session",
             "hermes_approve_always": "always",
             "hermes_deny": "deny",
+            "hermes_action_approve": "once",
+            "hermes_action_decline": "deny",
         }
         choice = choice_map.get(action_id, "deny")
 
@@ -6931,7 +7036,17 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                decision_context={
+                    "platform": "slack",
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "observed_at": int(time.time()),
+                },
+                approval_id=approval_id or None,
+            )
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count,
@@ -6952,6 +7067,10 @@ class SlackAdapter(BasePlatformAdapter):
             "always": f"✅ Approved permanently by {user_name}",
             "deny": f"❌ Denied by {user_name}",
         }
+        if action_id == "hermes_action_approve":
+            label_map["once"] = f"✅ Approved by {user_name}"
+        elif action_id == "hermes_action_decline":
+            label_map["deny"] = f"❌ Declined by {user_name}"
         decision_text = label_map.get(choice, f"Resolved by {user_name}")
         if not count:
             decision_text = (

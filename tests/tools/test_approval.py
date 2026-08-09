@@ -21,6 +21,7 @@ from tools.approval import (
     is_approved,
     load_permanent,
     prompt_dangerous_approval,
+    request_action_approval,
 )
 
 
@@ -39,6 +40,90 @@ class TestApprovalModeParsing:
     def test_config_bool_false_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config_readonly", return_value={"approvals": {"mode": False}}):
             assert _get_approval_mode() == "off"
+
+
+class TestOneShotActionApproval:
+    def test_exact_action_id_resolves_only_its_own_pending_entry(self):
+        session_key = "concurrent-action-approval"
+        first = approval_module._ApprovalEntry({"approval_id": "first"})
+        second = approval_module._ApprovalEntry({"approval_id": "second"})
+        approval_module._gateway_queues[session_key] = [first, second]
+        try:
+            assert approval_module.resolve_gateway_approval(
+                session_key, "once", approval_id="second",
+            ) == 1
+            assert second.event.is_set()
+            assert second.result == "once"
+            assert not first.event.is_set()
+            assert approval_module._gateway_queues[session_key] == [first]
+        finally:
+            approval_module._gateway_queues.pop(session_key, None)
+
+    def test_gateway_returns_authenticated_click_context_without_persistence(self, monkeypatch):
+        session_key = "test-action-approval"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", session_key)
+        approval_module._gateway_queues.clear()
+        approval_module._gateway_notify_cbs.clear()
+        approval_module._session_approved.clear()
+        approval_module._permanent_approved.clear()
+
+        observed = []
+
+        def notify(data):
+            observed.append(data)
+            approval_module.resolve_gateway_approval(
+                session_key,
+                "once",
+                decision_context={
+                    "platform": "slack",
+                    "user_id": "U_OPERATOR",
+                    "channel_id": "C_CITY",
+                    "observed_at": 123,
+                },
+            )
+
+        approval_module.register_gateway_notify(session_key, notify)
+        try:
+            result = request_action_approval(
+                title="Grant access",
+                summary="Grant the exact resolved role.",
+                facts=["Account: person@example.com", "Role: producer"],
+                approve_label="Approve & run",
+                decline_label="Decline",
+                surface="test-action",
+            )
+        finally:
+            approval_module.unregister_gateway_notify(session_key)
+
+        assert result == {
+            "decision": "approve",
+            "context": {
+                "platform": "slack",
+                "user_id": "U_OPERATOR",
+                "channel_id": "C_CITY",
+                "observed_at": 123,
+            },
+        }
+        assert observed[0]["approval_kind"] == "action"
+        assert observed[0]["allow_session"] is False
+        assert observed[0]["allow_permanent"] is False
+        assert observed[0]["approve_label"] == "Approve & run"
+        assert observed[0]["decline_label"] == "Decline"
+        assert not approval_module._session_approved
+        assert not approval_module._permanent_approved
+
+    def test_gateway_without_notify_callback_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", "missing-action-notify")
+        approval_module._gateway_notify_cbs.clear()
+
+        assert request_action_approval("Grant access", "Exact plan") == {
+            "decision": "decline",
+            "context": None,
+        }
 
 
 class TestSmartApproval:

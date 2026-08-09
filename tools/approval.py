@@ -16,6 +16,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2442,7 +2443,7 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "decision_context", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
@@ -2452,6 +2453,12 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # Adapter-owned metadata captured at decision time (for example the
+        # authenticated Slack clicker and channel).  Callers may use it to
+        # re-establish authority after a human wait without trusting model
+        # arguments or stale turn context.
+        self.decision_context: Optional[dict] = None
+        self.approval_id = str(data.get("approval_id") or "")
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2485,7 +2492,9 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             decision_context: Optional[dict] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2497,6 +2506,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
+    *decision_context* is trusted metadata supplied by the gateway adapter
+    after it authenticates the decision.  It is returned only to the waiting
+    in-process caller and is never accepted from tool/model arguments.
+
+    *approval_id* targets one exact pending entry. Interactive action cards use
+    it so concurrent approvals in one session cannot resolve each other. Legacy
+    command approvals omit it and retain FIFO behavior.
+
     Returns the number of approvals resolved (0 means nothing was pending).
     """
     with _lock:
@@ -2506,6 +2523,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if resolve_all:
             targets = list(queue)
             queue.clear()
+        elif approval_id:
+            target_index = next(
+                (index for index, entry in enumerate(queue) if entry.approval_id == approval_id),
+                None,
+            )
+            if target_index is None:
+                return 0
+            targets = [queue.pop(target_index)]
         else:
             targets = [queue.pop(0)]
         if not queue:
@@ -2515,6 +2540,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         if reason:
             entry.reason = reason
+        if decision_context:
+            entry.decision_context = dict(decision_context)
         entry.event.set()
     return len(targets)
 
@@ -3728,7 +3755,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        "context": entry.decision_context,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -4459,8 +4491,119 @@ def check_execute_code_guard(code: str, env_type: str,
 
 
 # =========================================================================
-# MCP elicitation entry point
+# One-shot action approval and MCP elicitation entry points
 # =========================================================================
+
+def request_action_approval(
+    title: str,
+    summary: str,
+    *,
+    facts: Optional[list[str]] = None,
+    approve_label: str = "Approve",
+    decline_label: str = "Decline",
+    timeout_seconds: int | None = None,
+    surface: str = "action-approval",
+) -> dict:
+    """Request one exact, non-persistent human decision.
+
+    This is a native extension point for trusted plugins that already own an
+    action plan.  It does not register a model-visible tool and it never offers
+    session or permanent approval.  Gateway adapters may return authenticated
+    click metadata in ``context`` so the plugin can re-establish authority at
+    decision time.
+
+    Returns ``{"decision": "approve"|"decline"|"timeout", "context": ...}``.
+    Missing gateway state, delivery errors, malformed prompts, and exceptions
+    fail closed.
+    """
+    try:
+        clean_title = str(title or "").strip()
+        clean_summary = str(summary or "").strip()
+        clean_facts = list(facts or [])
+        clean_approve = str(approve_label or "").strip()
+        clean_decline = str(decline_label or "").strip()
+        if not clean_title or len(clean_title) > 150:
+            raise ValueError("action approval title must be 1-150 characters")
+        if not clean_summary or len(clean_summary) > 2000:
+            raise ValueError("action approval summary must be 1-2000 characters")
+        if len(clean_facts) > 20 or any(
+            not isinstance(item, str) or not item.strip() or len(item) > 500
+            for item in clean_facts
+        ):
+            raise ValueError("action approval facts are invalid")
+        if not clean_approve or len(clean_approve) > 75:
+            raise ValueError("action approval approve label is invalid")
+        if not clean_decline or len(clean_decline) > 75:
+            raise ValueError("action approval decline label is invalid")
+        clean_facts = [item.strip() for item in clean_facts]
+        session_key = get_current_session_key()
+    except Exception as exc:
+        logger.warning("Action approval prompt rejected: %s", exc)
+        return {"decision": "decline", "context": None}
+
+    display = clean_summary
+    if clean_facts:
+        display += "\n" + "\n".join(f"• {item}" for item in clean_facts)
+    if len(f"*{clean_title}*\n\n{display}") > 2800:
+        logger.warning("Action approval prompt rejected: rendered prompt is too long")
+        return {"decision": "decline", "context": None}
+
+    if _is_gateway_approval_context():
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+        if notify_cb is None:
+            logger.warning(
+                "Action approval requested in gateway session %s without a notify callback",
+                session_key,
+            )
+            return {"decision": "decline", "context": None}
+        approval_data = {
+            "approval_kind": "action",
+            "approval_id": secrets.token_urlsafe(24),
+            "command": display,
+            "description": clean_title,
+            "pattern_key": "one_shot_action",
+            "pattern_keys": ["one_shot_action"],
+            "action_title": clean_title,
+            "action_summary": clean_summary,
+            "action_facts": clean_facts,
+            "approve_label": clean_approve,
+            "decline_label": clean_decline,
+            "allow_permanent": False,
+            "allow_session": False,
+        }
+        try:
+            decision = _await_gateway_decision(
+                session_key, notify_cb, approval_data, surface=surface,
+            )
+        except Exception as exc:
+            logger.error("Action approval gateway dispatch failed: %s", exc, exc_info=True)
+            return {"decision": "decline", "context": None}
+        if decision.get("notify_failed"):
+            return {"decision": "decline", "context": None}
+        if not decision.get("resolved"):
+            return {"decision": "timeout", "context": None}
+        return {
+            "decision": "approve" if decision.get("choice") == "once" else "decline",
+            "context": decision.get("context"),
+        }
+
+    try:
+        choice = prompt_dangerous_approval(
+            display,
+            clean_title,
+            timeout_seconds=timeout_seconds,
+            allow_permanent=False,
+        )
+    except Exception as exc:
+        logger.error("Action approval CLI prompt failed: %s", exc, exc_info=True)
+        return {"decision": "decline", "context": None}
+    if choice == "timeout":
+        return {"decision": "timeout", "context": None}
+    return {
+        "decision": "approve" if choice in ("once", "session", "always") else "decline",
+        "context": None,
+    }
 
 def request_elicitation_consent(
     message: str,
