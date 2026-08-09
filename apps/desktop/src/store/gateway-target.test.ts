@@ -102,6 +102,20 @@ describe('gateway target-aware registry behavior', () => {
     expect(constructedGateways).toHaveLength(0)
   })
 
+  it('derives explicit retention keys for primary default-root events', async () => {
+    const gateway = await import('./gateway')
+
+    gateway.setPrimaryGateway(null, 'default')
+    gateway.setPrimaryBackendMode('local')
+    expect(gateway.primaryGatewayRetentionKey('default')).toBe('__local__:default')
+
+    gateway.setPrimaryBackendMode('remote')
+    expect(gateway.primaryGatewayRetentionKey('default')).toBe('__remote__:default')
+
+    gateway.setPrimaryGateway(null, 'writer')
+    expect(gateway.primaryGatewayRetentionKey('writer')).toBe('writer')
+  })
+
   it('recreates an active remote-root secondary with remoteOnly when the cached entry is gone', async () => {
     const gateway = await import('./gateway')
     const primary = new FakeHermesGateway()

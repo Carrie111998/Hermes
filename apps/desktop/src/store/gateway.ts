@@ -245,6 +245,20 @@ export function sessionGatewayRetentionKey(profile: null | string | undefined, s
   return storedSessionId?.trim() ? (g.storedTargetKeys.get(storedSessionId.trim()) ?? key) : key
 }
 
+export function primaryGatewayRetentionKey(profile: null | string | undefined): string {
+  const key = normKey(profile)
+
+  if (key !== g.primaryProfile) {
+    return key
+  }
+
+  if (key !== 'default') {
+    return key
+  }
+
+  return g.primaryBackendMode === 'remote' ? `${REMOTE_TARGET_PREFIX}${key}` : `${LOCAL_TARGET_PREFIX}${key}`
+}
+
 export function isActivePrimary(): boolean {
   return g.activeKey === g.primaryProfile
 }
