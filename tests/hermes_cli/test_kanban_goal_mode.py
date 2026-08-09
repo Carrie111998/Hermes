@@ -201,6 +201,24 @@ def test_workspace_git_head_none_for_missing_dir(tmp_path):
     assert cli._kanban_workspace_git_head(str(tmp_path / "does_not_exist")) is None
 
 
+def test_goal_max_turns_ceiling_leaves_room_for_extension_above_configured_budget():
+    """A card whose goal_max_turns already meets or exceeds the default
+    ceiling must still get at least one extension's worth of headroom,
+    or the extension mechanism is a no-op for it (#81990 review: a card
+    budgeted at exactly the 200-turn default ceiling was blocked before
+    the progress signals ever ran)."""
+    from hermes_cli.goals import DEFAULT_GOAL_EXTENSION_TURNS, DEFAULT_GOAL_MAX_TURNS_CEILING
+
+    assert cli._kanban_goal_max_turns_ceiling(DEFAULT_GOAL_MAX_TURNS_CEILING) == (
+        DEFAULT_GOAL_MAX_TURNS_CEILING + DEFAULT_GOAL_EXTENSION_TURNS
+    )
+    assert cli._kanban_goal_max_turns_ceiling(DEFAULT_GOAL_MAX_TURNS_CEILING + 50) == (
+        DEFAULT_GOAL_MAX_TURNS_CEILING + 50 + DEFAULT_GOAL_EXTENSION_TURNS
+    )
+    # Small configured budgets keep the default ceiling unchanged.
+    assert cli._kanban_goal_max_turns_ceiling(20) == DEFAULT_GOAL_MAX_TURNS_CEILING
+
+
 def test_loop_extends_budget_when_progress_detected(monkeypatch):
     """A worker that hits its turn budget but is showing observable
     progress gets a bounded extension instead of an immediate block, but

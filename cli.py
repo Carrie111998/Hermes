@@ -18067,6 +18067,22 @@ def _kanban_workspace_git_head(path: str) -> "str | None":
     return result.stdout.strip() or None
 
 
+def _kanban_goal_max_turns_ceiling(max_turns: int) -> int:
+    """Absolute turn ceiling for a goal loop's budget extension.
+
+    Must leave room for at least one extension above whatever budget the
+    card was configured with — otherwise a card whose ``goal_max_turns``
+    already meets or exceeds ``DEFAULT_GOAL_MAX_TURNS_CEILING`` (200 is a
+    common explicit ``--goal-max-turns`` value; see #81990) would never
+    benefit from the extension mechanism at all, since the gate in
+    ``run_kanban_goal_loop`` skips straight to blocking once the starting
+    budget already meets the ceiling.
+    """
+    from hermes_cli.goals import DEFAULT_GOAL_EXTENSION_TURNS, DEFAULT_GOAL_MAX_TURNS_CEILING
+
+    return max(DEFAULT_GOAL_MAX_TURNS_CEILING, int(max_turns) + DEFAULT_GOAL_EXTENSION_TURNS)
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -18192,6 +18208,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         first_response=first_response or "",
         log=lambda m: logger.info("%s", m),
         progress_check_fn=_progress_check,
+        max_turns_ceiling=_kanban_goal_max_turns_ceiling(max_turns),
     )
 
 
