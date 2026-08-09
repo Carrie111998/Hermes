@@ -33,7 +33,6 @@ import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import {
-  shouldHoldBackendQuit,
   stopBackendChild as stopBackendChildImpl,
   stopBackendTreesForUpdate,
   waitForBackendExit as waitForBackendExitImpl
@@ -167,7 +166,13 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import {
+  type ActiveWork,
+  createQuitTeardownBarrier,
+  mergeActiveWork,
+  normalizeActiveWork,
+  quitPromptFor
+} from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -2651,8 +2656,7 @@ let isQuittingForHandoff = false
 // (the app.quit() that follows re-enters before-quit and must pass through).
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
-let backendQuitTeardownPromise: Promise<void> | null = null
-let backendQuitTeardownDone = false
+const quitTeardown = createQuitTeardownBarrier()
 
 // Resolve the staged updater binary the desktop may hand an update to. On
 // Windows that binary owns ALL repo mutation — running `hermes update` +
@@ -7353,8 +7357,6 @@ const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PA
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
 
-let sshQuitTeardownDone = false
-
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
 }
@@ -8077,6 +8079,10 @@ function profileRouteOptions(profile) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
+  if (quitTeardown.started) {
+    throw new Error('Hermes Desktop is quitting.')
+  }
+
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
@@ -8250,6 +8256,10 @@ async function spawnPoolBackend(profile, entry) {
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
+  if (quitTeardown.started || backendPool.get(profile) !== entry) {
+    throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
+  }
+
   const child = spawn(
     backend.command,
     backend.args,
@@ -8415,6 +8425,10 @@ async function prepareProfileDeleteRequest(request) {
 }
 
 async function startHermes() {
+  if (quitTeardown.started) {
+    throw new Error('Hermes Desktop is quitting.')
+  }
+
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -8538,6 +8552,10 @@ async function startHermes() {
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
+    if (quitTeardown.started) {
+      throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
+    }
+
     const hermesProcess = spawn(
       backend.command,
       backend.args,
@@ -8572,6 +8590,7 @@ async function startHermes() {
 
     if (!processOwner) {
       stopBackendChild(hermesProcess)
+      await waitForBackendExit(hermesProcess)
       throw new Error('Hermes backend start was superseded by a newer connection attempt.')
     }
 
@@ -12480,49 +12499,68 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
 }
 
 app.on('before-quit', event => {
-  // Runs ahead of every teardown below, so "Keep Running" leaves the app
-  // exactly as it was.
+  // A retry from one teardown branch must not bypass another branch whose
+  // registry was already cleared while physical cleanup is still pending.
+  if (quitTeardown.pending) {
+    event.preventDefault()
+
+    return
+  }
+
+  // Runs ahead of the first teardown so "Keep Running" leaves the app exactly
+  // as it was. Once teardown starts, quitConfirmedWithActiveWork is the
+  // authorization latch for the one internal retry.
   if (heldQuitForActiveWork(event)) {
     return
   }
 
+  const primaryStart = backendConnectionState.getPromise()
+  const poolEntries = [...backendPool.values()]
+
   const backendProcesses = [
     backendConnectionState.getProcess(),
-    ...[...backendPool.values()].map(entry => entry.process)
+    ...poolEntries.map(entry => entry.process)
   ].filter(child => child && child.exitCode === null && child.signalCode === null)
 
+  const backendStarts = [primaryStart, ...poolEntries.map(entry => entry.connectionPromise)].filter(Boolean)
+  const sshScopes = [...sshConnections.keys()]
+  const sshBootstraps = sshBootstrapCoordinator.promises()
+
   if (
-    shouldHoldBackendQuit(backendQuitTeardownDone, backendProcesses.length, backendQuitTeardownPromise !== null)
+    !quitTeardown.done &&
+    (backendProcesses.length > 0 || backendStarts.length > 0 || sshScopes.length > 0 || sshBootstraps.length > 0)
   ) {
     event.preventDefault()
+    quitConfirmedWithActiveWork = true
 
-    if (!backendQuitTeardownPromise) {
-      for (const child of backendProcesses) {
-        stopBackendChild(child)
-      }
-
-      backendQuitTeardownPromise = Promise.all(backendProcesses.map(child => waitForBackendExit(child))).then(() => {
-        backendQuitTeardownDone = true
-        app.quit()
-      })
-    }
-  }
-
-  if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
-    event.preventDefault()
+    // Fence starts before the event loop can resume. Pending primary attempts
+    // lose attachProcess(), while pending pool attempts lose their entry check.
+    backendConnectionState.invalidate()
+    backendPool.clear()
     sshBootstrapCoordinator.cancelAll()
-    const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
+    void quitTeardown
+      .start(async () => {
+        for (const child of backendProcesses) {
+          stopBackendChild(child)
+        }
 
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
-      sshQuitTeardownDone = true
-      app.quit()
-    })
+        const sshTeardown = (async () => {
+          if (sshScopes.length === 0 && sshBootstraps.length === 0) {
+            return
+          }
+
+          const established = sshScopes.map(scope => teardownSshConnection(scope || null))
+          const pending = Promise.allSettled([...established, ...sshBootstraps])
+
+          await Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))])
+          await sshBootstrapCoordinator.forceCleanupAll()
+          await Promise.allSettled(established)
+        })()
+
+        await Promise.all([...backendProcesses.map(child => waitForBackendExit(child)), sshTeardown])
+      }, () => app.quit())
+      .catch(error => rememberLog(`Quit teardown failed: ${error instanceof Error ? error.message : String(error)}`))
   }
 
   // Clean quit mid-boot should not trip next-launch --no-sandbox (#38216).
