@@ -264,11 +264,17 @@ class ObserverStore:
             raise ObserverStoreError("legacy observer migration disabled without fd-bound handle")
         if not existed:
             _create_empty_database(self.path)
+            identity = _database_identity(self.path)
         try:
-            if existed:
-                if _database_identity(self.path) != identity:
-                    raise ObserverStoreError("observer database identity changed")
+            if _database_identity(self.path) != identity:
+                raise ObserverStoreError("observer database identity changed")
             self._connection = sqlite3.connect(self.path, check_same_thread=False)
+            # No PRAGMA, migration, WAL switch, or write is allowed until the
+            # path is revalidated after connect. If an attacker swapped the
+            # pathname during connect, close immediately and fail closed.
+            if _database_identity(self.path) != identity:
+                self._connection.close()
+                raise ObserverStoreError("observer database identity changed after connect")
             self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute("PRAGMA busy_timeout=5000")
             self._migrate(prior_version)
