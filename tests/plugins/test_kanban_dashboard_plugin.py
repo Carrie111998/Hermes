@@ -704,7 +704,246 @@ def test_specify_happy_path(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Final result visibility for Done cards
+# POST /tasks/:id/recovery — operator skill/failure/claim recovery edits
+# (issue #22925 dashboard slice). Maps 1:1 to kanban_db.edit_task_recovery —
+# never direct UI SQLite.
 # ---------------------------------------------------------------------------
+
+
+def _create_task_with_skills(client, skills=None, title="recovery task"):
+    body = {"title": title}
+    if skills is not None:
+        body["skills"] = skills
+    r = client.post("/api/plugins/kanban/tasks", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()["task"]
+
+
+def _force_claim(conn, task_id, *, live=True, status="running"):
+    """Set a claim on a task directly (bypassing claim_task) so tests can
+    control staleness. ``live=True`` → claim_expires in the future."""
+    lock = f"lock-{task_id}"
+    expires = int(time.time()) + 3600 if live else int(time.time()) - 3600
+    conn.execute(
+        "UPDATE tasks SET status=?, claim_lock=?, claim_expires=?, worker_pid=? WHERE id=?",
+        (status, lock, expires, 99999, task_id),
+    )
+    conn.commit()
+
+
+def test_recovery_endpoint_replaces_skills(client):
+    """POST /tasks/:id/recovery replaces the task's force-loaded skills via
+    the kernel function. UI contract: the response carries the updated task
+    so the drawer can refresh without a second round-trip."""
+    t = _create_task_with_skills(client, skills=["alpha"])
+    assert t["skills"] == ["alpha"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"skills": ["beta", "gamma"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["task_id"] == t["id"]
+    assert body["task"]["skills"] == ["beta", "gamma"]
+    # Audit trail recorded through the kernel, not direct SQL.
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()
+    assert any(e["kind"] == "edited" for e in detail["events"])
+
+
+def test_recovery_endpoint_clears_skills(client):
+    """clear_skills=True stores an explicit empty list (no extra skills),
+    distinct from NULL (defaults)."""
+    t = _create_task_with_skills(client, skills=["alpha", "bogus"])
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"clear_skills": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["skills"] == []
+
+
+def test_recovery_endpoint_resets_failures(client):
+    """reset_failures=True zeroes consecutive_failures and clears the last
+    failure error so the dispatcher circuit breaker stops tripping."""
+    t = _create_task_with_skills(client)
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures=3, last_failure_error='boom' WHERE id=?",
+            (t["id"],),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"reset_failures": True},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["consecutive_failures"] == 0
+    assert task["last_failure_error"] is None
+
+
+def test_recovery_endpoint_clears_stale_claim(client):
+    """clear_claim=True on an expired claim returns the task to ready and
+    clears the lock (the kernel closes the dangling run as reclaimed)."""
+    t = _create_task_with_skills(client)
+    conn = kb.connect()
+    try:
+        _force_claim(conn, t["id"], live=False)  # expired claim
+    finally:
+        conn.close()
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"clear_claim": True},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["status"] == "ready"
+    assert task["claim_lock"] is None
+
+
+def test_recovery_endpoint_rejects_live_claimed_worker(client):
+    """Skills/failure edits must be refused while a worker is actively
+    claimed — the kernel raises RuntimeError, surfaced as 409 so the UI can
+    show an actionable message instead of silently mutating a live worker."""
+    t = _create_task_with_skills(client)
+    conn = kb.connect()
+    try:
+        _force_claim(conn, t["id"], live=True)
+    finally:
+        conn.close()
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"skills": ["beta"]},
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"].lower()
+    assert "running" in detail or "claim" in detail
+
+
+def test_recovery_endpoint_rejects_clearing_live_claim(client):
+    """clear_claim must not release a live claim — a genuinely running
+    worker is aborted via /reclaim, not via the recovery edit."""
+    t = _create_task_with_skills(client)
+    conn = kb.connect()
+    try:
+        _force_claim(conn, t["id"], live=True)
+    finally:
+        conn.close()
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"clear_claim": True},
+    )
+    assert r.status_code == 409, r.text
+
+
+def test_recovery_endpoint_validation_errors(client):
+    """Actionable 400s: path-like skill names, no-op requests, and the
+    skills+clear_skills conflict are all rejected with the kernel's
+    message as detail."""
+    t = _create_task_with_skills(client)
+    # Path-like skill name rejected (kernel _normalize_skill_names).
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"skills": ["../evil"]},
+    )
+    assert r.status_code == 400, r.text
+    # No operation requested.
+    r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/recovery", json={})
+    assert r.status_code == 400, r.text
+    # skills + clear_skills conflict.
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"skills": ["beta"], "clear_skills": True},
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_recovery_endpoint_unknown_task(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks/t_unknown/recovery",
+        json={"reset_failures": True},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_recovery_endpoint_archived_task(client):
+    """Archived tasks are not recoverable — same 404 as unknown ids."""
+    t = _create_task_with_skills(client)
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "archived"})
+    assert r.status_code == 200, r.text
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"reset_failures": True},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_recovery_save_then_retry_flow(client):
+    """UI contract: the drawer's 'Save & retry' chains a recovery edit then
+    unblocks to ready (PATCH status=ready). Both steps must succeed in
+    sequence on a blocked task, and the saved skills must survive."""
+    t = _create_task_with_skills(client, skills=["bogus-skill"])
+    # Put the task into blocked.
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "blocked"})
+    assert r.status_code == 200, r.text
+    # Recovery edit (replace bogus skill, clear the failure streak).
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/recovery",
+        json={"skills": ["real-skill"], "reset_failures": True},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["skills"] == ["real-skill"]
+    # …then unblock to ready so the dispatcher can retry.
+    r = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"})
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["status"] == "ready"
+    assert task["skills"] == ["real-skill"]
+
+
+# ---------------------------------------------------------------------------
+# Recovery UI contract — the shipped dashboard bundle must expose the
+# recovery control for blocked/crashed tasks (issue #22925 dashboard slice).
+# Mirrors the markdown-sanitization bundle test above: read the committed
+# dist bundle and pin the surface strings so a future rebuild that drops the
+# control fails CI instead of silently shipping a dashboard without it.
+# ---------------------------------------------------------------------------
+
+
+def _dashboard_bundle() -> str:
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    assert bundle.exists(), f"dashboard bundle missing: {bundle}"
+    return bundle.read_text()
+
+
+def test_dashboard_bundle_ships_recovery_control():
+    js = _dashboard_bundle()
+    # The control component itself is present.
+    assert "function SkillRecoveryControl(props)" in js
+    # It POSTs to the recovery endpoint backed by kanban_db.edit_task_recovery
+    # (never direct UI SQLite) and uses the board-scoped URL helper.
+    assert "/recovery" in js
+    assert "kanban_db.edit_task_recovery" in js or "edit_task_recovery" in js
+    assert "withBoard" in js
+    # Save-and-retry flow: recovery edit then PATCH status=ready.
+    assert "status: \"ready\"" in js
+    # Live-claim guard: the control is disabled/explained while running.
+    assert "hermes-kanban-recovery-running" in js
+    assert "claimed by a live worker" in js
+
+
+def test_dashboard_bundle_recovery_does_not_touch_sqlite():
+    js = _dashboard_bundle()
+    # The bundle must not reach for a SQLite client — recovery goes through
+    # the plugin API only. (The dashboard's other UI does the same; this pins
+    # the recovery slice against a future shortcut.)
+    assert "sqlite3" not in js
+    assert "better-sqlite3" not in js
+    assert "Database(" not in js
 
 

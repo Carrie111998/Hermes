@@ -1777,6 +1777,82 @@ def reassign_task_endpoint(
         conn.close()
 
 
+class RecoveryBody(BaseModel):
+    """Recovery edit on a stopped task (issue #22925).
+
+    Maps 1:1 to ``kanban_db.edit_task_recovery`` — the same kernel path the
+    CLI uses for ``hermes kanban edit --skills/--clear-skills/
+    --reset-failures/--clear-claim``, so the three surfaces cannot drift.
+    Never direct UI SQLite.
+
+    ``skills`` replaces the stored force-loaded skill list; ``clear_skills``
+    stores an explicit empty list (distinct from NULL = defaults). Both
+    together (or neither, with nothing else) is a 400.
+    """
+
+    skills: Optional[list[str]] = None
+    clear_skills: bool = False
+    reset_failures: bool = False
+    clear_claim: bool = False
+
+
+@router.post("/tasks/{task_id}/recovery")
+def recovery_task_endpoint(
+    task_id: str,
+    payload: RecoveryBody,
+    board: Optional[str] = Query(None),
+):
+    """Operator recovery edit on a stopped/blocked/crashed task.
+
+    Replaces or clears the task's force-loaded skills, resets the
+    consecutive-failure counter, and/or clears a stale claim — through
+    :func:`kanban_db.edit_task_recovery`, never direct SQL.
+
+    Guards (mirroring the kernel's safety invariants):
+
+    * **409** — the task is actively claimed/running (a live worker's
+      payload must not be mutated underneath it), or ``clear_claim`` is
+      pointed at a *live* claim (use ``POST /tasks/:id/reclaim`` to abort
+      a genuinely running worker).
+    * **400** — invalid skill names (path-like / toolset+comma), a no-op
+      request, or ``skills`` + ``clear_skills`` together.
+    * **404** — unknown or archived task id.
+
+    Returns the updated task so the drawer can refresh without a second
+    round-trip.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        try:
+            ok = kanban_db.edit_task_recovery(
+                conn,
+                task_id,
+                skills=payload.skills,
+                clear_skills=payload.clear_skills,
+                reset_failures=payload.reset_failures,
+                clear_claim=payload.clear_claim,
+                author="dashboard",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        if not ok:
+            raise HTTPException(
+                status_code=404,
+                detail=f"task {task_id} not found or archived",
+            )
+        updated = kanban_db.get_task(conn, task_id)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "task": _task_dict(updated) if updated else None,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Estimate — a rough token/complexity estimate for a task via the auxiliary
 # (auto-routed) model. NOT a dollar cost: providers don't report cost

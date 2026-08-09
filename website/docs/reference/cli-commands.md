@@ -616,6 +616,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `claim <id>` | Atomically claim a ready task. Prints resolved workspace path. |
 | `comment <id> "<text>"` | Append a comment. The next worker that claims the task reads it as part of its `kanban_show()` response. |
 | `complete <id>` | Mark task done. Flags: `--result`, `--summary`, `--metadata`. |
+| `edit <id>` | Recovery edit on a task. Flags: `--result`/`--summary`/`--metadata` (backfill a *done* task's result), `--skills NAME...` (replace the force-loaded skills), `--clear-skills` (store an explicit empty list; `--skills []` is an alias), `--reset-failures` (zero the consecutive-failure counter + error so the circuit breaker resets), `--clear-claim` (clear a *stale* claim and return the task to `ready`; refuses a live claim). Requires at least one flag. Refused while a task is actively claimed/running. Records an `edited` event + operator comment. |
 | `block <id> "<reason>"` | Mark task blocked for human input. Also appends the reason as a comment. |
 | `schedule <id> "<reason>"` | Park time-delay/follow-up work in `scheduled` so it is not shown as a human blocker. |
 | `unblock <id>` | Return a blocked or scheduled task to ready (or `todo` if dependencies are still open). |
