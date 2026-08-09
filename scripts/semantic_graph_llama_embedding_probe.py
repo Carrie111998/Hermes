@@ -46,6 +46,30 @@ BASE_REQUIRED_CHECKS = (
     "semantic_ordering",
 )
 
+PROFILE_BGE_M3_CONTROL = "bge_m3_control"
+PROFILE_QWEN3_TEXT = "qwen3_text"
+PROFILE_QWEN3_VL_CANDIDATE = "qwen3_vl_candidate"
+
+
+def stability_thresholds(profile: str) -> tuple[float, float]:
+    """Return the acceptance thresholds for an explicitly named model family."""
+    if profile == PROFILE_BGE_M3_CONTROL:
+        return 0.9999, 0.999
+    if profile in {PROFILE_QWEN3_TEXT, PROFILE_QWEN3_VL_CANDIDATE}:
+        return 0.99999, 0.9999
+    raise ValueError(f"unsupported embedding profile: {profile}")
+
+
+def serialize_query(query: str, *, profile: str, instruction: str | None = None) -> str:
+    """Serialize a query according to the selected model family."""
+    if profile in {"raw", PROFILE_BGE_M3_CONTROL}:
+        return query
+    if profile in {PROFILE_QWEN3_TEXT, PROFILE_QWEN3_VL_CANDIDATE}:
+        if not instruction:
+            raise ValueError("Qwen3 profiles require an instruction")
+        return f"Instruct: {instruction}\nQuery:{query}"
+    raise ValueError(f"unsupported embedding profile: {profile}")
+
 
 def required_check_names(*, soak_requests: int) -> tuple[str, ...]:
     if soak_requests < 0:
@@ -348,7 +372,10 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
             checks["repeat_stability"] = False
             errors.append(repeat_message or "repeat request failed")
         else:
-            repeat_check, repeat_message, repeat_metrics = check_repeat_stability(repeat_vectors)
+            repeat_threshold, _batch_threshold = stability_thresholds(config.profile)
+            repeat_check, repeat_message, repeat_metrics = check_repeat_stability(
+                repeat_vectors, threshold=repeat_threshold
+            )
             checks["repeat_stability"] = repeat_check
             metrics.update(repeat_metrics)
             if repeat_message:
@@ -385,7 +412,10 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
             batch_cosines.extend(
                 cosine(repeat_vectors[0], vector) for vector in batch_vectors
             )
-        checks["batch_stability"] = batch_check and bool(batch_cosines)
+        _, batch_threshold = stability_thresholds(config.profile)
+        checks["batch_stability"] = (
+            batch_check and bool(batch_cosines) and min(batch_cosines) >= batch_threshold
+        )
         if batch_cosines:
             metrics["single_batch_cosine_min"] = min(batch_cosines)
             metrics["latency_ms_p95"] = _percentile(batch_latencies, 0.95)
@@ -459,7 +489,11 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
             )
 
         ordering_ok, ordering_message, ordering_metrics = ordering_for(
-            "What frontend language does the user prefer?", profile="raw"
+            serialize_query(
+                "What frontend language does the user prefer?",
+                profile="raw",
+            ),
+            profile="raw",
         )
         checks["semantic_ordering"] = ordering_ok
         observations["semantic_ordering"] = {
@@ -470,7 +504,11 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
             observations["semantic_ordering"]["error"] = ordering_message
 
         japanese_ok, japanese_message, japanese_metrics = ordering_for(
-            "フロントエンドでは何の言語を優先する？", profile="raw"
+            serialize_query(
+                "フロントエンドでは何の言語を優先する？",
+                profile="raw",
+            ),
+            profile="raw",
         )
         observations["japanese_cross_lingual"] = {
             "passed": japanese_ok,
@@ -479,9 +517,10 @@ def run_probe_sync(config: ProbeConfig) -> ProbeResult:
         if japanese_message:
             observations["japanese_cross_lingual"]["error"] = japanese_message
 
-        instruction_query = (
-            "Instruct: Retrieve stable, provenance-backed memories relevant to the user's current query.\n"
-            "Query:フロントエンドでは何の言語を優先する？"
+        instruction_query = serialize_query(
+            "フロントエンドでは何の言語を優先する？",
+            profile=PROFILE_QWEN3_TEXT,
+            instruction="Retrieve stable, provenance-backed memories relevant to the user's current query.",
         )
         profile_ok, profile_message, profile_metrics = ordering_for(
             instruction_query, profile="qwen3_text"
@@ -558,6 +597,9 @@ __all__ = [
     "BASE_REQUIRED_CHECKS",
     "ProbeConfig",
     "ProbeResult",
+    "PROFILE_BGE_M3_CONTROL",
+    "PROFILE_QWEN3_TEXT",
+    "PROFILE_QWEN3_VL_CANDIDATE",
     "build_payload",
     "check_shape",
     "check_finite_norm",
@@ -570,4 +612,6 @@ __all__ = [
     "required_check_names",
     "run_probe",
     "run_probe_sync",
+    "serialize_query",
+    "stability_thresholds",
 ]

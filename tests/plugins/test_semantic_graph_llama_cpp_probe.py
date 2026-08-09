@@ -18,6 +18,8 @@ from scripts.semantic_graph_llama_embedding_probe import (
     check_shape,
     cosine,
     make_report,
+    serialize_query,
+    stability_thresholds,
 )
 
 
@@ -62,6 +64,16 @@ def test_control_config_is_supported() -> None:
     )
     assert config.expected_dimensions == 1024
     assert config.profile == "qwen3_text_control"
+
+
+def test_bge_m3_control_uses_raw_serializer_and_control_thresholds() -> None:
+    assert serialize_query("query", profile="bge_m3_control") == "query"
+    assert stability_thresholds("bge_m3_control") == (0.9999, 0.999)
+    assert serialize_query(
+        "query", profile="qwen3_text", instruction="Retrieve memories."
+    ) == "Instruct: Retrieve memories.\nQuery:query"
+    with pytest.raises(ValueError, match="Qwen3 profiles require an instruction"):
+        serialize_query("query", profile="qwen3_text")
 
 
 def test_shape_accepts_flat_vectors_and_reorders_by_index() -> None:

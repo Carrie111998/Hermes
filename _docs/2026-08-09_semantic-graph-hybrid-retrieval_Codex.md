@@ -376,3 +376,123 @@ Residual risk:
 
 Next action:
 - Create the independent fix commit, then obtain pinned control/candidate GGUFs and run the explicit live probes.
+
+## BGE-M3 Control formal live probe — 2026-08-10
+
+### Overview
+
+`KGESH/nsfw-bge-m3` is approved as the text-only Control candidate. It is recorded as a BGE-M3 fine-tune; Qwen3 architecture is not claimed. Production embedding adoption remains unapproved.
+
+### Fixed model identity
+
+- Repository: `KGESH/nsfw-bge-m3`
+- HF revision: `e22b93e36704360fc712c8894de59a66cdb1638e`
+- GGUF: `nsfw-bge-m3-v4.gguf`
+- GGUF SHA-256: `ecc1d6cd89a82ab72ced141e63d4c5b6644f1723c94d41e3d36ce40a52a21f16`
+- Family: BGE-M3 fine-tune
+- Measured dimension: `1024`
+- Role: text-only Control candidate
+- Qwen3 architecture: NOT CLAIMED
+
+### Implementation boundary
+
+The probe now has an explicit `bge_m3_control` profile. BGE-M3 uses raw query text without a Qwen3 instruction prefix. Qwen3 text and Qwen3-VL profiles remain explicit alternatives and require an instruction when serialized. Stability thresholds are profile-specific: BGE-M3 Control uses repeat cosine `>= 0.9999` and single-vs-batch cosine `>= 0.999`; Qwen3 profiles retain their stricter existing thresholds. These are probe gates only and do not enable production retrieval.
+
+Changed files:
+
+- `scripts/semantic_graph_llama_embedding_probe.py`
+- `tests/plugins/test_semantic_graph_llama_cpp_probe.py`
+- this implementation log
+
+### Live execution
+
+Server binary:
+
+```text
+<llama.cpp-build>/build-codex-rtx5060ti-msvc/bin/llama-server.exe
+version 10262 / commit dd6f75569
+```
+
+Flags:
+
+```text
+--host 127.0.0.1 --port 8084 --embedding --embd-normalize 2 -hf KGESH/nsfw-bge-m3
+```
+
+Probe command:
+
+```text
+uv run python scripts/semantic_graph_llama_embedding_probe.py --base-url http://127.0.0.1:8084 --model nsfw-bge-m3-v4.gguf --repo KGESH/nsfw-bge-m3 --expected-dimensions 1024 --profile bge_m3_control --repeat-count 20 --batch-sizes 1,2,4,8,16,32 --soak-requests 0 --output <redacted-local-temp-path>
+```
+
+### Formal result
+
+```json
+{
+  "verdict": "pass_text_only",
+  "checks": {
+    "health": true,
+    "v1_models": true,
+    "v1_embeddings": true,
+    "one_vector_per_input": true,
+    "all_finite": true,
+    "all_nonzero": true,
+    "unit_norm": true,
+    "repeat_stability": true,
+    "batch_stability": true,
+    "semantic_ordering": true,
+    "soak": null
+  },
+  "metrics": {
+    "repeat_cosine_min": 0.9999965475685408,
+    "single_batch_cosine_min": 0.9999965475685408,
+    "norm_min": 1.0000000066971888,
+    "norm_max": 1.0000000426240097,
+    "semantic_margin": 0.4080396183234475
+  },
+  "observations": {
+    "japanese_cross_lingual": {
+      "passed": false,
+      "positive_similarity": 0.5674954061668106,
+      "negative_similarity": 0.323344254142926,
+      "semantic_margin": 0.2441511520238846
+    },
+    "instruction_profile_comparison": {
+      "passed": true,
+      "raw_margin": 0.2441511520238846,
+      "instruction_margin": 0.20648312285147058,
+      "margin_delta": -0.03766802917241402
+    }
+  },
+  "soak": {
+    "requested": false,
+    "request_count": 0,
+    "passed": null
+  }
+}
+```
+
+The Japanese observation was recorded as non-required and did not affect the verdict. The raw-vs-instruction A/B observation used the same BGE-M3 server; raw query versus Qwen-style instruction cosine was `0.6877488333154761`. Raw BGE-M3 remains the first-choice serializer profile because it produced the larger measured Japanese semantic margin and does not impose a Qwen3 template.
+
+The server was stopped after verification and port `8084` was confirmed free of a listening socket. No production adapter, retrieval path, database state, promotion, `same_as`, authority, confidence, or merge behavior was changed. The next gate is the real-vector 90-query lexical-only versus lexical+BGE-M3 dense+RRF benchmark. Production readiness and `main` merge remain pending.
+
+### Verification evidence
+
+- Targeted probe tests: `24 passed`.
+- Ruff: PASS.
+- Python compile: PASS.
+- `git diff --check`: PASS.
+- Formal Control probe: `pass_text_only`, exit 0.
+- Live required checks: all PASS; Soak intentionally not requested (`null`).
+- Working tree still contains only the two probe/test modifications before commit; no secret or absolute local path was added to the public evidence.
+
+### Residual risks
+
+- `nsfw-bge-m3` is a domain fine-tune; general memory-retrieval quality is not established by the compatibility probe.
+- Japanese/cross-lingual behavior remains observational and one Japanese ordering observation did not pass.
+- The Qwen3-VL Candidate remains a separate namespace and retains its prior repeat-stability failure.
+- Production adapter, backfill/rebuild, and the real 90-query A/B remain unimplemented/unverified.
+
+### Recommended next action
+
+Commit and push this independent probe/profile change, verify PR CI, then run the real-vector 90-query A/B before considering any production adapter work.
