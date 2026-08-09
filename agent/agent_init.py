@@ -766,6 +766,7 @@ def init_agent(
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback
     agent.clarify_callback = clarify_callback
+    agent.self_nudge_callback = None
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
     agent.read_window_below_callback = read_window_below_callback
@@ -829,6 +830,7 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
+    agent._self_nudge_armed_this_turn = False
     
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
@@ -1443,6 +1445,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        platform=agent.platform,
     )
     
     # Show tool configuration and store valid tool names for validation
