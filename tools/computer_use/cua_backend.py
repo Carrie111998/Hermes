@@ -52,7 +52,7 @@ import threading
 import time
 import uuid
 from pathlib import PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.backend import (
@@ -1148,9 +1148,11 @@ class _CuaDriverSession:
         self,
         bridge: _AsyncBridge,
         embedded_daemon: Optional[_EmbeddedCuaDaemon] = None,
+        runtime_attestation_callback: Optional[Callable[[], None]] = None,
     ) -> None:
         self._bridge = bridge
         self._embedded_daemon = embedded_daemon
+        self._runtime_attestation_callback = runtime_attestation_callback
         self._session = None
         self._lock = threading.Lock()
         self._started = False
@@ -1330,7 +1332,26 @@ class _CuaDriverSession:
                 return
             self._bridge.start()
             self._start_lifecycle_locked()
+            self._attest_runtime_locked()
             self._started = True
+
+    def _attest_runtime_locked(self) -> None:
+        """Attest a newly spawned MCP child before it can perform an action."""
+        callback = getattr(self, "_runtime_attestation_callback", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as attestation_error:
+            self._started = False
+            try:
+                self._stop_lifecycle_locked()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "runtime attestation failed and replacement cleanup was unconfirmed: "
+                    f"attestation={attestation_error!r}; cleanup={cleanup_error!r}"
+                ) from attestation_error
+            raise
 
     def _start_lifecycle_locked(self) -> None:
         """Spawn the lifecycle owner and wait for it to reach ready.
@@ -1582,15 +1603,16 @@ class _CuaDriverSession:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
         if self._started:
-            try:
-                self._stop_lifecycle_locked()
-            except Exception as e:
-                logger.debug("cua-driver session cleanup before reconnect failed: %s", e)
+            self._started = False
+            # An unconfirmed old-child teardown is an ownership failure. Do not
+            # overlap it with a replacement process or retry the action.
+            self._stop_lifecycle_locked()
         self._started = False
         # Clear stale capability state; the next start populates from scratch.
         self._capabilities = {}
         self._capability_version = ""
         self._start_lifecycle_locked()
+        self._attest_runtime_locked()
         self._started = True
 
     def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
@@ -1613,6 +1635,10 @@ class _CuaDriverSession:
         call is itself retried a few times with backoff, since the underlying
         daemon socket can still be momentarily busy.
         """
+        if getattr(self, "_runtime_attestation_callback", None) is not None:
+            raise RuntimeError(
+                "cua-driver CLI fallback cannot satisfy required runtime attestation"
+            )
         import subprocess as _subprocess
         import tempfile as _tempfile
         import time as _time
@@ -1985,7 +2011,13 @@ def _apps_from_windows(windows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 class CuaDriverBackend(ComputerUseBackend):
     """Default computer-use backend. Cross-platform via cua-driver MCP."""
 
-    def __init__(self, permission_mode: str = "standard") -> None:
+    _requires_runtime_attestation = True
+
+    def __init__(
+        self,
+        permission_mode: str = "standard",
+        runtime_attestation_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
         if permission_mode not in {"standard", "unrestricted"}:
             raise ValueError(f"unsupported cua-driver permission mode: {permission_mode}")
         self.permission_mode = permission_mode
@@ -1995,7 +2027,11 @@ class CuaDriverBackend(ComputerUseBackend):
             else None
         )
         self._bridge = _AsyncBridge()
-        self._session = _CuaDriverSession(self._bridge, self._embedded_daemon)
+        self._session = _CuaDriverSession(
+            self._bridge,
+            self._embedded_daemon,
+            runtime_attestation_callback,
+        )
         # Sticky context — updated by capture(), used by action tools.
         self._active_pid: Optional[int] = None
         self._active_window_id: Optional[int] = None
@@ -2034,6 +2070,15 @@ class CuaDriverBackend(ComputerUseBackend):
             call_tool=self._session.call_tool,
             has_tool=self._session._has_tool,
         )
+
+    def set_runtime_attestation_callback(
+        self,
+        callback: Callable[[], None],
+    ) -> None:
+        """Install the managed-gateway process replacement attestation gate."""
+        if not callable(callback):
+            raise TypeError("runtime attestation callback must be callable")
+        self._session._runtime_attestation_callback = callback
 
     def _browser_route(self) -> CuaTypedBrowserRoute:
         """Return the per-backend typed route, including test-constructed instances."""

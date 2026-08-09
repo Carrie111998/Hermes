@@ -1251,3 +1251,111 @@ def test_async_bridge_stop_refuses_to_forget_a_live_thread():
 
     assert bridge._thread is thread
     assert bridge._loop is loop
+
+
+def test_magicmock_backend_does_not_synthesize_runtime_attestation_requirement():
+    from tools.computer_use import tool as computer_use
+
+    backend = MagicMock()
+    backend.start.return_value = None
+    attest = MagicMock()
+    computer_use.set_computer_use_session_validator(lambda _route, _sid: True)
+    publication = computer_use.publish_computer_use_session(
+        "mock-session",
+        route_key="telegram:dm:mock",
+    )
+    try:
+        with (
+            patch(
+                "tools.computer_use.cua_backend.CuaDriverBackend",
+                return_value=backend,
+            ),
+            patch.object(
+                computer_use,
+                "write_computer_use_runtime_attestation",
+                attest,
+            ),
+        ):
+            assert computer_use._get_backend("mock-session") is backend
+        attest.assert_not_called()
+    finally:
+        computer_use.unpublish_computer_use_session(publication)
+
+
+def test_backend_activation_refreshes_active_runtime_attestation_before_success():
+    from tools.computer_use import tool as computer_use
+
+    backend = _Backend()
+    backend._requires_runtime_attestation = True
+    attest = MagicMock()
+    captured_attestation = {}
+    backend.set_runtime_attestation_callback = lambda callback: (
+        captured_attestation.update(callback=callback)
+    )
+    factory = MagicMock(return_value=backend)
+    computer_use.set_computer_use_session_validator(lambda _route, _sid: True)
+    publication = computer_use.publish_computer_use_session(
+        "attested-session",
+        route_key="telegram:dm:1",
+    )
+    try:
+        with (
+            patch(
+                "tools.computer_use.cua_backend.CuaDriverBackend",
+                factory,
+            ),
+            patch.object(
+                computer_use,
+                "write_computer_use_runtime_attestation",
+                attest,
+            ),
+        ):
+            assert computer_use._get_backend("attested-session") is backend
+            attest.assert_called_once_with(require_active_cua=True)
+            replacement_attestation = captured_attestation["callback"]
+            replacement_attestation()
+            assert attest.call_count == 2
+        assert computer_use.computer_use_lifecycle_snapshot()["attested-session"][
+            "state"
+        ] == "ACTIVE"
+    finally:
+        computer_use.unpublish_computer_use_session(publication)
+
+
+def test_installed_publication_validator_heals_current_compression_child(tmp_path):
+    from datetime import datetime
+
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionEntry, SessionStore
+    from hermes_state import SessionDB
+    from tools.computer_use import tool as computer_use
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("parent", source="telegram")
+    db.end_session("parent", "compression")
+    db.create_session("child", source="telegram", parent_session_id="parent")
+    now = datetime.now()
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._db = db
+    store._loaded = True
+    store._entries = {
+        "telegram:dm:compression": SessionEntry(
+            session_key="telegram:dm:compression",
+            session_id="parent",
+            created_at=now,
+            updated_at=now,
+        )
+    }
+
+    assert not store.route_matches("telegram:dm:compression", "child")
+    computer_use.set_computer_use_session_validator(store.ensure_route_matches)
+    publication = computer_use.publish_computer_use_session(
+        "child",
+        route_key="telegram:dm:compression",
+    )
+    try:
+        assert publication.session_id == "child"
+        assert store.route_matches("telegram:dm:compression", "child")
+    finally:
+        computer_use.unpublish_computer_use_session(publication)
+        db.close()

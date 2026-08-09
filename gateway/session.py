@@ -3913,6 +3913,75 @@ class SessionStore:
 
         return entries
 
+    def ensure_route_matches(
+        self,
+        session_key: Optional[str],
+        session_id: str,
+    ) -> bool:
+        """Validate an exact route, healing only a proven compression tip.
+
+        Compression can rotate ``AIAgent.session_id`` in the middle of one
+        gateway turn, before another inbound message reaches
+        ``get_or_create_session``.  A later tool call therefore carries the
+        committed child id while the durable gateway route still names its
+        ended compression parent.  Admit that child only by performing the
+        normal serialized compression route transition first; unrelated,
+        missing, ended, or ambiguous ids fail closed.
+        """
+        if not session_id:
+            return False
+        if session_key and self.route_matches(session_key, session_id):
+            return True
+        if not session_key and self.lookup_by_session_id(session_id) is not None:
+            return True
+        if self._db is None:
+            return False
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            if session_key:
+                entry = self._entries.get(session_key)
+                candidates = [entry] if entry is not None else []
+            else:
+                candidates = list(self._entries.values())
+
+        matching: list[tuple[str, str]] = []
+        for entry in candidates:
+            prior_session_id = entry.session_id
+            if prior_session_id == session_id:
+                matching.append((entry.session_key, prior_session_id))
+                continue
+            try:
+                tip = self._compression_tip_for_session_id(prior_session_id)
+                target_row = self._db.get_session(session_id)
+            except Exception:
+                return False
+            if (
+                tip == session_id
+                and target_row is not None
+                and not target_row.get("ended_at")
+            ):
+                matching.append((entry.session_key, prior_session_id))
+
+        if len(matching) != 1:
+            return False
+        matched_key, prior_session_id = matching[0]
+        if prior_session_id == session_id:
+            return self.route_matches(matched_key, session_id)
+        try:
+            advanced = self.advance_compression_session(
+                matched_key,
+                prior_session_id,
+                session_id,
+            )
+        except Exception:
+            return False
+        return bool(
+            advanced is not None
+            and advanced.session_id == session_id
+            and self.route_matches(matched_key, session_id)
+        )
+
     def route_matches(self, session_key: str, session_id: str) -> bool:
         """Atomically validate one exact persisted route binding."""
         if not session_key or not session_id:

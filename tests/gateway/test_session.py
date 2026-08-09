@@ -1917,6 +1917,60 @@ class TestRewriteTranscriptPreservesReasoning:
         assert after[0].get("codex_reasoning_items") == [{"id": "r1", "type": "reasoning"}]
 
 
+class TestGatewayCompressionRouteAuthority:
+    def test_current_compression_child_heals_route_before_tool_admission(self, tmp_path):
+        """A mid-turn compression child must not be rejected behind its ended parent route."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("parent", source="telegram")
+        db.end_session("parent", "compression")
+        db.create_session(
+            "child",
+            source="telegram",
+            parent_session_id="parent",
+        )
+
+        now = datetime.now()
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = db
+        store._loaded = True
+        store._entries = {
+            "route": SessionEntry(
+                session_key="route",
+                session_id="parent",
+                created_at=now,
+                updated_at=now,
+            )
+        }
+
+        assert store.route_matches("route", "child") is False
+        assert store.ensure_route_matches("route", "child") is True
+        assert store.route_matches("route", "child") is True
+        assert store.lookup_by_session_id("parent") is None
+        assert store.lookup_by_session_id("child") is not None
+        db.close()
+
+    def test_unrelated_child_cannot_heal_route(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("parent", source="telegram")
+        db.create_session("unrelated", source="telegram")
+        now = datetime.now()
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._db = db
+        store._loaded = True
+        store._entries = {
+            "route": SessionEntry(
+                session_key="route",
+                session_id="parent",
+                created_at=now,
+                updated_at=now,
+            )
+        }
+
+        assert store.ensure_route_matches("route", "unrelated") is False
+        assert store.route_matches("route", "parent") is True
+        db.close()
+
+
 class TestGatewaySessionDbRecovery:
     def test_compression_closed_parent_reroutes_without_retry_queue(self, tmp_path):
         import threading

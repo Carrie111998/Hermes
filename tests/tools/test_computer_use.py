@@ -1090,6 +1090,122 @@ class TestCuaDriverSessionReconnect:
         assert len(bridge.calls) == 2
 
 
+    def test_reconnect_cleanup_failure_does_not_spawn_replacement(self):
+        from anyio import ClosedResourceError
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, value, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ClosedResourceError()
+                return {"unexpected": "replacement action"}
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        session._stop_lifecycle_locked = lambda: (_ for _ in ()).throw(
+            RuntimeError("old child cleanup unconfirmed")
+        )
+
+        with pytest.raises(RuntimeError, match="old child cleanup unconfirmed"):
+            session.call_tool("list_apps", {})
+        assert bridge.calls == 1
+        assert session._reconnect_log == []
+        assert session._started is False
+
+    def test_reconnect_attests_replacement_before_retrying_action(self):
+        """A replacement MCP child must be durably attested before it acts."""
+        from anyio import ClosedResourceError
+
+        class FakeBridge:
+            def __init__(self, session):
+                self.session = session
+                self.calls = 0
+
+            def run(self, value, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ClosedResourceError()
+                assert self.session._reconnect_log == ["stop", "start", "attest"]
+                return {"ok": True}
+
+        session = self._make_session(None)
+        bridge = FakeBridge(session)
+        session._bridge = bridge
+        session._runtime_attestation_callback = (
+            lambda: session._reconnect_log.append("attest")
+        )
+
+        assert session.call_tool("list_apps", {}) == {"ok": True}
+        assert session._reconnect_log == ["stop", "start", "attest"]
+
+    def test_reconnect_attestation_failure_prevents_replacement_action(self):
+        from anyio import ClosedResourceError
+
+        class FakeBridge:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, value, timeout=None):
+                self.calls += 1
+                raise ClosedResourceError()
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+
+        def reject_attestation():
+            session._reconnect_log.append("attest")
+            raise RuntimeError("attestation rejected replacement")
+
+        session._runtime_attestation_callback = reject_attestation
+        with pytest.raises(RuntimeError, match="attestation rejected replacement"):
+            session.call_tool("list_apps", {})
+        assert bridge.calls == 1
+        assert session._reconnect_log == ["stop", "start", "attest", "stop"]
+        assert session._started is False
+
+    def test_session_start_attests_child_before_becoming_active(self):
+        from typing import Any, cast
+        import threading
+        from tools.computer_use.cua_backend import _CuaDriverSession
+
+        session = cast(Any, _CuaDriverSession.__new__(_CuaDriverSession))
+        session._lock = threading.Lock()
+        session._started = False
+        session._events = []
+        session._bridge = type(
+            "Bridge",
+            (),
+            {"start": lambda inner: session._events.append("bridge")},
+        )()
+        session._start_lifecycle_locked = lambda: session._events.append("start")
+        session._stop_lifecycle_locked = lambda: session._events.append("stop")
+        session._runtime_attestation_callback = lambda: session._events.append("attest")
+
+        session.start()
+
+        assert session._events == ["bridge", "start", "attest"]
+        assert session._started is True
+
+    def test_managed_session_rejects_unattestable_cli_fallback(self, monkeypatch):
+        from typing import Any, cast
+        from tools.computer_use.cua_backend import _CuaDriverSession
+
+        session = cast(Any, _CuaDriverSession.__new__(_CuaDriverSession))
+        session._runtime_attestation_callback = lambda: None
+        spawned = []
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *args, **kwargs: spawned.append((args, kwargs)),
+        )
+
+        with pytest.raises(RuntimeError, match="runtime attestation"):
+            session._call_tool_via_cli("list_apps", {}, 30.0)
+        assert spawned == []
+
+
     def test_cli_fallback_reads_screenshot_from_file(self, tmp_path, monkeypatch):
         """_call_tool_via_cli must base64-read a screenshot written to disk
         (screenshot_out_file path) when no inline base64 is present."""

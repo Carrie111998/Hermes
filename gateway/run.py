@@ -6056,13 +6056,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.computer_use import write_computer_use_runtime_attestation
 
         session_validator = lambda route_key, sid: (
-            self.session_store.route_matches(route_key, sid)
-            if route_key
-            else self.session_store.lookup_by_session_id(sid) is not None
+            self.session_store.ensure_route_matches(route_key, sid)
         )
         try:
             write_computer_use_runtime_attestation({
                 "GatewayRunner._run_agent": self._run_agent,
+                "SessionStore.ensure_route_matches": (
+                    self.session_store.ensure_route_matches
+                ),
                 "SessionStore.route_matches": self.session_store.route_matches,
                 "SessionStore._run_route_transition": (
                     self.session_store._run_route_transition

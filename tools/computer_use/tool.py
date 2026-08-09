@@ -854,11 +854,14 @@ _CUA_ATTESTATION_CALLABLES = (
     "tools.computer_use.tool:_dispatch",
     "tools.computer_use.cua_backend:_AsyncBridge.run",
     "tools.computer_use.cua_backend:_CuaDriverSession._lifecycle_coro",
+    "tools.computer_use.cua_backend:_CuaDriverSession.start",
+    "tools.computer_use.cua_backend:_CuaDriverSession._attest_runtime_locked",
     "tools.computer_use.cua_backend:_CuaDriverSession.call_tool",
     "tools.computer_use.cua_backend:_CuaDriverSession._call_tool_via_cli",
     "tools.computer_use.cua_backend:_CuaDriverSession._restart_session_locked",
     "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.start",
     "tools.computer_use.cua_backend:_EmbeddedCuaDaemon.stop",
+    "tools.computer_use.cua_backend:CuaDriverBackend.set_runtime_attestation_callback",
     "tools.computer_use.cua_backend:CuaDriverBackend.start",
     "tools.computer_use.cua_backend:CuaDriverBackend.stop",
     "tools.computer_use.cua_backend:CuaDriverBackend.capture",
@@ -870,6 +873,7 @@ _CUA_ATTESTATION_CALLABLES = (
     "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_prepare",
     "tools.computer_use.cua_backend:CuaDriverBackend.typed_browser_action",
     "gateway.run:GatewayRunner._run_agent",
+    "gateway.session:SessionStore.ensure_route_matches",
     "gateway.session:SessionStore.route_matches",
     "gateway.session:SessionStore._run_route_transition",
     "gateway.session:SessionStore.prune_old_entries",
@@ -962,10 +966,237 @@ def _resolve_attested_callable(identity: str, supplied: Dict[str, Any]) -> Any:
     return getattr(target, "__func__", target)
 
 
-def write_computer_use_runtime_attestation(extra_callables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Atomically bind the live gateway PID to a fixed CUA code/source surface."""
+_NATIVE_RUNTIME_ARTIFACTS = (
+    "python_runtime",
+    "sqlite3_extension",
+    "psutil_extension",
+    "cua_driver_launcher",
+    "cua_driver_executable",
+)
+
+
+def _attested_native_file(path: "Path") -> Dict[str, Any]:
+    """Return a canonical, byte-bound native file identity or fail closed."""
+    canonical = path.resolve(strict=True)
+    if not canonical.is_file():
+        raise RuntimeError(f"required native runtime artifact is not a file: {canonical}")
+    raw = canonical.read_bytes()
+    return {
+        "canonical_path": str(canonical),
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _python_runtime_library() -> "Path":
+    """Resolve the loaded Python runtime library without accepting receipt input."""
+    from pathlib import Path
+    import sysconfig
+
+    names = [
+        value for value in (
+            sysconfig.get_config_var("LDLIBRARY"),
+            sysconfig.get_config_var("LIBRARY"),
+            f"python{sys.version_info.major}{sys.version_info.minor}.dll" if os.name == "nt" else None,
+        ) if isinstance(value, str) and value
+    ]
+    directories = [
+        Path(sys.base_prefix), Path(sys.prefix), Path(sys.executable).resolve().parent,
+    ]
+    libdir = sysconfig.get_config_var("LIBDIR")
+    if isinstance(libdir, str) and libdir:
+        directories.insert(0, Path(libdir))
+    for directory in directories:
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate.resolve(strict=True)
+    raise RuntimeError("could not resolve the Python runtime library")
+
+
+def _live_cua_driver_processes(
+    *,
+    owner_pid: Optional[int] = None,
+    owner_create_time: Optional[float] = None,
+    owner_executable: Optional[str] = None,
+    require_active: bool = False,
+) -> List[Dict[str, Any]]:
+    """Bind only direct cua-driver children of one exact gateway process."""
+    from pathlib import Path
+    import psutil
+
+    owner_pid = os.getpid() if owner_pid is None else int(owner_pid)
+    owner = psutil.Process(owner_pid)
+    actual_owner_create_time = owner.create_time()
+    actual_owner_executable = owner.exe()
+    if owner_create_time is None:
+        owner_create_time = actual_owner_create_time
+    if owner_executable is None:
+        owner_executable = actual_owner_executable
+    if abs(float(owner_create_time) - actual_owner_create_time) > 0.001:
+        raise RuntimeError("gateway owner process create time changed during attestation")
+    if Path(owner_executable).resolve(strict=True) != Path(
+        actual_owner_executable
+    ).resolve(strict=True):
+        raise RuntimeError("gateway owner executable changed during attestation")
+
+    parent_identity = {
+        "pid": owner_pid,
+        "process_create_time": float(owner_create_time),
+        "executable": str(owner_executable),
+    }
+    rows: List[Dict[str, Any]] = []
+    for process in psutil.process_iter(["pid", "name"]):
+        try:
+            if "cua-driver" not in str(process.info.get("name") or "").lower():
+                continue
+            if process.ppid() != owner_pid:
+                continue
+            parent = process.parent()
+            if parent is None or parent.pid != owner_pid:
+                continue
+            if abs(parent.create_time() - float(owner_create_time)) > 0.001:
+                continue
+            if Path(parent.exe()).resolve(strict=True) != Path(
+                owner_executable
+            ).resolve(strict=True):
+                continue
+            argv = process.cmdline()
+            if not isinstance(argv, list) or not argv or not all(
+                isinstance(value, str) for value in argv
+            ):
+                raise RuntimeError("owned cua-driver command line is unavailable")
+            # argv[0] is the concrete launcher actually used for this process;
+            # it is intentionally distinct from Process.exe() on shim installs.
+            _attested_native_file(Path(argv[0]))
+            rows.append({
+                "pid": process.pid,
+                "process_create_time": process.create_time(),
+                "ppid": owner_pid,
+                "executable": _attested_native_file(Path(process.exe())),
+                "parent": dict(parent_identity),
+                "argv": argv,
+            })
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+    rows.sort(key=lambda row: (row["process_create_time"], row["pid"]))
+    if require_active and not rows:
+        raise RuntimeError("no gateway-owned cua-driver process is available for attestation")
+    executable_identities = {
+        (row["executable"]["canonical_path"], row["executable"]["sha256"])
+        for row in rows
+    }
+    launcher_identities = {
+        (
+            artifact["canonical_path"],
+            artifact["sha256"],
+        )
+        for artifact in (
+            _attested_native_file(Path(row["argv"][0])) for row in rows
+        )
+    }
+    if len(executable_identities) > 1:
+        raise RuntimeError("owned cua-driver processes use ambiguous executable bytes")
+    if len(launcher_identities) > 1:
+        raise RuntimeError("owned cua-driver processes use ambiguous launcher bytes")
+    return rows
+
+
+def _native_runtime_artifacts(
+    cua_driver_processes: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Bind the exact native dependencies and concrete CUA launch/runtime files."""
+    from pathlib import Path
+    import _sqlite3
+    import psutil
+    from tools.computer_use.cua_backend import resolve_cua_driver_cmd
+
+    extension_name = {
+        "win32": "psutil._psutil_windows",
+        "darwin": "psutil._psutil_osx",
+    }.get(sys.platform, "psutil._psutil_linux")
+    psutil_extension = importlib.import_module(extension_name)
+    process_rows = list(cua_driver_processes or [])
+    if process_rows:
+        launcher = _attested_native_file(Path(process_rows[0]["argv"][0]))
+        runtime_executable = dict(process_rows[0]["executable"])
+    else:
+        driver = resolve_cua_driver_cmd()
+        if not driver:
+            raise RuntimeError("could not resolve the cua-driver launcher in use")
+        launcher = _attested_native_file(Path(driver))
+        # Startup-phase evidence is prospective only. Final verification
+        # rejects that phase and requires a refreshed gateway-owned process.
+        runtime_executable = dict(launcher)
+    artifacts = {
+        "python_runtime": _attested_native_file(_python_runtime_library()),
+        "sqlite3_extension": _attested_native_file(Path(_sqlite3.__file__)),
+        "psutil_extension": _attested_native_file(Path(psutil_extension.__file__)),
+        "cua_driver_launcher": launcher,
+        "cua_driver_executable": runtime_executable,
+    }
+    if set(artifacts) != set(_NATIVE_RUNTIME_ARTIFACTS):
+        raise RuntimeError("native runtime artifact policy is incomplete")
+    return artifacts
+
+
+def _atomic_write_attestation(path: "Path", raw: bytes) -> None:
+    """Durably replace one required receipt before reporting success."""
+    from pathlib import Path
+    import uuid
+
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / (
+        f".cua-attest-{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+            move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+            move_file.restype = wintypes.BOOL
+            # MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH. Concurrent
+            # runtime refreshes may briefly contend on the current receipt;
+            # retry only Windows access/sharing violations within a fixed bound.
+            import time as _time
+
+            for attempt in range(50):
+                if move_file(str(temporary), str(destination), 0x1 | 0x8):
+                    break
+                error = ctypes.get_last_error()
+                if error not in {5, 32} or attempt == 49:
+                    raise OSError(error, "MoveFileExW failed")
+                _time.sleep(min(0.002 * (attempt + 1), 0.05))
+        else:
+            os.replace(temporary, destination)
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def write_computer_use_runtime_attestation(
+    extra_callables: Optional[Dict[str, Any]] = None,
+    *,
+    require_active_cua: bool = False,
+) -> Dict[str, Any]:
+    """Durably bind the gateway and, after startup, its exact CUA children."""
     from datetime import datetime, timezone
     from pathlib import Path
+    import uuid
     from hermes_constants import get_hermes_home
 
     importlib.import_module("tools.computer_use.cua_backend")
@@ -1004,17 +1235,25 @@ def write_computer_use_runtime_attestation(extra_callables: Optional[Dict[str, A
         raise RuntimeError("could not attest live gateway process identity") from exc
     output = get_hermes_home() / "runtime" / "cua_gateway_attestation.json"
     archive_dir = output.parent / "cua_gateway_attestations"
-    archive = archive_dir / f"{os.getpid()}-{int(process_create_time * 1_000_000)}.json"
-    receipt = {"schema": 3, "captured_at": datetime.now(timezone.utc).isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "parent": parent_identity, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
-    output.parent.mkdir(parents=True, exist_ok=True)
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(receipt, indent=2)
-    archive_temporary = archive.with_suffix(".tmp")
-    archive_temporary.write_text(encoded, encoding="utf-8")
-    os.replace(archive_temporary, archive)
-    temporary = output.with_suffix(".tmp")
-    temporary.write_text(encoded, encoding="utf-8")
-    os.replace(temporary, output)
+    captured_at = datetime.now(timezone.utc)
+    archive = archive_dir / (
+        f"{os.getpid()}-{int(process_create_time * 1_000_000)}-"
+        f"{int(captured_at.timestamp() * 1_000_000)}-{uuid.uuid4().hex}.json"
+    )
+    cua_driver_processes = _live_cua_driver_processes(
+        owner_pid=os.getpid(),
+        owner_create_time=process_create_time,
+        owner_executable=process_executable,
+        require_active=require_active_cua,
+    )
+    runtime_phase = "cua_active" if cua_driver_processes else "gateway_startup"
+    receipt = {"schema": 3, "runtime_phase": runtime_phase, "captured_at": captured_at.isoformat(), "pid": os.getpid(), "ppid": os.getppid(), "process_create_time": process_create_time, "executable": process_executable, "launcher": sys.executable, "parent": parent_identity, "argv": list(sys.argv), "runtime": {"python_implementation": platform.python_implementation(), "python_version": list(sys.version_info[:3]), "python_cache_tag": sys.implementation.cache_tag, "optimization": sys.flags.optimize}, "native_runtime_artifacts": _native_runtime_artifacts(cua_driver_processes), "cua_driver_processes": cua_driver_processes, "source_identity": _collect_attested_source_identity(repo_root, _CUA_ATTESTATION_MODULES, modules), "modules": modules, "callables": callables, "archive_path": str(archive), "path": str(output)}
+    encoded = json.dumps(receipt, indent=2).encode("utf-8")
+    # Archive first, then publish the current pointer. A crash between these
+    # writes leaves either the previous current receipt or a final verifier
+    # failure; it cannot publish a current receipt without its archive.
+    _atomic_write_attestation(archive, encoded)
+    _atomic_write_attestation(output, encoded)
     return receipt
 
 
@@ -1099,7 +1338,8 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 backend_name = os.environ.get(
                     "HERMES_COMPUTER_USE_BACKEND", "cua"
                 ).lower()
-                if backend_name in {"cua", "cua-driver", ""}:
+                is_cua_backend = backend_name in {"cua", "cua-driver", ""}
+                if is_cua_backend:
                     from tools.computer_use.cua_backend import CuaDriverBackend
 
                     backend = CuaDriverBackend(permission_mode=permission_mode)
@@ -1108,6 +1348,25 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 else:
                     raise RuntimeError(
                         f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}"
+                    )
+                requires_runtime_attestation = (
+                    getattr(backend, "_requires_runtime_attestation", False) is True
+                )
+                if requires_runtime_attestation:
+                    configure_attestation = getattr(
+                        backend,
+                        "set_runtime_attestation_callback",
+                        None,
+                    )
+                    if not callable(configure_attestation):
+                        raise RuntimeError(
+                            "CUA backend requires runtime attestation but exposes no "
+                            "replacement-attestation hook"
+                        )
+                    configure_attestation(
+                        lambda: write_computer_use_runtime_attestation(
+                            require_active_cua=True
+                        )
                     )
                 call_lock = threading.RLock()
                 record = _BackendRecord(
@@ -1125,6 +1384,14 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                     _backend = backend
                 try:
                     backend.start()
+                    if requires_runtime_attestation:
+                        # The gateway-startup receipt is prospective. Refresh it
+                        # only after this backend has spawned its exact direct
+                        # cua-driver child, and do not publish ACTIVE authority
+                        # unless the durable active-runtime receipt succeeds.
+                        write_computer_use_runtime_attestation(
+                            require_active_cua=True
+                        )
                 except Exception as exc:
                     record.state = BackendLifecycleState.FAILED
                     record.last_error = repr(exc)
