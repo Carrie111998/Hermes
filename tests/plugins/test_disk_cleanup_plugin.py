@@ -314,6 +314,27 @@ class TestPostToolCallHook:
         data = json.loads(tracked_file.read_text())
         assert any(Path(i["path"]) == p.resolve() for i in data)
 
+    def test_terminal_hook_ignores_inaccessible_external_candidate(
+        self, _isolate_env, monkeypatch
+    ):
+        """Output paths outside HERMES_HOME must not crash the observer hook."""
+        pi = _load_plugin_init()
+        inaccessible = Path("/restricted/external/test_created.py")
+        original_exists = Path.exists
+
+        def guarded_exists(path):
+            if path == inaccessible:
+                raise PermissionError("permission denied")
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", guarded_exists)
+        pi._on_post_tool_call(
+            tool_name="terminal",
+            args={"command": f"touch {inaccessible}"},
+            result="",
+            task_id="t3", session_id="s3",
+        )
+
     def test_ignores_unrelated_tool(self, _isolate_env):
         pi = _load_plugin_init()
         pi._on_post_tool_call(

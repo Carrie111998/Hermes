@@ -75,7 +75,12 @@ def _attempt_track(path_str: str, task_id: str, session_id: str) -> None:
         p = Path(path_str).expanduser()
     except Exception:
         return
-    if not p.exists():
+    # Terminal output can contain inaccessible host paths. Reject anything
+    # outside HERMES_HOME before probing it, and keep the observer non-fatal.
+    try:
+        if not dg.is_safe_path(p) or not p.exists():
+            return
+    except OSError:
         return
     category = dg.guess_category(p)
     if category is None:
