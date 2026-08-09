@@ -229,11 +229,10 @@ function notifyGatewayTools(tools: string[] | undefined) {
 // are now authenticated. Pick the first curated model for the matching
 // provider as a sensible default, persist it via /api/model/set, and
 // transition to the model-confirmation step. If anything goes wrong
-// fetching options (no providers returned, network error), the caller
+// fetching options (no matching provider, network error), the caller
 // falls through to completing onboarding without showing the confirm
-// card — the user gets the undefined-model auto-selection behaviour
-// we had before, which works but is surprising. The confirm step is
-// opportunistic polish, not a hard requirement for onboarding.
+// card. Never fall back to a different provider: doing so can overwrite
+// an otherwise working model assignment after an unrelated OAuth flow.
 async function fetchProviderDefaultModel(
   preferredSlugs: string[]
 ): Promise<null | { providerSlug: string; defaultModel: string }> {
@@ -251,13 +250,15 @@ async function fetchProviderDefaultModel(
     return null
   }
 
-  // Try each preferred slug (lowercased), fall back to the first provider
-  // returned (model.options orders by recency / authenticated state, so
-  // the just-authenticated provider is usually first anyway).
+  // Match only the provider that was just authenticated. model.options may
+  // contain other configured providers, but selecting one of those would turn
+  // an unrelated OAuth flow into a destructive model-provider switch.
   const lower = preferredSlugs.map(s => s.toLowerCase())
+  const matched = providers.find((p: ModelOptionProvider) => lower.includes(String(p.slug).toLowerCase()))
 
-  const matched =
-    providers.find((p: ModelOptionProvider) => lower.includes(String(p.slug).toLowerCase())) ?? providers[0]
+  if (!matched) {
+    return null
+  }
 
   const models = matched.models ?? []
 
@@ -312,11 +313,17 @@ async function completeWithModelConfirm(
   await ctx.requestGateway('reload.env').catch(() => undefined)
 
   const defaults = await fetchProviderDefaultModel(preferredSlugs)
+  const runtime = await checkRuntime(ctx, preferredSlugs[0])
+
+  if (!runtime.ready && !ignoreRuntimeGate) {
+    onFail(runtime.reason)
+
+    return
+  }
 
   if (defaults) {
-    // Persist the chosen provider/model before the runtime gate so a stale
-    // config provider (e.g. anthropic from a prior failed setup) cannot make
-    // setup.runtime_check validate the wrong backend after a fresh OAuth login.
+    // The scoped runtime check above proves the authenticated provider is
+    // executable before this mutates the user's current model assignment.
     try {
       const res = await setModelAssignment({
         scope: 'main',
@@ -326,17 +333,9 @@ async function completeWithModelConfirm(
 
       notifyGatewayTools(res.gateway_tools)
     } catch {
-      // Persistence failed — still run the scoped runtime check below and
-      // show the confirm card so the user can pick something explicitly.
+      // Persistence failed after validation — still show the confirm card so
+      // the user can pick something explicitly.
     }
-  }
-
-  const runtime = await checkRuntime(ctx, preferredSlugs[0])
-
-  if (!runtime.ready && !ignoreRuntimeGate) {
-    onFail(runtime.reason)
-
-    return
   }
 
   if (!defaults) {
@@ -363,6 +362,14 @@ function providerResolutionFailure(reason: null | string) {
   return detail
     ? `Connected, but Hermes still cannot resolve a usable provider. ${detail}`
     : 'Connected, but Hermes still cannot resolve a usable provider.'
+}
+
+// Claude Code is a synthetic OAuth account in the Desktop provider list; the
+// executable model provider is Anthropic. Keep this translation at the flow
+// boundary so runtime validation targets Anthropic before any model assignment
+// is persisted.
+function modelProviderSlugs(provider: OAuthProvider): string[] {
+  return [provider.id === 'claude-code' ? 'anthropic' : provider.id]
 }
 
 async function refreshProviders() {
@@ -733,7 +740,7 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
   }
 
   const { provider } = flow
-  await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
+  await completeWithModelConfirm(ctx, provider.name, modelProviderSlugs(provider), reason =>
     setFlow({
       status: 'error',
       provider,
