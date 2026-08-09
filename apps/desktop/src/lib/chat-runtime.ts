@@ -254,6 +254,32 @@ export function normalizePersonalityValue(value: string): string {
   return !trimmed || trimmed === 'default' || trimmed === 'none' ? '' : trimmed
 }
 
+// Desktop prepends attachment ref tags (@image:, @file:, @url:, @folder:,
+// @terminal:, @line:, @session:, @tool:, ...) to the submitted wire text. A
+// slash command typed after those refs must still be detected — strip leading
+// ref lines before testing the text for a command. Mirrors the gateway's
+// _ATTACHMENT_REF_RE, but covers every ref kind the composer can emit.
+const ATTACHMENT_REF_LINE_RE = /^@[a-z][a-z0-9-]*:[^\n]*\n?/i
+
+export function stripAttachmentRefs(text: string): string {
+  let current = text ?? ''
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const next = current.replace(ATTACHMENT_REF_LINE_RE, '')
+    if (next === current) {
+      break
+    }
+    current = next
+  }
+
+  return current
+}
+
+export function isSlashCommandText(text: string): boolean {
+  return SLASH_COMMAND_RE.test(stripAttachmentRefs(text).trimStart())
+}
+
 export function parseSlashCommand(command: string) {
   // `[\s\S]*` (not `.*`): the arg may span newlines — `/goal <multi-line text>`
   // or a skill command with a long pasted context. The old `.*$` regex failed
