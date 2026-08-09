@@ -2500,6 +2500,13 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
 
+# Minimum drain budget (seconds) when the only active work is cron jobs
+# or API-server runs.  ``restart_drain_timeout=0`` (the default) means
+# "don't wait for chat sessions" but should not kill background jobs
+# with zero grace — those have no pre-stop protection via
+# ``restart_after_turn_timeout`` (#82161).
+_MIN_DRAIN_FOR_BACKGROUND_WORK: float = 30.0
+
 # Conversation-scoped per-session state registry (legacy contract).
 # The state itself now lives in ``SessionState.conversation`` (see
 # gateway/session_state.py) and boundaries clear it structurally via
@@ -9379,7 +9386,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _maybe_update_status(force=True)
         if timeout <= 0:
-            return snapshot, True
+            # When drain_timeout is 0 (the default), chat sessions are
+            # handled by the pre-stop ``restart_after_turn_timeout`` wait,
+            # so a zero drain budget is intentional.  Cron jobs and
+            # API-server runs, however, live outside _running_agents and
+            # have no pre-stop protection — killing them with zero grace
+            # is a data-loss bug (#82161).  Apply a minimum drain budget
+            # when background work is the only active thing.
+            _background_only = (
+                not self._running_agents
+                and (last_cron_count > 0 or last_api_count > 0)
+            )
+            if not _background_only:
+                return snapshot, True
+            timeout = _MIN_DRAIN_FOR_BACKGROUND_WORK
 
         deadline = asyncio.get_running_loop().time() + timeout
         while (
