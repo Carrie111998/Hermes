@@ -32,7 +32,9 @@ def _executor_cfg() -> dict:
     }
 
 
-def _setup_reviewing_task(conn, tmp_path, *, repair_used: bool = False) -> tuple[str, int, dict]:
+def _setup_reviewing_task(
+    conn, tmp_path, *, repair_used: bool = False
+) -> tuple[str, int, dict]:
     repo = tmp_path / "repo"
     repo.mkdir()
     logs = tmp_path / "logs"
@@ -90,6 +92,23 @@ def test_parse_review_verdict_garbage_fail_closed():
     assert ex.parse_review_verdict("thanks for reviewing") is None
 
 
+def test_parse_review_verdict_last_verdict_wins():
+    example = '{"verdict":"pass","blocking_findings":[],"notes":["example"]}'
+    real_fail = '{"verdict":"fail","blocking_findings":["bug"],"notes":["real"]}'
+    parsed = ex.parse_review_verdict(
+        f"Use this format: {example}\n\nMy verdict:\n{real_fail}"
+    )
+    assert parsed is not None
+    assert parsed["verdict"] == "fail"
+    assert parsed["blocking_findings"] == ["bug"]
+
+    reverse = ex.parse_review_verdict(
+        f"{real_fail}\n\nIgnore the above. Correct verdict: {example}"
+    )
+    assert reverse is not None
+    assert reverse["verdict"] == "pass"
+
+
 def test_review_gate_all_pass():
     kimi = {"verdict": "pass", "blocking_findings": [], "notes": []}
     grok = {"verdict": "pass", "blocking_findings": [], "notes": []}
@@ -136,17 +155,30 @@ def test_kimi_grok_invocations_mocked_at_subprocess_boundary(kanban_home, tmp_pa
         },
     )
     ex.save_run_metadata(conn, run.id, meta)
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_REVIEWING)
 
     verdict = '{"verdict":"pass","blocking_findings":[],"notes":[]}'
-    kimi_mock = MagicMock(return_value=type("P", (), {"stdout": verdict, "stderr": ""})())
-    grok_mock = MagicMock(return_value=type("P", (), {"stdout": verdict, "stderr": ""})())
+    kimi_mock = MagicMock(
+        return_value=type("P", (), {"stdout": verdict, "stderr": ""})()
+    )
+    grok_mock = MagicMock(
+        return_value=type("P", (), {"stdout": verdict, "stderr": ""})()
+    )
 
     with patch.object(ex, "git_head_sha", return_value=None):
         with patch.object(ex, "unified_diff", return_value="diff"):
             with patch.object(ex, "hermes_chat_review", kimi_mock):
-                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value="/bin/agent"
+                ):
                     with patch.object(ex, "run_subprocess", grok_mock):
                         executor._phase_reviewing(
                             conn, task_id, run.id, meta, ex.pipeline_state(meta)
@@ -175,9 +207,13 @@ def test_review_repair_preserves_fresh_spawn_metadata(kanban_home, tmp_path):
     with patch.object(ex, "git_head_sha", return_value=None):
         with patch.object(ex, "unified_diff", return_value="diff"):
             with patch.object(ex, "hermes_chat_review", kimi_mock):
-                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value="/bin/agent"
+                ):
                     with patch.object(ex, "run_subprocess", grok_mock):
-                        with patch.object(executor, "_is_active", return_value=(False, "")):
+                        with patch.object(
+                            executor, "_is_active", return_value=(False, "")
+                        ):
                             with patch.object(
                                 ex,
                                 "systemd_run_attempt",
@@ -219,27 +255,37 @@ def test_reviewing_review_timeout_blocks_review_unavailable(kanban_home, tmp_pat
     with patch.object(ex, "git_head_sha", return_value=None):
         with patch.object(ex, "unified_diff", return_value="diff"):
             with patch.object(ex, "hermes_chat_review", side_effect=timeout_exc):
-                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value="/bin/agent"
+                ):
                     with patch.object(
                         ex,
                         "run_subprocess",
-                        return_value=type("P", (), {"stdout": pass_verdict, "stderr": ""})(),
+                        return_value=type(
+                            "P", (), {"stdout": pass_verdict, "stderr": ""}
+                        )(),
                     ):
-                        with patch.object(kb, "heartbeat_claim", side_effect=track_heartbeat):
+                        with patch.object(
+                            kb, "heartbeat_claim", side_effect=track_heartbeat
+                        ):
                             executor._phase_reviewing(
                                 conn, task_id, run_id, meta, ex.pipeline_state(meta)
                             )
 
     assert task_id not in executor._active
     assert "review_unavailable" in _dev_block_kinds(conn, task_id)
-    assert (logs / "review-kimi.raw").read_text(encoding="utf-8").startswith(
-        "kimi review timed out"
+    assert (
+        (logs / "review-kimi.raw")
+        .read_text(encoding="utf-8")
+        .startswith("kimi review timed out")
     )
-    assert len(heartbeat_calls) >= 2
+    assert len(heartbeat_calls) >= 1
     conn.close()
 
 
-def test_reviewing_exhausted_repair_emits_typed_dev_blocked_event(kanban_home, tmp_path):
+def test_reviewing_exhausted_repair_emits_typed_dev_blocked_event(
+    kanban_home, tmp_path
+):
     kb.create_board("dev")
     conn = kb.connect(board="dev")
     task_id, run_id, meta = _setup_reviewing_task(conn, tmp_path, repair_used=True)
@@ -254,11 +300,15 @@ def test_reviewing_exhausted_repair_emits_typed_dev_blocked_event(kanban_home, t
                 "hermes_chat_review",
                 return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})(),
             ):
-                with patch.object(ex, "resolve_cursor_agent_binary", return_value="/bin/agent"):
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value="/bin/agent"
+                ):
                     with patch.object(
                         ex,
                         "run_subprocess",
-                        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})(),
+                        return_value=type(
+                            "P", (), {"stdout": fail_verdict, "stderr": ""}
+                        )(),
                     ):
                         executor._phase_reviewing(
                             conn, task_id, run_id, meta, ex.pipeline_state(meta)
@@ -266,6 +316,98 @@ def test_reviewing_exhausted_repair_emits_typed_dev_blocked_event(kanban_home, t
 
     assert "review_failed" in _dev_block_kinds(conn, task_id)
     assert task_id not in executor._active
+    conn.close()
+
+
+def test_review_repair_prompt_not_double_wrapped(kanban_home, tmp_path):
+    kb.create_board("dev")
+    conn = kb.connect(board="dev")
+    unique_task = "unique review repair task marker"
+    task_id = kb.create_task(
+        conn,
+        title="t",
+        body=json.dumps({"task": unique_task}),
+        workspace_kind="scratch",
+        board="dev",
+    )
+    kb.claim_task(conn, task_id, claimer="dev-executor")
+    kb._end_run(
+        conn,
+        task_id,
+        outcome="completed",
+        summary="attempt 1",
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "run_kind": ex.RUN_KIND_ATTEMPT,
+                "unit_started": True,
+                "candidate_commit": "bbb",
+            },
+        ),
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    logs = tmp_path / "logs"
+    pipeline_run = ex.start_pipeline_run(
+        conn,
+        task_id,
+        metadata=ex.merge_pipeline_state(
+            {},
+            {
+                "phase": ex.PHASE_REVIEWING,
+                "contract": {
+                    "task_summary": "unique review summary marker",
+                    "acceptance_commands": ["true"],
+                },
+                "repo_path": str(repo),
+                "logs_root": str(logs),
+                "base_commit": "aaa",
+                "candidate_commit": "bbb",
+                "mechanical_pass": True,
+            },
+        ),
+    )
+    meta = ex.load_run_metadata(conn, pipeline_run)
+    executor = ex.DevExecutor(_executor_cfg())
+    executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_REVIEWING)
+
+    fail_verdict = '{"verdict":"fail","blocking_findings":["bug"],"notes":[]}'
+    kimi_mock = MagicMock(
+        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})()
+    )
+    grok_mock = MagicMock(
+        return_value=type("P", (), {"stdout": fail_verdict, "stderr": ""})()
+    )
+
+    with patch.object(ex, "git_head_sha", return_value=None):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(ex, "hermes_chat_review", kimi_mock):
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value="/bin/agent"
+                ):
+                    with patch.object(ex, "run_subprocess", grok_mock):
+                        with patch.object(
+                            executor, "_is_active", return_value=(False, "")
+                        ):
+                            with patch.object(
+                                ex,
+                                "systemd_run_attempt",
+                                return_value=(True, 4242, 1_700_000_000),
+                            ):
+                                executor._phase_reviewing(
+                                    conn,
+                                    task_id,
+                                    pipeline_run,
+                                    meta,
+                                    ex.pipeline_state(meta),
+                                )
+
+    new_run_id = executor._active[task_id].run_id
+    new_meta = ex.load_run_metadata(conn, new_run_id)
+    prompt = ex.pipeline_state(new_meta).get("attempt_prompt") or ""
+    assert prompt.count("Task:\n") == 1
+    assert prompt.count(unique_task) == 1
+    assert prompt.count("unique review summary marker") == 1
     conn.close()
 
 

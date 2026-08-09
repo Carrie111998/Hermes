@@ -21,7 +21,18 @@ from hermes_cli import kanban_db as kb
         (False, False, "abc123", "RUNNING", True, 1, 2, "resume", "VERIFYING", None),
         (False, False, "abc123", "RUNNING", False, 1, 2, "retry", "RUNNING", None),
         (False, False, None, "RUNNING", False, 1, 2, "retry", "RUNNING", None),
-        (False, False, None, "RUNNING", False, 2, 2, "block", None, "executor_restarted"),
+        (
+            False,
+            False,
+            None,
+            "RUNNING",
+            False,
+            2,
+            2,
+            "block",
+            None,
+            "executor_restarted",
+        ),
         (False, False, "abc", "REVIEWING", False, 1, 2, "resume", "REVIEWING", None),
         (False, False, "abc", "PUBLISHING", False, 1, 2, "resume", "PUBLISHING", None),
     ],
@@ -85,7 +96,12 @@ def _seed_running_task(conn, metadata: dict) -> tuple[str, int]:
         (
             task_id,
             int(time.time()),
-            json.dumps({"dev_pipeline": {**metadata, "run_kind": metadata.get("run_kind", ex.RUN_KIND_ATTEMPT)}}),
+            json.dumps({
+                "dev_pipeline": {
+                    **metadata,
+                    "run_kind": metadata.get("run_kind", ex.RUN_KIND_ATTEMPT),
+                }
+            }),
             int(time.time()) + 900,
         ),
     )
@@ -111,33 +127,29 @@ def test_reconcile_applies_adopt_to_executor_active_set(kanban_home_fixture):
     conn.execute(
         "UPDATE task_runs SET metadata=? WHERE id=?",
         (
-            json.dumps(
-                {
-                    "dev_pipeline": {
-                        "phase": "RUNNING",
-                        "unit_name": unit,
-                        "unit_pid": 99,
-                        "host_start_time": 42,
-                        "last_jsonl_size": 100,
-                        "last_jsonl_growth_at": 1234.5,
-                    }
+            json.dumps({
+                "dev_pipeline": {
+                    "phase": "RUNNING",
+                    "unit_name": unit,
+                    "unit_pid": 99,
+                    "host_start_time": 42,
+                    "last_jsonl_size": 100,
+                    "last_jsonl_growth_at": 1234.5,
                 }
-            ),
+            }),
             run_id,
         ),
     )
     conn.commit()
 
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
 
     def fake_active(u):
         return u == unit, "active"
@@ -171,16 +183,14 @@ def test_reconcile_resume_reviewing_advances_executor(kanban_home_fixture):
             "mechanical_pass": True,
         },
     )
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
 
     with patch.object(ex, "unified_diff", return_value="safe"):
         with patch.object(executor, "_phase_reviewing") as mock_review:
@@ -206,16 +216,14 @@ def test_reconcile_retry_spawns_attempt(kanban_home_fixture):
             "contract": {"task_summary": "x"},
         },
     )
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
 
     with patch.object(executor, "_spawn_attempt") as mock_spawn:
         ex.reconcile_board(
@@ -246,16 +254,14 @@ def test_reconcile_block_marks_task_blocked(kanban_home_fixture):
     )
     conn.commit()
 
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     ex.reconcile_board(
         conn,
         executor.cfg,
@@ -277,24 +283,26 @@ def test_fresh_executor_tick_adopts_running_task_after_restart(kanban_home_fixtu
     conn.execute(
         "UPDATE task_runs SET metadata=? WHERE id=?",
         (
-            json.dumps(
-                {"dev_pipeline": {"phase": "PLANNING", "repo": "/tmp/r", "branch": "main"}}
-            ),
+            json.dumps({
+                "dev_pipeline": {
+                    "phase": "PLANNING",
+                    "repo": "/tmp/r",
+                    "branch": "main",
+                }
+            }),
             run_id,
         ),
     )
     conn.commit()
 
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
 
     contract = {
         "task_summary": "x",
@@ -336,17 +344,17 @@ def test_fresh_executor_tick_adopts_running_task_after_restart(kanban_home_fixtu
 def test_reconcile_planning_resumes_planning_not_spawn(kanban_home_fixture):
     conn = kanban_home_fixture
     task_id, run_id = _seed_running_task(conn, {"phase": "PLANNING"})
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
-    with patch.object(ex, "run_planning", return_value=({"task_summary": "x"}, None, [])) as mock_plan:
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
+    with patch.object(
+        ex, "run_planning", return_value=({"task_summary": "x"}, None, [])
+    ) as mock_plan:
         with patch.object(ex, "clone_repo", return_value=(True, "")):
             with patch.object(ex, "build_repo_summary", return_value="summary"):
                 with patch.object(executor, "_spawn_attempt") as mock_spawn:
@@ -372,21 +380,23 @@ def test_reconcile_preparing_reruns_prepare_not_spawn(kanban_home_fixture):
             "contract": {"task_summary": "x"},
         },
     )
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     with patch.object(ex, "start_new_run") as mock_new_run:
         with patch.object(ex, "clone_repo", return_value=(True, "/tmp/r")):
-            with patch.object(ex, "ensure_dev_branch", return_value=("hermes-dev/t", "abc")):
+            with patch.object(
+                ex, "ensure_dev_branch", return_value=("hermes-dev/t", "abc")
+            ):
                 with patch.object(ex, "install_pinned_agents", return_value="pinned"):
-                    with patch.object(ex, "systemd_run_attempt", return_value=(True, 1, 100)):
+                    with patch.object(
+                        ex, "systemd_run_attempt", return_value=(True, 1, 100)
+                    ):
                         ex.reconcile_board(
                             conn,
                             executor.cfg,
@@ -396,7 +406,9 @@ def test_reconcile_preparing_reruns_prepare_not_spawn(kanban_home_fixture):
                         mock_new_run.assert_not_called()
 
 
-def test_reconcile_stale_candidate_without_unit_started_retries(kanban_home_fixture, tmp_path):
+def test_reconcile_stale_candidate_without_unit_started_retries(
+    kanban_home_fixture, tmp_path
+):
     conn = kanban_home_fixture
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -409,16 +421,14 @@ def test_reconcile_stale_candidate_without_unit_started_retries(kanban_home_fixt
             "repo_path": str(repo),
         },
     )
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     with patch.object(ex, "git_head_sha", return_value="C2"):
         with patch.object(executor, "_spawn_attempt"):
             decisions = ex.reconcile_board(

@@ -28,7 +28,9 @@ def kanban_home(tmp_path, monkeypatch):
 def git_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True
+    )
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"],
         cwd=repo,
@@ -42,7 +44,9 @@ def git_repo(tmp_path):
         capture_output=True,
     )
     (repo / "README.md").write_text("hi\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo, check=True, capture_output=True
+    )
     subprocess.run(
         ["git", "commit", "-m", "init"],
         cwd=repo,

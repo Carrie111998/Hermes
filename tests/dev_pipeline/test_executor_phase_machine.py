@@ -50,7 +50,14 @@ def test_planning_records_phase_transitions(kanban_home):
     )
     kb.claim_task(conn, task_id, claimer="dev-executor")
     run = kb.latest_run(conn, task_id)
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_PLANNING)
 
     contract = {
@@ -75,9 +82,17 @@ def test_planning_records_phase_transitions(kanban_home):
         with patch.object(ex, "build_repo_summary", return_value="summary"):
             with patch.object(ex, "run_planning", return_value=(contract, "", [])):
                 executor._phase_planning(conn, task_id, run.id, {}, {})
-                executor._phase_routing(conn, task_id, run.id, ex.load_run_metadata(conn, run.id), ex.pipeline_state(ex.load_run_metadata(conn, run.id)))
+                executor._phase_routing(
+                    conn,
+                    task_id,
+                    run.id,
+                    ex.load_run_metadata(conn, run.id),
+                    ex.pipeline_state(ex.load_run_metadata(conn, run.id)),
+                )
 
-    assert ex.PHASE_ROUTING in _phase_names(conn, task_id) or ex.PHASE_PREPARING in _phase_names(conn, task_id)
+    assert ex.PHASE_ROUTING in _phase_names(
+        conn, task_id
+    ) or ex.PHASE_PREPARING in _phase_names(conn, task_id)
     conn.close()
 
 
@@ -100,7 +115,14 @@ def test_planning_fail_closed_block_kinds(kanban_home, block_kind, planning_retu
     )
     kb.claim_task(conn, task_id, claimer="dev-executor")
     run = kb.latest_run(conn, task_id)
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_PLANNING)
 
     with patch.object(ex, "clone_repo", return_value=(True, "/tmp/r")):
@@ -124,7 +146,14 @@ def test_routing_lane_unavailable(kanban_home):
     )
     kb.claim_task(conn, task_id, claimer="dev-executor")
     run = kb.latest_run(conn, task_id)
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_ROUTING)
     meta = ex.merge_pipeline_state(
         {},
@@ -180,7 +209,14 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
         },
     )
     ex.save_run_metadata(conn, run.id, meta)
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_REVIEWING)
 
     with patch.object(ex, "unified_diff", return_value="diff"):
@@ -189,7 +225,9 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
                 "P", (), {"stdout": "not json", "stderr": ""}
             )()
             with patch.object(ex, "resolve_cursor_agent_binary", return_value=None):
-                executor._phase_reviewing(conn, task_id, run.id, meta, ex.pipeline_state(meta))
+                executor._phase_reviewing(
+                    conn, task_id, run.id, meta, ex.pipeline_state(meta)
+                )
 
     assert "review_unavailable" in _dev_block_kinds(conn, task_id)
     conn.close()
@@ -224,7 +262,9 @@ def test_secret_in_diff_blocks(kanban_home, tmp_path):
         evidence_paths=[],
         diff_text="token ghp_abcdefghijklmnopqrstuvwxyz1234567890",
         gh_fn=lambda *_a, **_k: ex.run_subprocess(["true"]),
-        git_fn=lambda *_a, **_k: type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+        git_fn=lambda *_a, **_k: type(
+            "P", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )(),
     )
     assert ok is False
     assert kind == "secret_in_diff"

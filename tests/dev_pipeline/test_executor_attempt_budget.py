@@ -32,7 +32,9 @@ def _regression_results():
     return [fail]
 
 
-def test_repair_budget_one_attempt_plus_pipeline_allows_one_repair(kanban_home, tmp_path):
+def test_repair_budget_one_attempt_plus_pipeline_allows_one_repair(
+    kanban_home, tmp_path
+):
     kb.create_board("dev")
     conn = kb.connect(board="dev")
     repo = tmp_path / "repo"
@@ -80,16 +82,14 @@ def test_repair_budget_one_attempt_plus_pipeline_allows_one_repair(kanban_home, 
     )
     assert ex.count_attempt_runs(conn, task_id) == 1
 
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_VERIFYING)
     meta = ex.load_run_metadata(conn, pipeline_run)
 
@@ -129,7 +129,9 @@ def test_repair_budget_second_regression_does_not_spawn(kanban_home, tmp_path):
         task_id,
         outcome="completed",
         summary="attempt 1",
-        metadata={"dev_pipeline": {"run_kind": ex.RUN_KIND_ATTEMPT, "unit_started": True}},
+        metadata={
+            "dev_pipeline": {"run_kind": ex.RUN_KIND_ATTEMPT, "unit_started": True}
+        },
     )
     ex.start_new_run(
         conn,
@@ -141,7 +143,9 @@ def test_repair_budget_second_regression_does_not_spawn(kanban_home, tmp_path):
         task_id,
         outcome="completed",
         summary="attempt 2 repair",
-        metadata={"dev_pipeline": {"run_kind": ex.RUN_KIND_ATTEMPT, "unit_started": True}},
+        metadata={
+            "dev_pipeline": {"run_kind": ex.RUN_KIND_ATTEMPT, "unit_started": True}
+        },
     )
     pipeline_run = ex.start_pipeline_run(
         conn,
@@ -164,16 +168,14 @@ def test_repair_budget_second_regression_does_not_spawn(kanban_home, tmp_path):
     )
     assert ex.count_attempt_runs(conn, task_id) == 2
 
-    executor = ex.DevExecutor(
-        {
-            "enabled": True,
-            "board": "dev",
-            "max_attempts": 2,
-            "tick_seconds": 15,
-            "cursor_timeout_seconds": 1800,
-            "verify_command_timeout": 600,
-        }
-    )
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_VERIFYING)
     meta = ex.load_run_metadata(conn, pipeline_run)
 

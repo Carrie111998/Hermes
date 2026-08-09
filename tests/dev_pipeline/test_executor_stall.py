@@ -77,7 +77,14 @@ def test_running_phase_stall_stops_unit_and_classifies(kanban_home, tmp_path):
     )
     ex.save_run_metadata(conn, run.id, meta)
 
-    executor = ex.DevExecutor({"enabled": True, "board": "dev", "max_attempts": 2, "tick_seconds": 15, "cursor_timeout_seconds": 1800, "verify_command_timeout": 600})
+    executor = ex.DevExecutor({
+        "enabled": True,
+        "board": "dev",
+        "max_attempts": 2,
+        "tick_seconds": 15,
+        "cursor_timeout_seconds": 1800,
+        "verify_command_timeout": 600,
+    })
     active = ex.ActiveTask(task_id, run.id, ex.PHASE_RUNNING)
     active.last_jsonl_size = jsonl.stat().st_size
     active.last_jsonl_growth_at = time.time() - 700
@@ -86,9 +93,13 @@ def test_running_phase_stall_stops_unit_and_classifies(kanban_home, tmp_path):
     stop_calls = []
 
     with patch.object(executor, "_is_active", return_value=(True, "active")):
-        with patch.object(executor, "_stop", side_effect=lambda u: stop_calls.append(u) or True):
+        with patch.object(
+            executor, "_stop", side_effect=lambda u: stop_calls.append(u) or True
+        ):
             with patch.object(executor, "_finish_attempt") as fin:
-                executor._phase_running(conn, task_id, run.id, meta, ex.pipeline_state(meta))
+                executor._phase_running(
+                    conn, task_id, run.id, meta, ex.pipeline_state(meta)
+                )
                 fin.assert_called_once()
                 assert fin.call_args.kwargs.get("classification_hint") == "stalled"
     assert stop_calls
