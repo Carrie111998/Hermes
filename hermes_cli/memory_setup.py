@@ -496,7 +496,13 @@ def cmd_status(args) -> None:
     # "disabled" even though the tool worked on the platform in use (#81430).
     from hermes_cli.tools_config import _get_platform_tools
     platform_toolsets_cfg = config.get("platform_toolsets") or {}
-    configured_platforms = list(platform_toolsets_cfg.keys()) or ["cli"]
+    # Always include the platform the command runs under (cli), even when the
+    # user only configured gateway platforms. Otherwise a CLI user with
+    # platform_toolsets: {telegram: [...]} gets a false "disabled" — cli falls
+    # back to its default toolset (hermes-cli, which includes memory) via
+    # _get_platform_tools, but was never added to the checked set. dict.fromkeys
+    # dedupes while preserving order.
+    configured_platforms = list(dict.fromkeys([*platform_toolsets_cfg, "cli"]))
     tool_status_by_platform = {}
     for plat in configured_platforms:
         plat_tools = _get_platform_tools(config, plat, include_default_mcp_servers=False)
