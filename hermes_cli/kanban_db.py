@@ -10305,15 +10305,30 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 # Worker executor selection (native Hermes vs. direct Claude Code CLI)
 # ---------------------------------------------------------------------------
 
-#: Default lane. ``hermes -p <profile> chat -q`` — the native provider stack.
+#: Escape-hatch lane. ``hermes -p <profile> chat -q`` — the native provider
+#: stack. No longer the default; see :data:`DEFAULT_WORKER_EXECUTOR`.
 WORKER_EXECUTOR_HERMES = "hermes"
-#: Opt-in lane. Runs the Claude Code CLI (``claude -p``) directly so the worker
+#: Default lane. Runs the Claude Code CLI (``claude -p``) directly so the worker
 #: uses the operator's own interactive Claude subscription instead of the
 #: native ``provider=anthropic`` adapter's third-party/extra-usage credits.
 WORKER_EXECUTOR_CLAUDE_CLI = "claude_cli"
 
+#: The global default, for every board and every profile.
+#:
+#: This lane started out strictly opt-in. It is the default now because the
+#: native lane's provider routing failed in a way the dispatcher cannot see:
+#: when the pool behind ``provider=anthropic`` exhausts, every worker fails at
+#: startup, and one review card was re-dispatched 132 times behind repeated
+#: 429s before the breaker tripped — all while ``env -u CLAUDE_CONFIG_DIR
+#: claude -p`` answered fine in the same shell. An operator who wants the
+#: native lane back asks for it by name.
+DEFAULT_WORKER_EXECUTOR = WORKER_EXECUTOR_CLAUDE_CLI
+
+#: Per-process override, ahead of config. Lets one dispatcher (or a test) pick
+#: a lane without editing a shared file.
+ENV_WORKER_EXECUTOR = "HERMES_KANBAN_WORKER_EXECUTOR"
+
 _WORKER_EXECUTOR_ALIASES = {
-    "": WORKER_EXECUTOR_HERMES,
     "hermes": WORKER_EXECUTOR_HERMES,
     "native": WORKER_EXECUTOR_HERMES,
     "claude": WORKER_EXECUTOR_CLAUDE_CLI,
@@ -10338,14 +10353,33 @@ _WORKER_EXECUTOR_ALIASES = {
 #: when the whole point of this lane is the subscription. The
 #: ``CLAUDE_CODE_USE_*`` entries are the same class: they move the run onto a
 #: Bedrock / Vertex account's billing instead.
+#: The ``OPENAI_*`` / ``CODEX_*`` entries are here because this is the lane
+#: every worker takes now: a kanban worker must never reach the OpenAI-Codex
+#: stack, and a credential left in a detached child's environment is how it
+#: ends up quoted in a task log.
 CLAUDE_CLI_STRIPPED_ENV_VARS = (
     "CLAUDE_CONFIG_DIR",
+    "CLAUDE_API_KEY",
+    "CLAUDE_CODE_API_KEY_HELPER",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "CLOUD_ML_REGION",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "AZURE_OPENAI_API_KEY",
+    "AZURE_OPENAI_ENDPOINT",
+    "CODEX_HOME",
+    "CODEX_API_KEY",
 )
+
+#: Stamped onto every direct-lane worker so `ps`, the log header, and anything
+#: reading the child's env can tell which lane produced it.
+ENV_ACTIVE_EXECUTOR = "HERMES_KANBAN_EXECUTOR"
 
 #: Argv flags that grant a ``claude -p`` worker the ability to act. Without one
 #: of these the CLI runs in its default (ask-a-human) permission mode, and a
@@ -10361,6 +10395,25 @@ _CLAUDE_CLI_PERMISSION_FLAGS = (
     "--allowed-tools",
     "--settings",
 )
+
+#: ``--permission-mode`` applied when the operator supplied no permission flag
+#: of their own.
+#:
+#: This exists because the lane is the default now. While it was opt-in, adding
+#: a permission flag implicitly would have been escalating a worker's
+#: privileges uninvited, so the code only warned — and a warned-but-unarmed
+#: worker is merely a no-op on one board someone deliberately switched over.
+#: As the global lane that same warning would make *every* worker a no-op:
+#: able to read and post board comments, unable to edit a file or run a
+#: command, i.e. unable to do any task it is given.
+#:
+#: This is parity, not escalation. A native worker already runs with Hermes'
+#: full unattended tool surface, and the direct-lane worker is doing the same
+#: job in the same claimed workspace with stdin closed and no human to ask.
+#: Operators who sandbox differently set ``kanban.claude_cli_permission_mode``
+#: (or pass their own flag in ``claude_cli_extra_args``), and an explicit
+#: empty value restores the old warn-only behavior.
+CLAUDE_CLI_DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
 #: Minimum seconds between two direct-lane ``claude`` process *startups* on
 #: this Hermes root. See :func:`_claude_cli_spawn_gate`.
@@ -10391,29 +10444,47 @@ def _load_kanban_config() -> dict:
 
 
 def resolve_worker_executor(kanban_cfg: Optional[dict] = None) -> str:
-    """Return the configured worker executor lane.
+    """Return the worker executor lane for every dispatcher-spawned worker.
 
-    Reads ``kanban.worker_executor`` from ``config.yaml``. Anything other
-    than an explicit claude-cli spelling resolves to the native Hermes lane,
-    so the direct-CLI path is strictly opt-in. An unrecognized value is a
-    config typo, not an instruction: it is logged loudly and the native
-    default is used (a typo must never silently change how workers bill).
+    Precedence: ``$HERMES_KANBAN_WORKER_EXECUTOR`` → ``kanban.worker_executor``
+    → :data:`DEFAULT_WORKER_EXECUTOR` (the direct Claude CLI).
+
+    Global on purpose — not per-board or per-profile. The provider routing
+    this replaces was not profile-specific, so a per-profile opt-out would
+    leave exactly the boards that wedge hardest still wedging.
+
+    An unrecognized value is a config typo, not an instruction: it is logged
+    loudly and the *default* is used. Note the direction — a typo falls
+    forward to the direct lane, never back onto the native provider stack.
+    Silently restoring the failure mode this lane exists to remove would be
+    the worst possible reading of a misspelling.
     """
+    env_raw = os.environ.get(ENV_WORKER_EXECUTOR)
+    if env_raw and env_raw.strip():
+        resolved = _WORKER_EXECUTOR_ALIASES.get(env_raw.strip().lower())
+        if resolved is not None:
+            return resolved
+        _log.warning(
+            "kanban worker: unknown %s=%r — using %r.",
+            ENV_WORKER_EXECUTOR, env_raw, DEFAULT_WORKER_EXECUTOR,
+        )
+        return DEFAULT_WORKER_EXECUTOR
+
     if kanban_cfg is None:
         kanban_cfg = _load_kanban_config()
     raw = (kanban_cfg or {}).get("worker_executor")
-    if raw is None:
-        return WORKER_EXECUTOR_HERMES
+    if raw is None or not str(raw).strip():
+        return DEFAULT_WORKER_EXECUTOR
     key = str(raw).strip().lower()
     resolved = _WORKER_EXECUTOR_ALIASES.get(key)
     if resolved is None:
         _log.warning(
             "kanban worker: unknown kanban.worker_executor=%r — using %r. "
             "Valid values: %r, %r.",
-            raw, WORKER_EXECUTOR_HERMES,
+            raw, DEFAULT_WORKER_EXECUTOR,
             WORKER_EXECUTOR_HERMES, WORKER_EXECUTOR_CLAUDE_CLI,
         )
-        return WORKER_EXECUTOR_HERMES
+        return DEFAULT_WORKER_EXECUTOR
     return resolved
 
 
@@ -10465,6 +10536,10 @@ def _apply_claude_cli_env(env: dict) -> list[str]:
     for name in CLAUDE_CLI_STRIPPED_ENV_VARS:
         if env.pop(name, None) is not None:
             stripped.append(name)
+    env[ENV_ACTIVE_EXECUTOR] = WORKER_EXECUTOR_CLAUDE_CLI
+    # stdin is already /dev/null; this covers the other way a detached worker
+    # hangs forever — git blocking on a credential prompt nobody can answer.
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
     return stripped
 
 
@@ -10527,6 +10602,53 @@ def _claude_cli_extra_args(kanban_cfg: Optional[dict] = None) -> list[str]:
                 "entry %r.", item,
             )
     return args
+
+
+def _claude_cli_permission_mode(kanban_cfg: Optional[dict] = None) -> str:
+    """Return the ``--permission-mode`` for a direct-lane worker.
+
+    Empty string means "add nothing" — an explicit operator opt-out, distinct
+    from an unset key, which takes
+    :data:`CLAUDE_CLI_DEFAULT_PERMISSION_MODE`.
+    """
+    if kanban_cfg is None:
+        kanban_cfg = _load_kanban_config()
+    raw = (kanban_cfg or {}).get("claude_cli_permission_mode")
+    if raw is None:
+        return CLAUDE_CLI_DEFAULT_PERMISSION_MODE
+    return str(raw).strip()
+
+
+def _claude_cli_goal_mode_prompt(task: Task) -> str:
+    """Return the self-judge section for a goal-mode card, or ``""``.
+
+    Hermes' Ralph-style goal loop lives in cli.py's quiet branch and has no
+    host-CLI equivalent. While this lane was opt-in, the spawn refused a
+    goal-mode card outright: correct then, because the alternative was one
+    unjudged pass that looks like success to whoever asked for goal mode.
+
+    As the global lane, refusing would fail every goal card on every board
+    instead. So the judge step becomes the worker's own, stated explicitly in
+    the prompt — the one thing that must not happen is a goal card quietly
+    degrading into a single unjudged pass, and naming it is what prevents
+    that. The turn budget is passed through as a soft bound.
+    """
+    if not task.goal_mode:
+        return ""
+    budget = ""
+    if task.goal_max_turns is not None:
+        try:
+            budget = f" Keep it under about {int(task.goal_max_turns)} rounds."
+        except (TypeError, ValueError):
+            budget = ""
+    return (
+        "\n\nGOAL MODE: this card describes an outcome, not a checklist. There is "
+        "no external judge loop on this run — you are the judge. Before you "
+        "complete, re-read the card's success criteria and verify your work "
+        f"against each one, iterating until they actually hold.{budget} If you "
+        "cannot satisfy them, block with what is missing rather than completing "
+        "on a partial result."
+    )
 
 
 def _claude_cli_worker_prompt(task: Task, workspace: str) -> str:
@@ -10597,6 +10719,7 @@ def _claude_cli_worker_prompt(task: Task, workspace: str) -> str:
         "board rows are durable. The board, profile, and workspace are already "
         "pinned in your environment; do not pass --board and do not edit the "
         "board database directly."
+        + _claude_cli_goal_mode_prompt(task)
     )
 
 
@@ -10606,18 +10729,6 @@ def _build_claude_cli_worker_command(
     kanban_cfg: Optional[dict] = None,
 ) -> list[str]:
     """Build the full ``claude -p ...`` argv for a direct-CLI worker."""
-    if task.goal_mode:
-        # The Ralph-style goal loop lives in cli.py's quiet branch, so it has
-        # no equivalent here. Running a single pass instead would look like a
-        # success to the CLI and like an unjudged, silently-downgraded run to
-        # whoever asked for goal mode. Refuse: the spawn failure is recorded
-        # against the task and surfaces to a human after `failure_limit`.
-        raise RuntimeError(
-            f"kanban task {task.id} has goal_mode enabled, which the "
-            f"{WORKER_EXECUTOR_CLAUDE_CLI!r} executor does not implement (the "
-            "goal judge loop is a Hermes CLI feature). Clear goal_mode on the "
-            f"task or run it on the {WORKER_EXECUTOR_HERMES!r} executor."
-        )
     cmd = _resolve_claude_cli_argv(kanban_cfg)
     model = _claude_cli_model_arg(task, kanban_cfg)
     if model:
@@ -10626,17 +10737,24 @@ def _build_claude_cli_worker_command(
     if not any(
         arg.split("=", 1)[0] in _CLAUDE_CLI_PERMISSION_FLAGS for arg in extra
     ):
-        # Not fatal — a read-only investigation task is a legitimate use — but
-        # it is the single most common reason this lane "does nothing".
-        _log.warning(
-            "kanban worker %s: no permission flag in kanban.claude_cli_extra_args, "
-            "so `claude -p` runs in its default ask-a-human permission mode. The "
-            "worker can still report on the board (those commands are granted "
-            "explicitly) but cannot edit files or run any other command. Note that "
-            "`--permission-mode acceptEdits` covers file edits only, NOT Bash — a "
-            "task whose work needs to run commands needs a broader mode.",
-            task.id,
-        )
+        mode = _claude_cli_permission_mode(kanban_cfg)
+        if mode:
+            cmd.extend(["--permission-mode", mode])
+        else:
+            # Explicitly disabled. A read-only investigation lane is a
+            # legitimate setup, but it is also the single most common reason
+            # this lane "does nothing", so it stays loud.
+            _log.warning(
+                "kanban worker %s: kanban.claude_cli_permission_mode is empty and "
+                "no permission flag is set in kanban.claude_cli_extra_args, so "
+                "`claude -p` runs in its default ask-a-human permission mode. The "
+                "worker can still report on the board (those commands are granted "
+                "explicitly) but cannot edit files or run any other command. Note "
+                "that `--permission-mode acceptEdits` covers file edits only, NOT "
+                "Bash — a task whose work needs to run commands needs a broader "
+                "mode.",
+                task.id,
+            )
     # Always last, and always merged rather than appended as a second flag:
     # without these the worker cannot run its own lifecycle commands.
     cmd.extend(_merge_allowed_tools(

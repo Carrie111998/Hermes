@@ -97,14 +97,17 @@ sessions still have zero `kanban_*` schema footprint unless configured.
 - **Isolation:** board is the hard boundary (workers get
   `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
   within a board for workspace-path + memory-key isolation.
-- **Worker executor:** workers run `hermes -p <profile> chat -q` by
-  default. `kanban.worker_executor: claude_cli` opts a board into
-  running the Claude Code CLI directly instead — for operators whose
-  `provider: anthropic` credentials are an extra-usage pool that
-  exhausts separately from their interactive subscription. Opt-in
-  only, no silent fallback either way, identical env/board pinning
-  across lanes, and the CLI lane has no `kanban_*` tools (it drives
-  the board with `hermes kanban` shell commands, which are granted to
-  it explicitly). See `docs/kanban/worker-executor.md`.
+- **Worker executor:** workers run the Claude Code CLI directly
+  (`claude -p`) under the operator's host login, on every board and
+  every profile — the native `hermes -p <profile> chat -q` lane bills
+  `provider: anthropic` credentials that on some setups are an
+  extra-usage pool exhausting separately from the interactive
+  subscription, which wedges boards invisibly.
+  `kanban.worker_executor: native` is the deliberate opt-out. No
+  silent fallback either way (an unresolvable CLI is a hard error; an
+  unknown value falls forward to the direct lane), identical env/board
+  pinning across lanes, and the CLI lane has no `kanban_*` tools (it
+  drives the board with `hermes kanban` shell commands, which are
+  granted to it explicitly). See `docs/kanban/worker-executor.md`.
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban

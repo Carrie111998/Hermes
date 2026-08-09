@@ -1,37 +1,48 @@
 # Kanban worker executor
 
-The dispatcher spawns each claimed task as a detached child process. By default
-that child is a native Hermes worker:
+The dispatcher spawns each claimed task as a detached child process. That child
+is the Claude Code CLI running under the operator's own host login:
+
+```
+claude -p [--model ...] --permission-mode bypassPermissions [...] "<protocol prompt>"
+```
+
+This is the default for **every board and every profile**. The alternative lane
+is the native Hermes worker:
 
 ```
 hermes -p <assignee> --cli --accept-hooks [...] chat -q "work kanban task <id>"
 ```
 
-That lane resolves the model through Hermes' own provider stack. On an
+which resolves the model through Hermes' own provider stack. On an
 Anthropic-backed profile it bills the configured `provider: anthropic`
 credentials, which on some setups is a third-party / extra-usage pool that can
 exhaust independently of the operator's interactive Claude subscription. When
 that pool is empty, every worker fails at startup even though
-`env -u CLAUDE_CONFIG_DIR claude -p ...` runs fine in the same shell.
-
-`kanban.worker_executor` lets an operator point workers at that working lane —
-the Claude Code CLI itself — explicitly.
+`env -u CLAUDE_CONFIG_DIR claude -p ...` runs fine in the same shell — and the
+dispatcher cannot tell that apart from a wedged board. One review card was
+re-dispatched 132 times behind repeated 429s before the breaker tripped. That
+is why the direct lane, which began as strictly opt-in, is now the default.
 
 ## Configuration
 
 ```yaml
 kanban:
-  # hermes (default) | claude_cli
+  # claude_cli (default) | hermes (alias: native)
   worker_executor: claude_cli
 
   # Optional. Absolute path or bare command name; default: `claude` on PATH.
   claude_cli_bin: /opt/homebrew/bin/claude
 
-  # Extra argv appended before `-p <prompt>`. YAML list or a single
-  # shell-quoted string. In practice this is REQUIRED — see "Permissions".
+  # --permission-mode for the run. Default `bypassPermissions` — see
+  # "Permissions". Set to "" to add no flag at all (read-only lane).
+  claude_cli_permission_mode: bypassPermissions
+
+  # Extra argv appended before the prompt. YAML list or a single
+  # shell-quoted string. A permission flag here wins over the setting above.
   claude_cli_extra_args:
-    - --permission-mode
-    - acceptEdits
+    - --add-dir
+    - /srv/shared
 
   # Optional. `--model` for the direct lane when a task carries no Claude
   # model override of its own.
@@ -44,6 +55,26 @@ kanban:
 
 `worker_executor` is a behavioral setting, so it lives in `config.yaml`, not in
 `.env`. It is per-profile-root like the rest of the `kanban:` block.
+`HERMES_KANBAN_WORKER_EXECUTOR` overrides it for a single process.
+
+To pin the default explicitly (and verify it is being read):
+
+```
+hermes config set kanban.worker_executor claude_cli
+hermes config get kanban.worker_executor
+```
+
+### Going back to the native lane
+
+```
+hermes config set kanban.worker_executor native
+```
+
+This is the only supported way back. There is no automatic fallback: an
+unresolvable `claude` binary is a hard error that records `spawn_failed`
+against the task, and an unrecognized `worker_executor` value falls *forward*
+to the direct lane. A typo must never silently restore the routing that wedged
+the board.
 
 ## Permissions — read this before you conclude the lane is broken
 
@@ -74,11 +105,23 @@ never started. It grants no general Bash, no `Edit`, and no `Write`. If you
 supply your own `--allowedTools`, these are merged into your list rather than
 added as a second flag (a second occurrence would win and silently drop yours).
 
-**The task's actual work permissions stay yours.** Hermes will not widen those
-for you. Choose them in `claude_cli_extra_args` based on what the tasks on this
-board need — `--permission-mode acceptEdits` for edit-only work, something
-broader if the work must run commands. A spawn with no permission flag at all
-logs a warning explaining the above.
+**The task's actual work permissions default to `bypassPermissions`.** While
+this lane was opt-in, Hermes only warned here and added nothing: silently
+widening a worker's privileges was not its call, and an unarmed worker was a
+no-op on one board someone had deliberately switched over. As the default lane
+that same warning would make *every* worker a no-op — able to read and post
+board comments, unable to edit a file or run a command, i.e. unable to do any
+task it is given.
+
+So `claude_cli_permission_mode` defaults to `bypassPermissions`. This is parity
+rather than escalation: a native Hermes worker already runs with the full
+unattended tool surface, and the direct-lane worker is doing the same job in
+the same claimed workspace with stdin closed and no human to ask.
+
+To choose differently, set `claude_cli_permission_mode` (or pass your own
+permission flag in `claude_cli_extra_args`, which wins) — `acceptEdits` for
+edit-only work, or `""` for a read-only lane, which restores the old
+warn-and-add-nothing behavior.
 
 ### Argument order is load-bearing
 
@@ -143,8 +186,7 @@ reclaim, not against being wedged.
 
 ## Credential policy
 
-The direct lane removes these variables from the child's environment and adds
-nothing:
+The direct lane removes these variables from the child's environment:
 
 | Variable | Why it is dropped |
 |---|---|
@@ -154,6 +196,14 @@ nothing:
 | `ANTHROPIC_BASE_URL` | Keeps an inherited gateway/proxy override from redirecting the subscription lane. |
 | `CLAUDE_CODE_USE_BEDROCK` | Would move the run onto an AWS account's billing. |
 | `CLAUDE_CODE_USE_VERTEX` | Would move the run onto a GCP account's billing. |
+| `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`, `CLOUD_ML_REGION` | The rest of the cloud-account routing surface. |
+| `CLAUDE_API_KEY`, `CLAUDE_CODE_API_KEY_HELPER` | Alternate ways to hand the CLI a key instead of the host login. |
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `CODEX_HOME`, `CODEX_API_KEY` | A kanban worker must never reach the OpenAI-Codex stack, and a credential left in a detached child's environment is how it ends up quoted in a task log. |
+
+It adds exactly two variables: `HERMES_KANBAN_EXECUTOR=claude_cli`, so anything
+reading the child's env can tell which lane produced it, and
+`GIT_TERMINAL_PROMPT=0`, so a worker doing git work fails fast instead of
+blocking forever on a credential prompt nobody can answer.
 
 Hermes never reads, copies, decrypts, or rewrites the Claude credential store.
 No token is placed in argv, in the child env, in the board database, or in a
@@ -183,13 +233,14 @@ with `kanban.max_in_progress_per_profile`.
 
 ## No silent fallback
 
-Selecting `claude_cli` is a commitment. If the binary is missing, not
+The direct lane is a commitment, not a preference. If the binary is missing, not
 executable, or the configured `claude_cli_bin` path does not exist, the spawn
 raises with an actionable message naming the lane and the exact path, and the
 task is *not* started on the native provider instead — a quiet downgrade would
-put the run back on the exhausted pool the setting exists to avoid. An
+put the run back on the exhausted pool this lane exists to avoid. An
 unrecognized `worker_executor` value is treated as a typo: it is logged loudly
-and the native default is used, so a misspelling never changes billing.
+and the *default* is used. Note the direction — a typo resolves forward to the
+direct lane, never back onto the provider stack that wedged the board.
 
 Each direct-lane spawn logs the executor, the resolved binary, the *names* of
 the argv flags, and the *names* of the stripped variables — never a flag value,
@@ -198,11 +249,16 @@ header in the task's worker log.
 
 ## Limitations
 
-- **Goal mode is unsupported, and refuses rather than degrades.** The
-  Ralph-style `/goal` judge loop lives in the Hermes CLI's quiet path. Spawning
-  a `goal_mode` task on the direct lane raises; the attempt is recorded against
-  the task and reaches a human after `kanban.failure_limit`. Clear `goal_mode`
-  or run that task on the native executor.
+- **Goal mode has no judge loop; the worker judges itself.** The Ralph-style
+  `/goal` loop lives in the Hermes CLI's quiet path and has no CLI equivalent.
+  While this lane was opt-in the spawn refused a `goal_mode` card outright,
+  because the alternative was one unjudged pass that looks like success. As the
+  default lane that would fail every goal card on every board, so the prompt
+  instead carries an explicit GOAL MODE section telling the worker to verify
+  its work against the card's success criteria before completing, and to block
+  rather than complete on a partial result. `goal_max_turns` is passed through
+  as a soft round budget. This is weaker than the native judge loop — run
+  goal-critical cards on `native` if you need the real thing.
 - **Per-task `--toolsets`, `--skills`, and `--reasoning` pins do not apply** —
   they are Hermes CLI flags. Use `claude_cli_extra_args` for the CLI's own
   equivalents.

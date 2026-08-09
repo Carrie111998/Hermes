@@ -1,21 +1,27 @@
 """Kanban worker executor selection: native Hermes vs. direct Claude Code CLI.
 
-The dispatcher's ``_default_spawn`` runs ``hermes -p <profile> chat -q`` by
-default. When ``kanban.worker_executor: claude_cli`` is set in ``config.yaml``,
-it must instead run the Claude Code CLI directly (the lane that works against
-an interactive Claude subscription), while keeping every worker invariant the
-native lane has: board/profile/tenant/task/workspace env pins, the per-task log
-file, and the returned PID the dispatcher uses for crash detection.
+The dispatcher's ``_default_spawn`` runs the Claude Code CLI directly
+(``claude -p``) for every worker, on every board and every profile — the lane
+that works against an interactive Claude subscription. It keeps every worker
+invariant the native lane has: board/profile/tenant/task/workspace env pins,
+the per-task log file, and the returned PID the dispatcher uses for crash
+detection. ``kanban.worker_executor: native`` is the deliberate opt-out back
+to ``hermes -p <profile> chat -q``.
 
 Contracts asserted here:
 
-* default (no config) → native ``hermes`` argv; claude never invoked
-* opt-in → ``claude -p <prompt>`` argv, no ``hermes chat`` anywhere
+* default (no config) → ``claude -p <prompt>`` argv, no ``hermes chat``
+* explicit ``native`` → native ``hermes`` argv; claude never invoked
+* an unknown value falls *forward* to the direct lane, never back onto the
+  provider stack that wedged the board
+* the config keys are recognized by ``hermes config set``
 * the env is identical across lanes for every board-isolation pin
 * the direct lane drops ``CLAUDE_CONFIG_DIR`` and inherited Anthropic API
   credentials, and never copies a token into argv or the log
 * a missing/unusable ``claude`` binary is a hard error, never a silent
   downgrade back onto the native provider
+* a worker gets a permission mode by default, so the global lane can actually
+  act rather than no-opping on every card
 """
 
 from __future__ import annotations
@@ -109,32 +115,89 @@ def _select(monkeypatch, kb, **kanban_cfg):
 # ---------------------------------------------------------------------------
 
 class TestResolveWorkerExecutor:
-    def test_default_is_native_hermes(self):
+    def test_default_is_the_direct_claude_cli(self):
+        """Global default: unset config means the direct lane, everywhere."""
         from hermes_cli import kanban_db as kb
 
-        assert kb.resolve_worker_executor({}) == kb.WORKER_EXECUTOR_HERMES
-        assert kb.resolve_worker_executor({"worker_executor": None}) == "hermes"
-        assert kb.resolve_worker_executor({"worker_executor": "hermes"}) == "hermes"
+        assert kb.resolve_worker_executor({}) == kb.WORKER_EXECUTOR_CLAUDE_CLI
+        assert kb.resolve_worker_executor({"worker_executor": None}) == "claude_cli"
+        assert kb.resolve_worker_executor({"worker_executor": ""}) == "claude_cli"
+        assert kb.DEFAULT_WORKER_EXECUTOR == kb.WORKER_EXECUTOR_CLAUDE_CLI
 
     @pytest.mark.parametrize(
         "value",
         ["claude_cli", "claude-cli", "claude", "claude_code", "CLAUDE_CLI", " claude_cli "],
     )
-    def test_claude_spellings_opt_in(self, value):
+    def test_claude_spellings_resolve(self, value):
         from hermes_cli import kanban_db as kb
 
         assert kb.resolve_worker_executor({"worker_executor": value}) == (
             kb.WORKER_EXECUTOR_CLAUDE_CLI
         )
 
-    def test_unknown_value_falls_back_to_native_with_warning(self, caplog):
+    @pytest.mark.parametrize("value", ["hermes", "native"])
+    def test_native_is_an_explicit_opt_out(self, value):
+        from hermes_cli import kanban_db as kb
+
+        assert kb.resolve_worker_executor({"worker_executor": value}) == (
+            kb.WORKER_EXECUTOR_HERMES
+        )
+
+    def test_unknown_value_falls_forward_to_the_default(self, caplog):
+        """A typo must not silently restore the lane this one replaced.
+
+        Note the direction: unknown resolves to the direct CLI, not back to
+        the native provider stack that wedged the board.
+        """
         from hermes_cli import kanban_db as kb
 
         with caplog.at_level("WARNING"):
             resolved = kb.resolve_worker_executor({"worker_executor": "gemini"})
 
-        assert resolved == kb.WORKER_EXECUTOR_HERMES
+        assert resolved == kb.WORKER_EXECUTOR_CLAUDE_CLI
         assert "worker_executor" in caplog.text
+
+    def test_env_override_beats_config(self, monkeypatch):
+        from hermes_cli import kanban_db as kb
+
+        monkeypatch.setenv(kb.ENV_WORKER_EXECUTOR, "native")
+        assert kb.resolve_worker_executor({"worker_executor": "claude_cli"}) == (
+            kb.WORKER_EXECUTOR_HERMES
+        )
+
+    def test_unknown_env_override_falls_forward(self, monkeypatch, caplog):
+        from hermes_cli import kanban_db as kb
+
+        monkeypatch.setenv(kb.ENV_WORKER_EXECUTOR, "gemini")
+        with caplog.at_level("WARNING"):
+            assert kb.resolve_worker_executor({"worker_executor": "hermes"}) == (
+                kb.WORKER_EXECUTOR_CLAUDE_CLI
+            )
+        assert kb.ENV_WORKER_EXECUTOR in caplog.text
+
+    def test_config_key_is_recognized_by_config_set(self):
+        """`hermes config set kanban.worker_executor ...` must not warn.
+
+        The lane was unreachable in practice before this: the code read the
+        key but nothing declared it, so `config set` flagged it as unknown
+        and operators reasonably assumed it was being ignored.
+        """
+        from hermes_cli.config import _validate_config_key
+
+        for key in (
+            "kanban.worker_executor",
+            "kanban.claude_cli_bin",
+            "kanban.claude_cli_model",
+            "kanban.claude_cli_permission_mode",
+            "kanban.claude_cli_extra_args",
+            "kanban.claude_cli_spawn_stagger_seconds",
+        ):
+            assert _validate_config_key(key)[0] is True, key
+
+    def test_config_default_ships_the_direct_lane(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["kanban"]["worker_executor"] == "claude_cli"
 
 
 # ---------------------------------------------------------------------------
@@ -142,9 +205,24 @@ class TestResolveWorkerExecutor:
 # ---------------------------------------------------------------------------
 
 class TestSpawnCommand:
-    def test_default_spawns_native_hermes_chat(self, spawn_env, monkeypatch):
+    def test_default_spawns_the_direct_claude_cli(self, spawn_env, monkeypatch):
+        """No `worker_executor` in config: the direct lane is what runs."""
         kb = spawn_env["kb"]
         _select(monkeypatch, kb)
+
+        pid = kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert pid == 4321
+        assert cmd[0] == str(spawn_env["claude_bin"])
+        assert cmd[-2] == "-p"
+        assert "chat" not in cmd
+        assert "-q" not in cmd
+
+    def test_explicit_native_still_spawns_hermes_chat(self, spawn_env, monkeypatch):
+        """`native` remains a working, deliberate escape hatch."""
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="native")
 
         pid = kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
 
@@ -176,31 +254,81 @@ class TestSpawnCommand:
         assert "chat" not in cmd
         assert "-q" not in cmd
 
-    def test_goal_mode_refuses_instead_of_silently_downgrading(
-        self, spawn_env, monkeypatch
-    ):
+    def test_goal_mode_gets_an_explicit_self_judge_step(self, spawn_env, monkeypatch):
         """The goal judge loop is a Hermes CLI feature with no CLI equivalent.
 
-        Running a single pass would look like success to the CLI and like an
-        unjudged run to whoever asked for goal mode.
+        While this lane was opt-in the spawn refused a goal card outright,
+        because the alternative was one unjudged pass that looks like success.
+        As the global lane, refusing would fail every goal card on every
+        board, so the judge step is handed to the worker explicitly. What must
+        not happen is a silent single-pass downgrade — naming it is what
+        prevents that.
         """
         kb = spawn_env["kb"]
         _select(monkeypatch, kb, worker_executor="claude_cli")
 
-        with pytest.raises(RuntimeError) as exc:
-            kb._default_spawn(_make_task(kb, goal_mode=True), str(spawn_env["workspace"]))
+        kb._default_spawn(
+            _make_task(kb, goal_mode=True, goal_max_turns=6),
+            str(spawn_env["workspace"]),
+        )
 
-        assert "goal_mode" in str(exc.value)
-        assert "cmd" not in spawn_env["captured"]
+        prompt = spawn_env["captured"]["cmd"][-1]
+        assert "GOAL MODE" in prompt
+        assert "you are the judge" in prompt.lower()
+        assert "6 rounds" in prompt
 
-    def test_missing_permission_flag_warns(self, spawn_env, monkeypatch, caplog):
-        """Default permission mode + no TTY = a worker that cannot act."""
+    def test_non_goal_cards_get_no_judge_section(self, spawn_env, monkeypatch):
         kb = spawn_env["kb"]
         _select(monkeypatch, kb, worker_executor="claude_cli")
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        assert "GOAL MODE" not in spawn_env["captured"]["cmd"][-1]
+
+    def test_permission_mode_defaults_so_the_worker_can_act(
+        self, spawn_env, monkeypatch
+    ):
+        """Default permission mode + no TTY = a worker that cannot act.
+
+        Warning was enough while the lane was opt-in; as the global lane an
+        unarmed worker would no-op on every card, so a mode is supplied.
+        """
+        kb = spawn_env["kb"]
+        _select(monkeypatch, kb, worker_executor="claude_cli")
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert "--permission-mode" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
+
+    def test_operator_permission_flag_is_not_overridden(self, spawn_env, monkeypatch):
+        kb = spawn_env["kb"]
+        _select(
+            monkeypatch, kb, worker_executor="claude_cli",
+            claude_cli_extra_args=["--permission-mode", "acceptEdits"],
+        )
+
+        kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
+
+        cmd = spawn_env["captured"]["cmd"]
+        assert cmd.count("--permission-mode") == 1
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+
+    def test_empty_permission_mode_restores_the_warning(
+        self, spawn_env, monkeypatch, caplog
+    ):
+        """An explicit empty value is a read-only lane, and stays loud."""
+        kb = spawn_env["kb"]
+        _select(
+            monkeypatch, kb, worker_executor="claude_cli",
+            claude_cli_permission_mode="",
+        )
 
         with caplog.at_level("WARNING"):
             kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
 
+        assert "--permission-mode" not in spawn_env["captured"]["cmd"]
         assert "permission" in caplog.text.lower()
 
     def test_board_lifecycle_commands_are_granted(self, spawn_env, monkeypatch):
@@ -505,7 +633,7 @@ class TestWorkerEnv:
         return dict(spawn_env["captured"]["env"])
 
     def test_board_and_identity_pins_match_across_executors(self, spawn_env, monkeypatch):
-        native = self._env_for(spawn_env, monkeypatch)
+        native = self._env_for(spawn_env, monkeypatch, worker_executor="native")
         claude = self._env_for(spawn_env, monkeypatch, worker_executor="claude_cli")
 
         for key in self.PINS:
@@ -539,10 +667,10 @@ class TestWorkerEnv:
         assert not any("sk-ant-secret" in part for part in spawn_env["captured"]["cmd"])
 
     def test_native_lane_keeps_claude_config_dir(self, spawn_env, monkeypatch):
-        """The strip is scoped to the opt-in lane; the default is untouched."""
+        """The strip is scoped to the direct lane; `native` is untouched."""
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/tmp/hermes-managed-claude")
 
-        env = self._env_for(spawn_env, monkeypatch)
+        env = self._env_for(spawn_env, monkeypatch, worker_executor="native")
 
         assert env["CLAUDE_CONFIG_DIR"] == "/tmp/hermes-managed-claude"
 
@@ -620,7 +748,7 @@ class TestFailureHandling:
     ):
         """Broadening the native lane's except must not swallow real errors."""
         kb = spawn_env["kb"]
-        _select(monkeypatch, kb)
+        _select(monkeypatch, kb, worker_executor="native")
 
         def boom(*_args, **_kwargs):
             raise PermissionError(13, "Permission denied")
@@ -732,9 +860,9 @@ class TestSpawnGate:
         assert starts[1] - starts[0] >= 0.3
 
     def test_native_lane_does_not_take_the_gate(self, spawn_env, monkeypatch):
-        """The gate is scoped to the opt-in lane — no default-path cost."""
+        """The gate is scoped to the direct lane; `native` never pays for it."""
         kb = spawn_env["kb"]
-        _select(monkeypatch, kb)
+        _select(monkeypatch, kb, worker_executor="native")
 
         kb._default_spawn(_make_task(kb), str(spawn_env["workspace"]))
 
