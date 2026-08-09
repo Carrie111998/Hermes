@@ -106,6 +106,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("new", "Start a new session (fresh session ID + history)", "Session",
                aliases=("reset",), args_hint="[name]",
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
+    CommandDef("end", "Run session closeout (log worklog, update memory, summarize)", "Session",
+               busy_policy="dispatch"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
@@ -1277,7 +1279,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "end"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
