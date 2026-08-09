@@ -2865,6 +2865,21 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+_DISPATCH_CLAIM_SUFFIX = ":dispatch"
+
+
+def _dispatcher_claimer_id() -> str:
+    """Return a durable marker for claims owned by automatic dispatch."""
+    return f"{_claimer_id()}{_DISPATCH_CLAIM_SUFFIX}"
+
+
+def _is_host_local_dispatch_claim(claim_lock: Optional[str]) -> bool:
+    """Distinguish automatic launches from direct/manual task claims."""
+    lock = claim_lock or ""
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    return lock.startswith(host_prefix) and lock.endswith(_DISPATCH_CLAIM_SUFFIX)
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -7627,6 +7642,8 @@ def detect_never_started(
     crash detection also ignores them because it requires a PID.  After twice
     the normal launch grace, a host-local claim with no PID, heartbeat, or
     worker log from the active attempt is therefore treated as a spawn failure.
+    Automatic dispatch marks its claim lock explicitly; direct/manual claims
+    intentionally lack that marker and are never interpreted as failed spawns.
 
     The log check protects the narrow ``Popen`` -> PID-persistence crash window:
     ``_default_spawn`` opens the task log before starting the child, so a log
@@ -7642,7 +7659,6 @@ def detect_never_started(
         else max(0, int(grace_seconds))
     )
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     rows = conn.execute(
         "SELECT t.id, t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
@@ -7663,7 +7679,7 @@ def detect_never_started(
     log_dir = worker_logs_dir(board=board)
     for row in rows:
         claim_lock = row["claim_lock"] or ""
-        if not claim_lock.startswith(host_prefix):
+        if not _is_host_local_dispatch_claim(claim_lock):
             continue
         log_path = log_dir / f"{row['id']}.log"
         if log_path.exists():
@@ -8763,7 +8779,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claimer_id(),
+        )
         if claimed is None:
             continue
         try:
@@ -8855,7 +8876,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claimer_id(),
+        )
         if claimed is None:
             continue
         try:
