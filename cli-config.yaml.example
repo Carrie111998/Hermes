@@ -748,6 +748,46 @@ session_reset:
 # local runtime lease registry cannot be read or locked.
 max_concurrent_sessions: null
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Global Daily LLM Token Budget
+# ─────────────────────────────────────────────────────────────────────────────
+# One daily budget for AGENT-LOOP tokens, shared by every surface that runs
+# the agent loop in this profile (CLI, TUI, desktop, messaging gateway, cron
+# jobs, subagents) and by every concurrent Hermes process — the ledger lives in
+# the profile's state.db, not in memory.
+#
+# Each provider attempt reserves its estimated cost before the request and
+# settles the real token count afterwards, so estimates self-correct and two
+# processes can never both spend the last of the budget. Retries are metered
+# individually. A request that no longer fits is refused instead of being sent.
+#
+# WHAT THIS GUARANTEES: admission, not an absolute ceiling. A call's true cost
+# is only known once the provider has answered, so a day can end over
+# daily_tokens by however much the last admitted response overshot its
+# reservation — one API response's worth, charged in full so the next attempt
+# is judged against the corrected total.
+#
+# SCOPE: auxiliary provider calls are NOT counted — context compression and
+# summarisation, memory/curator passes, title generation, embeddings, and MoA
+# advisor fan-out all spend tokens this ledger never sees. daily_tokens bounds
+# the agent loop, not your whole provider bill; leave headroom accordingly.
+#
+# You get one-time notifications at 50% and 75% of the daily budget (once per
+# day across all processes, not once per session), and `/usage` shows the
+# current global figure in both the CLI and messaging platforms.
+#
+# A reservation is handed back only by the process holding it — there is no
+# reclamation timer, so a SIGKILLed process parks its claim until midnight.
+# That loses capacity rather than overspending it, which is the tradeoff this
+# feature exists to make.
+#
+# daily_tokens: 0 or null disables the feature entirely — no ledger reads and
+# no writes on the request path.
+budget:
+  daily_tokens: 0          # e.g. 2000000 for a 2M-token/day budget
+  timezone: ""             # IANA zone deciding when "today" rolls over;
+                           # empty falls back to the global `timezone` setting
+
 # When true, group/channel chats use one session per participant when the platform
 # provides a user ID. This is the secure default and prevents users in the same
 # room from sharing context, interrupts, and token costs. Set false only if you

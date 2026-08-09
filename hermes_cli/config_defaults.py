@@ -1941,6 +1941,24 @@ DEFAULT_CONFIG = {
     # Empty string means use server-local time.
     "timezone": "",
 
+    # Global daily budget for AGENT-LOOP tokens, shared by every surface that
+    # runs the loop (CLI, TUI, desktop, gateway, cron, subagents) and every
+    # concurrent process — the ledger lives in the profile's state.db. Each
+    # provider attempt reserves its estimate before the request and settles the
+    # real token count afterwards; a request that no longer fits is refused.
+    # It gates admission rather than capping spend absolutely: a day can end
+    # over by one response's overshoot of its reservation. Auxiliary calls
+    # (compression, summaries, memory, embeddings, MoA advisors) are NOT
+    # metered. See agent/token_budget.py.
+    "budget": {
+        # Tokens per calendar day. 0 / null disables the feature entirely
+        # (no ledger reads, no writes).
+        "daily_tokens": 0,
+        # IANA timezone deciding when "today" rolls over. Empty string falls
+        # back to the global `timezone` setting above (then server-local).
+        "timezone": "",
+    },
+
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels

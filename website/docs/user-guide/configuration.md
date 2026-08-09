@@ -2023,6 +2023,77 @@ group_sessions_per_user: true  # true = per-user isolation in groups/channels, f
 
 For the behavior details and examples, see [Sessions](/user-guide/sessions) and the [Discord guide](/user-guide/messaging/discord).
 
+## Global Daily LLM Token Budget
+
+Cap how many tokens the **agent loop** may spend per calendar day. The budget
+is shared by every surface that runs the agent loop — CLI, TUI, desktop,
+messaging gateway, cron jobs, and subagents — and by every concurrent Hermes
+process:
+
+```yaml
+budget:
+  daily_tokens: 2000000   # 0 / null = disabled (default)
+  timezone: "America/Sao_Paulo"   # empty = use the global `timezone` setting
+```
+
+The ledger lives in the profile's `state.db`, not in memory. Each provider
+attempt reserves its estimated cost before the request and settles the
+provider's real token count afterwards, so estimates self-correct and two
+processes can never both spend the last of the budget. Retries are metered
+individually, because each retry is a real request. A request that no longer
+fits is refused with a message instead of being sent, and the turn ends there.
+
+### What it guarantees
+
+`daily_tokens` is an **admission budget**, not an absolute ceiling: it decides
+whether the next provider attempt may be *sent*, using an estimate, because a
+call's real cost is only known once the provider has answered and the tokens
+are already spent. A day can therefore end slightly over `daily_tokens` — by
+however much the last admitted response exceeded its own reservation, i.e. at
+most one API response's overshoot. That overrun is charged in full, so the
+next attempt is judged against the corrected total and the gap does not
+compound.
+
+An attempt that gets a response is always charged: its reported usage when the
+provider sends one, and its reservation when the provider reports none. Only
+an attempt that never received a response at all (transport failure, a
+cancellation before any answer) gives its tokens back.
+
+### What is counted
+
+Only the agent loop's own model calls. Auxiliary provider calls do **not** go
+through this ledger and are not counted against the budget:
+
+- context compression and conversation summarisation
+- memory and curator passes
+- title generation, embeddings, and other background helpers
+- MoA advisor fan-out (the advisors' own calls, not the aggregator's)
+
+So `daily_tokens` bounds agent-loop spend, not the profile's total token spend.
+Leave headroom if you are budgeting against a provider bill.
+
+### Notifications and reporting
+
+You get one-time notifications at 50% and 75% of the daily budget — once per
+day across all processes, not once per session — and `/usage` shows the current
+global figure in both the CLI and messaging platforms. Reading `/usage` never
+mutates the ledger.
+
+### Failure behaviour
+
+The budget fails open: if the ledger cannot be read or written, calls proceed
+rather than being blocked. `daily_tokens: 0` (the default) disables the feature
+entirely, with no ledger reads or writes on the request path.
+
+Reservations are only ever handed back by the process that made them — there is
+no reclamation timer, because a timer that freed a call still in flight would
+lose that call's spend and keep admitting requests against budget that was
+already gone. Hermes releases its claim on every retry, iteration, and turn
+boundary, including abort paths, so this only bites if a process is `SIGKILL`ed
+mid-request: its reservation stays parked for the remainder of that day and the
+capacity is lost until midnight. That errs toward spending less than
+`daily_tokens`, never more.
+
 ## Unauthorized DM Behavior
 
 Control what Hermes does when an unknown user sends a direct message:

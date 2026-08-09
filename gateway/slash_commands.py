@@ -5089,6 +5089,20 @@ class GatewaySlashCommandsMixin:
         except Exception:
             credits_lines = []  # fail-open: never break /usage
 
+        # ── Global daily LLM budget ─────────────────────────────────────
+        # Agent-independent: a read of the profile's shared state.db ledger,
+        # which every surface (CLI, TUI, cron, this gateway) settles into. It
+        # therefore renders on every /usage branch below, including the ones
+        # with no resident agent. Same renderer the CLI uses, so the two
+        # surfaces cannot drift. Off the event loop (SQLite I/O). Fail-open.
+        budget_lines: list[str] = []
+        try:
+            from agent.token_budget import daily_budget_lines
+
+            budget_lines = await asyncio.to_thread(daily_budget_lines, markdown=True)
+        except Exception:
+            budget_lines = []
+
         if agent and hasattr(agent, "session_total_tokens") and agent.session_api_calls > 0:
             lines = []
 
@@ -5130,6 +5144,9 @@ class GatewaySlashCommandsMixin:
                 lines.append("")
                 lines.extend(breakdown_lines)
 
+            if budget_lines:
+                lines.append("")
+                lines.extend(budget_lines)
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
@@ -5152,6 +5169,9 @@ class GatewaySlashCommandsMixin:
                 t("gateway.usage.label_estimated_context", count=f"{approx:,}"),
                 t("gateway.usage.detailed_after_first"),
             ]
+            if budget_lines:
+                lines.append("")
+                lines.extend(budget_lines)
             if account_lines:
                 lines.append("")
                 lines.extend(account_lines)
@@ -5159,13 +5179,16 @@ class GatewaySlashCommandsMixin:
                 lines.append("")
                 lines.extend(credits_lines)
             return "\n".join(lines)
-        if account_lines or credits_lines:
-            # account-only, credits-only, or both — joined with a blank divider.
-            parts = list(account_lines)
-            if credits_lines:
+        if budget_lines or account_lines or credits_lines:
+            # budget-only, account-only, credits-only, or any mix — joined with
+            # blank dividers in the same order as the with-agent branch.
+            parts: list[str] = []
+            for block in (budget_lines, account_lines, credits_lines):
+                if not block:
+                    continue
                 if parts:
                     parts.append("")
-                parts.extend(credits_lines)
+                parts.extend(block)
             return "\n".join(parts)
         return t("gateway.usage.no_data")
 

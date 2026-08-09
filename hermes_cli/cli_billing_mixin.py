@@ -85,6 +85,27 @@ class CLIBillingMixin:
             print(f"  {line}")
         return True
 
+    def _print_daily_budget_block(self) -> bool:
+        """Print the global daily LLM token budget block. True if it printed.
+
+        Agent-independent (a read of the profile's shared state.db ledger), so
+        ``/usage`` shows today's global spend even with no live agent — the
+        budget is a property of the profile, not of this session. Returns
+        False when ``budget.daily_tokens`` is unset, which is the default.
+        """
+        try:
+            from agent.token_budget import daily_budget_lines
+
+            lines = daily_budget_lines()
+        except Exception:
+            return False
+        if not lines:
+            return False
+        print()
+        for line in lines:
+            print(f"  {line}")
+        return True
+
     def _print_usage_cta(self) -> None:
         """Print the `/usage` call-to-action pointing at /subscription + /topup.
 

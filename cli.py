@@ -11526,11 +11526,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         with no live agent — important for the TUI, where /usage runs in a slash-worker
         subprocess that resumes the session WITHOUT building an agent (self.agent is None),
         which would otherwise early-return before any credits showed.
+
+        The global daily-budget block is agent-independent for the same reason,
+        but a stronger one: it reports the WHOLE profile's spend today (every
+        CLI, gateway, and cron process), so it is meaningful before this
+        session has made a single call.
         """
         if not self.agent:
+            printed_budget = self._print_daily_budget_block()
             if self._print_nous_credits_block():
                 self._print_usage_cta()
-            else:
+            elif not printed_budget:
                 print("(._.) No active agent -- send a message first.")
             return
 
@@ -11538,9 +11544,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         calls = agent.session_api_calls
 
         if calls == 0:
+            printed_budget = self._print_daily_budget_block()
             if self._print_nous_credits_block():
                 self._print_usage_cta()
-            else:
+            elif not printed_budget:
                 print("(._.) No API calls made yet in this session.")
             return
 
@@ -11608,6 +11615,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print()
             for line in account_lines:
                 print(line)
+
+        # Profile-wide daily token ceiling (agent-independent — see the
+        # docstring). Prints nothing when budget.daily_tokens is unset.
+        self._print_daily_budget_block()
 
         # Nous credits magnitudes + monthly-grant gauge (agent-independent — also
         # runs at the no-agent / no-calls early-returns above). See the helper.

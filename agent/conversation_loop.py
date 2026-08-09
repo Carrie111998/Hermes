@@ -1419,6 +1419,110 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _release_agent_budget_reservation(agent) -> None:
+    """Hand back an unsettled global daily-budget claim held by ``agent``.
+
+    A reservation is a *claim*, not a charge: releasing one never records
+    spend, so this may only run for an attempt that produced **no provider
+    response** — a transport exception, a denial, or a cancellation that never
+    got an answer.  An attempt that did get a response has already been settled
+    by :func:`_settle_agent_budget_reservation` the moment the response
+    arrived, which leaves nothing here to release; releasing a responded-to
+    attempt would book real provider spend as free.
+
+    Called at the top of every provider *attempt* (so a retry does not inherit
+    the previous attempt's claim), at the top of every loop iteration, after
+    the loop, and once more from ``AIAgent.run_conversation``'s ``finally`` —
+    which is what covers the early ``return`` and raise paths inside the loop.
+    Owner-release is the *only* way a claim comes back: ``token_budget``
+    deliberately runs no reclamation timer, so an attempt that dies without
+    releasing holds its tokens for the rest of the day.
+    """
+    held = getattr(agent, "_budget_reservation", None)
+    if held is None:
+        return
+    try:
+        from agent.token_budget import release as _budget_release
+
+        _budget_release(held)
+        # Retain the owner reference until SQLite accepted the release. A
+        # transient write failure can then be retried at the next boundary.
+        agent._budget_reservation = None
+    except Exception:
+        logger.debug("daily budget release failed (fail-open)", exc_info=True)
+
+
+def _settle_agent_budget_reservation(agent, response) -> None:
+    """Charge ``agent``'s global daily-budget claim for a provider response.
+
+    Runs the instant the provider answers, *before* the loop decides what to
+    do with that answer.  That ordering is the whole point: most of those
+    decisions leave the attempt without reaching the usage bookkeeping further
+    down — a redirect that crossed the response discards it, a truncated reply
+    re-loops for a continuation, a truncated tool call retries, a safety
+    refusal / thinking-budget exhaustion / rollback returns outright — and
+    every one of them is a response the provider already billed.  Settling
+    here is what stops those paths from handing the tokens back as if the
+    attempt had been free.
+
+    What gets charged:
+
+    * the response's canonical usage total, when the provider reported one;
+    * otherwise the reservation itself.  A response with no usage still burned
+      tokens, so its estimate is the honest floor — releasing it would record
+      a real call as costing nothing.
+
+    ``response is None`` means no answer exists (transport error, cancellation
+    before any response), so the claim is left outstanding for
+    :func:`_release_agent_budget_reservation` to hand back.
+    """
+    held = getattr(agent, "_budget_reservation", None)
+    if held is None or response is None:
+        return
+    # Conservative default; overridden below by the provider's real count.
+    actual = int(getattr(held, "tokens", 0) or 0)
+    usage = getattr(response, "usage", None)
+    if usage:
+        try:
+            reported = int(
+                normalize_usage(
+                    usage,
+                    provider=agent.provider,
+                    api_mode=agent.api_mode,
+                ).total_tokens
+                or 0
+            )
+            # A zero/absent total is "no usage supplied", not "free call".
+            if reported > 0:
+                actual = reported
+        except Exception:
+            logger.debug(
+                "daily budget usage normalization failed — charging the reservation",
+                exc_info=True,
+            )
+
+    try:
+        from agent.token_budget import (
+            settle as _budget_settle,
+            threshold_message as _budget_threshold_message,
+        )
+
+        # Swaps this attempt's estimate for ``actual`` in one transaction and
+        # returns whichever 50%/75% marks this settlement is responsible for.
+        # The ledger claims each mark atomically, so a mark is announced
+        # exactly once per day across every Hermes process. Keep the owner
+        # reference until SQLite accepts settlement: a transient write failure
+        # must remain retryable and must never be released as a free call.
+        _settle_outcome = _budget_settle(held, actual)
+        agent._budget_reservation = None
+        for _mark in _settle_outcome.crossed_marks:
+            agent._emit_status(
+                _budget_threshold_message(_settle_outcome.snapshot, _mark)
+            )
+    except Exception:
+        logger.debug("daily budget settle failed (fail-open)", exc_info=True)
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1603,6 +1707,17 @@ def run_conversation(
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
 
+    # Outstanding global daily-budget claim for the provider attempt in flight
+    # (see agent/token_budget.py). Reserved per physical attempt, settled as
+    # soon as the provider answers (real token count when reported, the
+    # reservation otherwise), and released only on paths that never got an
+    # answer at all. Covers this loop's provider calls only — auxiliary calls
+    # (compression, summaries, memory, embeddings) go through
+    # agent/auxiliary_client.py and are not metered. Held on the agent (not a
+    # local) so AIAgent.run_conversation()'s ``finally`` can release it after
+    # the loop's early-return and exception paths too.
+    agent._budget_reservation = None
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -1632,6 +1747,12 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Any claim still held here belongs to a previous iteration whose last
+        # attempt never got a provider response (transport failure, interrupt).
+        # An attempt that did get one settled on arrival, so there is nothing
+        # left to free. Give the unspent tokens back before reserving again.
+        _release_agent_budget_reservation(agent)
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2384,10 +2505,10 @@ def run_conversation(
                     request_pressure_tokens,
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
-        
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
-        
+
         if not agent.quiet_mode:
             agent._vprint(f"\n{agent.log_prefix}🔄 Making API call #{api_call_count}/{agent.max_iterations}...")
             agent._vprint(f"{agent.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
@@ -2423,8 +2544,39 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        # Set when the global daily ledger refuses an attempt; handled right
+        # after this retry loop, because the denial ends the whole turn.
+        _budget_denial = None
 
         while retry_count < max_retries:
+            # ── Global daily LLM budget: per-attempt reserve ───────────────
+            # Scoped to ONE physical provider attempt, not to this retry loop:
+            # every attempt that reaches the wire burns real tokens, so every
+            # attempt claims its own estimate (rough prompt estimate + tools +
+            # the response cap) and settles or releases it. Reserving once
+            # around the loop would let N retries spend against a single
+            # claim. The release below hands back the previous attempt's
+            # claim — an attempt that got a response already settled it, so
+            # this only ever frees an attempt that died before any answer.
+            # No budget configured → reserve() short-circuits without touching
+            # the ledger, so the default install pays nothing here.
+            _release_agent_budget_reservation(agent)
+            try:
+                from agent.token_budget import reserve as _budget_reserve
+
+                _budget_outcome = _budget_reserve(
+                    request_pressure_tokens + int(getattr(agent, "max_tokens", 0) or 0)
+                )
+            except Exception:
+                logger.debug("daily budget reserve skipped (fail-open)", exc_info=True)
+                _budget_outcome = None
+            if _budget_outcome is not None and _budget_outcome.denied:
+                _budget_denial = _budget_outcome.message
+                break
+            agent._budget_reservation = (
+                _budget_outcome.reservation if _budget_outcome is not None else None
+            )
+
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -2751,6 +2903,19 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+
+                # ── Global daily LLM budget: settle this attempt ───────────
+                # The provider answered, so this attempt's tokens are spent no
+                # matter what the loop does with the answer next. Settled HERE,
+                # ahead of every response-driven ``break`` / ``continue`` /
+                # ``return`` below (redirect discard, truncation continuation,
+                # refusal, tool-call retry, rollback), because those paths
+                # bypass the usage bookkeeping further down and would otherwise
+                # let the claim be released as zero spend. No usage reported →
+                # the reservation is charged rather than freed. A ``None``
+                # response is left to the release paths.
+                _settle_agent_budget_reservation(agent, response)
+
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -3659,6 +3824,12 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+                    # (The global daily budget was already settled for this
+                    # attempt from the response's own usage, back where the
+                    # provider returned — see _settle_agent_budget_reservation.
+                    # It cannot be settled here: the truncation, refusal, and
+                    # retry paths above never reach this line.)
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -5985,6 +6156,26 @@ def run_conversation(
                     # stale request.
                     break
         
+        if _budget_denial is not None:
+            # The global daily budget has no room for this attempt, so nothing
+            # was sent. Refund the logical iteration (an attempt that never
+            # reached the provider must not consume one) and end the turn with
+            # the denial as the visible answer. Checked ahead of the restart /
+            # `response is None` branches below so the user gets the real
+            # reason instead of "all retries exhausted".
+            final_response = _budget_denial
+            failed = True
+            _turn_exit_reason = "daily_token_budget_exhausted"
+            messages.append({"role": "assistant", "content": final_response})
+            agent._emit_status(final_response)
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            try:
+                agent.iteration_budget.refund()
+            except Exception:
+                pass
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
@@ -7714,6 +7905,12 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # The turn is over: hand back any daily-budget claim whose attempt never
+    # got a provider response (interrupt, transport failure, budget denial).
+    # Nothing else will — the ledger runs no reclamation timer — so skipping
+    # this would park those tokens until midnight.
+    _release_agent_budget_reservation(agent)
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.

@@ -8046,6 +8046,21 @@ class AIAgent:
                         self._reset_activity_labels_after_turn()
                     except Exception:
                         pass
+                    # Hand back any global daily-budget claim whose provider
+                    # call never got a response (an attempt that did is settled
+                    # on arrival, leaving nothing here). The loop releases on
+                    # its own normal paths; this covers the turn dying by
+                    # exception or by an early return from inside the loop.
+                    # There is no reclamation timer, so a claim missed here
+                    # stays parked until midnight. See agent/token_budget.py.
+                    try:
+                        from agent.conversation_loop import (
+                            _release_agent_budget_reservation,
+                        )
+
+                        _release_agent_budget_reservation(self)
+                    except Exception:
+                        pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
