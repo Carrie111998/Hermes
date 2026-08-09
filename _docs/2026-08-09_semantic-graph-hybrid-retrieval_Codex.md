@@ -244,3 +244,56 @@ Next action:
 ## 変更履歴
 
 - 2026-08-09: Commit 4 transactional migration and invalidation verification recorded.
+
+## Commit 6 — model-agnostic lexical/dense RRF candidate fusion
+
+Commit 6 adds deterministic, read-only hybrid candidate retrieval. It uses the existing lexical ranking path, `DeterministicFakeEmbeddingBackend`, Commit 5 exact cosine search, and a pure reciprocal-rank-fusion function. It does not download or invoke the Etherll model, start llama-server, make HTTP/network calls, add dependencies, change configuration, add graph expansion, or measure model quality.
+
+Selected SOPs and skills:
+- `milspec-codex-standard`
+- `test-driven-development`
+- `windows-hermes-code-verification`
+- `SOP-Implementation-Start-Gate`, `SOP-Skill-Selection`, `SOP-Application-Development`, and `SOP-Python`
+
+Changed files:
+- `plugins/semantic_graph/fusion.py`
+- `plugins/semantic_graph/retrieval.py`
+- `tests/plugins/test_semantic_graph_retrieval_rrf.py`
+- this implementation log
+
+RRF contract:
+- Ranks are one-based and use `score += 1 / (k + rank)`, with `k=60` by default.
+- Duplicate IDs retain the first rank within each source and become one candidate.
+- Ordering is `rrf_score DESC`, `source_count DESC`, `best_rank ASC`, then `node_id ASC`; `best_rank` is the minimum available source rank.
+- `dense_similarity` is ranking metadata attached by the retrieval caller; it is never copied to confidence or authority.
+- `top_k` is enforced by the retrieval layer and is separate from the RRF smoothing constant.
+
+Failure and safety contract:
+- Disabled, unavailable, empty, stale, dimension-incompatible, or backend-failure dense paths return the existing lexical result unchanged.
+- Dense candidates are namespace-scoped and filtered against the current canonical node source hash.
+- Hybrid retrieval performs no SQLite writes, status/authority/confidence changes, merges, `same_as` creation, or graph expansion.
+- Commit 6 remains model-agnostic; the fake backend dimension is test data and is not the Qwen3-VL native dimension.
+
+Verification evidence:
+- RED: focused collection failed before `fusion.py` existed with `ModuleNotFoundError` (exit 2).
+- Focused RRF/integration tests: 10 passed, exit 0.
+- Related Semantic Graph tests: 122 passed, exit 0.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS before commit.
+- No live model, llama-server, HTTP, or network call performed.
+- Production config, runtime, serializer profile, and dependencies remain outside this commit.
+
+Deferred live-model work:
+- Add a separate `qwen3_vl` serializer profile for conversation/system instruction handling; do not overwrite the existing `qwen3_text` profile.
+- Validate candidate `--pooling last` behavior against Qwen3-VL chat-template/EOS handling.
+- First live response dimension expectation is 2048. MRL dimensions such as 1024 require live confirmation or explicit client truncation plus renormalization and a distinct namespace.
+- Record GGUF filename/hash, llama.cpp build, server flags, response dimension, finite values, norm, positive-vs-negative semantic ordering, and resource/latency measurements.
+- Compare lexical-only, Qwen3-VL 2B + RRF, and Qwen3 text 0.6B + RRF on English/Japanese text-only benchmarks before production selection.
+
+Residual risk:
+- Real adapter serialization, pooling, response dimensions, Q8_0 quality, latency, RAM/VRAM use, and multimodal retrieval remain unverified.
+- Commit 6 proves fusion and fail-open behavior only; it does not establish Recall@8 improvement or production readiness.
+
+Next action:
+- Commit the deterministic fusion implementation, then perform the isolated llama-server live-validation phase.
