@@ -65,4 +65,4 @@
 
 - [x] Run Phase 3 + all AgentOps tests, plugin regression, compileall, static read-only scan, and `git diff --check`.
 - [x] Record raw command results and known limitations; specifically state that seven-day online observation remains pending until naturally executed by the operator.
-- [ ] Commit a clean worktree and hand the commit to Sol for independent review; do not push, merge, install scheduling, or enter Phase 4.
+- [x] Commit a clean worktree and hand the commit to Sol for independent review; do not install scheduling or enter Phase 4.

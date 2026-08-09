@@ -2,6 +2,9 @@
 
 **Status:** implementation/evidence contract only; seven-day production observation is pending.
 
+**Final offline PR head:** `fbdc57bdd` (clean worktree; AgentOps 144 passed,
+plugins 683 passed, compileall/static read-only scan/diff check passed).
+
 ## Scope and trust boundary
 
 Only `hermes:profile:default:gateway` is core scope. The loop reads the fixed
